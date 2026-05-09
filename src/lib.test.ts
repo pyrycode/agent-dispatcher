@@ -33,7 +33,6 @@ import {
   parseCommitsAhead,
   shouldFlagEmptyBranch,
   shouldProduceCommits,
-  shouldSkipBlockedFor,
 } from "./blockers.js";
 import { AGENT_COLUMN_MAP, selectDispatches } from "./dispatch-selection.js";
 import {
@@ -1354,48 +1353,37 @@ describe("decideDoneCleanup", () => {
   });
 });
 
-describe("shouldSkipBlockedFor", () => {
-  test("ALL agents (including PO) skip blocked tickets — flipped 2026-05-08", () => {
-    // PO used to bypass the blocker check on the rationale that
-    // refinement is "cheap prep work." But PO refines from the issue
-    // body PLUS the docs — and the Documentation agent runs LAST in
-    // the pipeline, so the docs lag the code. PO refining a blocked
-    // ticket reads docs that don't yet describe the upstream's API,
-    // baking stale assumptions into AC. Flipped so PO waits like
-    // every other agent.
-    //
-    // See lib.ts's shouldSkipBlockedFor docstring + project Lessons.md
-    // for full rationale.
-    for (const agent of ["po", "architect", "developer", "code-review", "documentation"]) {
-      assert.equal(
-        shouldSkipBlockedFor(agent, [{ number: 40, state: "OPEN" }]),
-        true,
-        `${agent} should skip on OPEN blocker`,
-      );
-    }
+describe("hasOpenBlockers — uniform across agents (post-2026-05-08 flip)", () => {
+  // PO used to bypass the blocker check on the rationale that
+  // refinement is "cheap prep work." But PO refines from the issue
+  // body PLUS the docs — and the Documentation agent runs LAST in
+  // the pipeline, so the docs lag the code. PO refining a blocked
+  // ticket reads docs that don't yet describe the upstream's API,
+  // baking stale assumptions into AC. Flipped so PO waits like
+  // every other agent — this tier of tests locks in that the gate
+  // is purely blocker-state-driven, no per-agent variation.
+  //
+  // The earlier `shouldSkipBlockedFor(agentName, blockers)` wrapper
+  // existed to support the per-agent exemption. After the 2026-05-08
+  // flip it was a one-line `return hasOpenBlockers(blockers)` with
+  // an unused `agentName` parameter, so it was deleted 2026-05-09
+  // late evening. These tests now exercise `hasOpenBlockers` directly.
+
+  test("OPEN blocker → skip (any agent)", () => {
+    assert.equal(hasOpenBlockers([{ number: 40, state: "OPEN" }]), true);
   });
 
-  test("any agent + no blockers → not skipped", () => {
-    for (const agent of ["po", "architect", "developer", "code-review", "documentation"]) {
-      assert.equal(shouldSkipBlockedFor(agent, []), false);
-    }
+  test("no blockers → don't skip", () => {
+    assert.equal(hasOpenBlockers([]), false);
   });
 
-  test("any agent + all-CLOSED blockers → not skipped (dependencies satisfied)", () => {
-    // Once all blockers close, the gate releases for every agent.
-    for (const agent of ["po", "architect", "developer", "code-review", "documentation"]) {
-      assert.equal(
-        shouldSkipBlockedFor(agent, [{ number: 40, state: "CLOSED" }]),
-        false,
-        `${agent} should not skip when all blockers are CLOSED`,
-      );
-    }
+  test("all-CLOSED blockers → don't skip (dependencies satisfied)", () => {
+    assert.equal(hasOpenBlockers([{ number: 40, state: "CLOSED" }]), false);
   });
 
   test("any-OPEN-blocker holds even when other blockers are CLOSED", () => {
-    // Mixed state: one blocker still open. Gate stays closed.
     assert.equal(
-      shouldSkipBlockedFor("po", [
+      hasOpenBlockers([
         { number: 40, state: "CLOSED" },
         { number: 41, state: "OPEN" },
       ]),

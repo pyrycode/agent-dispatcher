@@ -6,11 +6,11 @@
 // does the I/O.
 //
 // Split from lib.ts on 2026-05-09. Imports `shouldSkipDispatch` from
-// pipeline-decisions.ts and `shouldSkipBlockedFor` from blockers.ts.
+// pipeline-decisions.ts and `hasOpenBlockers` from blockers.ts.
 
 import { AGENTS, type AgentConfig } from "./types.js";
 import { shouldSkipDispatch, type DecisionItem } from "./pipeline-decisions.js";
-import { shouldSkipBlockedFor } from "./blockers.js";
+import { hasOpenBlockers } from "./blockers.js";
 
 // Built from AGENTS — single source of truth for the name → column mapping.
 export const AGENT_COLUMN_MAP: ReadonlyMap<string, string> = new Map(
@@ -32,14 +32,14 @@ export interface DispatchCandidate<T extends DecisionItem = DecisionItem> {
  * scans items in order, accumulating eligible dispatches. Eligibility is the
  * same per-item gate the original WIP=1 loop applied — `shouldSkipDispatch`
  * (label-based: ready/needs-rework/wip/error/error:max_turns_salvaged) AND
- * `shouldSkipBlockedFor` (open-blocker-based, applies to all agents
+ * `hasOpenBlockers` (open-blocker-based, applies to all agents
  * including PO — see that function's docstring for the docs-lag rationale).
  *
  * Concurrency model: WIP=1 *per dependency chain*, parallel across chains.
  * Two unrelated tickets (neither blocks the other) can run simultaneously.
  * Two tickets where A blocks B are kept serial because while A's wip:<agent>
  * is set, A's issue stays OPEN, and B's blockedBy(A) gates it through
- * `shouldSkipBlockedFor`. So this function never picks both halves of an
+ * `hasOpenBlockers`. So this function never picks both halves of an
  * in-flight blocker pair, even when iterating an outdated snapshot.
  *
  * Multiple eligible items in the same column produce multiple candidates for
@@ -63,7 +63,7 @@ export function selectDispatches<T extends DecisionItem>(opts: {
     for (const item of items) {
       if (out.length >= maxConcurrent) break;
       if (shouldSkipDispatch(item.labels, agent.name)) continue;
-      if (item.issueNumber > 0 && shouldSkipBlockedFor(agent.name, item.blockedBy ?? [])) continue;
+      if (item.issueNumber > 0 && hasOpenBlockers(item.blockedBy ?? [])) continue;
       out.push({ agent, item });
     }
   }

@@ -29,45 +29,14 @@ export function hasOpenBlockers(
   return blockers.some(b => b.state === "OPEN");
 }
 
-/**
- * True if this dispatch attempt should be skipped because the ticket
- * has any open blocker. Applies uniformly to ALL agents — including PO.
- *
- * **PO is no longer exempted (2026-05-08).** The earlier design exempted
- * PO on the rationale that refinement is "cheap prep work" — but PO
- * actually refines from the issue body PLUS the docs (`docs/PROJECT-MEMORY.md`,
- * `docs/knowledge/INDEX.md`, `docs/knowledge/features/*.md`). The
- * Documentation agent runs LAST in the pipeline, so the docs only
- * reflect a ticket's changes after that ticket auto-merges to main.
- *
- * Result of the bypass: when PO refined a blocked ticket, it read docs
- * that didn't yet describe the upstream's API / sentinels / files.
- * Refinements baked stale assumptions that either propagated into the
- * dependent's body verbatim (sometimes wrong post-merge) or produced a
- * less-grounded body that architect had to bounce back via
- * `needs-rework:po`. Net cost was throughput-negative for tight chains
- * (refactors, dependent slices), where the upstream API IS the subject
- * of the upstream ticket.
- *
- * Now: blocked tickets sit in Backlog without `ready:po` until the
- * blocker closes. PO refines once with current docs. Cycle delay is
- * one PO turn (~60s, ~$0.20-0.50) per dependency relationship — bounded
- * and deterministic.
- *
- * Auto-advance from Backlog → In Architecture also respects open
- * blockers (see `decideAutoAdvance`).
- *
- * See [[Lessons#PO refines from docs; docs lag the code; PO bypass on
- * blockers ships stale refinements (#198/#199, 2026-05-08)]] for full
- * rationale + the generalizable pattern (informational dependencies vs
- * API dependencies in any pipeline).
- */
-export function shouldSkipBlockedFor(
-  agentName: string,
-  blockers: { number: number; state: "OPEN" | "CLOSED" }[],
-): boolean {
-  return hasOpenBlockers(blockers);
-}
+// Note: `shouldSkipBlockedFor(agentName, blockers)` used to live here as a
+// per-agent gate predicate. PO was originally exempted ("refinement is cheap
+// prep work") but that bypass shipped stale refinements when PO read pre-merge
+// docs about an upstream blocker (relay #198/#199, 2026-05-08); since then
+// the gate is uniform across all agents — `hasOpenBlockers(blockers)`
+// directly. Wrapper deleted 2026-05-09 late evening as dead generalization.
+// Full rationale + the generalizable "informational vs API dependencies"
+// pattern in [[Lessons#PO refines from docs ...]].
 
 // --------- Empty-branch guard ---------
 

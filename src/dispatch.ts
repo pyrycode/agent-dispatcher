@@ -16,7 +16,6 @@ import {
   extractRateLimitInfo,
 } from "./agent-runtime.js";
 import {
-  hasOpenBlockers,
   parseCommitsAhead,
   shouldFlagEmptyBranch,
   shouldProduceCommits,
@@ -1980,7 +1979,7 @@ export async function pollLoop(): Promise<void> {
   // burning Anthropic rate-limit budget too fast). Set PYRY_MAX_CONCURRENT=1
   // for legacy WIP=1 finish-first behaviour, or higher when queue depth grows
   // (Phase 2/3 will increase load). Serial-within-a-dependency-chain is
-  // preserved by `shouldSkipBlockedFor` regardless of this cap — it only
+  // preserved by `hasOpenBlockers` regardless of this cap — it only
   // gates parallel dispatches of *unrelated* tickets. Shipped 2026-05-07.
   const MAX_CONCURRENT = (() => {
     const raw = process.env.PYRY_MAX_CONCURRENT;
@@ -2056,7 +2055,7 @@ export async function pollLoop(): Promise<void> {
     await runDoneCleanup(client);
 
     // Concurrency model: WIP=N (default 2 via PYRY_MAX_CONCURRENT env var).
-    // Serial within a dependency chain is preserved by `shouldSkipBlockedFor`
+    // Serial within a dependency chain is preserved by `hasOpenBlockers`
     // (open-blocker check, exercised inside selectDispatches): a ticket whose
     // blocker is OPEN — including in-flight under wip:<agent> on a still-open
     // issue — is gated. Two unrelated tickets (neither blocks the other) can
