@@ -26,17 +26,17 @@
 
 import type { GitHubProjectClient } from "./github.js";
 import { AGENTS, type ProjectItem } from "./types.js";
+import { AGENT_COLUMN_MAP } from "./dispatch-selection.js";
 import {
   AUTO_ADVANCE_RULES,
-  AGENT_COLUMN_MAP,
   MANUAL_ADVANCE_GATES,
   MID_PIPELINE_COLUMNS,
+  REWORK_LOOP_THRESHOLD,
   countPipelineInFlight,
   decideAutoAdvance,
   decideReworkRoutes,
   extractReworkCount,
-  REWORK_LOOP_THRESHOLD,
-} from "./lib.js";
+} from "./pipeline-decisions.js";
 
 /**
  * Subset of `GitHubProjectClient` that reconciliation actually uses.

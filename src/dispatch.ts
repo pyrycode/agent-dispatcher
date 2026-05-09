@@ -7,34 +7,39 @@ import { config } from "dotenv";
 import { GitHubProjectClient } from "./github.js";
 import { AGENTS, type AgentConfig, type ProjectItem } from "./types.js";
 import {
+  maxTurnsFor,
   parseSalvageGates,
+  scrubSpawnEnv,
+  shouldAttemptSafeSalvage,
+  shouldUseWorktree,
+  findReadyPrNumber,
+  extractRateLimitInfo,
+} from "./agent-runtime.js";
+import {
+  hasOpenBlockers,
+  parseCommitsAhead,
+  shouldFlagEmptyBranch,
+  shouldProduceCommits,
+} from "./blockers.js";
+import { selectDispatches } from "./dispatch-selection.js";
+import {
+  decideDoneCleanup,
+  decidePostRunLabels,
+  isMergeConflictError,
+  isPipelineLabel,
+  isPipelineLabelForAgent,
+  shouldAddReadyLabel,
+  shouldSkipDispatch,
+} from "./pipeline-decisions.js";
+import {
+  decideBranchSetup,
+  decideCodegraphSymlink,
+  findWorktreesForBranch,
   resolveAgentsRepoRootWithEnv,
   resolveDefaultBranch,
   resolveTargetRepoRoot,
-  shouldSkipDispatch,
-  isPipelineLabel,
-  isPipelineLabelForAgent,
-  isMergeConflictError,
-  decideDoneCleanup,
   shouldAutoCommit,
-  shouldUseWorktree,
-  shouldProduceCommits,
-  parseCommitsAhead,
-  shouldFlagEmptyBranch,
-  decideCodegraphSymlink,
-  hasOpenBlockers,
-  shouldSkipBlockedFor,
-  maxTurnsFor,
-  shouldAttemptSafeSalvage,
-  findReadyPrNumber,
-  extractRateLimitInfo,
-  shouldAddReadyLabel,
-  decidePostRunLabels,
-  selectDispatches,
-  decideBranchSetup,
-  findWorktreesForBranch,
-  scrubSpawnEnv,
-} from "./lib.js";
+} from "./worktree.js";
 import { runAutoAdvance, runReworkRouting } from "./reconcile.js";
 
 // Load .env from the consumer's agents repo. AGENTS_REPO_PATH (set by
