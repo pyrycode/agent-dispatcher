@@ -451,27 +451,33 @@ async function buildPromptForAgent(
     }
   }
 
-  // Add specific instructions based on agent role
-  switch (agent.name) {
-    case "po":
-      if (ticketNum > 0) {
-        parts.push("\n## Your Task\nThis ticket was routed back to you for rework. Read the issue body and the previous agent comments above to understand what needs to change. Common reasons:\n- **Ticket too large**: Split into smaller, independently deliverable tickets. Create sub-tickets and close this one.\n- **Unclear acceptance criteria**: Rewrite the criteria to be specific and testable.\n- **Missing context**: Add the missing information.\n\nAfter making changes, add label `ready:po`.");
-      } else {
-        parts.push("\n## Your Task\nCreate a well-structured GitHub issue from the above request.");
-      }
-      break;
-    case "architect":
-      parts.push("\n## Your Task\nCreate a Go architecture document for this feature. Define interfaces, data flows, concurrency patterns. Save to docs/specs/architecture/");
-      break;
-    case "developer":
-      parts.push("\n## Your Task\nImplement this feature in Go following the architecture doc above. Run `go test -race ./...` and `go vet ./...` before creating a PR.");
-      break;
-    case "code-review":
-      parts.push("\n## Your Task\nReview the PR for Go quality, idioms, and correctness. Use `gh pr diff <number>` to read the diff.");
-      break;
-    case "documentation":
-      parts.push("\n## Your Task\nSynthesize all ticket artifacts into the project knowledge base. Write or update feature docs in docs/knowledge/features/, create ADRs in docs/knowledge/decisions/ if significant decisions were made, and update docs/knowledge/INDEX.md.");
-      break;
+  // Per-agent task framing.
+  //
+  // Pre-2026-05-09, this block contained role-specific AND
+  // language-specific AND path-specific instructions ("Implement this
+  // feature in Go ... Run `go test -race ./...` ... Save to
+  // docs/specs/architecture/ ..."). That coupled the generic dispatcher
+  // to pyrycode's Go pipeline + path conventions — useless for Kotlin
+  // (mobile-agents) or any future non-Go consumer, and stepping on the
+  // per-agent CLAUDE.md system prompt that already owns role + language
+  // + tooling specifics.
+  //
+  // Now: the dispatcher only conveys what's STATE-DEPENDENT and not
+  // discoverable from the agent's CLAUDE.md alone — i.e. the PO mode
+  // signal (rework existing ticket vs. create from raw request). All
+  // role/language/path/tooling specifics live in each agent's CLAUDE.md
+  // (per-consumer, language-aware), passed via `--append-system-prompt-file`.
+  //
+  // If a future class of state-dependent signal needs threading (e.g.
+  // a "this is a hotfix vs. normal" flag), add it here. Resist the urge
+  // to re-add role-level "Your Task" text — that's the system prompt's
+  // job.
+  if (agent.name === "po") {
+    parts.push(
+      ticketNum > 0
+        ? "\n## Mode\nrework — existing ticket routed back. Read the previous agent comments above for the rework reason."
+        : "\n## Mode\ncreate-from-inbox — raw user request, draft a structured GitHub issue.",
+    );
   }
 
   return parts.join("\n");
