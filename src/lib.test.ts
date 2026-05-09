@@ -51,6 +51,7 @@ import {
   REWORK_LOOP_THRESHOLD,
   findAdvanceRule,
   maxTurnsFor,
+  parseSalvageGates,
   shouldAttemptSafeSalvage,
   findReadyPrNumber,
   extractRateLimitInfo,
@@ -1584,11 +1585,10 @@ describe("shouldAttemptSafeSalvage", () => {
     terminalReason: "max_turns",
     prAlreadyExists: false,
     gitStatusOutput: " M internal/e2e/rotation_test.go\n?? internal/e2e/internal/fakeclaude/main.go\n",
-    vetExitCode: 0,
-    buildExitCode: 0,
+    gateExitCodes: [0, 0],
   };
 
-  test("max_turns + uncommitted + clean vet + clean build → salvage", () => {
+  test("max_turns + uncommitted + all gates pass → salvage", () => {
     assert.equal(shouldAttemptSafeSalvage(baseOk), true);
   });
 
@@ -1621,34 +1621,71 @@ describe("shouldAttemptSafeSalvage", () => {
     );
   });
 
-  test("vet failure → no salvage (don't ship broken code as a draft PR)", () => {
-    assert.equal(
-      shouldAttemptSafeSalvage({ ...baseOk, vetExitCode: 1 }),
-      false,
+  test("any failing gate → no salvage (don't ship broken code as a draft PR)", () => {
+    // Every gate must be 0; any non-zero blocks. The point is that a
+    // human reviewing the salvage PR has buildable code to work with —
+    // failing tests are fine (they're often the signal the agent was
+    // chasing), but failing vet/build means the code itself is in an
+    // indeterminate state.
+    assert.equal(shouldAttemptSafeSalvage({ ...baseOk, gateExitCodes: [1, 0] }), false);
+    assert.equal(shouldAttemptSafeSalvage({ ...baseOk, gateExitCodes: [0, 1] }), false);
+    assert.equal(shouldAttemptSafeSalvage({ ...baseOk, gateExitCodes: [1] }), false);
+    assert.equal(shouldAttemptSafeSalvage({ ...baseOk, gateExitCodes: [2] }), false);
+  });
+
+  test("empty gate list → salvage proceeds (consumer opted out of gating)", () => {
+    // SALVAGE_GATES="" (explicitly empty env var) means "always salvage
+    // when the other criteria match" — useful for languages without
+    // cheap precommit gates, or for consumers who'd rather let humans
+    // sort it out at PR review.
+    assert.equal(shouldAttemptSafeSalvage({ ...baseOk, gateExitCodes: [] }), true);
+  });
+
+  test("variable gate count works (3+ gates, any failing blocks)", () => {
+    assert.equal(shouldAttemptSafeSalvage({ ...baseOk, gateExitCodes: [0, 0, 0] }), true);
+    assert.equal(shouldAttemptSafeSalvage({ ...baseOk, gateExitCodes: [0, 0, 1] }), false);
+    assert.equal(shouldAttemptSafeSalvage({ ...baseOk, gateExitCodes: [0, 1, 0] }), false);
+  });
+});
+
+describe("parseSalvageGates", () => {
+  // Lets consumers configure what build gates run before the dispatcher
+  // ships salvaged work. SALVAGE_GATES is a `;`-delimited list of shell
+  // commands; each runs in the agent's worktree, all must exit 0.
+  //
+  // - Unset:     defaults to the legacy Go pair (back-compat for pyrycode).
+  // - Empty "":  zero gates (always salvage when other criteria match).
+  // - Set:       split on `;`, trim, drop empty entries.
+
+  test("unset → Go default pair (back-compat)", () => {
+    assert.deepEqual(parseSalvageGates(undefined), ["go vet ./...", "go build ./..."]);
+  });
+
+  test("empty string → no gates (consumer opted out)", () => {
+    assert.deepEqual(parseSalvageGates(""), []);
+  });
+
+  test("single gate → single-element array", () => {
+    assert.deepEqual(parseSalvageGates("cargo check"), ["cargo check"]);
+  });
+
+  test("semicolon-separated → multiple gates", () => {
+    assert.deepEqual(
+      parseSalvageGates("npm run lint; npm run build"),
+      ["npm run lint", "npm run build"],
     );
   });
 
-  test("build failure → no salvage (don't ship broken code as a draft PR)", () => {
-    assert.equal(
-      shouldAttemptSafeSalvage({ ...baseOk, buildExitCode: 2 }),
-      false,
+  test("trims surrounding whitespace per gate", () => {
+    assert.deepEqual(
+      parseSalvageGates("  cargo check  ;  cargo build  "),
+      ["cargo check", "cargo build"],
     );
   });
 
-  test("any non-zero vet OR build → no salvage (independent gates)", () => {
-    // Both must be 0; either non-zero blocks. The point of the gate is
-    // that a human reviewing the salvage PR has buildable code to work
-    // with — failing tests are fine (they're often the signal the agent
-    // was chasing), but failing vet/build means the code itself is in
-    // an indeterminate state.
-    assert.equal(
-      shouldAttemptSafeSalvage({ ...baseOk, vetExitCode: 0, buildExitCode: 1 }),
-      false,
-    );
-    assert.equal(
-      shouldAttemptSafeSalvage({ ...baseOk, vetExitCode: 1, buildExitCode: 0 }),
-      false,
-    );
+  test("drops empty segments (trailing/leading/double semicolons)", () => {
+    assert.deepEqual(parseSalvageGates(";cargo check;;cargo build;"), ["cargo check", "cargo build"]);
+    assert.deepEqual(parseSalvageGates(";;"), []);
   });
 });
 

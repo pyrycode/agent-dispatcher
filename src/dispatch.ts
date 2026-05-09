@@ -7,6 +7,7 @@ import { config } from "dotenv";
 import { GitHubProjectClient } from "./github.js";
 import { AGENTS, type AgentConfig, type ProjectItem } from "./types.js";
 import {
+  parseSalvageGates,
   resolveAgentsRepoRootWithEnv,
   resolveDefaultBranch,
   resolveTargetRepoRoot,
@@ -64,6 +65,14 @@ const repoRoot = process.env.TARGET_REPO_PATH
 // based variants). Threaded into every git command that branches off, merges
 // into, or counts commits against the default branch.
 const defaultBranch = resolveDefaultBranch(process.env.TARGET_DEFAULT_BRANCH);
+
+// Salvage gates run after a `max_turns` failure to gate whether the
+// dispatcher commits + pushes the agent's uncommitted work as a draft PR.
+// Defaults to the Go pair (`go vet ./...`, `go build ./...`) for back-compat
+// with pyrycode + relay; consumers in other ecosystems set `SALVAGE_GATES`
+// (`;`-delimited shell commands), or `SALVAGE_GATES=""` to opt out of
+// gating entirely.
+const salvageGates = parseSalvageGates(process.env.SALVAGE_GATES);
 
 config({ path: resolve(agentsRepoRoot, ".env") });
 
@@ -504,23 +513,32 @@ async function attemptSaferSalvage(opts: {
       cwd: opts.agentCwd, encoding: "utf-8", timeout: 15_000,
     }).toString();
 
-    let vetExitCode = 0;
-    try { execSync(`go vet ./...`, { cwd: opts.agentCwd, stdio: "pipe", timeout: 60_000 }); }
-    catch (e: any) { vetExitCode = typeof e.status === "number" ? e.status : 1; }
-
-    let buildExitCode = 0;
-    try { execSync(`go build ./...`, { cwd: opts.agentCwd, stdio: "pipe", timeout: 120_000 }); }
-    catch (e: any) { buildExitCode = typeof e.status === "number" ? e.status : 1; }
+    // Run each configured gate in order; collect exit codes. Each gate
+    // gets a 120s timeout — same envelope as the Go build default,
+    // generous enough for typed-language compilation but not so long
+    // that a hung gate blocks the salvage path indefinitely.
+    const gateExitCodes: number[] = [];
+    for (const gate of salvageGates) {
+      let exitCode = 0;
+      try {
+        execSync(gate, { cwd: opts.agentCwd, stdio: "pipe", timeout: 120_000 });
+      } catch (e: any) {
+        exitCode = typeof e.status === "number" ? e.status : 1;
+      }
+      gateExitCodes.push(exitCode);
+    }
 
     if (!shouldAttemptSafeSalvage({
       terminalReason: opts.streamResult.terminalReason || "",
       prAlreadyExists: false,
       gitStatusOutput: dirty,
-      vetExitCode,
-      buildExitCode,
+      gateExitCodes,
     })) {
+      const gateSummary = salvageGates.length === 0
+        ? "gates: none"
+        : `gates: ${salvageGates.map((g, i) => `"${g}"=${gateExitCodes[i]}`).join(" ")}`;
       writeLog(opts.logFile, "SAFER_SALVAGE_SKIPPED",
-        `gates: vet=${vetExitCode} build=${buildExitCode} dirty=${dirty.trim().length > 0}`);
+        `${gateSummary} dirty=${dirty.trim().length > 0}`);
       return false;
     }
 
@@ -557,7 +575,7 @@ async function attemptSaferSalvage(opts: {
       ``,
       `The **${opts.agent.name}** agent hit \`max_turns\` (${opts.streamResult.numTurns} turns, $${opts.streamResult.totalCostUsd.toFixed(2)}) on #${opts.item.issueNumber} while work was in progress. The dispatcher auto-committed the uncommitted changes and opened this **draft** PR for human triage.`,
       ``,
-      `**Build status at salvage:** clean (\`go vet\` + \`go build\` both passed). Tests were not run as a salvage gate — failing tests are often the signal the agent was chasing.`,
+      `**Build status at salvage:** clean (${salvageGates.length === 0 ? "no gates configured" : salvageGates.map((g) => `\`${g}\``).join(" + ") + " all passed"}). Tests were not run as a salvage gate — failing tests are often the signal the agent was chasing.`,
       ``,
       `**Last messages from the agent (may include unresolved findings):**`,
       ``,

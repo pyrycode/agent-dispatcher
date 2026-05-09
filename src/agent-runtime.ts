@@ -81,10 +81,13 @@ export function maxTurnsFor(agent: AgentConfig): number {
  * 2. No PR already exists — the existing salvage path handles that case.
  * 3. Working tree has changes — nothing to salvage if the worktree is
  *    clean (the agent did no productive work).
- * 4. `go vet` AND `go build` both clean — don't ship broken code as a
- *    draft PR. Failing tests are fine (they're often the signal the
- *    agent was chasing); failing vet/build means the code itself is
- *    indeterminate.
+ * 4. All configured salvage gates exit 0 — don't ship broken code as a
+ *    draft PR. Default gates are Go-specific (`go vet ./...` and
+ *    `go build ./...`); consumers in other ecosystems override via the
+ *    `SALVAGE_GATES` env var (`;`-delimited shell commands). An empty
+ *    list means "no gating" — consumer opted out. Failing tests are fine
+ *    (they're often the signal the agent was chasing); failing build
+ *    gates mean the code itself is indeterminate.
  *
  * **Why a draft PR (not a regular PR + `ready:developer`):**
  * salvaged work is by definition incomplete (the agent stopped in the
@@ -108,15 +111,49 @@ export function shouldAttemptSafeSalvage(opts: {
   terminalReason: string;
   prAlreadyExists: boolean;
   gitStatusOutput: string;
-  vetExitCode: number;
-  buildExitCode: number;
+  /**
+   * Exit codes from each configured salvage gate, in execution order.
+   * All must be 0 for salvage to proceed. Empty array = no gating
+   * (consumer opted out via empty `SALVAGE_GATES` env var).
+   */
+  gateExitCodes: number[];
 }): boolean {
   if (opts.terminalReason !== "max_turns") return false;
   if (opts.prAlreadyExists) return false;
   if (opts.gitStatusOutput.trim().length === 0) return false;
-  if (opts.vetExitCode !== 0) return false;
-  if (opts.buildExitCode !== 0) return false;
+  if (opts.gateExitCodes.some((code) => code !== 0)) return false;
   return true;
+}
+
+/**
+ * Parse the `SALVAGE_GATES` env var into a list of shell commands.
+ *
+ * Format: `;`-delimited shell commands; each runs in the agent's
+ * worktree. All must exit 0 for `shouldAttemptSafeSalvage` to fire.
+ *
+ * - **Unset** (`undefined`): defaults to the legacy Go pair
+ *   `["go vet ./...", "go build ./..."]` for back-compat with pyrycode
+ *   + pyrycode-relay. Forks targeting other ecosystems set the env var
+ *   explicitly.
+ * - **Empty string** (`""`): zero gates — `shouldAttemptSafeSalvage`
+ *   skips the gate check entirely. Useful for consumers in ecosystems
+ *   without cheap precommit gates, or who prefer human triage at PR
+ *   review.
+ * - **Set**: split on `;`, trim each segment, drop empties. So `"cargo
+ *   check; cargo build"`, `";cargo check;;"`, and `"cargo check  ;
+ *   cargo build  "` all yield two-gate or one-gate clean lists.
+ *
+ * Pure decision; the caller (`attemptSaferSalvage` in dispatch.ts) does
+ * the `execSync` per gate and threads exit codes back here.
+ */
+export function parseSalvageGates(envValue: string | undefined): string[] {
+  if (envValue === undefined) {
+    return ["go vet ./...", "go build ./..."];
+  }
+  return envValue
+    .split(";")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
 }
 
 /**
