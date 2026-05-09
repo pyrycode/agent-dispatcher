@@ -83,11 +83,18 @@ async function notifyDiscord(message: string): Promise<void> {
   }
 }
 
-// Agent run logs
-const LOGS_DIR = resolve(agentsRepoRoot, "dispatch/logs");
+// Agent run logs. Lives at <agentsRepoRoot>/logs/ (gitignored). Pre-split
+// these were under <agentsRepoRoot>/dispatch/logs/ when the dispatcher
+// source itself lived at <agentsRepoRoot>/dispatch/. After the split into
+// pyrycode/agent-dispatcher (consumed via submodule), keeping the old
+// path would create a stale `dispatch/` dir in each consumer's agents
+// repo just for log storage — confusing because `dispatcher/` (the
+// submodule mount) is right next to it. Pinning to agentsRepoRoot keeps
+// runtime artifacts cleanly separated from the submodule working tree.
+const LOGS_DIR = resolve(agentsRepoRoot, "logs");
 mkdirSync(LOGS_DIR, { recursive: true });
 
-// Each dispatch writes ~5MB to dispatch/logs/. At 50 dispatches/day → ~9GB/year
+// Each dispatch writes ~5MB to <agentsRepoRoot>/logs/. At 50 dispatches/day → ~9GB/year
 // per project. Without rotation the dir eventually fills the disk on
 // long-running deployments. Default retention 30 days; override with
 // PYRY_LOG_RETENTION_DAYS=N (>=1; setting to 0 disables rotation).
@@ -1111,8 +1118,15 @@ export async function prepareAgentSpawn(
     return { ok: false };
   }
 
-  const promptFile = resolve(__dirname, `../.prompt-${item.issueNumber}.txt`);
-  const systemPromptFile = resolve(__dirname, `../.system-prompt-${agent.name}.txt`);
+  // Prompt + system-prompt files land in the consumer's agents repo
+  // root (gitignored as `.prompt-*.txt` / `.system-prompt-*.txt`). Pre-
+  // split these used `__dirname/..` because dispatcher source lived
+  // inside the agents repo; post-split that path lands inside the
+  // submodule working tree, mixing runtime artifacts with vendored
+  // source. Pinning to agentsRepoRoot mirrors the LOGS_DIR move and
+  // keeps runtime files out of the submodule.
+  const promptFile = resolve(agentsRepoRoot, `.prompt-${item.issueNumber}.txt`);
+  const systemPromptFile = resolve(agentsRepoRoot, `.system-prompt-${agent.name}.txt`);
   writeFileSync(promptFile, prompt);
   writeFileSync(systemPromptFile, systemPrompt);
 
@@ -1535,7 +1549,13 @@ export async function cleanupAfterDispatch(ctx: DispatchContext): Promise<void> 
     // (e.g., Claude Code's own worktree recovery writes to .claude/worktrees/ in the main repo)
     try {
       execSync(`git checkout -- .`, { cwd: repoRoot, stdio: "pipe" });
-      execSync(`git clean -fd --exclude=.env --exclude=agents/dispatch/logs --exclude=agents/dispatch/node_modules`, { cwd: repoRoot, stdio: "pipe" });
+      // Exclude the entire agents/ tree — it's gitignored from the target
+      // repo's perspective, and contains the submodule's node_modules,
+      // runtime logs, prompt files, and the per-agent CLAUDE.md files.
+      // Pre-split this enumerated `agents/dispatch/logs` and
+      // `agents/dispatch/node_modules`; the single `agents` exclude is
+      // both simpler and stays correct when the submodule layout changes.
+      execSync(`git clean -fd --exclude=.env --exclude=agents`, { cwd: repoRoot, stdio: "pipe" });
     } catch (e) {
       console.warn(`   ⚠️  Failed to clean main repo: ${e}`);
     }
