@@ -1176,9 +1176,10 @@ export async function prepareAgentSpawn(
   const isCodeReview = agent.name === "code-review";
 
   // Tool access per agent role
-  // codegraph tools are read-only Go-symbol queries (callers/callees/impact/search/etc) backed
-  // by the .codegraph/ index in pyrycode/. Bootstrap once with `codegraph index .`; subsequent
-  // updates via `codegraph sync` (or the mark-dirty / sync-if-dirty hook pair).
+  // codegraph tools are read-only symbol queries (callers/callees/impact/search/etc) backed
+  // by the .codegraph/ index at the target repo root. Bootstrap once with `codegraph init -i`;
+  // the dispatcher refreshes the index post-merge in `runAutoMerge` so subsequent ticket spawns
+  // see fresh symbols (`codegraph sync` is unreliable per Lessons.md 2026-05-09).
   const baseTools = "Bash,Read,Write,Edit,Glob,Grep,TodoWrite,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status,mcp__context7__resolve-library-id,mcp__context7__query-docs,mcp__codegraph__codegraph_search,mcp__codegraph__codegraph_callers,mcp__codegraph__codegraph_callees,mcp__codegraph__codegraph_impact,mcp__codegraph__codegraph_node,mcp__codegraph__codegraph_context,mcp__codegraph__codegraph_files,mcp__codegraph__codegraph_status";
   const needsAgent = ["architect", "code-review"].includes(agent.name);
   let allowedTools = baseTools;
@@ -1808,7 +1809,7 @@ export async function runAutoMerge(
   client: DispatchClient,
   deps: DispatchDeps = DEFAULT_DEPS,
 ): Promise<void> {
-  const { execSync, notifyDiscord } = deps;
+  const { execSync, existsSync, notifyDiscord } = deps;
   try {
     const doneItems = await client.getItemsByStatus("Done");
     for (const item of doneItems) {
@@ -1858,6 +1859,36 @@ export async function runAutoMerge(
           execSync(`git checkout ${defaultBranch} && git pull`, { cwd: repoRoot, stdio: "pipe", timeout: 15_000 });
         } catch (e: any) {
           console.warn(`   ⚠️  Post-merge git pull failed (will retry next cycle): ${e?.message ?? e}`);
+        }
+
+        // Refresh the codegraph index against the now-updated default
+        // branch. Codegraph has no reliable watcher in our deployment
+        // — the FSEvents auto-sync inside `serve --mcp` is tied to the
+        // MCP server's lifetime (per-spawn for stdio MCP, useless for
+        // persistence) and `codegraph sync` doesn't reliably pick up
+        // edits (Lessons.md 2026-05-09). Manual `codegraph index -f`
+        // is the only refresh that works.
+        //
+        // Post-merge is the natural seam: code has just stabilized on
+        // the default branch, and subsequent ticket spawns will be
+        // querying a fresh shape. Without this step, the index drifts
+        // behind main as features ship through the pipeline; spawned
+        // agents on dependent tickets query stale symbol data.
+        //
+        // Skipped if no `.codegraph/` exists at the target root (the
+        // operator hasn't bootstrapped one) — the dispatcher's startup
+        // pre-flight already warned about that case.
+        //
+        // Non-fatal: codegraph isn't load-bearing — agents fall through
+        // to grep on missing/stale indexes per `decideCodegraphHealth`.
+        // Same posture as the `git pull` failure path above.
+        if (existsSync(resolve(repoRoot, ".codegraph"))) {
+          try {
+            execSync(`codegraph index -f`, { cwd: repoRoot, stdio: "pipe", timeout: 60_000 });
+            console.log(`   📚 codegraph index refreshed`);
+          } catch (e: any) {
+            console.warn(`   ⚠️  Post-merge codegraph reindex failed (next merge will retry): ${e?.message ?? e}`);
+          }
         }
 
         // Clean up pipeline labels — they're noise on completed tickets.

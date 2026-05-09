@@ -47,11 +47,17 @@ import {
   type StreamResult,
 } from "./dispatch.js";
 import type { AgentConfig, BlockerInfo, ProjectItem } from "./types.js";
-import { resolveAgentsRepoRoot } from "./worktree.js";
+import { resolveAgentsRepoRoot, resolveTargetRepoRoot } from "./worktree.js";
 
 // Recompute agentsRepoRoot the same way dispatch.ts does so test
 // fsMaps can use the absolute paths the production code resolves.
 const TEST_AGENTS_REPO_ROOT = resolveAgentsRepoRoot(dirname(fileURLToPath(import.meta.url)));
+// Mirror dispatch.ts:63's env-precedence pattern so tests can compute
+// the same `repoRoot` the production code resolves.
+const TEST_REPO_ROOT = process.env.TARGET_REPO_PATH
+  ? resolve(process.env.TARGET_REPO_PATH)
+  : resolveTargetRepoRoot(TEST_AGENTS_REPO_ROOT);
+const TEST_CODEGRAPH_PATH = resolve(TEST_REPO_ROOT, ".codegraph");
 
 // --------- Call log (assertion surface) ---------
 
@@ -2676,5 +2682,110 @@ describe("runAutoMerge", () => {
     // No comment, no Discord notify.
     assert.equal(client.comments.length, 0);
     assert.equal(calls.discord.length, 0);
+  });
+
+  test("happy path → codegraph index -f invoked when .codegraph exists at repoRoot", async () => {
+    // Post-merge codegraph reindex: codegraph has no reliable watcher,
+    // and the dispatcher only refreshes the index when explicitly told
+    // (no per-spawn reindex, no FSEvents in stdio MCP). The natural seam
+    // is right after a successful auto-merge — main has just stabilized,
+    // and subsequent ticket spawns will be querying a fresh shape.
+    //
+    // Non-fatal: codegraph isn't load-bearing (agents fall through to
+    // grep when index is missing/stale). Failure logs a warning and the
+    // rest of the merge flow continues.
+    const client = new MockGitHubClient({
+      items: [
+        { issueNumber: 1300, status: "Done", labels: ["ready:documentation"], state: "OPEN" },
+      ],
+    });
+    const { deps, calls } = makeMockDeps({
+      fsMap: { [TEST_CODEGRAPH_PATH]: "" },  // existsSync returns true → reindex runs
+      execImpls: {
+        "gh pr list --head \"feature/1300\"": () => "800\n",
+        "gh pr merge 800 --merge --delete-branch": () => "",
+        "git checkout main && git pull": () => "",
+        "codegraph index -f": () => "✓ Indexed 14 files",
+      },
+    });
+
+    await runAutoMerge(client, deps);
+
+    // codegraph index -f invoked at the target repo root.
+    const cgCall = calls.exec.find(c => c.cmd.includes("codegraph index -f"));
+    assert.ok(cgCall, "codegraph index -f must be invoked when .codegraph exists");
+    assert.equal(cgCall.opts?.cwd, TEST_REPO_ROOT, "must run codegraph index -f at the target repo root");
+    // Standard merge path still completed (label cleanup + Discord).
+    assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1300 && c.label === "ready:documentation"));
+    assert.equal(calls.discord.length, 1);
+    assert.match(calls.discord[0]!, /^🔀 PR #800 merged/);
+  });
+
+  test("no .codegraph at repoRoot → reindex skipped silently", async () => {
+    // If the target repo has no codegraph index (operator hasn't
+    // bootstrapped one yet), the dispatcher's existing pre-flight already
+    // warned about it at startup. The post-merge step must not invoke
+    // `codegraph index -f` against a non-existent index — that would
+    // either error or auto-bootstrap (codegraph CLI behaviour varies),
+    // both of which are surprising side-effects of a merge.
+    const client = new MockGitHubClient({
+      items: [
+        { issueNumber: 1301, status: "Done", labels: ["ready:documentation"], state: "OPEN" },
+      ],
+    });
+    const { deps, calls } = makeMockDeps({
+      fsMap: {},  // no .codegraph at repoRoot → existsSync returns false
+      execImpls: {
+        "gh pr list --head \"feature/1301\"": () => "801\n",
+        "gh pr merge 801 --merge --delete-branch": () => "",
+        "git checkout main && git pull": () => "",
+      },
+    });
+
+    await runAutoMerge(client, deps);
+
+    // No codegraph invocation of any kind.
+    assert.ok(!calls.exec.some(c => c.cmd.includes("codegraph")),
+      "no codegraph command should run when .codegraph is absent");
+    // Standard merge path still completed.
+    assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1301));
+    assert.equal(calls.discord.length, 1);
+  });
+
+  test("codegraph reindex failure is non-fatal — labels still cleaned, Discord still notified", async () => {
+    // Codegraph isn't load-bearing. If `codegraph index -f` errors
+    // (lock contention, disk full, transient binary issue), the
+    // dispatcher must log a warning and continue — the merge already
+    // happened on origin, the labels matter more than a temporarily
+    // stale index. Same posture as the existing post-merge `git pull`
+    // failure path (line 1858-1861).
+    const client = new MockGitHubClient({
+      items: [
+        { issueNumber: 1302, status: "Done", labels: ["ready:documentation"], state: "OPEN" },
+      ],
+    });
+    const { deps, calls } = makeMockDeps({
+      fsMap: { [TEST_CODEGRAPH_PATH]: "" },
+      execImpls: {
+        "gh pr list --head \"feature/1302\"": () => "802\n",
+        "gh pr merge 802 --merge --delete-branch": () => "",
+        "git checkout main && git pull": () => "",
+        "codegraph index -f": () => execError({
+          stderr: "Error: lock file exists at /path/.codegraph/lock",
+          message: "Command failed: codegraph index -f",
+        }),
+      },
+    });
+
+    await runAutoMerge(client, deps);
+
+    // The reindex was attempted (proves the path runs even on failure).
+    assert.ok(calls.exec.some(c => c.cmd.includes("codegraph index -f")));
+    // Critical: the rest of the merge path completed despite codegraph's failure.
+    assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1302 && c.label === "ready:documentation"));
+    assert.equal(calls.discord.length, 1);
+    assert.match(calls.discord[0]!, /^🔀 PR #802 merged/);
+    // No error label applied — codegraph failure isn't a ticket-level signal.
+    assert.ok(!client.addLabelCalls.some(c => c.label.startsWith("error:")));
   });
 });
