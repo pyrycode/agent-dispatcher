@@ -1,0 +1,136 @@
+// Issue dependencies (`addBlockedBy`) and empty-branch guard.
+//
+// All pure: examines blocker state, agent config, parsed git output.
+//
+// Split from lib.ts on 2026-05-09.
+
+import type { AgentConfig } from "./types.js";
+
+// --------- Issue dependencies ---------
+
+/**
+ * True if any of the listed blockers is still OPEN.
+ *
+ * Uses GitHub's first-class `addBlockedBy` relationship (queryable as
+ * `Issue.blockedBy` in GraphQL, visible in the issue UI as a "Blocked by
+ * #N" badge). The dispatcher skips dispatch on any ticket where this
+ * returns true — a blocked ticket can't make progress until its
+ * dependencies close.
+ *
+ * Avoids the retry-loop class of failures (Pyrycode #41 hit this 6 times,
+ * burning ~$4 of dev tokens, before the dev agent self-halted by
+ * setting `error:developer`). Native `blockedBy` makes the constraint
+ * structural — survives across runs, visible in the GitHub UI, and
+ * doesn't require a custom label scheme.
+ */
+export function hasOpenBlockers(
+  blockers: { number: number; state: "OPEN" | "CLOSED" }[],
+): boolean {
+  return blockers.some(b => b.state === "OPEN");
+}
+
+/**
+ * True if this dispatch attempt should be skipped because the ticket
+ * has any open blocker. Applies uniformly to ALL agents — including PO.
+ *
+ * **PO is no longer exempted (2026-05-08).** The earlier design exempted
+ * PO on the rationale that refinement is "cheap prep work" — but PO
+ * actually refines from the issue body PLUS the docs (`docs/PROJECT-MEMORY.md`,
+ * `docs/knowledge/INDEX.md`, `docs/knowledge/features/*.md`). The
+ * Documentation agent runs LAST in the pipeline, so the docs only
+ * reflect a ticket's changes after that ticket auto-merges to main.
+ *
+ * Result of the bypass: when PO refined a blocked ticket, it read docs
+ * that didn't yet describe the upstream's API / sentinels / files.
+ * Refinements baked stale assumptions that either propagated into the
+ * dependent's body verbatim (sometimes wrong post-merge) or produced a
+ * less-grounded body that architect had to bounce back via
+ * `needs-rework:po`. Net cost was throughput-negative for tight chains
+ * (refactors, dependent slices), where the upstream API IS the subject
+ * of the upstream ticket.
+ *
+ * Now: blocked tickets sit in Backlog without `ready:po` until the
+ * blocker closes. PO refines once with current docs. Cycle delay is
+ * one PO turn (~60s, ~$0.20-0.50) per dependency relationship — bounded
+ * and deterministic.
+ *
+ * Auto-advance from Backlog → In Architecture also respects open
+ * blockers (see `decideAutoAdvance`).
+ *
+ * See [[Lessons#PO refines from docs; docs lag the code; PO bypass on
+ * blockers ships stale refinements (#198/#199, 2026-05-08)]] for full
+ * rationale + the generalizable pattern (informational dependencies vs
+ * API dependencies in any pipeline).
+ */
+export function shouldSkipBlockedFor(
+  agentName: string,
+  blockers: { number: number; state: "OPEN" | "CLOSED" }[],
+): boolean {
+  return hasOpenBlockers(blockers);
+}
+
+// --------- Empty-branch guard ---------
+
+/**
+ * True if this agent is expected to produce commits during a normal
+ * successful run. The empty-branch guard fires only on agents where
+ * this is true AND the post-run branch is 0 ahead of `main`.
+ *
+ * Reads `agent.producesCommits` (declared in types.ts). Distinct from
+ * `shouldUseWorktree`: code-review uses a worktree (reads code) but
+ * never commits — its output is PR comments via `gh pr review`.
+ *
+ * Surfaced by relay #5 (2026-05-08): architect refused to spec without
+ * blocker resolution, developer refused to code without spec, code-review
+ * couldn't apply `needs-rework:developer` because that label didn't
+ * exist in the relay repo — and the dispatcher march-marched the ticket
+ * across every column to "Done" with `feature/5` unchanged from main.
+ * The fix is deterministic: don't trust the agent's prose about whether
+ * work happened; verify by counting commits.
+ */
+export function shouldProduceCommits(agent: AgentConfig): boolean {
+  return agent.producesCommits;
+}
+
+/**
+ * Parse the integer count from `git rev-list --count <base>..<branch>`.
+ * Returns -1 on unparseable input — caller treats as "git output
+ * unknown, don't act on it" (safer than treating garbage as 0 and
+ * falsely flagging a successful run as empty).
+ *
+ * The git command itself either succeeds with a single integer line or
+ * exits non-zero (then `execSync` throws and the caller's `catch`
+ * leaves `commitsAhead` at -1). This function only exists so the
+ * parsing is testable without shelling out — the contract is "trust
+ * a parsed integer; treat anything else as unknown."
+ */
+export function parseCommitsAhead(revListOutput: string): number {
+  const trimmed = revListOutput.trim();
+  if (trimmed.length === 0) return -1;
+  const n = Number.parseInt(trimmed, 10);
+  if (Number.isNaN(n)) return -1;
+  return n;
+}
+
+/**
+ * True iff the dispatcher should treat this agent's post-run branch
+ * state as a silent failure — the agent was expected to produce
+ * commits but the branch is still 0 ahead of `main`.
+ *
+ * Caller side (in dispatch.ts) wraps this in:
+ *   - `useWorktree` gate (no worktree = no branch to count against)
+ *   - `!saferSalvaged` gate (salvage path manages its own labeling)
+ *   - error-handling around the `git rev-list` call (treat throw as -1)
+ *
+ * Returns false on negative `commitsAhead` (parse failed or git errored)
+ * — the dispatcher prefers to advance the ticket and let downstream
+ * gates catch the issue rather than block on uncertain state.
+ *
+ * See `shouldProduceCommits` for the per-agent classification and the
+ * relay #5 incident that motivated this guard.
+ */
+export function shouldFlagEmptyBranch(agent: AgentConfig, commitsAhead: number): boolean {
+  if (!shouldProduceCommits(agent)) return false;
+  if (commitsAhead < 0) return false;
+  return commitsAhead === 0;
+}

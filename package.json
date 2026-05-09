@@ -1,0 +1,23 @@
+{
+  "name": "agent-dispatcher",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Dispatch agent runs against a GitHub Project board. Label-driven state machine, worktree isolation, salvage on max_turns.",
+  "scripts": {
+    "start": "tsx src/dispatch-bin.ts",
+    "watch": "tsx --watch src/dispatch-bin.ts",
+    "test": "tsx --test src/*.test.ts",
+    "typecheck": "tsc --noEmit -p .",
+    "drain": "pkill -TERM -f 'tsx.*src/dispatch-bin\\.ts' && echo 'SIGTERM sent — dispatcher will exit after current dispatch completes.'"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2"
+  },
+  "dependencies": {
+    "@octokit/graphql": "^9.0.3",
+    "dotenv": "^17.3.1"
+  }
+}

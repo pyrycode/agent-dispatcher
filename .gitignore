@@ -1,0 +1,21 @@
+node_modules/
+dist/
+
+# Runtime artifacts
+logs/
+.prompt-*.txt
+.system-prompt-*.txt
+
+# Env files (this repo never holds .env — consumers own their own
+# .env in the agents repo that uses this dispatcher)
+.env
+.env.local
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Claude Code per-session state
+.claude/
