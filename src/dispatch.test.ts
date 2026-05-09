@@ -574,7 +574,7 @@ describe("setupBranchAndWorktree — failure modes", () => {
     assert.deepEqual(result, { ok: false });
     assert.deepEqual(client.addLabelCalls, [{ issueNumber: 100, label: "error:developer" }]);
     assert.equal(client.comments.length, 1);
-    assert.match(client.comments[0]!.body, /Failed to update main branch/);
+    assert.match(client.comments[0]!.body, /Failed to update `main` branch/);
     // Sanity: we never advanced past the checkout — no fetch, no branch,
     // no worktree add.
     assert.ok(!calls.exec.some(c => c.cmd.includes("git fetch")), "fetch should not run after checkout fail");

@@ -226,6 +226,24 @@ export function resolveAgentsRepoRootWithEnv(opts: {
 }
 
 /**
+ * Resolve the target repo's default branch with env-var precedence
+ * over the hardcoded fallback `main`.
+ *
+ * Pyrycode + relay + mobile all use `main`, so the fallback covers
+ * today's deployments without any .env updates. Forks targeting a
+ * `master` or trunk-based variant set `TARGET_DEFAULT_BRANCH=master`
+ * (or whatever) in their `.env`.
+ *
+ * Empty string is treated as unset (a stray `TARGET_DEFAULT_BRANCH=`
+ * line in .env shouldn't silently turn into an empty branch name and
+ * break every `git checkout` / `git rev-list` call downstream).
+ */
+export function resolveDefaultBranch(envValue: string | undefined): string {
+  if (envValue && envValue.length > 0) return envValue;
+  return "main";
+}
+
+/**
  * Resolve the target repo root from the agents repo root.
  *
  * `agents/` lives **inside** the target repo (gitignored there) rather

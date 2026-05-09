@@ -8,6 +8,7 @@ import { GitHubProjectClient } from "./github.js";
 import { AGENTS, type AgentConfig, type ProjectItem } from "./types.js";
 import {
   resolveAgentsRepoRootWithEnv,
+  resolveDefaultBranch,
   resolveTargetRepoRoot,
   shouldSkipDispatch,
   isPipelineLabel,
@@ -57,6 +58,12 @@ const agentsRepoRoot = resolveAgentsRepoRootWithEnv({
 const repoRoot = process.env.TARGET_REPO_PATH
   ? resolve(process.env.TARGET_REPO_PATH)
   : resolveTargetRepoRoot(agentsRepoRoot);
+
+// Target repo's default branch. Defaults to `main`; consumer overrides via
+// `TARGET_DEFAULT_BRANCH` env var (e.g. forks targeting `master` or trunk-
+// based variants). Threaded into every git command that branches off, merges
+// into, or counts commits against the default branch.
+const defaultBranch = resolveDefaultBranch(process.env.TARGET_DEFAULT_BRANCH);
 
 config({ path: resolve(agentsRepoRoot, ".env") });
 
@@ -599,7 +606,7 @@ async function attemptSaferSalvage(opts: {
         "pr", "create", "--draft",
         "--title", `[max_turns] ${opts.item.title}`,
         "--head", opts.branchName,
-        "--base", "main",
+        "--base", defaultBranch,
         "--body-file", "-",
       ],
       { cwd: opts.agentCwd, stdio: ["pipe", "pipe", "pipe"], input: prBody, timeout: 30_000 },
@@ -838,23 +845,23 @@ export async function setupBranchAndWorktree(
   const { agent, item, client, branchName, worktreeDir, useWorktree } = ctx;
   const { execSync, mkdirSync, symlinkSync, existsSync } = ctx.deps;
 
-  // PO and issue-0 (manual dispatch) run on main — just pull latest
+  // PO and issue-0 (manual dispatch) run on the default branch — just pull latest
   if (!useWorktree) {
     try {
-      execSync(`git checkout main && git pull`, { cwd: repoRoot, stdio: "pipe" });
+      execSync(`git checkout ${defaultBranch} && git pull`, { cwd: repoRoot, stdio: "pipe" });
     } catch (e) {
-      console.warn(`   ⚠️  Failed to update main: ${e}`);
+      console.warn(`   ⚠️  Failed to update ${defaultBranch}: ${e}`);
     }
     return { ok: true };
   }
 
-  // Pull latest main and fetch remote branches
+  // Pull latest default branch and fetch remote branches
   try {
-    execSync(`git checkout main && git pull`, { cwd: repoRoot, stdio: "pipe" });
+    execSync(`git checkout ${defaultBranch} && git pull`, { cwd: repoRoot, stdio: "pipe" });
     execSync(`git fetch origin`, { cwd: repoRoot, stdio: "pipe" });
   } catch (e) {
-    console.error(`   ⚠️  Failed to update main: ${e}`);
-    await client.addComment(item.issueNumber, `## ⚠️ Dispatch Error: ${agent.name}\n\nFailed to update main branch. Manual intervention required.\n\n\`\`\`\n${e}\n\`\`\``);
+    console.error(`   ⚠️  Failed to update ${defaultBranch}: ${e}`);
+    await client.addComment(item.issueNumber, `## ⚠️ Dispatch Error: ${agent.name}\n\nFailed to update \`${defaultBranch}\` branch. Manual intervention required.\n\n\`\`\`\n${e}\n\`\`\``);
     try { await client.addLabel(item.issueNumber, `error:${agent.name}`); } catch {}
     return { ok: false };
   }
@@ -910,8 +917,12 @@ export async function setupBranchAndWorktree(
   try {
     switch (branchAction) {
       case "create-from-main":
-        execSync(`git branch ${branchName} main`, { cwd: repoRoot, stdio: "pipe" });
-        console.log(`   🌿 Created branch ${branchName} from main`);
+        // The action label "create-from-main" is preserved as a discriminated-
+        // union identifier (decideBranchSetup is pure and shouldn't know about
+        // the consumer's actual default branch); the branch creation uses the
+        // configured default.
+        execSync(`git branch ${branchName} ${defaultBranch}`, { cwd: repoRoot, stdio: "pipe" });
+        console.log(`   🌿 Created branch ${branchName} from ${defaultBranch}`);
         break;
       case "create-from-origin":
         execSync(`git branch ${branchName} origin/${branchName}`, { cwd: repoRoot, stdio: "pipe" });
@@ -1043,14 +1054,14 @@ export async function setupBranchAndWorktree(
     return { ok: false };
   }
 
-  // Merge main into the feature branch INSIDE the worktree (not in the main repo)
+  // Merge default branch into the feature branch INSIDE the worktree (not in the main repo)
   try {
-    execSync(`git merge main --no-edit`, { cwd: worktreeDir, stdio: "pipe" });
-    console.log(`   🔀 Merged main into ${branchName} (in worktree)`);
+    execSync(`git merge ${defaultBranch} --no-edit`, { cwd: worktreeDir, stdio: "pipe" });
+    console.log(`   🔀 Merged ${defaultBranch} into ${branchName} (in worktree)`);
   } catch (e) {
     try { execSync(`git merge --abort`, { cwd: worktreeDir, stdio: "pipe" }); } catch {}
-    console.error(`   ❌ Merge conflict merging main into ${branchName}: ${e}`);
-    await client.addComment(item.issueNumber, `## ⚠️ Dispatch Error: ${agent.name}\n\nMerge conflict on branch \`${branchName}\` when merging main. Manual resolution required.\n\n\`\`\`\n${e}\n\`\`\``);
+    console.error(`   ❌ Merge conflict merging ${defaultBranch} into ${branchName}: ${e}`);
+    await client.addComment(item.issueNumber, `## ⚠️ Dispatch Error: ${agent.name}\n\nMerge conflict on branch \`${branchName}\` when merging \`${defaultBranch}\`. Manual resolution required.\n\n\`\`\`\n${e}\n\`\`\``);
     try { await client.addLabel(item.issueNumber, `error:${agent.name}`); } catch {}
     // Clean up the worktree since we're bailing
     try { execSync(`git worktree remove --force "${worktreeDir}"`, { cwd: repoRoot, stdio: "pipe" }); } catch {}
@@ -1150,7 +1161,7 @@ export async function prepareAgentSpawn(
   const timeoutMs = isCodeReview ? 2_400_000 : isMediumAgent ? 1_500_000 : 1_200_000;
   const timeoutLabel = isCodeReview ? "40min" : isMediumAgent ? "25min" : "20min";
 
-  writeLog(logFile, "DISPATCH", `Agent: ${agent.name}\nTicket: #${item.issueNumber} — ${item.title}\nBranch: ${branchName}\nWorktree: ${useWorktree ? worktreeDir : "none (PO on main)"}\nMax turns: ${maxTurns}\nTimeout: ${timeoutLabel}\nAllowed tools: ${allowedTools}`);
+  writeLog(logFile, "DISPATCH", `Agent: ${agent.name}\nTicket: #${item.issueNumber} — ${item.title}\nBranch: ${branchName}\nWorktree: ${useWorktree ? worktreeDir : `none (PO on ${defaultBranch})`}\nMax turns: ${maxTurns}\nTimeout: ${timeoutLabel}\nAllowed tools: ${allowedTools}`);
   writeLog(logFile, "PROMPT", prompt);
   writeLog(logFile, "SYSTEM PROMPT", systemPrompt);
 
@@ -1411,7 +1422,7 @@ export async function handlePostRun(
     let commitsAhead = -1;
     try {
       const out = execSync(
-        `git rev-list --count main..${branchName}`,
+        `git rev-list --count ${defaultBranch}..${branchName}`,
         { cwd: agentCwd, stdio: "pipe" },
       ).toString();
       commitsAhead = parseCommitsAhead(out);
@@ -1422,10 +1433,10 @@ export async function handlePostRun(
       // can't tell us the answer. Surface the failure so operators
       // see why the guard didn't fire on a possibly-empty branch.
       const detail = e?.stderr?.toString?.() ?? e?.message ?? String(e);
-      console.warn(`   ⚠️  Failed to count commits ahead of main (empty-branch guard skipped): ${detail.slice(0, 300)}`);
+      console.warn(`   ⚠️  Failed to count commits ahead of ${defaultBranch} (empty-branch guard skipped): ${detail.slice(0, 300)}`);
     }
     if (shouldFlagEmptyBranch(agent, commitsAhead)) {
-      console.error(`   ❌ ${agent.name} produced no commits — branch is 0 ahead of main. Treating as error:${agent.name}.`);
+      console.error(`   ❌ ${agent.name} produced no commits — branch is 0 ahead of ${defaultBranch}. Treating as error:${agent.name}.`);
       try {
         await client.addLabel(item.issueNumber, `error:${agent.name}`);
       } catch (e) {
@@ -1435,12 +1446,12 @@ export async function handlePostRun(
         await client.addComment(
           item.issueNumber,
           `## ⚠️ Dispatch Error: ${agent.name} produced no commits\n\n` +
-          `Branch \`${branchName}\` is 0 commits ahead of \`main\` after the run completed. ` +
+          `Branch \`${branchName}\` is 0 commits ahead of \`${defaultBranch}\` after the run completed. ` +
           `This agent (\`${agent.name}\`) is expected to produce commits during a normal run; an empty branch usually means the agent silently refused or pattern-matched its way out of the work without raising a structured signal.\n\n` +
           `Likely causes:\n` +
           `- Upstream prerequisite not visible to the agent (missing spec, blocker semantics, or repo-side label gap)\n` +
           `- Agent posted comments instead of writing files (mechanical-contract violation)\n` +
-          `- Pre-existing branch state already contained the work (rare; check \`git log main..${branchName}\`)\n\n` +
+          `- Pre-existing branch state already contained the work (rare; check \`git log ${defaultBranch}..${branchName}\`)\n\n` +
           `Treating as \`error:${agent.name}\`. To unblock: investigate the agent's run log, fix the underlying cause, then strip the \`error:${agent.name}\` label to retry — or route via \`needs-rework:<previous-agent>\` if the upstream needs to redo its handoff.`,
         );
       } catch (e) {
@@ -1568,9 +1579,9 @@ export async function cleanupAfterDispatch(ctx: DispatchContext): Promise<void> 
   // cycle silently wallpapers over it.
   if (!useWorktree) {
     try {
-      execSync(`git checkout main`, { cwd: repoRoot, stdio: "pipe" });
+      execSync(`git checkout ${defaultBranch}`, { cwd: repoRoot, stdio: "pipe" });
     } catch (e: any) {
-      console.warn(`   ⚠️  Failed to return repoRoot to main after PO run: ${e?.message ?? e}`);
+      console.warn(`   ⚠️  Failed to return repoRoot to ${defaultBranch} after PO run: ${e?.message ?? e}`);
     }
   }
 }
@@ -1812,11 +1823,11 @@ export async function runAutoMerge(
         // Pull merged changes to local main. Failure is non-fatal — the
         // PR already merged on origin, so the next cycle's dispatch will
         // re-pull and recover. But silent swallowing leaves stale local
-        // main propagating through subsequent cycles' dispatch setup
-        // where the same `try {}` would swallow it again. Surface so
+        // default branch propagating through subsequent cycles' dispatch
+        // setup where the same `try {}` would swallow it again. Surface so
         // operators see it in dispatcher logs.
         try {
-          execSync(`git checkout main && git pull`, { cwd: repoRoot, stdio: "pipe", timeout: 15_000 });
+          execSync(`git checkout ${defaultBranch} && git pull`, { cwd: repoRoot, stdio: "pipe", timeout: 15_000 });
         } catch (e: any) {
           console.warn(`   ⚠️  Post-merge git pull failed (will retry next cycle): ${e?.message ?? e}`);
         }
@@ -1844,12 +1855,12 @@ export async function runAutoMerge(
             await client.addComment(
               item.issueNumber,
               `## 🛑 Auto-merge blocked by merge conflict\n\n` +
-              `PR #${prNumber} cannot be merged into \`main\` cleanly. ` +
+              `PR #${prNumber} cannot be merged into \`${defaultBranch}\` cleanly. ` +
               `The dispatcher has stopped retrying this PR; resolve the conflict manually:\n\n` +
               `\`\`\`bash\n` +
               `gh pr checkout ${prNumber}\n` +
-              `git fetch origin main\n` +
-              `git merge origin/main\n` +
+              `git fetch origin ${defaultBranch}\n` +
+              `git merge origin/${defaultBranch}\n` +
               `# resolve conflicts in your editor\n` +
               `git push\n` +
               `\`\`\`\n\n` +

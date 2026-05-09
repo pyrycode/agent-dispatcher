@@ -24,6 +24,7 @@ import {
   PIPELINE_LABEL_PREFIXES,
   resolveAgentsRepoRoot,
   resolveAgentsRepoRootWithEnv,
+  resolveDefaultBranch,
   resolveTargetRepoRoot,
   isPipelineLabel,
   isPipelineLabelForAgent,
@@ -153,6 +154,29 @@ describe("resolveAgentsRepoRootWithEnv", () => {
       fallbackSrcDir: "/anywhere/else",
     });
     assert.equal(got, "/work/pyrycode/agents");
+  });
+});
+
+describe("resolveDefaultBranch", () => {
+  // Lets consumers configure their target repo's default branch via
+  // TARGET_DEFAULT_BRANCH env var. Pyrycode + relay + mobile all use
+  // `main`, so the fallback covers today's deployments without any
+  // .env updates. Forks targeting `master` or trunk-based variants set
+  // the env var explicitly.
+
+  test("env value takes precedence over the fallback", () => {
+    assert.equal(resolveDefaultBranch("master"), "master");
+  });
+
+  test("falls back to 'main' when env value is undefined", () => {
+    assert.equal(resolveDefaultBranch(undefined), "main");
+  });
+
+  test("treats empty string as unset (falls back to 'main')", () => {
+    // An accidental `TARGET_DEFAULT_BRANCH=` line in .env shouldn't
+    // silently turn into an empty branch name and break every git
+    // command — fall back instead.
+    assert.equal(resolveDefaultBranch(""), "main");
   });
 });
 
