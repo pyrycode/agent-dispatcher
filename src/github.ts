@@ -30,13 +30,13 @@ async function fetchWithRetry(
  * Backlog ticket to advance next. Drag a ticket up the column to
  * prioritize it; drag down to defer.
  *
- * **Known limit:** every items() query uses `first: 100`, which is a
- * hard cap. If a single column ever exceeds 100 items (or
- * `getClosedItemsNotInDone` returns a project with 100+ closed items),
- * tickets beyond the page boundary go invisible to the dispatcher.
- * Pagination via `pageInfo.hasNextPage` + `endCursor` is the standard
- * fix when this becomes a real constraint. Today's pyrycode project is
- * well under the cap.
+ * **Pagination:** `fetchAllItems` loops on `pageInfo.hasNextPage` +
+ * `endCursor` until the project is fully drained. Pre-2026-05-09 the
+ * fetch used `items(first: 100)` with no continuation, silently
+ * truncating boards past 100 entries. Surfaced as pyrycode #203
+ * (board grew to 105 items, last 5 went invisible to the dispatcher).
+ * Loop is bounded by `MAX_PAGES` to avoid runaway iteration on a
+ * future bug; today's pyrycode is 2 pages.
  */
 /**
  * Internal item shape during the cache lifetime — same as `ProjectItem`
@@ -96,10 +96,6 @@ export class GitHubProjectClient {
    */
   private lastRateLimit: { remaining: number; resetAt: string; cost: number } | null = null;
 
-  // Once-per-process flag for the items(first:100) saturation warning.
-  // Prevents log spam on a saturated board (review #23).
-  private warnedItemsSaturation: boolean = false;
-
   constructor(config: ProjectConfig) {
     this.config = config;
     this.gql = graphql.defaults({
@@ -155,39 +151,65 @@ export class GitHubProjectClient {
     return this.allItemsCache;
   }
 
+  // Hard cap on pagination iterations. 50 pages × 100 items = 5000
+  // items. A real project that big is a different operational regime
+  // anyway; better to surface a runaway loop (e.g. a future GraphQL
+  // bug echoing the same `endCursor` forever) than to silently consume
+  // GraphQL points indefinitely.
+  private static readonly MAX_PAGES = 50;
+
   private async fetchAllItems(): Promise<RawItem[]> {
     if (!this.projectId) throw new Error("Not initialized");
 
-    // `rateLimit` adds visibility into our GraphQL budget — the dispatcher
-    // logs `remaining` once per cycle so a slow leak (or a sudden burst)
-    // is visible in normal operation, not just at the moment we hit the
-    // 5000-points-per-hour ceiling. `cost` is what THIS query consumed.
-    const result: any = await this.gql(`
-      query($projectId: ID!) {
-        rateLimit { remaining resetAt cost }
-        node(id: $projectId) {
-          ... on ProjectV2 {
-            items(first: 100, orderBy: { field: POSITION, direction: ASC }) {
-              nodes {
-                id
-                fieldValueByName(name: "Status") {
-                  ... on ProjectV2ItemFieldSingleSelectValue {
-                    name
-                  }
-                }
-                content {
-                  ... on Issue {
-                    id
-                    number
-                    title
-                    body
-                    url
-                    state
-                    labels(first: 10) {
-                      nodes { name }
+    // Paginate via `pageInfo.hasNextPage` + `endCursor`. Pre-2026-05-09
+    // this was a single `items(first: 100)` call with no continuation,
+    // silently truncating boards past 100 (pyrycode #203 lineage).
+    //
+    // `rateLimit` is queried on EACH page so the dispatcher's per-cycle
+    // log reflects total cost across pages, not just the first; without
+    // this, a 3-page fetch would log only page 1's cost and the operator
+    // would see understated budget consumption.
+    const items: RawItem[] = [];
+    let cursor: string | null = null;
+    let pages = 0;
+    let totalCost = 0;
+    do {
+      if (pages >= GitHubProjectClient.MAX_PAGES) {
+        throw new Error(
+          `fetchAllItems exceeded ${GitHubProjectClient.MAX_PAGES} pages — ` +
+          `runaway pagination? Aggregated ${items.length} items so far. ` +
+          `If the project is genuinely this large, raise MAX_PAGES; ` +
+          `otherwise check the endCursor logic for a loop.`,
+        );
+      }
+      const result: any = await this.gql(`
+        query($projectId: ID!, $cursor: String) {
+          rateLimit { remaining resetAt cost }
+          node(id: $projectId) {
+            ... on ProjectV2 {
+              items(first: 100, after: $cursor, orderBy: { field: POSITION, direction: ASC }) {
+                pageInfo { hasNextPage endCursor }
+                nodes {
+                  id
+                  fieldValueByName(name: "Status") {
+                    ... on ProjectV2ItemFieldSingleSelectValue {
+                      name
                     }
-                    blockedBy(first: 10) {
-                      nodes { number state }
+                  }
+                  content {
+                    ... on Issue {
+                      id
+                      number
+                      title
+                      body
+                      url
+                      state
+                      labels(first: 10) {
+                        nodes { name }
+                      }
+                      blockedBy(first: 10) {
+                        nodes { number state }
+                      }
                     }
                   }
                 }
@@ -195,55 +217,49 @@ export class GitHubProjectClient {
             }
           }
         }
+      `, { projectId: this.projectId, cursor });
+      pages++;
+
+      if (result.rateLimit) {
+        totalCost += result.rateLimit.cost ?? 0;
+        // Capture the most recent remaining/resetAt; sum the cost
+        // across pages for accurate per-cycle budget logging.
+        this.lastRateLimit = {
+          remaining: result.rateLimit.remaining,
+          resetAt: result.rateLimit.resetAt,
+          cost: totalCost,
+        };
       }
-    `, { projectId: this.projectId });
 
-    if (result.rateLimit) {
-      this.lastRateLimit = {
-        remaining: result.rateLimit.remaining,
-        resetAt: result.rateLimit.resetAt,
-        cost: result.rateLimit.cost,
-      };
-    }
+      for (const node of result.node.items.nodes) {
+        const itemStatus = node.fieldValueByName?.name;
+        if (!node.content) continue;
+        // Skip non-Issue content (PR fragment, DraftIssue) — number is
+        // undefined on those so any downstream code keying on it would
+        // silently misbehave.
+        if (typeof node.content.number !== "number") continue;
 
-    // Saturation warning: the GraphQL query caps at 100 items. At pyrycode's
-    // current board size this is fine, but a silent truncation at 100 would
-    // first present as "some tickets stop dispatching" with no log signal.
-    // Surface the cap before it bites — operator decides whether to add
-    // pagination or rebuild the query for first(>100). (review #23)
-    // Once per process — a saturated board prints one warn at startup, not
-    // every poll cycle.
-    const rawNodes: unknown[] = result.node.items.nodes ?? [];
-    if (rawNodes.length === 100 && !this.warnedItemsSaturation) {
-      this.warnedItemsSaturation = true;
-      console.warn(`   ⚠️  GraphQL items(first:100) returned exactly 100 — board may be truncated. Add pagination if the board grows past this.`);
-    }
+        items.push({
+          id: node.id,
+          issueId: node.content.id,
+          issueNumber: node.content.number,
+          title: node.content.title,
+          body: node.content.body ?? "",
+          status: itemStatus ?? "no-status",
+          state: node.content.state ?? null,
+          labels: node.content.labels.nodes.map((l: any) => l.name),
+          url: node.content.url,
+          blockedBy: (node.content.blockedBy?.nodes ?? []).map((b: any) => ({
+            number: b.number,
+            state: b.state,
+          })),
+        });
+      }
 
-    const items: RawItem[] = [];
-    for (const node of result.node.items.nodes) {
-      const itemStatus = node.fieldValueByName?.name;
-      if (!node.content) continue;
-      // Skip non-Issue content (PR fragment, DraftIssue) — number is
-      // undefined on those so any downstream code keying on it would
-      // silently misbehave.
-      if (typeof node.content.number !== "number") continue;
+      const pageInfo = result.node.items.pageInfo;
+      cursor = pageInfo?.hasNextPage ? pageInfo.endCursor : null;
+    } while (cursor !== null);
 
-      items.push({
-        id: node.id,
-        issueId: node.content.id,
-        issueNumber: node.content.number,
-        title: node.content.title,
-        body: node.content.body ?? "",
-        status: itemStatus ?? "no-status",
-        state: node.content.state ?? null,
-        labels: node.content.labels.nodes.map((l: any) => l.name),
-        url: node.content.url,
-        blockedBy: (node.content.blockedBy?.nodes ?? []).map((b: any) => ({
-          number: b.number,
-          state: b.state,
-        })),
-      });
-    }
     return items;
   }
 
