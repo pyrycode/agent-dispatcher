@@ -147,6 +147,60 @@ export function shouldAttemptSafeSalvage(opts: {
  * the `execSync` per gate and threads exit codes back here.
  */
 /**
+ * Startup pre-flight that classifies the canonical `.codegraph/` index
+ * into one of three operator-facing states:
+ *
+ * - **missing**: no `.codegraph/` at all. Agents fall through to grep.
+ *   Bootstrap recommended (`codegraph init -i` at the target repo root).
+ * - **queryable**: index exists, `codegraph status` agrees. Good to go;
+ *   spawned agents will see real symbol data through the worktree
+ *   symlink.
+ * - **broken**: index exists but `codegraph status` says it isn't
+ *   usable. Surfaces broken self-ref symlinks, schema mismatches, db
+ *   corruption, wrong-project indexes — all the cases where existsSync
+ *   says "true" but the index can't actually answer queries. Warn
+ *   loudly so the operator notices at boot, before a dispatch silently
+ *   degrades. Particularly important after the 2026-05-09 self-ref
+ *   symlink incident: existsSync returned true on the bad symlink (it
+ *   existed as a symlink), but every codegraph query through the
+ *   worktree symlink hit ELOOP and returned no data.
+ *
+ * Don't fail-fast on broken — codegraph isn't load-bearing; agents fall
+ * through to grep. The point is operator visibility at boot, not
+ * blocking the dispatcher.
+ *
+ * Pure decision; the caller (`dispatch-bin.ts`) does the `existsSync`
+ * + `spawnSync("codegraph", ["status", ...])` and threads the results
+ * back here.
+ */
+export function decideCodegraphHealth(opts: {
+  exists: boolean;
+  /** spawnSync's `.status` — number on normal exit, null when the
+   *  binary couldn't be spawned at all (ENOENT, PATH miss, etc.). */
+  statusExitCode: number | null;
+  statusStdout: string;
+  statusStderr: string;
+}): { state: "missing" | "queryable" | "broken"; detail: string } {
+  if (!opts.exists) {
+    return { state: "missing", detail: "no .codegraph/ at the canonical path" };
+  }
+  if (opts.statusExitCode !== 0) {
+    const detail = opts.statusStderr.trim() || opts.statusStdout.trim() || `codegraph status exited with ${opts.statusExitCode}`;
+    return { state: "broken", detail };
+  }
+  // Codegraph CLI returns exit 0 on `Not initialized` (it's an
+  // informational state, not an error). Treat the message in stdout as
+  // authoritative — broken self-ref symlinks land here.
+  if (/not initialized/i.test(opts.statusStdout)) {
+    return { state: "broken", detail: opts.statusStdout.trim() };
+  }
+  if (/error/i.test(opts.statusStderr)) {
+    return { state: "broken", detail: opts.statusStderr.trim() };
+  }
+  return { state: "queryable", detail: "ok" };
+}
+
+/**
  * Pre-flight check: list any agent whose CLAUDE.md file is missing from
  * the consumer's agents repo. Empty array means all CLAUDE.mds resolve.
  *

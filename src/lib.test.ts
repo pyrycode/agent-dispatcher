@@ -50,6 +50,7 @@ import {
   extractReworkCount,
   REWORK_LOOP_THRESHOLD,
   findAdvanceRule,
+  decideCodegraphHealth,
   findMissingAgentClaudeMds,
   maxTurnsFor,
   parseSalvageGates,
@@ -1646,6 +1647,91 @@ describe("shouldAttemptSafeSalvage", () => {
     assert.equal(shouldAttemptSafeSalvage({ ...baseOk, gateExitCodes: [0, 0, 0] }), true);
     assert.equal(shouldAttemptSafeSalvage({ ...baseOk, gateExitCodes: [0, 0, 1] }), false);
     assert.equal(shouldAttemptSafeSalvage({ ...baseOk, gateExitCodes: [0, 1, 0] }), false);
+  });
+});
+
+describe("decideCodegraphHealth", () => {
+  // Startup pre-flight that classifies the canonical .codegraph index
+  // into one of three states for operator-facing logging:
+  //   - missing:    no .codegraph at all (agents grep; bootstrap recommended)
+  //   - queryable:  index exists, `codegraph status` agreed (good to go)
+  //   - broken:     index exists but `codegraph status` says it isn't usable
+  //                 (broken self-ref symlink, schema mismatch, db corruption,
+  //                 wrong-project index — all surface here as a warn-loudly
+  //                 signal so the operator can investigate at boot rather
+  //                 than after a dispatch silently degrades)
+  //
+  // Pure decision; caller (dispatch-bin.ts) does the existsSync + spawnSync
+  // and threads the results back here.
+
+  test("missing index → state=missing", () => {
+    const got = decideCodegraphHealth({
+      exists: false,
+      statusExitCode: null,
+      statusStdout: "",
+      statusStderr: "",
+    });
+    assert.equal(got.state, "missing");
+  });
+
+  test("exists + status exit 0 + clean output → state=queryable", () => {
+    const got = decideCodegraphHealth({
+      exists: true,
+      statusExitCode: 0,
+      statusStdout: "CodeGraph Status\nProject: /work/repo\nFiles indexed: 133\nIndex is up to date",
+      statusStderr: "",
+    });
+    assert.equal(got.state, "queryable");
+  });
+
+  test("exists + 'Not initialized' in stdout → state=broken (the self-ref symlink case)", () => {
+    // The exact failure mode that bricked pyrycode/.codegraph in the
+    // late evening 2026-05-09 session — broken self-ref symlink lets
+    // existsSync return true (the symlink exists), but codegraph status
+    // can't follow it and reports "Not initialized" with exit 0. The
+    // pre-flight catches this state at boot.
+    const got = decideCodegraphHealth({
+      exists: true,
+      statusExitCode: 0,
+      statusStdout: "CodeGraph Status\nProject: /work/repo\n⚠ Not initialized\nRun \"codegraph init\" to initialize",
+      statusStderr: "",
+    });
+    assert.equal(got.state, "broken");
+  });
+
+  test("exists + non-zero exit → state=broken", () => {
+    const got = decideCodegraphHealth({
+      exists: true,
+      statusExitCode: 1,
+      statusStdout: "",
+      statusStderr: "Error: db corruption detected",
+    });
+    assert.equal(got.state, "broken");
+  });
+
+  test("exists + null exit (spawn failed entirely) → state=broken", () => {
+    // spawnSync returns null status when the binary couldn't be found
+    // or the process couldn't be spawned (no PATH, ENOENT, etc.). Treat
+    // as broken — codegraph CLI isn't installed or isn't reachable from
+    // the dispatcher's environment.
+    const got = decideCodegraphHealth({
+      exists: true,
+      statusExitCode: null,
+      statusStdout: "",
+      statusStderr: "",
+    });
+    assert.equal(got.state, "broken");
+  });
+
+  test("detail field surfaces actionable info on broken state", () => {
+    const got = decideCodegraphHealth({
+      exists: true,
+      statusExitCode: 0,
+      statusStdout: "Not initialized — run codegraph init",
+      statusStderr: "",
+    });
+    assert.equal(got.state, "broken");
+    assert.match(got.detail, /not initialized/i);
   });
 });
 

@@ -16,14 +16,15 @@
 // recur even under a future refactor that misses the gate. See
 // `📋 Projects/2026-04-10 - Pyrycode/Lessons.md` for the full lesson.
 
+import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { dispatchInbox, pollLoop } from "./dispatch.js";
-import { findMissingAgentClaudeMds } from "./agent-runtime.js";
+import { decideCodegraphHealth, findMissingAgentClaudeMds } from "./agent-runtime.js";
 import { AGENTS } from "./types.js";
-import { resolveAgentsRepoRootWithEnv } from "./worktree.js";
+import { resolveAgentsRepoRootWithEnv, resolveTargetRepoRoot } from "./worktree.js";
 
 // Validate required environment variables. dispatch.ts loads .env at
 // module top-level (via dotenv.config), so by the time this file runs,
@@ -70,6 +71,41 @@ if (missingClaudeMds.length > 0) {
   }
   console.error(`Restore the prompts (or fix the AGENTS config paths) before restarting the dispatcher.`);
   process.exit(1);
+}
+
+// Pre-flight: codegraph index queryability at the canonical path.
+// Surfaces broken self-ref symlinks, schema mismatches, missing
+// installs, db corruption — all the states where existsSync says
+// "yes" but `codegraph status` disagrees. Logs the result; doesn't
+// fail-fast (codegraph isn't load-bearing — agents fall through to
+// grep when it's degraded).
+//
+// targetRepoRoot resolution mirrors dispatch.ts's module-top logic.
+// Re-resolved here rather than imported to keep this validation a
+// pure pre-flight that doesn't depend on dispatch.ts internals.
+const targetRepoRoot = process.env.TARGET_REPO_PATH
+  ? resolve(process.env.TARGET_REPO_PATH)
+  : resolveTargetRepoRoot(agentsRepoRoot);
+const codegraphPath = resolve(targetRepoRoot, ".codegraph");
+const codegraphExists = existsSync(codegraphPath);
+const cgStatus = codegraphExists
+  ? spawnSync("codegraph", ["status", targetRepoRoot], { encoding: "utf-8", timeout: 10_000 })
+  : null;
+const cgHealth = decideCodegraphHealth({
+  exists: codegraphExists,
+  statusExitCode: cgStatus ? cgStatus.status : null,
+  statusStdout: cgStatus?.stdout ?? "",
+  statusStderr: cgStatus?.stderr ?? "",
+});
+if (cgHealth.state === "queryable") {
+  console.log(`✓ codegraph: ${codegraphPath} indexed and queryable`);
+} else if (cgHealth.state === "missing") {
+  console.warn(`⚠️  codegraph: no index at ${codegraphPath} — agents fall through to grep. Bootstrap with \`cd ${targetRepoRoot} && codegraph init -i\`.`);
+} else {
+  // broken
+  console.warn(`⚠️  codegraph: ${codegraphPath} exists but isn't queryable.`);
+  console.warn(`    Detail: ${cgHealth.detail.slice(0, 500)}`);
+  console.warn(`    Fix: \`rm ${codegraphPath} && cd ${targetRepoRoot} && codegraph init -i\` (or investigate why status fails — broken symlink, schema mismatch, db corruption, codegraph CLI not on PATH).`);
 }
 
 // Entry-point dispatch.
