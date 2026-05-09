@@ -60,6 +60,8 @@ Optional:
 
 | Variable | Default | Description |
 |---|---|---|
+| `TARGET_DEFAULT_BRANCH` | `main` | Default branch of the target repo. Set to `master` or your trunk-based branch name as needed. Threaded through `git checkout`, `git rev-list --count`, merge targets, and the empty-branch guard. |
+| `SALVAGE_GATES` | `go vet ./...; go build ./...` | `;`-delimited shell commands that gate the safer-salvage path on `max_turns`. Each runs in the agent's worktree; all must exit 0 for the dispatcher to commit + push uncommitted work as a draft PR. Set to `""` to skip gating entirely. Override per ecosystem (e.g. `cargo check --all-targets; cargo test --no-run` for Rust). |
 | `DISCORD_WEBHOOK_URL` | — | Notify on dispatch start/end |
 | `PYRY_LOG_RETENTION_DAYS` | `30` | Rotate logs older than N days; `0` disables |
 | `OWNER_TYPE` | `user` | `user` or `organization` for GitHub Project owner |
@@ -88,7 +90,7 @@ src/
 
 ## Status
 
-Pre-1.0. The 5-agent pipeline (PO / architect / developer / code-review / documentation) is hardcoded today; making it config-driven via `agents-config.yaml` is the next planned change. Default branch is hardcoded `main`. Salvage gates (`go vet`, `go build`) are Go-specific.
+Pre-1.0. Default branch + salvage gates are now config-driven via env vars (`TARGET_DEFAULT_BRANCH`, `SALVAGE_GATES`). The 5-agent pipeline (PO / architect / developer / code-review / documentation) is still hardcoded — making it overridable via an `agents-config.json` in each consumer's agents repo is the next planned change, deferred until a consumer with a different pipeline shape actually shows up (per "evidence-based fix selection" — don't build for hypothetical needs).
 
 ## License
 
