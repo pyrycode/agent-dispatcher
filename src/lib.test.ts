@@ -50,6 +50,7 @@ import {
   extractReworkCount,
   REWORK_LOOP_THRESHOLD,
   findAdvanceRule,
+  findMissingAgentClaudeMds,
   maxTurnsFor,
   parseSalvageGates,
   shouldAttemptSafeSalvage,
@@ -1645,6 +1646,67 @@ describe("shouldAttemptSafeSalvage", () => {
     assert.equal(shouldAttemptSafeSalvage({ ...baseOk, gateExitCodes: [0, 0, 0] }), true);
     assert.equal(shouldAttemptSafeSalvage({ ...baseOk, gateExitCodes: [0, 0, 1] }), false);
     assert.equal(shouldAttemptSafeSalvage({ ...baseOk, gateExitCodes: [0, 1, 0] }), false);
+  });
+});
+
+describe("findMissingAgentClaudeMds", () => {
+  // Belt-and-suspenders for the (rare but observed) failure mode where
+  // a CLAUDE.md file goes missing in a consumer's agents repo —
+  // typo'd path in the AGENTS config, accidental `git rm`, fork that
+  // hasn't created the prompt file yet, etc. Today's runtime error
+  // ("agent CLAUDE.md not found") catches it at dispatch time, mid-
+  // cycle; this lets dispatch-bin.ts catch it at startup before
+  // pollLoop ever runs. Pre-flight check, fail-fast.
+  //
+  // Pure decision; the caller (dispatch-bin.ts) does the existsSync
+  // calls and the process.exit on non-empty result.
+
+  const fakeAgents = [
+    { name: "po", claudeMdPath: "po/CLAUDE.md" },
+    { name: "architect", claudeMdPath: "architect/CLAUDE.md" },
+    { name: "developer", claudeMdPath: "developer/CLAUDE.md" },
+  ];
+
+  test("all present → empty array (clean)", () => {
+    const got = findMissingAgentClaudeMds({
+      agents: fakeAgents,
+      agentsRepoRoot: "/work/agents",
+      existsSync: () => true,
+    });
+    assert.deepEqual(got, []);
+  });
+
+  test("one missing → single-entry array with absolute path", () => {
+    const got = findMissingAgentClaudeMds({
+      agents: fakeAgents,
+      agentsRepoRoot: "/work/agents",
+      existsSync: (p) => !p.endsWith("architect/CLAUDE.md"),
+    });
+    assert.deepEqual(got, [{ name: "architect", path: "/work/agents/architect/CLAUDE.md" }]);
+  });
+
+  test("multiple missing → all reported (don't bail on first)", () => {
+    // Reporting all up front is more useful than fail-fast-on-first
+    // when an operator just cloned a fresh fork — they want to fix
+    // every gap at once, not run + fail + run + fail.
+    const got = findMissingAgentClaudeMds({
+      agents: fakeAgents,
+      agentsRepoRoot: "/work/agents",
+      existsSync: (p) => p.endsWith("po/CLAUDE.md"),
+    });
+    assert.deepEqual(got, [
+      { name: "architect", path: "/work/agents/architect/CLAUDE.md" },
+      { name: "developer", path: "/work/agents/developer/CLAUDE.md" },
+    ]);
+  });
+
+  test("empty agents list → empty result (vacuously OK)", () => {
+    const got = findMissingAgentClaudeMds({
+      agents: [],
+      agentsRepoRoot: "/work/agents",
+      existsSync: () => false,
+    });
+    assert.deepEqual(got, []);
   });
 });
 

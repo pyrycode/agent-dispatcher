@@ -16,7 +16,14 @@
 // recur even under a future refactor that misses the gate. See
 // `📋 Projects/2026-04-10 - Pyrycode/Lessons.md` for the full lesson.
 
+import { existsSync } from "node:fs";
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { dispatchInbox, pollLoop } from "./dispatch.js";
+import { findMissingAgentClaudeMds } from "./agent-runtime.js";
+import { AGENTS } from "./types.js";
+import { resolveAgentsRepoRootWithEnv } from "./worktree.js";
 
 // Validate required environment variables. dispatch.ts loads .env at
 // module top-level (via dotenv.config), so by the time this file runs,
@@ -32,6 +39,36 @@ for (const key of REQUIRED_ENV) {
 }
 if (isNaN(parseInt(process.env.PROJECT_NUMBER!, 10))) {
   console.error(`PROJECT_NUMBER must be a number, got: "${process.env.PROJECT_NUMBER}"`);
+  process.exit(1);
+}
+
+// Pre-flight: each agent's CLAUDE.md exists in the consumer's agents
+// repo. Catches typo'd paths, accidental `git rm`, fresh forks that
+// haven't created the prompts yet — at startup, before pollLoop can
+// dispatch anything. Today's runtime "agent CLAUDE.md not found" error
+// in dispatch.ts still catches the same gap at dispatch time, but
+// hours into a session is too late. Reports all gaps in one shot.
+//
+// agentsRepoRoot resolution mirrors dispatch.ts's module-top logic —
+// re-resolved here rather than imported to keep this validation a
+// pure pre-flight that could in principle move out of dispatch-bin.ts
+// (e.g. into a CLI subcommand `pyry preflight`).
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const agentsRepoRoot = resolveAgentsRepoRootWithEnv({
+  envValue: process.env.AGENTS_REPO_PATH,
+  fallbackSrcDir: __dirname,
+});
+const missingClaudeMds = findMissingAgentClaudeMds({
+  agents: AGENTS,
+  agentsRepoRoot,
+  existsSync,
+});
+if (missingClaudeMds.length > 0) {
+  console.error(`Missing per-agent CLAUDE.md files in ${agentsRepoRoot}:`);
+  for (const m of missingClaudeMds) {
+    console.error(`  ${m.name}: ${m.path}`);
+  }
+  console.error(`Restore the prompts (or fix the AGENTS config paths) before restarting the dispatcher.`);
   process.exit(1);
 }
 

@@ -146,6 +146,42 @@ export function shouldAttemptSafeSalvage(opts: {
  * Pure decision; the caller (`attemptSaferSalvage` in dispatch.ts) does
  * the `execSync` per gate and threads exit codes back here.
  */
+/**
+ * Pre-flight check: list any agent whose CLAUDE.md file is missing from
+ * the consumer's agents repo. Empty array means all CLAUDE.mds resolve.
+ *
+ * **Why this exists.** Pre-2026-05-09, the dispatcher source lived
+ * inside each consumer's agents repo and a `lib.test.ts` test verified
+ * each agent's CLAUDE.md existed on disk. After the dispatcher was
+ * extracted into `pyrycode/agent-dispatcher`, that test moved out
+ * because the standalone dispatcher doesn't own per-agent CLAUDE.md
+ * files. The runtime "agent CLAUDE.md not found" error in `dispatch.ts`
+ * still catches missing files mid-dispatch — but only when that agent
+ * actually gets dispatched, which can be hours after startup. This
+ * surfaces the gap at startup instead.
+ *
+ * Reports ALL missing files in one shot (don't bail on the first) so
+ * an operator setting up a fresh fork sees every gap at once, fixes
+ * them together, and doesn't run-fail-run-fail.
+ *
+ * Pure decision; the caller (`dispatch-bin.ts`) does the `existsSync`
+ * calls and the `process.exit(1)` on non-empty result.
+ */
+export function findMissingAgentClaudeMds(opts: {
+  agents: ReadonlyArray<{ name: string; claudeMdPath: string }>;
+  agentsRepoRoot: string;
+  existsSync: (path: string) => boolean;
+}): Array<{ name: string; path: string }> {
+  const missing: Array<{ name: string; path: string }> = [];
+  for (const agent of opts.agents) {
+    const path = `${opts.agentsRepoRoot}/${agent.claudeMdPath}`;
+    if (!opts.existsSync(path)) {
+      missing.push({ name: agent.name, path });
+    }
+  }
+  return missing;
+}
+
 export function parseSalvageGates(envValue: string | undefined): string[] {
   if (envValue === undefined) {
     return ["go vet ./...", "go build ./..."];
