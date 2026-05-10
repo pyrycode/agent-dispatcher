@@ -1428,6 +1428,20 @@ export async function handlePostRun(
     }
   }
 
+  // Fetch post-run labels once. Used by the empty-branch guard below
+  // (to honor `needs-rework:*` as a legitimate bail signal — see
+  // `shouldFlagEmptyBranch`'s doc) AND by the post-success labeling
+  // block (`decidePostRunLabels`). Hoisted up here so both blocks
+  // share one fetch instead of two.
+  let postLabels: string[] = [];
+  if (item.issueNumber > 0 && !saferSalvaged) {
+    try {
+      postLabels = await client.getIssueLabels(item.issueNumber);
+    } catch (e) {
+      console.warn(`   ⚠️  Failed to check post-run labels: ${e}`);
+    }
+  }
+
   // Empty-branch guard: agents that are supposed to produce commits
   // (architect/developer/documentation) but exit cleanly with the
   // branch still 0 ahead of `main` are silent failures. Treat as
@@ -1441,6 +1455,10 @@ export async function handlePostRun(
   // deterministic check that the prose matched the branch state.
   // The auto-commit safety net above catches "agent wrote files but
   // forgot to commit"; this catches "agent didn't write anything."
+  //
+  // Skipped when the agent legitimately bailed via `needs-rework:*`
+  // — the predicate handles this internally via `postLabels`. Surfaced
+  // 2026-05-10 on relay#26 (architect's file-overlap bail).
   //
   // Skipped on saferSalvaged: salvage already labeled
   // `error:max_turns_salvaged` and opened a draft PR with whatever
@@ -1464,7 +1482,7 @@ export async function handlePostRun(
       const detail = e?.stderr?.toString?.() ?? e?.message ?? String(e);
       console.warn(`   ⚠️  Failed to count commits ahead of ${defaultBranch} (empty-branch guard skipped): ${detail.slice(0, 300)}`);
     }
-    if (shouldFlagEmptyBranch(agent, commitsAhead)) {
+    if (shouldFlagEmptyBranch(agent, commitsAhead, postLabels)) {
       console.error(`   ❌ ${agent.name} produced no commits — branch is 0 ahead of ${defaultBranch}. Treating as error:${agent.name}.`);
       try {
         await client.addLabel(item.issueNumber, `error:${agent.name}`);
@@ -1499,15 +1517,10 @@ export async function handlePostRun(
   // Also skipped by the empty-branch guard above (early `return`) when an agent
   // that's supposed to commit produced nothing.
   if (item.issueNumber > 0 && !saferSalvaged) {
-    // Gather state — labels + post-run column. Both can fail with API
-    // errors; collect what we have and let `decidePostRunLabels` choose
-    // the cautious branch when state is missing.
-    let postLabels: string[] = [];
-    try {
-      postLabels = await client.getIssueLabels(item.issueNumber);
-    } catch (e) {
-      console.warn(`   ⚠️  Failed to check post-run labels: ${e}`);
-    }
+    // Gather state — `postLabels` was already fetched up above (it's
+    // also used by the empty-branch guard). Just need the current
+    // column. Failure to fetch falls back to the cautious branch in
+    // `decidePostRunLabels`.
     let currentColumn: string | null = null;
     try {
       currentColumn = await client.getItemStatus(item.issueNumber, { forceRefresh: true });

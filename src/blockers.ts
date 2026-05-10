@@ -95,11 +95,28 @@ export function parseCommitsAhead(revListOutput: string): number {
  * — the dispatcher prefers to advance the ticket and let downstream
  * gates catch the issue rather than block on uncertain state.
  *
+ * Returns false when `postLabels` includes any `needs-rework:*` label
+ * — the agent legitimately bailed via the documented rework path
+ * (architect on a too-large or blocked ticket, code-review on FAIL,
+ * etc.). Empty branch is the EXPECTED outcome of that bail; flagging
+ * it as `error:<agent>` is a false positive that blocks downstream
+ * routing. Surfaced 2026-05-10 morning on `pyrycode-relay#26`'s
+ * architect run — see Lessons.md "Empty-branch guard false-positives
+ * on legitimate `needs-rework` bails (2026-05-10 morning)".
+ *
  * See `shouldProduceCommits` for the per-agent classification and the
  * relay #5 incident that motivated this guard.
  */
-export function shouldFlagEmptyBranch(agent: AgentConfig, commitsAhead: number): boolean {
+export function shouldFlagEmptyBranch(
+  agent: AgentConfig,
+  commitsAhead: number,
+  postLabels: readonly string[],
+): boolean {
   if (!shouldProduceCommits(agent)) return false;
   if (commitsAhead < 0) return false;
-  return commitsAhead === 0;
+  if (commitsAhead !== 0) return false;
+  // Legitimate bail: agent added a needs-rework:* label deliberately.
+  // Empty branch is expected; rework routing handles the next step.
+  if (postLabels.some(l => l.startsWith("needs-rework:"))) return false;
+  return true;
 }

@@ -2657,7 +2657,8 @@ describe("parseCommitsAhead", () => {
 
 describe("shouldFlagEmptyBranch", () => {
   // True iff the agent was supposed to produce commits AND the branch
-  // is still 0 ahead of main after the run. Belt-and-suspenders against
+  // is still 0 ahead of main after the run AND the agent didn't
+  // legitimately bail via needs-rework. Belt-and-suspenders against
   // agents that exit cleanly without doing the work (relay #5: architect
   // refused without spec, developer refused without spec, code-review
   // FAILed silently because needs-rework labels didn't exist — board
@@ -2665,40 +2666,75 @@ describe("shouldFlagEmptyBranch", () => {
 
   test("PO + 0 commits → false (PO doesn't commit, expected)", () => {
     const po = AGENTS.find(a => a.name === "po")!;
-    assert.equal(shouldFlagEmptyBranch(po, 0), false);
+    assert.equal(shouldFlagEmptyBranch(po, 0, []), false);
   });
 
   test("code-review + 0 commits → false (code-review doesn't commit, expected)", () => {
     const cr = AGENTS.find(a => a.name === "code-review")!;
-    assert.equal(shouldFlagEmptyBranch(cr, 0), false);
+    assert.equal(shouldFlagEmptyBranch(cr, 0, []), false);
   });
 
   test("architect + 0 commits → true (silent failure)", () => {
     const arch = AGENTS.find(a => a.name === "architect")!;
-    assert.equal(shouldFlagEmptyBranch(arch, 0), true);
+    assert.equal(shouldFlagEmptyBranch(arch, 0, []), true);
   });
 
   test("architect + 1+ commits → false (did the work)", () => {
     const arch = AGENTS.find(a => a.name === "architect")!;
-    assert.equal(shouldFlagEmptyBranch(arch, 1), false);
-    assert.equal(shouldFlagEmptyBranch(arch, 17), false);
+    assert.equal(shouldFlagEmptyBranch(arch, 1, []), false);
+    assert.equal(shouldFlagEmptyBranch(arch, 17, []), false);
   });
 
   test("developer + 0 commits → true (silent failure)", () => {
     const dev = AGENTS.find(a => a.name === "developer")!;
-    assert.equal(shouldFlagEmptyBranch(dev, 0), true);
+    assert.equal(shouldFlagEmptyBranch(dev, 0, []), true);
   });
 
   test("documentation + 0 commits → true (silent failure)", () => {
     const docs = AGENTS.find(a => a.name === "documentation")!;
-    assert.equal(shouldFlagEmptyBranch(docs, 0), true);
+    assert.equal(shouldFlagEmptyBranch(docs, 0, []), true);
   });
 
   test("negative commits-ahead (parse failed) → false (don't act on garbage)", () => {
     // -1 from `parseCommitsAhead` means "git output unparseable" — caller
     // skips the flag rather than acting on a value it doesn't trust.
     const arch = AGENTS.find(a => a.name === "architect")!;
-    assert.equal(shouldFlagEmptyBranch(arch, -1), false);
+    assert.equal(shouldFlagEmptyBranch(arch, -1, []), false);
+  });
+
+  test("architect + 0 commits + needs-rework:po → false (legitimate bail)", () => {
+    // Surfaced on relay#26 (2026-05-10): architect ran file-overlap
+    // check, found `feature/25` and `feature/7` overlap with the spec
+    // it would have written, applied `needs-rework:po`, exited success
+    // without writing a spec. Empty branch is the EXPECTED outcome of
+    // that documented bail path — flagging it as `error:architect` is
+    // a false positive that blocks downstream rework routing.
+    const arch = AGENTS.find(a => a.name === "architect")!;
+    assert.equal(shouldFlagEmptyBranch(arch, 0, ["needs-rework:po"]), false);
+  });
+
+  test("developer + 0 commits + needs-rework:architect → false (legitimate bail)", () => {
+    // Same shape for developer bailing via needs-rework when the spec
+    // doesn't match reality (e.g., a path it expects doesn't exist).
+    const dev = AGENTS.find(a => a.name === "developer")!;
+    assert.equal(shouldFlagEmptyBranch(dev, 0, ["needs-rework:architect"]), false);
+  });
+
+  test("architect + 0 commits + ready:po (no needs-rework) → true (still silent failure)", () => {
+    // Sanity: the bail-suppression specifically requires a
+    // `needs-rework:*` label, not just any non-error label. An agent
+    // that exits with stale `ready:po` and no needs-rework still
+    // triggers the guard.
+    const arch = AGENTS.find(a => a.name === "architect")!;
+    assert.equal(shouldFlagEmptyBranch(arch, 0, ["ready:po", "size:s"]), true);
+  });
+
+  test("architect + 0 commits + needs-rework:architect (self-route) → false (still a bail)", () => {
+    // Even self-routed needs-rework is a deliberate bail — the agent
+    // is signaling "I made progress that needs review-and-redo" rather
+    // than silently producing nothing. Same suppression applies.
+    const arch = AGENTS.find(a => a.name === "architect")!;
+    assert.equal(shouldFlagEmptyBranch(arch, 0, ["needs-rework:architect"]), false);
   });
 });
 

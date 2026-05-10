@@ -1317,6 +1317,48 @@ describe("handlePostRun — failure modes", () => {
     assert.ok(!client.addLabelCalls.some(c => c.label === "ready:developer"));
   });
 
+  test("empty branch + architect added needs-rework:po → guard skipped (legitimate bail, no false-positive error:architect)", async () => {
+    // Surfaced on `pyrycode-relay#26` (2026-05-10): architect ran 24
+    // turns, did file-overlap check correctly, found `feature/25` and
+    // `feature/7` overlap, wired addBlockedBy, posted triage comment,
+    // applied `needs-rework:po`, exited success. Got a false-positive
+    // `error:architect` because `feature/26` was 0 ahead of main —
+    // the architect deliberately didn't write a spec.
+    //
+    // The fix in `shouldFlagEmptyBranch` reads postLabels and skips
+    // the flag when any `needs-rework:*` is present. This test locks
+    // in the end-to-end behavior through `handlePostRun`.
+    const client = new MockGitHubClient({
+      status: { 426: "In Architecture" },
+      labels: { 426: ["needs-rework:po"] },  // architect added during run
+    });
+    const { ctx, calls } = makeTestContext({
+      agent: { name: "architect", column: "In Architecture", claudeMdPath: "architect/CLAUDE.md", usesWorktree: true, producesCommits: true },
+      item: { issueNumber: 426 },
+      client,
+      mockOptions: {
+        execImpls: {
+          "git status --porcelain": () => "",
+          "git rev-list --count main..": () => "0\n",  // architect wrote no spec
+        },
+      },
+    });
+
+    const result = await handlePostRun(STREAM_OK(), ctx, false);
+
+    assert.deepEqual(result, { ok: true }, "architect bail must not propagate as ok:false");
+    // Critical: NO error:architect applied despite 0-commit branch.
+    assert.ok(!client.addLabelCalls.some(c => c.label === "error:architect"),
+      "needs-rework:po + 0 commits is a legitimate bail; must NOT add error:architect");
+    // No empty-branch error comment posted either.
+    assert.ok(!client.comments.some(c => c.body.includes("produced no commits")),
+      "empty-branch error comment must not be posted on legitimate bail");
+    // The rework signal is preserved on the ticket — runReworkRouting
+    // (separate maintenance pass) will pick it up next cycle.
+    // (decidePostRunLabels won't add ready:architect either, because
+    // postLabels has needs-rework:po — that's tested in lib.test.ts.)
+  });
+
   test("empty branch + agent-doesn't-produce-commits (code-review) → guard skipped via shouldFlagEmptyBranch", async () => {
     // code-review uses a worktree (reads code locally to review) but
     // its output is PR comments via `gh pr review` — never commits.
