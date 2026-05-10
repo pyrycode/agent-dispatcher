@@ -44,8 +44,10 @@ import {
   countPipelineInFlight,
   decideAutoAdvance,
   decideDoneCleanup,
+  decideMergeRetry,
   decidePostRunLabels,
   decideReworkRoutes,
+  extractMergeAttemptCount,
   extractReworkCount,
   extractReworkTarget,
   findAdvanceRule,
@@ -1436,6 +1438,114 @@ describe("extractReworkCount", () => {
     // makes the default explicit and forces an update to the test if
     // the constant changes — discussion-required, not silent drift.
     assert.equal(REWORK_LOOP_THRESHOLD, 3);
+  });
+});
+
+describe("extractMergeAttemptCount", () => {
+  // Mirror of extractReworkCount's contract — same shape, different
+  // counter (`merge-attempt:N` instead of `rework-count:N`). Used by
+  // runAutoMerge to spread auto-merge conflict retries across cycles.
+
+  test("empty labels → 0", () => {
+    assert.equal(extractMergeAttemptCount([]), 0);
+  });
+
+  test("no merge-attempt label → 0", () => {
+    assert.equal(extractMergeAttemptCount(["size:s", "ready:developer"]), 0);
+  });
+
+  test("single merge-attempt:2 → 2", () => {
+    assert.equal(extractMergeAttemptCount(["merge-attempt:2", "size:s"]), 2);
+  });
+
+  test("merge-attempt:0 → 0 (treated same as missing)", () => {
+    // Edge case: counters are written by addLabel, never reset to 0
+    // explicitly — they're stripped on success. But tolerate a literal
+    // 0 if it ever appears (e.g. operator typo) by reading max-of-0.
+    assert.equal(extractMergeAttemptCount(["merge-attempt:0"]), 0);
+  });
+
+  test("malformed merge-attempt → 0 (defensive)", () => {
+    assert.equal(extractMergeAttemptCount(["merge-attempt:abc"]), 0);
+    assert.equal(extractMergeAttemptCount(["merge-attempt:"]), 0);
+  });
+
+  test("multiple merge-attempt labels → max wins", () => {
+    // Counter-accumulation is possible if a previous-counter strip
+    // failed (network blip mid-cycle). Reading max biases toward
+    // exhaustion — we'd rather give up early than under-count and
+    // loop forever.
+    assert.equal(
+      extractMergeAttemptCount(["merge-attempt:1", "merge-attempt:3", "merge-attempt:2"]),
+      3,
+    );
+  });
+
+  test("negative merge-attempt → 0", () => {
+    assert.equal(extractMergeAttemptCount(["merge-attempt:-1"]), 0);
+  });
+});
+
+describe("decideMergeRetry", () => {
+  // Pure decision: given the current attempt count and the max-attempts
+  // threshold, what does the caller (runAutoMerge) do next on a
+  // conflict — retry or give up?
+
+  test("currentCount=0, max=3 → retry as attempt 1", () => {
+    const r = decideMergeRetry({ currentCount: 0, maxAttempts: 3 });
+    assert.deepEqual(r, { shouldGiveUp: false, newCount: 1, previousCount: 0 });
+  });
+
+  test("currentCount=1, max=3 → retry as attempt 2", () => {
+    const r = decideMergeRetry({ currentCount: 1, maxAttempts: 3 });
+    assert.deepEqual(r, { shouldGiveUp: false, newCount: 2, previousCount: 1 });
+  });
+
+  test("currentCount=2, max=3 → retry exhausted → give up", () => {
+    // 3rd attempt failed = newCount === maxAttempts → shouldGiveUp.
+    const r = decideMergeRetry({ currentCount: 2, maxAttempts: 3 });
+    assert.deepEqual(r, { shouldGiveUp: true, newCount: 3, previousCount: 2 });
+  });
+
+  test("currentCount >= max → give up (defensive against double-bump)", () => {
+    // If a prior retry path already bumped to maxAttempts and the
+    // counter wasn't stripped, the next conflict still gives up
+    // immediately — never loops past the threshold.
+    const r = decideMergeRetry({ currentCount: 5, maxAttempts: 3 });
+    assert.equal(r.shouldGiveUp, true);
+  });
+
+  test("maxAttempts=1 → first conflict gives up immediately", () => {
+    // Edge case: caller could disable retry by setting max=1.
+    const r = decideMergeRetry({ currentCount: 0, maxAttempts: 1 });
+    assert.deepEqual(r, { shouldGiveUp: true, newCount: 1, previousCount: 0 });
+  });
+});
+
+describe("decideDoneCleanup — merge-attempt cleanup", () => {
+  // Behavior added 2026-05-10 evening alongside merge-retry: a Done
+  // ticket that carried a merge-attempt:N counter (because retries
+  // happened before success) must have it stripped, same as
+  // rework-count:N. Without this, a re-opened ticket would carry stale
+  // merge-attempt:* labels that bias future retries toward early
+  // exhaustion.
+
+  test("strips merge-attempt:N alongside pipeline labels and rework-count:N", () => {
+    const cleanups = decideDoneCleanup([
+      {
+        id: "x",
+        issueNumber: 42,
+        labels: ["ready:documentation", "rework-count:1", "merge-attempt:2", "size:s", "priority:high"],
+      },
+    ]);
+    assert.equal(cleanups.length, 1);
+    const stripped = new Set(cleanups[0]!.labelsToStrip);
+    assert.ok(stripped.has("ready:documentation"));
+    assert.ok(stripped.has("rework-count:1"));
+    assert.ok(stripped.has("merge-attempt:2"));
+    // Non-pipeline labels are left alone.
+    assert.ok(!stripped.has("size:s"));
+    assert.ok(!stripped.has("priority:high"));
   });
 });
 

@@ -2786,10 +2786,13 @@ describe("runAutoMerge", () => {
     assert.ok(!client.addLabelCalls.some(c => c.label === "error:merge-conflict"));
   });
 
-  test("merge conflict → error:merge-conflict label + triage comment + Discord notify + Status rolled back to In Code Review", async () => {
+  test("merge conflict on retries-exhausted attempt → error:merge-conflict label + triage comment + Discord notify + Status rolled back to In Code Review", async () => {
+    // Pre-seeded `merge-attempt:2` simulates the 3rd attempt — that's
+    // when retries are exhausted and the dispatcher gives up. Earlier
+    // attempts bump the counter and skip; see the retry tests below.
     const client = new MockGitHubClient({
       items: [
-        { id: "PVTI_1201", issueNumber: 1201, status: "Done", labels: ["ready:documentation"], state: "OPEN" },
+        { id: "PVTI_1201", issueNumber: 1201, status: "Done", labels: ["ready:documentation", "merge-attempt:2"], state: "OPEN" },
       ],
     });
     const { deps, calls } = makeMockDeps({
@@ -2838,10 +2841,13 @@ describe("runAutoMerge", () => {
     // path or the loop's `continue` to the next item. Label is the
     // load-bearing signal (blocks re-dispatch via GLOBAL_BLOCK_LABELS);
     // Status is cosmetic correctness.
+    //
+    // Pre-seeded `merge-attempt:2` on both items so the next conflict
+    // triggers the give-up path (retries exhausted), not a counter bump.
     const client = new MockGitHubClient({
       items: [
-        { id: "PVTI_1207", issueNumber: 1207, status: "Done", labels: ["ready:documentation"], state: "OPEN" },
-        { id: "PVTI_1208", issueNumber: 1208, status: "Done", labels: ["ready:documentation"], state: "OPEN" },
+        { id: "PVTI_1207", issueNumber: 1207, status: "Done", labels: ["ready:documentation", "merge-attempt:2"], state: "OPEN" },
+        { id: "PVTI_1208", issueNumber: 1208, status: "Done", labels: ["ready:documentation", "merge-attempt:2"], state: "OPEN" },
       ],
     });
     // Rollback fails for 1207 only; 1208 should still process normally.
@@ -2864,6 +2870,87 @@ describe("runAutoMerge", () => {
     // 1207's Status stayed Done (rollback failed); 1208's rolled back successfully.
     assert.equal(client.itemsByIssueNumber.get(1207)!.status, "Done");
     assert.equal(client.itemsByIssueNumber.get(1208)!.status, "In Code Review");
+  });
+
+  test("merge conflict on first attempt → bumps merge-attempt:1, no error:merge-conflict, no comment, no Status rollback", async () => {
+    // First conflict (no prior counter): the retry path bumps the
+    // counter to 1 and skips the cycle. The dispatcher's natural
+    // poll loop produces the retry on the next cycle; a transient
+    // race (sibling PR mid-merge) often resolves by then.
+    const client = new MockGitHubClient({
+      items: [
+        { id: "PVTI_1210", issueNumber: 1210, status: "Done", labels: ["ready:documentation"], state: "OPEN" },
+      ],
+    });
+    const { deps, calls } = makeMockDeps({
+      execImpls: {
+        "gh pr list --head \"feature/1210\"": () => "793\n",
+        "gh pr merge 793 --merge --delete-branch": () => execError({
+          stderr: "X Pull request #793 is not mergeable",
+        }),
+      },
+    });
+
+    await runAutoMerge(client, deps);
+
+    // Counter bumped to 1.
+    assert.ok(client.addLabelCalls.some(c => c.issueNumber === 1210 && c.label === "merge-attempt:1"));
+    // No give-up signals.
+    assert.ok(!client.addLabelCalls.some(c => c.label === "error:merge-conflict"));
+    assert.equal(client.comments.length, 0);
+    assert.equal(client.updateItemStatusCalls.length, 0);
+    // Discord notify NOT sent — give-up only.
+    assert.equal(calls.discord.length, 0);
+    // No previous-counter to strip on first attempt (currentCount=0).
+    assert.ok(!client.removeLabelCalls.some(c => c.label.startsWith("merge-attempt:")));
+  });
+
+  test("merge conflict on second attempt (merge-attempt:1) → bumps to merge-attempt:2, strips merge-attempt:1, no give-up", async () => {
+    // Second conflict: bump counter to 2, strip the previous counter
+    // to prevent accumulation.
+    const client = new MockGitHubClient({
+      items: [
+        { id: "PVTI_1211", issueNumber: 1211, status: "Done", labels: ["ready:documentation", "merge-attempt:1"], state: "OPEN" },
+      ],
+    });
+    const { deps, calls } = makeMockDeps({
+      execImpls: {
+        "gh pr list --head \"feature/1211\"": () => "794\n",
+        "gh pr merge 794 --merge --delete-branch": () => execError({ stderr: "is not mergeable" }),
+      },
+    });
+
+    await runAutoMerge(client, deps);
+
+    assert.ok(client.addLabelCalls.some(c => c.issueNumber === 1211 && c.label === "merge-attempt:2"));
+    assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1211 && c.label === "merge-attempt:1"));
+    assert.ok(!client.addLabelCalls.some(c => c.label === "error:merge-conflict"));
+    assert.equal(client.comments.length, 0);
+    assert.equal(calls.discord.length, 0);
+  });
+
+  test("rebase-time conflict on first attempt → bumps merge-attempt:1, never invokes gh pr merge", async () => {
+    // Pre-merge rebase failure on the first attempt: counter bumps,
+    // merge step skipped (correct — same posture as the give-up rebase
+    // test, just at the retry seam).
+    const client = new MockGitHubClient({
+      items: [
+        { id: "PVTI_1410", issueNumber: 1410, status: "Done", labels: ["ready:documentation"], state: "OPEN" },
+      ],
+    });
+    const { deps, calls } = makeMockDeps({
+      execImpls: {
+        "gh pr list --head \"feature/1410\"": () => "910\n",
+        "gh pr update-branch 910 --rebase": () => execError({ stderr: "is not mergeable" }),
+      },
+    });
+
+    await runAutoMerge(client, deps);
+
+    assert.ok(client.addLabelCalls.some(c => c.issueNumber === 1410 && c.label === "merge-attempt:1"));
+    assert.ok(!calls.exec.some(c => c.cmd.includes("gh pr merge")),
+      "rebase conflict must short-circuit before merge attempt, even on retry");
+    assert.ok(!client.addLabelCalls.some(c => c.label === "error:merge-conflict"));
   });
 
   test("skip cases — merged label, error:merge-conflict label, issueNumber=0 → no gh pr list invoked", async () => {
@@ -3079,9 +3166,12 @@ describe("runAutoMerge", () => {
     // Status rollback to In Code Review). The whole point of the rebase
     // step is to catch the conflict at this earlier seam; falling
     // through to attempt the merge would defeat it.
+    //
+    // Pre-seeded `merge-attempt:2` so this is the 3rd (final) attempt —
+    // retries exhausted, dispatcher gives up at the rebase step.
     const client = new MockGitHubClient({
       items: [
-        { id: "PVTI_1401", issueNumber: 1401, status: "Done", labels: ["ready:documentation"], state: "OPEN" },
+        { id: "PVTI_1401", issueNumber: 1401, status: "Done", labels: ["ready:documentation", "merge-attempt:2"], state: "OPEN" },
       ],
     });
     const { deps, calls } = makeMockDeps({

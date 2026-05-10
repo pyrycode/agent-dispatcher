@@ -392,7 +392,9 @@ export function decideDoneCleanup(
     if (item.issueNumber <= 0) continue;
 
     const labelsToStrip = item.labels.filter(
-      l => isPipelineLabel(l) || l.startsWith("rework-count:"),
+      l => isPipelineLabel(l)
+        || l.startsWith("rework-count:")
+        || l.startsWith("merge-attempt:"),
     );
 
     if (labelsToStrip.length === 0) continue;
@@ -740,6 +742,71 @@ export function extractReworkCount(labels: string[]): number {
     if (n > max) max = n;
   }
   return max;
+}
+
+/**
+ * Parse the current merge-conflict retry count from labels.
+ *
+ * Counter prefix: `merge-attempt:N`. Mirrors `extractReworkCount`'s
+ * shape (max-of-found, defensive against multiple stale counters from
+ * partial label-strip races).
+ *
+ * Used by `decideMergeRetry` to spread auto-merge conflict retries
+ * across dispatcher cycles. The conflict failure mode is usually
+ * transient — another sibling PR is mid-merge against the same line —
+ * and a retry one cycle later, after the sibling has landed or also
+ * failed, often succeeds. Pre-2026-05-10 evening the dispatcher gave
+ * up after one conflict; this helper lets it count.
+ *
+ * Returns 0 when no `merge-attempt:N` label is present (fresh ticket).
+ */
+export function extractMergeAttemptCount(labels: string[]): number {
+  const prefix = "merge-attempt:";
+  let max = 0;
+  for (const label of labels) {
+    if (!label.startsWith(prefix)) continue;
+    const tail = label.slice(prefix.length);
+    if (tail.length === 0) continue;
+    const n = parseInt(tail, 10);
+    if (isNaN(n) || n < 0) continue;
+    if (n > max) max = n;
+  }
+  return max;
+}
+
+/**
+ * Decide what to do on an auto-merge conflict, given the current
+ * `merge-attempt:N` count.
+ *
+ * Pure function — caller (runAutoMerge) does the I/O (label add/remove,
+ * comment, Status rollback).
+ *
+ * Two outcomes:
+ *
+ *   - `shouldGiveUp: false` — bump the counter and skip this cycle.
+ *     Caller writes `merge-attempt:<newCount>` and removes
+ *     `merge-attempt:<previousCount>` (when previousCount > 0) to
+ *     prevent counter accumulation.
+ *   - `shouldGiveUp: true` — retries exhausted; caller falls through to
+ *     the existing `handleMergeConflict` flow (error:merge-conflict
+ *     label, triage comment, Status rollback to In Code Review).
+ *
+ * `maxAttempts` is the threshold AT which the dispatcher gives up (3 by
+ * default). With currentCount=0 the next conflict bumps to 1 and retries
+ * (1st attempt failed); at currentCount=2 the next conflict gives up
+ * (3rd attempt failed = exhausted).
+ */
+export function decideMergeRetry(opts: {
+  currentCount: number;
+  maxAttempts: number;
+}): { shouldGiveUp: boolean; newCount: number; previousCount: number } {
+  const { currentCount, maxAttempts } = opts;
+  const newCount = currentCount + 1;
+  return {
+    shouldGiveUp: newCount >= maxAttempts,
+    newCount,
+    previousCount: currentCount,
+  };
 }
 
 // --------- Auto-advance rule lookup ---------

@@ -23,7 +23,9 @@ import {
 import { selectDispatches } from "./dispatch-selection.js";
 import {
   decideDoneCleanup,
+  decideMergeRetry,
   decidePostRunLabels,
+  extractMergeAttemptCount,
   isMergeConflictError,
   isPipelineLabel,
   isPipelineLabelForAgent,
@@ -1814,6 +1816,80 @@ export async function runConcurrentDispatches(
 }
 
 /**
+ * Auto-merge retry budget. The dispatcher tries the merge this many
+ * times across cycles before applying `error:merge-conflict` and
+ * stopping. Spread across cycles (not within a cycle) because the
+ * conflict failure mode is usually a sibling PR mid-merge against the
+ * same line — back-to-back attempts within one cycle can't help, but a
+ * retry one cycle later (after the sibling has landed or also failed)
+ * often resolves cleanly. Set 2026-05-10 evening after a transient
+ * race on agent-dispatcher-v2#25 surfaced the give-up-on-first-failure
+ * behavior of the pre-retry code.
+ */
+const MERGE_RETRY_MAX_ATTEMPTS = 3;
+
+/**
+ * Handle an auto-merge conflict with cross-cycle retry. Replaces the
+ * direct `handleMergeConflict` call at conflict-detection seams.
+ *
+ * Reads the current `merge-attempt:N` count from the item's labels,
+ * delegates the decision to `decideMergeRetry`, and either:
+ *
+ *   - Bumps the counter and skips this cycle (the dispatcher's natural
+ *     poll loop produces the retry on the next cycle), or
+ *   - Falls through to the existing `handleMergeConflict` flow when
+ *     retries are exhausted.
+ *
+ * On success at any retry, `decideDoneCleanup` strips the
+ * `merge-attempt:*` counter alongside the rest of the pipeline labels
+ * (the same way `rework-count:*` gets stripped).
+ *
+ * Counter cleanup is best-effort: if removing the previous counter
+ * fails, the next cycle's `extractMergeAttemptCount` reads max-of-found
+ * and we still progress correctly toward the threshold.
+ */
+async function handleConflictWithRetry(
+  client: DispatchClient,
+  item: ProjectItem,
+  prNumber: number,
+  notifyDiscord: DispatchDeps["notifyDiscord"],
+): Promise<void> {
+  const currentCount = extractMergeAttemptCount(item.labels);
+  const decision = decideMergeRetry({
+    currentCount,
+    maxAttempts: MERGE_RETRY_MAX_ATTEMPTS,
+  });
+
+  if (decision.shouldGiveUp) {
+    await handleMergeConflict(client, item, prNumber, notifyDiscord);
+    return;
+  }
+
+  // Bump the counter and let the next cycle retry. Add the new
+  // counter first (so we never lose the current attempt count if the
+  // remove fails), then strip the previous counter (best-effort).
+  console.warn(
+    `   🔁 PR #${prNumber} for #${item.issueNumber} merge conflict — ` +
+    `retry ${decision.newCount}/${MERGE_RETRY_MAX_ATTEMPTS} next cycle`,
+  );
+  try {
+    await client.addLabel(item.issueNumber, `merge-attempt:${decision.newCount}`);
+  } catch (e: any) {
+    console.warn(`   ⚠️  Failed to set merge-attempt:${decision.newCount} on #${item.issueNumber}: ${e?.message ?? e}`);
+    return;
+  }
+  if (decision.previousCount > 0) {
+    try {
+      await client.removeLabel(item.issueNumber, `merge-attempt:${decision.previousCount}`);
+    } catch (e: any) {
+      // Non-fatal: extractMergeAttemptCount returns max-of-found, so
+      // the next cycle will read the higher counter and progress.
+      console.warn(`   ⚠️  Failed to strip merge-attempt:${decision.previousCount} on #${item.issueNumber}: ${e?.message ?? e}`);
+    }
+  }
+}
+
+/**
  * Apply the conflict-block path: `error:merge-conflict` label + triage
  * comment + Discord notify + Status rollback to In Code Review.
  *
@@ -1976,7 +2052,7 @@ export async function runAutoMerge(
       } catch (e: any) {
         const errOut = `${e.stderr ?? ""}\n${e.message ?? ""}`;
         if (isMergeConflictError(errOut)) {
-          await handleMergeConflict(client, item, prNumber, notifyDiscord);
+          await handleConflictWithRetry(client, item, prNumber, notifyDiscord);
           continue;
         }
         // Non-conflict failure: silent, retry next cycle.
@@ -2048,8 +2124,10 @@ export async function runAutoMerge(
         if (isMergeConflictError(errOut)) {
           // Idempotent guard above (`error:merge-conflict` skip) handles
           // re-entry — but we got here, so the label isn't set yet.
-          // Same path as the pre-merge rebase conflict (Step 1.5).
-          await handleMergeConflict(client, item, prNumber, notifyDiscord);
+          // Same path as the pre-merge rebase conflict (Step 1.5):
+          // retry across cycles up to MERGE_RETRY_MAX_ATTEMPTS, then
+          // fall through to handleMergeConflict.
+          await handleConflictWithRetry(client, item, prNumber, notifyDiscord);
           continue;
         }
         // Non-conflict failure (transient network, auth, etc.): silently retry next cycle.
