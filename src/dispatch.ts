@@ -1799,6 +1799,80 @@ export async function runConcurrentDispatches(
 }
 
 /**
+ * Apply the conflict-block path: `error:merge-conflict` label + triage
+ * comment + Discord notify + Status rollback to In Code Review.
+ *
+ * Invoked from two seams in `runAutoMerge`:
+ *   1. Pre-merge `gh pr update-branch --rebase` surfacing a conflict
+ *      (catches retroactive sibling conflicts at the earliest seam).
+ *   2. The merge step itself returning `isMergeConflictError`.
+ *
+ * Both seams need the same operator-visible side-effects (label is the
+ * load-bearing global-block signal; Status rollback maintains the
+ * column-as-truth invariant; comment + Discord surface the manual
+ * recovery recipe). Extracted here so the new pre-merge step rides the
+ * same path without duplicating ~50 lines.
+ *
+ * Errors are caught internally — the conflict-block label is the only
+ * load-bearing post-condition. Discord/comment/Status failures log a
+ * warning and continue (matches the pre-extraction inline behaviour).
+ */
+async function handleMergeConflict(
+  client: DispatchClient,
+  item: ProjectItem,
+  prNumber: number,
+  notifyDiscord: DispatchDeps["notifyDiscord"],
+): Promise<void> {
+  console.warn(`   🛑 PR #${prNumber} for #${item.issueNumber} has merge conflicts — labelling for triage`);
+  try {
+    await client.addLabel(item.issueNumber, "error:merge-conflict");
+    await client.addComment(
+      item.issueNumber,
+      `## 🛑 Auto-merge blocked by merge conflict\n\n` +
+      `PR #${prNumber} cannot be merged into \`${defaultBranch}\` cleanly. ` +
+      `The dispatcher has stopped retrying this PR; resolve the conflict manually:\n\n` +
+      `\`\`\`bash\n` +
+      `gh pr checkout ${prNumber}\n` +
+      `git fetch origin ${defaultBranch}\n` +
+      `git merge origin/${defaultBranch}\n` +
+      `# resolve conflicts in your editor\n` +
+      `git push\n` +
+      `\`\`\`\n\n` +
+      `Then strip \`error:merge-conflict\` from this issue to resume the pipeline. ` +
+      `The dispatcher will pick the merge back up on its next cycle.\n\n` +
+      `*Filed automatically by dispatcher — pyrycode/agents commit log has the implementation.*`,
+    );
+    await notifyDiscord(`🛑 Merge conflict on PR #${prNumber} (#${item.issueNumber}) — labelled for human triage.`);
+  } catch (labelErr: any) {
+    console.warn(`   ⚠️  Failed to label/comment merge conflict on #${item.issueNumber}: ${labelErr.message ?? labelErr}`);
+  }
+  // Roll Status back from Done → In Code Review. Without this, the
+  // ticket sits at Status=Done with a still-open PR, breaking the
+  // column-as-truth invariant. The 2026-05-09 morning batch (#214 +
+  // #218) hit this: both moved to Done by `runAutoAdvance`'s
+  // `ready:documentation` advance BEFORE the auto-merge attempted and
+  // failed on conflict. Manual recovery moved them back, but a future
+  // stale-conflict can recur silently.
+  //
+  // In its own try/catch — failure is non-fatal because the label is
+  // the load-bearing signal (blocks re-dispatch via
+  // GLOBAL_BLOCK_LABELS). Status drift is cosmetic; surface the
+  // failure so operators see drift.
+  //
+  // "In Code Review" is the natural rollback target — a conflict means
+  // the PR can't merge against current main, which is exactly the
+  // state code-review re-evaluates after a rebase. Hardcoded today;
+  // if pyrycode forks ever rename their pre-Done column, this becomes
+  // config (out of scope until observed).
+  try {
+    await client.updateItemStatus(item.id, "In Code Review");
+    console.log(`   📋 Rolled #${item.issueNumber} Status back to In Code Review (was Done; PR conflicts)`);
+  } catch (statusErr: any) {
+    console.warn(`   ⚠️  Failed to roll #${item.issueNumber} Status back to In Code Review: ${statusErr?.message ?? statusErr}`);
+  }
+}
+
+/**
  * Auto-merge any open PR for tickets sitting in the Done column.
  *
  * Steps per Done-column ticket:
@@ -1806,17 +1880,23 @@ export async function runConcurrentDispatches(
  *     set (human triaging), or issueNumber <= 0 (synthetic items).
  *   - `gh pr list --head feature/<n>` to find the PR. Transient
  *     failure (network/rate-limit) → skip, retry next cycle.
+ *   - `gh pr update-branch <n> --rebase` to fast-forward the PR branch
+ *     onto current main. Catches retroactive sibling conflicts that
+ *     architect-time `git branch -r` overlap couldn't see (sibling PRs
+ *     landing AFTER architect ran). Conflict here → `handleMergeConflict`,
+ *     skip the merge attempt this cycle. Transient failure → silent
+ *     skip, retry next cycle (same posture as PR-list transient).
  *   - `gh pr merge <n> --merge --delete-branch`. On success: pull
  *     merged changes to local main (non-fatal failure), strip pipeline
  *     labels from the issue, Discord notify. On conflict (detected
- *     via `isMergeConflictError` on stderr): apply
- *     `error:merge-conflict` (a global-block label that stops retry),
- *     post a triage comment with the manual-resolution recipe, Discord
- *     notify. Non-conflict failures: silent, retry next cycle.
+ *     via `isMergeConflictError` on stderr): `handleMergeConflict`.
+ *     Non-conflict failures: silent, retry next cycle.
  *
  * The conflict-block-via-label pattern is the 2026-05-08 fix that
- * stopped infinite retry loops on stale-PR conflicts (see Lessons.md
- * "Auto-merge fails silently on stale-PR conflicts").
+ * stopped infinite retry loops on stale-PR conflicts; the pre-merge
+ * rebase is the 2026-05-10 complement that catches them earlier (see
+ * Lessons.md "Auto-merge fails silently on stale-PR conflicts" + the
+ * agent-dispatcher#2 retroactive-conflict gap).
  */
 export async function runAutoMerge(
   client: DispatchClient,
@@ -1852,6 +1932,39 @@ export async function runAutoMerge(
         prNumber = parsed;
       } catch (e: any) {
         // PR-list failures are transient (rate limit, network) — retry next cycle.
+        continue;
+      }
+
+      // Step 1.5: Rebase the PR branch onto current main BEFORE attempting
+      // the merge. Catches retroactive sibling conflicts that the
+      // architect-time `git branch -r` overlap check couldn't see —
+      // sibling PRs that merged AFTER architect ran on this ticket
+      // invalidate the original assumption. Pre-2026-05-10 these surfaced
+      // at merge time as `error:merge-conflict`; now they surface here at
+      // the earliest server-side seam (no local working-tree mutation —
+      // `gh pr update-branch --rebase` is server-side; the dispatcher's
+      // repoRoot stays untouched).
+      //
+      // Conflict path: `handleMergeConflict` (same label/comment/rollback
+      // as the merge step below); skip the merge attempt this cycle so
+      // the conflict-block label takes effect immediately. Transient
+      // failure (gh rate limit, network): silent skip, retry next cycle —
+      // same posture as the PR-list transient-failure path above. We do
+      // NOT fall through to the merge step on transient: next cycle's
+      // rebase is the correctness path; falling through risks merging
+      // against a stale base that the rebase intended to refresh.
+      try {
+        execSync(
+          `gh pr update-branch ${prNumber} --rebase`,
+          { cwd: repoRoot, encoding: "utf-8", timeout: 30_000 }
+        );
+      } catch (e: any) {
+        const errOut = `${e.stderr ?? ""}\n${e.message ?? ""}`;
+        if (isMergeConflictError(errOut)) {
+          await handleMergeConflict(client, item, prNumber, notifyDiscord);
+          continue;
+        }
+        // Non-conflict failure: silent, retry next cycle.
         continue;
       }
 
@@ -1918,57 +2031,10 @@ export async function runAutoMerge(
         // through both depending on Node version + how the process exited.
         const errOut = `${e.stderr ?? ""}\n${e.message ?? ""}`;
         if (isMergeConflictError(errOut)) {
-          // Label + comment, then bail out of retries via GLOBAL_BLOCK_LABELS.
           // Idempotent guard above (`error:merge-conflict` skip) handles
           // re-entry — but we got here, so the label isn't set yet.
-          console.warn(`   🛑 PR #${prNumber} for #${item.issueNumber} has merge conflicts — labelling for triage`);
-          try {
-            await client.addLabel(item.issueNumber, "error:merge-conflict");
-            await client.addComment(
-              item.issueNumber,
-              `## 🛑 Auto-merge blocked by merge conflict\n\n` +
-              `PR #${prNumber} cannot be merged into \`${defaultBranch}\` cleanly. ` +
-              `The dispatcher has stopped retrying this PR; resolve the conflict manually:\n\n` +
-              `\`\`\`bash\n` +
-              `gh pr checkout ${prNumber}\n` +
-              `git fetch origin ${defaultBranch}\n` +
-              `git merge origin/${defaultBranch}\n` +
-              `# resolve conflicts in your editor\n` +
-              `git push\n` +
-              `\`\`\`\n\n` +
-              `Then strip \`error:merge-conflict\` from this issue to resume the pipeline. ` +
-              `The dispatcher will pick the merge back up on its next cycle.\n\n` +
-              `*Filed automatically by dispatcher — pyrycode/agents commit log has the implementation.*`,
-            );
-            await notifyDiscord(`🛑 Merge conflict on PR #${prNumber} (#${item.issueNumber}) — labelled for human triage.`);
-          } catch (labelErr: any) {
-            console.warn(`   ⚠️  Failed to label/comment merge conflict on #${item.issueNumber}: ${labelErr.message ?? labelErr}`);
-          }
-          // Roll Status back from Done → In Code Review. Without this,
-          // the ticket sits at Status=Done with a still-open PR, breaking
-          // the column-as-truth invariant. The 2026-05-09 morning batch
-          // (#214 + #218) hit this: both moved to Done by `runAutoAdvance`'s
-          // `ready:documentation` advance BEFORE the auto-merge attempted
-          // and failed on conflict. Manual recovery moved them back, but
-          // a future stale-conflict can recur silently.
-          //
-          // In its own try/catch — failure is non-fatal because the label
-          // is the load-bearing signal (blocks re-dispatch via
-          // GLOBAL_BLOCK_LABELS). Status drift is cosmetic; surface the
-          // failure so operators see drift.
-          //
-          // "In Code Review" is the natural rollback target — a conflict
-          // means the PR can't merge against current main, which is
-          // exactly the state code-review re-evaluates after a rebase.
-          // Hardcoded today; if pyrycode forks ever rename their
-          // pre-Done column, this becomes config (out of scope until
-          // observed).
-          try {
-            await client.updateItemStatus(item.id, "In Code Review");
-            console.log(`   📋 Rolled #${item.issueNumber} Status back to In Code Review (was Done; PR conflicts)`);
-          } catch (statusErr: any) {
-            console.warn(`   ⚠️  Failed to roll #${item.issueNumber} Status back to In Code Review: ${statusErr?.message ?? statusErr}`);
-          }
+          // Same path as the pre-merge rebase conflict (Step 1.5).
+          await handleMergeConflict(client, item, prNumber, notifyDiscord);
           continue;
         }
         // Non-conflict failure (transient network, auth, etc.): silently retry next cycle.

@@ -2830,4 +2830,125 @@ describe("runAutoMerge", () => {
     // No error label applied — codegraph failure isn't a ticket-level signal.
     assert.ok(!client.addLabelCalls.some(c => c.label.startsWith("error:")));
   });
+
+  test("pre-merge rebase succeeds → gh pr update-branch invoked before gh pr merge, happy path completes", async () => {
+    // The dispatcher rebases the feature branch onto current main BEFORE
+    // attempting the merge. Catches retroactive sibling conflicts that
+    // architect-time `git branch -r` overlap couldn't see (sibling PRs
+    // landing AFTER architect ran). Pre-fix, this surfaced as
+    // `error:merge-conflict` at merge time (see Lessons.md
+    // "Auto-merge fails silently on stale-PR conflicts"); post-fix, GitHub
+    // performs the rebase server-side and the subsequent merge proceeds
+    // against fresh base.
+    const client = new MockGitHubClient({
+      items: [
+        { issueNumber: 1400, status: "Done", labels: ["ready:documentation", "size:s"], state: "OPEN" },
+      ],
+    });
+    const { deps, calls } = makeMockDeps({
+      execImpls: {
+        "gh pr list --head \"feature/1400\"": () => "900\n",
+        "gh pr update-branch 900 --rebase": () => "",
+        "gh pr merge 900 --merge --delete-branch": () => "",
+        "git checkout main && git pull": () => "",
+      },
+    });
+
+    await runAutoMerge(client, deps);
+
+    // Both calls happened, in order: update-branch first, then merge.
+    const updateIdx = calls.exec.findIndex(c => c.cmd === "gh pr update-branch 900 --rebase");
+    const mergeIdx = calls.exec.findIndex(c => c.cmd === "gh pr merge 900 --merge --delete-branch");
+    assert.ok(updateIdx >= 0, "must invoke `gh pr update-branch 900 --rebase` before merge");
+    assert.ok(mergeIdx >= 0, "merge must still run on rebase success");
+    assert.ok(updateIdx < mergeIdx, "update-branch must precede merge");
+    // Standard happy-path post-conditions still hold.
+    assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1400 && c.label === "ready:documentation"));
+    assert.equal(calls.discord.length, 1);
+    assert.match(calls.discord[0]!, /^🔀 PR #900 merged/);
+    assert.ok(!client.addLabelCalls.some(c => c.label === "error:merge-conflict"));
+  });
+
+  test("pre-merge rebase conflict → label + comment + Status rollback applied, gh pr merge NEVER invoked", async () => {
+    // When the rebase itself surfaces a conflict, the dispatcher must
+    // short-circuit BEFORE the merge call — same load-bearing conflict
+    // path as a merge-time conflict (label + triage comment + Discord +
+    // Status rollback to In Code Review). The whole point of the rebase
+    // step is to catch the conflict at this earlier seam; falling
+    // through to attempt the merge would defeat it.
+    const client = new MockGitHubClient({
+      items: [
+        { id: "PVTI_1401", issueNumber: 1401, status: "Done", labels: ["ready:documentation"], state: "OPEN" },
+      ],
+    });
+    const { deps, calls } = makeMockDeps({
+      execImpls: {
+        "gh pr list --head \"feature/1401\"": () => "901\n",
+        // gh pr update-branch fails with a "not mergeable" stderr —
+        // isMergeConflictError matches the substring, mirroring the
+        // existing merge-conflict test.
+        "gh pr update-branch 901 --rebase": () => execError({
+          stderr: "X Pull request #901 is not mergeable: the merge commit cannot be cleanly created.",
+          message: "Command failed: gh pr update-branch 901 --rebase",
+        }),
+      },
+    });
+
+    await runAutoMerge(client, deps);
+
+    // The merge call MUST NOT have been attempted.
+    assert.ok(!calls.exec.some(c => c.cmd.includes("gh pr merge")),
+      "rebase-time conflict must short-circuit before merge attempt");
+    // Conflict-block label applied (stops retry loop).
+    assert.ok(client.addLabelCalls.some(c => c.issueNumber === 1401 && c.label === "error:merge-conflict"));
+    // Triage comment posted.
+    assert.equal(client.comments.length, 1);
+    assert.match(client.comments[0]!.body, /Auto-merge blocked by merge conflict/);
+    assert.match(client.comments[0]!.body, /gh pr checkout 901/);
+    // Discord notify (one 🛑).
+    assert.equal(calls.discord.length, 1);
+    assert.match(calls.discord[0]!, /^🛑 Merge conflict on PR #901/);
+    // Status rolled back to In Code Review.
+    assert.deepEqual(
+      client.updateItemStatusCalls,
+      [{ itemId: "PVTI_1401", newStatus: "In Code Review" }],
+      "rebase-conflict path must roll Status back from Done → In Code Review",
+    );
+    assert.equal(client.itemsByIssueNumber.get(1401)!.status, "In Code Review");
+  });
+
+  test("pre-merge rebase transient failure (non-conflict) → silent skip, no label, no merge attempt this cycle", async () => {
+    // Network/auth/rate-limit failures on `gh pr update-branch` are
+    // transient. Same posture as the PR-list transient-failure path:
+    // skip silently, retry next cycle, do NOT apply any error label
+    // (an error label permanently blocks legitimate PRs). Crucially,
+    // we also must not fall through to the merge step — the next
+    // cycle will re-attempt the rebase, which is the correctness path.
+    const client = new MockGitHubClient({
+      items: [
+        { issueNumber: 1402, status: "Done", labels: ["ready:documentation"], state: "OPEN" },
+      ],
+    });
+    const { deps, calls } = makeMockDeps({
+      execImpls: {
+        "gh pr list --head \"feature/1402\"": () => "902\n",
+        "gh pr update-branch 902 --rebase": () => execError({
+          stderr: "GraphQL error: rate limit exceeded",
+          message: "Command failed: gh pr update-branch",
+        }),
+      },
+    });
+
+    await runAutoMerge(client, deps);
+
+    // No merge attempt this cycle.
+    assert.ok(!calls.exec.some(c => c.cmd.includes("gh pr merge")));
+    // No error label applied (transient failure).
+    assert.ok(!client.addLabelCalls.some(c => c.label.startsWith("error:")));
+    // No comment, no Discord notify.
+    assert.equal(client.comments.length, 0);
+    assert.equal(calls.discord.length, 0);
+    // Status NOT rolled back — the ticket may yet succeed next cycle.
+    assert.equal(client.updateItemStatusCalls.length, 0);
+  });
 });
