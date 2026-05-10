@@ -424,6 +424,29 @@ export interface PostRunLabelDecision {
    *  rework was requested, the agent moved the ticket out of its
    *  column, or the post-run status fetch failed. */
   addReadyLabel: boolean;
+  /** `ready:*` labels from prior agents that should be stripped before
+   *  the new `ready:<agentName>` is applied. Populated only when
+   *  `addReadyLabel === true`; empty otherwise.
+   *
+   *  `runAutoAdvance` moves tickets between columns without stripping
+   *  the `ready:<agent>` labels that drove each advance (auto-advance
+   *  is column-only by design — see `decideAutoAdvance` and
+   *  `decideDoneCleanup`'s docstring for the asymmetry). The rework
+   *  path strips via `runReworkRouting`; the Done path strips via
+   *  `runDoneCleanup` + `runAutoMerge`. Mid-pipeline tickets that
+   *  freeze on a `GLOBAL_BLOCK_LABELS` entry (e.g. `error:max_turns_salvaged`)
+   *  carry every prior `ready:*` until human triage. Stripping at the
+   *  point the next agent's `ready:<self>` is added closes the gap.
+   *
+   *  Excludes `ready:<agentName>` itself (idempotency: don't remove +
+   *  re-add this agent's own label if a re-dispatch left it set).
+   *
+   *  Surfaced 2026-05-10 by relay #7 carrying `ready:po + ready:architect
+   *  + error:max_turns_salvaged`. The asymmetry has been present since
+   *  pyrycode/agents@985bad1; rare visibility because most tickets
+   *  flow to Done before stalling.
+   */
+  priorReadyLabelsToStrip: string[];
   /** Why `addReadyLabel` is what it is — drives the log message
    *  shape so humans can see the reasoning at a glance. */
   logKind: "ready" | "rework" | "moved-out" | "status-unknown";
@@ -490,10 +513,22 @@ export function decidePostRunLabels(opts: {
     logKind = "status-unknown";
   }
 
+  // Strip prior agents' `ready:*` only when we're about to add
+  // `ready:<self>`. Rework path defers to `runReworkRouting`; moved-out
+  // and status-unknown paths skip strips by design (no ready add to
+  // bookend; cautious recovery on next cycle).
+  const ownReadyLabel = `ready:${opts.agentName}`;
+  const priorReadyLabelsToStrip = addReadyLabel
+    ? opts.postLabels.filter(
+        (l) => l.startsWith("ready:") && l !== ownReadyLabel,
+      )
+    : [];
+
   return {
     reworkTarget: effectiveReworkTarget,
     shouldStripLegacyNeedsRework: hasLegacy,
     addReadyLabel,
+    priorReadyLabelsToStrip,
     logKind,
   };
 }

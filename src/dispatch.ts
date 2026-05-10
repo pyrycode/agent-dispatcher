@@ -1542,6 +1542,21 @@ export async function handlePostRun(
     }
 
     if (decision.addReadyLabel) {
+      // Strip prior agents' `ready:*` BEFORE adding `ready:<self>` —
+      // closes the accumulation gap surfaced by relay #7 (carried both
+      // `ready:po` + `ready:architect` mid-pipeline). Sequential awaits
+      // so the ticket never observably holds both labels at once between
+      // API calls. Each removeLabel failure is non-fatal: log and continue;
+      // the stale label is cosmetic, not state-bearing for dispatch
+      // decisions.
+      for (const prior of decision.priorReadyLabelsToStrip) {
+        try {
+          await client.removeLabel(item.issueNumber, prior);
+          console.log(`   🧹 Stripped prior ${prior} from #${item.issueNumber}`);
+        } catch (e) {
+          console.warn(`   ⚠️  Failed to strip ${prior}: ${e}`);
+        }
+      }
       try {
         await client.addLabel(item.issueNumber, `ready:${agent.name}`);
         console.log(`   🏷️  Added ready:${agent.name} to #${item.issueNumber}`);

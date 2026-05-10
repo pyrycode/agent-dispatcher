@@ -2203,6 +2203,105 @@ describe("decidePostRunLabels", () => {
     });
     assert.equal(d.addReadyLabel, true);
     assert.equal(d.logKind, "ready");
+    assert.deepEqual(d.priorReadyLabelsToStrip, []);
+  });
+
+  // --- priorReadyLabelsToStrip — added 2026-05-10 to fix observed
+  // accumulation on relay #7 (carried `ready:po + ready:architect +
+  // error:max_turns_salvaged` mid-pipeline). The asymmetry has been
+  // present since pyrycode/agents@985bad1 — auto-advance moves columns
+  // without stripping prior agents' `ready:*`, runReworkRouting strips
+  // only on rework, runDoneCleanup strips only at Done. For tickets
+  // that freeze on a global-block label between Done and the rework
+  // path, prior `ready:*` labels are misleading provenance. Surfacing
+  // them was rare enough that no one observed it until the first
+  // `error:max_turns_salvaged` ticket got past two agents.
+
+  test("happy path with prior ready:po → strips ready:po before adding ready:architect", () => {
+    // The relay #7 shape: PO refined → ready:po; auto-advance to
+    // In Architecture; architect ran successfully → addReadyLabel=true.
+    // Without strip, ticket carries both ready:po + ready:architect.
+    const d = decidePostRunLabels({
+      postLabels: ["ready:po", "size:s", "security-sensitive"],
+      agentName: "architect",
+      agentColumn: "In Architecture",
+      currentColumn: "In Architecture",
+    });
+    assert.equal(d.addReadyLabel, true);
+    assert.equal(d.logKind, "ready");
+    assert.deepEqual(d.priorReadyLabelsToStrip, ["ready:po"]);
+  });
+
+  test("happy path with multiple prior ready:* → strips all of them", () => {
+    // A developer run after PO + architect — both prior `ready:*`
+    // accumulated. All should be stripped before adding ready:developer.
+    const d = decidePostRunLabels({
+      postLabels: ["ready:po", "ready:architect", "size:m"],
+      agentName: "developer",
+      agentColumn: "In Development",
+      currentColumn: "In Development",
+    });
+    assert.equal(d.addReadyLabel, true);
+    assert.deepEqual(d.priorReadyLabelsToStrip, ["ready:po", "ready:architect"]);
+  });
+
+  test("happy path: never strips this agent's own ready:<self> from the list", () => {
+    // Defense-in-depth: runPreDispatchPrep strips `ready:<self>` before
+    // dispatch via isPipelineLabelForAgent, so this case shouldn't arise
+    // organically. But if it does (re-dispatch race, manual edit), don't
+    // emit a redundant remove → re-add round-trip.
+    const d = decidePostRunLabels({
+      postLabels: ["ready:po", "ready:architect"],
+      agentName: "architect",
+      agentColumn: "In Architecture",
+      currentColumn: "In Architecture",
+    });
+    assert.equal(d.addReadyLabel, true);
+    assert.deepEqual(d.priorReadyLabelsToStrip, ["ready:po"]);
+  });
+
+  test("rework path → priorReadyLabelsToStrip is empty (runReworkRouting handles strip)", () => {
+    // `runReworkRouting` strips ALL ready:/wip:/error: labels when a
+    // needs-rework:<target> is added. Stripping here would duplicate
+    // that work; the rework path is the existing strip surface.
+    const d = decidePostRunLabels({
+      postLabels: ["ready:po", "needs-rework:po"],
+      agentName: "architect",
+      agentColumn: "In Architecture",
+      currentColumn: "In Architecture",
+    });
+    assert.equal(d.addReadyLabel, false);
+    assert.equal(d.logKind, "rework");
+    assert.deepEqual(d.priorReadyLabelsToStrip, []);
+  });
+
+  test("moved-out path → priorReadyLabelsToStrip is empty (no ready add to bookend)", () => {
+    // PO demoting Backlog → Inbox: addReadyLabel=false, so there's
+    // nothing to bookend with a strip. Pre-existing behavior preserved.
+    const d = decidePostRunLabels({
+      postLabels: ["ready:po"],
+      agentName: "po",
+      agentColumn: "Backlog",
+      currentColumn: "Inbox",
+    });
+    assert.equal(d.addReadyLabel, false);
+    assert.equal(d.logKind, "moved-out");
+    assert.deepEqual(d.priorReadyLabelsToStrip, []);
+  });
+
+  test("status-unknown path → priorReadyLabelsToStrip is empty (cautious)", () => {
+    // Same caution as addReadyLabel=false: skip strips when we can't
+    // confirm the post-run column. Next cycle re-runs the decision
+    // with fresh state.
+    const d = decidePostRunLabels({
+      postLabels: ["ready:po"],
+      agentName: "architect",
+      agentColumn: "In Architecture",
+      currentColumn: null,
+    });
+    assert.equal(d.addReadyLabel, false);
+    assert.equal(d.logKind, "status-unknown");
+    assert.deepEqual(d.priorReadyLabelsToStrip, []);
   });
 });
 
