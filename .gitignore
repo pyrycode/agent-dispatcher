@@ -19,3 +19,13 @@ logs/
 
 # Claude Code per-session state
 .claude/
+
+# CodeGraph index — local code-intel cache for interactive sessions.
+# Anchored, no trailing slash: matches both directories AND symlinks
+# (the trailing-slash variant `.codegraph/` only matches directories,
+# which let a dispatcher-worktree symlink slip past gitignore in
+# pyrycode/pyrycode commit 30f3d53 before that gap was fixed). Same
+# defensive shape applied here, even though this repo isn't an agent
+# target (no auto-commit chain to bite it) — cheaper than the chance
+# of a future scenario where it does.
+/.codegraph
