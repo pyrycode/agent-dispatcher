@@ -306,6 +306,13 @@ export class MockGitHubClient implements DispatchClient {
   comments: { issueNumber: number; body: string }[] = [];
   addLabelCalls: { issueNumber: number; label: string }[] = [];
   removeLabelCalls: { issueNumber: number; label: string }[] = [];
+  /**
+   * Unified add/remove call log in chronological push order, used by
+   * tests that need to assert ordering across both methods (e.g. the
+   * strip-before-add contract in handlePostRun's prior-ready strip).
+   * Per-method arrays above are still populated; this is additive.
+   */
+  labelOps: Array<{ op: "add" | "remove"; issueNumber: number; label: string }> = [];
   getItemStatusCalls: { issueNumber: number; forceRefresh: boolean | undefined }[] = [];
   getIssueLabelsCalls: number[] = [];
   getItemsByStatusCalls: string[] = [];
@@ -350,6 +357,7 @@ export class MockGitHubClient implements DispatchClient {
 
   async addLabel(issueNumber: number, label: string): Promise<void> {
     this.addLabelCalls.push({ issueNumber, label });
+    this.labelOps.push({ op: "add", issueNumber, label });
     if (typeof this.failures.addLabel === "function") {
       const e = this.failures.addLabel(issueNumber, label);
       if (e) throw e;
@@ -366,6 +374,7 @@ export class MockGitHubClient implements DispatchClient {
 
   async removeLabel(issueNumber: number, label: string): Promise<void> {
     this.removeLabelCalls.push({ issueNumber, label });
+    this.labelOps.push({ op: "remove", issueNumber, label });
     if (typeof this.failures.removeLabel === "function") {
       const e = this.failures.removeLabel(issueNumber, label);
       if (e) throw e;
@@ -1466,17 +1475,149 @@ describe("handlePostRun — decidePostRunLabels integration", () => {
       "security-sensitive is metadata, must not be stripped",
     );
 
-    // Strip happens BEFORE add — preserves invariant that the ticket
-    // never observably carries both labels at once between API calls.
-    const stripIdx = client.removeLabelCalls.findIndex(c => c.issueNumber === 415 && c.label === "ready:po");
-    const addIdx = client.addLabelCalls.findIndex(c => c.issueNumber === 415 && c.label === "ready:architect");
-    assert.ok(stripIdx >= 0 && addIdx >= 0, "both calls must have happened");
-    // Both arrays have absolute call ordering (push order). The strip
-    // must precede the add in the combined timeline. We can't compare
-    // indices across separate arrays, but we can assert: at the moment
-    // ready:architect was added, ready:po was already stripped.
-    // Implementation contract: handlePostRun calls removeLabel first,
-    // then addLabel, in sequential awaits.
+    // Strip-before-add order is asserted via labelOps in the dedicated
+    // "strip-before-add order" test below.
+  });
+
+  test("strip-before-add order: prior ready:* removes precede ready:<self> add in unified labelOps log (multi-prior)", async () => {
+    // Contract: handlePostRun strips prior `ready:*` labels via sequential
+    // awaits BEFORE adding `ready:<self>`. The ticket must never observably
+    // hold both labels simultaneously between API calls — a board observer
+    // (or another agent's pre-dispatch fetch) seeing `ready:po + ready:architect
+    // + ready:developer` mid-window would be misled about pipeline state.
+    //
+    // Asserted via MockGitHubClient.labelOps — a unified add/remove call
+    // log in chronological push order. Multi-prior shape (developer running
+    // after PO + architect) doubles as integration coverage for the
+    // multi-prior strip case (only pure-tested in lib.test.ts otherwise).
+    const client = new MockGitHubClient({
+      status: { 416: "In Development" },
+      labels: { 416: ["ready:po", "ready:architect", "size:s"] },
+    });
+    const { ctx } = makeTestContext({
+      // Default agent in makeTestContext is developer / In Development.
+      item: { issueNumber: 416 },
+      client,
+      mockOptions: {
+        execImpls: {
+          "git status --porcelain": () => "",
+          "git rev-list --count main..": () => "1\n",
+        },
+      },
+    });
+
+    const result = await handlePostRun(STREAM_OK(), ctx, false);
+    assert.deepEqual(result, { ok: true });
+
+    // Filter to this issue's label ops (other tests may share the mock
+    // module — though each test instantiates its own client so this is
+    // belt-and-suspenders).
+    const ops = client.labelOps.filter(o => o.issueNumber === 416);
+
+    // Expected exact sequence:
+    //   1. remove ready:po       (first prior, in postLabels order)
+    //   2. remove ready:architect (second prior)
+    //   3. add    ready:developer (this agent's ready, AFTER both strips)
+    // size:s is non-pipeline → not stripped, not in this log.
+    assert.deepEqual(
+      ops,
+      [
+        { op: "remove", issueNumber: 416, label: "ready:po" },
+        { op: "remove", issueNumber: 416, label: "ready:architect" },
+        { op: "add",    issueNumber: 416, label: "ready:developer" },
+      ],
+      "all prior ready:* strips must precede the ready:<self> add",
+    );
+  });
+
+  test("removeLabel failure on prior ready:* is non-fatal — ready:<self> still added", async () => {
+    // Contract: each prior-strip removeLabel is wrapped in try/catch and
+    // logs a warning on failure. Stale prior labels are cosmetic, not
+    // state-bearing for dispatch decisions; a label-strip blip (network
+    // glitch, label already removed by a concurrent dispatcher cycle,
+    // GraphQL 503) must not block ready:<self> from landing — that would
+    // break auto-advance for the next agent and turn a transient label
+    // problem into a stuck ticket.
+    const client = new MockGitHubClient({
+      status: { 417: "In Development" },
+      labels: { 417: ["ready:po", "ready:architect"] },
+    });
+    // Inject failure on the FIRST strip; second strip + add still proceed.
+    client.failures.removeLabel = (_n, label) =>
+      label === "ready:po" ? new Error("simulated GraphQL 503") : null;
+
+    const { ctx } = makeTestContext({
+      item: { issueNumber: 417 },
+      client,
+      mockOptions: {
+        execImpls: {
+          "git status --porcelain": () => "",
+          "git rev-list --count main..": () => "1\n",
+        },
+      },
+    });
+
+    const result = await handlePostRun(STREAM_OK(), ctx, false);
+    assert.deepEqual(result, { ok: true }, "post-run must not throw on a single removeLabel failure");
+
+    // Both removeLabel attempts were made — push to removeLabelCalls
+    // happens before the failure check, so a failed call is recorded.
+    assert.ok(
+      client.removeLabelCalls.some(c => c.issueNumber === 417 && c.label === "ready:po"),
+      "first strip was attempted (and recorded) even though it failed",
+    );
+    assert.ok(
+      client.removeLabelCalls.some(c => c.issueNumber === 417 && c.label === "ready:architect"),
+      "second strip proceeds after the first one failed — try/catch isolates failures",
+    );
+    // ready:<self> still landed despite the strip failure.
+    assert.ok(
+      client.addLabelCalls.some(c => c.issueNumber === 417 && c.label === "ready:developer"),
+      "ready:<self> must still be applied even if a prior-label strip failed",
+    );
+  });
+
+  test("rework path with prior ready:* → handlePostRun does NOT strip (runReworkRouting handles it)", async () => {
+    // When `addReadyLabel === false` because rework was requested,
+    // handlePostRun's prior-strip block is skipped. `runReworkRouting`
+    // (in reconcile.ts) strips ALL `ready:/wip:/error:` labels when it
+    // routes the ticket back upstream — pre-empting that here would
+    // duplicate work AND potentially strip labels the upstream agent
+    // might want to see during its own pre-dispatch state read.
+    //
+    // This test guards against a refactor that "helpfully" widens
+    // the strip to all post-run paths.
+    const client = new MockGitHubClient({
+      status: { 418: "In Development" },
+      labels: { 418: ["ready:po", "ready:architect", "needs-rework:po"] },
+    });
+    const { ctx } = makeTestContext({
+      item: { issueNumber: 418 },
+      client,
+      mockOptions: {
+        execImpls: {
+          "git status --porcelain": () => "",
+          "git rev-list --count main..": () => "1\n",
+        },
+      },
+    });
+
+    const result = await handlePostRun(STREAM_OK(), ctx, false);
+    assert.deepEqual(result, { ok: true });
+
+    // No `ready:<self>` added (rework path wins per shouldAddReadyLabel).
+    assert.ok(!client.addLabelCalls.some(c => c.label === "ready:developer"));
+
+    // Critical: no prior `ready:*` stripped here. runReworkRouting will
+    // strip them on the next reconcile pass when it routes the ticket
+    // back to PO.
+    const readyStrips = client.removeLabelCalls.filter(
+      c => c.issueNumber === 418 && c.label.startsWith("ready:"),
+    );
+    assert.deepEqual(
+      readyStrips, [],
+      "rework path must not strip prior ready:* labels in handlePostRun — runReworkRouting owns that",
+    );
   });
 
   test("logKind=rework → no ready label, rework comment, no success Discord", async () => {
