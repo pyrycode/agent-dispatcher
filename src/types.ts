@@ -65,6 +65,29 @@ export interface AgentConfig {
    * labeling block.
    */
   producesCommits: boolean;
+  /**
+   * True if this agent must run serially — at most one instance running
+   * AND at most one item picked per cycle, regardless of `maxConcurrent`.
+   *
+   * Applies to agents that touch centralized cross-cutting files every
+   * ticket would also touch (e.g. documentation writing into
+   * `docs/knowledge/INDEX.md`, `docs/PROJECT-MEMORY.md`). Two such
+   * agents running in parallel produce add/add or edit/edit conflicts
+   * on the same lines that auto-merge can't resolve — surfaced
+   * 2026-05-10 when documentation on #1 and #2 both wrote to
+   * `docs/knowledge/INDEX.md` independently and the second PR ended up
+   * `mergeStateStatus=DIRTY` after the first merged.
+   *
+   * File-overlap detection (architect's `4e44a6f` style) doesn't help
+   * here — these files are touched by EVERY ticket by design.
+   * Serialization is the right shape.
+   *
+   * Default `false` (omit). Predicate is `selectDispatches`'s
+   * serial-agent branch — counts in-flight `wip:<agent>` across the
+   * whole snapshot and skips picking a second item when one is
+   * already in flight or already picked this cycle.
+   */
+  serial?: boolean;
 }
 
 // 5-agent pipeline: PO → Architect → Developer → Code Review → Documentation
@@ -109,5 +132,7 @@ export const AGENTS: AgentConfig[] = [
     description: "Documentation Agent — synthesizes project knowledge base",
     usesWorktree: true, // writes to docs/
     producesCommits: true, // commits doc updates
+    serial: true, // writes to centralized docs/knowledge/INDEX.md + docs/PROJECT-MEMORY.md;
+                  // two parallel docs runs produce add/add merge conflicts (2026-05-10)
   },
 ];

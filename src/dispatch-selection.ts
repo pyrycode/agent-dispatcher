@@ -46,6 +46,17 @@ export interface DispatchCandidate<T extends DecisionItem = DecisionItem> {
  * the same agent — two PO instances can refine two unrelated Backlog tickets
  * in parallel. The cap is the `maxConcurrent` budget, not per-agent.
  *
+ * **Per-agent serial cap.** Agents marked `serial: true` in their
+ * `AgentConfig` (currently: documentation) get a per-agent WIP=1 cap on top
+ * of the global `maxConcurrent`. Counts in-flight `wip:<agent>` from any
+ * column in the snapshot AND items already picked this cycle as slots
+ * consumed; once one slot is taken, no further items for that agent are
+ * picked this cycle. Applies to agents that touch centralized cross-cutting
+ * files every ticket also touches (e.g. `docs/knowledge/INDEX.md`,
+ * `docs/PROJECT-MEMORY.md`) — two parallel runs produce add/add merge
+ * conflicts the dispatcher's pre-merge step can't resolve. Surfaced
+ * 2026-05-10 by concurrent documentation runs on #1 and #2.
+ *
  * Pure function over a snapshot. Caller is responsible for invalidating the
  * snapshot (per-cycle items cache) at appropriate boundaries.
  */
@@ -60,11 +71,30 @@ export function selectDispatches<T extends DecisionItem>(opts: {
   for (const agent of pollOrder) {
     if (out.length >= maxConcurrent) break;
     const items = itemsByColumn.get(agent.column) ?? [];
+
+    // Serial agents (e.g. documentation): cap at WIP=1 across the whole
+    // pipeline. Count in-flight `wip:<agent>` from every column in the
+    // snapshot, plus any items already picked this cycle for this agent.
+    // Once one slot is taken, this agent is done for the cycle.
+    let serialBudget = Number.POSITIVE_INFINITY;
+    if (agent.serial) {
+      const wipLabel = `wip:${agent.name}`;
+      let inFlight = 0;
+      for (const cols of itemsByColumn.values()) {
+        for (const it of cols) {
+          if (it.labels.includes(wipLabel)) inFlight++;
+        }
+      }
+      serialBudget = Math.max(0, 1 - inFlight);
+    }
+
     for (const item of items) {
       if (out.length >= maxConcurrent) break;
+      if (serialBudget <= 0) break;
       if (shouldSkipDispatch(item.labels, agent.name)) continue;
       if (item.issueNumber > 0 && hasOpenBlockers(item.blockedBy ?? [])) continue;
       out.push({ agent, item });
+      if (agent.serial) serialBudget--;
     }
   }
   return out;

@@ -2029,6 +2029,85 @@ describe("selectDispatches", () => {
     assert.equal(r[0].agent.name, "architect");
     assert.equal(r[1].agent.name, "po");
   });
+
+  // Serial agent cap (post-2026-05-10). Agents with `serial: true` in
+  // AgentConfig (currently: documentation) get a per-agent WIP=1 cap on
+  // top of the global maxConcurrent. Surfaced when concurrent
+  // documentation runs on #1 and #2 produced add/add merge conflicts on
+  // docs/knowledge/INDEX.md (both branches added the same file
+  // independently), leaving #2's PR mergeStateStatus=DIRTY after #1
+  // merged.
+
+  test("serial agent: real AGENTS — documentation caps at 1 picks per cycle", () => {
+    // documentation has `serial: true` in the real AGENTS array. Two
+    // eligible items in In Documentation must produce exactly one
+    // candidate — the second one waits for the first to finish.
+    const r = selectDispatches({
+      itemsByColumn: new Map([
+        ["In Documentation", [item(1), item(2)]],
+      ]),
+      pollOrder: POLL_ORDER,
+      maxConcurrent: 5,
+    });
+    assert.equal(r.length, 1, "documentation must serialize regardless of maxConcurrent");
+    assert.equal(r[0].agent.name, "documentation");
+    assert.equal(r[0].item.issueNumber, 1);
+  });
+
+  test("serial agent: in-flight wip:<self> in same column blocks new pick", () => {
+    // One item already running (wip:documentation present in the
+    // snapshot). Even if the global cap allows more, the serial cap is 1
+    // — the new candidate must wait.
+    const r = selectDispatches({
+      itemsByColumn: new Map([
+        ["In Documentation", [
+          item(1, ["wip:documentation"]),  // already running
+          item(2),                         // would be eligible
+        ]],
+      ]),
+      pollOrder: POLL_ORDER,
+      maxConcurrent: 5,
+    });
+    assert.equal(r.length, 0);
+  });
+
+  test("serial agent: in-flight wip:<self> in another column also counts", () => {
+    // Edge case: wip:documentation could survive on a ticket already
+    // moved to Done before runDoneCleanup strips it. The serial cap
+    // counts wip:* across ALL columns so snapshot races don't smuggle
+    // a second concurrent run through.
+    const r = selectDispatches({
+      itemsByColumn: new Map([
+        ["Done", [item(99, ["wip:documentation"])]],  // stale wip from prior cycle
+        ["In Documentation", [item(1)]],              // new candidate
+      ]),
+      pollOrder: POLL_ORDER,
+      maxConcurrent: 5,
+    });
+    assert.equal(r.length, 0, "stale wip:* in any column counts as in-flight for serial agents");
+  });
+
+  test("serial cap doesn't constrain other agents in the same cycle", () => {
+    // documentation is serial. PO is not. A serialized documentation
+    // pick must NOT prevent PO from filling the rest of the global
+    // budget with parallel refinements.
+    const r = selectDispatches({
+      itemsByColumn: new Map([
+        ["In Documentation", [item(10), item(11)]],   // serial cap → 1
+        ["Backlog", [item(1), item(2), item(3)]],     // PO unbounded (within global)
+      ]),
+      pollOrder: POLL_ORDER,
+      maxConcurrent: 4,
+    });
+    // 1 documentation + 3 PO = 4 (hits global cap)
+    assert.equal(r.length, 4);
+    const byAgent = r.reduce((acc, c) => {
+      acc[c.agent.name] = (acc[c.agent.name] ?? 0) + 1;
+      return acc;
+    }, {} as Record<string, number>);
+    assert.equal(byAgent["documentation"], 1);
+    assert.equal(byAgent["po"], 3);
+  });
 });
 
 describe("decideBranchSetup", () => {
