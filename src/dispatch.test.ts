@@ -956,6 +956,22 @@ describe("prepareAgentSpawn", () => {
     // baseTools without Agent (developer doesn't sub-dispatch).
     assert.ok(config.allowedTools.includes("Bash,Read,Write,Edit"));
     assert.ok(config.allowedTools.includes("mcp__codegraph__"));
+    assert.ok(
+      config.allowedTools.includes("mcp__plugin_figma_figma__get_design_context"),
+      "developer must have Figma get_design_context for UI-anchored ticket flow",
+    );
+    assert.ok(
+      config.allowedTools.includes("mcp__plugin_figma_figma__get_screenshot"),
+      "developer must have Figma get_screenshot for visual reference + validation",
+    );
+    assert.ok(
+      config.allowedTools.includes("mcp__plugin_figma_figma__get_metadata"),
+      "developer must have Figma get_metadata for truncation-fallback to per-child fetch",
+    );
+    assert.ok(
+      !config.allowedTools.includes("mcp__plugin_figma_figma__use_figma"),
+      "developer must NOT have Figma write tools — read-only access",
+    );
     assert.ok(!config.allowedTools.includes(",Agent"), "developer must not get Agent tool");
     // Env is scrubbed: no GITHUB_TOKEN, but CLAUDE_CODE_ENTRYPOINT set.
     assert.equal(config.env.GITHUB_TOKEN, undefined, "GITHUB_TOKEN must be scrubbed");
