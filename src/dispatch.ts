@@ -1242,7 +1242,7 @@ export async function prepareAgentSpawn(
       promptFile,
       systemPromptFile,
       model: "opus",
-      effort: "high",
+      effort: "xhigh",
       maxTurns,
       allowedTools,
       cwd: agentCwd,

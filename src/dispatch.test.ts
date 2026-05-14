@@ -949,7 +949,7 @@ describe("prepareAgentSpawn", () => {
     }
     const config = result.config;
     assert.equal(config.model, "opus");
-    assert.equal(config.effort, "high");
+    assert.equal(config.effort, "xhigh");
     assert.equal(config.maxTurns, 70, "developer base budget post-2026-05-03 is 70");
     assert.equal(config.cwd, ctx.agentCwd);
     assert.equal(config.timeoutMs, 1_500_000, "developer = 25min");
