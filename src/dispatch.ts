@@ -237,21 +237,47 @@ function runClaudeStreaming(opts: {
   env: NodeJS.ProcessEnv;
 }): Promise<StreamResult> {
   return new Promise((resolve, reject) => {
-    // Spawn claude directly with argv; pipe the prompt file via stdin.
-    // Previously used `bash -c "cat ${promptFile} | claude ..."` which is
-    // fragile under any change that lets user-influenced text reach
-    // promptFile/allowedTools/systemPromptFile. argv-based spawn closes
-    // the entire shell-quoting surface (review issue #8/#22).
-    const child = spawn("claude", [
-      "-p",
-      "--verbose",
-      "--output-format", "stream-json",
-      "--model", opts.model,
-      "--effort", opts.effort,
-      "--max-turns", String(opts.maxTurns),
-      "--allowedTools", opts.allowedTools,
-      "--append-system-prompt-file", opts.systemPromptFile,
-    ], {
+    // Phase C cutover (2026-05-14, pyrycode/pyrycode#329): default-spawn
+    // `pyry agent-run` instead of `claude -p`. Both produce stream-json on
+    // stdout consumed identically by the parser below. Pyry agent-run reads
+    // the prompt from --prompt-file (not stdin) and requires --workdir as
+    // an explicit flag; flag names also shift to kebab-case. Rollback:
+    // set PYRY_USE_LEGACY_CLAUDE=1 in the dispatcher's env (e.g., in the
+    // fork's .env) to fall back to `claude -p`.
+    //
+    // Both spawns use argv-only (no shell). Pre-cutover this closed the
+    // shell-quoting surface (review issue #8/#22); the property holds for
+    // pyry agent-run unchanged.
+    const useLegacyClaude = process.env.PYRY_USE_LEGACY_CLAUDE === "1";
+    let bin: string;
+    let args: string[];
+    if (useLegacyClaude) {
+      bin = "claude";
+      args = [
+        "-p",
+        "--verbose",
+        "--output-format", "stream-json",
+        "--model", opts.model,
+        "--effort", opts.effort,
+        "--max-turns", String(opts.maxTurns),
+        "--allowedTools", opts.allowedTools,
+        "--append-system-prompt-file", opts.systemPromptFile,
+      ];
+    } else {
+      bin = "pyry";
+      args = [
+        "agent-run",
+        "--output-format", "stream-json",
+        "--model", opts.model,
+        "--effort", opts.effort,
+        "--max-turns", String(opts.maxTurns),
+        "--allowed-tools", opts.allowedTools,
+        "--system-prompt-file", opts.systemPromptFile,
+        "--prompt-file", opts.promptFile,
+        "--workdir", opts.cwd,
+      ];
+    }
+    const child = spawn(bin, args, {
       cwd: opts.cwd,
       env: opts.env,
       stdio: ["pipe", "pipe", "pipe"],
@@ -267,16 +293,22 @@ function runClaudeStreaming(opts: {
       child.kill("SIGTERM");
     }, opts.timeoutMs);
 
-    // Pipe the prompt file content into claude's stdin, then close. Replaces
-    // the prior `bash -c "cat ${file} | claude ..."` which made promptFile
-    // pass through a shell quoting layer.
-    const promptStream = createReadStream(opts.promptFile);
-    promptStream.pipe(child.stdin!);
-    promptStream.on("error", (err) => {
-      clearTimeout(timer);
-      child.kill("SIGTERM");
-      reject(err);
-    });
+    if (useLegacyClaude) {
+      // Pipe the prompt file content into claude's stdin, then close. Replaces
+      // the prior `bash -c "cat ${file} | claude ..."` which made promptFile
+      // pass through a shell quoting layer.
+      const promptStream = createReadStream(opts.promptFile);
+      promptStream.pipe(child.stdin!);
+      promptStream.on("error", (err) => {
+        clearTimeout(timer);
+        child.kill("SIGTERM");
+        reject(err);
+      });
+    } else {
+      // pyry agent-run reads --prompt-file directly from disk; close stdin
+      // so the child doesn't wait for input that won't come.
+      child.stdin!.end();
+    }
 
     child.stdout!.on("data", (chunk: Buffer) => {
       buffer += chunk.toString();
