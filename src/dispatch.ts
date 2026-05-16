@@ -1217,9 +1217,12 @@ export async function prepareAgentSpawn(
   // Figma read tools enable UI-anchored ticket flow: architect calls get_design_context
   // + get_screenshot while writing the spec; developer follows the inlined figma-implement-design
   // workflow before writing UI code; code-review verifies visual fidelity via screenshot.
-  // Write tools (use_figma, generate_diagram) deliberately excluded — agents read Figma, never
-  // modify it. Per-agent prescriptions in each fork's <role>/CLAUDE.md gate actual usage.
-  const baseTools = "Bash,Read,Write,Edit,Glob,Grep,TodoWrite,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status,mcp__context7__resolve-library-id,mcp__context7__query-docs,mcp__codegraph__codegraph_search,mcp__codegraph__codegraph_callers,mcp__codegraph__codegraph_callees,mcp__codegraph__codegraph_impact,mcp__codegraph__codegraph_node,mcp__codegraph__codegraph_context,mcp__codegraph__codegraph_files,mcp__codegraph__codegraph_status,mcp__plugin_figma_figma__get_design_context,mcp__plugin_figma_figma__get_screenshot,mcp__plugin_figma_figma__get_metadata";
+  // get_variable_defs + search_design_system added 2026-05-16 for design-token tickets (e.g. mobile
+  // #119 Warning color slot) where the architect needs to read variable mode values that aren't
+  // visible via get_design_context. Write tools (use_figma, generate_diagram) deliberately excluded
+  // — agents read Figma, never modify it. Per-agent prescriptions in each fork's <role>/CLAUDE.md
+  // gate actual usage.
+  const baseTools = "Bash,Read,Write,Edit,Glob,Grep,TodoWrite,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status,mcp__context7__resolve-library-id,mcp__context7__query-docs,mcp__codegraph__codegraph_search,mcp__codegraph__codegraph_callers,mcp__codegraph__codegraph_callees,mcp__codegraph__codegraph_impact,mcp__codegraph__codegraph_node,mcp__codegraph__codegraph_context,mcp__codegraph__codegraph_files,mcp__codegraph__codegraph_status,mcp__plugin_figma_figma__get_design_context,mcp__plugin_figma_figma__get_screenshot,mcp__plugin_figma_figma__get_metadata,mcp__plugin_figma_figma__get_variable_defs,mcp__plugin_figma_figma__search_design_system";
   const needsAgent = ["architect", "code-review"].includes(agent.name);
   let allowedTools = baseTools;
   if (needsAgent) allowedTools += ",Agent";

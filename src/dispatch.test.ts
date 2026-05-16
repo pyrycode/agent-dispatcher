@@ -969,6 +969,14 @@ describe("prepareAgentSpawn", () => {
       "developer must have Figma get_metadata for truncation-fallback to per-child fetch",
     );
     assert.ok(
+      config.allowedTools.includes("mcp__plugin_figma_figma__get_variable_defs"),
+      "developer must have Figma get_variable_defs for design-token tickets (variable mode values)",
+    );
+    assert.ok(
+      config.allowedTools.includes("mcp__plugin_figma_figma__search_design_system"),
+      "developer must have Figma search_design_system for finding components/variables/styles by name",
+    );
+    assert.ok(
       !config.allowedTools.includes("mcp__plugin_figma_figma__use_figma"),
       "developer must NOT have Figma write tools — read-only access",
     );
