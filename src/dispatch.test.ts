@@ -226,6 +226,9 @@ export function makeMockDeps(opts: MockDepsOptions = {}): { deps: DispatchDeps; 
     usage: { input_tokens: 100, output_tokens: 200 },
     terminalReason: "stop",
     rawResult: {},
+    hadPermissionDenial: false,
+    deniedOpContent: null,
+    lastAssistantText: null,
   };
   const streamResolver = opts.streamResult ?? defaultStream;
   const mockRunClaudeStreaming = (async (...args: any[]) => {
@@ -1163,6 +1166,9 @@ function streamResult(overrides: Partial<StreamResult> = {}): StreamResult {
     usage: {},
     terminalReason: "stop",
     rawResult: {},
+    hadPermissionDenial: false,
+    deniedOpContent: null,
+    lastAssistantText: null,
     ...overrides,
   };
 }
@@ -1311,6 +1317,139 @@ describe("handleAgentResultErrors", () => {
     // for max_turns; same for safer-salvage).
     assert.equal(calls.exec.filter(c => c.cmd.includes("gh pr list")).length, 0);
     assert.equal(calls.exec.filter(c => c.cmd.includes("git status")).length, 0);
+  });
+
+  // ===================================================================
+  // Permission-denial salvage (#8 Layer 2)
+  // ===================================================================
+  //
+  // Covers the salvage routing when `hadPermissionDenial` is set on the
+  // stream result. Two paths: clean+dirty WIP → draft PR + label +
+  // comment; no-WIP-or-failing-gates → label + comment only (no PR
+  // because we don't ship broken/empty drafts).
+
+  test("hadPermissionDenial=true + dirty WIP + clean gates → draft PR + error:<agent>:permission_denied label + diagnostic comment", async () => {
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 310, title: "ticket title" },
+      mockOptions: {
+        execImpls: {
+          // Salvage path probes git status + runs build gates + git
+          // add/commit + push. Default success across the board.
+          "git status --porcelain": () => "M file.go\n",
+        },
+      },
+    });
+
+    const saferSalvaged = await handleAgentResultErrors(
+      streamResult({
+        isError: true,
+        terminalReason: "permission_denied",
+        hadPermissionDenial: true,
+        deniedOpContent: "Permission to use Bash with command `git reset --hard HEAD~1` has been denied.",
+        lastAssistantText: "I'm trying to undo the revert commit.",
+      }),
+      ctx,
+    );
+
+    assert.equal(saferSalvaged, true);
+    // Distinct label (NOT generic error:developer, NOT max_turns_salvaged).
+    assert.ok(
+      client.addLabelCalls.some((c) => c.label === "error:developer:permission_denied"),
+      "must apply error:developer:permission_denied",
+    );
+    assert.ok(
+      !client.addLabelCalls.some((c) => c.label === "error:developer"),
+      "must NOT apply generic error:developer",
+    );
+    assert.ok(
+      !client.addLabelCalls.some((c) => c.label === "error:max_turns_salvaged"),
+      "must NOT apply max_turns label (wrong failure mode)",
+    );
+    // Diagnostic comment quotes denied op + agent intent.
+    assert.equal(client.comments.length, 1);
+    assert.match(client.comments[0]!.body, /Salvaged from `permission_denied`/);
+    assert.match(client.comments[0]!.body, /git reset --hard/);
+    // gh pr create --draft was invoked.
+    const ghCalls = calls.spawn.filter((s) => s.cmd === "gh" && s.args[0] === "pr" && s.args.includes("--draft"));
+    assert.equal(ghCalls.length, 1);
+    assert.ok(ghCalls[0]!.args.includes("[permission_denied] ticket title"),
+      "draft PR title must carry the permission_denied prefix");
+    // Discord notify fires (💾 salvage shape).
+    assert.equal(calls.discord.length, 1);
+    assert.match(calls.discord[0]!, /💾.*developer.*permission-denied salvaged/);
+  });
+
+  test("hadPermissionDenial=true + clean worktree → label + diagnostic comment, NO draft PR", async () => {
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 311 },
+      mockOptions: {
+        execImpls: {
+          "git status --porcelain": () => "",  // clean — no WIP to salvage
+        },
+      },
+    });
+
+    const saferSalvaged = await handleAgentResultErrors(
+      streamResult({
+        isError: true,
+        terminalReason: "permission_denied",
+        hadPermissionDenial: true,
+        deniedOpContent: "Permission to use Bash with command `git push --force` has been denied.",
+        lastAssistantText: "Force-pushing to clean up history.",
+      }),
+      ctx,
+    );
+
+    assert.equal(saferSalvaged, true, "salvage 'succeeds' even when there's nothing to ship — label + comment is the recovery");
+    assert.ok(
+      client.addLabelCalls.some((c) => c.label === "error:developer:permission_denied"),
+    );
+    // No draft PR was opened (nothing to ship).
+    const ghCalls = calls.spawn.filter((s) => s.cmd === "gh" && s.args[0] === "pr" && s.args.includes("--draft"));
+    assert.equal(ghCalls.length, 0, "must not open a draft PR when worktree is clean");
+    // Comment explains the no-PR outcome + quotes the denied op.
+    assert.equal(client.comments.length, 1);
+    assert.match(client.comments[0]!.body, /Permission Denied — agent halted/);
+    assert.match(client.comments[0]!.body, /git push --force/);
+    assert.match(client.comments[0]!.body, /Worktree was clean/);
+    // Discord notify fires with the no-salvage variant.
+    assert.equal(calls.discord.length, 1);
+    assert.match(calls.discord[0]!, /⛔.*permission-denied/);
+  });
+
+  test("hadPermissionDenial=true runs salvage BEFORE max_turns paths (permission_denied wins routing)", async () => {
+    // Defensive: if the stream emitted both a max_turns terminal AND a
+    // denial earlier, route as permission_denied. The max_turns paths
+    // assume a normal-shutdown stream; permission denial overrides.
+    const { ctx, client } = makeTestContext({
+      item: { issueNumber: 312 },
+      mockOptions: {
+        execImpls: {
+          "git status --porcelain": () => "",
+          // If max_turns path ran, it would probe gh pr list. Assert
+          // below that it didn't.
+          "gh pr list --head": () => "[]",
+        },
+      },
+    });
+
+    await handleAgentResultErrors(
+      streamResult({
+        isError: true,
+        terminalReason: "max_turns",  // would normally route to max_turns salvage
+        hadPermissionDenial: true,    // but denial wins
+        deniedOpContent: "Permission to use Bash with command `rm -rf /tmp/foo` has been denied.",
+      }),
+      ctx,
+    );
+
+    assert.ok(
+      client.addLabelCalls.some((c) => c.label === "error:developer:permission_denied"),
+      "must apply permission_denied label, not max_turns_salvaged",
+    );
+    assert.ok(
+      !client.addLabelCalls.some((c) => c.label === "error:max_turns_salvaged"),
+    );
   });
 });
 

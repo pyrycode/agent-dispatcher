@@ -7,6 +7,8 @@ import { config } from "dotenv";
 import { GitHubProjectClient } from "./github.js";
 import { AGENTS, type AgentConfig, type ProjectItem } from "./types.js";
 import {
+  advancePermissionDenialState,
+  initPermissionDenialState,
   maxTurnsFor,
   parseSalvageGates,
   ResourceExhaustedError,
@@ -189,6 +191,22 @@ export interface StreamResult {
   usage: Record<string, unknown>;
   terminalReason: string;
   rawResult: Record<string, unknown>;
+  /**
+   * True when the dispatcher detected a permission-denial event in the
+   * stream (Layer 2 of agent-dispatcher#8). Threaded into
+   * `handleAgentResultErrors` so it can apply the distinct
+   * `error:<agent>:permission_denied` label + tailored salvage comment.
+   */
+  hadPermissionDenial: boolean;
+  /** The `tool_result.content` of the first permission denial — typically
+   *  `"Permission to use Bash with command <cmd> has been denied."`.
+   *  Null when no denial fired. Used to quote the denied op in the
+   *  diagnostic comment. */
+  deniedOpContent: string | null;
+  /** Last assistant text block before the denial / before stream end.
+   *  Captures the agent's intent for the diagnostic comment. Null when
+   *  no text was emitted (rare). */
+  lastAssistantText: string | null;
 }
 
 function logStreamMessage(logFile: string, msg: Record<string, unknown>): void {
@@ -297,12 +315,38 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
     let buffer = "";
     let resultMsg: Record<string, unknown> | null = null;
     let timedOut = false;
+    // Watchdog state for the permission-denial Layer 2 detector
+    // (agent-dispatcher#8). See `advancePermissionDenialState` for the
+    // state-machine semantics.
+    let denialState = initPermissionDenialState();
+    let forceExitTimer: NodeJS.Timeout | null = null;
 
     const timer = setTimeout(() => {
       timedOut = true;
       appendFileSync(opts.logFile, `\n⏰ TIMEOUT — killing agent after ${opts.timeoutMs / 1000}s\n`);
       child.kill("SIGTERM");
     }, opts.timeoutMs);
+
+    const handleWatchdogAction = (action: ReturnType<typeof advancePermissionDenialState>["action"]) => {
+      if (action === "logDenial") {
+        const ts = new Date().toISOString();
+        const snippet = (denialState.deniedContent ?? "").slice(0, 200);
+        appendFileSync(opts.logFile, `[${ts}] ⛔ PERMISSION DENIED — ${snippet}\n`);
+        console.log(`   ⛔ Permission denied: ${snippet.slice(0, 120)}`);
+      } else if (action === "forceExit") {
+        // Layer 1 missed (agent tried a workaround). Layer 2 enforces:
+        // SIGTERM with a 2s grace window before SIGKILL.
+        if (forceExitTimer) return; // already firing
+        const ts = new Date().toISOString();
+        appendFileSync(opts.logFile, `[${ts}] 🛑 FORCE-EXIT — agent attempted workaround after permission denial; sending SIGTERM (2s grace before SIGKILL)\n`);
+        console.log("   🛑 Force-exit after denial workaround attempt (SIGTERM)");
+        child.kill("SIGTERM");
+        forceExitTimer = setTimeout(() => {
+          appendFileSync(opts.logFile, `[${new Date().toISOString()}] 🛑 FORCE-EXIT — grace expired, sending SIGKILL\n`);
+          try { child.kill("SIGKILL"); } catch { /* already dead */ }
+        }, 2000);
+      }
+    };
 
     if (useLegacyClaude) {
       // Pipe the prompt file content into claude's stdin, then close. Replaces
@@ -332,6 +376,12 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
           const msg = JSON.parse(line);
           logStreamMessage(opts.logFile, msg);
           if (msg.type === "result") resultMsg = msg;
+          // Drive the Layer 2 denial watchdog. State transitions are
+          // pure; only side effects (log lines, SIGTERM) go through
+          // handleWatchdogAction.
+          const advanced = advancePermissionDenialState(denialState, msg);
+          denialState = advanced.state;
+          handleWatchdogAction(advanced.action);
         } catch {
           appendFileSync(opts.logFile, `[stream] ${line.slice(0, 500)}\n`);
         }
@@ -344,6 +394,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
 
     child.on("close", (code) => {
       clearTimeout(timer);
+      if (forceExitTimer) clearTimeout(forceExitTimer);
 
       // Process remaining buffer
       if (buffer.trim()) {
@@ -351,6 +402,15 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
           const msg = JSON.parse(buffer);
           logStreamMessage(opts.logFile, msg);
           if (msg.type === "result") resultMsg = msg;
+          const advanced = advancePermissionDenialState(denialState, msg);
+          denialState = advanced.state;
+          // Tail-buffer denial: log only; no force-exit (child has already
+          // exited or is mid-exit). The state still threads through to
+          // hadPermissionDenial so downstream applies the right label.
+          if (advanced.action === "logDenial") {
+            const ts = new Date().toISOString();
+            appendFileSync(opts.logFile, `[${ts}] ⛔ PERMISSION DENIED (tail) — ${(denialState.deniedContent ?? "").slice(0, 200)}\n`);
+          }
         } catch { /* partial JSON, already logged via stream */ }
       }
 
@@ -366,6 +426,28 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
           usage: r.usage || {},
           terminalReason: r.terminal_reason || "",
           rawResult: r,
+          hadPermissionDenial: denialState.hadPermissionDenial,
+          deniedOpContent: denialState.deniedContent,
+          lastAssistantText: denialState.lastAssistantText,
+        });
+      } else if (denialState.hadPermissionDenial) {
+        // Force-exit produced no `result` event — synthesize a
+        // permission-denied "result" so handleAgentResultErrors can
+        // route to the new salvage path instead of throwing into the
+        // generic outer catch (which would label `error:<agent>` only).
+        resolve({
+          output: denialState.lastAssistantText ?? "",
+          sessionId: "",
+          isError: true,
+          numTurns: 0,
+          totalCostUsd: 0,
+          durationMs: 0,
+          usage: {},
+          terminalReason: "permission_denied",
+          rawResult: {},
+          hadPermissionDenial: true,
+          deniedOpContent: denialState.deniedContent,
+          lastAssistantText: denialState.lastAssistantText,
         });
       } else if (timedOut) {
         reject(new Error(`Agent timed out after ${opts.timeoutMs / 1000}s`));
@@ -730,6 +812,196 @@ async function attemptSaferSalvage(opts: {
   } catch (e) {
     console.warn(`   ⚠️  Safer salvage attempt failed: ${e}`);
     writeLog(opts.logFile, "SAFER_SALVAGE_FAILED", String(e));
+    return false;
+  }
+}
+
+/**
+ * Permission-denial salvage (#8 Layer 2 sibling of `attemptSaferSalvage`).
+ *
+ * Fires after the stream watchdog has terminated the agent (or the agent
+ * voluntarily ended its turn per Layer 1's CLAUDE.md rule) following a
+ * dispatcher permission denial. Same git+gh shape as `attemptSaferSalvage`
+ * — commit, push, draft PR — but with permission-denied-specific label
+ * (`error:<agent>:permission_denied`) and comment text that names the
+ * denied op + the agent's intent.
+ *
+ * Returns true if salvage succeeded (caller suppresses the throw + the
+ * normal success-path labelling). Returns false when there's nothing to
+ * salvage (clean worktree, build gates failing, gh/git failures) — caller
+ * falls through to the generic error path.
+ *
+ * Out of scope (intentionally lighter than `attemptSaferSalvage`):
+ * `shouldAttemptSafeSalvage`'s `terminalReason === "max_turns"` gate is
+ * skipped — permission-denied is its own terminal reason. Build gates
+ * (vet/build) still gate the salvage so we don't ship broken WIP.
+ */
+async function attemptPermissionDenialSalvage(opts: {
+  agentCwd: string;
+  branchName: string;
+  agent: AgentConfig;
+  item: ProjectItem;
+  streamResult: StreamResult;
+  client: DispatchClient;
+  logFile: string;
+  deps: DispatchDeps;
+}): Promise<boolean> {
+  const { execSync, spawnSync, notifyDiscord } = opts.deps;
+  const label = `error:${opts.agent.name}:permission_denied`;
+  try {
+    const dirty = execSync(`git status --porcelain`, {
+      cwd: opts.agentCwd, encoding: "utf-8", timeout: 15_000,
+    }).toString();
+
+    // Run salvage build gates (same envelope as max_turns salvage).
+    // Permission denial without clean code → don't ship a broken draft;
+    // post the label + comment and exit so the operator is alerted.
+    const gateExitCodes: number[] = [];
+    for (const gate of salvageGates) {
+      let exitCode = 0;
+      try {
+        execSync(gate, { cwd: opts.agentCwd, stdio: "pipe", timeout: 120_000 });
+      } catch (e: any) {
+        exitCode = typeof e.status === "number" ? e.status : 1;
+      }
+      gateExitCodes.push(exitCode);
+    }
+    const gatesPass = gateExitCodes.every((c) => c === 0);
+    const hasDirty = dirty.trim().length > 0;
+
+    // Apply label even when there's nothing to commit — the operator
+    // still needs the signal that a permission denial happened. Order:
+    // label first (the safety primitive — blocks redispatch) before any
+    // PR work that might fail mid-flight.
+    try {
+      await opts.client.addLabel(opts.item.issueNumber, label);
+    } catch (e) {
+      // Label is the load-bearing signal. If GitHub is flaky during
+      // recovery, bail to the generic error path (the outer catch will
+      // try `error:<agent>` as a fallback).
+      throw new Error(`addLabel failed (permission-denial salvage cannot proceed safely without the global block): ${e}`);
+    }
+
+    const deniedOp = (opts.streamResult.deniedOpContent ?? "").slice(0, 500) || "(unknown — denied content not captured)";
+    const intent = (opts.streamResult.lastAssistantText ?? "").slice(-1500) || "(agent did not emit a text message before the denial)";
+
+    if (!hasDirty || !gatesPass) {
+      // No code to ship as a draft PR. Still post the diagnostic comment
+      // — the label is set; the operator unblocks redispatch after review.
+      const gateSummary = salvageGates.length === 0
+        ? "no gates configured"
+        : salvageGates.map((g, i) => `\`${g}\`=${gateExitCodes[i]}`).join(" + ");
+      try {
+        await opts.client.addComment(
+          opts.item.issueNumber,
+          [
+            `## ⛔ Permission Denied — agent halted`,
+            ``,
+            `The ${opts.agent.name} agent attempted a dispatcher-gated operation that was denied. ${hasDirty ? `Build gates (${gateSummary}) did not pass — refusing to ship broken WIP as a salvage PR.` : "Worktree was clean — no work to salvage as a draft PR."}`,
+            ``,
+            `**Denied operation:**`,
+            "```",
+            deniedOp,
+            "```",
+            ``,
+            `**Agent's intent (last message before denial):**`,
+            "```",
+            intent,
+            "```",
+            ``,
+            `Label \`${label}\` is set; the ticket does **not** auto-advance. Operator decides whether the policy or the agent's approach needs adjustment, then strips the label to re-queue.`,
+          ].join("\n"),
+        );
+      } catch (e) { console.warn(`   ⚠️  Failed to post permission-denial comment: ${e}`); }
+
+      writeLog(opts.logFile, "PERMISSION_DENIED_NO_SALVAGE",
+        `Label set; no draft PR (dirty=${hasDirty}, gates=${gateExitCodes.join(",")})`);
+      console.log(`   ⛔ Permission denied for #${opts.item.issueNumber} — label set, no salvage PR`);
+
+      await notifyDiscord(`⛔ **${opts.agent.name}** permission-denied on #${opts.item.issueNumber}: ${opts.item.title}\n${opts.item.url}\nNeeds human triage.`);
+      return true;
+    }
+
+    // Clean WIP exists and gates pass → commit + push + draft PR.
+    execSync(`git add -A`, { cwd: opts.agentCwd, stdio: "pipe", timeout: 15_000 });
+    const commitResult = spawnSync(
+      "git",
+      [
+        "commit",
+        "-m", `WIP: permission-denial salvage for #${opts.item.issueNumber}`,
+        "-m", `Auto-committed by dispatcher after the ${opts.agent.name} agent hit a permission denial. Build was clean; work preserved as draft PR for human triage.`,
+      ],
+      { cwd: opts.agentCwd, stdio: "pipe", timeout: 15_000 },
+    );
+    if (commitResult.status !== 0) {
+      throw new Error(`git commit failed: ${commitResult.stderr?.toString() || "unknown"}`);
+    }
+    const pushResult = spawnSync(
+      "git", ["push", "-u", "origin", opts.branchName],
+      { cwd: opts.agentCwd, stdio: "pipe", timeout: 30_000 },
+    );
+    if (pushResult.status !== 0) {
+      throw new Error(`git push failed: ${pushResult.stderr?.toString() || "unknown"}`);
+    }
+
+    const prBody = [
+      `## Auto-salvaged from \`permission_denied\``,
+      ``,
+      `The **${opts.agent.name}** agent on #${opts.item.issueNumber} hit a dispatcher permission denial. The dispatcher auto-committed the uncommitted changes and opened this **draft** PR for human triage.`,
+      ``,
+      `**Denied operation:**`,
+      "```",
+      deniedOp,
+      "```",
+      ``,
+      `**Agent's intent (last text message):**`,
+      "```",
+      intent,
+      "```",
+      ``,
+      `**Build status at salvage:** clean (${salvageGates.length === 0 ? "no gates configured" : salvageGates.map((g) => `\`${g}\``).join(" + ") + " all passed"}).`,
+      ``,
+      `**To investigate:**`,
+      `- Branch: \`${opts.branchName}\``,
+      `- Issue: ${opts.item.url}`,
+      `- Operator question: does the policy need updating, or should the agent's approach change?`,
+      ``,
+      `This PR is a **draft** — auto-merge is disabled until a reviewer marks it ready (or closes it). Ticket label \`${label}\` indicates triage required.`,
+      ``,
+      `Closes #${opts.item.issueNumber}`,
+    ].join("\n");
+
+    const prResult = spawnSync(
+      "gh",
+      [
+        "pr", "create", "--draft",
+        "--title", `[permission_denied] ${opts.item.title}`,
+        "--head", opts.branchName,
+        "--base", defaultBranch,
+        "--body-file", "-",
+      ],
+      { cwd: opts.agentCwd, stdio: ["pipe", "pipe", "pipe"], input: prBody, timeout: 30_000 },
+    );
+    if (prResult.status !== 0) {
+      throw new Error(`gh pr create failed (label was set; ticket is blocked, recover manually): ${prResult.stderr?.toString() || "unknown"}`);
+    }
+
+    try {
+      await opts.client.addComment(
+        opts.item.issueNumber,
+        `## ⛔ Salvaged from \`permission_denied\`\n\nThe ${opts.agent.name} agent hit a dispatcher permission denial. The dispatcher auto-committed the uncommitted changes and opened a draft PR for human triage.\n\n**Denied operation:** \`${deniedOp.slice(0, 200)}\`\n\nLabel \`${label}\` is set; the ticket does **not** auto-advance.\n\n**Reviewer:** check the draft PR + decide if the policy should change, the agent's approach should change, or the salvaged work is enough to ship as-is (mark draft ready).`,
+      );
+    } catch (e) { console.warn(`   ⚠️  Failed to post permission-denial salvage comment: ${e}`); }
+
+    writeLog(opts.logFile, "PERMISSION_DENIED_SALVAGE",
+      `Committed + pushed + draft PR opened for #${opts.item.issueNumber}; denied op=${deniedOp.slice(0, 100)}`);
+    console.log(`   💾 Permission-denial salvage: draft PR opened for #${opts.item.issueNumber}, label ${label} set`);
+
+    await notifyDiscord(`💾 **${opts.agent.name}** permission-denied salvaged on #${opts.item.issueNumber}: ${opts.item.title}\n${opts.item.url}\nDraft PR opened — needs human triage.`);
+    return true;
+  } catch (e) {
+    console.warn(`   ⚠️  Permission-denial salvage attempt failed: ${e}`);
+    writeLog(opts.logFile, "PERMISSION_DENIED_SALVAGE_FAILED", String(e));
     return false;
   }
 }
@@ -1338,6 +1610,26 @@ export async function handleAgentResultErrors(
   const { execSync } = ctx.deps;
   let salvaged = false;
   let saferSalvaged = false;
+
+  // Permission-denial salvage (#8 Layer 2). Checked BEFORE max_turns
+  // paths because hadPermissionDenial may co-occur with terminalReason
+  // values like "permission_denied" (synthesized when force-exit fired
+  // and no `result` event arrived) OR with a normal "stop" if Layer 1's
+  // clean exit ran and the stream wound down. Either way, the denial
+  // shape is the right routing signal.
+  if (streamResult.hadPermissionDenial
+      && useWorktree
+      && item.issueNumber > 0) {
+    const ok = await attemptPermissionDenialSalvage({
+      agentCwd, branchName, agent, item,
+      streamResult, client, logFile,
+      deps: ctx.deps,
+    });
+    if (ok) {
+      saferSalvaged = true;
+      salvaged = true;
+    }
+  }
 
   // Special case: if the agent hit max_turns but already created a PR, treat as success.
   // The agent likely finished the work and ran out of turns on cleanup (todo updates, etc.).

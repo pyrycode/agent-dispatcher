@@ -523,3 +523,178 @@ export async function retrySpawnOnTransientError<T>(
   }
   throw new ResourceExhaustedError(lastErrno, max);
 }
+
+// --------- Permission-denial detection + watchdog (#8 Layer 2) ---------
+
+/**
+ * True iff `msg` is a claude stream-json `user` event carrying a
+ * permission-denied `tool_result` from the dispatcher's tool-call gate.
+ *
+ * Claude emits these in a fixed shape when a Bash tool call hits the
+ * dispatcher's allowlist denial:
+ *
+ *   { "type": "user", "message": { "role": "user", "content": [{
+ *       "type": "tool_result",
+ *       "is_error": true,
+ *       "content": "Permission to use Bash with command <cmd> has been denied.",
+ *       "tool_use_id": "..."
+ *   }]}}
+ *
+ * Detection is the conjunction of three independent fields (type,
+ * is_error, substring) — false-positive risk is very low. Substring
+ * `"Permission to use"` AND `"has been denied"` is claude-generated
+ * (not user-influenceable in this position), so user-supplied content
+ * cannot trip it.
+ *
+ * Returns the `tool_result.content` string when matched (so the caller
+ * can quote the denied operation back to the operator), or null.
+ *
+ * Source: pyrycode/pyrycode#398 JSONL trace (2026-05-15 overnight).
+ */
+export function detectPermissionDenial(msg: unknown): { content: string } | null {
+  if (!msg || typeof msg !== "object") return null;
+  const m = msg as Record<string, unknown>;
+  if (m.type !== "user") return null;
+  const message = m.message as Record<string, unknown> | undefined;
+  if (!message || typeof message !== "object") return null;
+  const content = message.content;
+  if (!Array.isArray(content)) return null;
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    const b = block as Record<string, unknown>;
+    if (b.type !== "tool_result") continue;
+    if (b.is_error !== true) continue;
+    const blockContent = typeof b.content === "string" ? b.content : null;
+    if (!blockContent) continue;
+    if (
+      blockContent.includes("Permission to use") &&
+      blockContent.includes("has been denied")
+    ) {
+      return { content: blockContent };
+    }
+  }
+  return null;
+}
+
+/**
+ * Watchdog state for the permission-denial Layer 2 detector. Threaded
+ * through the stream-parsing loop as a pure state machine:
+ *
+ * - `hadPermissionDenial` flips true at the first denial and never
+ *   clears — downstream uses it to apply
+ *   `error:<agent>:permission_denied`.
+ * - `watchdogPending` flips true on detection and clears as soon as the
+ *   agent's next assistant event arrives. If that event is a `tool_use`
+ *   (workaround attempt), the state machine emits `forceExit` and the
+ *   driver SIGTERMs the child — Layer 1 missed; Layer 2 enforces the
+ *   stop. If it's text-only (clean Layer 1 exit), the watchdog clears
+ *   silently and the stream winds down on its own.
+ * - `deniedContent` captures the first denial's `tool_result.content`
+ *   so the post-run comment can quote the denied op back to the operator.
+ * - `lastAssistantText` is the most recent assistant text block (the
+ *   agent's "intent" — what it was trying to do). Captured for the
+ *   diagnostic comment.
+ */
+export interface PermissionDenialState {
+  hadPermissionDenial: boolean;
+  watchdogPending: boolean;
+  deniedContent: string | null;
+  lastAssistantText: string | null;
+}
+
+export function initPermissionDenialState(): PermissionDenialState {
+  return {
+    hadPermissionDenial: false,
+    watchdogPending: false,
+    deniedContent: null,
+    lastAssistantText: null,
+  };
+}
+
+/** Side-effect signal the stream-driver should perform after advancing
+ *  the state machine. Driver maps to: append log line, SIGTERM the
+ *  child, or no-op. */
+export type StreamWatchdogAction = "none" | "logDenial" | "forceExit";
+
+/**
+ * Advance the watchdog state machine on one parsed stream-json message.
+ *
+ * **Design choice (deviates from literal ticket text "force-exit on
+ * detection"):** the watchdog gives the agent one turn-boundary of grace
+ * to comply with Layer 1's CLAUDE.md rule (emit a single text message
+ * naming the denied op, then end the turn). Only if the next assistant
+ * event is *another* `tool_use` does the driver force-exit. A clean
+ * text-only message clears the watchdog silently and the stream winds
+ * down on its own.
+ *
+ * Rationale: a literal force-exit-on-first-denial bypasses Layer 1
+ * entirely — the agent never gets its clean-exit slot, and the
+ * dispatcher's "different fabric" safety net effectively replaces the
+ * stochastic rule instead of backing it up. The watchdog keeps Layer 2
+ * deterministic when Layer 1 fails while preserving Layer 1's value
+ * when it works.
+ *
+ * Pure: no I/O. Driver is responsible for the SIGTERM + 2s SIGKILL
+ * grace timer + log writes.
+ */
+export function advancePermissionDenialState(
+  state: PermissionDenialState,
+  msg: unknown,
+): { state: PermissionDenialState; action: StreamWatchdogAction } {
+  // Denial event always wins (even if it co-arrives with assistant text
+  // in the same parse window — which doesn't happen in claude's stream
+  // shape, but the check is defensive).
+  const denial = detectPermissionDenial(msg);
+  if (denial) {
+    return {
+      state: {
+        ...state,
+        hadPermissionDenial: true,
+        // First denial wins — keep the original op visible to the
+        // operator even if claude emits subsequent denials before
+        // force-exit lands.
+        deniedContent: state.deniedContent ?? denial.content,
+        watchdogPending: true,
+      },
+      action: "logDenial",
+    };
+  }
+
+  if (!msg || typeof msg !== "object") return { state, action: "none" };
+  const m = msg as Record<string, unknown>;
+  if (m.type !== "assistant") return { state, action: "none" };
+  const message = m.message as Record<string, unknown> | undefined;
+  const content = message?.content;
+  if (!Array.isArray(content)) return { state, action: "none" };
+
+  let sawToolUse = false;
+  let lastText: string | null = state.lastAssistantText;
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    const b = block as Record<string, unknown>;
+    if (b.type === "tool_use") sawToolUse = true;
+    if (b.type === "text" && typeof b.text === "string" && b.text.trim().length > 0) {
+      lastText = b.text;
+    }
+  }
+
+  if (state.watchdogPending && sawToolUse) {
+    // Workaround attempt — Layer 1 missed. Force-exit.
+    return {
+      state: { ...state, lastAssistantText: lastText, watchdogPending: false },
+      action: "forceExit",
+    };
+  }
+  if (state.watchdogPending && !sawToolUse) {
+    // Clean text-only emission — Layer 1 worked. Clear watchdog,
+    // stream winds down naturally.
+    return {
+      state: { ...state, lastAssistantText: lastText, watchdogPending: false },
+      action: "none",
+    };
+  }
+  return {
+    state: { ...state, lastAssistantText: lastText },
+    action: "none",
+  };
+}
