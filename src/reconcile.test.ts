@@ -144,6 +144,78 @@ describe("runAutoAdvance — cache invalidation", () => {
     assert.equal(client.updateItemStatusCalls[0]?.newStatus, "In Architecture");
     assert.equal(client.clearItemsCacheCalls, 1);
   });
+
+  test("blocked mid-pipeline ticket does NOT hold a capacity seat (the #10 deadlock fix)", async () => {
+    // The 2026-05-16 deadlock shape: #383 sits in "In Development"
+    // blocked-by #409 (still open). #409 sits in Backlog with
+    // `ready:po`, ready to advance into the pipeline. Pre-fix, #383
+    // consumed the only seat (PYRY_MAX_CONCURRENT=1) and #409 stayed
+    // in Backlog forever — mutual deadlock: #383 needs #409 to close,
+    // #409 needs the seat #383 holds.
+    //
+    // Post-fix: countPipelineInFlight excludes the blocked #383, so
+    // capacity = max(0, 1 - 0) = 1, and #409 advances out of Backlog.
+    const blocked = makeItem({
+      id: "item-383",
+      issueNumber: 383,
+      status: "In Development",
+      labels: ["size:s"],
+      blockedBy: [{ number: 409, state: "OPEN" }],
+    });
+    const blockingBacklog = makeItem({
+      id: "item-409",
+      issueNumber: 409,
+      status: "Backlog",
+      labels: ["ready:po", "size:xs"],
+    });
+    const client = new MockClient([blocked, blockingBacklog]);
+
+    await runAutoAdvance(client, 1);
+
+    // #409 advances into the pipeline. #383 stays parked (its `blockedBy`
+    // hasn't cleared yet; only #409 closing would clear it).
+    assert.equal(
+      client.updateItemStatusCalls.length, 1,
+      "exactly one advance — #409 out of Backlog (without the fix this would be 0)",
+    );
+    assert.equal(client.updateItemStatusCalls[0]?.itemId, "item-409");
+    assert.equal(client.updateItemStatusCalls[0]?.newStatus, "In Architecture");
+    // #383 was NOT moved (still blocked).
+    assert.ok(
+      !client.updateItemStatusCalls.some(c => c.itemId === "item-383"),
+      "blocked ticket stays where it is — clearing the blocker is the operator's job",
+    );
+  });
+
+  test("CLOSED blockers don't free the seat — only OPEN blockers parked the ticket in the first place", async () => {
+    // Counter-test: when a mid-pipeline ticket has only CLOSED blockers
+    // (e.g. the blocker closed and the ticket is back in active flow),
+    // it counts toward capacity normally. Verifies the fix's exclusion
+    // is keyed on OPEN, not on the mere presence of a blockedBy entry.
+    const midActive = makeItem({
+      id: "item-100",
+      issueNumber: 100,
+      status: "In Development",
+      labels: ["size:s"],
+      blockedBy: [{ number: 50, state: "CLOSED" }],  // blocker already closed
+    });
+    const backlog = makeItem({
+      id: "item-101",
+      issueNumber: 101,
+      status: "Backlog",
+      labels: ["ready:po", "size:s"],
+    });
+    const client = new MockClient([midActive, backlog]);
+
+    await runAutoAdvance(client, 1);
+
+    // #100 counts as in-flight (its blocker is closed → it's progressing).
+    // Capacity = max(0, 1 - 1) = 0 → #101 stays in Backlog.
+    assert.equal(
+      client.updateItemStatusCalls.length, 0,
+      "active mid-pipeline ticket (no OPEN blockers) consumes capacity — Backlog stays held",
+    );
+  });
 });
 
 describe("runReworkRouting — cache invalidation", () => {
