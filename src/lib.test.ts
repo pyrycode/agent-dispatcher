@@ -17,10 +17,13 @@ import assert from "node:assert/strict";
 
 import { AGENTS } from "./types.js";
 import {
+  advancePermissionDenialState,
   decideCodegraphHealth,
+  detectPermissionDenial,
   extractRateLimitInfo,
   findMissingAgentClaudeMds,
   findReadyPrNumber,
+  initPermissionDenialState,
   isRetryableSpawnError,
   MAX_SPAWN_ATTEMPTS,
   maxTurnsFor,
@@ -3396,6 +3399,247 @@ describe("retrySpawnOnTransientError", () => {
     );
     assert.equal(attempts, 3);
     assert.deepEqual(delays, [10, 20]);
+  });
+});
+
+// =====================================================================
+// detectPermissionDenial + advancePermissionDenialState (#8 Layer 2)
+// =====================================================================
+//
+// Pure state machine for the permission-denial watchdog. Covers the
+// detection predicate (conjunction across type/is_error/substring) and
+// the watchdog grace window — one turn-boundary after detection to let
+// Layer 1's CLAUDE.md rule fire, force-exit on workaround attempt.
+
+describe("detectPermissionDenial", () => {
+  /** Real shape from pyrycode/pyrycode#398 JSONL trace. */
+  const denialMsg = {
+    type: "user",
+    message: {
+      role: "user",
+      content: [{
+        type: "tool_result",
+        is_error: true,
+        content: "Permission to use Bash with command `git reset --hard HEAD~1` has been denied.",
+        tool_use_id: "toolu_01ABCD",
+      }],
+    },
+  };
+
+  test("real #398 denial fixture → match, returns full content string", () => {
+    const got = detectPermissionDenial(denialMsg);
+    assert.ok(got !== null);
+    assert.match(got!.content, /git reset --hard/);
+    assert.match(got!.content, /has been denied/);
+  });
+
+  test("denial with different command → still matches (substring conjunction is the rule, not the command)", () => {
+    const msg = {
+      type: "user",
+      message: { role: "user", content: [{
+        type: "tool_result", is_error: true,
+        content: "Permission to use Bash with command `rm -rf /` has been denied.",
+      }]},
+    };
+    assert.ok(detectPermissionDenial(msg) !== null);
+  });
+
+  test("user message but no tool_result block → no match", () => {
+    const msg = {
+      type: "user",
+      message: { role: "user", content: [{ type: "text", text: "Permission to use foo has been denied." }] },
+    };
+    assert.equal(detectPermissionDenial(msg), null);
+  });
+
+  test("tool_result but is_error=false → no match (success path)", () => {
+    const msg = {
+      type: "user",
+      message: { role: "user", content: [{
+        type: "tool_result", is_error: false,
+        content: "Permission to use Bash with command `ls` has been denied.",
+      }]},
+    };
+    assert.equal(detectPermissionDenial(msg), null);
+  });
+
+  test("tool_result with is_error=true but no denial substring → no match (generic Bash failure)", () => {
+    const msg = {
+      type: "user",
+      message: { role: "user", content: [{
+        type: "tool_result", is_error: true,
+        content: "fatal: not a git repository",
+      }]},
+    };
+    assert.equal(detectPermissionDenial(msg), null);
+  });
+
+  test("only one of the two substrings present → no match (conjunction is load-bearing)", () => {
+    const msg1 = {
+      type: "user",
+      message: { role: "user", content: [{
+        type: "tool_result", is_error: true,
+        content: "Permission to use Bash was revoked.",
+      }]},
+    };
+    assert.equal(detectPermissionDenial(msg1), null);
+    const msg2 = {
+      type: "user",
+      message: { role: "user", content: [{
+        type: "tool_result", is_error: true,
+        content: "Operation has been denied by the operator.",
+      }]},
+    };
+    assert.equal(detectPermissionDenial(msg2), null);
+  });
+
+  test("type=assistant → no match (denials are user-role tool_results)", () => {
+    const msg = {
+      type: "assistant",
+      message: { content: [{
+        type: "tool_result", is_error: true,
+        content: "Permission to use Bash has been denied.",
+      }]},
+    };
+    assert.equal(detectPermissionDenial(msg), null);
+  });
+
+  test("malformed / null / non-object inputs → no match (defensive)", () => {
+    assert.equal(detectPermissionDenial(null), null);
+    assert.equal(detectPermissionDenial(undefined), null);
+    assert.equal(detectPermissionDenial("user"), null);
+    assert.equal(detectPermissionDenial({ type: "user" }), null); // no message
+    assert.equal(detectPermissionDenial({ type: "user", message: { content: "not-an-array" } }), null);
+    assert.equal(detectPermissionDenial({ type: "user", message: { content: [null, undefined, "string"] } }), null);
+  });
+});
+
+describe("advancePermissionDenialState — watchdog state machine", () => {
+  const denialMsg = {
+    type: "user",
+    message: { role: "user", content: [{
+      type: "tool_result", is_error: true,
+      content: "Permission to use Bash with command `git reset --hard HEAD~1` has been denied.",
+    }]},
+  };
+  const toolUseMsg = (name = "Bash") => ({
+    type: "assistant",
+    message: { content: [{ type: "tool_use", name, input: { command: "echo hi" } }] },
+  });
+  const textMsg = (text: string) => ({
+    type: "assistant",
+    message: { content: [{ type: "text", text }] },
+  });
+  const mixedMsg = (text: string, toolName = "Bash") => ({
+    type: "assistant",
+    message: { content: [{ type: "text", text }, { type: "tool_use", name: toolName, input: {} }] },
+  });
+
+  test("initial state — no denial, no watchdog, no text", () => {
+    const s = initPermissionDenialState();
+    assert.deepEqual(s, {
+      hadPermissionDenial: false,
+      watchdogPending: false,
+      deniedContent: null,
+      lastAssistantText: null,
+    });
+  });
+
+  test("denial event → hadPermissionDenial+watchdogPending set, action=logDenial", () => {
+    const { state, action } = advancePermissionDenialState(initPermissionDenialState(), denialMsg);
+    assert.equal(state.hadPermissionDenial, true);
+    assert.equal(state.watchdogPending, true);
+    assert.match(state.deniedContent!, /git reset --hard/);
+    assert.equal(action, "logDenial");
+  });
+
+  test("first denial wins — second denial does NOT overwrite deniedContent", () => {
+    let s = initPermissionDenialState();
+    ({ state: s } = advancePermissionDenialState(s, denialMsg));
+    const secondDenial = {
+      type: "user",
+      message: { role: "user", content: [{
+        type: "tool_result", is_error: true,
+        content: "Permission to use Bash with command `git push --force` has been denied.",
+      }]},
+    };
+    ({ state: s } = advancePermissionDenialState(s, secondDenial));
+    assert.match(s.deniedContent!, /git reset --hard/);
+    assert.doesNotMatch(s.deniedContent!, /git push --force/);
+  });
+
+  test("tool_use BEFORE any denial → no action (normal stream); lastAssistantText unchanged from pure tool_use msg", () => {
+    const s0 = initPermissionDenialState();
+    const { state, action } = advancePermissionDenialState(s0, toolUseMsg("Bash"));
+    assert.equal(action, "none");
+    assert.equal(state.watchdogPending, false);
+    assert.equal(state.lastAssistantText, null); // tool_use without text doesn't update lastAssistantText
+  });
+
+  test("assistant text BEFORE denial → captured into lastAssistantText, no action", () => {
+    let s = initPermissionDenialState();
+    ({ state: s } = advancePermissionDenialState(s, textMsg("I'm going to undo the revert commit.")));
+    assert.equal(s.lastAssistantText, "I'm going to undo the revert commit.");
+    assert.equal(s.watchdogPending, false);
+  });
+
+  test("denial then tool_use → action=forceExit, watchdog clears, hadPermissionDenial stays true", () => {
+    let s = initPermissionDenialState();
+    ({ state: s } = advancePermissionDenialState(s, denialMsg));
+    assert.equal(s.watchdogPending, true);
+    const advanced = advancePermissionDenialState(s, toolUseMsg("Bash"));
+    assert.equal(advanced.action, "forceExit");
+    assert.equal(advanced.state.watchdogPending, false);
+    assert.equal(advanced.state.hadPermissionDenial, true, "denial flag persists past watchdog clear");
+  });
+
+  test("denial then text-only assistant → action=none (Layer 1 worked), watchdog clears, hadPermissionDenial stays true", () => {
+    let s = initPermissionDenialState();
+    ({ state: s } = advancePermissionDenialState(s, denialMsg));
+    const advanced = advancePermissionDenialState(s, textMsg(
+      "The dispatcher denied `git reset --hard HEAD~1`. I was trying to undo the revert commit. Stopping here per the absolute rule."
+    ));
+    assert.equal(advanced.action, "none", "clean text exit must NOT force-exit");
+    assert.equal(advanced.state.watchdogPending, false);
+    assert.equal(advanced.state.hadPermissionDenial, true);
+    assert.match(advanced.state.lastAssistantText!, /Stopping here/);
+  });
+
+  test("denial then mixed (text + tool_use) → action=forceExit (tool_use wins even with accompanying text)", () => {
+    // Defensive: an agent that emits "I'll work around this" + a Bash
+    // call in the same turn is still a workaround attempt.
+    let s = initPermissionDenialState();
+    ({ state: s } = advancePermissionDenialState(s, denialMsg));
+    const advanced = advancePermissionDenialState(s, mixedMsg("Let me try git revert instead", "Bash"));
+    assert.equal(advanced.action, "forceExit");
+    assert.equal(advanced.state.lastAssistantText, "Let me try git revert instead");
+  });
+
+  test("denial then unrelated message (non-assistant) → watchdog stays pending; assistant-text-or-tool-use is the only trigger", () => {
+    let s = initPermissionDenialState();
+    ({ state: s } = advancePermissionDenialState(s, denialMsg));
+    const sysMsg = { type: "system", session_id: "sess-001" };
+    const advanced = advancePermissionDenialState(s, sysMsg);
+    assert.equal(advanced.action, "none");
+    assert.equal(advanced.state.watchdogPending, true, "watchdog must NOT clear on non-assistant events");
+  });
+
+  test("empty / whitespace text doesn't overwrite lastAssistantText (preserves real intent)", () => {
+    let s = initPermissionDenialState();
+    ({ state: s } = advancePermissionDenialState(s, textMsg("Real intent.")));
+    ({ state: s } = advancePermissionDenialState(s, textMsg("   ")));
+    assert.equal(s.lastAssistantText, "Real intent.");
+  });
+
+  test("full sequence: text → denial → workaround tool_use → forceExit; state captures intent + denied op", () => {
+    let s = initPermissionDenialState();
+    ({ state: s } = advancePermissionDenialState(s, textMsg("Cleaning up the revert commit.")));
+    ({ state: s } = advancePermissionDenialState(s, denialMsg));
+    const advanced = advancePermissionDenialState(s, toolUseMsg("Bash"));
+    assert.equal(advanced.action, "forceExit");
+    assert.equal(advanced.state.hadPermissionDenial, true);
+    assert.match(advanced.state.deniedContent!, /git reset --hard/);
+    assert.equal(advanced.state.lastAssistantText, "Cleaning up the revert commit.");
   });
 });
 
