@@ -449,7 +449,7 @@ export function makeAgentConfig(overrides: Partial<AgentConfig> = {}): AgentConf
     name: "developer",
     column: "In Development",
     claudeMdPath: "developer/CLAUDE.md",
-    description: "Developer — implements Go code with tests",
+    description: "Developer — implements code with tests",
     usesWorktree: true,
     producesCommits: true,
     ...overrides,

@@ -105,7 +105,7 @@ export const AGENTS: AgentConfig[] = [
     name: "architect",
     column: "In Architecture",
     claudeMdPath: "architect/CLAUDE.md",
-    description: "System Architect — defines Go interfaces, data flows, concurrency patterns",
+    description: "System Architect — defines interfaces, data flows, concurrency patterns",
     usesWorktree: true, // writes spec to docs/specs/architecture/
     producesCommits: true, // commits the spec
   },
@@ -113,7 +113,7 @@ export const AGENTS: AgentConfig[] = [
     name: "developer",
     column: "In Development",
     claudeMdPath: "developer/CLAUDE.md",
-    description: "Developer — implements Go code with tests",
+    description: "Developer — implements code with tests",
     usesWorktree: true, // writes Go code + tests
     producesCommits: true, // commits implementation + tests
   },
@@ -121,7 +121,7 @@ export const AGENTS: AgentConfig[] = [
     name: "code-review",
     column: "In Code Review",
     claudeMdPath: "code-review/CLAUDE.md",
-    description: "Code Reviewer — reviews PRs for Go quality and correctness",
+    description: "Code Reviewer — reviews PRs for quality and correctness",
     usesWorktree: true, // reads code locally to review
     producesCommits: false, // PR comments only via `gh pr review`
   },
