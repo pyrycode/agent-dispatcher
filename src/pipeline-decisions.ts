@@ -92,17 +92,24 @@ export const MID_PIPELINE_COLUMNS: readonly string[] = [
  *     human action and shouldn't block unrelated work. Adding `error:*` is
  *     also the escape hatch for parking a normal-path ticket (e.g. a long
  *     human-gate hold where you want unrelated tickets to flow).
+ *   - tickets with an OPEN `blockedBy` dependency — they're parked, not
+ *     progressing. `hasOpenBlockers` correctly prevents the dispatcher
+ *     from picking them; without this exclusion they still held a
+ *     capacity seat, deadlocking Backlog promotion at MAX_CONCURRENT=1
+ *     when a blocker pair sits opposite each other (agent-dispatcher#10,
+ *     surfaced 2026-05-16 with pyrycode/pyrycode#383 blocked by #409).
  *
  * Pure function over the items the caller already collected from
  * MID_PIPELINE_COLUMNS — no I/O, no side effects, easy to unit-test.
  */
 export function countPipelineInFlight(
-  items: { issueNumber: number; labels: string[] }[],
+  items: { issueNumber: number; labels: string[]; blockedBy?: { number: number; state: "OPEN" | "CLOSED" }[] }[],
 ): number {
   return items.filter(
     item =>
       item.issueNumber > 0 &&
-      !item.labels.some(l => l.startsWith("error:")),
+      !item.labels.some(l => l.startsWith("error:")) &&
+      !hasOpenBlockers(item.blockedBy ?? []),
   ).length;
 }
 
@@ -110,9 +117,13 @@ export function countPipelineInFlight(
  * True if any item in the mid-pipeline column set counts as in-flight.
  * Thin wrapper over `countPipelineInFlight`; kept as a boolean alias
  * for callers that don't need the count.
+ *
+ * Inherits the blocker exclusion transparently — semantics shifted from
+ * "any non-errored mid-pipeline" to "any progressing mid-pipeline,"
+ * which is what every existing caller actually wants.
  */
 export function isPipelineInFlight(
-  items: { issueNumber: number; labels: string[] }[],
+  items: { issueNumber: number; labels: string[]; blockedBy?: { number: number; state: "OPEN" | "CLOSED" }[] }[],
 ): boolean {
   return countPipelineInFlight(items) > 0;
 }

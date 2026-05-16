@@ -1042,14 +1042,82 @@ describe("countPipelineInFlight", () => {
     );
   });
 
+  test("excludes tickets with OPEN blockers (the #10 deadlock fix)", () => {
+    // Surfaced 2026-05-16: pyrycode/pyrycode#383 in "In Development"
+    // blocked-by #409. `hasOpenBlockers` correctly prevents dispatch,
+    // but pre-fix the same ticket held a capacity seat — deadlocking
+    // Backlog promotion at MAX_CONCURRENT=1.
+    assert.equal(
+      countPipelineInFlight([
+        { issueNumber: 28, labels: ["ready:architect"] },
+        { issueNumber: 383, labels: ["size:s"], blockedBy: [{ number: 409, state: "OPEN" }] },
+      ]),
+      1,
+      "blocked ticket must not consume a pipeline seat",
+    );
+  });
+
+  test("CLOSED blockers do NOT exclude — only OPEN blockers park a ticket", () => {
+    // A blocker that already closed is no longer blocking; the ticket
+    // is back in active flow and should consume a seat.
+    assert.equal(
+      countPipelineInFlight([
+        { issueNumber: 28, labels: [], blockedBy: [{ number: 100, state: "CLOSED" }] },
+        { issueNumber: 29, labels: [], blockedBy: [{ number: 101, state: "CLOSED" }, { number: 102, state: "CLOSED" }] },
+      ]),
+      2,
+    );
+  });
+
+  test("mixed OPEN+CLOSED blockers → still excluded (any OPEN blocker parks the ticket)", () => {
+    // Inherits hasOpenBlockers semantics: one OPEN entry is enough.
+    assert.equal(
+      countPipelineInFlight([
+        { issueNumber: 383, labels: [], blockedBy: [{ number: 100, state: "CLOSED" }, { number: 409, state: "OPEN" }] },
+      ]),
+      0,
+    );
+  });
+
+  test("error:* AND blocked → still excluded (order-independent)", () => {
+    // Both exclusions stack; the ticket is excluded once even when
+    // both reasons apply.
+    assert.equal(
+      countPipelineInFlight([
+        { issueNumber: 383, labels: ["error:developer"], blockedBy: [{ number: 409, state: "OPEN" }] },
+        { issueNumber: 28, labels: [] },
+      ]),
+      1,
+    );
+  });
+
+  test("undefined blockedBy treated as no blockers (back-compat with pre-fix call sites)", () => {
+    // The shape was tightened with an optional field; existing callers
+    // that pass {issueNumber, labels} without blockedBy must keep
+    // counting as in-flight (they're not blocked).
+    assert.equal(
+      countPipelineInFlight([
+        { issueNumber: 28, labels: ["ready:architect"] },
+        { issueNumber: 29, labels: [], blockedBy: [] },
+      ]),
+      2,
+    );
+  });
+
   test("isPipelineInFlight is countPipelineInFlight > 0", () => {
     // Locks the alias relationship — boolean wrapper must agree with count.
-    const cases: { issueNumber: number; labels: string[] }[][] = [
+    const cases: { issueNumber: number; labels: string[]; blockedBy?: { number: number; state: "OPEN" | "CLOSED" }[] }[][] = [
       [],
       [{ issueNumber: 1, labels: [] }],
       [{ issueNumber: 99, labels: ["error:po"] }],
       [
         { issueNumber: 99, labels: ["error:po"] },
+        { issueNumber: 28, labels: [] },
+      ],
+      // #10 cases: blocker exclusion propagates to the boolean wrapper.
+      [{ issueNumber: 383, labels: [], blockedBy: [{ number: 409, state: "OPEN" }] }],
+      [
+        { issueNumber: 383, labels: [], blockedBy: [{ number: 409, state: "OPEN" }] },
         { issueNumber: 28, labels: [] },
       ],
     ];
