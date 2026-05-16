@@ -398,3 +398,128 @@ export function scrubSpawnEnv(parentEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   }
   return out;
 }
+
+// --------- Spawn retry on transient resource exhaustion ---------
+
+/**
+ * `posix_spawn` errnos that signal *temporary* resource pressure on the
+ * host — retrying after a short backoff almost always succeeds.
+ *
+ * - **EAGAIN** ("Resource temporarily unavailable"): typically RLIMIT_NPROC
+ *   exhaustion from accumulated zombie/leaked subprocesses. Bounded by
+ *   the time it takes the kernel to reap zombies / the operator to clear
+ *   the leak — minutes, not hours.
+ * - **ENOMEM** ("Cannot allocate memory"): host memory pressure. Same
+ *   pattern — transient, bounded.
+ *
+ * EMFILE/ENFILE (file descriptor exhaustion) are also transient but not
+ * yet observed; add when evidence shows up.
+ *
+ * Source: agent-dispatcher#9 (2026-05-15 22:51Z EAGAIN cascade — five PO
+ * spawns failed in a 17-second window with 485/4000 NPROC at the time of
+ * post-mortem, confirming transience).
+ */
+export const RETRYABLE_SPAWN_ERRNOS: ReadonlySet<string> = new Set([
+  "EAGAIN",
+  "ENOMEM",
+]);
+
+/**
+ * Default backoff schedule between failed spawn attempts, in ms.
+ *
+ * Five attempts total. Wait 1s after attempt 1 fails (before attempt 2),
+ * 2s before attempt 3, etc. The fifth (final) failure throws
+ * `ResourceExhaustedError` immediately — no terminal sleep, since there's
+ * no sixth attempt for it to delay.
+ *
+ * Worst-case wall-clock for the retry sequence: 1+2+4+8 = 15s of waits
+ * between five quick spawn failures. Generous enough to outwait a
+ * subprocess-reap cycle; short enough that an operator-visible "stuck"
+ * dispatch is rare.
+ */
+export const SPAWN_RETRY_DELAYS_MS: ReadonlyArray<number> = [1000, 2000, 4000, 8000];
+
+/** Total spawn attempts (including the first). */
+export const MAX_SPAWN_ATTEMPTS = 5;
+
+/**
+ * Thrown by `retrySpawnOnTransientError` when every attempt failed with
+ * a retryable errno. Distinct type so callers (handleDispatchError) can
+ * differentiate "couldn't even spawn" from "agent crashed mid-run" and
+ * apply a distinct label (`error:<agent>:resource_exhausted` vs
+ * `error:<agent>`).
+ */
+export class ResourceExhaustedError extends Error {
+  readonly errno: string;
+  readonly attempts: number;
+  constructor(errno: string, attempts: number) {
+    super(
+      `Failed to spawn agent process after ${attempts} retries (final errno: ${errno}). ` +
+        `Likely transient host resource exhaustion (RLIMIT_NPROC / available memory).`,
+    );
+    this.name = "ResourceExhaustedError";
+    this.errno = errno;
+    this.attempts = attempts;
+  }
+}
+
+/**
+ * True iff `err` looks like a Node `posix_spawn` failure with a
+ * retryable errno. Tolerates plain `Error` instances with a `.code`
+ * property (the shape Node throws on `child.on("error", ...)` for
+ * spawn failures) and unstructured/unknown values (returns false).
+ */
+export function isRetryableSpawnError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const code = (err as NodeJS.ErrnoException).code;
+  return typeof code === "string" && RETRYABLE_SPAWN_ERRNOS.has(code);
+}
+
+/**
+ * Run `attempt` up to `maxAttempts` times, retrying with bounded backoff
+ * when it rejects with a retryable spawn errno (EAGAIN/ENOMEM).
+ *
+ * Non-retryable errors propagate immediately — the caller's existing
+ * error path handles them as today. After every retryable attempt is
+ * exhausted, throws `ResourceExhaustedError` carrying the final errno.
+ *
+ * Pure logic; the caller injects the side-effecting `attempt` (spawn +
+ * stream consumption) and optional `sleep` / `logger` for testability.
+ *
+ * @param opts.delaysMs - Backoff schedule. `delaysMs[i-1]` is the wait
+ *   after attempt `i` fails (before attempt `i+1`). The final attempt's
+ *   failure throws without sleeping.
+ * @param opts.maxAttempts - Total attempts including the first.
+ * @param opts.sleep - Override for testability. Defaults to setTimeout.
+ * @param opts.logger - Optional INFO-level retry logger. Receives one
+ *   line per retry (`spawn EAGAIN: attempt 1/5 failed, retrying in 1000ms`).
+ */
+export async function retrySpawnOnTransientError<T>(
+  attempt: () => Promise<T>,
+  opts?: {
+    delaysMs?: ReadonlyArray<number>;
+    maxAttempts?: number;
+    sleep?: (ms: number) => Promise<void>;
+    logger?: (msg: string) => void;
+  },
+): Promise<T> {
+  const delays = opts?.delaysMs ?? SPAWN_RETRY_DELAYS_MS;
+  const max = opts?.maxAttempts ?? MAX_SPAWN_ATTEMPTS;
+  const sleep =
+    opts?.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const log = opts?.logger ?? (() => {});
+  let lastErrno = "unknown";
+  for (let i = 1; i <= max; i++) {
+    try {
+      return await attempt();
+    } catch (err) {
+      if (!isRetryableSpawnError(err)) throw err;
+      lastErrno = (err as NodeJS.ErrnoException).code ?? "unknown";
+      if (i === max) break;
+      const delay = delays[i - 1] ?? delays[delays.length - 1] ?? 0;
+      log(`spawn ${lastErrno}: attempt ${i}/${max} failed, retrying in ${delay}ms`);
+      await sleep(delay);
+    }
+  }
+  throw new ResourceExhaustedError(lastErrno, max);
+}
