@@ -9,6 +9,8 @@ import { AGENTS, type AgentConfig, type ProjectItem } from "./types.js";
 import {
   maxTurnsFor,
   parseSalvageGates,
+  ResourceExhaustedError,
+  retrySpawnOnTransientError,
   scrubSpawnEnv,
   shouldAttemptSafeSalvage,
   shouldUseWorktree,
@@ -224,7 +226,7 @@ function logStreamMessage(logFile: string, msg: Record<string, unknown>): void {
   }
 }
 
-function runClaudeStreaming(opts: {
+interface RunClaudeOpts {
   promptFile: string;
   systemPromptFile: string;
   model: string;
@@ -235,7 +237,16 @@ function runClaudeStreaming(opts: {
   timeoutMs: number;
   logFile: string;
   env: NodeJS.ProcessEnv;
-}): Promise<StreamResult> {
+}
+
+/**
+ * One spawn attempt. Rejects with the original `Error` (preserving
+ * `.code` for errno checks) on `child.on("error", ...)`. The outer
+ * `runClaudeStreaming` wraps this with `retrySpawnOnTransientError` so
+ * EAGAIN/ENOMEM transient failures don't surface to the dispatcher's
+ * outer error path. Direct callers (none today) get one-shot behaviour.
+ */
+function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
   return new Promise((resolve, reject) => {
     // Phase C cutover (2026-05-14, pyrycode/pyrycode#329): default-spawn
     // `pyry agent-run` instead of `claude -p`. Both produce stream-json on
@@ -368,6 +379,30 @@ function runClaudeStreaming(opts: {
       reject(err);
     });
   });
+}
+
+/**
+ * Spawn the agent with bounded backoff retry on transient `posix_spawn`
+ * errnos (EAGAIN/ENOMEM). See agent-runtime.ts `retrySpawnOnTransientError`
+ * for the policy. Non-retryable errors (claude exit code, timeout, agent
+ * crash mid-stream) propagate to the caller's existing error path
+ * unchanged. Persistent retryable failures throw `ResourceExhaustedError`,
+ * which `handleDispatchError` maps to a distinct
+ * `error:<agent>:resource_exhausted` label.
+ */
+function runClaudeStreaming(opts: RunClaudeOpts): Promise<StreamResult> {
+  return retrySpawnOnTransientError(
+    () => runClaudeStreamingOnce(opts),
+    {
+      logger: (msg: string) => {
+        const ts = new Date().toLocaleTimeString("en-GB", {
+          hour: "2-digit", minute: "2-digit", second: "2-digit",
+        });
+        appendFileSync(opts.logFile, `[${ts}] ♻️  ${msg}\n`);
+        console.log(`   ♻️  ${msg}`);
+      },
+    },
+  );
 }
 
 // State file to persist across restarts
@@ -875,16 +910,32 @@ export async function handleDispatchError(
   if (sessionId !== "unknown") {
     console.error(`   🔍 Resume session: claude --resume ${sessionId}`);
   }
+  // Distinguish "couldn't even spawn" (ResourceExhaustedError, distinct
+  // label so the operator can tell host-pressure incidents from agent
+  // crashes) from generic agent errors. The retry helper has already
+  // exhausted bounded backoff at this point — no point retrying again.
+  const isResourceExhausted = error instanceof ResourceExhaustedError;
+  const errorLabel = isResourceExhausted
+    ? `error:${agent.name}:resource_exhausted`
+    : `error:${agent.name}`;
   if (item.issueNumber > 0) {
     try {
-      await client.addLabel(item.issueNumber, `error:${agent.name}`);
-      console.log(`   🏷️  Added error:${agent.name} to #${item.issueNumber}`);
+      await client.addLabel(item.issueNumber, errorLabel);
+      console.log(`   🏷️  Added ${errorLabel} to #${item.issueNumber}`);
     } catch {}
     try {
-      await client.addComment(
-        item.issueNumber,
-        `## ⚠️ Agent Error: ${agent.name}\n\nThe ${agent.name} agent encountered an error:\n\n\`\`\`\n${error.message.slice(-2000)}\n\`\`\`${sessionId !== "unknown" ? `\n\n**Debug**: \`claude --resume ${sessionId}\`` : ""}\n\nManual intervention required.`
-      );
+      const commentBody = isResourceExhausted
+        ? `## ⚠️ Agent Spawn Failed: ${agent.name}\n\n` +
+          `The dispatcher could not spawn the ${agent.name} agent process after ` +
+          `${(error as ResourceExhaustedError).attempts} retries with backoff ` +
+          `(final errno: \`${(error as ResourceExhaustedError).errno}\`).\n\n` +
+          `Likely cause: transient host resource exhaustion (RLIMIT_NPROC / ` +
+          `available memory). Stranded zombie/leaked subprocesses are a common trigger.\n\n` +
+          `**Operator action:** investigate process pressure on the host ` +
+          `(\`ps -ef | wc -l\`, \`ulimit -u\`, look for orphaned \`claude\` / \`pyry\` processes). ` +
+          `The ticket will re-queue on the next pickup cycle once \`${errorLabel}\` is removed.`
+        : `## ⚠️ Agent Error: ${agent.name}\n\nThe ${agent.name} agent encountered an error:\n\n\`\`\`\n${error.message.slice(-2000)}\n\`\`\`${sessionId !== "unknown" ? `\n\n**Debug**: \`claude --resume ${sessionId}\`` : ""}\n\nManual intervention required.`;
+      await client.addComment(item.issueNumber, commentBody);
     } catch {}
   }
   await notifyDiscord(`❌ **${agent.name}** failed on #${item.issueNumber}: ${item.title}\n${item.url}\nManual intervention required.`);

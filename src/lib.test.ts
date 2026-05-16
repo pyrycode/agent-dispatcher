@@ -21,12 +21,17 @@ import {
   extractRateLimitInfo,
   findMissingAgentClaudeMds,
   findReadyPrNumber,
+  isRetryableSpawnError,
+  MAX_SPAWN_ATTEMPTS,
   maxTurnsFor,
   parseSalvageGates,
+  ResourceExhaustedError,
+  retrySpawnOnTransientError,
   scrubSpawnEnv,
   shouldAttemptSafeSalvage,
   shouldUseWorktree,
   SPAWN_ENV_DENYLIST,
+  SPAWN_RETRY_DELAYS_MS,
 } from "./agent-runtime.js";
 import {
   hasOpenBlockers,
@@ -3154,6 +3159,175 @@ describe("findAdvanceRule", () => {
       const found = findAdvanceRule(AUTO_ADVANCE_RULES, rule.from, [rule.readyLabel]);
       assert.equal(found, rule);
     }
+  });
+});
+
+// =====================================================================
+// retrySpawnOnTransientError + isRetryableSpawnError
+// =====================================================================
+//
+// Covers the EAGAIN/ENOMEM retry helper added for #9 (2026-05-15 22:51Z
+// EAGAIN cascade — five PO spawns failed in 17s). Pure logic; the helper
+// takes injected `sleep` so we can run zero-wait retries without timing
+// flakiness in CI.
+
+describe("isRetryableSpawnError", () => {
+  test("EAGAIN → true", () => {
+    assert.equal(isRetryableSpawnError(Object.assign(new Error("spawn EAGAIN"), { code: "EAGAIN" })), true);
+  });
+
+  test("ENOMEM → true", () => {
+    assert.equal(isRetryableSpawnError(Object.assign(new Error("oom"), { code: "ENOMEM" })), true);
+  });
+
+  test("ENOENT → false (binary missing is not transient)", () => {
+    assert.equal(isRetryableSpawnError(Object.assign(new Error("nope"), { code: "ENOENT" })), false);
+  });
+
+  test("EMFILE → false (fd exhaustion not yet observed; conservative until evidence)", () => {
+    assert.equal(isRetryableSpawnError(Object.assign(new Error("fd"), { code: "EMFILE" })), false);
+  });
+
+  test("plain Error without .code → false", () => {
+    assert.equal(isRetryableSpawnError(new Error("just a string")), false);
+  });
+
+  test("null / undefined / non-object → false", () => {
+    assert.equal(isRetryableSpawnError(null), false);
+    assert.equal(isRetryableSpawnError(undefined), false);
+    assert.equal(isRetryableSpawnError("EAGAIN"), false);
+    assert.equal(isRetryableSpawnError(42), false);
+  });
+});
+
+describe("retrySpawnOnTransientError", () => {
+  /** Build a spawn-style errno error matching what Node throws on
+   *  `child.on("error", ...)` for posix_spawn failures. */
+  const errno = (code: string) =>
+    Object.assign(new Error(`spawn ${code}`), { code }) as NodeJS.ErrnoException;
+
+  /** Zero-wait sleep so tests are deterministic; record delays so we
+   *  can assert the backoff schedule. */
+  const recordingSleep = () => {
+    const delays: number[] = [];
+    return {
+      delays,
+      sleep: async (ms: number) => { delays.push(ms); },
+    };
+  };
+
+  test("first attempt succeeds → no retry, no logger output", async () => {
+    let attempts = 0;
+    const logs: string[] = [];
+    const result = await retrySpawnOnTransientError(
+      async () => { attempts++; return "ok"; },
+      { sleep: async () => {}, logger: (m) => logs.push(m) },
+    );
+    assert.equal(result, "ok");
+    assert.equal(attempts, 1);
+    assert.deepEqual(logs, []);
+  });
+
+  test("EAGAIN twice then success → 3 attempts, 2 logged retries, default backoff schedule", async () => {
+    let attempts = 0;
+    const logs: string[] = [];
+    const { delays, sleep } = recordingSleep();
+    const result = await retrySpawnOnTransientError(
+      async () => {
+        attempts++;
+        if (attempts < 3) throw errno("EAGAIN");
+        return "ok";
+      },
+      { sleep, logger: (m) => logs.push(m) },
+    );
+    assert.equal(result, "ok");
+    assert.equal(attempts, 3);
+    // Two retries → two logger calls, two sleeps.
+    assert.equal(logs.length, 2);
+    assert.match(logs[0]!, /EAGAIN.*attempt 1\/5.*1000ms/);
+    assert.match(logs[1]!, /EAGAIN.*attempt 2\/5.*2000ms/);
+    assert.deepEqual(delays, [1000, 2000]);
+  });
+
+  test("ENOMEM is also retryable (not just EAGAIN)", async () => {
+    let attempts = 0;
+    const result = await retrySpawnOnTransientError(
+      async () => {
+        attempts++;
+        if (attempts === 1) throw errno("ENOMEM");
+        return "ok";
+      },
+      { sleep: async () => {}, logger: () => {} },
+    );
+    assert.equal(result, "ok");
+    assert.equal(attempts, 2);
+  });
+
+  test("non-retryable error propagates immediately, no retries", async () => {
+    let attempts = 0;
+    await assert.rejects(
+      retrySpawnOnTransientError(
+        async () => { attempts++; throw errno("ENOENT"); },
+        { sleep: async () => {}, logger: () => {} },
+      ),
+      (err: Error) => err.message === "spawn ENOENT" && (err as any).code === "ENOENT",
+    );
+    assert.equal(attempts, 1, "ENOENT must not retry — it's not transient");
+  });
+
+  test("EAGAIN exhausted across all 5 attempts → ResourceExhaustedError with errno + count", async () => {
+    let attempts = 0;
+    const { delays, sleep } = recordingSleep();
+    const logs: string[] = [];
+    await assert.rejects(
+      retrySpawnOnTransientError(
+        async () => { attempts++; throw errno("EAGAIN"); },
+        { sleep, logger: (m) => logs.push(m) },
+      ),
+      (err: Error) => {
+        if (!(err instanceof ResourceExhaustedError)) return false;
+        assert.equal(err.errno, "EAGAIN");
+        assert.equal(err.attempts, MAX_SPAWN_ATTEMPTS);
+        assert.match(err.message, /5 retries/);
+        assert.match(err.message, /EAGAIN/);
+        return true;
+      },
+    );
+    assert.equal(attempts, MAX_SPAWN_ATTEMPTS, "must spawn exactly 5 times");
+    // 4 sleeps between 5 attempts; no terminal sleep before throwing.
+    assert.deepEqual(delays, [...SPAWN_RETRY_DELAYS_MS]);
+    assert.equal(logs.length, 4, "one log per retry, not after final failure");
+  });
+
+  test("mid-sequence non-retryable error short-circuits (no retry, no ResourceExhaustedError)", async () => {
+    let attempts = 0;
+    await assert.rejects(
+      retrySpawnOnTransientError(
+        async () => {
+          attempts++;
+          // EAGAIN, then EAGAIN, then a real spawn error → bail.
+          if (attempts < 3) throw errno("EAGAIN");
+          throw errno("ENOENT");
+        },
+        { sleep: async () => {}, logger: () => {} },
+      ),
+      (err: Error) => err.message === "spawn ENOENT" && !(err instanceof ResourceExhaustedError),
+    );
+    assert.equal(attempts, 3);
+  });
+
+  test("delaysMs override applies (test isolation against schedule changes)", async () => {
+    let attempts = 0;
+    const { delays, sleep } = recordingSleep();
+    await assert.rejects(
+      retrySpawnOnTransientError(
+        async () => { attempts++; throw errno("EAGAIN"); },
+        { sleep, logger: () => {}, delaysMs: [10, 20], maxAttempts: 3 },
+      ),
+      (err: Error) => err instanceof ResourceExhaustedError,
+    );
+    assert.equal(attempts, 3);
+    assert.deepEqual(delays, [10, 20]);
   });
 });
 

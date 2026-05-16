@@ -47,6 +47,7 @@ import {
   type StreamResult,
 } from "./dispatch.js";
 import type { AgentConfig, BlockerInfo, ProjectItem } from "./types.js";
+import { ResourceExhaustedError } from "./agent-runtime.js";
 import { resolveAgentsRepoRoot, resolveTargetRepoRoot } from "./worktree.js";
 
 // Recompute agentsRepoRoot the same way dispatch.ts does so test
@@ -1863,6 +1864,42 @@ describe("handleDispatchError", () => {
     assert.equal(client.comments.length, 1, "addComment attempt recorded");
     // Discord notify still fires (outside the silent catches).
     assert.equal(calls.discord.length, 1);
+  });
+
+  test("ResourceExhaustedError → distinct label + tailored comment (no generic error:<agent>)", async () => {
+    // The retry helper has already exhausted its bounded backoff
+    // before this fires. handleDispatchError must distinguish this
+    // failure mode (couldn't spawn) from a regular crash (agent ran,
+    // then failed) — operator triage is different.
+    const { ctx, client } = makeTestContext({ item: { issueNumber: 503 } });
+
+    await handleDispatchError(
+      new ResourceExhaustedError("EAGAIN", 5),
+      ctx,
+      null, // sessionId is meaningless when spawn never succeeded
+    );
+
+    // Distinct label — operator can filter resource-pressure incidents
+    // separately from agent crashes.
+    assert.deepEqual(
+      client.addLabelCalls,
+      [{ issueNumber: 503, label: "error:developer:resource_exhausted" }],
+      "must use the resource_exhausted suffix, NOT generic error:developer",
+    );
+    // Tailored comment names the errno, the attempt count, and points
+    // the operator at host-pressure diagnostics.
+    assert.equal(client.comments.length, 1);
+    const body = client.comments[0]!.body;
+    assert.match(body, /Agent Spawn Failed/);
+    assert.match(body, /5 retries/);
+    assert.match(body, /EAGAIN/);
+    assert.match(body, /RLIMIT_NPROC/);
+    assert.match(body, /ulimit -u/);
+    // No "Manual intervention required" generic stub.
+    assert.ok(!/encountered an error/.test(body),
+      "must not use the generic agent-error template");
+    // No resume hint — there's no session to resume (spawn never succeeded).
+    assert.ok(!/claude --resume/.test(body));
   });
 });
 
