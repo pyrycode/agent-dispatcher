@@ -1069,6 +1069,75 @@ describe("prepareAgentSpawn", () => {
       assert.equal(hasAgent, c.hasAgentTool, `${c.name} Agent tool presence`);
     }
   });
+
+  // ===================================================================
+  // Contract: --disallowed-tools for non-interactive agents (#7)
+  // ===================================================================
+  //
+  // Today the dispatcher does NOT pass `--disallowed-tools` to claude.
+  // pyrycode/pyrycode#398 evidence: developer hit a `git reset --hard`
+  // denial, invoked `AskUserQuestion` (no operator on the line), burned
+  // its remaining turns, work stranded. `--allowed-tools` cannot exclude
+  // these — claude treats `AskUserQuestion`/`EnterPlanMode`/`ExitPlanMode`
+  // as always-available; only `--disallowed-tools` can strip them.
+  //
+  // Two coordinated changes ship the fix:
+  //   1. (pyry side, TBD) `pyry agent-run` learns to forward
+  //      `--disallowed-tools` to its child claude. Tracked in
+  //      pyrycode/pyrycode follow-up (link in this PR).
+  //   2. (this side, once 1 lands) `prepareAgentSpawn` adds a
+  //      `disallowedTools` field to SpawnConfig, populated for ALL
+  //      pipeline agents (every agent here is non-interactive).
+  //
+  // Shipping the dispatcher flag before pyry forwards it would break
+  // production: pyry's `parseAgentRunArgs` errors on unknown flags.
+  // So this test is `todo` — it locks in the *contract* now (what the
+  // disallow list must contain), runs but doesn't fail CI, and flips
+  // RED→GREEN as soon as both sides land.
+  test(
+    "disallowed-tools contract — AskUserQuestion/EnterPlanMode/ExitPlanMode stripped for all non-interactive agents (pyrycode/pyrycode forwarding TBD)",
+    { todo: "blocked on pyry-side --disallowed-tools forwarding (pyrycode/pyrycode#411)" },
+    async () => {
+      const REQUIRED_DISALLOWED = ["AskUserQuestion", "EnterPlanMode", "ExitPlanMode"] as const;
+      // Every pipeline agent is non-interactive — the disallow list
+      // applies uniformly. (If a future agent role IS interactive,
+      // narrow this when adding it.)
+      const agents: Array<Partial<AgentConfig>> = [
+        { name: "po",            column: "Backlog",          claudeMdPath: "po/CLAUDE.md",            usesWorktree: false, producesCommits: false },
+        { name: "architect",     column: "In Architecture",  claudeMdPath: "architect/CLAUDE.md",     usesWorktree: true,  producesCommits: true  },
+        { name: "developer",     column: "In Development",   claudeMdPath: "developer/CLAUDE.md",     usesWorktree: true,  producesCommits: true  },
+        { name: "code-review",   column: "In Code Review",   claudeMdPath: "code-review/CLAUDE.md",   usesWorktree: true,  producesCommits: false },
+        { name: "documentation", column: "In Documentation", claudeMdPath: "documentation/CLAUDE.md", usesWorktree: true,  producesCommits: true  },
+      ];
+
+      for (const a of agents) {
+        const claudeMd = claudeMdAbsPath(a.claudeMdPath!);
+        const { ctx } = makeTestContext({
+          agent: a,
+          item: { issueNumber: 270 },
+          mockOptions: { fsMap: { [claudeMd]: `${a.name} system prompt` } },
+        });
+
+        const result = await prepareAgentSpawn(ctx);
+        assert.ok(result.ok, `${a.name} prepareAgentSpawn must succeed`);
+        const cfg = (result as { ok: true; config: any }).config;
+
+        // CONTRACT (currently unmet — `cfg.disallowedTools` is undefined
+        // until the spawn config gains the field):
+        assert.ok(
+          typeof cfg.disallowedTools === "string" && cfg.disallowedTools.length > 0,
+          `${a.name} must declare disallowedTools (got ${JSON.stringify(cfg.disallowedTools)})`,
+        );
+        const disallowed = String(cfg.disallowedTools).split(",").map((s) => s.trim());
+        for (const tool of REQUIRED_DISALLOWED) {
+          assert.ok(
+            disallowed.includes(tool),
+            `${a.name} disallowedTools must include "${tool}" — non-interactive context cannot answer it`,
+          );
+        }
+      }
+    },
+  );
 });
 
 // =====================================================================
