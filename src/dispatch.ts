@@ -488,7 +488,7 @@ function runClaudeStreaming(opts: RunClaudeOpts): Promise<StreamResult> {
 }
 
 // State file to persist across restarts
-// Dispatch state is tracked entirely via GitHub labels (ready:<agent>, needs-rework:<agent>).
+// Dispatch state is tracked entirely via GitHub labels (done:<agent>, needs-rework:<agent>).
 // No local state file needed — all state is visible on the ticket itself.
 
 async function buildPromptForAgent(
@@ -768,7 +768,7 @@ async function attemptSaferSalvage(opts: {
     // If pr-create succeeded first and addLabel then failed, the
     // ticket would be unblocked, the next dispatch would find the
     // open PR via the existing PR-already-exists salvage path, and
-    // auto-advance partial work via `ready:<agent>` — defeating the
+    // auto-advance partial work via `done:<agent>` — defeating the
     // entire safer-salvage design. So addLabel throws on failure to
     // abort the salvage cleanly (caller falls through to error path,
     // ticket gets `error:<agent>` instead — same shape as a non-salvaged
@@ -1594,7 +1594,7 @@ export async function prepareAgentSpawn(
 //   2. Safer salvage: max_turns + worktree path + clean vet/build +
 //      uncommitted work → auto-commit, push, open DRAFT PR, label
 //      `error:max_turns_salvaged`. Returns true (saferSalvaged) so the
-//      orchestrator suppresses ready:<agent>, success-comment wording,
+//      orchestrator suppresses done:<agent>, success-comment wording,
 //      and the success Discord notify.
 //
 // If neither path applies, throws to the outer catch handler. Path
@@ -1672,7 +1672,7 @@ export async function handleAgentResultErrors(
   // Distinct from the PR-already-exists path above (which treats
   // max_turns as success). This path preserves work the agent
   // produced but didn't get to PR-create — keeps it visible while
-  // forcing human triage (no auto-advance via `ready:<agent>`).
+  // forcing human triage (no auto-advance via `done:<agent>`).
   if (!salvaged
       && streamResult.terminalReason === "max_turns"
       && useWorktree
@@ -1792,7 +1792,7 @@ export async function handlePostRun(
   // strips the error label after deciding to retry or salvage. Surfaced
   // 2026-05-07 when code-review on #155 ran on a stale worktree, FAILed,
   // tried to push its review comments, hit non-fast-forward, but the
-  // dispatcher continued to apply ready:code-review and auto-advance.
+  // dispatcher continued to apply done:code-review and auto-advance.
   if (item.issueNumber > 0 && useWorktree) {
     try {
       execSync(`git push -u origin ${branchName}`, { cwd: agentCwd, stdio: "pipe" });
@@ -1831,7 +1831,7 @@ export async function handlePostRun(
   // (architect/developer/documentation) but exit cleanly with the
   // branch still 0 ahead of `main` are silent failures. Treat as
   // `error:<agent>` to force human triage instead of auto-advancing
-  // a no-op past `ready:<agent>`.
+  // a no-op past `done:<agent>`.
   //
   // Belt-and-suspenders against a class the agents themselves can't
   // reliably catch: each agent in the relay #5 incident (2026-05-08)
@@ -1897,7 +1897,7 @@ export async function handlePostRun(
   // Convention: agents add needs-rework:{target} directly (target = who should fix it).
   // The dispatch detects any needs-rework:* label and treats it as a rework signal.
   // Skipped when saferSalvaged: that path already set `error:max_turns_salvaged`
-  // and posted its own comment; adding `ready:<agent>` here would auto-advance
+  // and posted its own comment; adding `done:<agent>` here would auto-advance
   // partial work, which is exactly what the salvage path is designed to prevent.
   // Also skipped by the empty-branch guard above (early `return`) when an agent
   // that's supposed to commit produced nothing.
@@ -1927,9 +1927,9 @@ export async function handlePostRun(
     }
 
     if (decision.addReadyLabel) {
-      // Strip prior agents' `ready:*` BEFORE adding `ready:<self>` —
+      // Strip prior agents' `done:*` BEFORE adding `done:<self>` —
       // closes the accumulation gap surfaced by relay #7 (carried both
-      // `ready:po` + `ready:architect` mid-pipeline). Sequential awaits
+      // `done:po` + `done:architect` mid-pipeline). Sequential awaits
       // so the ticket never observably holds both labels at once between
       // API calls. Each removeLabel failure is non-fatal: log and continue;
       // the stale label is cosmetic, not state-bearing for dispatch
@@ -1943,10 +1943,10 @@ export async function handlePostRun(
         }
       }
       try {
-        await client.addLabel(item.issueNumber, `ready:${agent.name}`);
-        console.log(`   🏷️  Added ready:${agent.name} to #${item.issueNumber}`);
+        await client.addLabel(item.issueNumber, `done:${agent.name}`);
+        console.log(`   🏷️  Added done:${agent.name} to #${item.issueNumber}`);
       } catch (e) {
-        console.warn(`   ⚠️  Failed to add ready:${agent.name} label: ${e}`);
+        console.warn(`   ⚠️  Failed to add done:${agent.name} label: ${e}`);
       }
     } else {
       switch (decision.logKind) {
@@ -1954,10 +1954,10 @@ export async function handlePostRun(
           console.log(`   🔄 Rework requested → needs-rework:${decision.reworkTarget}`);
           break;
         case "moved-out":
-          console.log(`   📋 Agent moved #${item.issueNumber} ${agent.column} → ${currentColumn} — skipping ready:${agent.name}`);
+          console.log(`   📋 Agent moved #${item.issueNumber} ${agent.column} → ${currentColumn} — skipping done:${agent.name}`);
           break;
         case "status-unknown":
-          console.log(`   ⚠️  Skipping ready:${agent.name} for #${item.issueNumber} (status fetch failed; will retry next cycle)`);
+          console.log(`   ⚠️  Skipping done:${agent.name} for #${item.issueNumber} (status fetch failed; will retry next cycle)`);
           break;
       }
     }
@@ -2075,7 +2075,7 @@ export async function runClosedSweep(client: DispatchClient): Promise<void> {
 // the Done column. Runs every maintenance pass alongside auto-advance.
 //
 // `runAutoAdvance` moves tickets into Done by status-only — it doesn't
-// strip the `ready:<agent>` labels that drove each advance. The auto-merge
+// strip the `done:<agent>` labels that drove each advance. The auto-merge
 // block (later in pollLoop) cleans labels, but only when a PR exists and
 // merges cleanly. Doc-only tickets, manually-merged PRs, and
 // closed-as-won't-fix all reach Done with their pipeline labels intact.
@@ -2324,7 +2324,7 @@ async function handleMergeConflict(
   // ticket sits at Status=Done with a still-open PR, breaking the
   // column-as-truth invariant. The 2026-05-09 morning batch (#214 +
   // #218) hit this: both moved to Done by `runAutoAdvance`'s
-  // `ready:documentation` advance BEFORE the auto-merge attempted and
+  // `done:documentation` advance BEFORE the auto-merge attempted and
   // failed on conflict. Manual recovery moved them back, but a future
   // stale-conflict can recur silently.
   //
@@ -2631,11 +2631,11 @@ export async function pollLoop(): Promise<void> {
     }
 
     // Reconcile state FIRST every cycle: closed-sweep, route rework labels,
-    // auto-advance ready:* tickets, then strip pipeline labels off any
+    // auto-advance done:* tickets, then strip pipeline labels off any
     // ticket now sitting in Done. This makes restart behavior predictable —
-    // any ticket left in `ready:<agent>` in the previous agent's column moves
+    // any ticket left in `done:<agent>` in the previous agent's column moves
     // forward on the same cycle as the next agent dispatch, not the cycle
-    // after. Without this, a restart with a `ready:developer` ticket in In
+    // after. Without this, a restart with a `done:developer` ticket in In
     // Development takes two full cycles to advance + dispatch code-review;
     // if the dispatcher stops between the cycles, the ticket stays stuck.
     // Surfaced 2026-05-02 after dispatcher stop left #73 unable to advance

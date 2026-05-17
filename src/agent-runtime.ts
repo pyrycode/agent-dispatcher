@@ -89,7 +89,7 @@ export function maxTurnsFor(agent: AgentConfig): number {
  *    (they're often the signal the agent was chasing); failing build
  *    gates mean the code itself is indeterminate.
  *
- * **Why a draft PR (not a regular PR + `ready:developer`):**
+ * **Why a draft PR (not a regular PR + `done:developer`):**
  * salvaged work is by definition incomplete (the agent stopped in the
  * middle). A regular PR risks silent auto-merge of broken or partial
  * work. A draft PR + `error:max_turns_salvaged` label keeps the work
@@ -257,7 +257,7 @@ export function parseSalvageGates(envValue: string | undefined): string[] {
  * and ran out of turns on cleanup). But after the safer-salvage lever
  * shipped, an open PR for a branch is often a DRAFT opened by salvage
  * itself — partial work awaiting human triage. Treating it as success
- * would auto-advance partial work via `ready:<agent>`, defeating the
+ * would auto-advance partial work via `done:<agent>`, defeating the
  * safer-salvage design's safety property.
  *
  * Defaults to "draft" when `isDraft` is missing — the cautious default.

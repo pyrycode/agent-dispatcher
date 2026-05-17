@@ -1483,7 +1483,7 @@ describe("handlePostRun — failure modes", () => {
     // verdict failed, tried to push review comments, hit non-fast-forward
     // because someone pushed out-of-band during the run. Pre-fix the
     // dispatcher swallowed the push failure and continued to apply
-    // ready:code-review + auto-advance.
+    // done:code-review + auto-advance.
     const { ctx, client } = makeTestContext({
       item: { issueNumber: 400 },
       mockOptions: {
@@ -1503,9 +1503,9 @@ describe("handlePostRun — failure modes", () => {
     assert.equal(client.comments.length, 1);
     assert.match(client.comments[0]!.body, /git push/);
     assert.match(client.comments[0]!.body, /non-fast-forward/);
-    // Crucially: no `ready:developer` was applied. Push success is the
+    // Crucially: no `done:developer` was applied. Push success is the
     // precondition for treating the agent's verdict as canonical.
-    assert.ok(!client.addLabelCalls.some(c => c.label === "ready:developer"));
+    assert.ok(!client.addLabelCalls.some(c => c.label === "done:developer"));
   });
 
   test("empty branch + agent-produces-commits → error:<agent> label + comment + {ok:false}", async () => {
@@ -1531,7 +1531,7 @@ describe("handlePostRun — failure modes", () => {
     assert.deepEqual(client.addLabelCalls, [{ issueNumber: 401, label: "error:developer" }]);
     assert.match(client.comments[0]!.body, /produced no commits/);
     assert.match(client.comments[0]!.body, /0 commits ahead of/);
-    assert.ok(!client.addLabelCalls.some(c => c.label === "ready:developer"));
+    assert.ok(!client.addLabelCalls.some(c => c.label === "done:developer"));
   });
 
   test("empty branch + saferSalvaged=true → guard skipped, no error label, salvage stays canonical", async () => {
@@ -1556,7 +1556,7 @@ describe("handlePostRun — failure modes", () => {
     // Crucially: NO error:developer applied even though branch is 0 ahead.
     assert.ok(!client.addLabelCalls.some(c => c.label === "error:developer"));
     // Post-success labeling is also gated on !saferSalvaged → no ready label.
-    assert.ok(!client.addLabelCalls.some(c => c.label === "ready:developer"));
+    assert.ok(!client.addLabelCalls.some(c => c.label === "done:developer"));
   });
 
   test("empty branch + architect added needs-rework:po → guard skipped (legitimate bail, no false-positive error:architect)", async () => {
@@ -1597,7 +1597,7 @@ describe("handlePostRun — failure modes", () => {
       "empty-branch error comment must not be posted on legitimate bail");
     // The rework signal is preserved on the ticket — runReworkRouting
     // (separate maintenance pass) will pick it up next cycle.
-    // (decidePostRunLabels won't add ready:architect either, because
+    // (decidePostRunLabels won't add done:architect either, because
     // postLabels has needs-rework:po — that's tested in lib.test.ts.)
   });
 
@@ -1625,13 +1625,13 @@ describe("handlePostRun — failure modes", () => {
 
     assert.deepEqual(result, { ok: true }, "code-review with 0 commits is the expected case");
     assert.ok(!client.addLabelCalls.some(c => c.label === "error:code-review"));
-    // Code-review still gets ready:code-review (the agent's column hasn't moved).
-    assert.ok(client.addLabelCalls.some(c => c.label === "ready:code-review"));
+    // Code-review still gets done:code-review (the agent's column hasn't moved).
+    assert.ok(client.addLabelCalls.some(c => c.label === "done:code-review"));
   });
 });
 
 describe("handlePostRun — decidePostRunLabels integration", () => {
-  test("addReadyLabel=true (happy path) → ready:<agent> + completion comment + success Discord notify", async () => {
+  test("addReadyLabel=true (happy path) → done:<agent> + completion comment + success Discord notify", async () => {
     const client = new MockGitHubClient({
       status: { 410: "In Development" },     // matches developer.column
       labels: { 410: [] },                   // no rework target
@@ -1650,7 +1650,7 @@ describe("handlePostRun — decidePostRunLabels integration", () => {
     const result = await handlePostRun(STREAM_OK(), ctx, false);
 
     assert.deepEqual(result, { ok: true });
-    assert.ok(client.addLabelCalls.some(c => c.label === "ready:developer"));
+    assert.ok(client.addLabelCalls.some(c => c.label === "done:developer"));
     assert.equal(client.comments.length, 1);
     assert.match(client.comments[0]!.body, /completed work on this ticket/);
     assert.match(client.comments[0]!.body, /Ready for human review/);
@@ -1659,16 +1659,16 @@ describe("handlePostRun — decidePostRunLabels integration", () => {
     assert.match(calls.discord[0]!, /^✅/);
   });
 
-  test("addReadyLabel=true with prior ready:po → strips ready:po then adds ready:architect (the relay #7 fix)", async () => {
+  test("addReadyLabel=true with prior done:po → strips done:po then adds done:architect (the relay #7 fix)", async () => {
     // Architect runs successfully on a ticket that PO refined earlier.
-    // PO's `ready:po` is still on the ticket because runAutoAdvance
+    // PO's `done:po` is still on the ticket because runAutoAdvance
     // moves columns without stripping. After this fix, handlePostRun
-    // strips the prior `ready:po` before applying `ready:architect`.
+    // strips the prior `done:po` before applying `done:architect`.
     // Order matters: strip-before-add prevents a transient state where
     // both labels exist between API calls.
     const client = new MockGitHubClient({
       status: { 415: "In Architecture" },
-      labels: { 415: ["ready:po", "size:s", "security-sensitive"] },
+      labels: { 415: ["done:po", "size:s", "security-sensitive"] },
     });
     const { ctx } = makeTestContext({
       agent: { name: "architect", column: "In Architecture", claudeMdPath: "architect/CLAUDE.md", usesWorktree: true, producesCommits: true },
@@ -1686,16 +1686,16 @@ describe("handlePostRun — decidePostRunLabels integration", () => {
 
     assert.deepEqual(result, { ok: true });
 
-    // Prior `ready:po` was stripped.
+    // Prior `done:po` was stripped.
     assert.ok(
-      client.removeLabelCalls.some(c => c.issueNumber === 415 && c.label === "ready:po"),
-      "prior ready:po must be stripped",
+      client.removeLabelCalls.some(c => c.issueNumber === 415 && c.label === "done:po"),
+      "prior done:po must be stripped",
     );
 
-    // `ready:architect` was added.
+    // `done:architect` was added.
     assert.ok(
-      client.addLabelCalls.some(c => c.issueNumber === 415 && c.label === "ready:architect"),
-      "ready:architect must be added",
+      client.addLabelCalls.some(c => c.issueNumber === 415 && c.label === "done:architect"),
+      "done:architect must be added",
     );
 
     // Non-pipeline labels (`size:s`, `security-sensitive`) untouched.
@@ -1712,12 +1712,12 @@ describe("handlePostRun — decidePostRunLabels integration", () => {
     // "strip-before-add order" test below.
   });
 
-  test("strip-before-add order: prior ready:* removes precede ready:<self> add in unified labelOps log (multi-prior)", async () => {
-    // Contract: handlePostRun strips prior `ready:*` labels via sequential
-    // awaits BEFORE adding `ready:<self>`. The ticket must never observably
+  test("strip-before-add order: prior done:* removes precede done:<self> add in unified labelOps log (multi-prior)", async () => {
+    // Contract: handlePostRun strips prior `done:*` labels via sequential
+    // awaits BEFORE adding `done:<self>`. The ticket must never observably
     // hold both labels simultaneously between API calls — a board observer
-    // (or another agent's pre-dispatch fetch) seeing `ready:po + ready:architect
-    // + ready:developer` mid-window would be misled about pipeline state.
+    // (or another agent's pre-dispatch fetch) seeing `done:po + done:architect
+    // + done:developer` mid-window would be misled about pipeline state.
     //
     // Asserted via MockGitHubClient.labelOps — a unified add/remove call
     // log in chronological push order. Multi-prior shape (developer running
@@ -1725,7 +1725,7 @@ describe("handlePostRun — decidePostRunLabels integration", () => {
     // multi-prior strip case (only pure-tested in lib.test.ts otherwise).
     const client = new MockGitHubClient({
       status: { 416: "In Development" },
-      labels: { 416: ["ready:po", "ready:architect", "size:s"] },
+      labels: { 416: ["done:po", "done:architect", "size:s"] },
     });
     const { ctx } = makeTestContext({
       // Default agent in makeTestContext is developer / In Development.
@@ -1748,36 +1748,36 @@ describe("handlePostRun — decidePostRunLabels integration", () => {
     const ops = client.labelOps.filter(o => o.issueNumber === 416);
 
     // Expected exact sequence:
-    //   1. remove ready:po       (first prior, in postLabels order)
-    //   2. remove ready:architect (second prior)
-    //   3. add    ready:developer (this agent's ready, AFTER both strips)
+    //   1. remove done:po       (first prior, in postLabels order)
+    //   2. remove done:architect (second prior)
+    //   3. add    done:developer (this agent's ready, AFTER both strips)
     // size:s is non-pipeline → not stripped, not in this log.
     assert.deepEqual(
       ops,
       [
-        { op: "remove", issueNumber: 416, label: "ready:po" },
-        { op: "remove", issueNumber: 416, label: "ready:architect" },
-        { op: "add",    issueNumber: 416, label: "ready:developer" },
+        { op: "remove", issueNumber: 416, label: "done:po" },
+        { op: "remove", issueNumber: 416, label: "done:architect" },
+        { op: "add",    issueNumber: 416, label: "done:developer" },
       ],
-      "all prior ready:* strips must precede the ready:<self> add",
+      "all prior done:* strips must precede the done:<self> add",
     );
   });
 
-  test("removeLabel failure on prior ready:* is non-fatal — ready:<self> still added", async () => {
+  test("removeLabel failure on prior done:* is non-fatal — done:<self> still added", async () => {
     // Contract: each prior-strip removeLabel is wrapped in try/catch and
     // logs a warning on failure. Stale prior labels are cosmetic, not
     // state-bearing for dispatch decisions; a label-strip blip (network
     // glitch, label already removed by a concurrent dispatcher cycle,
-    // GraphQL 503) must not block ready:<self> from landing — that would
+    // GraphQL 503) must not block done:<self> from landing — that would
     // break auto-advance for the next agent and turn a transient label
     // problem into a stuck ticket.
     const client = new MockGitHubClient({
       status: { 417: "In Development" },
-      labels: { 417: ["ready:po", "ready:architect"] },
+      labels: { 417: ["done:po", "done:architect"] },
     });
     // Inject failure on the FIRST strip; second strip + add still proceed.
     client.failures.removeLabel = (_n, label) =>
-      label === "ready:po" ? new Error("simulated GraphQL 503") : null;
+      label === "done:po" ? new Error("simulated GraphQL 503") : null;
 
     const { ctx } = makeTestContext({
       item: { issueNumber: 417 },
@@ -1796,24 +1796,24 @@ describe("handlePostRun — decidePostRunLabels integration", () => {
     // Both removeLabel attempts were made — push to removeLabelCalls
     // happens before the failure check, so a failed call is recorded.
     assert.ok(
-      client.removeLabelCalls.some(c => c.issueNumber === 417 && c.label === "ready:po"),
+      client.removeLabelCalls.some(c => c.issueNumber === 417 && c.label === "done:po"),
       "first strip was attempted (and recorded) even though it failed",
     );
     assert.ok(
-      client.removeLabelCalls.some(c => c.issueNumber === 417 && c.label === "ready:architect"),
+      client.removeLabelCalls.some(c => c.issueNumber === 417 && c.label === "done:architect"),
       "second strip proceeds after the first one failed — try/catch isolates failures",
     );
-    // ready:<self> still landed despite the strip failure.
+    // done:<self> still landed despite the strip failure.
     assert.ok(
-      client.addLabelCalls.some(c => c.issueNumber === 417 && c.label === "ready:developer"),
-      "ready:<self> must still be applied even if a prior-label strip failed",
+      client.addLabelCalls.some(c => c.issueNumber === 417 && c.label === "done:developer"),
+      "done:<self> must still be applied even if a prior-label strip failed",
     );
   });
 
-  test("rework path with prior ready:* → handlePostRun does NOT strip (runReworkRouting handles it)", async () => {
+  test("rework path with prior done:* → handlePostRun does NOT strip (runReworkRouting handles it)", async () => {
     // When `addReadyLabel === false` because rework was requested,
     // handlePostRun's prior-strip block is skipped. `runReworkRouting`
-    // (in reconcile.ts) strips ALL `ready:/wip:/error:` labels when it
+    // (in reconcile.ts) strips ALL `done:/wip:/error:` labels when it
     // routes the ticket back upstream — pre-empting that here would
     // duplicate work AND potentially strip labels the upstream agent
     // might want to see during its own pre-dispatch state read.
@@ -1822,7 +1822,7 @@ describe("handlePostRun — decidePostRunLabels integration", () => {
     // the strip to all post-run paths.
     const client = new MockGitHubClient({
       status: { 418: "In Development" },
-      labels: { 418: ["ready:po", "ready:architect", "needs-rework:po"] },
+      labels: { 418: ["done:po", "done:architect", "needs-rework:po"] },
     });
     const { ctx } = makeTestContext({
       item: { issueNumber: 418 },
@@ -1838,18 +1838,18 @@ describe("handlePostRun — decidePostRunLabels integration", () => {
     const result = await handlePostRun(STREAM_OK(), ctx, false);
     assert.deepEqual(result, { ok: true });
 
-    // No `ready:<self>` added (rework path wins per shouldAddReadyLabel).
-    assert.ok(!client.addLabelCalls.some(c => c.label === "ready:developer"));
+    // No `done:<self>` added (rework path wins per shouldAddReadyLabel).
+    assert.ok(!client.addLabelCalls.some(c => c.label === "done:developer"));
 
-    // Critical: no prior `ready:*` stripped here. runReworkRouting will
+    // Critical: no prior `done:*` stripped here. runReworkRouting will
     // strip them on the next reconcile pass when it routes the ticket
     // back to PO.
     const readyStrips = client.removeLabelCalls.filter(
-      c => c.issueNumber === 418 && c.label.startsWith("ready:"),
+      c => c.issueNumber === 418 && c.label.startsWith("done:"),
     );
     assert.deepEqual(
       readyStrips, [],
-      "rework path must not strip prior ready:* labels in handlePostRun — runReworkRouting owns that",
+      "rework path must not strip prior done:* labels in handlePostRun — runReworkRouting owns that",
     );
   });
 
@@ -1872,8 +1872,8 @@ describe("handlePostRun — decidePostRunLabels integration", () => {
     const result = await handlePostRun(STREAM_OK(), ctx, false);
 
     assert.deepEqual(result, { ok: true });
-    // No `ready:developer` (rework target wins per shouldAddReadyLabel).
-    assert.ok(!client.addLabelCalls.some(c => c.label === "ready:developer"));
+    // No `done:developer` (rework target wins per shouldAddReadyLabel).
+    assert.ok(!client.addLabelCalls.some(c => c.label === "done:developer"));
     assert.equal(client.comments.length, 1);
     assert.match(client.comments[0]!.body, /rework by \*\*po\*\*/);
     assert.match(client.comments[0]!.body, /Needs rework by po/);
@@ -1900,8 +1900,8 @@ describe("handlePostRun — decidePostRunLabels integration", () => {
     const result = await handlePostRun(STREAM_OK(), ctx, false);
 
     assert.deepEqual(result, { ok: true });
-    assert.ok(!client.addLabelCalls.some(c => c.label === "ready:po"),
-      "moved-out path must not apply ready:<agent>");
+    assert.ok(!client.addLabelCalls.some(c => c.label === "done:po"),
+      "moved-out path must not apply done:<agent>");
     // Comment still posted (the success-with-output comment), but no
     // rework framing.
     assert.equal(client.comments.length, 1);
@@ -1929,8 +1929,8 @@ describe("handlePostRun — decidePostRunLabels integration", () => {
     const result = await handlePostRun(STREAM_OK(), ctx, false);
 
     assert.deepEqual(result, { ok: true }, "post-run must not throw on getItemStatus failure");
-    // Cautious default: skip ready:<agent> when we can't confirm the column.
-    assert.ok(!client.addLabelCalls.some(c => c.label === "ready:developer"));
+    // Cautious default: skip done:<agent> when we can't confirm the column.
+    assert.ok(!client.addLabelCalls.some(c => c.label === "done:developer"));
   });
 });
 
@@ -1958,8 +1958,8 @@ describe("handlePostRun — coverage edges", () => {
     const result = await handlePostRun(STREAM_OK(), ctx, /* saferSalvaged */ true);
 
     assert.deepEqual(result, { ok: true });
-    assert.ok(!client.addLabelCalls.some(c => c.label === "ready:developer"),
-      "salvage path must not apply ready:<agent>");
+    assert.ok(!client.addLabelCalls.some(c => c.label === "done:developer"),
+      "salvage path must not apply done:<agent>");
     // No success comment (the post-success block is gated on !saferSalvaged).
     assert.equal(client.comments.length, 0);
     // No success Discord notify (also gated on !saferSalvaged).
@@ -2205,7 +2205,7 @@ function fullHappyExecImpls(branch: string): Record<string, ExecHandler> {
 }
 
 describe("dispatchToAgent — orchestrator integration", () => {
-  test("happy-path full run → setup + spawn + stream + post-run all green; ready:<agent> + cleanup runs", async () => {
+  test("happy-path full run → setup + spawn + stream + post-run all green; done:<agent> + cleanup runs", async () => {
     const claudeMd = claudeMdAbsPath("developer/CLAUDE.md");
     const client = new MockGitHubClient({
       status: { 700: "In Development" },
@@ -2220,8 +2220,8 @@ describe("dispatchToAgent — orchestrator integration", () => {
 
     await dispatchToAgent(agent, item, client, deps);
 
-    // ready:developer applied (post-success labeling).
-    assert.ok(client.addLabelCalls.some(c => c.label === "ready:developer"));
+    // done:developer applied (post-success labeling).
+    assert.ok(client.addLabelCalls.some(c => c.label === "done:developer"));
     // No error labels.
     assert.ok(!client.addLabelCalls.some(c => c.label.startsWith("error:")));
     // Cleanup ran (the marker command).
@@ -2306,7 +2306,7 @@ describe("dispatchToAgent — orchestrator integration", () => {
     // Stream returns max_turns + uncommitted clean code →
     // handleAgentResultErrors triggers safer-salvage, returns
     // saferSalvaged=true → handlePostRun sees the flag and skips
-    // ready:<agent> + success comment + success Discord →
+    // done:<agent> + success comment + success Discord →
     // returns {ok:true} → cleanup runs.
     const claudeMd = claudeMdAbsPath("developer/CLAUDE.md");
     const client = new MockGitHubClient({
@@ -2341,8 +2341,8 @@ describe("dispatchToAgent — orchestrator integration", () => {
 
     // Salvage label applied.
     assert.ok(client.addLabelCalls.some(c => c.label === "error:max_turns_salvaged"));
-    // No ready:<agent> (suppressed by saferSalvaged=true).
-    assert.ok(!client.addLabelCalls.some(c => c.label === "ready:developer"));
+    // No done:<agent> (suppressed by saferSalvaged=true).
+    assert.ok(!client.addLabelCalls.some(c => c.label === "done:developer"));
     // No error:<agent> either (salvage is the canonical signal here).
     assert.ok(!client.addLabelCalls.some(c => c.label === "error:developer"));
     // Salvage notify (one 💾 message from attemptSaferSalvage; no
@@ -2449,8 +2449,8 @@ describe("dispatchToAgent — concurrent dispatches (pollLoop's Promise.allSettl
     assert.equal(results[1]!.status, "fulfilled", `dispatch 2: ${results[1]!.status}`);
 
     // Per-issue label state: each ticket got its own ready label, no cross-pollination.
-    assert.ok(client.addLabelCalls.some(c => c.issueNumber === 800 && c.label === "ready:developer"));
-    assert.ok(client.addLabelCalls.some(c => c.issueNumber === 801 && c.label === "ready:developer"));
+    assert.ok(client.addLabelCalls.some(c => c.issueNumber === 800 && c.label === "done:developer"));
+    assert.ok(client.addLabelCalls.some(c => c.issueNumber === 801 && c.label === "done:developer"));
     // No error labels on either.
     assert.ok(!client.addLabelCalls.some(c => c.label.startsWith("error:")));
 
@@ -2499,11 +2499,11 @@ describe("dispatchToAgent — concurrent dispatches (pollLoop's Promise.allSettl
     ]);
 
     // Per-issue label scope holds:
-    // 802 got error:developer (push failed); NO ready:developer.
+    // 802 got error:developer (push failed); NO done:developer.
     assert.ok(client.addLabelCalls.some(c => c.issueNumber === 802 && c.label === "error:developer"));
-    assert.ok(!client.addLabelCalls.some(c => c.issueNumber === 802 && c.label === "ready:developer"));
-    // 803 got ready:developer (happy path); NO error:developer.
-    assert.ok(client.addLabelCalls.some(c => c.issueNumber === 803 && c.label === "ready:developer"));
+    assert.ok(!client.addLabelCalls.some(c => c.issueNumber === 802 && c.label === "done:developer"));
+    // 803 got done:developer (happy path); NO error:developer.
+    assert.ok(client.addLabelCalls.some(c => c.issueNumber === 803 && c.label === "done:developer"));
     assert.ok(!client.addLabelCalls.some(c => c.issueNumber === 803 && c.label === "error:developer"));
 
     // Cleanup-skip is per-dispatch: 803's worktree was cleaned up
@@ -2575,7 +2575,7 @@ describe("dispatchToAgent — concurrent dispatches (pollLoop's Promise.allSettl
     // different tickets — the `<agent>-<n>` worktree path naming
     // scheme means no path collision is possible. Verify both
     // dispatches succeed AND their labels are scoped to the right
-    // agent name (ready:architect on 806, ready:developer on 807).
+    // agent name (done:architect on 806, done:developer on 807).
     const archMd = claudeMdAbsPath("architect/CLAUDE.md");
     const devMd = claudeMdAbsPath("developer/CLAUDE.md");
     const client = new MockGitHubClient({
@@ -2606,12 +2606,12 @@ describe("dispatchToAgent — concurrent dispatches (pollLoop's Promise.allSettl
     assert.equal(results[1]!.status, "fulfilled");
 
     // Per-agent label scoping: each ticket got the correct
-    // ready:<agent> prefix matching the dispatching agent's name.
-    assert.ok(client.addLabelCalls.some(c => c.issueNumber === 806 && c.label === "ready:architect"));
-    assert.ok(client.addLabelCalls.some(c => c.issueNumber === 807 && c.label === "ready:developer"));
-    // No cross-pollination: 806 didn't get ready:developer, 807 didn't get ready:architect.
-    assert.ok(!client.addLabelCalls.some(c => c.issueNumber === 806 && c.label === "ready:developer"));
-    assert.ok(!client.addLabelCalls.some(c => c.issueNumber === 807 && c.label === "ready:architect"));
+    // done:<agent> prefix matching the dispatching agent's name.
+    assert.ok(client.addLabelCalls.some(c => c.issueNumber === 806 && c.label === "done:architect"));
+    assert.ok(client.addLabelCalls.some(c => c.issueNumber === 807 && c.label === "done:developer"));
+    // No cross-pollination: 806 didn't get done:developer, 807 didn't get done:architect.
+    assert.ok(!client.addLabelCalls.some(c => c.issueNumber === 806 && c.label === "done:developer"));
+    assert.ok(!client.addLabelCalls.some(c => c.issueNumber === 807 && c.label === "done:architect"));
 
     // Worktree paths: `architect-806` and `developer-807` — distinct
     // by agent name AND ticket number, doubly safe.
@@ -2637,28 +2637,28 @@ describe("dispatchToAgent — concurrent dispatches (pollLoop's Promise.allSettl
 
 describe("runDoneCleanup", () => {
   test("strips pipeline labels from Done items", async () => {
-    // Two Done items with stale ready:* labels accumulated from the pipeline run.
+    // Two Done items with stale done:* labels accumulated from the pipeline run.
     const client = new MockGitHubClient({
       items: [
-        { issueNumber: 900, status: "Done", labels: ["ready:documentation", "size:s"], state: "OPEN" },
-        { issueNumber: 901, status: "Done", labels: ["ready:po", "ready:architect", "ready:developer", "ready:code-review", "ready:documentation"], state: "OPEN" },
+        { issueNumber: 900, status: "Done", labels: ["done:documentation", "size:s"], state: "OPEN" },
+        { issueNumber: 901, status: "Done", labels: ["done:po", "done:architect", "done:developer", "done:code-review", "done:documentation"], state: "OPEN" },
       ],
     });
 
     await runDoneCleanup(client);
 
-    // Item 900: only ready:documentation stripped; size:s preserved
+    // Item 900: only done:documentation stripped; size:s preserved
     // (decideDoneCleanup leaves size labels alone).
-    assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 900 && c.label === "ready:documentation"));
+    assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 900 && c.label === "done:documentation"));
     assert.ok(!client.removeLabelCalls.some(c => c.issueNumber === 900 && c.label === "size:s"));
 
-    // Item 901: all five ready:* stripped.
+    // Item 901: all five done:* stripped.
     const stripped901 = client.removeLabelCalls.filter(c => c.issueNumber === 901).map(c => c.label);
-    assert.ok(stripped901.includes("ready:po"));
-    assert.ok(stripped901.includes("ready:architect"));
-    assert.ok(stripped901.includes("ready:developer"));
-    assert.ok(stripped901.includes("ready:code-review"));
-    assert.ok(stripped901.includes("ready:documentation"));
+    assert.ok(stripped901.includes("done:po"));
+    assert.ok(stripped901.includes("done:architect"));
+    assert.ok(stripped901.includes("done:developer"));
+    assert.ok(stripped901.includes("done:code-review"));
+    assert.ok(stripped901.includes("done:documentation"));
   });
 
   test("idempotent — clean Done item produces no removeLabel calls", async () => {
@@ -2689,7 +2689,7 @@ describe("runDoneCleanup", () => {
     // across tests within this process).
     const client = new MockGitHubClient({
       items: [
-        { issueNumber: 909_001, status: "Done", labels: ["ready:developer"], state: "OPEN" },
+        { issueNumber: 909_001, status: "Done", labels: ["done:developer"], state: "OPEN" },
       ],
     });
     client.failures.removeLabel = new Error("renamed label, REST 404");
@@ -2701,7 +2701,7 @@ describe("runDoneCleanup", () => {
     await runDoneCleanup(client);
 
     // Both cycles attempted removal of the same label.
-    const attempts = client.removeLabelCalls.filter(c => c.issueNumber === 909_001 && c.label === "ready:developer");
+    const attempts = client.removeLabelCalls.filter(c => c.issueNumber === 909_001 && c.label === "done:developer");
     assert.equal(attempts.length, 2, "removeLabel attempted on both cycles (warn-once doesn't suppress the call)");
     // The warn-once Set is module-level and only-observable via
     // console.warn; we can't assert it directly without exporting the
@@ -2782,7 +2782,7 @@ describe("runClosedSweep", () => {
 describe("runPreDispatchPrep", () => {
   test("strips per-agent labels ONLY (does NOT touch other agents' labels — the #9 fix)", async () => {
     const client = new MockGitHubClient({
-      labels: { 1000: ["ready:developer", "error:architect", "wip:po", "size:m", "needs-rework:code-review"] },
+      labels: { 1000: ["done:developer", "error:architect", "wip:po", "size:m", "needs-rework:code-review"] },
     });
     const item = makeProjectItem({ issueNumber: 1000, labels: client.labelsByIssue.get(1000)! });
     const agent = makeAgentConfig({});  // developer
@@ -2791,7 +2791,7 @@ describe("runPreDispatchPrep", () => {
 
     const stripped = client.removeLabelCalls.map(c => c.label);
     // Developer's own pipeline label stripped.
-    assert.ok(stripped.includes("ready:developer"));
+    assert.ok(stripped.includes("done:developer"));
     // Other agents' pipeline labels PRESERVED (the load-bearing invariant).
     assert.ok(!stripped.includes("error:architect"), "other agent's error label must survive (human-actionable signal)");
     assert.ok(!stripped.includes("wip:po"), "other agent's wip label must survive");
@@ -2823,11 +2823,11 @@ describe("runPreDispatchPrep", () => {
     // tickets shouldn't race for prep. Sequential by design — the for-loop
     // awaits each iteration before the next.
     const client = new MockGitHubClient({
-      labels: { 1002: ["ready:developer"], 1003: ["ready:architect"] },
+      labels: { 1002: ["done:developer"], 1003: ["done:architect"] },
     });
     const candidates = [
-      { agent: makeAgentConfig({}), item: makeProjectItem({ issueNumber: 1002, labels: ["ready:developer"] }) },
-      { agent: makeAgentConfig({ name: "architect", column: "In Architecture", claudeMdPath: "architect/CLAUDE.md" }), item: makeProjectItem({ issueNumber: 1003, labels: ["ready:architect"] }) },
+      { agent: makeAgentConfig({}), item: makeProjectItem({ issueNumber: 1002, labels: ["done:developer"] }) },
+      { agent: makeAgentConfig({ name: "architect", column: "In Architecture", claudeMdPath: "architect/CLAUDE.md" }), item: makeProjectItem({ issueNumber: 1003, labels: ["done:architect"] }) },
     ];
 
     await runPreDispatchPrep(candidates, client);
@@ -3023,7 +3023,7 @@ describe("runAutoMerge", () => {
   test("happy path → gh pr merge succeeds, labels stripped, git pull, Discord notified", async () => {
     const client = new MockGitHubClient({
       items: [
-        { issueNumber: 1200, status: "Done", labels: ["ready:documentation", "size:s"], state: "OPEN" },
+        { issueNumber: 1200, status: "Done", labels: ["done:documentation", "size:s"], state: "OPEN" },
       ],
     });
     const { deps, calls } = makeMockDeps({
@@ -3044,8 +3044,8 @@ describe("runAutoMerge", () => {
       "must invoke `gh pr merge 789 --merge --delete-branch`");
     // Post-merge pull happened.
     assert.ok(calls.exec.some(c => c.cmd === "git checkout main && git pull"));
-    // Pipeline label stripped (ready:documentation is a pipeline label).
-    assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1200 && c.label === "ready:documentation"));
+    // Pipeline label stripped (done:documentation is a pipeline label).
+    assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1200 && c.label === "done:documentation"));
     // Non-pipeline label (size:s) NOT stripped.
     assert.ok(!client.removeLabelCalls.some(c => c.label === "size:s"));
     // Discord notify (one 🔀 message for the merge).
@@ -3061,7 +3061,7 @@ describe("runAutoMerge", () => {
     // attempts bump the counter and skip; see the retry tests below.
     const client = new MockGitHubClient({
       items: [
-        { id: "PVTI_1201", issueNumber: 1201, status: "Done", labels: ["ready:documentation", "merge-attempt:2"], state: "OPEN" },
+        { id: "PVTI_1201", issueNumber: 1201, status: "Done", labels: ["done:documentation", "merge-attempt:2"], state: "OPEN" },
       ],
     });
     const { deps, calls } = makeMockDeps({
@@ -3115,8 +3115,8 @@ describe("runAutoMerge", () => {
     // triggers the give-up path (retries exhausted), not a counter bump.
     const client = new MockGitHubClient({
       items: [
-        { id: "PVTI_1207", issueNumber: 1207, status: "Done", labels: ["ready:documentation", "merge-attempt:2"], state: "OPEN" },
-        { id: "PVTI_1208", issueNumber: 1208, status: "Done", labels: ["ready:documentation", "merge-attempt:2"], state: "OPEN" },
+        { id: "PVTI_1207", issueNumber: 1207, status: "Done", labels: ["done:documentation", "merge-attempt:2"], state: "OPEN" },
+        { id: "PVTI_1208", issueNumber: 1208, status: "Done", labels: ["done:documentation", "merge-attempt:2"], state: "OPEN" },
       ],
     });
     // Rollback fails for 1207 only; 1208 should still process normally.
@@ -3148,7 +3148,7 @@ describe("runAutoMerge", () => {
     // race (sibling PR mid-merge) often resolves by then.
     const client = new MockGitHubClient({
       items: [
-        { id: "PVTI_1210", issueNumber: 1210, status: "Done", labels: ["ready:documentation"], state: "OPEN" },
+        { id: "PVTI_1210", issueNumber: 1210, status: "Done", labels: ["done:documentation"], state: "OPEN" },
       ],
     });
     const { deps, calls } = makeMockDeps({
@@ -3179,7 +3179,7 @@ describe("runAutoMerge", () => {
     // to prevent accumulation.
     const client = new MockGitHubClient({
       items: [
-        { id: "PVTI_1211", issueNumber: 1211, status: "Done", labels: ["ready:documentation", "merge-attempt:1"], state: "OPEN" },
+        { id: "PVTI_1211", issueNumber: 1211, status: "Done", labels: ["done:documentation", "merge-attempt:1"], state: "OPEN" },
       ],
     });
     const { deps, calls } = makeMockDeps({
@@ -3204,7 +3204,7 @@ describe("runAutoMerge", () => {
     // test, just at the retry seam).
     const client = new MockGitHubClient({
       items: [
-        { id: "PVTI_1410", issueNumber: 1410, status: "Done", labels: ["ready:documentation"], state: "OPEN" },
+        { id: "PVTI_1410", issueNumber: 1410, status: "Done", labels: ["done:documentation"], state: "OPEN" },
       ],
     });
     const { deps, calls } = makeMockDeps({
@@ -3232,7 +3232,7 @@ describe("runAutoMerge", () => {
         { id: "PVTI_1202", issueNumber: 1202, status: "Done", labels: ["merged", "size:s"], state: "OPEN" },                     // skip: merged
         { id: "PVTI_1203", issueNumber: 1203, status: "Done", labels: ["error:merge-conflict"], state: "OPEN" },                  // skip: conflicted
         { id: "PVTI_1204", issueNumber: 0,    status: "Done", labels: [], state: "OPEN" },                                        // skip: issue-0 (epic)
-        { id: "PVTI_1205", issueNumber: 1205, status: "Done", labels: ["ready:documentation"], state: "OPEN" },                  // would process if it had a PR
+        { id: "PVTI_1205", issueNumber: 1205, status: "Done", labels: ["done:documentation"], state: "OPEN" },                  // would process if it had a PR
       ],
     });
     const { deps, calls } = makeMockDeps({
@@ -3262,7 +3262,7 @@ describe("runAutoMerge", () => {
     // permanently block legitimate PRs.
     const client = new MockGitHubClient({
       items: [
-        { issueNumber: 1206, status: "Done", labels: ["ready:documentation"], state: "OPEN" },
+        { issueNumber: 1206, status: "Done", labels: ["done:documentation"], state: "OPEN" },
       ],
     });
     const { deps, calls } = makeMockDeps({
@@ -3297,7 +3297,7 @@ describe("runAutoMerge", () => {
     // rest of the merge flow continues.
     const client = new MockGitHubClient({
       items: [
-        { issueNumber: 1300, status: "Done", labels: ["ready:documentation"], state: "OPEN" },
+        { issueNumber: 1300, status: "Done", labels: ["done:documentation"], state: "OPEN" },
       ],
     });
     const { deps, calls } = makeMockDeps({
@@ -3317,7 +3317,7 @@ describe("runAutoMerge", () => {
     assert.ok(cgCall, "codegraph index -f must be invoked when .codegraph exists");
     assert.equal(cgCall.opts?.cwd, TEST_REPO_ROOT, "must run codegraph index -f at the target repo root");
     // Standard merge path still completed (label cleanup + Discord).
-    assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1300 && c.label === "ready:documentation"));
+    assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1300 && c.label === "done:documentation"));
     assert.equal(calls.discord.length, 1);
     assert.match(calls.discord[0]!, /^🔀 PR #800 merged/);
   });
@@ -3331,7 +3331,7 @@ describe("runAutoMerge", () => {
     // both of which are surprising side-effects of a merge.
     const client = new MockGitHubClient({
       items: [
-        { issueNumber: 1301, status: "Done", labels: ["ready:documentation"], state: "OPEN" },
+        { issueNumber: 1301, status: "Done", labels: ["done:documentation"], state: "OPEN" },
       ],
     });
     const { deps, calls } = makeMockDeps({
@@ -3362,7 +3362,7 @@ describe("runAutoMerge", () => {
     // failure path (line 1858-1861).
     const client = new MockGitHubClient({
       items: [
-        { issueNumber: 1302, status: "Done", labels: ["ready:documentation"], state: "OPEN" },
+        { issueNumber: 1302, status: "Done", labels: ["done:documentation"], state: "OPEN" },
       ],
     });
     const { deps, calls } = makeMockDeps({
@@ -3383,7 +3383,7 @@ describe("runAutoMerge", () => {
     // The reindex was attempted (proves the path runs even on failure).
     assert.ok(calls.exec.some(c => c.cmd.includes("codegraph index -f")));
     // Critical: the rest of the merge path completed despite codegraph's failure.
-    assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1302 && c.label === "ready:documentation"));
+    assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1302 && c.label === "done:documentation"));
     assert.equal(calls.discord.length, 1);
     assert.match(calls.discord[0]!, /^🔀 PR #802 merged/);
     // No error label applied — codegraph failure isn't a ticket-level signal.
@@ -3401,7 +3401,7 @@ describe("runAutoMerge", () => {
     // against fresh base.
     const client = new MockGitHubClient({
       items: [
-        { issueNumber: 1400, status: "Done", labels: ["ready:documentation", "size:s"], state: "OPEN" },
+        { issueNumber: 1400, status: "Done", labels: ["done:documentation", "size:s"], state: "OPEN" },
       ],
     });
     const { deps, calls } = makeMockDeps({
@@ -3422,7 +3422,7 @@ describe("runAutoMerge", () => {
     assert.ok(mergeIdx >= 0, "merge must still run on rebase success");
     assert.ok(updateIdx < mergeIdx, "update-branch must precede merge");
     // Standard happy-path post-conditions still hold.
-    assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1400 && c.label === "ready:documentation"));
+    assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1400 && c.label === "done:documentation"));
     assert.equal(calls.discord.length, 1);
     assert.match(calls.discord[0]!, /^🔀 PR #900 merged/);
     assert.ok(!client.addLabelCalls.some(c => c.label === "error:merge-conflict"));
@@ -3440,7 +3440,7 @@ describe("runAutoMerge", () => {
     // retries exhausted, dispatcher gives up at the rebase step.
     const client = new MockGitHubClient({
       items: [
-        { id: "PVTI_1401", issueNumber: 1401, status: "Done", labels: ["ready:documentation", "merge-attempt:2"], state: "OPEN" },
+        { id: "PVTI_1401", issueNumber: 1401, status: "Done", labels: ["done:documentation", "merge-attempt:2"], state: "OPEN" },
       ],
     });
     const { deps, calls } = makeMockDeps({
@@ -3488,7 +3488,7 @@ describe("runAutoMerge", () => {
     // cycle will re-attempt the rebase, which is the correctness path.
     const client = new MockGitHubClient({
       items: [
-        { issueNumber: 1402, status: "Done", labels: ["ready:documentation"], state: "OPEN" },
+        { issueNumber: 1402, status: "Done", labels: ["done:documentation"], state: "OPEN" },
       ],
     });
     const { deps, calls } = makeMockDeps({

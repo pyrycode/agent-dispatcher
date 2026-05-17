@@ -125,7 +125,7 @@ export class GitHubProjectClient {
    * Used by the dispatcher's post-success path to detect "agent moved
    * the ticket out of its dispatch column" (PO demoting to Inbox, PO
    * moving a split parent to Done). When that happens, the dispatcher
-   * skips the `ready:<agent>` label so the board view doesn't show a
+   * skips the `done:<agent>` label so the board view doesn't show a
    * stale "ready" signal on a ticket the agent already routed away.
    *
    * `forceRefresh: true` clears the per-cycle cache before reading —

@@ -17,7 +17,7 @@ Inbox → Backlog → In Architecture → In Development → In Code Review → 
          (PO)      (architect)       (developer)      (code-review)    (documentation)
 ```
 
-Each transition is gated by a `ready:<agent>` label, advanced automatically when the previous agent finishes. Failures route via `needs-rework:<agent>` (back to that agent) or `error:<agent>` (held for human triage).
+Each transition is gated by a `done:<agent>` label, advanced automatically when the previous agent finishes. Failures route via `needs-rework:<agent>` (back to that agent) or `error:<agent>` (held for human triage).
 
 ### Worktree isolation
 

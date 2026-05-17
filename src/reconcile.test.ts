@@ -86,14 +86,14 @@ function makeItem(overrides: Partial<ProjectItem>): ProjectItem {
 describe("runAutoAdvance — cache invalidation", () => {
   test("clears items cache when an advance is applied (the 2026-05-03 #127 bug)", async () => {
     // Reproduces the exact shape that misfired in production: a ticket
-    // in In Development with `ready:developer` should auto-advance to
+    // in In Development with `done:developer` should auto-advance to
     // In Code Review AND signal cache invalidation so the per-agent
     // loop in the same cycle sees the new placement.
     const item = makeItem({
       id: "item-127",
       issueNumber: 127,
       status: "In Development",
-      labels: ["ready:developer", "size:xs"],
+      labels: ["done:developer", "size:xs"],
     });
     const client = new MockClient([item]);
 
@@ -128,13 +128,13 @@ describe("runAutoAdvance — cache invalidation", () => {
   });
 
   test("clears cache for Backlog → In Architecture advance when nothing in flight", async () => {
-    // The other path that mutates: Backlog ticket with `ready:po` and
+    // The other path that mutates: Backlog ticket with `done:po` and
     // an empty mid-pipeline. decideAutoAdvance moves it to In Architecture.
     const item = makeItem({
       id: "item-200",
       issueNumber: 200,
       status: "Backlog",
-      labels: ["ready:po", "size:s"],
+      labels: ["done:po", "size:s"],
     });
     const client = new MockClient([item]);
 
@@ -148,7 +148,7 @@ describe("runAutoAdvance — cache invalidation", () => {
   test("blocked mid-pipeline ticket does NOT hold a capacity seat (the #10 deadlock fix)", async () => {
     // The 2026-05-16 deadlock shape: #383 sits in "In Development"
     // blocked-by #409 (still open). #409 sits in Backlog with
-    // `ready:po`, ready to advance into the pipeline. Pre-fix, #383
+    // `done:po`, ready to advance into the pipeline. Pre-fix, #383
     // consumed the only seat (PYRY_MAX_CONCURRENT=1) and #409 stayed
     // in Backlog forever — mutual deadlock: #383 needs #409 to close,
     // #409 needs the seat #383 holds.
@@ -166,7 +166,7 @@ describe("runAutoAdvance — cache invalidation", () => {
       id: "item-409",
       issueNumber: 409,
       status: "Backlog",
-      labels: ["ready:po", "size:xs"],
+      labels: ["done:po", "size:xs"],
     });
     const client = new MockClient([blocked, blockingBacklog]);
 
@@ -203,7 +203,7 @@ describe("runAutoAdvance — cache invalidation", () => {
       id: "item-101",
       issueNumber: 101,
       status: "Backlog",
-      labels: ["ready:po", "size:s"],
+      labels: ["done:po", "size:s"],
     });
     const client = new MockClient([midActive, backlog]);
 
@@ -265,7 +265,7 @@ describe("runReworkRouting — cache invalidation", () => {
       id: "item-300",
       issueNumber: 300,
       status: "In Architecture",
-      labels: ["needs-rework:developer", "ready:architect", "size:m"],
+      labels: ["needs-rework:developer", "done:architect", "size:m"],
     });
     const client = new MockClient([item]);
 

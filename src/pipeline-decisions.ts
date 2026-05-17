@@ -21,16 +21,16 @@ export interface AdvanceRule {
 // include `readyLabel`. The chain must walk every column from Backlog to
 // Done with no gaps; the consistency tests in lib.test.ts enforce this.
 export const AUTO_ADVANCE_RULES: AdvanceRule[] = [
-  { from: "Backlog",            readyLabel: "ready:po",             to: "In Architecture" },
-  { from: "In Architecture",    readyLabel: "ready:architect",      to: "In Development" },
-  { from: "In Development",     readyLabel: "ready:developer",      to: "In Code Review" },
-  { from: "In Code Review",     readyLabel: "ready:code-review",    to: "In Documentation" },
-  { from: "In Documentation",   readyLabel: "ready:documentation",  to: "Done" },
+  { from: "Backlog",            readyLabel: "done:po",             to: "In Architecture" },
+  { from: "In Architecture",    readyLabel: "done:architect",      to: "In Development" },
+  { from: "In Development",     readyLabel: "done:developer",      to: "In Code Review" },
+  { from: "In Code Review",     readyLabel: "done:code-review",    to: "In Documentation" },
+  { from: "In Documentation",   readyLabel: "done:documentation",  to: "Done" },
 ];
 
 /**
  * Columns where the dispatcher does NOT auto-advance even when the
- * matching `ready:<agent>` label is present — a human reviews the work
+ * matching `done:<agent>` label is present — a human reviews the work
  * and moves the ticket forward manually (same gesture as Inbox → Backlog).
  *
  * **Currently empty** (as of 2026-05-02). The architect → developer gate
@@ -44,9 +44,9 @@ export const AUTO_ADVANCE_RULES: AdvanceRule[] = [
  * append the column name here, update the corresponding test in lib.test.ts,
  * and the gating behaviour in `decideAutoAdvance` activates automatically.
  *
- * Tickets in a gated column sit with `ready:<agent>` set; the gate
+ * Tickets in a gated column sit with `done:<agent>` set; the gate
  * just suppresses the auto-advance step. `shouldSkipDispatch` prevents
- * re-dispatch of an agent that has already added `ready:` for itself,
+ * re-dispatch of an agent that has already added `done:` for itself,
  * so the ticket is stable.
  */
 export const MANUAL_ADVANCE_GATES: ReadonlySet<string> = new Set<string>();
@@ -167,7 +167,7 @@ export interface AutoAdvanceDecision {
  *
  * Semantics:
  *   - **Gated columns** (in MANUAL_ADVANCE_GATES): no advance even when
- *     `ready:<agent>` is set. Eligible items are reported in `gatedAwaiting`
+ *     `done:<agent>` is set. Eligible items are reported in `gatedAwaiting`
  *     for heartbeat logging.
  *   - **Backlog**: capacity = `max(0, maxConcurrent - inFlightCount)`.
  *     Advance the first `min(eligible.length, capacity)` items in input
@@ -175,7 +175,7 @@ export interface AutoAdvanceDecision {
  *     eligible Backlog items are held. The cap matches `selectDispatches`'s
  *     concurrency model — N parallel threads through the pipeline, no
  *     PO frontrunning past available capacity. Without this cap, refined
- *     `ready:po` tickets would accumulate in Backlog while only one
+ *     `done:po` tickets would accumulate in Backlog while only one
  *     advanced per cycle (the pre-2026-05-08 bug).
  *   - **Mid-pipeline columns**: advance ALL eligible items. Once a ticket
  *     is past Backlog we want it to keep flowing.
@@ -221,7 +221,7 @@ export function decideAutoAdvance(
     if (rule.from === "Backlog") {
       // Capacity-bounded Backlog promotion. Advance up to `capacity` items
       // in input (board-position) order; hold the rest. Capacity tracks
-      // free pipeline seats so PO refinements don't pile up as `ready:po`
+      // free pipeline seats so PO refinements don't pile up as `done:po`
       // tickets that can't enter the pipeline (the bug shape: with WIP=N
       // dispatch but a hardcoded WIP=1 advance, refined backlog tickets
       // got stranded one-per-cycle while the pipeline ran serially).
@@ -271,7 +271,7 @@ export interface ReworkRoute {
   /** The needs-rework:<target> label that triggered this route. */
   triggerLabel: string;
   /** Labels to remove on routing — includes the trigger plus any
-   *  ready:/wip:/error: state labels (so the target column receives a
+   *  done:/wip:/error: state labels (so the target column receives a
    *  clean ticket, ready for re-dispatch). Non-state labels (size:,
    *  priority:, custom tags) are preserved. */
   labelsToStrip: string[];
@@ -324,7 +324,7 @@ export function decideReworkRoutes(
           label,
           ...item.labels.filter(l =>
             l !== label &&
-            (l.startsWith("ready:") || l.startsWith("wip:") || l.startsWith("error:")),
+            (l.startsWith("done:") || l.startsWith("wip:") || l.startsWith("error:")),
           ),
         ];
 
@@ -361,9 +361,9 @@ export interface DoneCleanup {
  * carries pipeline-state labels.
  *
  * The bug this fixes: `runAutoAdvance` moves tickets between columns by
- * `updateItemStatus` only — it doesn't strip the `ready:<agent>` labels
+ * `updateItemStatus` only — it doesn't strip the `done:<agent>` labels
  * that drove each advance. So a ticket that flowed through every agent
- * arrives in Done carrying every `ready:*` from the trail. The auto-merge
+ * arrives in Done carrying every `done:*` from the trail. The auto-merge
  * path strips pipeline labels, but only after `gh pr merge` succeeds —
  * doc-only tickets, manually-merged PRs, and closed-as-won't-fix never
  * get cleaned. `runClosedSweep` (which moves closed-but-not-Done tickets
@@ -377,7 +377,7 @@ export interface DoneCleanup {
  * pipeline labels.
  *
  * Strips:
- *   - any `ready:`/`wip:`/`error:`/`needs-rework:` label (`isPipelineLabel`)
+ *   - any `done:`/`wip:`/`error:`/`needs-rework:` label (`isPipelineLabel`)
  *   - any `rework-count:N` label (counter — reset so a re-opened ticket
  *     starts fresh rather than carrying stale rounds toward the loop
  *     threshold)
@@ -433,28 +433,28 @@ export interface PostRunLabelDecision {
   /** True if a legacy `needs-rework` (no agent suffix) is present and
    *  should be stripped — the dispatcher's legacy-label cleanup. */
   shouldStripLegacyNeedsRework: boolean;
-  /** True if the dispatcher should add `ready:<agentName>`. False if
+  /** True if the dispatcher should add `done:<agentName>`. False if
    *  rework was requested, the agent moved the ticket out of its
    *  column, or the post-run status fetch failed. */
   addReadyLabel: boolean;
-  /** `ready:*` labels from prior agents that should be stripped before
-   *  the new `ready:<agentName>` is applied. Populated only when
+  /** `done:*` labels from prior agents that should be stripped before
+   *  the new `done:<agentName>` is applied. Populated only when
    *  `addReadyLabel === true`; empty otherwise.
    *
    *  `runAutoAdvance` moves tickets between columns without stripping
-   *  the `ready:<agent>` labels that drove each advance (auto-advance
+   *  the `done:<agent>` labels that drove each advance (auto-advance
    *  is column-only by design — see `decideAutoAdvance` and
    *  `decideDoneCleanup`'s docstring for the asymmetry). The rework
    *  path strips via `runReworkRouting`; the Done path strips via
    *  `runDoneCleanup` + `runAutoMerge`. Mid-pipeline tickets that
    *  freeze on a `GLOBAL_BLOCK_LABELS` entry (e.g. `error:max_turns_salvaged`)
-   *  carry every prior `ready:*` until human triage. Stripping at the
-   *  point the next agent's `ready:<self>` is added closes the gap.
+   *  carry every prior `done:*` until human triage. Stripping at the
+   *  point the next agent's `done:<self>` is added closes the gap.
    *
-   *  Excludes `ready:<agentName>` itself (idempotency: don't remove +
+   *  Excludes `done:<agentName>` itself (idempotency: don't remove +
    *  re-add this agent's own label if a re-dispatch left it set).
    *
-   *  Surfaced 2026-05-10 by relay #7 carrying `ready:po + ready:architect
+   *  Surfaced 2026-05-10 by relay #7 carrying `done:po + done:architect
    *  + error:max_turns_salvaged`. The asymmetry has been present since
    *  pyrycode/agents@985bad1; rare visibility because most tickets
    *  flow to Done before stalling.
@@ -475,7 +475,7 @@ export interface PostRunLabelDecision {
  * 1. Find the rework target — the agent named in any `needs-rework:<target>`
  *    label. Also flags whether a legacy `needs-rework` (no suffix) is
  *    present so the caller can strip it.
- * 2. Decide whether to add `ready:<agentName>` — defers to
+ * 2. Decide whether to add `done:<agentName>` — defers to
  *    `shouldAddReadyLabel` for the canonical rule (rework wins, column
  *    move wins, status-unknown wins).
  * 3. Categorize the outcome for logging — `ready`, `rework`, `moved-out`,
@@ -526,14 +526,14 @@ export function decidePostRunLabels(opts: {
     logKind = "status-unknown";
   }
 
-  // Strip prior agents' `ready:*` only when we're about to add
-  // `ready:<self>`. Rework path defers to `runReworkRouting`; moved-out
+  // Strip prior agents' `done:*` only when we're about to add
+  // `done:<self>`. Rework path defers to `runReworkRouting`; moved-out
   // and status-unknown paths skip strips by design (no ready add to
   // bookend; cautious recovery on next cycle).
-  const ownReadyLabel = `ready:${opts.agentName}`;
+  const ownReadyLabel = `done:${opts.agentName}`;
   const priorReadyLabelsToStrip = addReadyLabel
     ? opts.postLabels.filter(
-        (l) => l.startsWith("ready:") && l !== ownReadyLabel,
+        (l) => l.startsWith("done:") && l !== ownReadyLabel,
       )
     : [];
 
@@ -547,9 +547,9 @@ export function decidePostRunLabels(opts: {
 }
 
 /**
- * Decide whether to add `ready:<agent>` after a successful agent run.
+ * Decide whether to add `done:<agent>` after a successful agent run.
  *
- * The auto-advance step interprets `ready:<agent>` as "this agent is
+ * The auto-advance step interprets `done:<agent>` as "this agent is
  * done, move the ticket forward." But some agents legitimately move
  * the ticket OUT of their dispatch column during a successful run:
  *
@@ -559,11 +559,11 @@ export function decidePostRunLabels(opts: {
  * - **PO** moves the parent ticket Backlog → Done after a split (it's
  *   superseded by the child tickets PO created).
  *
- * In those cases, adding `ready:po` would attach a stale "ready for
+ * In those cases, adding `done:po` would attach a stale "ready for
  * the next stage" signal to a ticket the agent explicitly moved off
  * the pipeline. The auto-advance rule wouldn't fire (the ticket is
  * no longer in the rule's `from` column), but a human scanning the
- * board sees `ready:po` on an Inbox ticket and is misled about state.
+ * board sees `done:po` on an Inbox ticket and is misled about state.
  *
  * Rules:
  * - Rework requested → skip (existing semantics)
@@ -589,12 +589,12 @@ export function shouldAddReadyLabel(opts: {
 // --------- Label predicates ---------
 
 // The four label prefixes the dispatcher uses for per-agent state.
-//   ready:<agent>        — agent completed successfully
+//   done:<agent>        — agent completed successfully
 //   needs-rework:<agent> — agent (or another) flagged the ticket back here
 //   wip:<agent>          — agent currently running
 //   error:<agent>        — agent crashed
 export const PIPELINE_LABEL_PREFIXES = [
-  "ready:",
+  "done:",
   "needs-rework:",
   "wip:",
   "error:",
@@ -638,7 +638,7 @@ export function isPipelineLabelForAgent(label: string, agentName: string): boole
  * - `error:max_turns_salvaged` — ticket's salvaged work sits in a draft PR
  *   awaiting human triage. Without the block, the next dispatch's existing
  *   PR-salvage path (which treats max_turns + open PR as success) would
- *   auto-advance partial work via `ready:<agent>`. See `attemptSaferSalvage`
+ *   auto-advance partial work via `done:<agent>`. See `attemptSaferSalvage`
  *   and `shouldAttemptSafeSalvage` for the salvage flow.
  * - `error:merge-conflict` — auto-merge against `main` failed because the
  *   PR has a merge conflict. The label stops the auto-merge retry loop
@@ -682,7 +682,7 @@ export function isMergeConflictError(stderr: string | null | undefined): boolean
 
 /**
  * The four-label gate from pollLoop's per-ticket inner loop: a ticket
- * should be skipped from dispatch if any of `ready:<agent>`,
+ * should be skipped from dispatch if any of `done:<agent>`,
  * `needs-rework:<agent>`, `wip:<agent>`, or `error:<agent>` is present.
  *
  * Returns true to skip (don't dispatch this agent on this ticket).

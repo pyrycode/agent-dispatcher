@@ -199,7 +199,7 @@ describe("resolveDefaultBranch", () => {
 
 describe("isPipelineLabel", () => {
   test("matches all four pipeline prefixes", () => {
-    assert.equal(isPipelineLabel("ready:po"), true);
+    assert.equal(isPipelineLabel("done:po"), true);
     assert.equal(isPipelineLabel("needs-rework:developer"), true);
     assert.equal(isPipelineLabel("wip:architect"), true);
     assert.equal(isPipelineLabel("error:code-review"), true);
@@ -225,7 +225,7 @@ describe("isPipelineLabelForAgent", () => {
   // human-actionable failure signal from a prior run on a different agent.
 
   test("matches the agent's own pipeline labels", () => {
-    assert.equal(isPipelineLabelForAgent("ready:developer", "developer"), true);
+    assert.equal(isPipelineLabelForAgent("done:developer", "developer"), true);
     assert.equal(isPipelineLabelForAgent("wip:developer", "developer"), true);
     assert.equal(isPipelineLabelForAgent("error:developer", "developer"), true);
     assert.equal(isPipelineLabelForAgent("needs-rework:developer", "developer"), true);
@@ -235,7 +235,7 @@ describe("isPipelineLabelForAgent", () => {
     // Dispatching `architect`, an `error:developer` left as a breadcrumb
     // by a prior dev run is NOT the architect dispatch's concern.
     assert.equal(isPipelineLabelForAgent("error:developer", "architect"), false);
-    assert.equal(isPipelineLabelForAgent("ready:po", "architect"), false);
+    assert.equal(isPipelineLabelForAgent("done:po", "architect"), false);
     assert.equal(isPipelineLabelForAgent("wip:code-review", "developer"), false);
     assert.equal(isPipelineLabelForAgent("needs-rework:po", "developer"), false);
   });
@@ -273,7 +273,7 @@ describe("shouldSkipDispatch", () => {
     // The bug this guards against: stripping all pipeline labels would
     // skip dispatch even for agents that haven't run yet.
     assert.equal(
-      shouldSkipDispatch(["ready:po", "ready:architect", "wip:developer"], "code-review"),
+      shouldSkipDispatch(["done:po", "done:architect", "wip:developer"], "code-review"),
       false,
     );
   });
@@ -289,7 +289,7 @@ describe("shouldSkipDispatch", () => {
   test("matches every agent in AGENTS without panicking on hyphens", () => {
     // 'code-review' has a hyphen — make sure prefix concatenation works.
     for (const agent of AGENTS) {
-      assert.equal(shouldSkipDispatch([`ready:${agent.name}`], agent.name), true);
+      assert.equal(shouldSkipDispatch([`done:${agent.name}`], agent.name), true);
       assert.equal(shouldSkipDispatch([], agent.name), false);
     }
   });
@@ -300,7 +300,7 @@ describe("shouldSkipDispatch", () => {
     // dispatch cycle would re-dispatch the same agent, hit max_turns
     // again, and the existing PR-already-exists salvage path would
     // treat the open draft PR as success — auto-advancing partial work
-    // to code-review with `ready:<agent>`. That's exactly what the
+    // to code-review with `done:<agent>`. That's exactly what the
     // safer-salvage design is meant to prevent. The label must block
     // dispatch on every agent until a human triages and removes it.
     for (const agent of AGENTS) {
@@ -409,7 +409,7 @@ describe("extractReworkTarget", () => {
   });
 
   test("returns null for non-rework labels", () => {
-    assert.equal(extractReworkTarget("ready:po"), null);
+    assert.equal(extractReworkTarget("done:po"), null);
     assert.equal(extractReworkTarget("wip:developer"), null);
     assert.equal(extractReworkTarget("size:s"), null);
     assert.equal(extractReworkTarget(""), null);
@@ -465,7 +465,7 @@ describe("AUTO_ADVANCE_RULES", () => {
   test("every readyLabel matches a known agent", () => {
     const knownAgents = new Set(AGENTS.map((a) => a.name));
     for (const rule of AUTO_ADVANCE_RULES) {
-      const agentName = rule.readyLabel.replace("ready:", "");
+      const agentName = rule.readyLabel.replace("done:", "");
       assert.ok(
         knownAgents.has(agentName),
         `rule readyLabel ${rule.readyLabel} references unknown agent ${agentName}`,
@@ -474,11 +474,11 @@ describe("AUTO_ADVANCE_RULES", () => {
   });
 
   test("each rule's `from` column is owned by its readyLabel's agent", () => {
-    // The `from` column should be the column of the agent whose `ready:`
+    // The `from` column should be the column of the agent whose `done:`
     // label triggers the advance — i.e. PO's column is Backlog, architect's
     // is In Architecture, etc.
     for (const rule of AUTO_ADVANCE_RULES) {
-      const agentName = rule.readyLabel.replace("ready:", "");
+      const agentName = rule.readyLabel.replace("done:", "");
       const expectedColumn = AGENT_COLUMN_MAP.get(agentName);
       assert.equal(
         rule.from,
@@ -574,7 +574,7 @@ describe("isPipelineInFlight", () => {
   test("any non-errored ticket counts as in flight", () => {
     // The most common case: a ticket actively progressing.
     assert.equal(
-      isPipelineInFlight([{ issueNumber: 28, labels: ["size:s", "ready:architect"] }]),
+      isPipelineInFlight([{ issueNumber: 28, labels: ["size:s", "done:architect"] }]),
       true,
     );
   });
@@ -613,7 +613,7 @@ describe("isPipelineInFlight", () => {
     assert.equal(
       isPipelineInFlight([
         { issueNumber: 99, labels: ["error:developer"] },
-        { issueNumber: 28, labels: ["ready:architect"] },
+        { issueNumber: 28, labels: ["done:architect"] },
       ]),
       true,
     );
@@ -627,7 +627,7 @@ describe("isPipelineInFlight", () => {
       false,
     );
     assert.equal(
-      isPipelineInFlight([{ issueNumber: -1, labels: ["ready:po"] }]),
+      isPipelineInFlight([{ issueNumber: -1, labels: ["done:po"] }]),
       false,
     );
   });
@@ -656,11 +656,11 @@ describe("decideAutoAdvance", () => {
     assert.deepEqual(d.gatedAwaiting, []);
   });
 
-  test("single ready:po in Backlog, pipeline empty → advance to In Architecture", () => {
+  test("single done:po in Backlog, pipeline empty → advance to In Architecture", () => {
     const d = decideAutoAdvance(
       AUTO_ADVANCE_RULES,
       MANUAL_ADVANCE_GATES,
-      items(["Backlog", [{ id: "i1", issueNumber: 28, labels: ["ready:po", "size:s"] }]]),
+      items(["Backlog", [{ id: "i1", issueNumber: 28, labels: ["done:po", "size:s"] }]]),
       0,
       1,
     );
@@ -674,7 +674,7 @@ describe("decideAutoAdvance", () => {
     assert.deepEqual(d.backlogHeld, []);
   });
 
-  test("two ready:po in Backlog at maxConcurrent=1, pipeline empty → first advances, second held", () => {
+  test("two done:po in Backlog at maxConcurrent=1, pipeline empty → first advances, second held", () => {
     // With WIP=1 (legacy mode, PYRY_MAX_CONCURRENT=1), only one Backlog
     // ticket may enter the pipeline per cycle. This is the b39f569 fix
     // semantic: without the within-cycle cap, both #28 and #29 would
@@ -683,8 +683,8 @@ describe("decideAutoAdvance", () => {
       AUTO_ADVANCE_RULES,
       MANUAL_ADVANCE_GATES,
       items(["Backlog", [
-        { id: "i1", issueNumber: 28, labels: ["ready:po", "size:s"] },
-        { id: "i2", issueNumber: 29, labels: ["ready:po", "size:s"] },
+        { id: "i1", issueNumber: 28, labels: ["done:po", "size:s"] },
+        { id: "i2", issueNumber: 29, labels: ["done:po", "size:s"] },
       ]]),
       0,
       1,
@@ -708,8 +708,8 @@ describe("decideAutoAdvance", () => {
       AUTO_ADVANCE_RULES,
       MANUAL_ADVANCE_GATES,
       items(["Backlog", [
-        { id: "i2", issueNumber: 29, labels: ["ready:po"] },
-        { id: "i1", issueNumber: 28, labels: ["ready:po"] },
+        { id: "i2", issueNumber: 29, labels: ["done:po"] },
+        { id: "i1", issueNumber: 28, labels: ["done:po"] },
       ]]),
       0,
       1,
@@ -727,9 +727,9 @@ describe("decideAutoAdvance", () => {
       AUTO_ADVANCE_RULES,
       MANUAL_ADVANCE_GATES,
       items(["Backlog", [
-        { id: "i3", issueNumber: 31, labels: ["ready:po"] },
-        { id: "i1", issueNumber: 28, labels: ["ready:po"] },
-        { id: "i2", issueNumber: 30, labels: ["ready:po"] },
+        { id: "i3", issueNumber: 31, labels: ["done:po"] },
+        { id: "i1", issueNumber: 28, labels: ["done:po"] },
+        { id: "i2", issueNumber: 30, labels: ["done:po"] },
       ]]),
       0,
       1,
@@ -740,11 +740,11 @@ describe("decideAutoAdvance", () => {
     assert.deepEqual(d.backlogHeld, [28, 30]);
   });
 
-  test("ready:po in Backlog while pipeline at capacity → all held, no advance", () => {
+  test("done:po in Backlog while pipeline at capacity → all held, no advance", () => {
     const d = decideAutoAdvance(
       AUTO_ADVANCE_RULES,
       MANUAL_ADVANCE_GATES,
-      items(["Backlog", [{ id: "i1", issueNumber: 29, labels: ["ready:po"] }]]),
+      items(["Backlog", [{ id: "i1", issueNumber: 29, labels: ["done:po"] }]]),
       1,
       1,
     );
@@ -763,7 +763,7 @@ describe("decideAutoAdvance", () => {
     const d = decideAutoAdvance(
       AUTO_ADVANCE_RULES,
       customGates,
-      items(["In Architecture", [{ id: "i1", issueNumber: 28, labels: ["ready:architect"] }]]),
+      items(["In Architecture", [{ id: "i1", issueNumber: 28, labels: ["done:architect"] }]]),
       1,
       1,
     );
@@ -773,22 +773,22 @@ describe("decideAutoAdvance", () => {
     assert.deepEqual(d.gatedAwaiting[0].itemNumbers, [28]);
   });
 
-  test("needs-rework label blocks advance even with ready:po", () => {
+  test("needs-rework label blocks advance even with done:po", () => {
     const d = decideAutoAdvance(
       AUTO_ADVANCE_RULES,
       MANUAL_ADVANCE_GATES,
-      items(["Backlog", [{ id: "i1", issueNumber: 28, labels: ["ready:po", "needs-rework:po"] }]]),
+      items(["Backlog", [{ id: "i1", issueNumber: 28, labels: ["done:po", "needs-rework:po"] }]]),
       0,
       1,
     );
     assert.deepEqual(d.advances, []);
   });
 
-  test("error label blocks advance even with ready:po", () => {
+  test("error label blocks advance even with done:po", () => {
     const d = decideAutoAdvance(
       AUTO_ADVANCE_RULES,
       MANUAL_ADVANCE_GATES,
-      items(["Backlog", [{ id: "i1", issueNumber: 28, labels: ["ready:po", "error:po"] }]]),
+      items(["Backlog", [{ id: "i1", issueNumber: 28, labels: ["done:po", "error:po"] }]]),
       0,
       1,
     );
@@ -799,7 +799,7 @@ describe("decideAutoAdvance", () => {
     const d = decideAutoAdvance(
       AUTO_ADVANCE_RULES,
       MANUAL_ADVANCE_GATES,
-      items(["Backlog", [{ id: "i1", issueNumber: 0, labels: ["ready:po"] }]]),
+      items(["Backlog", [{ id: "i1", issueNumber: 0, labels: ["done:po"] }]]),
       0,
       1,
     );
@@ -818,7 +818,7 @@ describe("decideAutoAdvance", () => {
   });
 
   test("mid-pipeline advance proceeds even when pipeline at capacity", () => {
-    // A ticket sitting in In Development with ready:developer should advance
+    // A ticket sitting in In Development with done:developer should advance
     // to In Code Review even though another ticket sits at In Architecture.
     // The cap holds NEW tickets out of the pipeline; in-flight tickets keep
     // flowing forward regardless.
@@ -826,8 +826,8 @@ describe("decideAutoAdvance", () => {
       AUTO_ADVANCE_RULES,
       MANUAL_ADVANCE_GATES,
       items(
-        ["In Architecture", [{ id: "i1", issueNumber: 28, labels: ["ready:architect"] }]],
-        ["In Development",  [{ id: "i2", issueNumber: 30, labels: ["ready:developer"] }]],
+        ["In Architecture", [{ id: "i1", issueNumber: 28, labels: ["done:architect"] }]],
+        ["In Development",  [{ id: "i2", issueNumber: 30, labels: ["done:developer"] }]],
       ),
       1,
       1,
@@ -839,7 +839,7 @@ describe("decideAutoAdvance", () => {
   });
 
   test("blocked Backlog item does not auto-advance (stays in Backlog until unblocked)", () => {
-    // A blocked ticket can be PO-refined (ready:po set) but should not
+    // A blocked ticket can be PO-refined (done:po set) but should not
     // auto-advance to In Architecture while blockers are open. Keeps
     // the board state honest: blocked tickets stay in the queue, not
     // the architect's column.
@@ -849,7 +849,7 @@ describe("decideAutoAdvance", () => {
       items(["Backlog", [{
         id: "i1",
         issueNumber: 45,
-        labels: ["ready:po", "size:s"],
+        labels: ["done:po", "size:s"],
         blockedBy: [{ number: 40, state: "OPEN" }],
       }]]),
       0,
@@ -867,7 +867,7 @@ describe("decideAutoAdvance", () => {
       items(["Backlog", [{
         id: "i1",
         issueNumber: 45,
-        labels: ["ready:po", "size:s"],
+        labels: ["done:po", "size:s"],
         blockedBy: [{ number: 40, state: "CLOSED" }],
       }]]),
       0,
@@ -884,8 +884,8 @@ describe("decideAutoAdvance", () => {
       AUTO_ADVANCE_RULES,
       MANUAL_ADVANCE_GATES,
       items(
-        ["In Development", [{ id: "i1", issueNumber: 30, labels: ["ready:developer"] }]],
-        ["In Code Review", [{ id: "i2", issueNumber: 31, labels: ["ready:code-review"] }]],
+        ["In Development", [{ id: "i1", issueNumber: 30, labels: ["done:developer"] }]],
+        ["In Code Review", [{ id: "i2", issueNumber: 31, labels: ["done:code-review"] }]],
       ),
       2,
       2,
@@ -899,21 +899,21 @@ describe("decideAutoAdvance", () => {
   //
   // Before the fix, `decideAutoAdvance` advanced at most ONE Backlog ticket
   // per cycle even when `selectDispatches` had room for N. Refined
-  // `ready:po` tickets piled up in Backlog while only one drained per cycle,
+  // `done:po` tickets piled up in Backlog while only one drained per cycle,
   // so PO frontran the queue (consuming the second WIP slot for new
   // refinement work) while the pipeline ran serially. Concurrency was a
   // mirage. These tests lock in the new capacity-bounded behaviour.
 
-  test("WIP=N: two ready:po, no in-flight, max=2 → both advance same cycle", () => {
-    // The bug case. Pre-fix: only #28 advanced; #29 stayed `ready:po` in
+  test("WIP=N: two done:po, no in-flight, max=2 → both advance same cycle", () => {
+    // The bug case. Pre-fix: only #28 advanced; #29 stayed `done:po` in
     // Backlog and waited a full cycle for the next promotion slot. Post-fix:
     // capacity = max(0, 2 - 0) = 2 → both go.
     const d = decideAutoAdvance(
       AUTO_ADVANCE_RULES,
       MANUAL_ADVANCE_GATES,
       items(["Backlog", [
-        { id: "i1", issueNumber: 28, labels: ["ready:po"] },
-        { id: "i2", issueNumber: 29, labels: ["ready:po"] },
+        { id: "i1", issueNumber: 28, labels: ["done:po"] },
+        { id: "i2", issueNumber: 29, labels: ["done:po"] },
       ]]),
       0,
       2,
@@ -931,11 +931,11 @@ describe("decideAutoAdvance", () => {
       AUTO_ADVANCE_RULES,
       MANUAL_ADVANCE_GATES,
       items(["Backlog", [
-        { id: "i1", issueNumber: 28, labels: ["ready:po"] },
-        { id: "i2", issueNumber: 29, labels: ["ready:po"] },
-        { id: "i3", issueNumber: 30, labels: ["ready:po"] },
-        { id: "i4", issueNumber: 31, labels: ["ready:po"] },
-        { id: "i5", issueNumber: 32, labels: ["ready:po"] },
+        { id: "i1", issueNumber: 28, labels: ["done:po"] },
+        { id: "i2", issueNumber: 29, labels: ["done:po"] },
+        { id: "i3", issueNumber: 30, labels: ["done:po"] },
+        { id: "i4", issueNumber: 31, labels: ["done:po"] },
+        { id: "i5", issueNumber: 32, labels: ["done:po"] },
       ]]),
       0,
       2,
@@ -952,9 +952,9 @@ describe("decideAutoAdvance", () => {
       AUTO_ADVANCE_RULES,
       MANUAL_ADVANCE_GATES,
       items(["Backlog", [
-        { id: "i1", issueNumber: 28, labels: ["ready:po"] },
-        { id: "i2", issueNumber: 29, labels: ["ready:po"] },
-        { id: "i3", issueNumber: 30, labels: ["ready:po"] },
+        { id: "i1", issueNumber: 28, labels: ["done:po"] },
+        { id: "i2", issueNumber: 29, labels: ["done:po"] },
+        { id: "i3", issueNumber: 30, labels: ["done:po"] },
       ]]),
       1,
       2,
@@ -969,7 +969,7 @@ describe("decideAutoAdvance", () => {
     const d = decideAutoAdvance(
       AUTO_ADVANCE_RULES,
       MANUAL_ADVANCE_GATES,
-      items(["Backlog", [{ id: "i1", issueNumber: 30, labels: ["ready:po"] }]]),
+      items(["Backlog", [{ id: "i1", issueNumber: 30, labels: ["done:po"] }]]),
       2,
       2,
     );
@@ -985,7 +985,7 @@ describe("decideAutoAdvance", () => {
     const d = decideAutoAdvance(
       AUTO_ADVANCE_RULES,
       MANUAL_ADVANCE_GATES,
-      items(["Backlog", [{ id: "i1", issueNumber: 30, labels: ["ready:po"] }]]),
+      items(["Backlog", [{ id: "i1", issueNumber: 30, labels: ["done:po"] }]]),
       5,
       2,
     );
@@ -1000,8 +1000,8 @@ describe("decideAutoAdvance", () => {
       AUTO_ADVANCE_RULES,
       MANUAL_ADVANCE_GATES,
       items(["Backlog", [
-        { id: "i1", issueNumber: 28, labels: ["ready:po"] },
-        { id: "i2", issueNumber: 29, labels: ["ready:po"] },
+        { id: "i1", issueNumber: 28, labels: ["done:po"] },
+        { id: "i2", issueNumber: 29, labels: ["done:po"] },
       ]]),
       0,
       0,
@@ -1019,7 +1019,7 @@ describe("countPipelineInFlight", () => {
   test("counts non-errored tickets with positive issueNumber", () => {
     assert.equal(
       countPipelineInFlight([
-        { issueNumber: 28, labels: ["ready:architect"] },
+        { issueNumber: 28, labels: ["done:architect"] },
         { issueNumber: 30, labels: [] },
         { issueNumber: 31, labels: ["wip:developer"] },
       ]),
@@ -1031,7 +1031,7 @@ describe("countPipelineInFlight", () => {
     // Errored tickets are parked; they don't consume a WIP seat.
     assert.equal(
       countPipelineInFlight([
-        { issueNumber: 28, labels: ["ready:architect"] },
+        { issueNumber: 28, labels: ["done:architect"] },
         { issueNumber: 99, labels: ["error:developer"] },
         { issueNumber: 100, labels: ["error:max_turns_salvaged"] },
       ]),
@@ -1043,7 +1043,7 @@ describe("countPipelineInFlight", () => {
     assert.equal(
       countPipelineInFlight([
         { issueNumber: 0, labels: [] },
-        { issueNumber: -1, labels: ["ready:po"] },
+        { issueNumber: -1, labels: ["done:po"] },
         { issueNumber: 28, labels: [] },
       ]),
       1,
@@ -1057,7 +1057,7 @@ describe("countPipelineInFlight", () => {
     // Backlog promotion at MAX_CONCURRENT=1.
     assert.equal(
       countPipelineInFlight([
-        { issueNumber: 28, labels: ["ready:architect"] },
+        { issueNumber: 28, labels: ["done:architect"] },
         { issueNumber: 383, labels: ["size:s"], blockedBy: [{ number: 409, state: "OPEN" }] },
       ]),
       1,
@@ -1105,7 +1105,7 @@ describe("countPipelineInFlight", () => {
     // counting as in-flight (they're not blocked).
     assert.equal(
       countPipelineInFlight([
-        { issueNumber: 28, labels: ["ready:architect"] },
+        { issueNumber: 28, labels: ["done:architect"] },
         { issueNumber: 29, labels: [], blockedBy: [] },
       ]),
       2,
@@ -1155,7 +1155,7 @@ describe("decideReworkRoutes", () => {
       items(["In Architecture", [{
         id: "i1",
         issueNumber: 27,
-        labels: ["ready:architect", "size:m", "needs-rework:po"],
+        labels: ["done:architect", "size:m", "needs-rework:po"],
       }]]),
     );
     assert.equal(r.length, 1);
@@ -1208,7 +1208,7 @@ describe("decideReworkRoutes", () => {
     assert.deepEqual(r[0].labelsToStrip, ["needs-rework:po"]);
   });
 
-  test("rework label strips ready:/error:/wip: along with itself", () => {
+  test("rework label strips done:/error:/wip: along with itself", () => {
     // The dispatcher cleans up stale state-prefix labels on rework so the
     // ticket arrives in the target column with a clean slate. Lock that.
     const r = decideReworkRoutes(
@@ -1216,13 +1216,13 @@ describe("decideReworkRoutes", () => {
       items(["In Architecture", [{
         id: "i1",
         issueNumber: 27,
-        labels: ["ready:architect", "wip:architect", "error:architect", "needs-rework:po", "size:m"],
+        labels: ["done:architect", "wip:architect", "error:architect", "needs-rework:po", "size:m"],
       }]]),
     );
     assert.equal(r.length, 1);
     const stripped = new Set(r[0].labelsToStrip);
     assert.ok(stripped.has("needs-rework:po"));
-    assert.ok(stripped.has("ready:architect"));
+    assert.ok(stripped.has("done:architect"));
     assert.ok(stripped.has("wip:architect"));
     assert.ok(stripped.has("error:architect"));
     // Non-state labels survive
@@ -1293,46 +1293,46 @@ describe("decideDoneCleanup", () => {
     assert.deepEqual(c, []);
   });
 
-  test("ticket with ready:documentation → strip it", () => {
-    // The reported bug: ready:documentation persists on tickets that flow
+  test("ticket with done:documentation → strip it", () => {
+    // The reported bug: done:documentation persists on tickets that flow
     // into Done via runAutoAdvance. The auto-merge path strips pipeline
     // labels, but only when a PR exists. Doc-only tickets, manually-merged
     // PRs, and closed-as-won't-fix never get cleaned without this pass.
     const items: Item[] = [{
       id: "i1",
       issueNumber: 21,
-      labels: ["ready:documentation"],
+      labels: ["done:documentation"],
     }];
     const c = decideDoneCleanup(items);
     assert.equal(c.length, 1);
     assert.equal(c[0].itemId, "i1");
     assert.equal(c[0].issueNumber, 21);
-    assert.deepEqual(c[0].labelsToStrip, ["ready:documentation"]);
+    assert.deepEqual(c[0].labelsToStrip, ["done:documentation"]);
   });
 
-  test("accumulated ready:* labels from full pipeline run → strip all", () => {
-    // A ticket that flowed through every agent accumulates a ready:<agent>
+  test("accumulated done:* labels from full pipeline run → strip all", () => {
+    // A ticket that flowed through every agent accumulates a done:<agent>
     // for each. None get stripped between columns. Lock in that all five
     // come off when the ticket reaches Done.
     const items: Item[] = [{
       id: "i1",
       issueNumber: 21,
       labels: [
-        "ready:po",
-        "ready:architect",
-        "ready:developer",
-        "ready:code-review",
-        "ready:documentation",
+        "done:po",
+        "done:architect",
+        "done:developer",
+        "done:code-review",
+        "done:documentation",
       ],
     }];
     const c = decideDoneCleanup(items);
     assert.equal(c.length, 1);
     const stripped = new Set(c[0].labelsToStrip);
-    assert.ok(stripped.has("ready:po"));
-    assert.ok(stripped.has("ready:architect"));
-    assert.ok(stripped.has("ready:developer"));
-    assert.ok(stripped.has("ready:code-review"));
-    assert.ok(stripped.has("ready:documentation"));
+    assert.ok(stripped.has("done:po"));
+    assert.ok(stripped.has("done:architect"));
+    assert.ok(stripped.has("done:developer"));
+    assert.ok(stripped.has("done:code-review"));
+    assert.ok(stripped.has("done:documentation"));
     assert.equal(c[0].labelsToStrip.length, 5);
   });
 
@@ -1343,18 +1343,18 @@ describe("decideDoneCleanup", () => {
     const items: Item[] = [{
       id: "i1",
       issueNumber: 21,
-      labels: ["ready:documentation", "size:s", "priority:normal", "area:dispatcher"],
+      labels: ["done:documentation", "size:s", "priority:normal", "area:dispatcher"],
     }];
     const c = decideDoneCleanup(items);
     assert.equal(c.length, 1);
-    assert.deepEqual(c[0].labelsToStrip, ["ready:documentation"]);
+    assert.deepEqual(c[0].labelsToStrip, ["done:documentation"]);
   });
 
   test("wip:/error:/needs-rework: also stripped on Done", () => {
     // A ticket can reach Done via the closed-sweep path (e.g. user
     // closes a won't-fix while it had wip:developer set, or the ticket
     // had needs-rework:po set when it got closed manually). These are
-    // pipeline state, same family as ready:*, and need cleanup too.
+    // pipeline state, same family as done:*, and need cleanup too.
     const items: Item[] = [{
       id: "i1",
       issueNumber: 21,
@@ -1378,12 +1378,12 @@ describe("decideDoneCleanup", () => {
     const items: Item[] = [{
       id: "i1",
       issueNumber: 21,
-      labels: ["ready:documentation", "rework-count:2"],
+      labels: ["done:documentation", "rework-count:2"],
     }];
     const c = decideDoneCleanup(items);
     assert.equal(c.length, 1);
     const stripped = new Set(c[0].labelsToStrip);
-    assert.ok(stripped.has("ready:documentation"));
+    assert.ok(stripped.has("done:documentation"));
     assert.ok(stripped.has("rework-count:2"));
   });
 
@@ -1405,14 +1405,14 @@ describe("decideDoneCleanup", () => {
     // Done holds many tickets over time. Cleanup must scan each
     // independently and emit one entry per ticket that needs work.
     const items: Item[] = [
-      { id: "i1", issueNumber: 21, labels: ["ready:documentation"] },
+      { id: "i1", issueNumber: 21, labels: ["done:documentation"] },
       { id: "i2", issueNumber: 22, labels: ["size:s"] }, // already clean
       { id: "i3", issueNumber: 23, labels: ["wip:developer", "rework-count:1"] },
     ];
     const c = decideDoneCleanup(items);
     assert.equal(c.length, 2);
     const byNumber = new Map(c.map(e => [e.issueNumber, e]));
-    assert.deepEqual(byNumber.get(21)!.labelsToStrip, ["ready:documentation"]);
+    assert.deepEqual(byNumber.get(21)!.labelsToStrip, ["done:documentation"]);
     const stripped3 = new Set(byNumber.get(23)!.labelsToStrip);
     assert.ok(stripped3.has("wip:developer"));
     assert.ok(stripped3.has("rework-count:1"));
@@ -1424,7 +1424,7 @@ describe("decideDoneCleanup", () => {
     const items: Item[] = [{
       id: "i0",
       issueNumber: 0,
-      labels: ["ready:documentation"],
+      labels: ["done:documentation"],
     }];
     const c = decideDoneCleanup(items);
     assert.deepEqual(c, []);
@@ -1476,11 +1476,11 @@ describe("extractReworkCount", () => {
   });
 
   test("no rework-count label → 0", () => {
-    assert.equal(extractReworkCount(["size:s", "ready:po"]), 0);
+    assert.equal(extractReworkCount(["size:s", "done:po"]), 0);
   });
 
   test("single rework-count:2 → 2", () => {
-    assert.equal(extractReworkCount(["size:s", "rework-count:2", "ready:po"]), 2);
+    assert.equal(extractReworkCount(["size:s", "rework-count:2", "done:po"]), 2);
   });
 
   test("rework-count:0 → 0 (legitimate zero, not a missing label)", () => {
@@ -1527,7 +1527,7 @@ describe("extractMergeAttemptCount", () => {
   });
 
   test("no merge-attempt label → 0", () => {
-    assert.equal(extractMergeAttemptCount(["size:s", "ready:developer"]), 0);
+    assert.equal(extractMergeAttemptCount(["size:s", "done:developer"]), 0);
   });
 
   test("single merge-attempt:2 → 2", () => {
@@ -1611,12 +1611,12 @@ describe("decideDoneCleanup — merge-attempt cleanup", () => {
       {
         id: "x",
         issueNumber: 42,
-        labels: ["ready:documentation", "rework-count:1", "merge-attempt:2", "size:s", "priority:high"],
+        labels: ["done:documentation", "rework-count:1", "merge-attempt:2", "size:s", "priority:high"],
       },
     ]);
     assert.equal(cleanups.length, 1);
     const stripped = new Set(cleanups[0]!.labelsToStrip);
-    assert.ok(stripped.has("ready:documentation"));
+    assert.ok(stripped.has("done:documentation"));
     assert.ok(stripped.has("rework-count:1"));
     assert.ok(stripped.has("merge-attempt:2"));
     // Non-pipeline labels are left alone.
@@ -2022,7 +2022,7 @@ describe("findReadyPrNumber", () => {
   // branch. Draft PRs don't count — they're typically the salvage
   // helper's own output, opened mid-work and waiting on human triage.
   // Treating a draft PR as "agent finished, just out of turns on
-  // cleanup" auto-advances partial work via `ready:<agent>`, which
+  // cleanup" auto-advances partial work via `done:<agent>`, which
   // is exactly what the safer-salvage design is meant to prevent.
 
   test("empty array → null", () => {
@@ -2141,12 +2141,12 @@ describe("selectDispatches", () => {
     assert.equal(r[1].agent.name, "po");
   });
 
-  test("ineligible labels filter out (wip:* / ready:* / needs-rework:* / error:*)", () => {
+  test("ineligible labels filter out (wip:* / done:* / needs-rework:* / error:*)", () => {
     const r = selectDispatches({
       itemsByColumn: new Map([
         ["Backlog", [
           item(1, ["wip:po"]),                        // skipped (in flight)
-          item(2, ["ready:po"]),                      // skipped (already done)
+          item(2, ["done:po"]),                      // skipped (already done)
           item(3, ["error:max_turns_salvaged"]),      // skipped (global block)
           item(4, []),                                // eligible
         ]],
@@ -2472,65 +2472,65 @@ describe("decidePostRunLabels", () => {
   });
 
   // --- priorReadyLabelsToStrip — added 2026-05-10 to fix observed
-  // accumulation on relay #7 (carried `ready:po + ready:architect +
+  // accumulation on relay #7 (carried `done:po + done:architect +
   // error:max_turns_salvaged` mid-pipeline). The asymmetry has been
   // present since pyrycode/agents@985bad1 — auto-advance moves columns
-  // without stripping prior agents' `ready:*`, runReworkRouting strips
+  // without stripping prior agents' `done:*`, runReworkRouting strips
   // only on rework, runDoneCleanup strips only at Done. For tickets
   // that freeze on a global-block label between Done and the rework
-  // path, prior `ready:*` labels are misleading provenance. Surfacing
+  // path, prior `done:*` labels are misleading provenance. Surfacing
   // them was rare enough that no one observed it until the first
   // `error:max_turns_salvaged` ticket got past two agents.
 
-  test("happy path with prior ready:po → strips ready:po before adding ready:architect", () => {
-    // The relay #7 shape: PO refined → ready:po; auto-advance to
+  test("happy path with prior done:po → strips done:po before adding done:architect", () => {
+    // The relay #7 shape: PO refined → done:po; auto-advance to
     // In Architecture; architect ran successfully → addReadyLabel=true.
-    // Without strip, ticket carries both ready:po + ready:architect.
+    // Without strip, ticket carries both done:po + done:architect.
     const d = decidePostRunLabels({
-      postLabels: ["ready:po", "size:s", "security-sensitive"],
+      postLabels: ["done:po", "size:s", "security-sensitive"],
       agentName: "architect",
       agentColumn: "In Architecture",
       currentColumn: "In Architecture",
     });
     assert.equal(d.addReadyLabel, true);
     assert.equal(d.logKind, "ready");
-    assert.deepEqual(d.priorReadyLabelsToStrip, ["ready:po"]);
+    assert.deepEqual(d.priorReadyLabelsToStrip, ["done:po"]);
   });
 
-  test("happy path with multiple prior ready:* → strips all of them", () => {
-    // A developer run after PO + architect — both prior `ready:*`
-    // accumulated. All should be stripped before adding ready:developer.
+  test("happy path with multiple prior done:* → strips all of them", () => {
+    // A developer run after PO + architect — both prior `done:*`
+    // accumulated. All should be stripped before adding done:developer.
     const d = decidePostRunLabels({
-      postLabels: ["ready:po", "ready:architect", "size:m"],
+      postLabels: ["done:po", "done:architect", "size:m"],
       agentName: "developer",
       agentColumn: "In Development",
       currentColumn: "In Development",
     });
     assert.equal(d.addReadyLabel, true);
-    assert.deepEqual(d.priorReadyLabelsToStrip, ["ready:po", "ready:architect"]);
+    assert.deepEqual(d.priorReadyLabelsToStrip, ["done:po", "done:architect"]);
   });
 
-  test("happy path: never strips this agent's own ready:<self> from the list", () => {
-    // Defense-in-depth: runPreDispatchPrep strips `ready:<self>` before
+  test("happy path: never strips this agent's own done:<self> from the list", () => {
+    // Defense-in-depth: runPreDispatchPrep strips `done:<self>` before
     // dispatch via isPipelineLabelForAgent, so this case shouldn't arise
     // organically. But if it does (re-dispatch race, manual edit), don't
     // emit a redundant remove → re-add round-trip.
     const d = decidePostRunLabels({
-      postLabels: ["ready:po", "ready:architect"],
+      postLabels: ["done:po", "done:architect"],
       agentName: "architect",
       agentColumn: "In Architecture",
       currentColumn: "In Architecture",
     });
     assert.equal(d.addReadyLabel, true);
-    assert.deepEqual(d.priorReadyLabelsToStrip, ["ready:po"]);
+    assert.deepEqual(d.priorReadyLabelsToStrip, ["done:po"]);
   });
 
   test("rework path → priorReadyLabelsToStrip is empty (runReworkRouting handles strip)", () => {
-    // `runReworkRouting` strips ALL ready:/wip:/error: labels when a
+    // `runReworkRouting` strips ALL done:/wip:/error: labels when a
     // needs-rework:<target> is added. Stripping here would duplicate
     // that work; the rework path is the existing strip surface.
     const d = decidePostRunLabels({
-      postLabels: ["ready:po", "needs-rework:po"],
+      postLabels: ["done:po", "needs-rework:po"],
       agentName: "architect",
       agentColumn: "In Architecture",
       currentColumn: "In Architecture",
@@ -2544,7 +2544,7 @@ describe("decidePostRunLabels", () => {
     // PO demoting Backlog → Inbox: addReadyLabel=false, so there's
     // nothing to bookend with a strip. Pre-existing behavior preserved.
     const d = decidePostRunLabels({
-      postLabels: ["ready:po"],
+      postLabels: ["done:po"],
       agentName: "po",
       agentColumn: "Backlog",
       currentColumn: "Inbox",
@@ -2559,7 +2559,7 @@ describe("decidePostRunLabels", () => {
     // confirm the post-run column. Next cycle re-runs the decision
     // with fresh state.
     const d = decidePostRunLabels({
-      postLabels: ["ready:po"],
+      postLabels: ["done:po"],
       agentName: "architect",
       agentColumn: "In Architecture",
       currentColumn: null,
@@ -2844,20 +2844,20 @@ describe("extractRateLimitInfo", () => {
 });
 
 describe("shouldAddReadyLabel", () => {
-  // After a successful agent run, the dispatcher adds `ready:<agent>`
+  // After a successful agent run, the dispatcher adds `done:<agent>`
   // so the auto-advance step moves the ticket to the next column. But
   // some agents legitimately move the ticket OUT of their dispatch
   // column during a successful run — PO can demote a Backlog ticket
   // back to Inbox when it lacks information for refinement (per
   // PO's CLAUDE.md), and PO moves a parent ticket to Done after a
-  // split. In those cases, adding `ready:po` would attach a "ready
+  // split. In those cases, adding `done:po` would attach a "ready
   // for the next stage" signal to a ticket the agent explicitly
   // moved off the pipeline, creating a stale label that misleads
   // anyone scanning the board.
   //
   // Pyrycode #57 (2026-05-02): PO demoted to Inbox per its CLAUDE.md
   // ("defer until Phase 1.1's pyry attach <id> lands"). Dispatcher
-  // still added `ready:po` because its existing check only gated on
+  // still added `done:po` because its existing check only gated on
   // `needs-rework:*` labels, not column movement. Same shape as the
   // earlier label/PR-classification bugs — predicate didn't account
   // for a new agent behavior pattern.
@@ -2888,7 +2888,7 @@ describe("shouldAddReadyLabel", () => {
 
   test("any forward column move from agent → skip (agent already advanced)", () => {
     // Hypothetical: an agent that moves the ticket to the next column
-    // itself (none currently do, but defensive). Adding ready:<agent>
+    // itself (none currently do, but defensive). Adding done:<agent>
     // when the ticket is already in the next column would just leave
     // a stale label.
     assert.equal(shouldAddReadyLabel({
@@ -3084,13 +3084,13 @@ describe("shouldFlagEmptyBranch", () => {
     assert.equal(shouldFlagEmptyBranch(dev, 0, ["needs-rework:architect"]), false);
   });
 
-  test("architect + 0 commits + ready:po (no needs-rework) → true (still silent failure)", () => {
+  test("architect + 0 commits + done:po (no needs-rework) → true (still silent failure)", () => {
     // Sanity: the bail-suppression specifically requires a
     // `needs-rework:*` label, not just any non-error label. An agent
-    // that exits with stale `ready:po` and no needs-rework still
+    // that exits with stale `done:po` and no needs-rework still
     // triggers the guard.
     const arch = AGENTS.find(a => a.name === "architect")!;
-    assert.equal(shouldFlagEmptyBranch(arch, 0, ["ready:po", "size:s"]), true);
+    assert.equal(shouldFlagEmptyBranch(arch, 0, ["done:po", "size:s"]), true);
   });
 
   test("architect + 0 commits + needs-rework:architect (self-route) → false (still a bail)", () => {
@@ -3190,7 +3190,7 @@ describe("findAdvanceRule", () => {
     const rule = findAdvanceRule(
       AUTO_ADVANCE_RULES,
       "In Architecture",
-      ["ready:architect"],
+      ["done:architect"],
     );
     assert.ok(rule);
     assert.equal(rule.to, "In Development");
@@ -3206,11 +3206,11 @@ describe("findAdvanceRule", () => {
   });
 
   test("returns null when ready label belongs to a different column", () => {
-    // ready:developer in Architecture column — wrong stage.
+    // done:developer in Architecture column — wrong stage.
     const rule = findAdvanceRule(
       AUTO_ADVANCE_RULES,
       "In Architecture",
-      ["ready:developer"],
+      ["done:developer"],
     );
     assert.equal(rule, null);
   });
@@ -3219,7 +3219,7 @@ describe("findAdvanceRule", () => {
     const rule = findAdvanceRule(
       AUTO_ADVANCE_RULES,
       "Some Bogus Column",
-      ["ready:po"],
+      ["done:po"],
     );
     assert.equal(rule, null);
   });
