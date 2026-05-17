@@ -2521,17 +2521,40 @@ export async function runAutoMerge(
   }
 }
 
-// Drain mode: SIGTERM flips this to true. The poll loop checks at the top
-// of each iteration and exits cleanly before starting the next cycle.
+// Drain mode: SIGTERM or SIGINT flips this to true. The poll loop checks at
+// the top of each iteration and exits cleanly before starting the next cycle.
 // Whatever agent is currently running finishes normally, so wip:<agent>
 // labels get stripped properly — no manual cleanup after stop.
-// Triggered via `pnpm drain` (which pkills with SIGTERM). Ctrl-C / SIGINT
-// is unchanged — still hard-stops the process.
+//
+// SIGTERM is what `pnpm drain` (and `kill <pid>`) sends — fire-and-forget,
+// always sets drainMode.
+//
+// SIGINT is Ctrl-C in the foreground terminal where the dispatcher runs —
+// first press triggers drain (same behavior as SIGTERM); second press within
+// 5 s force-exits with code 130 (POSIX convention for SIGINT) for when you
+// know the in-flight dispatch is wedged and waiting it out isn't worth it.
+// Force-exit leaves wip:<agent> on the ticket — cleanup is manual after.
 let drainMode = false;
+let lastSigintAt = 0;
 process.on("SIGTERM", () => {
   if (drainMode) return;  // idempotent — multiple SIGTERMs only print once
   drainMode = true;
   console.log("\n🚦 Drain mode: will exit after current dispatch completes.");
+});
+process.on("SIGINT", () => {
+  const now = Date.now();
+  if (drainMode) {
+    if (now - lastSigintAt < 5_000) {
+      console.log("\n🛑 Force-exit (second Ctrl-C). In-flight dispatch left mid-run; expect wip:<agent> labels needing manual cleanup.");
+      process.exit(130);
+    }
+    lastSigintAt = now;
+    console.log("🚦 Already draining. Press Ctrl-C again within 5 s to force-quit.");
+    return;
+  }
+  drainMode = true;
+  lastSigintAt = now;
+  console.log("\n🚦 Drain mode: will exit after current dispatch completes. Ctrl-C again within 5 s to force-quit.");
 });
 
 export async function pollLoop(): Promise<void> {
