@@ -1710,42 +1710,42 @@ describe("shouldUseWorktree", () => {
 describe("maxTurnsFor", () => {
   // Code review runs sub-agents (each consumes turns from the parent
   // budget) and routinely needs the headroom; everyone else gets the
-  // base budget. The base bumped 60 → 70 on 2026-05-03 (later afternoon)
-  // after three Mode-E events in one session (#128, #75, #99) all hit
-  // exactly at turn 60-61 in the housekeeping phase (commit/docs polish/
-  // PROJECT-MEMORY edit/qmd re-index). All three were caught merge-ready
-  // by safer-salvage. 10 more turns covers the housekeeping tail.
-  // Earlier: 50 → 60 on 2026-05-02 after #55.
+  // base budget. The base bumped 70 → 90 on 2026-05-20 after a
+  // turn-by-turn audit showed successful runs clustering at 59-68 turns
+  // (#454, #466, #463, #459, #450, #453) jammed against the 70 cap on
+  // real implementation work, not housekeeping. Earlier: 60 → 70 on
+  // 2026-05-03 (housekeeping-tail cluster), 50 → 60 on 2026-05-02
+  // (after #55).
   test("code-review gets 100 (runs sub-agents)", () => {
     const cr = AGENTS.find(a => a.name === "code-review")!;
     assert.equal(maxTurnsFor(cr), 100);
   });
 
-  test("developer gets 70 (was 60 — bumped 2026-05-03 after #128/#75/#99)", () => {
+  test("developer gets 90 (was 70 — bumped 2026-05-20)", () => {
     const dev = AGENTS.find(a => a.name === "developer")!;
-    assert.equal(maxTurnsFor(dev), 70);
+    assert.equal(maxTurnsFor(dev), 90);
   });
 
-  test("architect gets 70 (base budget — sketch + spec)", () => {
+  test("architect gets 90 (base budget — sketch + spec)", () => {
     const arch = AGENTS.find(a => a.name === "architect")!;
-    assert.equal(maxTurnsFor(arch), 70);
+    assert.equal(maxTurnsFor(arch), 90);
   });
 
-  test("po gets 70 (base budget — issue body refinement)", () => {
+  test("po gets 90 (base budget — issue body refinement)", () => {
     const po = AGENTS.find(a => a.name === "po")!;
-    assert.equal(maxTurnsFor(po), 70);
+    assert.equal(maxTurnsFor(po), 90);
   });
 
-  test("documentation gets 70 (base budget — knowledge base writes)", () => {
+  test("documentation gets 90 (base budget — knowledge base writes)", () => {
     const docs = AGENTS.find(a => a.name === "documentation")!;
-    assert.equal(maxTurnsFor(docs), 70);
+    assert.equal(maxTurnsFor(docs), 90);
   });
 
   test("unknown agent name still gets the base budget (no implicit zero)", () => {
     // Defensive: a typo or new agent shouldn't silently dispatch with
     // 0 turns. The policy returns the base budget for any non-code-review
     // name; if a future agent needs more, it must be added explicitly.
-    assert.equal(maxTurnsFor({ name: "ghost", column: "", claudeMdPath: "", description: "", usesWorktree: false, producesCommits: false }), 70);
+    assert.equal(maxTurnsFor({ name: "ghost", column: "", claudeMdPath: "", description: "", usesWorktree: false, producesCommits: false }), 90);
   });
 });
 

@@ -1526,9 +1526,9 @@ export async function prepareAgentSpawn(
   writeFileSync(promptFile, prompt);
   writeFileSync(systemPromptFile, systemPrompt);
 
-  // Turn limits: see `maxTurnsFor` in lib.ts for rationale (base 70,
-  // code-review 100). Bumped 60 → 70 on 2026-05-03 after Mode-E cluster
-  // (#128, #75, #99) hit at turn 60-61 in the housekeeping phase.
+  // Turn limits: see `maxTurnsFor` in lib.ts for rationale (base 90,
+  // code-review 100). Bumped 70 → 90 on 2026-05-20 after successful runs
+  // clustered at 59-68 turns against the prior 70 cap on real impl work.
   const maxTurns = maxTurnsFor(agent);
   const isCodeReview = agent.name === "code-review";
 

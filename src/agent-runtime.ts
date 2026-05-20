@@ -36,31 +36,43 @@ export function shouldUseWorktree(agent: AgentConfig): boolean {
  * turn budget covers all child invocations). Everyone else gets the
  * base budget.
  *
- * **Base budget bumped 60 → 70 on 2026-05-03 (later afternoon)** after
- * three Mode-E max_turns events in one session (#128, #75, #99) all
- * hit at exactly turn 60-61, all caught merge-ready by safer-salvage,
- * all in the housekeeping phase (commit/docs polish/PROJECT-MEMORY
- * edit/qmd re-index). Pattern: implementation + tests landed cleanly,
- * cap hit during cleanup. The salvage backstop preserved the work in
- * each case ($4.74-$6.68 each), but draft-PR-then-mark-ready is
- * higher-friction than just shipping. 10 more turns covers the
- * housekeeping tail without weakening the forcing function.
+ * **Base budget bumped 70 → 90 on 2026-05-20** after a turn-by-turn
+ * log audit of the recent successful runs (#454: 68, #466: 65, #463:
+ * 66, #459: 59, #450: 65, #453: 60) showed a cluster jammed against
+ * the 70 cap on real implementation work — not housekeeping. The
+ * 2026-05-19 trim of the knowledge-doc AC + PR body template was the
+ * first response (saves ~1-3 turns on tickets where the doc was an
+ * AC), but the data showed the binding constraint was implementation
+ * + tests + verification on legitimately-sized S tickets, not a fixed
+ * housekeeping tail. The per-size differentiation idea (XS=40, S=70,
+ * e2e/refactor=90) predicted in the prior history was falsified by
+ * #478 (size:s, still hit 71): housekeeping cost is fixed, but so is
+ * the impl+test cost on S work — a flat bump is the right move when
+ * BOTH are jammed against the cap. 20 more turns absorbs both classes
+ * without making oversize tickets less detectable; the architect's
+ * total-LOC red lines (2026-05-17 `6029238`) and the per-ticket-doc
+ * trim (2026-05-19 `5183a67`) remain the forcing functions.
  *
- * **Earlier history:** Base budget bumped 50 → 60 on 2026-05-02
- * after #55 hit the 50 cap on an S-sized e2e ticket. Distribution
- * analysis at the time: 7+ tickets clustered exactly AT 50 turns,
- * indicating the cap was binding. Combined with the architect-spec
- * "Files to read first" rule, 60 reclaimed most of the long tail.
+ * **Earlier history:**
+ * - Base budget bumped 60 → 70 on 2026-05-03 after three Mode-E
+ *   max_turns events (#128, #75, #99) all hit at turn 60-61 in the
+ *   housekeeping phase (commit/docs polish/PROJECT-MEMORY edit/qmd
+ *   re-index). 10 more turns covered the housekeeping tail without
+ *   weakening the forcing function.
+ * - Base budget bumped 50 → 60 on 2026-05-02 after #55 hit the 50 cap
+ *   on an S-sized e2e ticket. Distribution analysis: 7+ tickets
+ *   clustered exactly AT 50 turns, indicating the cap was binding.
+ *   Combined with the architect-spec "Files to read first" rule, 60
+ *   reclaimed most of the long tail.
  *
- * Re-evaluate after ~10 dispatched runs at 70. If Mode E recurs at
- * 70-71, the right move is per-size differentiation (XS=40, S=70,
- * e2e/refactor=90) rather than another flat bump — the Mode-E cluster
- * suggests housekeeping cost is roughly fixed regardless of impl size,
- * so smaller tickets are over-budgeted at the flat rate.
+ * Re-evaluate after ~10 dispatched runs at 90. If runs cluster at
+ * 85-90, the cap is still binding and per-size differentiation finally
+ * earns its keep. If runs land at 50-75, the bump was right and the
+ * 2026-05-19 doc/PR-body trim accounts for the rest of the headroom.
  */
 export function maxTurnsFor(agent: AgentConfig): number {
   if (agent.name === "code-review") return 100;
-  return 70;
+  return 90;
 }
 
 // --------- Safer max_turns salvage ---------
