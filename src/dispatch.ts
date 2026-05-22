@@ -1,4 +1,4 @@
-import { execSync, spawn, spawnSync } from "node:child_process";
+import { type ChildProcess, execSync, spawn, spawnSync } from "node:child_process";
 import { readFileSync, existsSync, writeFileSync, mkdirSync, appendFileSync, readdirSync, createReadStream, statSync, symlinkSync, unlinkSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -257,6 +257,79 @@ interface RunClaudeOpts {
   env: NodeJS.ProcessEnv;
 }
 
+// =====================================================================
+// Detached-child pgrp tracking
+// =====================================================================
+//
+// Every spawn below uses `detached: true` so that terminal-pgrp SIGINT
+// (Ctrl+C delivered by the kernel to the whole foreground pgrp) doesn't
+// reach the spawned `pyry agent-run` / `claude` directly — instead it
+// reaches only the dispatcher, which routes through `decideSigint`. The
+// trade-off: `child.kill(sig)` no longer reaches the grandchild,
+// because with `detached: true` the child becomes the leader of a NEW
+// pgrp that its own descendants (claude under pyry agent-run) inherit.
+//
+// Every teardown path in this file therefore goes through one of the
+// two helpers below, which signal the WHOLE pgrp via the `-pid` syntax
+// (`process.kill(-pid, sig)` = "send sig to every member of the pgrp
+// whose leader is pid"). Direct `child.kill(...)` calls would orphan
+// the grandchild and let it keep running unattended, consuming API
+// credits up to claude's internal timeout.
+
+/** Live child PIDs whose pgrp the dispatcher is responsible for tearing
+ *  down on exit. Populated after each successful spawn, cleared in the
+ *  child's `close`/`error` handlers. Iterated by `killAllChildPgrps`
+ *  from the SIGINT-force-exit and SIGHUP paths, which don't have a
+ *  `child` reference in scope. */
+const liveChildPgrpPids = new Set<number>();
+
+/**
+ * Signal an entire detached-child process group via the negative-PID
+ * convention (`process.kill(-pid, sig)` = "send sig to every member of
+ * the pgrp led by pid"). With `detached: true` on the spawn, the child
+ * is its own pgrp leader and its descendants (e.g. `pyry agent-run` →
+ * `claude`) share that pgrp — so this reaches all of them, where
+ * `child.kill(sig)` would reach only the immediate child.
+ *
+ * Use this in every intentional teardown path (timeout, permission-
+ * denial force-exit, etc.). ESRCH ("no such pgrp") is swallowed
+ * silently — pgrp teardown is best-effort, and the pgrp may have
+ * drained naturally before we got here. Other errors fall back to a
+ * single-process `child.kill(sig)` so we still make a best-effort
+ * teardown attempt under unusual kernel conditions (e.g. EPERM in
+ * sandboxed environments).
+ */
+function killChildPgrp(child: ChildProcess, sig: NodeJS.Signals | number): void {
+  if (child.pid === undefined) return;
+  try {
+    process.kill(-child.pid, sig);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return;
+    try { child.kill(sig); } catch { /* already dead */ }
+  }
+}
+
+/**
+ * Tear down EVERY live child pgrp tracked by the dispatcher. Used by
+ * signal handlers (SIGINT force-exit, SIGHUP) that don't have a
+ * `child` reference in scope. Best-effort: ESRCH is silent, other
+ * errors are logged but not propagated (the caller is about to
+ * `process.exit` anyway, so the only audience is the log).
+ */
+function killAllChildPgrps(sig: NodeJS.Signals | number): void {
+  for (const pid of liveChildPgrpPids) {
+    try {
+      process.kill(-pid, sig);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ESRCH") {
+        console.error(`[killAllChildPgrps] failed to ${String(sig)} pgrp -${pid}: ${err}`);
+      }
+    }
+  }
+}
+
 /**
  * One spawn attempt. Rejects with the original `Error` (preserving
  * `.code` for errno checks) on `child.on("error", ...)`. The outer
@@ -315,18 +388,28 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
     // and aborts streaming ("aborted_streaming: no output"), defeating
     // the drain-mode contract.
     //
-    // `child.kill(...)` for intentional teardown (timeout / Layer-2
-    // force-exit after permission denial) still targets the child PID
-    // specifically and is unaffected by the pgrp split. stdio remains
-    // piped so the dispatcher reads stream-json as before, and the
-    // child is NOT `unref()`d — its lifecycle stays bound to the
-    // dispatcher's event loop. Surfaced 2026-05-22.
+    // CONSEQUENCE FOR TEARDOWN: with `detached: true`, the child's
+    // descendants (`pyry agent-run` → `claude`) share its NEW pgrp. A
+    // direct `child.kill(sig)` reaches only the immediate child and
+    // leaves the grandchild orphaned in that pgrp. Every teardown path
+    // below therefore goes through `killChildPgrp` / `killAllChildPgrps`
+    // (defined above the spawn function), which use the negative-PID
+    // syntax to signal the whole pgrp.
+    //
+    // stdio remains piped so the dispatcher reads stream-json as
+    // before; the child is NOT `unref()`d — its lifecycle stays bound
+    // to the dispatcher's event loop. Surfaced 2026-05-22.
     const child = spawn(bin, args, {
       cwd: opts.cwd,
       env: opts.env,
       stdio: ["pipe", "pipe", "pipe"],
       detached: true,
     });
+    // Track the new pgrp leader so SIGINT-force-exit / SIGHUP can tear
+    // it down without a `child` reference. `child.pid` is undefined if
+    // spawn synchronously failed; the surrounding `retrySpawnOnTransientError`
+    // wrapper handles that path separately, but be defensive anyway.
+    if (child.pid !== undefined) liveChildPgrpPids.add(child.pid);
 
     let buffer = "";
     let resultMsg: Record<string, unknown> | null = null;
@@ -340,7 +423,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
     const timer = setTimeout(() => {
       timedOut = true;
       appendFileSync(opts.logFile, `\n⏰ TIMEOUT — killing agent after ${opts.timeoutMs / 1000}s\n`);
-      child.kill("SIGTERM");
+      killChildPgrp(child, "SIGTERM");
     }, opts.timeoutMs);
 
     const handleWatchdogAction = (action: ReturnType<typeof advancePermissionDenialState>["action"]) => {
@@ -356,10 +439,10 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
         const ts = new Date().toISOString();
         appendFileSync(opts.logFile, `[${ts}] 🛑 FORCE-EXIT — agent attempted workaround after permission denial; sending SIGTERM (2s grace before SIGKILL)\n`);
         console.log("   🛑 Force-exit after denial workaround attempt (SIGTERM)");
-        child.kill("SIGTERM");
+        killChildPgrp(child, "SIGTERM");
         forceExitTimer = setTimeout(() => {
           appendFileSync(opts.logFile, `[${new Date().toISOString()}] 🛑 FORCE-EXIT — grace expired, sending SIGKILL\n`);
-          try { child.kill("SIGKILL"); } catch { /* already dead */ }
+          killChildPgrp(child, "SIGKILL");
         }, 2000);
       }
     };
@@ -372,7 +455,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
       promptStream.pipe(child.stdin!);
       promptStream.on("error", (err) => {
         clearTimeout(timer);
-        child.kill("SIGTERM");
+        killChildPgrp(child, "SIGTERM");
         reject(err);
       });
     } else {
@@ -411,6 +494,12 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
     child.on("close", (code) => {
       clearTimeout(timer);
       if (forceExitTimer) clearTimeout(forceExitTimer);
+      // Untrack the pgrp — child has exited, so its pgrp is empty
+      // (or contains only orphaned grandchildren that the kernel will
+      // re-parent; we've already SIGTERMed the pgrp on intentional
+      // teardown paths). Either way, the dispatcher no longer owns
+      // teardown for this PID.
+      if (child.pid !== undefined) liveChildPgrpPids.delete(child.pid);
 
       // Process remaining buffer
       if (buffer.trim()) {
@@ -474,6 +563,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
 
     child.on("error", (err) => {
       clearTimeout(timer);
+      if (child.pid !== undefined) liveChildPgrpPids.delete(child.pid);
       reject(err);
     });
   });
@@ -2641,6 +2731,13 @@ process.on("SIGINT", () => {
       return;
     case "force-exit":
       console.log("\n🛑 Force-exit (second Ctrl-C). In-flight dispatch left mid-run; expect wip:<agent> labels needing manual cleanup.");
+      // The detached spawns isolate children from terminal-pgrp SIGINT,
+      // so without this explicit teardown the force-exit path would
+      // kill the dispatcher but leave `pyry agent-run` + `claude`
+      // running orphaned (claude burning API credits up to its
+      // internal timeout). pgrp-kill brings them down with the
+      // dispatcher.
+      killAllChildPgrps("SIGTERM");
       process.exit(130);
       return;
     case "drain-already":
@@ -2650,6 +2747,18 @@ process.on("SIGINT", () => {
       console.log("\n🚦 Drain mode: will exit after current dispatch completes. Ctrl-C again within 5 s to force-quit.");
       return;
   }
+});
+// SIGHUP arrives on controlling-terminal disconnect — closing the
+// iTerm / Terminal.app window, SSH session drop, etc. Default Node
+// behaviour is to exit immediately, which would orphan our detached
+// claude children to launchd (since they're in their own session with
+// no controlling terminal of their own). Explicit pgrp teardown
+// ensures closing the window mid-dispatch doesn't leak long-running
+// claude processes burning API credits up to their internal timeout.
+process.on("SIGHUP", () => {
+  console.log("\n📞 SIGHUP — tearing down detached child pgrps before exit");
+  killAllChildPgrps("SIGTERM");
+  process.exit(129); // POSIX convention for exit-by-SIGHUP (128 + 1)
 });
 
 export async function pollLoop(): Promise<void> {

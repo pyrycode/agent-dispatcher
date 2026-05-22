@@ -3613,29 +3613,46 @@ describe("decideSigint", () => {
 });
 
 // =====================================================================
-// Claude spawn is detached (own process group)
+// Detached-child contract: spawn options + pgrp teardown
 // =====================================================================
 //
-// Source-level tripwire. `runClaudeStreamingOnce` lives below the
+// Source-level tripwires. `runClaudeStreamingOnce` lives below the
 // `DispatchDeps` injection boundary — the production `spawn(bin, args,
-// {...})` call cannot be intercepted from this test suite, so we lock
-// the contract by asserting the option is literally present in
-// dispatch.ts. If a future refactor removes `detached: true`, this test
-// fails before the regression ships.
+// {...})` call and the signal handlers cannot be intercepted from this
+// test suite, so we lock the contract by asserting the relevant tokens
+// are literally present in dispatch.ts. If a future refactor drops one
+// of these, the corresponding test fails before the regression ships.
 //
-// Why the option matters: without it the child shares the dispatcher's
-// foreground pgrp, the kernel delivers terminal Ctrl+C to every PID in
-// the group, and the spawned `pyry agent-run` / `claude` aborts streaming
-// while the dispatcher's own `decideSigint` correctly draws drain mode.
-// The `decideSigint` debounce above only suppresses the parent's
-// duplicate SIGINT; it cannot prevent kernel pgrp delivery to the child.
-// Both fixes ship together. Surfaced 2026-05-22.
+// The four invariants under test (introduced 2026-05-22 + 2026-05-23):
+//
+//   1. The claude spawn uses `detached: true` so terminal Ctrl+C
+//      doesn't kill the child directly via pgrp delivery.
+//   2. There is exactly one `spawn(bin, args, {...})` call in the
+//      file, so (1) is unambiguous about which spawn it's checking.
+//   3. Intentional teardown paths use `process.kill(-pid, sig)` (pgrp
+//      kill), not bare `child.kill(sig)` — otherwise the grandchild
+//      (`claude` under `pyry agent-run`) orphans when the immediate
+//      child dies and keeps consuming API credits unattended.
+//   4. A SIGHUP handler is installed, so closing the terminal window
+//      (or losing an SSH session) tears down detached children
+//      instead of letting them orphan to launchd.
+
+const dispatchTsPath = resolve(dirname(fileURLToPath(import.meta.url)), "dispatch.ts");
+const readDispatchSource = (): string => readFileSync(dispatchTsPath, "utf8");
 
 describe("runClaudeStreamingOnce spawn options", () => {
-  test("spawn options include detached:true so terminal Ctrl+C does not reach the child via pgrp delivery", () => {
-    const dispatchTsPath = resolve(dirname(fileURLToPath(import.meta.url)), "dispatch.ts");
-    const source = readFileSync(dispatchTsPath, "utf8");
+  test("exactly one `spawn(bin, args, {...})` call exists in dispatch.ts (anchor for the detached-true assertion below)", () => {
+    const source = readDispatchSource();
+    const matches = [...source.matchAll(/spawn\(bin, args, \{[\s\S]*?\}\);/g)];
+    assert.equal(
+      matches.length,
+      1,
+      "exactly one `spawn(bin, args, { ... });` must exist in dispatch.ts — if a second is added, this tripwire becomes ambiguous about which spawn it's asserting against. Narrow the regex (e.g. anchor on the `runClaudeStreamingOnce` function name) before adding a second call site.",
+    );
+  });
 
+  test("spawn options include detached:true so terminal Ctrl+C does not reach the child via pgrp delivery", () => {
+    const source = readDispatchSource();
     // Locate the single spawn call inside runClaudeStreamingOnce. We
     // anchor on the bin/args identifiers used at that call site so a
     // future renamed variable forces the test to be re-anchored
@@ -3648,6 +3665,53 @@ describe("runClaudeStreamingOnce spawn options", () => {
       spawnCall,
       /\bdetached:\s*true\b/,
       "the claude spawn must include `detached: true` so the child runs in its own process group and terminal Ctrl+C does not kill it directly — see decideSigint block above for the corresponding parent-side debounce",
+    );
+  });
+});
+
+describe("detached-child teardown uses pgrp-kill", () => {
+  test("dispatcher uses `process.kill(-pid, sig)` somewhere (pgrp-kill syntax required for detached spawns)", () => {
+    const source = readDispatchSource();
+    assert.match(
+      source,
+      /process\.kill\(\s*-/,
+      "with `detached: true` on the claude spawn, intentional teardown paths (timeout, permission-denial force-exit, SIGINT force-exit, SIGHUP) MUST signal the whole pgrp via `process.kill(-pid, sig)`. A bare `child.kill(sig)` reaches only `pyry agent-run` and leaves the grandchild `claude` orphaned in the new pgrp, burning API credits up to its internal timeout. See `killChildPgrp` / `killAllChildPgrps` in dispatch.ts.",
+    );
+  });
+
+  test("a SIGHUP handler is installed so terminal-disconnect tears down detached children", () => {
+    const source = readDispatchSource();
+    assert.match(
+      source,
+      /process\.on\(\s*["']SIGHUP["']/,
+      "without a SIGHUP handler, closing the terminal (Cmd-W on iTerm / SSH disconnect) exits the dispatcher with default behaviour and leaves the detached claude in its own session running until its internal timeout. The handler must call `killAllChildPgrps('SIGTERM')` before `process.exit`.",
+    );
+  });
+
+  test("intentional teardown sites in `runClaudeStreamingOnce` do not use bare `child.kill(` (comments stripped before matching)", () => {
+    const source = readDispatchSource();
+    // Extract the runClaudeStreamingOnce function body — the spawn
+    // happens here, and every kill in this function must go through
+    // the pgrp helper. We anchor on the function signature and walk
+    // until the next top-level `function ` keyword (rough but
+    // sufficient for a tripwire).
+    const fnStart = source.indexOf("function runClaudeStreamingOnce(");
+    assert.ok(fnStart >= 0, "could not locate runClaudeStreamingOnce in dispatch.ts");
+    const nextFnStart = source.indexOf("\nfunction ", fnStart + 1);
+    const fnBody = source.slice(fnStart, nextFnStart >= 0 ? nextFnStart : undefined);
+    // Strip comments before searching so explanatory text mentioning
+    // `child.kill()` as a counter-example (e.g. the spawn block's
+    // comment block) doesn't trip this assertion. We strip block
+    // comments first, then line comments — order matters because a
+    // line comment inside a block comment must be eaten as part of
+    // the block.
+    const codeOnly = fnBody
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/\/\/.*$/gm, "");
+    assert.doesNotMatch(
+      codeOnly,
+      /\bchild\.kill\(/,
+      "intentional teardown sites in `runClaudeStreamingOnce` must use `killChildPgrp(child, sig)` (pgrp-kill) instead of bare `child.kill`. The latter reaches only `pyry agent-run` and orphans the grandchild — see the comment block above the function for the contract.",
     );
   });
 });
