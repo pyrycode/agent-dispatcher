@@ -23,6 +23,7 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
+import { readFileSync } from "node:fs";
 
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -3608,5 +3609,45 @@ describe("decideSigint", () => {
     state = decideSigint(state, T0).newState;
     const second = decideSigint(state, T0 + 1_000);
     assert.equal(second.action.kind, "force-exit");
+  });
+});
+
+// =====================================================================
+// Claude spawn is detached (own process group)
+// =====================================================================
+//
+// Source-level tripwire. `runClaudeStreamingOnce` lives below the
+// `DispatchDeps` injection boundary — the production `spawn(bin, args,
+// {...})` call cannot be intercepted from this test suite, so we lock
+// the contract by asserting the option is literally present in
+// dispatch.ts. If a future refactor removes `detached: true`, this test
+// fails before the regression ships.
+//
+// Why the option matters: without it the child shares the dispatcher's
+// foreground pgrp, the kernel delivers terminal Ctrl+C to every PID in
+// the group, and the spawned `pyry agent-run` / `claude` aborts streaming
+// while the dispatcher's own `decideSigint` correctly draws drain mode.
+// The `decideSigint` debounce above only suppresses the parent's
+// duplicate SIGINT; it cannot prevent kernel pgrp delivery to the child.
+// Both fixes ship together. Surfaced 2026-05-22.
+
+describe("runClaudeStreamingOnce spawn options", () => {
+  test("spawn options include detached:true so terminal Ctrl+C does not reach the child via pgrp delivery", () => {
+    const dispatchTsPath = resolve(dirname(fileURLToPath(import.meta.url)), "dispatch.ts");
+    const source = readFileSync(dispatchTsPath, "utf8");
+
+    // Locate the single spawn call inside runClaudeStreamingOnce. We
+    // anchor on the bin/args identifiers used at that call site so a
+    // future renamed variable forces the test to be re-anchored
+    // (intentional) rather than silently matching a different spawn.
+    const spawnCallMatch = source.match(/spawn\(bin, args, \{[\s\S]*?\}\);/);
+    assert.ok(spawnCallMatch, "expected to find `spawn(bin, args, { ... });` in dispatch.ts");
+    const spawnCall = spawnCallMatch[0];
+
+    assert.match(
+      spawnCall,
+      /\bdetached:\s*true\b/,
+      "the claude spawn must include `detached: true` so the child runs in its own process group and terminal Ctrl+C does not kill it directly — see decideSigint block above for the corresponding parent-side debounce",
+    );
   });
 });
