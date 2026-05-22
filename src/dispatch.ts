@@ -2793,18 +2793,31 @@ let handlersInstalled = false;
  *  the grace clock; subsequent presses are no-ops until it fires. */
 let forceExitTimer: NodeJS.Timeout | null = null;
 
+/** Exit code the pending force-exit timer will use. Mutable so SIGHUP
+ *  arriving during a SIGINT-force-exit grace can upgrade 130 → 129
+ *  (SIGHUP semantics take precedence — terminal-disconnect is "stronger"
+ *  cause of termination than user Ctrl+C). Reverse upgrade is not
+ *  meaningful (SIGINT after SIGHUP would never happen — terminal gone). */
+let forceExitCode = 130;
+
 /**
- * Schedule the SIGKILL+exit escalation. Idempotent — a second call
- * while a grace-window timer is already pending is a no-op (the user
- * mashing Ctrl+C after force-exit doesn't shorten or re-schedule the
- * wait). If a future UX wants "mashing means now," this is the single
- * place to change.
+ * Schedule the SIGKILL+exit escalation. Idempotent for the TIMER
+ * itself — a second call while a grace-window timer is already pending
+ * doesn't reschedule (the user mashing Ctrl+C after force-exit doesn't
+ * shorten the wait). The exit code IS upgradable, however: SIGHUP
+ * (129) overrides a pending SIGINT (130) so a supervising script
+ * watching for SIGHUP-induced termination sees the correct cause.
  */
 function scheduleForceExit(exitCode: number): void {
+  // Upgrade the pending exit code if SIGHUP arrives during a SIGINT
+  // grace (129 > 130 in semantic precedence, though numerically the
+  // opposite). For all other cases the first-call value wins.
+  if (exitCode === 129) forceExitCode = 129;
   if (forceExitTimer !== null) return;
+  forceExitCode = exitCode;
   forceExitTimer = setTimeout(() => {
     killAllChildPgrps("SIGKILL");
-    process.exit(exitCode);
+    process.exit(forceExitCode);
   }, FORCE_EXIT_SIGKILL_GRACE_MS);
 }
 
@@ -2835,7 +2848,13 @@ function scheduleForceExit(exitCode: number): void {
  */
 export function installSignalHandlers(): void {
   if (handlersInstalled) return;
-  handlersInstalled = true;
+  // Flag is set AFTER successful registration of all handlers — if a
+  // `process.on(...)` throws (extremely unlikely under normal Node,
+  // but possible in monkey-patched / sandboxed environments), the
+  // partial install isn't locked in and a retry can complete the
+  // setup. Re-registering an already-installed handler is harmless
+  // (Node appends; both copies run; both are idempotent w.r.t. their
+  // own state via `drainMode` / `forceExitTimer` guards).
 
   process.on("SIGTERM", () => {
     if (drainMode) return;  // idempotent — multiple SIGTERMs only print once
@@ -2881,14 +2900,25 @@ export function installSignalHandlers(): void {
   // behaviour is to exit immediately, which would orphan our detached
   // claude children to launchd. Two-step teardown with SIGKILL
   // escalation — same shape and rationale as the force-exit path
-  // above. Idempotent via `scheduleForceExit`.
+  // above.
+  //
+  // Idempotency: `scheduleForceExit(129)` is ALWAYS called, even if a
+  // SIGINT-force-exit timer is already pending. This lets SIGHUP
+  // upgrade the pending exit code from 130 → 129 so supervising
+  // scripts (launchd, systemd) see SIGHUP-induced termination
+  // distinct from SIGINT-induced. The first-press-only branch below
+  // suppresses redundant logs and SIGTERM resends (children already
+  // got SIGTERM from the SIGINT-force-exit).
   process.on("SIGHUP", () => {
     if (forceExitTimer === null) {
       console.log("\n📞 SIGHUP — tearing down detached child pgrps before exit");
       killAllChildPgrps("SIGTERM");
-      scheduleForceExit(129); // POSIX convention for exit-by-SIGHUP (128 + 1)
     }
+    scheduleForceExit(129); // POSIX convention for exit-by-SIGHUP (128 + 1); upgrades 130→129 if SIGINT-force-exit was pending
   });
+
+  // All registrations succeeded — lock in the idempotency flag.
+  handlersInstalled = true;
 }
 
 export async function pollLoop(): Promise<void> {

@@ -3852,12 +3852,14 @@ describe("detached-child teardown uses pgrp-kill", () => {
     const boundary = tail.search(/\n(?:export\s+)?(?:function |const |let |var |class |process\.on\()/);
     const installerEnd = boundary >= 0 ? installerStart + 1 + boundary : codeOnly.length;
 
-    // Match both `process.on(SIG*)` and `process.once(SIG*)` — a
-    // future one-shot handler registered at module scope would
-    // bypass detection if we only checked `.on(`.
-    const handlerPattern = /process\.(?:on|once)\(\s*["'](SIGINT|SIGHUP|SIGTERM)["']/g;
+    // Match every flavour of Node listener registration — `.on`,
+    // `.once`, and `.addListener` are all valid APIs that bind a
+    // callback to a signal. Without all three, a future refactor that
+    // switched to `process.addListener` (copy-pasted from Node docs)
+    // would slip past the scope check.
+    const handlerPattern = /process\.(?:on|once|addListener)\(\s*["'](SIGINT|SIGHUP|SIGTERM)["']/g;
     const occurrences = [...codeOnly.matchAll(handlerPattern)];
-    assert.ok(occurrences.length >= 3, `expected at least 3 process.(on|once)(SIG*) registrations in code, found ${occurrences.length}`);
+    assert.ok(occurrences.length >= 3, `expected at least 3 process.(on|once|addListener)(SIG*) registrations in code, found ${occurrences.length}`);
     for (const m of occurrences) {
       const idx = m.index ?? -1;
       assert.ok(
