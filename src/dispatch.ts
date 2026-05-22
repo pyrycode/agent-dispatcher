@@ -552,8 +552,11 @@ async function buildPromptForAgent(
     }
   }
 
-  // Look up open PR for agents that need it (code-review)
-  const needsPr = ["code-review"].includes(agent.name);
+  // Look up open PR for agents that need it (qa, code-review).
+  // QA posts test results + baseline-comparison findings via PR comments;
+  // code-review posts review comments via `gh pr review`. Both need the PR
+  // number/URL injected to avoid each agent re-discovering it via `gh pr list`.
+  const needsPr = ["qa", "code-review"].includes(agent.name);
   if (needsPr && ticketNum > 0) {
     try {
       // Query isDraft and prefer non-draft PRs over drafts. Without this,
