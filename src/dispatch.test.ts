@@ -3765,10 +3765,15 @@ describe("detached-child teardown uses pgrp-kill", () => {
       /killAllChildPgrps\(["']SIGTERM["']\)/,
       "force-exit must send SIGTERM to live child pgrps — otherwise the dispatcher dies and orphans claude.",
     );
-    assert.match(
-      caseBody,
-      /killAllChildPgrps\(["']SIGKILL["']\)/,
-      "force-exit must escalate to SIGKILL after the grace window — without this, children that ignore or hang on SIGTERM survive the dispatcher exit and orphan to launchd.",
+    // SIGKILL escalation may be inline OR delegated to
+    // `scheduleForceExit(...)`. Accept either — the SIGKILL contract
+    // for the helper case is verified by the `scheduleForceExit`
+    // tripwire below.
+    const escalates = /killAllChildPgrps\(["']SIGKILL["']\)/.test(caseBody)
+      || /scheduleForceExit\(/.test(caseBody);
+    assert.ok(
+      escalates,
+      "force-exit must escalate to SIGKILL after the grace window — either inline as `killAllChildPgrps('SIGKILL')` or via `scheduleForceExit(...)`. Without escalation, children that ignore or hang on SIGTERM survive the dispatcher exit and orphan to launchd.",
     );
   });
 
@@ -3776,20 +3781,56 @@ describe("detached-child teardown uses pgrp-kill", () => {
     const body = sliceDeclaration(readDispatchSource(), "export function installSignalHandlers(");
     assert.ok(body, "could not locate `installSignalHandlers` body");
     const code = stripComments(body);
+    // Locate the SIGHUP `process.on(...)` registration, then slice
+    // from there until the next `process.on(` (or end of installer)
+    // so the assertion scopes to JUST the SIGHUP handler body — no
+    // arbitrary character window that could miss content if the
+    // handler grows.
     const sighupStart = code.search(/process\.on\(\s*["']SIGHUP["']/);
     assert.ok(sighupStart >= 0, "could not locate the SIGHUP handler");
-    // Walk to the matching `})` — handler bodies are typically a few
-    // lines, so slice a generous window and assert on it.
-    const handlerSlice = code.slice(sighupStart, sighupStart + 1500);
+    const tail = code.slice(sighupStart + 1);
+    const nextHandlerIdx = tail.search(/process\.on\(/);
+    const handlerSlice = nextHandlerIdx >= 0
+      ? code.slice(sighupStart, sighupStart + 1 + nextHandlerIdx)
+      : code.slice(sighupStart);
+    // The SIGKILL escalation may be inline OR routed through a helper
+    // (e.g. `scheduleForceExit(...)`). Accept either by checking for
+    // SIGKILL appearing within the slice — if it's not here, it's not
+    // reachable from the handler.
     assert.match(
       handlerSlice,
       /killAllChildPgrps\(["']SIGTERM["']\)/,
       "SIGHUP handler must send SIGTERM to live child pgrps before exit.",
     );
+    // The SIGKILL stage may be inline or indirected through a helper
+    // (e.g. `scheduleForceExit(129)`); accept either by checking that
+    // the handler body either contains the literal `killAllChildPgrps('SIGKILL')`
+    // or delegates to a `scheduleForceExit(`-shaped helper which is
+    // itself asserted to use SIGKILL by the helper-body tripwire below.
+    const escalates = /killAllChildPgrps\(["']SIGKILL["']\)/.test(handlerSlice)
+      || /scheduleForceExit\(/.test(handlerSlice);
+    assert.ok(
+      escalates,
+      "SIGHUP handler must escalate to SIGKILL after the grace window — either inline as `killAllChildPgrps('SIGKILL')` or via `scheduleForceExit(...)`. Without escalation, children that ignore or hang on SIGTERM orphan to launchd.",
+    );
+  });
+
+  test("if `scheduleForceExit` helper exists, its body sends SIGKILL to live child pgrps before exit", () => {
+    // Conditional tripwire: only fires if the helper is defined. The
+    // SIGHUP / force-exit handlers may delegate SIGKILL escalation to
+    // this helper; if so, the SIGKILL contract lives here.
+    const helperBody = sliceDeclaration(readDispatchSource(), "function scheduleForceExit(");
+    if (!helperBody) return; // helper not present; SIGHUP/force-exit must inline SIGKILL (asserted in the test above)
+    const code = stripComments(helperBody);
     assert.match(
-      handlerSlice,
+      code,
       /killAllChildPgrps\(["']SIGKILL["']\)/,
-      "SIGHUP handler must escalate to SIGKILL after the grace window — same contract as force-exit.",
+      "`scheduleForceExit` must call `killAllChildPgrps('SIGKILL')` — it's the SIGKILL escalation stage that SIGHUP / force-exit delegate to.",
+    );
+    assert.match(
+      code,
+      /process\.exit\(/,
+      "`scheduleForceExit` must terminate the dispatcher via `process.exit(...)` after the SIGKILL escalation.",
     );
   });
 
@@ -3811,9 +3852,12 @@ describe("detached-child teardown uses pgrp-kill", () => {
     const boundary = tail.search(/\n(?:export\s+)?(?:function |const |let |var |class |process\.on\()/);
     const installerEnd = boundary >= 0 ? installerStart + 1 + boundary : codeOnly.length;
 
-    const handlerPattern = /process\.on\(\s*["'](SIGINT|SIGHUP|SIGTERM)["']/g;
+    // Match both `process.on(SIG*)` and `process.once(SIG*)` — a
+    // future one-shot handler registered at module scope would
+    // bypass detection if we only checked `.on(`.
+    const handlerPattern = /process\.(?:on|once)\(\s*["'](SIGINT|SIGHUP|SIGTERM)["']/g;
     const occurrences = [...codeOnly.matchAll(handlerPattern)];
-    assert.ok(occurrences.length >= 3, `expected at least 3 process.on(SIG*) registrations in code, found ${occurrences.length}`);
+    assert.ok(occurrences.length >= 3, `expected at least 3 process.(on|once)(SIG*) registrations in code, found ${occurrences.length}`);
     for (const m of occurrences) {
       const idx = m.index ?? -1;
       assert.ok(

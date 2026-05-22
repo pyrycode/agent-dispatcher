@@ -339,7 +339,15 @@ function killAllChildPgrps(sig: NodeJS.Signals | number): void {
       process.kill(-pid, sig);
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
-      if (code !== "ESRCH") {
+      if (code === "ESRCH") {
+        // Opportunistic GC: if a previous probe (close-handler /
+        // error-handler) kept the PID tracked because the pgrp still
+        // had members, and the pgrp has since drained, this is our
+        // chance to evict the stale entry. Set mutation during
+        // iteration is safe in JS (the for-of uses the Set's internal
+        // iterator, which handles concurrent delete cleanly).
+        liveChildPgrpPids.delete(pid);
+      } else {
         console.error(`[killAllChildPgrps] failed to ${String(sig)} pgrp -${pid}: ${err}`);
       }
     }
@@ -2766,8 +2774,39 @@ let lastSigintAt = 0;
  *  contract is consistent across all "kill the in-flight work" paths.
  *  Two seconds is empirically enough for `pyry agent-run` to propagate
  *  SIGTERM to its PTY-driven claude subprocess and let claude flush
- *  any final stream events. */
-export const FORCE_EXIT_SIGKILL_GRACE_MS = 2_000;
+ *  any final stream events.
+ *  Module-scoped const (not exported) — it's an internal tuning knob,
+ *  no callers outside this file. */
+const FORCE_EXIT_SIGKILL_GRACE_MS = 2_000;
+
+/** Tracks whether `installSignalHandlers` has already run, so callers
+ *  who invoke it twice (intentional or accidental, e.g. from a future
+ *  CLI subcommand or test harness) don't double-register handlers.
+ *  `process.on(...)` appends listeners; without this guard, every
+ *  SIGINT/SIGHUP/SIGTERM would fire twice, each scheduling its own
+ *  setTimeout SIGKILL+exit callback. */
+let handlersInstalled = false;
+
+/** Force-exit / SIGHUP grace-window timer. Held at module scope so
+ *  repeat SIGINTs (or a SIGHUP arriving during the grace window after
+ *  a force-exit) don't schedule redundant timers. First press starts
+ *  the grace clock; subsequent presses are no-ops until it fires. */
+let forceExitTimer: NodeJS.Timeout | null = null;
+
+/**
+ * Schedule the SIGKILL+exit escalation. Idempotent — a second call
+ * while a grace-window timer is already pending is a no-op (the user
+ * mashing Ctrl+C after force-exit doesn't shorten or re-schedule the
+ * wait). If a future UX wants "mashing means now," this is the single
+ * place to change.
+ */
+function scheduleForceExit(exitCode: number): void {
+  if (forceExitTimer !== null) return;
+  forceExitTimer = setTimeout(() => {
+    killAllChildPgrps("SIGKILL");
+    process.exit(exitCode);
+  }, FORCE_EXIT_SIGKILL_GRACE_MS);
+}
 
 /**
  * Register the dispatcher's signal handlers. Called from
@@ -2781,8 +2820,23 @@ export const FORCE_EXIT_SIGKILL_GRACE_MS = 2_000;
  * lets, which is fine — they're shared state for the running
  * dispatcher process; test processes don't invoke this function and
  * therefore don't touch them.
+ *
+ * **Idempotent.** Second and subsequent calls are no-ops. Without this
+ * guard, a future code path that calls this twice would double-register
+ * every handler (Node's `process.on` appends, not replaces), causing
+ * every SIGINT/SIGHUP to fire twice with the visible side effect of
+ * duplicate log lines and duplicate setTimeout SIGKILL+exit callbacks.
+ *
+ * `console.error` from the helpers below targets the dispatcher's
+ * stderr — note that on the SIGHUP path the controlling terminal is
+ * already gone, so these messages reach a dead fd and are silently
+ * discarded. Operators investigating an orphan claude post-disconnect
+ * should look at `ps`, not the terminal log.
  */
 export function installSignalHandlers(): void {
+  if (handlersInstalled) return;
+  handlersInstalled = true;
+
   process.on("SIGTERM", () => {
     if (drainMode) return;  // idempotent — multiple SIGTERMs only print once
     drainMode = true;
@@ -2797,19 +2851,21 @@ export function installSignalHandlers(): void {
       case "ignore-debounce":
         return;
       case "force-exit":
-        console.log("\n🛑 Force-exit (second Ctrl-C). In-flight dispatch left mid-run; expect wip:<agent> labels needing manual cleanup.");
-        // Two-step teardown with SIGKILL escalation, matching the
-        // permission-denial Layer 2 pattern. Without the SIGKILL stage,
-        // children that catch SIGTERM but hang (or that pyry-run forwards
-        // slowly) survive the dispatcher's `process.exit(130)` and
-        // orphan to launchd. The 2s grace gives well-behaved children
-        // time to drain cleanly; the SIGKILL ensures we don't leak even
-        // on misbehaving children.
-        killAllChildPgrps("SIGTERM");
-        setTimeout(() => {
-          killAllChildPgrps("SIGKILL");
-          process.exit(130);
-        }, FORCE_EXIT_SIGKILL_GRACE_MS);
+        // First press in force-exit territory schedules the timer.
+        // Subsequent presses within the grace window are no-ops via
+        // `scheduleForceExit`'s idempotency — the user mashing Ctrl+C
+        // doesn't shorten the wait. Print only on first entry so the
+        // log isn't spammed with redundant "🛑 Force-exit" lines.
+        if (forceExitTimer === null) {
+          console.log("\n🛑 Force-exit (second Ctrl-C). In-flight dispatch left mid-run; expect wip:<agent> labels needing manual cleanup.");
+          // Two-step teardown with SIGKILL escalation, matching the
+          // permission-denial Layer 2 pattern. Without the SIGKILL
+          // stage, children that catch SIGTERM but hang (or that
+          // pyry-run forwards slowly) survive the dispatcher's
+          // `process.exit(130)` and orphan to launchd.
+          killAllChildPgrps("SIGTERM");
+          scheduleForceExit(130);
+        }
         return;
       case "drain-already":
         console.log("🚦 Already draining. Press Ctrl-C again within 5 s to force-quit.");
@@ -2823,17 +2879,15 @@ export function installSignalHandlers(): void {
   // SIGHUP arrives on controlling-terminal disconnect — closing the
   // iTerm / Terminal.app window, SSH session drop, etc. Default Node
   // behaviour is to exit immediately, which would orphan our detached
-  // claude children to launchd (since they're in their own session with
-  // no controlling terminal of their own). Two-step teardown with
-  // SIGKILL escalation — same shape and rationale as the force-exit
-  // path above.
+  // claude children to launchd. Two-step teardown with SIGKILL
+  // escalation — same shape and rationale as the force-exit path
+  // above. Idempotent via `scheduleForceExit`.
   process.on("SIGHUP", () => {
-    console.log("\n📞 SIGHUP — tearing down detached child pgrps before exit");
-    killAllChildPgrps("SIGTERM");
-    setTimeout(() => {
-      killAllChildPgrps("SIGKILL");
-      process.exit(129); // POSIX convention for exit-by-SIGHUP (128 + 1)
-    }, FORCE_EXIT_SIGKILL_GRACE_MS);
+    if (forceExitTimer === null) {
+      console.log("\n📞 SIGHUP — tearing down detached child pgrps before exit");
+      killAllChildPgrps("SIGTERM");
+      scheduleForceExit(129); // POSIX convention for exit-by-SIGHUP (128 + 1)
+    }
   });
 }
 
