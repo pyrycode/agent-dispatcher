@@ -488,8 +488,25 @@ describe("AUTO_ADVANCE_RULES", () => {
     }
   });
 
-  test("five rules — one per agent (no missing or extra stages)", () => {
+  test("one rule per agent (no missing or extra stages)", () => {
     assert.equal(AUTO_ADVANCE_RULES.length, AGENTS.length);
+  });
+
+  test("developer → qa → code-review ordering (QA gates tests BEFORE code-review judgment)", () => {
+    // QA inserted 2026-05-22 between developer and code-review. Locks the
+    // economic property: red runs cost only a QA spawn + rework cycle;
+    // code-review never burns judgment-heavy tokens on code about to be
+    // rejected on mechanical gates. Reversing the order (developer → code-review
+    // → qa) would re-introduce the original economic problem.
+    const devRule = AUTO_ADVANCE_RULES.find(r => r.from === "In Development");
+    assert.ok(devRule, "expected an advance rule from In Development");
+    assert.equal(devRule!.to, "In QA");
+    assert.equal(devRule!.readyLabel, "done:developer");
+
+    const qaRule = AUTO_ADVANCE_RULES.find(r => r.from === "In QA");
+    assert.ok(qaRule, "expected an advance rule from In QA");
+    assert.equal(qaRule!.to, "In Code Review");
+    assert.equal(qaRule!.readyLabel, "done:qa");
   });
 });
 
@@ -819,7 +836,7 @@ describe("decideAutoAdvance", () => {
 
   test("mid-pipeline advance proceeds even when pipeline at capacity", () => {
     // A ticket sitting in In Development with done:developer should advance
-    // to In Code Review even though another ticket sits at In Architecture.
+    // to In QA even though another ticket sits at In Architecture.
     // The cap holds NEW tickets out of the pipeline; in-flight tickets keep
     // flowing forward regardless.
     const d = decideAutoAdvance(
@@ -835,7 +852,7 @@ describe("decideAutoAdvance", () => {
     const devAdvance = d.advances.find(a => a.fromColumn === "In Development");
     assert.ok(devAdvance, "expected an advance from In Development");
     assert.equal(devAdvance!.issueNumber, 30);
-    assert.equal(devAdvance!.toColumn, "In Code Review");
+    assert.equal(devAdvance!.toColumn, "In QA");
   });
 
   test("blocked Backlog item does not auto-advance (stays in Backlog until unblocked)", () => {
@@ -891,7 +908,7 @@ describe("decideAutoAdvance", () => {
       2,
     );
     assert.equal(d.advances.length, 2);
-    assert.ok(d.advances.some(a => a.issueNumber === 30 && a.toColumn === "In Code Review"));
+    assert.ok(d.advances.some(a => a.issueNumber === 30 && a.toColumn === "In QA"));
     assert.ok(d.advances.some(a => a.issueNumber === 31 && a.toColumn === "In Documentation"));
   });
 
@@ -1680,6 +1697,11 @@ describe("shouldUseWorktree", () => {
     assert.equal(shouldUseWorktree(dev), true);
   });
 
+  test("qa uses a worktree (checks out feature branch to run tests)", () => {
+    const qa = AGENTS.find(a => a.name === "qa")!;
+    assert.equal(shouldUseWorktree(qa), true);
+  });
+
   test("code-review uses a worktree (reads code locally to review)", () => {
     const cr = AGENTS.find(a => a.name === "code-review")!;
     assert.equal(shouldUseWorktree(cr), true);
@@ -1739,6 +1761,16 @@ describe("maxTurnsFor", () => {
   test("documentation gets 90 (base budget — knowledge base writes)", () => {
     const docs = AGENTS.find(a => a.name === "documentation")!;
     assert.equal(maxTurnsFor(docs), 90);
+  });
+
+  test("qa gets 30 (hot path 5-10 turns, cold path 15-25 — mechanical gates only)", () => {
+    // QA's work is bounded: run gates → green → exit, OR red → baseline-comparison
+    // routing → triage. Below the base budget on purpose — drift into judgment
+    // work (idiom/design) is what QA must NOT do; the low cap is the forcing
+    // function. If genuine triage cost exceeds 30, the failure is a signal to
+    // bump deliberately, not a routine adjustment.
+    const qa = AGENTS.find(a => a.name === "qa")!;
+    assert.equal(maxTurnsFor(qa), 30);
   });
 
   test("unknown agent name still gets the base budget (no implicit zero)", () => {
@@ -2961,6 +2993,14 @@ describe("shouldProduceCommits", () => {
   test("developer produces commits (writes Go code + tests)", () => {
     const dev = AGENTS.find(a => a.name === "developer")!;
     assert.equal(shouldProduceCommits(dev), true);
+  });
+
+  test("qa does not produce commits (runs gates, emits labels + PR comments)", () => {
+    // QA uses a worktree (checks out feature branch to run go test) but never
+    // writes — its output is PR comments + labels (done:qa / needs-rework:developer).
+    // A 0-ahead branch after qa is the normal case, not a failure signal.
+    const qa = AGENTS.find(a => a.name === "qa")!;
+    assert.equal(shouldProduceCommits(qa), false);
   });
 
   test("code-review does not produce commits (PR comments only)", () => {

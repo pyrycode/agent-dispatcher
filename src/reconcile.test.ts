@@ -87,8 +87,10 @@ describe("runAutoAdvance — cache invalidation", () => {
   test("clears items cache when an advance is applied (the 2026-05-03 #127 bug)", async () => {
     // Reproduces the exact shape that misfired in production: a ticket
     // in In Development with `done:developer` should auto-advance to
-    // In Code Review AND signal cache invalidation so the per-agent
+    // In QA AND signal cache invalidation so the per-agent
     // loop in the same cycle sees the new placement.
+    // (Post-2026-05-22: developer → QA → code-review; the cache-invalidation
+    // semantic is identical, just one column over.)
     const item = makeItem({
       id: "item-127",
       issueNumber: 127,
@@ -102,14 +104,14 @@ describe("runAutoAdvance — cache invalidation", () => {
     // Sanity: the advance happened.
     assert.equal(client.updateItemStatusCalls.length, 1, "expected one updateItemStatus call");
     assert.equal(client.updateItemStatusCalls[0]?.itemId, "item-127");
-    assert.equal(client.updateItemStatusCalls[0]?.newStatus, "In Code Review");
+    assert.equal(client.updateItemStatusCalls[0]?.newStatus, "In QA");
 
     // The bug: cache wasn't invalidated. The fix: invalidate after any advance.
     assert.equal(
       client.clearItemsCacheCalls,
       1,
       "expected clearItemsCache to be called once after advancing #127 — without this, " +
-        "the per-agent for-loop in the same cycle reads a stale snapshot and skips In Code Review",
+        "the per-agent for-loop in the same cycle reads a stale snapshot and skips In QA",
     );
   });
 

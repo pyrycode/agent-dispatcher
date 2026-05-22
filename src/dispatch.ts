@@ -552,8 +552,11 @@ async function buildPromptForAgent(
     }
   }
 
-  // Look up open PR for agents that need it (code-review)
-  const needsPr = ["code-review"].includes(agent.name);
+  // Look up open PR for agents that need it (qa, code-review).
+  // QA posts test results + baseline-comparison findings via PR comments;
+  // code-review posts review comments via `gh pr review`. Both need the PR
+  // number/URL injected to avoid each agent re-discovering it via `gh pr list`.
+  const needsPr = ["qa", "code-review"].includes(agent.name);
   if (needsPr && ticketNum > 0) {
     try {
       // Query isDraft and prefer non-draft PRs over drafts. Without this,
@@ -1550,8 +1553,10 @@ export async function prepareAgentSpawn(
   let allowedTools = baseTools;
   if (needsAgent) allowedTools += ",Agent";
 
-  // Timeout tiers: code-review 40min (sub-agents), developer/docs 25min, light agents 20min
-  const isMediumAgent = ["developer", "documentation"].includes(agent.name);
+  // Timeout tiers: code-review 40min (sub-agents), developer/docs/qa 25min, light agents 20min.
+  // QA is medium-tier because `go test -race ./...` on the full pyrycode suite (~346 tests
+  // as of 2026-05-10) can take 2-5min of wall-clock, plus baseline-comparison triage on red.
+  const isMediumAgent = ["developer", "documentation", "qa"].includes(agent.name);
   const timeoutMs = isCodeReview ? 2_400_000 : isMediumAgent ? 1_500_000 : 1_200_000;
   const timeoutLabel = isCodeReview ? "40min" : isMediumAgent ? "25min" : "20min";
 

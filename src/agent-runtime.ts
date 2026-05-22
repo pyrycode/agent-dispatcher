@@ -72,6 +72,12 @@ export function shouldUseWorktree(agent: AgentConfig): boolean {
  */
 export function maxTurnsFor(agent: AgentConfig): number {
   if (agent.name === "code-review") return 100;
+  // QA: hot path (run gates → green → exit) is 5-10 turns; cold path
+  // (red → baseline-comparison routing → triage comment + needs-rework
+  // OR exit-with-message) is 15-25 turns. 30 leaves modest headroom
+  // without blunting the forcing function — QA should NEVER drift into
+  // judgment work (idiom/design) that lives in code-review.
+  if (agent.name === "qa") return 30;
   return 90;
 }
 
