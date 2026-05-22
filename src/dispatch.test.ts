@@ -29,6 +29,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   cleanupAfterDispatch,
+  decideSigint,
   dispatchToAgent,
   handleAgentResultErrors,
   handleDispatchError,
@@ -41,9 +42,12 @@ import {
   runDoneCleanup,
   runPreDispatchPrep,
   setupBranchAndWorktree,
+  SIGINT_DEBOUNCE_MS,
+  SIGINT_FORCE_EXIT_WINDOW_MS,
   type DispatchClient,
   type DispatchContext,
   type DispatchDeps,
+  type SigintState,
   type StreamResult,
 } from "./dispatch.js";
 import type { AgentConfig, BlockerInfo, ProjectItem } from "./types.js";
@@ -3512,5 +3516,97 @@ describe("runAutoMerge", () => {
     assert.equal(calls.discord.length, 0);
     // Status NOT rolled back — the ticket may yet succeed next cycle.
     assert.equal(client.updateItemStatusCalls.length, 0);
+  });
+});
+
+// =====================================================================
+// decideSigint
+// =====================================================================
+//
+// SIGINT handler decision logic. The behaviour locked here:
+//
+//   - First SIGINT (drainMode false) → drain-init, record timestamp.
+//   - Second SIGINT within SIGINT_DEBOUNCE_MS (500ms) → ignore-debounce.
+//     This is pnpm/tsx forwarding a single user Ctrl+C as two SIGINTs.
+//     Without this guard the force-exit logic misfires on the first
+//     human press. State is NOT updated on ignore — the force-exit window
+//     stays measured from the original press.
+//   - SIGINT between SIGINT_DEBOUNCE_MS and SIGINT_FORCE_EXIT_WINDOW_MS
+//     (500ms-5s) → force-exit. Deliberate double-tap.
+//   - SIGINT after SIGINT_FORCE_EXIT_WINDOW_MS (>5s) → drain-already,
+//     reset the timestamp so a fresh double-tap window opens.
+//
+// Surfaced 2026-05-22 when bin/pyry-start showed Ctrl+C firing the drain
+// message AND the force-exit message back-to-back from a single user press.
+
+describe("decideSigint", () => {
+  const T0 = 1_000_000;  // arbitrary base for deterministic deltas
+
+  test("first SIGINT → drain-init, records timestamp", () => {
+    const initial: SigintState = { drainMode: false, lastSigintAt: 0 };
+    const { action, newState } = decideSigint(initial, T0);
+    assert.equal(action.kind, "drain-init");
+    assert.deepEqual(newState, { drainMode: true, lastSigintAt: T0 });
+  });
+
+  test("SIGINT within debounce window → ignore-debounce, state unchanged", () => {
+    // 10ms after drain-init: pnpm forwarding duplicate.
+    const drained: SigintState = { drainMode: true, lastSigintAt: T0 };
+    const { action, newState } = decideSigint(drained, T0 + 10);
+    assert.equal(action.kind, "ignore-debounce");
+    assert.deepEqual(newState, drained, "state must NOT be updated — the force-exit window stays measured from the original press");
+  });
+
+  test("SIGINT at the debounce boundary (exactly SIGINT_DEBOUNCE_MS) → force-exit (boundary is half-open: [0, DEBOUNCE) ignore, [DEBOUNCE, WINDOW) force-exit)", () => {
+    const drained: SigintState = { drainMode: true, lastSigintAt: T0 };
+    const { action } = decideSigint(drained, T0 + SIGINT_DEBOUNCE_MS);
+    assert.equal(action.kind, "force-exit");
+  });
+
+  test("SIGINT just inside force-exit window (1s after drain) → force-exit", () => {
+    const drained: SigintState = { drainMode: true, lastSigintAt: T0 };
+    const { action } = decideSigint(drained, T0 + 1_000);
+    assert.equal(action.kind, "force-exit");
+  });
+
+  test("SIGINT at force-exit window boundary (exactly 5s) → drain-already (boundary half-open)", () => {
+    const drained: SigintState = { drainMode: true, lastSigintAt: T0 };
+    const { action, newState } = decideSigint(drained, T0 + SIGINT_FORCE_EXIT_WINDOW_MS);
+    assert.equal(action.kind, "drain-already");
+    assert.deepEqual(newState, { drainMode: true, lastSigintAt: T0 + SIGINT_FORCE_EXIT_WINDOW_MS });
+  });
+
+  test("SIGINT well after force-exit window (10s after) → drain-already, timestamp refreshed", () => {
+    // User pressed Ctrl+C, let it drain for 10s, then pressed Ctrl+C again
+    // to change their mind. Should re-open a double-tap window from this point.
+    const drained: SigintState = { drainMode: true, lastSigintAt: T0 };
+    const { action, newState } = decideSigint(drained, T0 + 10_000);
+    assert.equal(action.kind, "drain-already");
+    assert.deepEqual(newState, { drainMode: true, lastSigintAt: T0 + 10_000 });
+  });
+
+  test("the pnpm-double-forward sequence (the bug this fixes): drain-init then ignore-debounce within 20ms", () => {
+    // Reproduces the 2026-05-22 incident. First SIGINT arrives from terminal
+    // pgroup-wide delivery; second arrives ~20ms later from pnpm's
+    // signal-forwarding. Pre-fix, both were classified by the force-exit
+    // logic → first press force-exited the dispatcher.
+    let state: SigintState = { drainMode: false, lastSigintAt: 0 };
+
+    const first = decideSigint(state, T0);
+    assert.equal(first.action.kind, "drain-init", "first SIGINT should enter drain mode");
+    state = first.newState;
+
+    const second = decideSigint(state, T0 + 20);
+    assert.equal(second.action.kind, "ignore-debounce", "second SIGINT 20ms later is a pnpm/tsx forwarding duplicate — must NOT force-exit");
+    assert.deepEqual(second.newState, first.newState, "state must remain measured from the original press");
+  });
+
+  test("deliberate user double-tap (~1s apart) still triggers force-exit", () => {
+    // User presses, sees drain message, decides to force-exit. ~1s later
+    // they press again. The fix preserves this path.
+    let state: SigintState = { drainMode: false, lastSigintAt: 0 };
+    state = decideSigint(state, T0).newState;
+    const second = decideSigint(state, T0 + 1_000);
+    assert.equal(second.action.kind, "force-exit");
   });
 });

@@ -2539,6 +2539,76 @@ export async function runAutoMerge(
 // 5 s force-exits with code 130 (POSIX convention for SIGINT) for when you
 // know the in-flight dispatch is wedged and waiting it out isn't worth it.
 // Force-exit leaves wip:<agent> on the ticket — cleanup is manual after.
+//
+// pnpm/tsx double-forward debounce (2026-05-22). The terminal sends SIGINT
+// to the entire foreground process group on Ctrl+C, so node receives it
+// directly. pnpm ALSO forwards SIGINT to its child node process as part of
+// its standard signal-forwarding behaviour. Result: a single human Ctrl+C
+// press fires this handler TWICE, ~10-20ms apart. Without debouncing, the
+// second invocation falls inside the 5-second force-exit window and the
+// dispatcher force-exits on the first press instead of draining. The
+// SIGINT_DEBOUNCE_MS window filters the duplicate while staying well below
+// the minimum human "press, see drain message, press again" latency
+// (>=200ms even for the fastest users; typically 500ms+).
+export const SIGINT_DEBOUNCE_MS = 500;
+export const SIGINT_FORCE_EXIT_WINDOW_MS = 5_000;
+
+/** State input to `decideSigint`. */
+export interface SigintState {
+  drainMode: boolean;
+  /** Wall-clock ms of the most recent SIGINT that this state recorded.
+   *  0 means "no prior SIGINT in this drain mode session." */
+  lastSigintAt: number;
+}
+
+/** Decision returned by `decideSigint`. The handler turns this into side effects. */
+export type SigintAction =
+  /** SIGINT arrived within SIGINT_DEBOUNCE_MS of the prior one — pnpm/tsx
+   *  forwarding duplicate. Do nothing, don't update state. */
+  | { kind: "ignore-debounce" }
+  /** SIGINT arrived AFTER debounce but within SIGINT_FORCE_EXIT_WINDOW_MS —
+   *  deliberate second press. Force-exit with code 130. */
+  | { kind: "force-exit" }
+  /** SIGINT arrived after the force-exit window expired. Stay in drain
+   *  mode, reset the lastSigintAt so a new double-tap window opens. */
+  | { kind: "drain-already" }
+  /** First SIGINT this session — enter drain mode. */
+  | { kind: "drain-init" };
+
+/**
+ * Pure decision function for the SIGINT handler. Given the current state
+ * and a timestamp, return the next action + new state. Caller does the
+ * side effects (console.log, process.exit) and state assignment.
+ *
+ * The debounce guards against pnpm/tsx forwarding a single human Ctrl+C
+ * as two SIGINTs to node (terminal pgroup-wide delivery + pnpm signal
+ * forwarding = double-fire). Without it, the force-exit logic
+ * misclassifies the duplicate as a deliberate second press and exits
+ * on the first user Ctrl+C.
+ */
+export function decideSigint(
+  state: SigintState,
+  now: number,
+): { action: SigintAction; newState: SigintState } {
+  if (state.drainMode) {
+    const elapsed = now - state.lastSigintAt;
+    if (elapsed < SIGINT_DEBOUNCE_MS) {
+      return { action: { kind: "ignore-debounce" }, newState: state };
+    }
+    if (elapsed < SIGINT_FORCE_EXIT_WINDOW_MS) {
+      return { action: { kind: "force-exit" }, newState: state };
+    }
+    return {
+      action: { kind: "drain-already" },
+      newState: { drainMode: true, lastSigintAt: now },
+    };
+  }
+  return {
+    action: { kind: "drain-init" },
+    newState: { drainMode: true, lastSigintAt: now },
+  };
+}
+
 let drainMode = false;
 let lastSigintAt = 0;
 process.on("SIGTERM", () => {
@@ -2547,19 +2617,23 @@ process.on("SIGTERM", () => {
   console.log("\n🚦 Drain mode: will exit after current dispatch completes.");
 });
 process.on("SIGINT", () => {
-  const now = Date.now();
-  if (drainMode) {
-    if (now - lastSigintAt < 5_000) {
+  const { action, newState } = decideSigint({ drainMode, lastSigintAt }, Date.now());
+  drainMode = newState.drainMode;
+  lastSigintAt = newState.lastSigintAt;
+  switch (action.kind) {
+    case "ignore-debounce":
+      return;
+    case "force-exit":
       console.log("\n🛑 Force-exit (second Ctrl-C). In-flight dispatch left mid-run; expect wip:<agent> labels needing manual cleanup.");
       process.exit(130);
-    }
-    lastSigintAt = now;
-    console.log("🚦 Already draining. Press Ctrl-C again within 5 s to force-quit.");
-    return;
+      return;
+    case "drain-already":
+      console.log("🚦 Already draining. Press Ctrl-C again within 5 s to force-quit.");
+      return;
+    case "drain-init":
+      console.log("\n🚦 Drain mode: will exit after current dispatch completes. Ctrl-C again within 5 s to force-quit.");
+      return;
   }
-  drainMode = true;
-  lastSigintAt = now;
-  console.log("\n🚦 Drain mode: will exit after current dispatch completes. Ctrl-C again within 5 s to force-quit.");
 });
 
 export async function pollLoop(): Promise<void> {
