@@ -90,8 +90,12 @@ export interface AgentConfig {
   serial?: boolean;
 }
 
-// 5-agent pipeline: PO → Architect → Developer → Code Review → Documentation
-// Skipped: UX Designer (no UI), Security (local-only daemon), QA (Go tests handled by Developer + CI)
+// 6-agent pipeline: PO → Architect → Developer → QA → Code Review → Documentation
+// QA added 2026-05-22 to separate mechanical gates (go test/vet/build + baseline-comparison
+// routing) from judgment-heavy code-review (idiom, concurrency, spec-vs-PR diff). Placed
+// BEFORE code-review so red-test runs cost only a QA spawn + rework cycle without burning
+// code-review tokens on code about to be rejected.
+// Skipped: UX Designer (no UI), Security (local-only daemon).
 export const AGENTS: AgentConfig[] = [
   {
     name: "po",
@@ -118,10 +122,18 @@ export const AGENTS: AgentConfig[] = [
     producesCommits: true, // commits implementation + tests
   },
   {
+    name: "qa",
+    column: "In QA",
+    claudeMdPath: "qa/CLAUDE.md",
+    description: "QA — runs mechanical gates (tests/vet/build) and triages failures against baseline",
+    usesWorktree: true, // checks out feature branch to run tests against
+    producesCommits: false, // PR comments + labels only; never writes code
+  },
+  {
     name: "code-review",
     column: "In Code Review",
     claudeMdPath: "code-review/CLAUDE.md",
-    description: "Code Reviewer — reviews PRs for quality and correctness",
+    description: "Code Reviewer — reviews PRs for quality and correctness (assumes green tests from QA)",
     usesWorktree: true, // reads code locally to review
     producesCommits: false, // PR comments only via `gh pr review`
   },

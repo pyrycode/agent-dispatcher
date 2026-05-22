@@ -23,7 +23,8 @@ export interface AdvanceRule {
 export const AUTO_ADVANCE_RULES: AdvanceRule[] = [
   { from: "Backlog",            readyLabel: "done:po",             to: "In Architecture" },
   { from: "In Architecture",    readyLabel: "done:architect",      to: "In Development" },
-  { from: "In Development",     readyLabel: "done:developer",      to: "In Code Review" },
+  { from: "In Development",     readyLabel: "done:developer",      to: "In QA" },
+  { from: "In QA",              readyLabel: "done:qa",             to: "In Code Review" },
   { from: "In Code Review",     readyLabel: "done:code-review",    to: "In Documentation" },
   { from: "In Documentation",   readyLabel: "done:documentation",  to: "Done" },
 ];
@@ -74,6 +75,7 @@ export const MANUAL_ADVANCE_GATES: ReadonlySet<string> = new Set<string>();
 export const MID_PIPELINE_COLUMNS: readonly string[] = [
   "In Architecture",
   "In Development",
+  "In QA",
   "In Code Review",
   "In Documentation",
 ];
