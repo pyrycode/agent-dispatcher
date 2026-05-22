@@ -292,33 +292,49 @@ const liveChildPgrpPids = new Set<number>();
  * `child.kill(sig)` would reach only the immediate child.
  *
  * Use this in every intentional teardown path (timeout, permission-
- * denial force-exit, etc.). ESRCH ("no such pgrp") is swallowed
- * silently — pgrp teardown is best-effort, and the pgrp may have
- * drained naturally before we got here. Other errors fall back to a
- * single-process `child.kill(sig)` so we still make a best-effort
- * teardown attempt under unusual kernel conditions (e.g. EPERM in
- * sandboxed environments).
+ * denial force-exit, etc.).
+ *
+ * Guards:
+ * - `pid <= 1` is rejected. `pid === undefined` is the "spawn produced
+ *   no PID" case; `pid === 0` would send to the caller's own pgrp via
+ *   `process.kill(-0, ...)`; `pid === 1` is init/launchd. None of these
+ *   are realistic spawn outputs today, but the cost of the check is a
+ *   single integer comparison and the cost of getting it wrong is
+ *   killing the dispatcher itself or the whole user session.
+ * - ESRCH ("no such pgrp") is swallowed silently — pgrp teardown is
+ *   best-effort and the pgrp may have drained naturally before we got
+ *   here.
+ *
+ * **No fallback to `child.kill(sig)`.** Earlier drafts fell back to
+ * single-process kill on non-ESRCH errors, but that's exactly the
+ * orphan-grandchild bug this helper exists to prevent. A fallback
+ * would silently re-create the pre-fix behaviour in the unusual
+ * environments (sandboxed runners, restricted namespaces) where the
+ * fallback would actually fire — the worst possible audience. We
+ * log loudly instead and let the caller proceed; if the caller is
+ * about to `process.exit`, at least the operator gets a signal.
  */
 function killChildPgrp(child: ChildProcess, sig: NodeJS.Signals | number): void {
-  if (child.pid === undefined) return;
+  if (child.pid === undefined || child.pid <= 1) return;
   try {
     process.kill(-child.pid, sig);
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === "ESRCH") return;
-    try { child.kill(sig); } catch { /* already dead */ }
+    console.error(`[killChildPgrp] failed to ${String(sig)} pgrp -${child.pid}: ${err}`);
   }
 }
 
 /**
  * Tear down EVERY live child pgrp tracked by the dispatcher. Used by
  * signal handlers (SIGINT force-exit, SIGHUP) that don't have a
- * `child` reference in scope. Best-effort: ESRCH is silent, other
- * errors are logged but not propagated (the caller is about to
- * `process.exit` anyway, so the only audience is the log).
+ * `child` reference in scope. Same guards and no-fallback policy as
+ * `killChildPgrp`: ESRCH silent, other errors logged loudly, never
+ * degrade to single-PID kill.
  */
 function killAllChildPgrps(sig: NodeJS.Signals | number): void {
   for (const pid of liveChildPgrpPids) {
+    if (pid <= 1) continue;
     try {
       process.kill(-pid, sig);
     } catch (err) {
@@ -494,12 +510,28 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
     child.on("close", (code) => {
       clearTimeout(timer);
       if (forceExitTimer) clearTimeout(forceExitTimer);
-      // Untrack the pgrp — child has exited, so its pgrp is empty
-      // (or contains only orphaned grandchildren that the kernel will
-      // re-parent; we've already SIGTERMed the pgrp on intentional
-      // teardown paths). Either way, the dispatcher no longer owns
-      // teardown for this PID.
-      if (child.pid !== undefined) liveChildPgrpPids.delete(child.pid);
+      // Untrack the pgrp ONLY if it has actually drained. The pgrp ID
+      // persists in the kernel until its LAST member exits, not until
+      // the pgrp LEADER (immediate child) exits — so if `pyry agent-run`
+      // crashed/exited abnormally while its PTY-driven claude is still
+      // alive, we must keep the PID tracked so SIGHUP / SIGINT
+      // force-exit can still tear down the orphan claude.
+      //
+      // Probe via signal 0 (existence check, no actual signal). ESRCH
+      // = pgrp is empty, safe to forget. Anything else (process still
+      // there, or EPERM) → keep tracking; killAllChildPgrps will retry
+      // and is itself ESRCH-tolerant if the pgrp drains in the
+      // meantime.
+      if (child.pid !== undefined && child.pid > 1) {
+        try {
+          process.kill(-child.pid, 0);
+          // pgrp still has members — keep tracking
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code === "ESRCH") {
+            liveChildPgrpPids.delete(child.pid);
+          }
+        }
+      }
 
       // Process remaining buffer
       if (buffer.trim()) {
@@ -563,7 +595,19 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
 
     child.on("error", (err) => {
       clearTimeout(timer);
-      if (child.pid !== undefined) liveChildPgrpPids.delete(child.pid);
+      // Same probe-before-delete as the close handler — `error` can
+      // fire for spawn failures (no pgrp existed) OR for kill failures
+      // (pgrp may still have live members). Probe ESRCH to disambiguate.
+      if (child.pid !== undefined && child.pid > 1) {
+        try {
+          process.kill(-child.pid, 0);
+          // pgrp still has members — keep tracking
+        } catch (probeErr) {
+          if ((probeErr as NodeJS.ErrnoException).code === "ESRCH") {
+            liveChildPgrpPids.delete(child.pid);
+          }
+        }
+      }
       reject(err);
     });
   });
@@ -2717,49 +2761,81 @@ export function decideSigint(
 
 let drainMode = false;
 let lastSigintAt = 0;
-process.on("SIGTERM", () => {
-  if (drainMode) return;  // idempotent — multiple SIGTERMs only print once
-  drainMode = true;
-  console.log("\n🚦 Drain mode: will exit after current dispatch completes.");
-});
-process.on("SIGINT", () => {
-  const { action, newState } = decideSigint({ drainMode, lastSigintAt }, Date.now());
-  drainMode = newState.drainMode;
-  lastSigintAt = newState.lastSigintAt;
-  switch (action.kind) {
-    case "ignore-debounce":
-      return;
-    case "force-exit":
-      console.log("\n🛑 Force-exit (second Ctrl-C). In-flight dispatch left mid-run; expect wip:<agent> labels needing manual cleanup.");
-      // The detached spawns isolate children from terminal-pgrp SIGINT,
-      // so without this explicit teardown the force-exit path would
-      // kill the dispatcher but leave `pyry agent-run` + `claude`
-      // running orphaned (claude burning API credits up to its
-      // internal timeout). pgrp-kill brings them down with the
-      // dispatcher.
-      killAllChildPgrps("SIGTERM");
-      process.exit(130);
-      return;
-    case "drain-already":
-      console.log("🚦 Already draining. Press Ctrl-C again within 5 s to force-quit.");
-      return;
-    case "drain-init":
-      console.log("\n🚦 Drain mode: will exit after current dispatch completes. Ctrl-C again within 5 s to force-quit.");
-      return;
-  }
-});
-// SIGHUP arrives on controlling-terminal disconnect — closing the
-// iTerm / Terminal.app window, SSH session drop, etc. Default Node
-// behaviour is to exit immediately, which would orphan our detached
-// claude children to launchd (since they're in their own session with
-// no controlling terminal of their own). Explicit pgrp teardown
-// ensures closing the window mid-dispatch doesn't leak long-running
-// claude processes burning API credits up to their internal timeout.
-process.on("SIGHUP", () => {
-  console.log("\n📞 SIGHUP — tearing down detached child pgrps before exit");
-  killAllChildPgrps("SIGTERM");
-  process.exit(129); // POSIX convention for exit-by-SIGHUP (128 + 1)
-});
+/** Grace window between pgrp-SIGTERM and pgrp-SIGKILL on force-exit /
+ *  SIGHUP paths. Matches the permission-denial Layer 2 grace so the
+ *  contract is consistent across all "kill the in-flight work" paths.
+ *  Two seconds is empirically enough for `pyry agent-run` to propagate
+ *  SIGTERM to its PTY-driven claude subprocess and let claude flush
+ *  any final stream events. */
+export const FORCE_EXIT_SIGKILL_GRACE_MS = 2_000;
+
+/**
+ * Register the dispatcher's signal handlers. Called from
+ * `dispatch-bin.ts` at startup — NOT at module load — so that test
+ * imports of `dispatch.ts` (or any sibling module that pulls it in)
+ * don't accidentally inherit a `process.on("SIGINT", ...)` /
+ * `process.on("SIGHUP", ...)` that would `process.exit` the test
+ * runner on signal delivery.
+ *
+ * Handlers close over the module-level `drainMode` and `lastSigintAt`
+ * lets, which is fine — they're shared state for the running
+ * dispatcher process; test processes don't invoke this function and
+ * therefore don't touch them.
+ */
+export function installSignalHandlers(): void {
+  process.on("SIGTERM", () => {
+    if (drainMode) return;  // idempotent — multiple SIGTERMs only print once
+    drainMode = true;
+    console.log("\n🚦 Drain mode: will exit after current dispatch completes.");
+  });
+
+  process.on("SIGINT", () => {
+    const { action, newState } = decideSigint({ drainMode, lastSigintAt }, Date.now());
+    drainMode = newState.drainMode;
+    lastSigintAt = newState.lastSigintAt;
+    switch (action.kind) {
+      case "ignore-debounce":
+        return;
+      case "force-exit":
+        console.log("\n🛑 Force-exit (second Ctrl-C). In-flight dispatch left mid-run; expect wip:<agent> labels needing manual cleanup.");
+        // Two-step teardown with SIGKILL escalation, matching the
+        // permission-denial Layer 2 pattern. Without the SIGKILL stage,
+        // children that catch SIGTERM but hang (or that pyry-run forwards
+        // slowly) survive the dispatcher's `process.exit(130)` and
+        // orphan to launchd. The 2s grace gives well-behaved children
+        // time to drain cleanly; the SIGKILL ensures we don't leak even
+        // on misbehaving children.
+        killAllChildPgrps("SIGTERM");
+        setTimeout(() => {
+          killAllChildPgrps("SIGKILL");
+          process.exit(130);
+        }, FORCE_EXIT_SIGKILL_GRACE_MS);
+        return;
+      case "drain-already":
+        console.log("🚦 Already draining. Press Ctrl-C again within 5 s to force-quit.");
+        return;
+      case "drain-init":
+        console.log("\n🚦 Drain mode: will exit after current dispatch completes. Ctrl-C again within 5 s to force-quit.");
+        return;
+    }
+  });
+
+  // SIGHUP arrives on controlling-terminal disconnect — closing the
+  // iTerm / Terminal.app window, SSH session drop, etc. Default Node
+  // behaviour is to exit immediately, which would orphan our detached
+  // claude children to launchd (since they're in their own session with
+  // no controlling terminal of their own). Two-step teardown with
+  // SIGKILL escalation — same shape and rationale as the force-exit
+  // path above.
+  process.on("SIGHUP", () => {
+    console.log("\n📞 SIGHUP — tearing down detached child pgrps before exit");
+    killAllChildPgrps("SIGTERM");
+    setTimeout(() => {
+      killAllChildPgrps("SIGKILL");
+      process.exit(129); // POSIX convention for exit-by-SIGHUP (128 + 1)
+    }, FORCE_EXIT_SIGKILL_GRACE_MS);
+  });
+}
 
 export async function pollLoop(): Promise<void> {
   const client = new GitHubProjectClient({

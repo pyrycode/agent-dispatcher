@@ -3669,47 +3669,166 @@ describe("runClaudeStreamingOnce spawn options", () => {
   });
 });
 
+/**
+ * Slice `source` from the start of a function/handler declaration to
+ * the next top-level construct. "Top-level" = a line that starts with
+ * `function `, `export function `, `const `, `let `, `var `, `class `,
+ * or `process.on(` — anchored at the start of a line (no leading
+ * whitespace), so nested code inside the slice doesn't terminate
+ * extraction early.
+ *
+ * Used by the tripwires below to scope assertions to specific
+ * function/handler bodies rather than scanning the whole file.
+ * Returns `null` if the start anchor isn't found.
+ */
+const sliceDeclaration = (source: string, startAnchor: string): string | null => {
+  const start = source.indexOf(startAnchor);
+  if (start < 0) return null;
+  // Search forward from just past the start anchor for the next
+  // top-level boundary. The pattern allows leading newline + any of
+  // the recognized declaration keywords (or `process.on(`).
+  const tail = source.slice(start + startAnchor.length);
+  const boundaryMatch = tail.match(/\n(?:export\s+)?(?:function |const |let |var |class |process\.on\()/);
+  const sliceEnd = boundaryMatch && boundaryMatch.index !== undefined
+    ? start + startAnchor.length + boundaryMatch.index
+    : undefined;
+  return source.slice(start, sliceEnd);
+};
+
+/**
+ * Strip JS/TS comments from a source slice for tripwire matching.
+ * KNOWN LIMITATION: this is a naive regex strip — it incorrectly
+ * removes the tail of any line containing `//` inside a string
+ * literal (e.g. a URL like `"https://example.com"`), and incorrectly
+ * removes content between `/*` and the next `*​/` even when those
+ * appear inside strings. The current dispatch.ts has no such cases
+ * on lines that the tripwires below scrutinise, but a future edit
+ * that introduces a URL on the same line as a `child.kill(` call
+ * would create a false-negative in the "no bare child.kill" tripwire.
+ *
+ * Acceptable trade-off because (a) the test surface is small enough
+ * to audit manually if a tripwire ever quietly passes when it
+ * shouldn't, (b) upgrading to a real tokenizer adds a dependency for
+ * marginal benefit, and (c) violating the convention is rare enough
+ * that the false-negative window is narrow.
+ */
+const stripComments = (source: string): string =>
+  source
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/.*$/gm, "");
+
 describe("detached-child teardown uses pgrp-kill", () => {
-  test("dispatcher uses `process.kill(-pid, sig)` somewhere (pgrp-kill syntax required for detached spawns)", () => {
-    const source = readDispatchSource();
+  test("`killChildPgrp` body sends `process.kill(-pid, sig)` (pgrp syntax)", () => {
+    const body = sliceDeclaration(readDispatchSource(), "function killChildPgrp(");
+    assert.ok(body, "could not locate `function killChildPgrp(` in dispatch.ts");
+    const code = stripComments(body);
     assert.match(
-      source,
+      code,
       /process\.kill\(\s*-/,
-      "with `detached: true` on the claude spawn, intentional teardown paths (timeout, permission-denial force-exit, SIGINT force-exit, SIGHUP) MUST signal the whole pgrp via `process.kill(-pid, sig)`. A bare `child.kill(sig)` reaches only `pyry agent-run` and leaves the grandchild `claude` orphaned in the new pgrp, burning API credits up to its internal timeout. See `killChildPgrp` / `killAllChildPgrps` in dispatch.ts.",
+      "`killChildPgrp` must signal the whole pgrp via `process.kill(-pid, sig)` — not bare `child.kill(sig)` which only reaches the immediate child and orphans the grandchild.",
     );
   });
 
-  test("a SIGHUP handler is installed so terminal-disconnect tears down detached children", () => {
-    const source = readDispatchSource();
-    assert.match(
-      source,
-      /process\.on\(\s*["']SIGHUP["']/,
-      "without a SIGHUP handler, closing the terminal (Cmd-W on iTerm / SSH disconnect) exits the dispatcher with default behaviour and leaves the detached claude in its own session running until its internal timeout. The handler must call `killAllChildPgrps('SIGTERM')` before `process.exit`.",
+  test("`killChildPgrp` body does NOT fall back to bare `child.kill(` on error (the orphaning bug the helper exists to prevent)", () => {
+    const body = sliceDeclaration(readDispatchSource(), "function killChildPgrp(");
+    assert.ok(body, "could not locate `function killChildPgrp(` in dispatch.ts");
+    const code = stripComments(body);
+    assert.doesNotMatch(
+      code,
+      /\bchild\.kill\(/,
+      "`killChildPgrp` must NOT fall back to `child.kill(sig)` on non-ESRCH errors. A fallback re-creates the exact orphan-grandchild bug this helper exists to prevent, silently, in the unusual environments (EPERM, restricted namespaces) where the fallback would actually fire. Log loudly via `console.error` instead and let the caller proceed.",
     );
+  });
+
+  test("a SIGHUP handler is installed in `installSignalHandlers` so terminal-disconnect tears down detached children", () => {
+    const body = sliceDeclaration(readDispatchSource(), "export function installSignalHandlers(");
+    assert.ok(body, "could not locate `export function installSignalHandlers(` — handlers must live in this function so test imports don't inherit them at module load");
+    assert.match(
+      body,
+      /process\.on\(\s*["']SIGHUP["']/,
+      "without a SIGHUP handler, closing the terminal (Cmd-W on iTerm / SSH disconnect) exits the dispatcher with default behaviour and leaves the detached claude orphaned to launchd. The handler must call `killAllChildPgrps('SIGTERM')` then escalate to SIGKILL after the grace window.",
+    );
+  });
+
+  test("SIGINT handler's `force-exit` case tears down child pgrps with SIGKILL escalation", () => {
+    const body = sliceDeclaration(readDispatchSource(), "export function installSignalHandlers(");
+    assert.ok(body, "could not locate `installSignalHandlers` body");
+    const code = stripComments(body);
+    // Find the force-exit case and walk to the next `case `/`}` boundary
+    const forceExitStart = code.indexOf('case "force-exit"');
+    assert.ok(forceExitStart >= 0, "could not locate the `case \"force-exit\":` branch in the SIGINT handler");
+    const tail = code.slice(forceExitStart);
+    const caseEnd = tail.search(/\n\s*case |\n\s*\}/);
+    const caseBody = caseEnd >= 0 ? tail.slice(0, caseEnd) : tail;
+    assert.match(
+      caseBody,
+      /killAllChildPgrps\(["']SIGTERM["']\)/,
+      "force-exit must send SIGTERM to live child pgrps — otherwise the dispatcher dies and orphans claude.",
+    );
+    assert.match(
+      caseBody,
+      /killAllChildPgrps\(["']SIGKILL["']\)/,
+      "force-exit must escalate to SIGKILL after the grace window — without this, children that ignore or hang on SIGTERM survive the dispatcher exit and orphan to launchd.",
+    );
+  });
+
+  test("SIGHUP handler body tears down child pgrps with SIGKILL escalation", () => {
+    const body = sliceDeclaration(readDispatchSource(), "export function installSignalHandlers(");
+    assert.ok(body, "could not locate `installSignalHandlers` body");
+    const code = stripComments(body);
+    const sighupStart = code.search(/process\.on\(\s*["']SIGHUP["']/);
+    assert.ok(sighupStart >= 0, "could not locate the SIGHUP handler");
+    // Walk to the matching `})` — handler bodies are typically a few
+    // lines, so slice a generous window and assert on it.
+    const handlerSlice = code.slice(sighupStart, sighupStart + 1500);
+    assert.match(
+      handlerSlice,
+      /killAllChildPgrps\(["']SIGTERM["']\)/,
+      "SIGHUP handler must send SIGTERM to live child pgrps before exit.",
+    );
+    assert.match(
+      handlerSlice,
+      /killAllChildPgrps\(["']SIGKILL["']\)/,
+      "SIGHUP handler must escalate to SIGKILL after the grace window — same contract as force-exit.",
+    );
+  });
+
+  test("module-level scope of `dispatch.ts` does NOT register `process.on(SIGINT|SIGHUP|SIGTERM)` — handlers must live in `installSignalHandlers` so test imports don't inherit them", () => {
+    const source = readDispatchSource();
+    // Find every `process.on("SIGINT" | "SIGHUP" | "SIGTERM"` callsite
+    // in CODE (not in comments — the docstring on `installSignalHandlers`
+    // itself mentions these handler names as illustrative text). For the
+    // index-based scope check we replace comments with same-length
+    // whitespace runs so subsequent indices still align with the original
+    // `source`.
+    const codeOnly = source
+      .replace(/\/\*[\s\S]*?\*\//g, (m) => " ".repeat(m.length))
+      .replace(/\/\/[^\n]*/g, (m) => " ".repeat(m.length));
+    const installerStart = codeOnly.indexOf("export function installSignalHandlers(");
+    assert.ok(installerStart >= 0, "could not locate `installSignalHandlers` declaration");
+    // installer body extends until the next top-level construct
+    const tail = codeOnly.slice(installerStart + 1);
+    const boundary = tail.search(/\n(?:export\s+)?(?:function |const |let |var |class |process\.on\()/);
+    const installerEnd = boundary >= 0 ? installerStart + 1 + boundary : codeOnly.length;
+
+    const handlerPattern = /process\.on\(\s*["'](SIGINT|SIGHUP|SIGTERM)["']/g;
+    const occurrences = [...codeOnly.matchAll(handlerPattern)];
+    assert.ok(occurrences.length >= 3, `expected at least 3 process.on(SIG*) registrations in code, found ${occurrences.length}`);
+    for (const m of occurrences) {
+      const idx = m.index ?? -1;
+      assert.ok(
+        idx >= installerStart && idx < installerEnd,
+        `found \`process.on("${m[1]}", ...)\` outside \`installSignalHandlers\` at index ${idx} (installer range: [${installerStart}, ${installerEnd})) — handlers must be registered only via \`installSignalHandlers\` (called from dispatch-bin.ts) so module imports (tests, sibling modules) don't inherit handlers that would \`process.exit\` the importer on signal delivery.`,
+      );
+    }
   });
 
   test("intentional teardown sites in `runClaudeStreamingOnce` do not use bare `child.kill(` (comments stripped before matching)", () => {
-    const source = readDispatchSource();
-    // Extract the runClaudeStreamingOnce function body — the spawn
-    // happens here, and every kill in this function must go through
-    // the pgrp helper. We anchor on the function signature and walk
-    // until the next top-level `function ` keyword (rough but
-    // sufficient for a tripwire).
-    const fnStart = source.indexOf("function runClaudeStreamingOnce(");
-    assert.ok(fnStart >= 0, "could not locate runClaudeStreamingOnce in dispatch.ts");
-    const nextFnStart = source.indexOf("\nfunction ", fnStart + 1);
-    const fnBody = source.slice(fnStart, nextFnStart >= 0 ? nextFnStart : undefined);
-    // Strip comments before searching so explanatory text mentioning
-    // `child.kill()` as a counter-example (e.g. the spawn block's
-    // comment block) doesn't trip this assertion. We strip block
-    // comments first, then line comments — order matters because a
-    // line comment inside a block comment must be eaten as part of
-    // the block.
-    const codeOnly = fnBody
-      .replace(/\/\*[\s\S]*?\*\//g, "")
-      .replace(/\/\/.*$/gm, "");
+    const body = sliceDeclaration(readDispatchSource(), "function runClaudeStreamingOnce(");
+    assert.ok(body, "could not locate `function runClaudeStreamingOnce(` in dispatch.ts");
+    const code = stripComments(body);
     assert.doesNotMatch(
-      codeOnly,
+      code,
       /\bchild\.kill\(/,
       "intentional teardown sites in `runClaudeStreamingOnce` must use `killChildPgrp(child, sig)` (pgrp-kill) instead of bare `child.kill`. The latter reaches only `pyry agent-run` and orphans the grandchild — see the comment block above the function for the contract.",
     );
