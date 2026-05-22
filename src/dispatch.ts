@@ -306,10 +306,26 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
         "--workdir", opts.cwd,
       ];
     }
+    // `detached: true` puts the child in its own process group, so a
+    // terminal Ctrl+C (which the kernel delivers to every PID in the
+    // foreground pgrp) reaches only the dispatcher — not the spawned
+    // `pyry agent-run` / `claude` underneath. Without this, the SIGINT
+    // debounce in `decideSigint` correctly suppresses the parent's
+    // duplicate but the child still gets its own pgrp-delivered SIGINT
+    // and aborts streaming ("aborted_streaming: no output"), defeating
+    // the drain-mode contract.
+    //
+    // `child.kill(...)` for intentional teardown (timeout / Layer-2
+    // force-exit after permission denial) still targets the child PID
+    // specifically and is unaffected by the pgrp split. stdio remains
+    // piped so the dispatcher reads stream-json as before, and the
+    // child is NOT `unref()`d — its lifecycle stays bound to the
+    // dispatcher's event loop. Surfaced 2026-05-22.
     const child = spawn(bin, args, {
       cwd: opts.cwd,
       env: opts.env,
       stdio: ["pipe", "pipe", "pipe"],
+      detached: true,
     });
 
     let buffer = "";
