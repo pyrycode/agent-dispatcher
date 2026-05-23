@@ -21,7 +21,7 @@ import { existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { dispatchInbox, pollLoop } from "./dispatch.js";
+import { dispatchInbox, installSignalHandlers, pollLoop } from "./dispatch.js";
 import { decideCodegraphHealth, findMissingAgentClaudeMds } from "./agent-runtime.js";
 import { AGENTS } from "./types.js";
 import { resolveAgentsRepoRootWithEnv, resolveTargetRepoRoot } from "./worktree.js";
@@ -107,6 +107,12 @@ if (cgHealth.state === "queryable") {
   console.warn(`    Detail: ${cgHealth.detail.slice(0, 500)}`);
   console.warn(`    Fix: \`rm ${codegraphPath} && cd ${targetRepoRoot} && codegraph init -i\` (or investigate why status fails — broken symlink, schema mismatch, db corruption, codegraph CLI not on PATH).`);
 }
+
+// Signal handlers are intentionally installed HERE rather than at
+// dispatch.ts module load — test imports of dispatch.ts must not
+// register SIGINT/SIGHUP handlers that would `process.exit` the test
+// runner on signal delivery. See `installSignalHandlers` docstring.
+installSignalHandlers();
 
 // Entry-point dispatch.
 const args = process.argv.slice(2);
