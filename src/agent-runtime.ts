@@ -81,6 +81,40 @@ export function maxTurnsFor(agent: AgentConfig): number {
   return 90;
 }
 
+/**
+ * Wall-clock timeout (ms) for an agent run, keyed off the role and the
+ * ticket's labels. `timeoutLabel` (the DISPATCH-log "Timeout: Nmin"
+ * string) is derived from this — `${timeoutFor(...) / 60_000}min`.
+ *
+ * Tiers:
+ *  - code-review → 40min. Runs adversarial sub-agents (each round-trips
+ *    through claude) and routinely needs the headroom.
+ *  - security-sensitive architect → 40min. A `security-sensitive` ticket
+ *    makes the architect write the spec AND run the adversarial
+ *    security-review pass (`architect/security-review.md`) — structurally
+ *    the same "produce an artifact + run a sub-agent audit" shape as
+ *    code-review, so it shares the budget. The base 20min was not enough
+ *    on pyrycode-mobile#304 (2026-05-31): the spec landed right at the
+ *    20min mark and the review never started; because the salvage path
+ *    skips timeout failures, the uncommitted spec was discarded.
+ *  - developer / documentation / qa → 25min. QA is medium-tier because
+ *    `go test -race ./...` on the full pyrycode suite (~346 tests as of
+ *    2026-05-10) is 2-5min of wall-clock plus baseline-comparison triage
+ *    on red.
+ *  - everyone else (po, non-security architect) → 20min.
+ *
+ * `labels` is the ticket's current label set; callers without labels in
+ * scope can omit it (defaults to none → base tiers only).
+ */
+export function timeoutFor(agent: AgentConfig, labels: string[] = []): number {
+  if (agent.name === "code-review") return 2_400_000;
+  if (agent.name === "architect" && labels.includes("security-sensitive")) {
+    return 2_400_000;
+  }
+  if (["developer", "documentation", "qa"].includes(agent.name)) return 1_500_000;
+  return 1_200_000;
+}
+
 // --------- Safer max_turns salvage ---------
 
 /**

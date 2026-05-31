@@ -27,6 +27,7 @@ import {
   isRetryableSpawnError,
   MAX_SPAWN_ATTEMPTS,
   maxTurnsFor,
+  timeoutFor,
   parseSalvageGates,
   ResourceExhaustedError,
   retrySpawnOnTransientError,
@@ -1778,6 +1779,61 @@ describe("maxTurnsFor", () => {
     // 0 turns. The policy returns the base budget for any non-code-review
     // name; if a future agent needs more, it must be added explicitly.
     assert.equal(maxTurnsFor({ name: "ghost", column: "", claudeMdPath: "", description: "", usesWorktree: false, producesCommits: false }), 90);
+  });
+});
+
+describe("timeoutFor", () => {
+  // Wall-clock budget per role. code-review gets 40min (adversarial
+  // sub-agents); developer/docs/qa get 25min; po + base architect get
+  // 20min. The security-sensitive architect carve-out (40min) was added
+  // 2026-05-31 after pyrycode-mobile#304 timed out: the architect wrote
+  // the spec right at the 20min mark and the mandatory security-review
+  // pass never started, and the salvage path discards timeout failures so
+  // the uncommitted spec was lost.
+  const arch = AGENTS.find(a => a.name === "architect")!;
+  const cr = AGENTS.find(a => a.name === "code-review")!;
+  const dev = AGENTS.find(a => a.name === "developer")!;
+  const docs = AGENTS.find(a => a.name === "documentation")!;
+  const qa = AGENTS.find(a => a.name === "qa")!;
+  const po = AGENTS.find(a => a.name === "po")!;
+
+  test("code-review gets 40min (runs sub-agents)", () => {
+    assert.equal(timeoutFor(cr), 2_400_000);
+    // code-review's budget is role-driven, not label-driven.
+    assert.equal(timeoutFor(cr, ["security-sensitive"]), 2_400_000);
+  });
+
+  test("developer/documentation/qa get 25min (medium tier)", () => {
+    assert.equal(timeoutFor(dev), 1_500_000);
+    assert.equal(timeoutFor(docs), 1_500_000);
+    assert.equal(timeoutFor(qa), 1_500_000);
+  });
+
+  test("po gets 20min (light tier)", () => {
+    assert.equal(timeoutFor(po), 1_200_000);
+  });
+
+  test("architect gets 20min on an ordinary ticket", () => {
+    assert.equal(timeoutFor(arch), 1_200_000);
+    assert.equal(timeoutFor(arch, ["size:s"]), 1_200_000);
+  });
+
+  test("architect gets 40min when the ticket is security-sensitive (spec + adversarial security-review)", () => {
+    assert.equal(timeoutFor(arch, ["security-sensitive"]), 2_400_000);
+    assert.equal(timeoutFor(arch, ["done:po", "size:s", "security-sensitive"]), 2_400_000);
+  });
+
+  test("the security-sensitive bump is architect-only — it does not lift po", () => {
+    // Only the architect runs the security-review pass, so only the
+    // architect's budget keys off the label. PO on a security-sensitive
+    // ticket stays at the light tier.
+    assert.equal(timeoutFor(po, ["security-sensitive"]), 1_200_000);
+  });
+
+  test("unknown agent name still gets the base tier (no implicit zero)", () => {
+    const ghost = { name: "ghost", column: "", claudeMdPath: "", description: "", usesWorktree: false, producesCommits: false };
+    assert.equal(timeoutFor(ghost), 1_200_000);
+    assert.equal(timeoutFor(ghost, ["security-sensitive"]), 1_200_000);
   });
 });
 

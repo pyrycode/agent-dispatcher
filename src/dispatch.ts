@@ -10,6 +10,7 @@ import {
   advancePermissionDenialState,
   initPermissionDenialState,
   maxTurnsFor,
+  timeoutFor,
   parseSalvageGates,
   ResourceExhaustedError,
   retrySpawnOnTransientError,
@@ -1815,7 +1816,6 @@ export async function prepareAgentSpawn(
   // code-review 100). Bumped 70 → 90 on 2026-05-20 after successful runs
   // clustered at 59-68 turns against the prior 70 cap on real impl work.
   const maxTurns = maxTurnsFor(agent);
-  const isCodeReview = agent.name === "code-review";
 
   // Tool access per agent role
   // codegraph tools are read-only symbol queries (callers/callees/impact/search/etc) backed
@@ -1835,12 +1835,11 @@ export async function prepareAgentSpawn(
   let allowedTools = baseTools;
   if (needsAgent) allowedTools += ",Agent";
 
-  // Timeout tiers: code-review 40min (sub-agents), developer/docs/qa 25min, light agents 20min.
-  // QA is medium-tier because `go test -race ./...` on the full pyrycode suite (~346 tests
-  // as of 2026-05-10) can take 2-5min of wall-clock, plus baseline-comparison triage on red.
-  const isMediumAgent = ["developer", "documentation", "qa"].includes(agent.name);
-  const timeoutMs = isCodeReview ? 2_400_000 : isMediumAgent ? 1_500_000 : 1_200_000;
-  const timeoutLabel = isCodeReview ? "40min" : isMediumAgent ? "25min" : "20min";
+  // Timeout tiers live in `timeoutFor` (agent-runtime.ts): code-review 40min,
+  // security-sensitive architect 40min (spec + adversarial security-review),
+  // developer/docs/qa 25min, light agents (po, non-security architect) 20min.
+  const timeoutMs = timeoutFor(agent, item.labels);
+  const timeoutLabel = `${timeoutMs / 60_000}min`;
 
   writeLog(logFile, "DISPATCH", `Agent: ${agent.name}\nTicket: #${item.issueNumber} — ${item.title}\nBranch: ${branchName}\nWorktree: ${useWorktree ? worktreeDir : `none (PO on ${defaultBranch})`}\nMax turns: ${maxTurns}\nTimeout: ${timeoutLabel}\nAllowed tools: ${allowedTools}`);
   writeLog(logFile, "PROMPT", prompt);
