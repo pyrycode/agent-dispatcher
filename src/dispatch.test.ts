@@ -327,6 +327,8 @@ export class MockGitHubClient implements DispatchClient {
   getItemsByStatusCalls: string[] = [];
   getClosedItemsNotInDoneCalls = 0;
   updateItemStatusCalls: { itemId: string; newStatus: string }[] = [];
+  getLatestRetryAtCalls: number[] = [];
+  retryAtByIssue: Map<number, Date | null> = new Map();
   failures: {
     addLabel?: Error | ((issueNumber: number, label: string) => Error | null);
     removeLabel?: Error | ((issueNumber: number, label: string) => Error | null);
@@ -336,6 +338,7 @@ export class MockGitHubClient implements DispatchClient {
     getItemsByStatus?: Error;
     getClosedItemsNotInDone?: Error;
     updateItemStatus?: Error | ((itemId: string, newStatus: string) => Error | null);
+    getLatestRetryAt?: Error;
   } = {};
 
   constructor(opts: {
@@ -444,6 +447,12 @@ export class MockGitHubClient implements DispatchClient {
     for (const item of this.itemsByIssueNumber.values()) {
       if (item.id === itemId) item.status = newStatus;
     }
+  }
+
+  async getLatestRetryAt(issueNumber: number): Promise<Date | null> {
+    this.getLatestRetryAtCalls.push(issueNumber);
+    if (this.failures.getLatestRetryAt) throw this.failures.getLatestRetryAt;
+    return this.retryAtByIssue.get(issueNumber) ?? null;
   }
 }
 
@@ -1313,7 +1322,7 @@ describe("handleAgentResultErrors", () => {
 
     await assert.rejects(
       handleAgentResultErrors(
-        streamResult({ isError: true, terminalReason: "api_error", output: "Anthropic 529" }),
+        streamResult({ isError: true, terminalReason: "api_error", output: "Anthropic API failure" }),
         ctx,
       ),
       /Agent error \(api_error\)/,
@@ -2079,40 +2088,18 @@ describe("handleDispatchError", () => {
     assert.equal(calls.discord.length, 1);
   });
 
-  test("ResourceExhaustedError → distinct label + tailored comment (no generic error:<agent>)", async () => {
-    // The retry helper has already exhausted its bounded backoff
-    // before this fires. handleDispatchError must distinguish this
-    // failure mode (couldn't spawn) from a regular crash (agent ran,
-    // then failed) — operator triage is different.
+  test("ResourceExhaustedError (EAGAIN) is transient → schedules a backoff retry on the first failure", async () => {
+    // agent-dispatcher#25: EAGAIN host pressure is on the auto-retry
+    // allowlist, so the first ResourceExhaustedError schedules a backoff
+    // retry rather than parking immediately. The resource_exhausted park
+    // is deferred to the retry cap (covered in retry-integration.test.ts).
     const { ctx, client } = makeTestContext({ item: { issueNumber: 503 } });
 
-    await handleDispatchError(
-      new ResourceExhaustedError("EAGAIN", 5),
-      ctx,
-      null, // sessionId is meaningless when spawn never succeeded
-    );
+    await handleDispatchError(new ResourceExhaustedError("EAGAIN", 5), ctx, null);
 
-    // Distinct label — operator can filter resource-pressure incidents
-    // separately from agent crashes.
-    assert.deepEqual(
-      client.addLabelCalls,
-      [{ issueNumber: 503, label: "error:developer:resource_exhausted" }],
-      "must use the resource_exhausted suffix, NOT generic error:developer",
-    );
-    // Tailored comment names the errno, the attempt count, and points
-    // the operator at host-pressure diagnostics.
-    assert.equal(client.comments.length, 1);
-    const body = client.comments[0]!.body;
-    assert.match(body, /Agent Spawn Failed/);
-    assert.match(body, /5 retries/);
-    assert.match(body, /EAGAIN/);
-    assert.match(body, /RLIMIT_NPROC/);
-    assert.match(body, /ulimit -u/);
-    // No "Manual intervention required" generic stub.
-    assert.ok(!/encountered an error/.test(body),
-      "must not use the generic agent-error template");
-    // No resume hint — there's no session to resume (spawn never succeeded).
-    assert.ok(!/claude --resume/.test(body));
+    const labels = client.addLabelCalls.map((c) => c.label);
+    assert.ok(labels.includes("error-retry-count:1"), "bumps the retry counter on first EAGAIN");
+    assert.ok(!labels.includes("error:developer:resource_exhausted"), "no immediate resource_exhausted park on the first failure");
   });
 });
 
@@ -2290,7 +2277,7 @@ describe("dispatchToAgent — orchestrator integration", () => {
       execImpls: fullHappyExecImpls("feature/702"),
       fsMap: { [claudeMd]: "developer system prompt" },
       // Stream returns a non-max_turns error → handleAgentResultErrors throws.
-      streamResult: streamResult({ isError: true, terminalReason: "api_error", output: "Anthropic 529" }),
+      streamResult: streamResult({ isError: true, terminalReason: "api_error", output: "Anthropic API failure" }),
     });
 
     await dispatchToAgent(agent, item, client, deps);
@@ -2543,7 +2530,7 @@ describe("dispatchToAgent — concurrent dispatches (pollLoop's Promise.allSettl
       // non-max_turns throw path independently.
       streamResult: (opts) => {
         if (opts?.cwd?.includes("developer-804")) {
-          return streamResult({ isError: true, terminalReason: "api_error", output: "Anthropic 529" });
+          return streamResult({ isError: true, terminalReason: "api_error", output: "Anthropic API failure" });
         }
         return streamResult({ isError: true, terminalReason: "timeout", output: "agent killed after 25min" });
       },
@@ -2927,7 +2914,7 @@ describe("runConcurrentDispatches", () => {
       fsMap: { [claudeMd]: "developer system prompt" },
       // 1102 errors mid-stream; 1103 succeeds.
       streamResult: (opts) => opts?.cwd?.includes("developer-1102")
-        ? streamResult({ isError: true, terminalReason: "api_error", output: "anthropic 529" })
+        ? streamResult({ isError: true, terminalReason: "api_error", output: "anthropic API failure" })
         : streamResult({ isError: false, output: "ok" }),
     });
     // Make notifyDiscord throw — only matters for 1102's failure path.

@@ -35,6 +35,14 @@ import {
   isPipelineLabelForAgent,
   shouldAddReadyLabel,
   shouldSkipDispatch,
+  classifyAgentError,
+  backoffDelayMs,
+  isRetryEligible,
+  extractErrorRetryCount,
+  seededRng,
+  RETRY_MAX_ATTEMPTS,
+  ERROR_RETRY_COUNT_PREFIX,
+  AUTO_RETRY_COMMENT_MARKER,
 } from "./pipeline-decisions.js";
 import {
   decideBranchSetup,
@@ -1187,6 +1195,13 @@ export interface DispatchClient {
   getClosedItemsNotInDone(): Promise<ProjectItem[]>;
   /** Used by `runClosedSweep` to move closed-but-stranded items to Done. */
   updateItemStatus(itemId: string, newStatus: string): Promise<void>;
+  /** Used by the transient-retry backoff (agent-dispatcher#25): the
+   *  createdAt of the most recent auto-retry comment on an issue, which is
+   *  the durable "last failure time" the poll loop uses to compute backoff
+   *  eligibility. Returns null when no marker comment exists (schedule
+   *  lost → caller treats as eligible); throws on fetch failure (caller
+   *  holds the ticket a cycle rather than retrying blindly during an outage). */
+  getLatestRetryAt(issueNumber: number): Promise<Date | null>;
 }
 
 // IO surface every phase function depends on. Threading it through
@@ -1319,11 +1334,93 @@ export async function dispatchToAgent(
   await cleanupAfterDispatch(ctx);
 }
 
+/**
+ * Schedule (or decline) a transient-error auto-retry for a failed dispatch
+ * (agent-dispatcher#25). Reads the current `error-retry-count:N` off the
+ * item's labels and:
+ *
+ *   - **Under the cap:** bumps the counter to N+1, posts a marker-tagged
+ *     auto-retry comment (whose createdAt the poll loop reads as the
+ *     last-failure time), and returns N+1. The caller then skips the
+ *     `error:<agent>` park entirely — the ticket sits with just the counter
+ *     and is re-dispatched once `backoffDelayMs(N+1)` has elapsed.
+ *   - **At/over the cap:** posts a "retries exhausted" note and returns
+ *     null. The caller falls through to its normal `error:<agent>` park.
+ *
+ * State is entirely board-encoded (counter label + comment createdAt), so a
+ * dispatcher restart mid-wait resumes the same schedule rather than
+ * resetting it. If the counter can't be persisted, returns null (park) —
+ * an untracked retry would loop without backoff.
+ */
+async function scheduleTransientRetry(opts: {
+  agent: AgentConfig;
+  item: ProjectItem;
+  client: DispatchClient;
+  logFile: string;
+  signature: string;
+}): Promise<number | null> {
+  const { agent, item, client, logFile, signature } = opts;
+  const newAttempt = extractErrorRetryCount(item.labels) + 1;
+
+  if (newAttempt > RETRY_MAX_ATTEMPTS) {
+    try {
+      await client.addComment(
+        item.issueNumber,
+        `## ⛔ Transient retries exhausted\n\n` +
+        `The ${agent.name} agent kept failing with transient errors ` +
+        `(last matched: \`${signature}\`) through all ${RETRY_MAX_ATTEMPTS} ` +
+        `auto-retries. Parking for human triage.`,
+      );
+    } catch {}
+    return null;
+  }
+
+  // Bump the counter — strip any stale ones first (mirrors rework-count
+  // handling: extractErrorRetryCount reads the max, so leftover lower
+  // counters would otherwise linger).
+  for (const label of item.labels) {
+    if (label.startsWith(ERROR_RETRY_COUNT_PREFIX)) {
+      try { await client.removeLabel(item.issueNumber, label); } catch {}
+    }
+  }
+  try {
+    await client.addLabel(item.issueNumber, `${ERROR_RETRY_COUNT_PREFIX}${newAttempt}`);
+  } catch (e) {
+    console.warn(`   ⚠️  Failed to set ${ERROR_RETRY_COUNT_PREFIX}${newAttempt} on #${item.issueNumber}; parking instead: ${e}`);
+    return null;
+  }
+
+  // The marker comment's createdAt is the durable last-failure time the
+  // poll loop reads to compute eligibility. If it fails to post, the poll
+  // loop sees no marker (getLatestRetryAt → null) and treats the ticket as
+  // immediately eligible — degraded but not stuck, so keep the retry.
+  try {
+    await client.addComment(
+      item.issueNumber,
+      `${AUTO_RETRY_COMMENT_MARKER}\n## ♻️ Auto-retry scheduled (attempt ${newAttempt}/${RETRY_MAX_ATTEMPTS})\n\n` +
+      `The ${agent.name} agent hit a transient error (\`${signature}\`). ` +
+      `The dispatcher will re-dispatch after an exponential backoff — ` +
+      `no action needed unless this recurs through all ${RETRY_MAX_ATTEMPTS} attempts.`,
+    );
+  } catch (e) {
+    console.warn(`   ⚠️  Failed to post auto-retry comment on #${item.issueNumber}: ${e}`);
+  }
+
+  writeLog(logFile, "AUTO_RETRY", `transient "${signature}" — attempt ${newAttempt}/${RETRY_MAX_ATTEMPTS}`);
+  console.log(`   ♻️  #${item.issueNumber} transient "${signature}" — auto-retry ${newAttempt}/${RETRY_MAX_ATTEMPTS} scheduled`);
+  return newAttempt;
+}
+
 // Outer catch-block body for dispatchToAgent. Logs the error, posts
 // `error:<agent>` label + diagnostic comment + Discord notify. The
 // session-id resume hint is the load-bearing piece for JSONL-replay
 // recovery — preserve verbatim. Issue-0 (manual dispatch) skips the
 // label/comment side effects.
+//
+// agent-dispatcher#25: before parking, transient transport/API errors
+// (socket/5xx/429/overloaded/EAGAIN) are auto-retried on a board-encoded
+// backoff via `scheduleTransientRetry`; only after the cap (or a
+// non-allowlisted error) does the `error:<agent>` park below fire.
 export async function handleDispatchError(
   error: any,
   ctx: DispatchContext,
@@ -1351,6 +1448,33 @@ export async function handleDispatchError(
   const errorLabel = isResourceExhausted
     ? `error:${agent.name}:resource_exhausted`
     : `error:${agent.name}`;
+
+  // agent-dispatcher#25: auto-retry transient transport/API errors on a
+  // board-encoded backoff before parking for a human. The classified text
+  // is the agent's error message (handleAgentResultErrors folds the agent
+  // output into it) plus the errno for the resource-exhaustion case. The
+  // ResourceExhaustedError's own spawn-retry budget only covers sub-second
+  // EAGAIN spikes; this backoff is the multi-minute-pressure fallback.
+  if (item.issueNumber > 0) {
+    const classifyText = isResourceExhausted
+      ? `${error.message} ${(error as ResourceExhaustedError).errno}`
+      : (error?.message ?? "");
+    const { transient, signature } = classifyAgentError(classifyText);
+    if (transient) {
+      const attempt = await scheduleTransientRetry({ agent, item, client, logFile, signature });
+      if (attempt !== null) {
+        await notifyDiscord(
+          `♻️ **${agent.name}** transient error on #${item.issueNumber} ("${signature}") — ` +
+          `auto-retry ${attempt}/${RETRY_MAX_ATTEMPTS} scheduled (backoff). No action needed yet.`,
+        );
+        return; // retry scheduled — do NOT park with error:<agent>
+      }
+      // attempt === null → cap reached (or counter couldn't be persisted);
+      // scheduleTransientRetry already noted the exhaustion. Fall through to
+      // the normal park path below (errorLabel + comment + Discord).
+    }
+  }
+
   if (item.issueNumber > 0) {
     try {
       await client.addLabel(item.issueNumber, errorLabel);
@@ -2111,6 +2235,20 @@ export async function handlePostRun(
       } catch (e) {
         console.warn(`   ⚠️  Failed to add done:${agent.name} label: ${e}`);
       }
+      // agent-dispatcher#25: a successful run clears any transient-retry
+      // backoff state so a later, unrelated failure starts the schedule
+      // fresh (the counter is per-occurrence, not cumulative for the
+      // ticket's life). Done-cleanup also strips it as a backstop.
+      for (const l of postLabels) {
+        if (l.startsWith(ERROR_RETRY_COUNT_PREFIX)) {
+          try {
+            await client.removeLabel(item.issueNumber, l);
+            console.log(`   🧹 Cleared ${l} from #${item.issueNumber} (transient retry resolved)`);
+          } catch (e) {
+            console.warn(`   ⚠️  Failed to clear ${l}: ${e}`);
+          }
+        }
+      }
     } else {
       switch (decision.logKind) {
         case "rework":
@@ -2278,6 +2416,62 @@ export async function runDoneCleanup(client: DispatchClient): Promise<void> {
 // =====================================================================
 // pollLoop coordination helpers (extracted for testability)
 // =====================================================================
+
+/**
+ * Hold tickets that are mid transient-retry backoff (agent-dispatcher#25).
+ *
+ * Mutates `itemsByColumn` in place: any ticket carrying `error-retry-count:N`
+ * (and not already parked with a terminal `error:` label) whose backoff
+ * window has NOT elapsed is removed from this cycle's snapshot so
+ * `selectDispatches` won't pick it. Eligibility is recomputed from board
+ * state every cycle — the counter label for the attempt, the auto-retry
+ * comment's createdAt for the last-failure time — so a dispatcher restart
+ * mid-wait resumes the same schedule rather than resetting it.
+ *
+ * The comment fetch runs ONLY for tickets actually carrying the counter
+ * (rare), so the common cycle pays nothing. A fetch failure holds the
+ * ticket for the cycle (re-checked next) rather than retrying blindly during
+ * an outage; a missing marker comment (null) is treated as eligible so a
+ * lost schedule never traps the ticket.
+ */
+export async function holdBackoffWaiters(
+  itemsByColumn: Map<string, ProjectItem[]>,
+  client: DispatchClient,
+  now: number = Date.now(),
+): Promise<void> {
+  for (const [column, items] of itemsByColumn) {
+    const kept: ProjectItem[] = [];
+    for (const item of items) {
+      const attempt = extractErrorRetryCount(item.labels);
+      const parked = item.labels.some((l) => l.startsWith("error:"));
+      if (attempt <= 0 || parked) {
+        kept.push(item);
+        continue;
+      }
+      let lastAt: Date | null;
+      try {
+        lastAt = await client.getLatestRetryAt(item.issueNumber);
+      } catch (e: any) {
+        console.log(`   ⏳ #${item.issueNumber} retry-eligibility lookup failed (${e?.message ?? e}); holding this cycle`);
+        continue; // held — dropped from this cycle's snapshot
+      }
+      // Same (issueNumber, attempt) → same jittered delay, so the deadline
+      // is stable across the cycles that recompute it. Each seededRng is a
+      // fresh stateful generator, so build one per use.
+      const eligible =
+        lastAt === null ||
+        isRetryEligible(lastAt, attempt, now, { rng: seededRng(item.issueNumber, attempt) });
+      if (eligible) {
+        kept.push(item);
+      } else {
+        const delay = backoffDelayMs(attempt, { rng: seededRng(item.issueNumber, attempt) });
+        const minsLeft = Math.max(0, Math.round((lastAt!.getTime() + delay - now) / 60_000));
+        console.log(`   ⏳ #${item.issueNumber} in transient-retry backoff (attempt ${attempt}/${RETRY_MAX_ATTEMPTS}, ~${minsLeft}min left) — holding`);
+      }
+    }
+    itemsByColumn.set(column, kept);
+  }
+}
 
 /**
  * Pre-dispatch label prep: for each candidate, strip any stale
@@ -3049,6 +3243,12 @@ export async function pollLoop(): Promise<void> {
         itemsByColumn.set(agent.column, []);
       }
     }
+
+    // agent-dispatcher#25: drop tickets still inside their transient-retry
+    // backoff window from this cycle's snapshot so they aren't re-dispatched
+    // early. The schedule is board-encoded and re-read each cycle, so this is
+    // restart-safe (a mid-wait restart resumes, doesn't reset).
+    await holdBackoffWaiters(itemsByColumn, client);
 
     const candidates = selectDispatches({ itemsByColumn, pollOrder, maxConcurrent: MAX_CONCURRENT });
     dispatched = candidates.length > 0;

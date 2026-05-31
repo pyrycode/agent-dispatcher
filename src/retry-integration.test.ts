@@ -1,0 +1,189 @@
+// Integration tests for the transient-error auto-retry wiring
+// (agent-dispatcher#25): handleDispatchError's schedule-vs-park decision and
+// holdBackoffWaiters' poll-loop gate. Self-contained — builds its own minimal
+// DispatchClient mock + DispatchContext from exported types, so it doesn't
+// depend on dispatch.test.ts's harness. node:test to match the repo.
+
+import { describe, test } from "node:test";
+import assert from "node:assert/strict";
+
+import {
+  handleDispatchError,
+  holdBackoffWaiters,
+  DEFAULT_DEPS,
+  type DispatchClient,
+  type DispatchContext,
+} from "./dispatch.js";
+import { ResourceExhaustedError } from "./agent-runtime.js";
+import { AGENTS, type ProjectItem } from "./types.js";
+
+const RETRY_MARKER = "<!-- pyry-auto-retry -->";
+
+class FakeClient implements DispatchClient {
+  addLabelCalls: { issueNumber: number; label: string }[] = [];
+  removeLabelCalls: { issueNumber: number; label: string }[] = [];
+  comments: { issueNumber: number; body: string }[] = [];
+  getLatestRetryAtCalls: number[] = [];
+  retryAtByIssue = new Map<number, Date | null>();
+  failRetryAt: Error | null = null;
+
+  async addLabel(issueNumber: number, label: string) { this.addLabelCalls.push({ issueNumber, label }); }
+  async removeLabel(issueNumber: number, label: string) { this.removeLabelCalls.push({ issueNumber, label }); }
+  async addComment(issueNumber: number, body: string) { this.comments.push({ issueNumber, body }); }
+  async getIssueLabels() { return []; }
+  async getItemStatus() { return null; }
+  async getItemsByStatus() { return []; }
+  async getClosedItemsNotInDone() { return []; }
+  async updateItemStatus() { /* no-op */ }
+  async getLatestRetryAt(issueNumber: number) {
+    this.getLatestRetryAtCalls.push(issueNumber);
+    if (this.failRetryAt) throw this.failRetryAt;
+    return this.retryAtByIssue.get(issueNumber) ?? null;
+  }
+  labels() { return this.addLabelCalls.map((c) => c.label); }
+}
+
+function makeItem(over: Partial<ProjectItem> & { issueNumber: number }): ProjectItem {
+  return {
+    id: over.id ?? `it-${over.issueNumber}`,
+    issueId: over.issueId ?? `node-${over.issueNumber}`,
+    issueNumber: over.issueNumber,
+    title: over.title ?? "test ticket",
+    body: over.body ?? "",
+    status: over.status ?? "In Development",
+    labels: over.labels ?? [],
+    url: over.url ?? "https://example.com/1",
+    blockedBy: over.blockedBy ?? [],
+  };
+}
+
+function makeCtx(
+  item: ProjectItem,
+  client: DispatchClient,
+  discord: string[],
+): DispatchContext {
+  const agent = AGENTS.find((a) => a.name === "developer")!;
+  return {
+    agent,
+    item,
+    client,
+    branchName: `feature/${item.issueNumber}`,
+    worktreeDir: "/tmp/wt",
+    useWorktree: true,
+    agentCwd: "/tmp/wt",
+    logFile: "/dev/null",
+    startTime: 0,
+    startTs: "00:00",
+    deps: { ...DEFAULT_DEPS, notifyDiscord: async (m: string) => { discord.push(m); } },
+  };
+}
+
+describe("handleDispatchError — transient auto-retry (agent-dispatcher#25)", () => {
+  test("transient error → schedules a retry (counter + marker comment), no error: park, no manual-intervention alert", async () => {
+    const client = new FakeClient();
+    const discord: string[] = [];
+    const ctx = makeCtx(makeItem({ issueNumber: 700 }), client, discord);
+    await handleDispatchError(
+      new Error("Agent error (error): socket connection was closed unexpectedly"),
+      ctx,
+      null,
+    );
+    assert.ok(client.labels().includes("error-retry-count:1"), "bumps the retry counter");
+    assert.ok(!client.labels().includes("error:developer"), "must NOT park on the first transient failure");
+    assert.ok(client.comments.some((c) => c.body.includes(RETRY_MARKER)), "posts the marker auto-retry comment");
+    assert.ok(discord.some((m) => m.includes("auto-retry")), "notifies the scheduled retry");
+    assert.ok(!discord.some((m) => m.includes("Manual intervention")), "no manual-intervention alert for a scheduled retry");
+  });
+
+  test("transient error at the cap → parks with error:<agent> + exhaustion note", async () => {
+    const client = new FakeClient();
+    const discord: string[] = [];
+    const ctx = makeCtx(makeItem({ issueNumber: 701, labels: ["error-retry-count:4"] }), client, discord);
+    await handleDispatchError(new Error('API Error: 529 {"type":"overloaded_error"}'), ctx, null);
+    assert.ok(client.labels().includes("error:developer"), "parks after the cap");
+    assert.ok(client.comments.some((c) => c.body.includes("Transient retries exhausted")));
+    assert.ok(!client.labels().includes("error-retry-count:5"), "does not bump past the cap");
+  });
+
+  test("non-transient error → parks immediately with error:<agent>, no retry counter", async () => {
+    const client = new FakeClient();
+    const discord: string[] = [];
+    const ctx = makeCtx(makeItem({ issueNumber: 702 }), client, discord);
+    await handleDispatchError(new Error("Agent error (max_turns): a real logic failure"), ctx, null);
+    assert.ok(client.labels().includes("error:developer"));
+    assert.ok(!client.labels().some((l) => l.startsWith("error-retry-count:")));
+    assert.ok(discord.some((m) => m.includes("Manual intervention")));
+  });
+
+  test("ResourceExhaustedError (EAGAIN) is transient → schedules a retry, not an immediate resource_exhausted park", async () => {
+    const client = new FakeClient();
+    const ctx = makeCtx(makeItem({ issueNumber: 703 }), client, []);
+    await handleDispatchError(new ResourceExhaustedError("EAGAIN", 5), ctx, null);
+    assert.ok(client.labels().includes("error-retry-count:1"));
+    assert.ok(!client.labels().includes("error:developer:resource_exhausted"), "no immediate resource_exhausted park");
+  });
+
+  test("ResourceExhaustedError parks with resource_exhausted once the cap is reached", async () => {
+    const client = new FakeClient();
+    const ctx = makeCtx(makeItem({ issueNumber: 704, labels: ["error-retry-count:4"] }), client, []);
+    await handleDispatchError(new ResourceExhaustedError("EAGAIN", 5), ctx, null);
+    assert.ok(client.labels().includes("error:developer:resource_exhausted"), "caps to resource_exhausted");
+    const body = client.comments.map((c) => c.body).join("\n");
+    assert.match(body, /Agent Spawn Failed/);
+    assert.match(body, /EAGAIN/);
+  });
+
+  test("scheduling a retry strips the stale counter before adding the next", async () => {
+    const client = new FakeClient();
+    const ctx = makeCtx(makeItem({ issueNumber: 705, labels: ["error-retry-count:1"] }), client, []);
+    await handleDispatchError(new Error("read ECONNRESET"), ctx, null);
+    assert.ok(client.removeLabelCalls.some((c) => c.label === "error-retry-count:1"));
+    assert.ok(client.addLabelCalls.some((c) => c.label === "error-retry-count:2"));
+  });
+});
+
+describe("holdBackoffWaiters — poll-loop backoff gate (agent-dispatcher#25)", () => {
+  const NOW = 10_000_000;
+
+  test("holds a ticket inside its window; keeps an elapsed retry and a normal ticket", async () => {
+    const client = new FakeClient();
+    const waiting = makeItem({ issueNumber: 201, labels: ["error-retry-count:1"] });
+    const elapsed = makeItem({ issueNumber: 202, labels: ["error-retry-count:1"] });
+    const normal = makeItem({ issueNumber: 203, labels: [] });
+    client.retryAtByIssue.set(201, new Date(NOW));            // just failed → any positive backoff holds it
+    client.retryAtByIssue.set(202, new Date(NOW - 6 * 60_000)); // 6min ago → past attempt-1 max (5min) for any jitter
+    const byCol = new Map<string, ProjectItem[]>([["In Development", [waiting, elapsed, normal]]]);
+    await holdBackoffWaiters(byCol, client, NOW);
+    assert.deepEqual(
+      byCol.get("In Development")!.map((i) => i.issueNumber).sort((a, b) => a - b),
+      [202, 203],
+    );
+  });
+
+  test("leaves a parked ticket (error:) in place and does not fetch its comments", async () => {
+    const client = new FakeClient();
+    const parked = makeItem({ issueNumber: 210, labels: ["error-retry-count:4", "error:developer"] });
+    const byCol = new Map<string, ProjectItem[]>([["In Development", [parked]]]);
+    await holdBackoffWaiters(byCol, client, NOW);
+    assert.deepEqual(byCol.get("In Development")!.map((i) => i.issueNumber), [210]);
+    assert.equal(client.getLatestRetryAtCalls.length, 0);
+  });
+
+  test("missing marker comment (null) → treated as eligible so a lost schedule never traps the ticket", async () => {
+    const client = new FakeClient();
+    const item = makeItem({ issueNumber: 220, labels: ["error-retry-count:2"] });
+    client.retryAtByIssue.set(220, null);
+    const byCol = new Map<string, ProjectItem[]>([["In QA", [item]]]);
+    await holdBackoffWaiters(byCol, client, NOW);
+    assert.deepEqual(byCol.get("In QA")!.map((i) => i.issueNumber), [220]);
+  });
+
+  test("comment-fetch failure → holds the ticket this cycle (no blind retry during an outage)", async () => {
+    const client = new FakeClient();
+    client.failRetryAt = new Error("503 Service Unavailable");
+    const item = makeItem({ issueNumber: 230, labels: ["error-retry-count:1"] });
+    const byCol = new Map<string, ProjectItem[]>([["In QA", [item]]]);
+    await holdBackoffWaiters(byCol, client, NOW);
+    assert.deepEqual(byCol.get("In QA")!.map((i) => i.issueNumber), []);
+  });
+});

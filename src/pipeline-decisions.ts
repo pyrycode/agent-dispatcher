@@ -111,6 +111,7 @@ export function countPipelineInFlight(
     item =>
       item.issueNumber > 0 &&
       !item.labels.some(l => l.startsWith("error:")) &&
+      !isRetryWaiting(item.labels) &&
       !hasOpenBlockers(item.blockedBy ?? []),
   ).length;
 }
@@ -407,7 +408,8 @@ export function decideDoneCleanup(
     const labelsToStrip = item.labels.filter(
       l => isPipelineLabel(l)
         || l.startsWith("rework-count:")
-        || l.startsWith("merge-attempt:"),
+        || l.startsWith("merge-attempt:")
+        || l.startsWith(ERROR_RETRY_COUNT_PREFIX),
     );
 
     if (labelsToStrip.length === 0) continue;
@@ -834,4 +836,207 @@ export function findAdvanceRule(
   labels: string[],
 ): AdvanceRule | null {
   return rules.find((r) => r.from === fromColumn && labels.includes(r.readyLabel)) ?? null;
+}
+
+// --------- Transient-error auto-retry (agent-dispatcher#25) ---------
+//
+// When an agent run fails with a transient transport/API error (dropped
+// socket, 5xx, 429, EAGAIN host pressure), the dispatcher auto-retries on
+// a board-encoded exponential backoff instead of immediately parking the
+// ticket with `error:<stage>` for a human. State lives entirely on the
+// board so it survives the frequent dispatcher restarts:
+//
+//   - attempt number   -> `error-retry-count:N` label (mirrors `rework-count:N`)
+//   - last-failure time -> createdAt of the marker-tagged auto-retry comment
+//
+// The poll loop is the timer: each cycle recomputes `eligible_at =
+// lastErrorAt + backoffDelayMs(N)` from board state and skips re-dispatch
+// until it passes. Nothing in-process, so a restart mid-wait resumes the
+// same schedule rather than resetting it.
+//
+// The schedule is itself a soft classifier: a genuine blip clears on the
+// first short retry; anything still failing through the full schedule
+// isn't transient and escalates to a human at the cap. That makes the
+// allowlist self-correcting against a mistakenly-added signature.
+
+/** Label prefix carrying the transient-retry attempt counter. Note it is
+ *  `error-retry-count:` (no colon after `error`), so it does NOT match the
+ *  `error:` pipeline-label prefix — a retry-waiting ticket is not treated
+ *  as an `error:`-parked one, and `isPipelineLabelForAgent` won't strip it
+ *  on re-dispatch (the counter must survive so the next failure increments). */
+export const ERROR_RETRY_COUNT_PREFIX = "error-retry-count:";
+
+/** Maximum auto-retry attempts before parking for a human. With the
+ *  5/10/20/40-min schedule below, total wait is <= ~75 min. */
+export const RETRY_MAX_ATTEMPTS = 4;
+
+/** Base backoff (attempt 1 nominal). Doubles per attempt: 5/10/20/40 min. */
+export const RETRY_BASE_MS = 5 * 60_000;
+
+/** Hidden marker embedded in every auto-retry comment so the dispatcher can
+ *  find the most recent one and read its createdAt as the last-failure time.
+ *  An HTML comment renders invisibly in GitHub's Markdown. */
+export const AUTO_RETRY_COMMENT_MARKER = "<!-- pyry-auto-retry -->";
+
+/** One transient-error signature: `match` is the lowercased substring probed
+ *  against the agent's error text; `signature` is the human-facing name
+ *  surfaced in the auto-retry comment. */
+export interface RetrySignature {
+  signature: string;
+  match: string;
+}
+
+/**
+ * Allowlist of transient transport/API error signatures that clear on a
+ * clean retry. Deliberately NARROW — the ticket's "never auto-retry" list
+ * stays OFF here so a blind re-run can't waste money or mask a real bug:
+ *   - git divergence ("commits not present on origin") — integrity decision
+ *   - wall-clock timeout / `max_turns` — a re-run just buys another overrun
+ *   - genuine test/build failures or wrong output — rework territory
+ *   - `400 thinking/redacted_thinking blocks` — a harness bug; fix it, don't mask
+ * Those never reach this allowlist (no matching entry) and park immediately.
+ */
+// Order matters: more-specific signatures are probed before broader ones.
+// `overloaded_error` / `529` come before the generic `api error: 5` so an
+// "API Error: 529 (overloaded)" surfaces the precise signature rather than
+// the catch-all 5xx one. (Both are transient, so `transient` is unaffected
+// either way — only the human-facing `signature` string differs.)
+export const RETRY_ALLOWLIST: readonly RetrySignature[] = [
+  { signature: "socket closed",          match: "socket connection was closed unexpectedly" },
+  { signature: "fetch failed",           match: "fetch failed" },
+  { signature: "connection reset",       match: "econnreset" },
+  { signature: "connection reset",       match: "connection reset" },
+  { signature: "overloaded",             match: "overloaded_error" },
+  { signature: "overloaded (529)",       match: "529" },
+  { signature: "rate limit (429)",       match: "429" },
+  { signature: "API 5xx",                match: "api error: 5" },
+  { signature: "cannot fork",            match: "cannot fork" },
+  { signature: "host pressure (EAGAIN)", match: "resource temporarily unavailable" },
+  { signature: "host pressure (EAGAIN)", match: "eagain" },
+];
+
+/**
+ * Classify an agent error string against the transient allowlist.
+ * Case-insensitive substring match. Returns the first matching signature
+ * (for the comment) and `transient: true`; otherwise `{ transient: false }`.
+ *
+ * Pure — no I/O. Unit-tested against captured real error strings including
+ * a non-matching one.
+ */
+export function classifyAgentError(
+  errText: string | null | undefined,
+): { transient: boolean; signature: string } {
+  if (!errText) return { transient: false, signature: "" };
+  const s = errText.toLowerCase();
+  for (const entry of RETRY_ALLOWLIST) {
+    if (s.includes(entry.match)) return { transient: true, signature: entry.signature };
+  }
+  return { transient: false, signature: "" };
+}
+
+/**
+ * Deterministic [0,1) PRNG seeded on (issueNumber, attempt). Same inputs
+ * always yield the same value, so `backoffDelayMs` produces a STABLE
+ * `eligible_at` across the poll cycles that recompute it from board state
+ * — without this, fresh jitter each cycle would move the deadline and the
+ * ticket would never settle. Different tickets get different jitter, which
+ * is also the decorrelation a global-overload burst needs. mulberry32 — a
+ * small, well-distributed integer PRNG, no dependencies.
+ */
+export function seededRng(issueNumber: number, attempt: number): () => number {
+  // Combine the inputs, then run a splitmix32 finalizer so the seed
+  // avalanches BEFORE the first draw. mulberry32's first output has weak
+  // avalanche straight off a lightly-mixed seed — without this finalizer,
+  // consecutive issue numbers (the common case: tickets erroring together)
+  // collapse to the same first value, and `backoffDelayMs` only ever draws
+  // once. The finalizer makes that single draw decorrelate across tickets.
+  let seed = (Math.imul(issueNumber | 0, 0x9e3779b1) ^ Math.imul(attempt | 0, 0x85ebca77)) >>> 0;
+  seed = Math.imul(seed ^ (seed >>> 16), 0x45d9f3b) >>> 0;
+  seed = Math.imul(seed ^ (seed >>> 16), 0x45d9f3b) >>> 0;
+  let a = (seed ^ (seed >>> 16)) >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/**
+ * Backoff delay (ms) for retry `attempt` (1-based). The nominal schedule
+ * doubles per attempt — 5/10/20/40 min — and full-jitter spreads the actual
+ * delay uniformly across `[0, nominal]` so a global Anthropic overload that
+ * errors many tickets at once doesn't retry them in lockstep and re-overload.
+ *
+ * `rng` MUST be deterministic per (ticket, attempt) in production (see
+ * `seededRng`) — eligibility is recomputed every poll, so a non-deterministic
+ * roll would make the deadline drift. Tests inject a fixed rng.
+ *
+ * `attempt <= 0` returns 0 (defensive). No cap is applied here; the
+ * attempt cap is a separate policy the caller enforces via RETRY_MAX_ATTEMPTS.
+ */
+export function backoffDelayMs(
+  attempt: number,
+  opts: { rng: () => number; baseMs?: number },
+): number {
+  if (attempt <= 0) return 0;
+  const baseMs = opts.baseMs ?? RETRY_BASE_MS;
+  const nominal = baseMs * 2 ** (attempt - 1);
+  const r = opts.rng();
+  const frac = Number.isFinite(r) ? Math.min(1, Math.max(0, r)) : 0;
+  return Math.round(nominal * frac);
+}
+
+/**
+ * True if `now` has reached `lastErrorAt + backoffDelayMs(attempt)` — i.e.
+ * the backoff window for the current attempt has elapsed and the ticket may
+ * be re-dispatched. `lastErrorAt`/`now` accept epoch-ms or Date. The caller
+ * passes the same seeded rng used to schedule, so the recomputed delay
+ * matches.
+ *
+ * Pure — no I/O. The caller supplies `lastErrorAt` (the auto-retry comment's
+ * createdAt) and `now`.
+ */
+export function isRetryEligible(
+  lastErrorAt: number | Date,
+  attempt: number,
+  now: number | Date,
+  opts: { rng: () => number; baseMs?: number },
+): boolean {
+  const last = lastErrorAt instanceof Date ? lastErrorAt.getTime() : lastErrorAt;
+  const nowMs = now instanceof Date ? now.getTime() : now;
+  return nowMs >= last + backoffDelayMs(attempt, opts);
+}
+
+/**
+ * Read the current transient-retry attempt count from a ticket's labels.
+ * Max-of-found (same defensive shape as `extractReworkCount`): multiple
+ * counters shouldn't co-exist, but if a partial label-strip race leaves
+ * stragglers, biasing high errs toward parking rather than over-retrying.
+ * Malformed / negative tails are treated as 0.
+ */
+export function extractErrorRetryCount(labels: string[]): number {
+  let max = 0;
+  for (const label of labels) {
+    if (!label.startsWith(ERROR_RETRY_COUNT_PREFIX)) continue;
+    const tail = label.slice(ERROR_RETRY_COUNT_PREFIX.length);
+    if (tail.length === 0) continue;
+    const n = parseInt(tail, 10);
+    if (isNaN(n) || n < 0) continue;
+    if (n > max) max = n;
+  }
+  return max;
+}
+
+/**
+ * True when a ticket is parked in transient-retry backoff: it carries an
+ * `error-retry-count:N` label but is NOT currently running (`wip:`). Such a
+ * ticket isn't consuming a pipeline thread, so `countPipelineInFlight`
+ * excludes it from the WIP count (a waiting retry "costs nothing against
+ * the WIP limit"). A retry that has been re-dispatched carries `wip:<agent>`
+ * and DOES count — it's genuinely in flight.
+ */
+export function isRetryWaiting(labels: string[]): boolean {
+  if (!labels.some(l => l.startsWith(ERROR_RETRY_COUNT_PREFIX))) return false;
+  return !labels.some(l => l.startsWith("wip:"));
 }
