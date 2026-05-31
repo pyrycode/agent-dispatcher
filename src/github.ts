@@ -1,5 +1,6 @@
 import { graphql } from "@octokit/graphql";
 import type { ProjectConfig, ProjectItem } from "./types.js";
+import { AUTO_RETRY_COMMENT_MARKER } from "./pipeline-decisions.js";
 
 async function fetchWithRetry(
   url: string,
@@ -492,5 +493,48 @@ export class GitHubProjectClient {
     if (!response.ok && response.status !== 404) {
       throw new Error(`Failed to remove label: ${response.statusText}`);
     }
+  }
+
+  /**
+   * The createdAt of the most recent dispatcher auto-retry comment on an
+   * issue — the marker-tagged comment posted on each transient-error retry
+   * (agent-dispatcher#25). This is the board-encoded "last failure time"
+   * the poll loop uses to compute backoff eligibility, so the schedule
+   * survives the frequent dispatcher restarts.
+   *
+   * Returns null when the issue's comments contain NO marker comment
+   * (schedule lost / never posted → the caller treats the ticket as
+   * immediately eligible rather than trapping it forever). THROWS on fetch
+   * failure (fetchWithRetry exhausted) so the caller can hold the ticket a
+   * cycle instead of hammering a degraded API.
+   *
+   * Scans for the max createdAt among marker comments rather than trusting
+   * sort order — robust regardless of how GitHub paginates/orders. One page
+   * (100) is far more than any ticket accrues in practice.
+   */
+  async getLatestRetryAt(issueNumber: number): Promise<Date | null> {
+    const response = await fetchWithRetry(
+      `https://api.github.com/repos/${this.config.owner}/${this.config.repo}/issues/${issueNumber}/comments?per_page=100`,
+      {
+        headers: {
+          Authorization: `token ${this.config.token}`,
+        },
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error(`Failed to fetch comments: ${response.statusText}`);
+    }
+
+    const comments: any[] = await response.json();
+    let latest: Date | null = null;
+    for (const c of comments) {
+      if (typeof c?.body !== "string" || !c.body.includes(AUTO_RETRY_COMMENT_MARKER)) continue;
+      const created = c.created_at ? new Date(c.created_at) : null;
+      if (created && !isNaN(created.getTime())) {
+        if (latest === null || created.getTime() > latest.getTime()) latest = created;
+      }
+    }
+    return latest;
   }
 }
