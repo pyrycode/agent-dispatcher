@@ -1088,6 +1088,24 @@ describe("prepareAgentSpawn", () => {
     }
   });
 
+  test("security-sensitive architect gets the 40min budget (item.labels threaded to timeoutFor)", async () => {
+    // pyrycode-mobile#304 (2026-05-31): a security-sensitive architect run
+    // must write the spec AND run the adversarial security-review pass; the
+    // base 20min wasn't enough and the timed-out spec was discarded. This
+    // locks that the ticket's labels actually reach the timeout computation
+    // (the unit-level policy is covered by timeoutFor's own tests).
+    const claudeMd = claudeMdAbsPath("architect/CLAUDE.md");
+    const { ctx } = makeTestContext({
+      agent: { name: "architect", column: "In Architecture", claudeMdPath: "architect/CLAUDE.md", usesWorktree: true, producesCommits: true },
+      item: { issueNumber: 304, labels: ["done:po", "size:s", "security-sensitive"] },
+      mockOptions: { fsMap: { [claudeMd]: "architect system prompt" } },
+    });
+
+    const result = await prepareAgentSpawn(ctx);
+    assert.ok(result.ok, "security-sensitive architect prepareAgentSpawn must succeed");
+    assert.equal((result as { ok: true; config: any }).config.timeoutMs, 2_400_000, "security-sensitive architect = 40min");
+  });
+
   // ===================================================================
   // Contract: --disallowed-tools for non-interactive agents (#7)
   // ===================================================================
