@@ -95,6 +95,22 @@ describe("handleDispatchError — transient auto-retry (agent-dispatcher#25)", (
     assert.ok(!discord.some((m) => m.includes("Manual intervention")), "no manual-intervention alert for a scheduled retry");
   });
 
+  test("idle_stall (pyry watchdog, pyrycode#360) → schedules a retry, no error: park", async () => {
+    const client = new FakeClient();
+    const discord: string[] = [];
+    const ctx = makeCtx(makeItem({ issueNumber: 706 }), client, discord);
+    await handleDispatchError(
+      new Error("Agent error (idle_stall): idle_stall: no stream activity for 240s while awaiting assistant turn"),
+      ctx,
+      null,
+    );
+    assert.ok(client.labels().includes("error-retry-count:1"), "bumps the retry counter");
+    assert.ok(!client.labels().includes("error:developer"), "must NOT park a wedged stream on the first failure");
+    assert.ok(client.comments.some((c) => c.body.includes(RETRY_MARKER)), "posts the marker auto-retry comment");
+    assert.ok(discord.some((m) => m.includes("idle stream stall")), "names the idle-stall signature in the retry notice");
+    assert.ok(!discord.some((m) => m.includes("Manual intervention")), "no manual-intervention alert for a scheduled retry");
+  });
+
   test("transient error at the cap → parks with error:<agent> + exhaustion note", async () => {
     const client = new FakeClient();
     const discord: string[] = [];

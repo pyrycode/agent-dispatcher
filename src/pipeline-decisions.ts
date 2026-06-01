@@ -895,6 +895,15 @@ export interface RetrySignature {
  *   - genuine test/build failures or wrong output — rework territory
  *   - `400 thinking/redacted_thinking blocks` — a harness bug; fix it, don't mask
  * Those never reach this allowlist (no matching entry) and park immediately.
+ *
+ * `idle_stall` IS on the list (unlike `timeout`/`max_turns`): pyry's
+ * streamrunner watchdog (pyrycode#360) emits it when claude's HTTPS stream to
+ * the Anthropic API wedges mid-run — zero bytes while claude still owes an
+ * assistant turn. That is a wedged connection, not a slow or over-budget
+ * agent, so a clean re-run genuinely clears it (it does not just buy another
+ * overrun). The watchdog (~240s) fires well before the dispatcher's 20-40min
+ * hard cap, so the synthetic `idle_stall` result reaches us first; the
+ * per-ticket retry cap still bounds a *persistent* stall to the operator.
  */
 // Order matters: more-specific signatures are probed before broader ones.
 // `overloaded_error` / `529` come before the generic `api error: 5` so an
@@ -902,6 +911,7 @@ export interface RetrySignature {
 // the catch-all 5xx one. (Both are transient, so `transient` is unaffected
 // either way — only the human-facing `signature` string differs.)
 export const RETRY_ALLOWLIST: readonly RetrySignature[] = [
+  { signature: "idle stream stall",      match: "idle_stall" },
   { signature: "socket closed",          match: "socket connection was closed unexpectedly" },
   { signature: "fetch failed",           match: "fetch failed" },
   { signature: "connection reset",       match: "econnreset" },
