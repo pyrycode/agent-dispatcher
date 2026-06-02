@@ -41,6 +41,15 @@ describe("classifyAgentError", () => {
     }
   });
 
+  test("idle_stall (pyry watchdog, pyrycode#360) classifies transient", () => {
+    // The dispatcher throws `Agent error (idle_stall): <output>` and the
+    // streamrunner's synthetic result embeds the phrase again in `output`.
+    const realistic = "Agent error (idle_stall): idle_stall: no stream activity for 240s while awaiting assistant turn";
+    const r = classifyAgentError(realistic);
+    assert.equal(r.transient, true);
+    assert.equal(r.signature, "idle stream stall");
+  });
+
   test("a bare 529 (no overloaded_error text) still classifies transient", () => {
     const r = classifyAgentError("API Error: 529 Service Overloaded");
     assert.equal(r.transient, true);
