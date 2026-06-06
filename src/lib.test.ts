@@ -1739,46 +1739,46 @@ describe("maxTurnsFor", () => {
   // real implementation work, not housekeeping. Earlier: 60 → 70 on
   // 2026-05-03 (housekeeping-tail cluster), 50 → 60 on 2026-05-02
   // (after #55).
-  test("code-review gets 100 (runs sub-agents)", () => {
+  test("code-review gets 150 (runs sub-agents)", () => {
     const cr = AGENTS.find(a => a.name === "code-review")!;
-    assert.equal(maxTurnsFor(cr), 100);
+    assert.equal(maxTurnsFor(cr), 150);
   });
 
-  test("developer gets 90 (was 70 — bumped 2026-05-20)", () => {
+  test("developer gets 135 (base budget)", () => {
     const dev = AGENTS.find(a => a.name === "developer")!;
-    assert.equal(maxTurnsFor(dev), 90);
+    assert.equal(maxTurnsFor(dev), 135);
   });
 
-  test("architect gets 90 (base budget — sketch + spec)", () => {
+  test("architect gets 135 (base budget — sketch + spec)", () => {
     const arch = AGENTS.find(a => a.name === "architect")!;
-    assert.equal(maxTurnsFor(arch), 90);
+    assert.equal(maxTurnsFor(arch), 135);
   });
 
-  test("po gets 90 (base budget — issue body refinement)", () => {
+  test("po gets 135 (base budget — issue body refinement)", () => {
     const po = AGENTS.find(a => a.name === "po")!;
-    assert.equal(maxTurnsFor(po), 90);
+    assert.equal(maxTurnsFor(po), 135);
   });
 
-  test("documentation gets 90 (base budget — knowledge base writes)", () => {
+  test("documentation gets 135 (base budget — knowledge base writes)", () => {
     const docs = AGENTS.find(a => a.name === "documentation")!;
-    assert.equal(maxTurnsFor(docs), 90);
+    assert.equal(maxTurnsFor(docs), 135);
   });
 
-  test("qa gets 30 (hot path 5-10 turns, cold path 15-25 — mechanical gates only)", () => {
+  test("qa gets 45 (hot path 5-10 turns, cold path 15-25 — mechanical gates only)", () => {
     // QA's work is bounded: run gates → green → exit, OR red → baseline-comparison
     // routing → triage. Below the base budget on purpose — drift into judgment
     // work (idiom/design) is what QA must NOT do; the low cap is the forcing
     // function. If genuine triage cost exceeds 30, the failure is a signal to
     // bump deliberately, not a routine adjustment.
     const qa = AGENTS.find(a => a.name === "qa")!;
-    assert.equal(maxTurnsFor(qa), 30);
+    assert.equal(maxTurnsFor(qa), 45);
   });
 
   test("unknown agent name still gets the base budget (no implicit zero)", () => {
     // Defensive: a typo or new agent shouldn't silently dispatch with
     // 0 turns. The policy returns the base budget for any non-code-review
     // name; if a future agent needs more, it must be added explicitly.
-    assert.equal(maxTurnsFor({ name: "ghost", column: "", claudeMdPath: "", description: "", usesWorktree: false, producesCommits: false }), 90);
+    assert.equal(maxTurnsFor({ name: "ghost", column: "", claudeMdPath: "", description: "", usesWorktree: false, producesCommits: false }), 135);
   });
 });
 

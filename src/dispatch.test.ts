@@ -968,7 +968,7 @@ describe("prepareAgentSpawn", () => {
     const config = result.config;
     assert.equal(config.model, "opus");
     assert.equal(config.effort, "xhigh");
-    assert.equal(config.maxTurns, 90, "developer base budget post-2026-05-20 is 90");
+    assert.equal(config.maxTurns, 135, "developer base budget post-2026-06-06 is 135");
     assert.equal(config.cwd, ctx.agentCwd);
     assert.equal(config.timeoutMs, 1_500_000, "developer = 25min");
     // baseTools without Agent (developer doesn't sub-dispatch).
@@ -1055,19 +1055,19 @@ describe("prepareAgentSpawn", () => {
   test("agent-specific tools / turns / timeout", async () => {
     // Parametric across agents. Asserts:
     //   - architect + code-review get the `,Agent` tool suffix
-    //   - code-review = 100 turns + 40min, developer/docs = 70 turns + 25min,
-    //     others (architect, po) = 70 turns + 20min
+    //   - code-review = 150 turns + 40min, developer/docs = 135 turns + 25min,
+    //     others (architect, po) = 135 turns + 20min (all +50% on 2026-06-06)
     // Field names mirror AgentConfig (`name`, not `agent`) so the
     // makeAgentConfig overrides actually apply — passing `{agent:...}`
     // would be silently dropped because AgentConfig has no such field.
     const cases: Array<Partial<AgentConfig> & {
       maxTurns: number; timeoutMs: number; hasAgentTool: boolean;
     }> = [
-      { name: "architect",     column: "In Architecture",  claudeMdPath: "architect/CLAUDE.md",     usesWorktree: true,  producesCommits: true,  maxTurns: 90,  timeoutMs: 1_200_000, hasAgentTool: true },
-      { name: "developer",     column: "In Development",   claudeMdPath: "developer/CLAUDE.md",     usesWorktree: true,  producesCommits: true,  maxTurns: 90,  timeoutMs: 1_500_000, hasAgentTool: false },
-      { name: "code-review",   column: "In Code Review",   claudeMdPath: "code-review/CLAUDE.md",   usesWorktree: true,  producesCommits: false, maxTurns: 100, timeoutMs: 2_400_000, hasAgentTool: true },
-      { name: "documentation", column: "In Documentation", claudeMdPath: "documentation/CLAUDE.md", usesWorktree: true,  producesCommits: true,  maxTurns: 90,  timeoutMs: 1_500_000, hasAgentTool: false },
-      { name: "po",            column: "Backlog",          claudeMdPath: "po/CLAUDE.md",            usesWorktree: false, producesCommits: false, maxTurns: 90,  timeoutMs: 1_200_000, hasAgentTool: false },
+      { name: "architect",     column: "In Architecture",  claudeMdPath: "architect/CLAUDE.md",     usesWorktree: true,  producesCommits: true,  maxTurns: 135, timeoutMs: 1_200_000, hasAgentTool: true },
+      { name: "developer",     column: "In Development",   claudeMdPath: "developer/CLAUDE.md",     usesWorktree: true,  producesCommits: true,  maxTurns: 135, timeoutMs: 1_500_000, hasAgentTool: false },
+      { name: "code-review",   column: "In Code Review",   claudeMdPath: "code-review/CLAUDE.md",   usesWorktree: true,  producesCommits: false, maxTurns: 150, timeoutMs: 2_400_000, hasAgentTool: true },
+      { name: "documentation", column: "In Documentation", claudeMdPath: "documentation/CLAUDE.md", usesWorktree: true,  producesCommits: true,  maxTurns: 135, timeoutMs: 1_500_000, hasAgentTool: false },
+      { name: "po",            column: "Backlog",          claudeMdPath: "po/CLAUDE.md",            usesWorktree: false, producesCommits: false, maxTurns: 135, timeoutMs: 1_200_000, hasAgentTool: false },
     ];
 
     for (const c of cases) {
