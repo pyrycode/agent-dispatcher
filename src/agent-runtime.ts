@@ -32,9 +32,18 @@ export function shouldUseWorktree(agent: AgentConfig): boolean {
 /**
  * The `claude --max-turns` budget for this agent's run.
  *
- * Code review gets 100 because it dispatches sub-agents (the parent
+ * Code review gets 150 because it dispatches sub-agents (the parent
  * turn budget covers all child invocations). Everyone else gets the
  * base budget.
+ *
+ * **All caps bumped +50% on 2026-06-06** (code-review 100 → 150,
+ * base 90 → 135, qa 30 → 45) after a claude behavior change in which
+ * the same work now consumes materially more turns, pushing real
+ * implementation runs into the cap (e.g. mobile #346/#351 both jammed
+ * the 90 cap at the commit boundary on 2026-06-02). The flat 50%
+ * scaling preserves the relative ratios between roles and the
+ * oversize-ticket forcing function; the wall-clock timeouts in
+ * `timeoutFor` were deliberately left unchanged this round.
  *
  * **Base budget bumped 70 → 90 on 2026-05-20** after a turn-by-turn
  * log audit of the recent successful runs (#454: 68, #466: 65, #463:
@@ -71,14 +80,14 @@ export function shouldUseWorktree(agent: AgentConfig): boolean {
  * 2026-05-19 doc/PR-body trim accounts for the rest of the headroom.
  */
 export function maxTurnsFor(agent: AgentConfig): number {
-  if (agent.name === "code-review") return 100;
+  if (agent.name === "code-review") return 150;
   // QA: hot path (run gates → green → exit) is 5-10 turns; cold path
   // (red → baseline-comparison routing → triage comment + needs-rework
-  // OR exit-with-message) is 15-25 turns. 30 leaves modest headroom
+  // OR exit-with-message) is 15-25 turns. 45 leaves modest headroom
   // without blunting the forcing function — QA should NEVER drift into
   // judgment work (idiom/design) that lives in code-review.
-  if (agent.name === "qa") return 30;
-  return 90;
+  if (agent.name === "qa") return 45;
+  return 135;
 }
 
 /**
