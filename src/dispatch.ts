@@ -2274,10 +2274,6 @@ export async function handlePostRun(
     }
   }
 
-  if (!saferSalvaged) {
-    await notifyDiscord(`✅ **${agent.name}** finished #${item.issueNumber}: ${item.title}\n${item.url}\nReady for review.`);
-  }
-
   return { ok: true };
 }
 
@@ -2855,7 +2851,6 @@ export async function runAutoMerge(
         }
 
         console.log(`   ✅ PR #${prNumber} merged, branch feature/${item.issueNumber} deleted, labels cleaned`);
-        await notifyDiscord(`🔀 PR #${prNumber} merged for #${item.issueNumber}: ${item.title}`);
       } catch (e: any) {
         // Combine stderr + message — execSync surfaces gh's stderr
         // through both depending on Node version + how the process exited.
@@ -3114,6 +3109,57 @@ export function installSignalHandlers(): void {
   handlersInstalled = true;
 }
 
+/**
+ * Count tickets across every column that represent work still moving on its
+ * own. Two cases count:
+ *   - running now: any `wip:<agent>` label.
+ *   - mid transient-retry: an `error-retry-count:N` counter (N > 0) with no
+ *     `error:<stage>` park label — waiting in backoff or already re-dispatched.
+ *
+ * Blocked, error-parked, done, and idle (just-arrived, no labels) tickets are
+ * deliberately NOT counted. A board holding only those is the
+ * "nothing left to dispatch" state the drain ping signals.
+ *
+ * pollLoop calls this on the snapshot BEFORE holdBackoffWaiters drops the
+ * backoff-waiters, so a board mid-retry-wait reads as busy, not drained.
+ */
+export function countActiveWork(itemsByColumn: Map<string, ProjectItem[]>): number {
+  let count = 0;
+  for (const items of itemsByColumn.values()) {
+    for (const item of items) {
+      const running = item.labels.some((l) => l.startsWith("wip:"));
+      const parked = item.labels.some((l) => l.startsWith("error:"));
+      const retrying = !parked && extractErrorRetryCount(item.labels) > 0;
+      if (running || retrying) count++;
+    }
+  }
+  return count;
+}
+
+/**
+ * Pure edge-trigger for the "board drained" Discord ping. Fires exactly once
+ * on the busy → drained transition, then stays quiet until work reappears.
+ *
+ *   - busy (candidates to dispatch, OR active work in flight) → arm, no ping.
+ *   - drained AND armed → ping once, disarm.
+ *   - drained AND not armed → stay quiet.
+ *
+ * `armed` is the caller's persisted edge state (sawActiveWork in pollLoop). A
+ * board idle from startup is never armed, so it never pings; it only pings
+ * after it has been busy and then goes quiet, and can ping again only once new
+ * work re-arms it.
+ */
+export function decideDrainNotification(opts: {
+  hasCandidates: boolean;
+  activeWork: number;
+  armed: boolean;
+}): { notify: boolean; armed: boolean } {
+  const busy = opts.hasCandidates || opts.activeWork > 0;
+  if (busy) return { notify: false, armed: true };
+  if (opts.armed) return { notify: true, armed: false };
+  return { notify: false, armed: false };
+}
+
 export async function pollLoop(): Promise<void> {
   const client = new GitHubProjectClient({
     owner: process.env.GITHUB_OWNER!,
@@ -3160,6 +3206,11 @@ export async function pollLoop(): Promise<void> {
     return Number.isFinite(n) && n > 0 ? n : 2;
   })();
   console.log(`   Concurrency cap: ${MAX_CONCURRENT} (PYRY_MAX_CONCURRENT)`);
+
+  // Edge-trigger state for the "board drained" ping: flips true once a cycle
+  // sees work, so the ping fires on the busy → quiet transition and never on a
+  // board that's been idle since startup. See decideDrainNotification.
+  let sawActiveWork = false;
 
   while (true) {
     // Drain check: exit cleanly before starting the next cycle if SIGTERM
@@ -3243,6 +3294,11 @@ export async function pollLoop(): Promise<void> {
       }
     }
 
+    // Count work still moving on its own BEFORE holdBackoffWaiters drops
+    // backoff-waiters from the snapshot — otherwise a board mid-retry-wait
+    // would look drained. Drives the edge-triggered drain ping below.
+    const activeWork = countActiveWork(itemsByColumn);
+
     // agent-dispatcher#25: drop tickets still inside their transient-retry
     // backoff window from this cycle's snapshot so they aren't re-dispatched
     // early. The schedule is board-encoded and re-read each cycle, so this is
@@ -3251,6 +3307,15 @@ export async function pollLoop(): Promise<void> {
 
     const candidates = selectDispatches({ itemsByColumn, pollOrder, maxConcurrent: MAX_CONCURRENT });
     dispatched = candidates.length > 0;
+
+    // Edge-triggered "board drained" ping: fire once when the board goes from
+    // busy to nothing-left-to-dispatch, so the operator knows the agents are
+    // done or stuck and it's time to look.
+    const drain = decideDrainNotification({ hasCandidates: dispatched, activeWork, armed: sawActiveWork });
+    sawActiveWork = drain.armed;
+    if (drain.notify) {
+      await notifyDiscord(`📭 **${process.env.GITHUB_REPO}**: no tickets left to dispatch. Everything is done, blocked, or parked for review.`);
+    }
 
     if (candidates.length > 0) {
       console.log(`   🚦 Dispatching ${candidates.length} agent(s) this cycle (cap ${MAX_CONCURRENT}): ${candidates.map(c => `${c.agent.name}#${c.item.issueNumber}`).join(", ")}`);

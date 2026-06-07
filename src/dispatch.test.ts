@@ -30,6 +30,8 @@ import { fileURLToPath } from "node:url";
 
 import {
   cleanupAfterDispatch,
+  countActiveWork,
+  decideDrainNotification,
   decideSigint,
   dispatchToAgent,
   handleAgentResultErrors,
@@ -1663,7 +1665,7 @@ describe("handlePostRun — failure modes", () => {
 });
 
 describe("handlePostRun — decidePostRunLabels integration", () => {
-  test("addReadyLabel=true (happy path) → done:<agent> + completion comment + success Discord notify", async () => {
+  test("addReadyLabel=true (happy path) → done:<agent> + completion comment + no Discord notify", async () => {
     const client = new MockGitHubClient({
       status: { 410: "In Development" },     // matches developer.column
       labels: { 410: [] },                   // no rework target
@@ -1686,9 +1688,9 @@ describe("handlePostRun — decidePostRunLabels integration", () => {
     assert.equal(client.comments.length, 1);
     assert.match(client.comments[0]!.body, /completed work on this ticket/);
     assert.match(client.comments[0]!.body, /Ready for human review/);
-    // Success Discord notify (one message, "✅" prefix).
-    assert.equal(calls.discord.length, 1);
-    assert.match(calls.discord[0]!, /^✅/);
+    // Success ping dropped 2026-06-07 (operator noise reduction) — the
+    // happy path completes silently; review is driven by the label + comment.
+    assert.equal(calls.discord.length, 0);
   });
 
   test("addReadyLabel=true with prior done:po → strips done:po then adds done:architect (the relay #7 fix)", async () => {
@@ -1909,10 +1911,10 @@ describe("handlePostRun — decidePostRunLabels integration", () => {
     assert.equal(client.comments.length, 1);
     assert.match(client.comments[0]!.body, /rework by \*\*po\*\*/);
     assert.match(client.comments[0]!.body, /Needs rework by po/);
-    // Success notify still fires (it's gated on !saferSalvaged, not rework).
-    // But content describes rework, not success — that's a side-effect of
-    // the existing dispatch.ts wiring; just assert one notify happened.
-    assert.equal(calls.discord.length, 1);
+    // Success ping dropped 2026-06-07 — the post-run path no longer notifies
+    // Discord on success OR rework. Rework triage is driven by the labels and
+    // the rework completion comment, not a Discord ping.
+    assert.equal(calls.discord.length, 0);
   });
 
   test("logKind=moved-out → agent moved ticket out of column, no ready label, no rework comment", async () => {
@@ -2238,9 +2240,9 @@ describe("dispatchToAgent — orchestrator integration", () => {
     assert.ok(cleanupRan(calls.exec), "happy path must run cleanupAfterDispatch");
     // Streaming was invoked exactly once.
     assert.equal(calls.claudeStreams, 1);
-    // Success Discord notify.
-    assert.equal(calls.discord.length, 1);
-    assert.match(calls.discord[0]!, /^✅/);
+    // Success ping dropped 2026-06-07 — happy path completes without a
+    // Discord notify.
+    assert.equal(calls.discord.length, 0);
   });
 
   test("setup-fails (push-equivalent: empty-branch from handlePostRun) → cleanup-skipped invariant", async () => {
@@ -2473,8 +2475,9 @@ describe("dispatchToAgent — concurrent dispatches (pollLoop's Promise.allSettl
 
     // Stream invoked twice (once per dispatch).
     assert.equal(calls.claudeStreams, 2);
-    // Discord notify fired twice (success per dispatch).
-    assert.equal(calls.discord.length, 2);
+    // Success ping dropped 2026-06-07 — neither successful dispatch notifies
+    // Discord.
+    assert.equal(calls.discord.length, 0);
   });
 
   test("one push-fail + one happy in parallel → no cross-contamination of labels or cleanup", async () => {
@@ -3030,7 +3033,7 @@ describe("runConcurrentDispatches", () => {
 // conflict path, and transient-gh-failure each get their own.
 
 describe("runAutoMerge", () => {
-  test("happy path → gh pr merge succeeds, labels stripped, git pull, Discord notified", async () => {
+  test("happy path → gh pr merge succeeds, labels stripped, git pull, no Discord notify", async () => {
     const client = new MockGitHubClient({
       items: [
         { issueNumber: 1200, status: "Done", labels: ["done:documentation", "size:s"], state: "OPEN" },
@@ -3058,9 +3061,9 @@ describe("runAutoMerge", () => {
     assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1200 && c.label === "done:documentation"));
     // Non-pipeline label (size:s) NOT stripped.
     assert.ok(!client.removeLabelCalls.some(c => c.label === "size:s"));
-    // Discord notify (one 🔀 message for the merge).
-    assert.equal(calls.discord.length, 1);
-    assert.match(calls.discord[0]!, /^🔀 PR #789 merged for #1200/);
+    // Merged ping dropped 2026-06-07 (operator noise reduction) — a clean
+    // auto-merge no longer notifies Discord.
+    assert.equal(calls.discord.length, 0);
     // No error:merge-conflict label applied (this is a clean merge).
     assert.ok(!client.addLabelCalls.some(c => c.label === "error:merge-conflict"));
   });
@@ -3326,10 +3329,10 @@ describe("runAutoMerge", () => {
     const cgCall = calls.exec.find(c => c.cmd.includes("codegraph index -f"));
     assert.ok(cgCall, "codegraph index -f must be invoked when .codegraph exists");
     assert.equal(cgCall.opts?.cwd, TEST_REPO_ROOT, "must run codegraph index -f at the target repo root");
-    // Standard merge path still completed (label cleanup + Discord).
+    // Standard merge path still completed (label cleanup). Merged ping
+    // dropped 2026-06-07 — no Discord notify.
     assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1300 && c.label === "done:documentation"));
-    assert.equal(calls.discord.length, 1);
-    assert.match(calls.discord[0]!, /^🔀 PR #800 merged/);
+    assert.equal(calls.discord.length, 0);
   });
 
   test("no .codegraph at repoRoot → reindex skipped silently", async () => {
@@ -3358,12 +3361,13 @@ describe("runAutoMerge", () => {
     // No codegraph invocation of any kind.
     assert.ok(!calls.exec.some(c => c.cmd.includes("codegraph")),
       "no codegraph command should run when .codegraph is absent");
-    // Standard merge path still completed.
+    // Standard merge path still completed. Merged ping dropped 2026-06-07 —
+    // no Discord notify.
     assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1301));
-    assert.equal(calls.discord.length, 1);
+    assert.equal(calls.discord.length, 0);
   });
 
-  test("codegraph reindex failure is non-fatal — labels still cleaned, Discord still notified", async () => {
+  test("codegraph reindex failure is non-fatal — labels still cleaned", async () => {
     // Codegraph isn't load-bearing. If `codegraph index -f` errors
     // (lock contention, disk full, transient binary issue), the
     // dispatcher must log a warning and continue — the merge already
@@ -3394,8 +3398,8 @@ describe("runAutoMerge", () => {
     assert.ok(calls.exec.some(c => c.cmd.includes("codegraph index -f")));
     // Critical: the rest of the merge path completed despite codegraph's failure.
     assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1302 && c.label === "done:documentation"));
-    assert.equal(calls.discord.length, 1);
-    assert.match(calls.discord[0]!, /^🔀 PR #802 merged/);
+    // Merged ping dropped 2026-06-07 — no Discord notify.
+    assert.equal(calls.discord.length, 0);
     // No error label applied — codegraph failure isn't a ticket-level signal.
     assert.ok(!client.addLabelCalls.some(c => c.label.startsWith("error:")));
   });
@@ -3433,8 +3437,8 @@ describe("runAutoMerge", () => {
     assert.ok(updateIdx < mergeIdx, "update-branch must precede merge");
     // Standard happy-path post-conditions still hold.
     assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1400 && c.label === "done:documentation"));
-    assert.equal(calls.discord.length, 1);
-    assert.match(calls.discord[0]!, /^🔀 PR #900 merged/);
+    // Merged ping dropped 2026-06-07 — no Discord notify.
+    assert.equal(calls.discord.length, 0);
     assert.ok(!client.addLabelCalls.some(c => c.label === "error:merge-conflict"));
   });
 
@@ -3614,6 +3618,123 @@ describe("decideSigint", () => {
     state = decideSigint(state, T0).newState;
     const second = decideSigint(state, T0 + 1_000);
     assert.equal(second.action.kind, "force-exit");
+  });
+});
+
+// =====================================================================
+// countActiveWork + decideDrainNotification — "board drained" ping
+// =====================================================================
+//
+// countActiveWork counts tickets still moving on their own (running or
+// mid transient-retry, NOT blocked/parked/done/idle). decideDrainNotification
+// is the pure edge-trigger that fires the 📭 "board drained" ping exactly once
+// when a board goes from busy to nothing-left-to-dispatch.
+
+describe("countActiveWork", () => {
+  const cols = (items: ProjectItem[]) =>
+    new Map<string, ProjectItem[]>([["In Development", items]]);
+
+  test("counts a running ticket (wip:<agent>)", () => {
+    const m = cols([makeProjectItem({ issueNumber: 1, labels: ["wip:developer"] })]);
+    assert.equal(countActiveWork(m), 1);
+  });
+
+  test("counts a transient retry that is NOT parked (backoff-waiting or re-dispatched)", () => {
+    const m = cols([
+      makeProjectItem({ issueNumber: 1, labels: ["error-retry-count:1"] }),           // waiting in backoff
+      makeProjectItem({ issueNumber: 2, labels: ["error-retry-count:2", "wip:qa"] }),  // re-dispatched
+    ]);
+    assert.equal(countActiveWork(m), 2);
+  });
+
+  test("does NOT count an error-parked ticket, even with a leftover retry counter", () => {
+    const m = cols([
+      makeProjectItem({ issueNumber: 1, labels: ["error:developer"] }),
+      makeProjectItem({ issueNumber: 2, labels: ["error:qa", "error-retry-count:3"] }),
+    ]);
+    assert.equal(countActiveWork(m), 0);
+  });
+
+  test("does NOT count a blocked, done, or idle ticket (no wip, no retry counter)", () => {
+    const m = cols([
+      makeProjectItem({ issueNumber: 1, labels: ["size:s"], blockedBy: [{ number: 9, state: "OPEN" }] }),
+      makeProjectItem({ issueNumber: 2, labels: ["done:developer"] }),
+      makeProjectItem({ issueNumber: 3, labels: [] }),
+    ]);
+    assert.equal(countActiveWork(m), 0);
+  });
+
+  test("sums active work across columns, ignoring inactive tickets", () => {
+    const m = new Map<string, ProjectItem[]>([
+      ["In Development", [
+        makeProjectItem({ issueNumber: 1, labels: ["wip:developer"] }),       // active
+        makeProjectItem({ issueNumber: 2, labels: ["done:developer"] }),      // not active
+      ]],
+      ["In QA", [
+        makeProjectItem({ issueNumber: 3, labels: ["error-retry-count:1"] }), // active (retrying)
+        makeProjectItem({ issueNumber: 4, labels: ["error:qa"] }),            // not active (parked)
+      ]],
+      ["Backlog", [
+        makeProjectItem({ issueNumber: 5, labels: [] }),                      // not active (idle)
+      ]],
+    ]);
+    assert.equal(countActiveWork(m), 2); // #1 + #3 only
+  });
+
+  test("an empty board counts as zero active work", () => {
+    assert.equal(countActiveWork(new Map()), 0);
+    assert.equal(countActiveWork(cols([])), 0);
+  });
+});
+
+describe("decideDrainNotification", () => {
+  test("a board idle from startup never pings (never armed)", () => {
+    let armed = false;
+    for (let i = 0; i < 3; i++) {
+      const r = decideDrainNotification({ hasCandidates: false, activeWork: 0, armed });
+      assert.equal(r.notify, false, "an unarmed, drained board must stay quiet");
+      armed = r.armed;
+    }
+    assert.equal(armed, false);
+  });
+
+  test("dispatch candidates this cycle arm the board without pinging", () => {
+    const r = decideDrainNotification({ hasCandidates: true, activeWork: 0, armed: false });
+    assert.deepEqual(r, { notify: false, armed: true });
+  });
+
+  test("active work in flight (no candidates) also arms without pinging", () => {
+    const r = decideDrainNotification({ hasCandidates: false, activeWork: 1, armed: false });
+    assert.deepEqual(r, { notify: false, armed: true });
+  });
+
+  test("busy → drained fires the ping exactly once, then stays silent", () => {
+    // Cycle 1: work present → arm, no ping.
+    let s = decideDrainNotification({ hasCandidates: true, activeWork: 0, armed: false });
+    assert.deepEqual(s, { notify: false, armed: true });
+
+    // Cycle 2: board drained while armed → ping once, disarm.
+    s = decideDrainNotification({ hasCandidates: false, activeWork: 0, armed: s.armed });
+    assert.deepEqual(s, { notify: true, armed: false });
+
+    // Cycle 3: still drained but no longer armed → silent.
+    s = decideDrainNotification({ hasCandidates: false, activeWork: 0, armed: s.armed });
+    assert.deepEqual(s, { notify: false, armed: false });
+  });
+
+  test("new work after a drain re-arms the board so the next drain pings again", () => {
+    // Drain once.
+    let s = decideDrainNotification({ hasCandidates: true, activeWork: 0, armed: false });
+    s = decideDrainNotification({ hasCandidates: false, activeWork: 0, armed: s.armed });
+    assert.equal(s.notify, true);
+
+    // New work appears → re-arm (no ping).
+    s = decideDrainNotification({ hasCandidates: false, activeWork: 2, armed: s.armed });
+    assert.deepEqual(s, { notify: false, armed: true });
+
+    // It drains again → pings again.
+    s = decideDrainNotification({ hasCandidates: false, activeWork: 0, armed: s.armed });
+    assert.equal(s.notify, true);
   });
 });
 
