@@ -1830,10 +1830,18 @@ export async function prepareAgentSpawn(
   // visible via get_design_context. Write tools (use_figma, generate_diagram) deliberately excluded
   // — agents read Figma, never modify it. Per-agent prescriptions in each fork's <role>/CLAUDE.md
   // gate actual usage.
-  const baseTools = "Bash,Read,Write,Edit,Glob,Grep,TodoWrite,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status,mcp__context7__resolve-library-id,mcp__context7__query-docs,mcp__codegraph__codegraph_search,mcp__codegraph__codegraph_callers,mcp__codegraph__codegraph_callees,mcp__codegraph__codegraph_impact,mcp__codegraph__codegraph_node,mcp__codegraph__codegraph_context,mcp__codegraph__codegraph_files,mcp__codegraph__codegraph_status,mcp__plugin_figma_figma__get_design_context,mcp__plugin_figma_figma__get_screenshot,mcp__plugin_figma_figma__get_metadata,mcp__plugin_figma_figma__get_variable_defs,mcp__plugin_figma_figma__search_design_system";
+  const baseTools = "Bash,Read,Write,Edit,Glob,Grep,TodoWrite,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status,mcp__plugin_context7_context7__resolve-library-id,mcp__plugin_context7_context7__query-docs,mcp__codegraph__codegraph_search,mcp__codegraph__codegraph_callers,mcp__codegraph__codegraph_callees,mcp__codegraph__codegraph_impact,mcp__codegraph__codegraph_node,mcp__codegraph__codegraph_context,mcp__codegraph__codegraph_files,mcp__codegraph__codegraph_status,mcp__plugin_figma_figma__get_design_context,mcp__plugin_figma_figma__get_screenshot,mcp__plugin_figma_figma__get_metadata,mcp__plugin_figma_figma__get_variable_defs,mcp__plugin_figma_figma__search_design_system";
+  // context7 tools carry the plugin prefix (mcp__plugin_context7_context7__*) so the
+  // allowlist matches the tool the agent actually loads. The bare mcp__context7__* form
+  // never matched, so every context7 call was silently denied (desktop #29, 2026-07-03).
   const needsAgent = ["architect", "code-review"].includes(agent.name);
+  // WebSearch is architect-only: the architect is the role that researches and picks a
+  // library or approach for the spec (e.g. desktop #29's Noise_IK library spike). Other
+  // roles implement against the chosen design, so they don't get open web access.
+  const needsWebSearch = agent.name === "architect";
   let allowedTools = baseTools;
   if (needsAgent) allowedTools += ",Agent";
+  if (needsWebSearch) allowedTools += ",WebSearch";
 
   // Timeout tiers live in `timeoutFor` (agent-runtime.ts): code-review 40min,
   // security-sensitive architect 40min (spec + adversarial security-review),

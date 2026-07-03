@@ -977,6 +977,22 @@ describe("prepareAgentSpawn", () => {
     assert.ok(config.allowedTools.includes("Bash,Read,Write,Edit"));
     assert.ok(config.allowedTools.includes("mcp__codegraph__"));
     assert.ok(
+      config.allowedTools.includes("mcp__plugin_context7_context7__resolve-library-id"),
+      "context7 must use the plugin tool name so the allowlist matches the loaded tool",
+    );
+    assert.ok(
+      config.allowedTools.includes("mcp__plugin_context7_context7__query-docs"),
+      "context7 query-docs must use the plugin tool name",
+    );
+    assert.ok(
+      !config.allowedTools.split(",").includes("mcp__context7__resolve-library-id"),
+      "the stale non-plugin context7 name must be gone — it never matched the loaded tool and silently denied every call",
+    );
+    assert.ok(
+      !config.allowedTools.split(",").includes("WebSearch"),
+      "developer must NOT get WebSearch — research access is architect-scoped",
+    );
+    assert.ok(
       config.allowedTools.includes("mcp__plugin_figma_figma__get_design_context"),
       "developer must have Figma get_design_context for UI-anchored ticket flow",
     );
@@ -1063,13 +1079,13 @@ describe("prepareAgentSpawn", () => {
     // makeAgentConfig overrides actually apply — passing `{agent:...}`
     // would be silently dropped because AgentConfig has no such field.
     const cases: Array<Partial<AgentConfig> & {
-      maxTurns: number; timeoutMs: number; hasAgentTool: boolean;
+      maxTurns: number; timeoutMs: number; hasAgentTool: boolean; hasWebSearch: boolean;
     }> = [
-      { name: "architect",     column: "In Architecture",  claudeMdPath: "architect/CLAUDE.md",     usesWorktree: true,  producesCommits: true,  maxTurns: 135, timeoutMs: 1_200_000, hasAgentTool: true },
-      { name: "developer",     column: "In Development",   claudeMdPath: "developer/CLAUDE.md",     usesWorktree: true,  producesCommits: true,  maxTurns: 135, timeoutMs: 1_500_000, hasAgentTool: false },
-      { name: "code-review",   column: "In Code Review",   claudeMdPath: "code-review/CLAUDE.md",   usesWorktree: true,  producesCommits: false, maxTurns: 150, timeoutMs: 2_400_000, hasAgentTool: true },
-      { name: "documentation", column: "In Documentation", claudeMdPath: "documentation/CLAUDE.md", usesWorktree: true,  producesCommits: true,  maxTurns: 135, timeoutMs: 1_500_000, hasAgentTool: false },
-      { name: "po",            column: "Backlog",          claudeMdPath: "po/CLAUDE.md",            usesWorktree: false, producesCommits: false, maxTurns: 135, timeoutMs: 1_200_000, hasAgentTool: false },
+      { name: "architect",     column: "In Architecture",  claudeMdPath: "architect/CLAUDE.md",     usesWorktree: true,  producesCommits: true,  maxTurns: 135, timeoutMs: 1_200_000, hasAgentTool: true,  hasWebSearch: true  },
+      { name: "developer",     column: "In Development",   claudeMdPath: "developer/CLAUDE.md",     usesWorktree: true,  producesCommits: true,  maxTurns: 135, timeoutMs: 1_500_000, hasAgentTool: false, hasWebSearch: false },
+      { name: "code-review",   column: "In Code Review",   claudeMdPath: "code-review/CLAUDE.md",   usesWorktree: true,  producesCommits: false, maxTurns: 150, timeoutMs: 2_400_000, hasAgentTool: true,  hasWebSearch: false },
+      { name: "documentation", column: "In Documentation", claudeMdPath: "documentation/CLAUDE.md", usesWorktree: true,  producesCommits: true,  maxTurns: 135, timeoutMs: 1_500_000, hasAgentTool: false, hasWebSearch: false },
+      { name: "po",            column: "Backlog",          claudeMdPath: "po/CLAUDE.md",            usesWorktree: false, producesCommits: false, maxTurns: 135, timeoutMs: 1_200_000, hasAgentTool: false, hasWebSearch: false },
     ];
 
     for (const c of cases) {
@@ -1087,6 +1103,8 @@ describe("prepareAgentSpawn", () => {
       assert.equal(cfg.timeoutMs, c.timeoutMs, `${c.name} timeoutMs`);
       const hasAgent = cfg.allowedTools.split(",").includes("Agent");
       assert.equal(hasAgent, c.hasAgentTool, `${c.name} Agent tool presence`);
+      const hasWebSearch = cfg.allowedTools.split(",").includes("WebSearch");
+      assert.equal(hasWebSearch, c.hasWebSearch, `${c.name} WebSearch tool presence — research is architect-scoped`);
     }
   });
 
