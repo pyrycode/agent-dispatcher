@@ -904,6 +904,14 @@ export interface RetrySignature {
  * overrun). The watchdog (~240s) fires well before the dispatcher's 20-40min
  * hard cap, so the synthetic `idle_stall` result reaches us first; the
  * per-ticket retry cap still bounds a *persistent* stall to the operator.
+ *
+ * `auth token (401)` IS on the list too: the dispatcher's agent runs and
+ * interactive Claudian share ONE macOS keychain Claude login, whose token
+ * refresh can fail transiently and self-heal (observed 2-min and 20-min
+ * outages on 2026-07-03, both recovered with no manual `/login`). The standard
+ * 5/10/20/40-min schedule is what makes this safe: a 20-min outage clears on
+ * attempt 3 (~+35min), while a genuinely dead login that needs interactive
+ * `/login` just parks at the cap instead of on the first failure.
  */
 // Order matters: more-specific signatures are probed before broader ones.
 // `overloaded_error` / `529` come before the generic `api error: 5` so an
@@ -923,6 +931,18 @@ export const RETRY_ALLOWLIST: readonly RetrySignature[] = [
   { signature: "cannot fork",            match: "cannot fork" },
   { signature: "host pressure (EAGAIN)", match: "resource temporarily unavailable" },
   { signature: "host pressure (EAGAIN)", match: "eagain" },
+  // Shared-keychain Claude login (`Claude Code-credentials`) token-refresh
+  // failure. The dispatcher's agent runs and interactive Claudian share ONE
+  // macOS keychain login, whose refresh can fail transiently and self-heal.
+  // Observed 2026-07-03: a ~2-min wobble (3 tickets, board #1) and a ~20-min
+  // outage (26 tickets, tui-driver), both recovered with no manual `/login`.
+  // Two phrasings of the one failure; either matches. Deliberately narrow —
+  // `please run /login` and `invalid authentication credentials` are the
+  // Claude CLI's own auth-token strings, NOT a GitHub `401 Bad credentials`.
+  // A genuinely dead login (needs interactive `/login`) self-corrects by
+  // parking at the ~75-min cap, same as any mistakenly-added signature.
+  { signature: "auth token (401)",       match: "please run /login" },
+  { signature: "auth token (401)",       match: "invalid authentication credentials" },
 ];
 
 /**

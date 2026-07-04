@@ -50,6 +50,18 @@ describe("classifyAgentError", () => {
     assert.equal(r.signature, "idle stream stall");
   });
 
+  test("shared-login auth 401 (Please run /login) classifies transient", () => {
+    // The exact string that parked 26 tui-driver tickets on 2026-07-03 when
+    // the shared macOS keychain Claude login's token refresh failed for ~20
+    // min and then self-healed. Both phrasings of the same failure match.
+    const observed = "Agent error (): Please run /login · API Error: 401 Invalid authentication credentials";
+    const r = classifyAgentError(observed);
+    assert.equal(r.transient, true);
+    assert.equal(r.signature, "auth token (401)");
+    assert.equal(classifyAgentError("API Error: 401 Invalid authentication credentials").transient, true);
+    assert.equal(classifyAgentError("Please run /login").transient, true);
+  });
+
   test("a bare 529 (no overloaded_error text) still classifies transient", () => {
     const r = classifyAgentError("API Error: 529 Service Overloaded");
     assert.equal(r.transient, true);
