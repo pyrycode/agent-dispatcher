@@ -1151,8 +1151,7 @@ describe("prepareAgentSpawn", () => {
   // disallow list must contain), runs but doesn't fail CI, and flips
   // RED→GREEN as soon as both sides land.
   test(
-    "disallowed-tools contract — AskUserQuestion/EnterPlanMode/ExitPlanMode stripped for all non-interactive agents (pyrycode/pyrycode forwarding TBD)",
-    { todo: "blocked on pyry-side --disallowed-tools forwarding (pyrycode/pyrycode#411)" },
+    "disallowed-tools contract — AskUserQuestion/EnterPlanMode/ExitPlanMode stripped for all non-interactive agents",
     async () => {
       const REQUIRED_DISALLOWED = ["AskUserQuestion", "EnterPlanMode", "ExitPlanMode"] as const;
       // Every pipeline agent is non-interactive — the disallow list

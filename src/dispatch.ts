@@ -260,6 +260,7 @@ interface RunClaudeOpts {
   effort: string;
   maxTurns: number;
   allowedTools: string;
+  disallowedTools: string;
   cwd: string;
   timeoutMs: number;
   logFile: string;
@@ -396,6 +397,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
         "--effort", opts.effort,
         "--max-turns", String(opts.maxTurns),
         "--allowedTools", opts.allowedTools,
+        ...(opts.disallowedTools ? ["--disallowedTools", opts.disallowedTools] : []),
         "--append-system-prompt-file", opts.systemPromptFile,
       ];
     } else {
@@ -407,6 +409,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
         "--effort", opts.effort,
         "--max-turns", String(opts.maxTurns),
         "--allowed-tools", opts.allowedTools,
+        ...(opts.disallowedTools ? ["--disallowed-tools", opts.disallowedTools] : []),
         "--system-prompt-file", opts.systemPromptFile,
         "--prompt-file", opts.promptFile,
         "--workdir", opts.cwd,
@@ -1843,6 +1846,15 @@ export async function prepareAgentSpawn(
   if (needsAgent) allowedTools += ",Agent";
   if (needsWebSearch) allowedTools += ",WebSearch";
 
+  // Human-only tools are stripped from every non-interactive pipeline agent.
+  // No operator is on the line, so under dontAsk a call to one of these is
+  // runtime-denied and arms the #8 permission-denial watchdog (wasting a turn
+  // and risking a force-exit). pyry writes these into the per-spawn settings
+  // file's `permissions.deny`, which removes them from the model's surface
+  // entirely (spike-verified 2026-07-04). Requires pyry-side --disallowed-tools
+  // support (pyrycode/pyrycode#411); ship + reinstall pyry BEFORE this goes live.
+  const disallowedTools = "AskUserQuestion,EnterPlanMode,ExitPlanMode";
+
   // Timeout tiers live in `timeoutFor` (agent-runtime.ts): code-review 40min,
   // security-sensitive architect 40min (spec + adversarial security-review),
   // developer/docs/qa 25min, light agents (po, non-security architect) 20min.
@@ -1865,6 +1877,7 @@ export async function prepareAgentSpawn(
       effort: "xhigh",
       maxTurns,
       allowedTools,
+      disallowedTools,
       cwd: agentCwd,
       timeoutMs,
       logFile,
