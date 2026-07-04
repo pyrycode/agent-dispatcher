@@ -218,6 +218,29 @@ export interface StreamResult {
   lastAssistantText: string | null;
 }
 
+/**
+ * Extract the structured failure signal from a claude `result` stream message
+ * (or a StreamResult.rawResult). On an `error_during_execution` wedge the
+ * process emits a result whose `terminal_reason` is empty and whose `result`
+ * text is just the agent's last narration, so the real cause — `subtype`,
+ * `api_error_status`, `stop_reason` — was dropped from both the per-stage log
+ * line and the `error:<agent>` comment, leaving an unfalsifiable `Agent error
+ * ()`. This surfaces it verbatim. Returns "" on the happy path (no error
+ * signal), so callers can gate the extra log line / message suffix on it.
+ */
+export function formatResultDiagnostics(raw: Record<string, unknown> | null | undefined): string {
+  if (!raw) return "";
+  const isError = raw.is_error === true;
+  const subtype = typeof raw.subtype === "string" ? raw.subtype : "";
+  // Happy path: nothing diagnostic to add.
+  if (!isError && (!subtype || subtype === "success")) return "";
+  const parts: string[] = [];
+  if (subtype) parts.push(`subtype=${subtype}`);
+  if (raw.api_error_status != null) parts.push(`api_error_status=${JSON.stringify(raw.api_error_status)}`);
+  if (raw.stop_reason) parts.push(`stop_reason=${String(raw.stop_reason)}`);
+  return parts.join(" ");
+}
+
 function logStreamMessage(logFile: string, msg: Record<string, unknown>): void {
   const ts = new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 
@@ -244,6 +267,10 @@ function logStreamMessage(logFile: string, msg: Record<string, unknown>): void {
     case "result": {
       const r = msg as any;
       appendFileSync(logFile, `[${ts}] 🏁 ${r.subtype} | Turns: ${r.num_turns} | Cost: $${(r.total_cost_usd || 0).toFixed(2)} | Session: ${r.session_id || "?"}\n`);
+      // On a failure result, log the structured cause so the .log file keeps
+      // the real error, not just the subtype header. "" on the happy path.
+      const diag = formatResultDiagnostics(r);
+      if (diag) appendFileSync(logFile, `[${ts}] ⚠️  result diagnostics: ${diag}\n`);
       break;
     }
     default: {
@@ -2036,8 +2063,19 @@ export async function handleAgentResultErrors(
   }
 
   if (!salvaged) {
+    // Surface the structured failure signal (subtype / api_error_status /
+    // stop_reason) from rawResult. On an `error_during_execution` wedge the
+    // terminal_reason is empty and `output` is just the agent's narration, so
+    // the old `Agent error (): <narration>` destroyed the actual cause. Keep
+    // `output` in the message (retry classification matches its substrings,
+    // e.g. "please run /login"), but label it as narration, not the failure.
+    const rawSubtype = typeof streamResult.rawResult?.subtype === "string"
+      ? streamResult.rawResult.subtype : "";
+    const reason = streamResult.terminalReason || rawSubtype || "unknown";
+    const diag = formatResultDiagnostics(streamResult.rawResult);
+    const lastText = streamResult.output?.slice(0, 500) || "no output";
     throw new Error(
-      `Agent error (${streamResult.terminalReason}): ${streamResult.output?.slice(0, 500) || "no output"}`
+      `Agent error (${reason})${diag ? `: ${diag}` : ""}. Last agent text (not the failure cause): ${lastText}`
     );
   }
 

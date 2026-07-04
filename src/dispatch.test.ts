@@ -1413,6 +1413,42 @@ describe("handleAgentResultErrors", () => {
     assert.equal(calls.exec.filter(c => c.cmd.includes("git status")).length, 0);
   });
 
+  test("error_during_execution wedge → error surfaces subtype + api_error_status from rawResult, labels the narration", async () => {
+    // The 2.1.199 wedge: claude emits a `result` with an EMPTY terminal_reason
+    // (so the old message was `Agent error ()`) whose `result` text is just the
+    // agent's last narration, NOT the failure cause. The real signal lives in
+    // rawResult (subtype / api_error_status / stop_reason) and was dropped.
+    const { ctx } = makeTestContext({ item: { issueNumber: 320 } });
+
+    await assert.rejects(
+      handleAgentResultErrors(
+        streamResult({
+          isError: true,
+          terminalReason: "", // empty — the "Agent error ()" case
+          output: "Let me check the commit messages before finalizing.", // narration, not the error
+          rawResult: {
+            subtype: "error_during_execution",
+            is_error: true,
+            api_error_status: { status: 500, message: "Internal server error" },
+            stop_reason: "tool_use",
+          },
+        }),
+        ctx,
+      ),
+      (err: Error) => {
+        const m = String(err.message);
+        // Structured cause surfaced instead of an empty ():
+        assert.match(m, /error_during_execution/);
+        assert.match(m, /api_error_status/);
+        assert.match(m, /500/);
+        // Narration kept but explicitly NOT presented as the failure cause:
+        assert.match(m, /Last agent text/i);
+        assert.match(m, /Let me check the commit messages/);
+        return true;
+      },
+    );
+  });
+
   // ===================================================================
   // Permission-denial salvage (#8 Layer 2)
   // ===================================================================
