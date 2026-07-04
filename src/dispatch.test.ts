@@ -616,22 +616,24 @@ describe("setupBranchAndWorktree — failure modes", () => {
     assert.ok(!calls.exec.some(c => c.cmd.includes("git worktree add")), "worktree add should not run after checkout fail");
   });
 
-  test("abort-local-ahead-of-origin → diverged commits + SHAs in comment, label, {ok:false}", async () => {
+  test("abort-local-diverged → divergence message + BOTH commit blocks + SHAs, no push advice", async () => {
     const { ctx, client, calls } = makeTestContext({
       item: { issueNumber: 155 },
       mockOptions: {
         execImpls: {
           ...happyExecBaseline(),
-          // Both refs exist; SHAs differ; local is NOT an ancestor of
-          // origin — the integrity-error path that surfaced in #155
-          // (2026-05-07).
+          // Both refs exist; SHAs differ; NEITHER direction is an ancestor —
+          // the genuine-divergence path (origin advanced out-of-band), which
+          // misled triage on tui-driver #158 (2026-07-04). Blanket-failing
+          // `--is-ancestor` fails both direction checks → diverged.
           "git rev-parse --verify feature/155": () => "",
           "git rev-parse --verify origin/feature/155": () => "",
           "git rev-parse origin/feature/155": () => "origin-sha-aaaaaaaa\n",
           "git rev-parse feature/155": () => "local-sha-bbbbbbbb\n",
           "git merge-base --is-ancestor": () => execError({ stderr: "" }),
-          // The diverged-commits log capture.
-          "git log --oneline -n 30": () => "bbbbbbbb local-only commit\n",
+          // Distinct commit listings per direction so we can assert both blocks.
+          "git log --oneline -n 30 origin/feature/155..feature/155": () => "bbbbbbbb local-only commit\n",
+          "git log --oneline -n 30 feature/155..origin/feature/155": () => "aaaaaaaa origin-only commit\n",
         },
       },
     });
@@ -642,13 +644,54 @@ describe("setupBranchAndWorktree — failure modes", () => {
     assert.deepEqual(client.addLabelCalls, [{ issueNumber: 155, label: "error:developer" }]);
     assert.equal(client.comments.length, 1);
     const body = client.comments[0]!.body;
-    assert.match(body, /commits not present on origin/);
-    // The diverged-commits + SHA blocks both surface in the comment.
+    // Divergence framing, not "unpushed work" framing.
+    assert.match(body, /have DIVERGED/);
+    assert.match(body, /would REVERT/);
+    assert.match(body, /git branch -f feature\/155 origin\/feature\/155/);
+    // Must NOT advise pushing local — that's the trap this split fixes.
+    assert.ok(!/Push the missing commits/.test(body), "diverged message must not advise pushing local");
+    // Both directions' commits + SHAs surface so the operator sees what a
+    // blind push would revert.
     assert.match(body, /local-sha-bbbbbbbb/);
     assert.match(body, /origin-sha-aaaaaaaa/);
-    assert.match(body, /Diverged commits/);
     assert.match(body, /bbbbbbbb local-only commit/);
+    assert.match(body, /aaaaaaaa origin-only commit/);
     // No worktree creation should follow an integrity-error abort.
+    assert.ok(!calls.exec.some(c => c.cmd.includes("git worktree add")));
+  });
+
+  test("abort-local-strictly-ahead → 'push the missing commits' advice, local-only block, no divergence framing", async () => {
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 166 },
+      mockOptions: {
+        execImpls: {
+          ...happyExecBaseline(),
+          // Both refs exist; SHAs differ; local is NOT an ancestor of origin
+          // but origin IS an ancestor of local → local strictly ahead (real
+          // unpushed work). Only the local→origin direction fails; the
+          // reverse direction has no override, so it succeeds (exit 0).
+          "git rev-parse --verify feature/166": () => "",
+          "git rev-parse --verify origin/feature/166": () => "",
+          "git rev-parse origin/feature/166": () => "origin-sha-cccccccc\n",
+          "git rev-parse feature/166": () => "local-sha-dddddddd\n",
+          "git merge-base --is-ancestor feature/166 origin/feature/166": () => execError({ stderr: "" }),
+          "git log --oneline -n 30 origin/feature/166..feature/166": () => "dddddddd unpushed work\n",
+        },
+      },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: false });
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 166, label: "error:developer" }]);
+    assert.equal(client.comments.length, 1);
+    const body = client.comments[0]!.body;
+    assert.match(body, /commits not present on origin/);
+    assert.match(body, /Push the missing commits/);
+    assert.match(body, /dddddddd unpushed work/);
+    // Strictly-ahead is NOT a divergence: no "would revert" warning.
+    assert.ok(!/have DIVERGED/.test(body), "strictly-ahead must not use divergence framing");
+    assert.ok(!/would REVERT/.test(body));
     assert.ok(!calls.exec.some(c => c.cmd.includes("git worktree add")));
   });
 

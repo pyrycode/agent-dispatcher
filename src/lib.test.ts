@@ -2438,29 +2438,46 @@ describe("decideBranchSetup", () => {
     );
   });
 
-  test("both exist, local NOT ancestor of origin → abort-local-ahead-of-origin", () => {
-    // Local has commits that aren't in origin. Per the dispatcher's flow,
-    // this means a prior dispatch failed to push and we didn't notice.
-    // Don't blow them away — abort and surface for human triage.
+  test("both exist, origin is ancestor of local → abort-local-strictly-ahead", () => {
+    // Local has real commits on top of origin (a prior dispatch committed
+    // but failed to push). Pushing the missing commits is the likely fix, so
+    // this case is safe to advise "push". Distinct from a genuine divergence.
     assert.equal(
       decideBranchSetup({
         localExists: true,
         remoteExists: true,
         localEqualsOrigin: false,
         localIsAncestorOfOrigin: false,
+        originIsAncestorOfLocal: true,
       }),
-      "abort-local-ahead-of-origin",
+      "abort-local-strictly-ahead",
     );
   });
 
-  test("local exists, remote exists, SHA-equality flag missing → treats as ahead (defensive)", () => {
-    // If the caller forgot to compute the equality/ancestor flags,
-    // default to abort rather than silently force-update local.
-    // The "both exist + missing flags" code path shouldn't happen in
-    // production, but we lock in the safe default.
+  test("both exist, neither is ancestor of the other → abort-local-diverged", () => {
+    // Local and origin have both moved: origin was advanced out-of-band (a
+    // manual triage / hot-fix push) while local carried its own commits.
+    // Pushing local would REVERT origin's work, so the advice must differ
+    // from the strictly-ahead case. Origin is the source of truth.
+    assert.equal(
+      decideBranchSetup({
+        localExists: true,
+        remoteExists: true,
+        localEqualsOrigin: false,
+        localIsAncestorOfOrigin: false,
+        originIsAncestorOfLocal: false,
+      }),
+      "abort-local-diverged",
+    );
+  });
+
+  test("local exists, remote exists, ancestry flags missing → abort-local-diverged (cautious default)", () => {
+    // If the caller forgot to compute the equality/ancestor flags, default
+    // to the cautious message: never advise pushing local, since we can't
+    // prove it's strictly ahead. Abort and surface for human triage.
     assert.equal(
       decideBranchSetup({ localExists: true, remoteExists: true }),
-      "abort-local-ahead-of-origin",
+      "abort-local-diverged",
     );
   });
 });

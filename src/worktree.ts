@@ -108,8 +108,17 @@ export type BranchSetupAction =
   | "reuse-local-already-synced"
   /** Both exist; local is a strict ancestor of origin. Fast-forward local. */
   | "fast-forward-from-origin"
-  /** Both exist; local has commits not in origin (or diverged). Abort. */
-  | "abort-local-ahead-of-origin";
+  /** Both exist; origin is a strict ancestor of local. Local carries real
+   *  commits not yet on origin (a prior dispatch committed but failed to
+   *  push). Pushing the missing commits is the likely fix, so the operator
+   *  advice can safely say "push". Abort for human triage. */
+  | "abort-local-strictly-ahead"
+  /** Both exist; local and origin have diverged (neither is an ancestor of
+   *  the other). Origin was advanced out-of-band while local held its own
+   *  commits. Pushing local would REVERT origin's work, so the advice must
+   *  point at origin as the source of truth, not at pushing local. Also the
+   *  cautious default when the ancestry flags are missing. Abort. */
+  | "abort-local-diverged";
 
 export function decideBranchSetup(opts: {
   localExists: boolean;
@@ -119,13 +128,19 @@ export function decideBranchSetup(opts: {
   /** True iff local is a strict ancestor of origin (fast-forwardable).
    *  Required when both exist and SHAs differ. */
   localIsAncestorOfOrigin?: boolean;
+  /** True iff origin is a strict ancestor of local (local strictly ahead).
+   *  Distinguishes "real unpushed work" (advise push) from a genuine
+   *  divergence (advise reset to origin). Required when both exist, SHAs
+   *  differ, and local is not behind origin. */
+  originIsAncestorOfLocal?: boolean;
 }): BranchSetupAction {
   if (!opts.localExists && !opts.remoteExists) return "create-from-main";
   if (!opts.localExists) return "create-from-origin";
   if (!opts.remoteExists) return "reuse-local-no-remote";
   if (opts.localEqualsOrigin) return "reuse-local-already-synced";
   if (opts.localIsAncestorOfOrigin) return "fast-forward-from-origin";
-  return "abort-local-ahead-of-origin";
+  if (opts.originIsAncestorOfLocal) return "abort-local-strictly-ahead";
+  return "abort-local-diverged";
 }
 
 // --------- Worktree introspection ---------

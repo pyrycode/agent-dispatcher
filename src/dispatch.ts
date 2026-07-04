@@ -1559,6 +1559,7 @@ export async function setupBranchAndWorktree(
 
   let localEqualsOrigin: boolean | undefined;
   let localIsAncestorOfOrigin: boolean | undefined;
+  let originIsAncestorOfLocal: boolean | undefined;
   let localSha = "";
   let originSha = "";
   if (localExists && remoteExists) {
@@ -1574,6 +1575,20 @@ export async function setupBranchAndWorktree(
         } catch {
           localIsAncestorOfOrigin = false;
         }
+        // When local is not behind origin, distinguish "local strictly ahead"
+        // (origin is an ancestor of local — real unpushed work, safe to push)
+        // from a genuine divergence (neither is an ancestor — origin advanced
+        // out-of-band, local usually the discardable side). The abort message
+        // differs so the operator isn't told to push work that would revert
+        // origin's commits.
+        if (!localIsAncestorOfOrigin) {
+          try {
+            execSync(`git merge-base --is-ancestor origin/${branchName} ${branchName}`, { cwd: repoRoot, stdio: "pipe" });
+            originIsAncestorOfLocal = true;
+          } catch {
+            originIsAncestorOfLocal = false;
+          }
+        }
       }
     } catch (e) {
       // Couldn't compute SHAs — defensive defaults make decideBranchSetup abort.
@@ -1586,6 +1601,7 @@ export async function setupBranchAndWorktree(
     remoteExists,
     localEqualsOrigin,
     localIsAncestorOfOrigin,
+    originIsAncestorOfLocal,
   });
 
   try {
@@ -1612,28 +1628,52 @@ export async function setupBranchAndWorktree(
         execSync(`git branch -f ${branchName} origin/${branchName}`, { cwd: repoRoot, stdio: "pipe" });
         console.log(`   🚀 Fast-forwarded local ${branchName} to origin/${branchName}`);
         break;
-      case "abort-local-ahead-of-origin": {
-        const msg = `Local \`${branchName}\` has commits not present on origin/${branchName}. A prior dispatch likely failed to push and we didn't notice. Manual triage required: decide whether to push the missing commits or discard them, then strip \`error:${agent.name}\` to retry.`;
+      case "abort-local-strictly-ahead":
+      case "abort-local-diverged": {
+        // Both are local-vs-origin integrity aborts, but the safe operator
+        // action is opposite, so the message must not conflate them.
+        //   strictly-ahead: origin is an ancestor of local. Local has real
+        //     unpushed commits; pushing them is the fix.
+        //   diverged:       neither is an ancestor. Origin moved out-of-band;
+        //     pushing local would REVERT origin's work, so reset local to
+        //     origin instead. (This is the case that misled triage on
+        //     tui-driver #158, 2026-07-04: a stale local merge from a wedged
+        //     run looked like "unpushed work" but held none.)
+        const diverged = branchAction === "abort-local-diverged";
+        const msg = diverged
+          ? `Local \`${branchName}\` and origin/${branchName} have DIVERGED: each carries commits the other lacks. This usually means origin was advanced out-of-band (a manual triage or hot-fix push) while local still held commits from a prior run, often a leftover merge from a wedged dispatch. Do NOT blindly push local: it would revert the commits origin has that local lacks. Origin is the source of truth. Confirm origin holds the intended work, then discard the local commits with \`git branch -f ${branchName} origin/${branchName}\` and strip \`error:${agent.name}\` to retry. Only push local if you have verified it holds work origin genuinely lacks.`
+          : `Local \`${branchName}\` has commits not present on origin/${branchName}, and origin has none that local lacks: a prior dispatch committed work but failed to push. Push the missing commits with \`git push origin ${branchName}\`, or discard them if known-bad, then strip \`error:${agent.name}\` to retry.`;
         console.error(`   ❌ ${msg}`);
 
-        // Capture the diverged commits inline so the operator doesn't
-        // need SSH access to the dispatcher machine to diagnose. Cap
-        // the listing at 30 entries / 2KB so a runaway local branch
-        // doesn't bloat the issue comment. (review #18)
-        let divergedSummary = "";
-        try {
-          const log = execSync(
-            `git log --oneline -n 30 origin/${branchName}..${branchName}`,
-            { cwd: repoRoot, encoding: "utf-8", timeout: 15_000 },
-          ).trim();
-          if (log) {
+        // Capture the relevant commits inline so the operator doesn't need
+        // SSH access to the dispatcher machine to diagnose. Cap each listing
+        // at 30 entries / 2KB so a runaway branch doesn't bloat the comment.
+        const commitBlock = (title: string, range: string): string => {
+          try {
+            const log = execSync(
+              `git log --oneline -n 30 ${range}`,
+              { cwd: repoRoot, encoding: "utf-8", timeout: 15_000 },
+            ).trim();
+            if (!log) return "";
             const truncated = log.length > 2000 ? log.slice(0, 2000) + "\n…(truncated)" : log;
-            divergedSummary =
-              `\n\n**Diverged commits** (local has, origin/${branchName} doesn't):\n` +
-              "```\n" + truncated + "\n```\n";
+            return `\n\n**${title}:**\n` + "```\n" + truncated + "\n```\n";
+          } catch (e: any) {
+            return `\n\n_(could not capture ${title}: ${e?.message ?? e})_`;
           }
-        } catch (e: any) {
-          divergedSummary = `\n\n_(could not capture diverged commits: ${e?.message ?? e})_`;
+        };
+
+        // Local-only commits: what a blind push would send. Shown in both cases.
+        let divergedSummary = commitBlock(
+          `Commits local has that origin/${branchName} doesn't`,
+          `origin/${branchName}..${branchName}`,
+        );
+        // For a true divergence the operator most needs origin's commits —
+        // those are the work a blind push of local would REVERT.
+        if (diverged) {
+          divergedSummary += commitBlock(
+            `Commits origin/${branchName} has that local doesn't — a blind push of local would REVERT these`,
+            `${branchName}..origin/${branchName}`,
+          );
         }
 
         const shaInfo = (localSha && originSha)
