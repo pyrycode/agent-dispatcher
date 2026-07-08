@@ -1940,8 +1940,11 @@ export async function prepareAgentSpawn(
     config: {
       promptFile,
       systemPromptFile,
-      model: "opus",
-      effort: "xhigh",
+      // Per-agent override, else the pipeline default. QA and documentation
+      // run on claude-sonnet-5 at high effort; every other stage inherits
+      // opus/xhigh. See AGENTS in types.ts.
+      model: agent.model ?? "opus",
+      effort: agent.effort ?? "xhigh",
       maxTurns,
       allowedTools,
       disallowedTools,

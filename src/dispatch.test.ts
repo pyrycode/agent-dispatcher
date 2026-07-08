@@ -54,6 +54,7 @@ import {
   type StreamResult,
 } from "./dispatch.js";
 import type { AgentConfig, BlockerInfo, ProjectItem } from "./types.js";
+import { AGENTS } from "./types.js";
 import { ResourceExhaustedError } from "./agent-runtime.js";
 import { resolveAgentsRepoRoot, resolveTargetRepoRoot } from "./worktree.js";
 
@@ -958,6 +959,34 @@ describe("setupBranchAndWorktree — coverage edges", () => {
 });
 
 // =====================================================================
+// AGENTS per-agent model / effort config
+// =====================================================================
+
+describe("AGENTS model/effort config", () => {
+  const byName = (name: string) => {
+    const agent = AGENTS.find(a => a.name === name);
+    assert.ok(agent, `AGENTS must contain ${name}`);
+    return agent;
+  };
+
+  test("QA and documentation run on claude-sonnet-5 at high effort", () => {
+    for (const name of ["qa", "documentation"]) {
+      const agent = byName(name);
+      assert.equal(agent.model, "claude-sonnet-5", `${name} model`);
+      assert.equal(agent.effort, "high", `${name} effort`);
+    }
+  });
+
+  test("every other stage inherits the pipeline default (no override)", () => {
+    for (const name of ["po", "architect", "developer", "code-review"]) {
+      const agent = byName(name);
+      assert.equal(agent.model, undefined, `${name} must not override model → inherits opus`);
+      assert.equal(agent.effort, undefined, `${name} must not override effort → inherits xhigh`);
+    }
+  });
+});
+
+// =====================================================================
 // prepareAgentSpawn
 // =====================================================================
 //
@@ -1069,6 +1098,26 @@ describe("prepareAgentSpawn", () => {
     assert.equal(writes.length, 2, "exactly two writeFileSync calls (prompt + system prompt)");
     assert.ok(writes.some(w => w.content === "## Mock prompt #201"));
     assert.ok(writes.some(w => w.content === "Mock developer system prompt"));
+  });
+
+  test("per-agent model/effort override flows into the spawn config (default opus/xhigh is covered by the happy-path test above)", async () => {
+    const claudeMd = claudeMdAbsPath("developer/CLAUDE.md");
+    const { ctx } = makeTestContext({
+      agent: { model: "claude-sonnet-5", effort: "high" },
+      item: { issueNumber: 205, title: "Override" },
+      mockOptions: {
+        fsMap: { [claudeMd]: "Mock system prompt" },
+        buildPromptResult: "## Mock prompt #205",
+      },
+    });
+
+    const result = await prepareAgentSpawn(ctx);
+
+    if (!result.ok) {
+      assert.fail(`expected ok:true, got ok:false`);
+    }
+    assert.equal(result.config.model, "claude-sonnet-5", "agent.model must override the opus default");
+    assert.equal(result.config.effort, "high", "agent.effort must override the xhigh default");
   });
 
   test("QMD re-index fails → warning logged, dispatch continues", async () => {

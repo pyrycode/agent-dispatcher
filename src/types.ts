@@ -88,6 +88,21 @@ export interface AgentConfig {
    * already in flight or already picked this cycle.
    */
   serial?: boolean;
+  /**
+   * Per-agent `claude --model` override. Omit to inherit the pipeline
+   * default (`opus`). Set on stages that don't need the top model —
+   * e.g. QA runs mechanical gates and documentation synthesizes prose,
+   * both on `claude-sonnet-5`. Resolved in `prepareAgentSpawn`
+   * (dispatch.ts) as `agent.model ?? "opus"`.
+   */
+  model?: string;
+  /**
+   * Per-agent `claude --effort` (thinking level) override. Omit to
+   * inherit the pipeline default (`xhigh`). One of pyry's accepted
+   * values: `low | medium | high | xhigh | max`. Resolved in
+   * `prepareAgentSpawn` as `agent.effort ?? "xhigh"`.
+   */
+  effort?: string;
 }
 
 // 6-agent pipeline: PO → Architect → Developer → QA → Code Review → Documentation
@@ -128,6 +143,8 @@ export const AGENTS: AgentConfig[] = [
     description: "QA — runs mechanical gates (tests/vet/build) and triages failures against baseline",
     usesWorktree: true, // checks out feature branch to run tests against
     producesCommits: false, // PR comments + labels only; never writes code
+    model: "claude-sonnet-5", // mechanical gate work, not top-model reasoning (2026-07-08)
+    effort: "high",
   },
   {
     name: "code-review",
@@ -146,5 +163,7 @@ export const AGENTS: AgentConfig[] = [
     producesCommits: true, // commits doc updates
     serial: true, // writes to centralized docs/knowledge/INDEX.md + docs/PROJECT-MEMORY.md;
                   // two parallel docs runs produce add/add merge conflicts (2026-05-10)
+    model: "claude-sonnet-5", // prose synthesis, not top-model reasoning (2026-07-08)
+    effort: "high",
   },
 ];
