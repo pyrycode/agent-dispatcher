@@ -1498,6 +1498,35 @@ describe("handleAgentResultErrors", () => {
     );
   });
 
+  test("failure message carries wall-clock duration + the timeout budget so a timeout kill is legible", async () => {
+    // A `parent_canceled` on its own can't be told apart from a
+    // dispatcher wall-clock timeout SIGTERM without the run duration.
+    // The failure comment now states how long the run took and the
+    // stage's timeout budget, so "ran ~= budget" reads as a timeout.
+    // Default agent is `developer` (25min budget), default labels [].
+    const { ctx } = makeTestContext({ item: { issueNumber: 321 } });
+
+    await assert.rejects(
+      handleAgentResultErrors(
+        streamResult({
+          isError: true,
+          terminalReason: "parent_canceled",
+          output: "extracting the failing test names",
+        }),
+        ctx,
+      ),
+      (err: Error) => {
+        const m = String(err.message);
+        assert.match(m, /parent_canceled/);
+        // Wall-clock duration is present (Xm Ys shape).
+        assert.match(m, /\d+m \d+s/);
+        // Timeout budget is stated, and for the developer default it's 25min.
+        assert.match(m, /timeout 25min/);
+        return true;
+      },
+    );
+  });
+
   // ===================================================================
   // Permission-denial salvage (#8 Layer 2)
   // ===================================================================

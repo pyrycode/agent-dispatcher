@@ -2077,8 +2077,17 @@ export async function handleAgentResultErrors(
     const reason = streamResult.terminalReason || rawSubtype || "unknown";
     const diag = formatResultDiagnostics(streamResult.rawResult);
     const lastText = streamResult.output?.slice(0, 500) || "no output";
+    // Wall-clock duration + the stage's timeout budget. A `parent_canceled`
+    // reason alone can't be told apart from a dispatcher wall-clock-timeout
+    // SIGTERM; stating "ran Nm Ns (timeout Mmin)" makes a timeout kill legible
+    // in the ticket comment (ran ~= budget → it timed out). Wall-clock from
+    // ctx.startTime is the value the timeout is enforced against, so it pairs
+    // honestly with the budget (unlike claude's self-reported durationMs).
+    const elapsedMs = Date.now() - ctx.startTime;
+    const elapsedStr = `${Math.floor(elapsedMs / 60_000)}m ${Math.round((elapsedMs % 60_000) / 1000)}s`;
+    const timeoutMin = timeoutFor(agent, item.labels) / 60_000;
     throw new Error(
-      `Agent error (${reason})${diag ? `: ${diag}` : ""}. Last agent text (not the failure cause): ${lastText}`
+      `Agent error (${reason})${diag ? `: ${diag}` : ""}. Ran ${elapsedStr} (timeout ${timeoutMin}min). Last agent text (not the failure cause): ${lastText}`
     );
   }
 
