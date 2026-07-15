@@ -55,6 +55,7 @@ import {
   shouldAutoCommit,
 } from "./worktree.js";
 import { runAutoAdvance, runReworkRouting } from "./reconcile.js";
+import { trimMemoryIndexFile, MEMORY_INDEX_CAP_BYTES } from "./memory-index.js";
 
 // Load .env from the consumer's agents repo. AGENTS_REPO_PATH (set by
 // bin/pyry-start in the agents repo) takes precedence; falls back to a
@@ -3340,6 +3341,30 @@ export async function pollLoop(): Promise<void> {
     // the consistency model (single snapshot per cycle, intra-cycle
     // state changes not visible until next cycle).
     client.clearItemsCache();
+
+    // Keep the per-repo memory index under its safe cap between cycles.
+    // The harness fires a built-in PostToolUse hook mid-run that tells the
+    // agent to hand-compact MEMORY.md when it nears the ~24.4KB read limit;
+    // that compaction runs inside the agent's wall-clock budget and timed
+    // out ticket #994's architect, discarding its finished spec. We cannot
+    // disable the hook (it lives in no settings file we own), so we keep the
+    // index small from the dispatcher instead. This spot is provably
+    // single-writer: the previous cycle already awaited
+    // runConcurrentDispatches, so every agent has exited and none is
+    // appending. Doing it here also shrinks last cycle's growth before the
+    // next cycle's agents boot and read the index. Wrapped so a trim failure
+    // never breaks dispatch.
+    try {
+      const trim = trimMemoryIndexFile({ repoRoot });
+      if (trim.changed) {
+        console.log(`   🧹 Memory index trimmed: ${trim.before} → ${trim.after} bytes (cap ${MEMORY_INDEX_CAP_BYTES})`);
+      }
+      if (trim.overCap) {
+        console.warn(`   ⚠️  Memory index still over ${MEMORY_INDEX_CAP_BYTES}B after trim (${trim.after}B): lesson entries alone exceed the cap and need hand-curation.`);
+      }
+    } catch (e) {
+      console.warn(`   ⚠️  Memory index trim failed (non-fatal): ${(e as any)?.message || e}`);
+    }
 
     // Proactive fetch + rate-limit handling. Trigger the cycle's single
     // GraphQL fetch up front (subsequent sub-step calls hit the cache).
