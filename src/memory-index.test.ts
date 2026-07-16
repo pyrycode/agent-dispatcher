@@ -189,16 +189,26 @@ describe("trimMemoryIndex", () => {
     assert.ok(bytes(result) <= cap, "lands at or under the byte cap");
   });
 
-  test("classification: digit-prefixed titles are tickets, word-prefixed are not", () => {
+  test("classification: digit and #-digit titles are tickets, word-prefixed are not", () => {
     const cases: Array<[string, boolean]> = [
+      // pyrycode bare-digit shape
       ["- [982 recent_workspaces e2e](f.md) — x", true],
       ["- [1000 give-up seam](f.md) — x", true],
       ["* [7 asterisk bullet](f.md) — x", true],
       ["  - [3 indented ticket](f.md) — x", true],
+      // mobile / desktop #-digit shape
+      ["- [#578 DONE PR#580 mobile ticket](f.md) — x", true],
+      ["- [#449 real-claude desktop ticket](f.md) — x", true],
+      ["  * [#7 hash indented asterisk](f.md) — x", true],
+      // # then non-digit is NOT a ticket (no such entries today, but the
+      // rule must not over-match a hypothetical #-titled lesson)
+      ["- [#live-mode rung note](f.md) — x", false],
+      // word-titled lessons across the forks
       ["- [new v2 Type* trips guard](f.md) — x", false],
       ["- [RED restore](f.md) — x", false],
       ["- [sec spec heading](f.md) — x", false],
-      ["- [gofmt126 not CI-gated](f.md) — x", false],
+      ["- [Injectable timeout breaks advanceUntilIdle() tests](f.md) — x", false],
+      ["- [src/main CANNOT import src/renderer](f.md) — x", false],
       ["# header", false],
       ["<!-- comment -->", false],
       ["", false],
@@ -208,6 +218,21 @@ describe("trimMemoryIndex", () => {
     for (const [line, expected] of cases) {
       assert.equal(TICKET_LINE.test(line), expected, `classify: ${JSON.stringify(line)}`);
     }
+  });
+
+  test("drops #-prefixed tickets (mobile/desktop shape) while keeping word lessons", () => {
+    const header = "# Index";
+    const t1 = "- [#578 newest mobile ticket](578-note.md) — detail";
+    const l = "- [Injectable timeout breaks tests](inj-note.md) — detail";
+    const t2 = "- [#535 older mobile ticket](535-note.md) — detail";
+    const content = [header, t1, l, t2].join("\n") + "\n";
+    // Cap forces dropping the bottom-most ticket (#535); keep #578 and the lesson.
+    const cap = bytes([header, t1, l].join("\n") + "\n");
+    const result = trimMemoryIndex(content, cap);
+    assert.equal(result, [header, t1, l].join("\n") + "\n");
+    assert.ok(result.includes(t1), "newest #-ticket kept");
+    assert.ok(result.includes(l), "word lesson kept");
+    assert.ok(!result.includes(t2), "oldest #-ticket dropped");
   });
 });
 

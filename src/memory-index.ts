@@ -49,16 +49,19 @@ import { join } from "node:path";
 export const MEMORY_INDEX_CAP_BYTES = 17_000;
 
 /**
- * A bullet whose title starts with a digit — a per-ticket entry. Everything
- * else (lesson bullets, headers, HTML comments, blanks) is keep-always.
+ * A bullet whose title starts with a ticket number — a per-ticket entry.
+ * Matches both `- [994 ...]` (pyrycode) and `- [#578 ...]` (mobile and
+ * desktop); the `#` is optional. Everything else (lesson bullets, headers,
+ * HTML comments, blanks) is keep-always.
  *
- * Exported so a fork whose index writes ticket entries in a different shape
- * (e.g. pyrycode-mobile's `[#578 ...]` or tui-driver's `[Title ... #291]`)
- * can override it. Under the default pattern those shapes classify as
- * lessons, so the trim is a safe no-op there rather than dropping the wrong
- * lines.
+ * The one-character `#?` covers the only shape difference across the forks.
+ * Verified 2026-07-16 that pyrycode, mobile, and desktop all title tickets
+ * with an optional `#` then the issue number, and no lesson entry in any of
+ * them starts with `[#` or `[<digit>`, so the rule catches exactly the
+ * tickets on all three. Exported so a fork with a genuinely different shape
+ * can still override it.
  */
-export const TICKET_LINE = /^\s*[-*]\s+\[\d/;
+export const TICKET_LINE = /^\s*[-*]\s+\[#?\d/;
 
 /**
  * Drop the oldest ticket entries until the content is at or under `capBytes`,
