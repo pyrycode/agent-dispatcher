@@ -37,11 +37,16 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 /**
- * Safe cap for the memory index, in bytes. Well under the ~19.6KB
- * approaching-trigger and far under the ~24.4KB harness read limit,
- * leaving room for a cycle's worth of appends before the hook could fire.
+ * Safe cap for the memory index, in bytes. Raised from 15000 to 17000 on
+ * 2026-07-16 to keep more ticket entries in the discovery map. The lesson
+ * floor turned out to be genuine unique knowledge that curation cannot
+ * shrink much, so the cap is the lever for map depth. 17000 stays under the
+ * harness's ~17.1KB compact-to target and its ~19.6KB hook trigger, leaving
+ * ~2600 bytes of buffer for a cycle's appends before the hook could fire,
+ * and far under the ~24.4KB read limit. At the current ~11700-byte lesson
+ * floor this fits roughly 17 tickets, up from roughly 10 at 15000.
  */
-export const MEMORY_INDEX_CAP_BYTES = 15_000;
+export const MEMORY_INDEX_CAP_BYTES = 17_000;
 
 /**
  * A bullet whose title starts with a digit — a per-ticket entry. Everything

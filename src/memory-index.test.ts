@@ -316,6 +316,6 @@ describe("trimMemoryIndexFile", () => {
   });
 
   test("default cap is MEMORY_INDEX_CAP_BYTES", () => {
-    assert.equal(MEMORY_INDEX_CAP_BYTES, 15_000);
+    assert.equal(MEMORY_INDEX_CAP_BYTES, 17_000);
   });
 });
