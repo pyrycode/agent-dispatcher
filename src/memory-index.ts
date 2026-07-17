@@ -49,6 +49,31 @@ import { join } from "node:path";
 export const MEMORY_INDEX_CAP_BYTES = 17_000;
 
 /**
+ * Lesson-floor watermark, in bytes. The deterministic trim only drops ticket
+ * entries, never lessons, so once the lessons alone approach the cap the trim
+ * can no longer help. This watermark fires earlier, while there is still
+ * runway, to request an out-of-band curation pass (compress verbose summaries,
+ * relocate the oldest lessons to the project Lessons.md, then de-index them).
+ * It is measured on the lesson floor (see `lessonFloorBytes`), not the total,
+ * because that floor is exactly the part the trim cannot reduce.
+ *
+ * Measurement 2026-07-17: 106 genuine pyrycode lessons compress to only
+ * ~16000 bytes, so compression alone cannot clear the cap; the real lever is
+ * cutting the lesson count by relocation. 13000 leaves the curation room to
+ * reach a comfortable ~11500 target with headroom before the cap.
+ */
+export const MEMORY_INDEX_LESSON_WATERMARK_BYTES = 13_000;
+
+/**
+ * Re-arm threshold, in bytes, below the fire watermark. Once a curation pass
+ * brings the lesson floor under this, the request marker is cleared so the
+ * next crossing can fire again. The gap between this and the watermark is
+ * hysteresis: it stops a single lesson append from re-firing curation right
+ * after it finishes.
+ */
+export const MEMORY_INDEX_LESSON_REARM_BYTES = 12_500;
+
+/**
  * A bullet whose title starts with a ticket number — a per-ticket entry.
  * Matches both `- [994 ...]` (pyrycode) and `- [#578 ...]` (mobile and
  * desktop); the `#` is optional. Everything else (lesson bullets, headers,
@@ -112,6 +137,52 @@ export function trimMemoryIndex(content: string, capBytes: number): string {
 }
 
 /**
+ * The lesson floor: the byte length of everything the trim can never drop.
+ * The trim only removes ticket lines, so the floor is the content with every
+ * ticket line removed — lessons plus headers, comments, and blanks. This is
+ * the quantity `trimMemoryIndex` converges to as `capBytes` shrinks, so it is
+ * exactly what decides whether the trim can reach the cap. Pure.
+ *
+ * Byte length is measured with `Buffer.byteLength`, so multibyte UTF-8 lessons
+ * count by their real on-disk size.
+ */
+export function lessonFloorBytes(content: string, ticketLine: RegExp = TICKET_LINE): number {
+  const kept = content
+    .split("\n")
+    .filter((line) => !ticketLine.test(line))
+    .join("\n");
+  return Buffer.byteLength(kept, "utf8");
+}
+
+/**
+ * Pure edge-trigger for the auto-curation request, mirroring
+ * `decideDrainNotification` in dispatch.ts. The presence of the request
+ * marker file is the persisted armed state (the dispatcher dies and restarts
+ * often, so an in-memory flag would re-fire on every restart).
+ *
+ *   - lesson floor at/above the watermark AND no marker yet → fire once
+ *     (the caller writes the marker + pings).
+ *   - lesson floor below the re-arm threshold AND a marker exists → clear it
+ *     (the crossing is resolved; the next one can fire again).
+ *   - anything else, including the hysteresis band between re-arm and
+ *     watermark → do nothing.
+ */
+export function decideCurationTrigger(opts: {
+  lessonFloorBytes: number;
+  watermark: number;
+  rearm: number;
+  markerPresent: boolean;
+}): { fire: boolean; clear: boolean } {
+  if (opts.lessonFloorBytes >= opts.watermark && !opts.markerPresent) {
+    return { fire: true, clear: false };
+  }
+  if (opts.lessonFloorBytes < opts.rearm && opts.markerPresent) {
+    return { fire: false, clear: true };
+  }
+  return { fire: false, clear: false };
+}
+
+/**
  * The canonical on-disk path of a repo's memory index. The claude-projects
  * directory encodes the repo's absolute path by replacing every `/` and `.`
  * with `-`, so `/Users/u/Workspace/Projects/pyrycode` becomes
@@ -139,6 +210,11 @@ export interface TrimMemoryIndexResult {
   after: number;
   /** True iff the result is still over cap — lessons alone exceed it. */
   overCap: boolean;
+  /**
+   * Byte length of the lesson floor after the trim (non-ticket lines). 0 if
+   * the file was missing. This is what the auto-curation watermark keys on.
+   */
+  lessonFloor: number;
 }
 
 const defaultFs: MemoryIndexFs = {
@@ -170,7 +246,7 @@ export function trimMemoryIndexFile(opts: {
   const path = memoryIndexPath(opts.repoRoot, opts.homeDir);
 
   if (!fs.existsSync(path)) {
-    return { changed: false, before: 0, after: 0, overCap: false };
+    return { changed: false, before: 0, after: 0, overCap: false, lessonFloor: 0 };
   }
 
   const content = fs.readFileSync(path);
@@ -178,13 +254,14 @@ export function trimMemoryIndexFile(opts: {
   const trimmed = trimMemoryIndex(content, capBytes);
   const after = Buffer.byteLength(trimmed, "utf8");
   const overCap = after > capBytes;
+  const lessonFloor = lessonFloorBytes(trimmed);
 
   if (trimmed === content) {
-    return { changed: false, before, after, overCap };
+    return { changed: false, before, after, overCap, lessonFloor };
   }
 
   const tmp = `${path}.tmp`;
   fs.writeFileSync(tmp, trimmed);
   fs.renameSync(tmp, path);
-  return { changed: true, before, after, overCap };
+  return { changed: true, before, after, overCap, lessonFloor };
 }

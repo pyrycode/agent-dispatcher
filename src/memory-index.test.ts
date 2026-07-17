@@ -17,8 +17,12 @@ import assert from "node:assert/strict";
 
 import {
   MEMORY_INDEX_CAP_BYTES,
+  MEMORY_INDEX_LESSON_WATERMARK_BYTES,
+  MEMORY_INDEX_LESSON_REARM_BYTES,
   TICKET_LINE,
   trimMemoryIndex,
+  lessonFloorBytes,
+  decideCurationTrigger,
   memoryIndexPath,
   trimMemoryIndexFile,
   type MemoryIndexFs,
@@ -342,5 +346,95 @@ describe("trimMemoryIndexFile", () => {
 
   test("default cap is MEMORY_INDEX_CAP_BYTES", () => {
     assert.equal(MEMORY_INDEX_CAP_BYTES, 17_000);
+  });
+
+  test("result carries lessonFloor = bytes of the non-ticket lines after trim", () => {
+    const fs = new MockFs();
+    // Two tickets + two lessons, no trailing newline; cap forces one ticket
+    // drop. lessonFloor is the non-ticket bytes of the trimmed content,
+    // unaffected by that drop.
+    const content = [ticket(2), ticket(1), lesson("a"), lesson("b")].join("\n");
+    fs.files.set(path, content);
+    const cap = bytes([ticket(2), lesson("a"), lesson("b")].join("\n"));
+    const result = trimMemoryIndexFile({ repoRoot, homeDir, capBytes: cap, fs });
+    assert.equal(result.lessonFloor, bytes([lesson("a"), lesson("b")].join("\n")));
+  });
+});
+
+describe("lessonFloorBytes", () => {
+  test("all-lesson content: floor equals full byte length (no tickets to drop)", () => {
+    const content = [lesson("a"), lesson("b"), lesson("c")].join("\n");
+    assert.equal(lessonFloorBytes(content), bytes(content));
+  });
+
+  test("mixed content: floor is the non-ticket bytes only", () => {
+    const kept = [lesson("a"), lesson("b")];
+    const content = [ticket(9), ...kept, ticket(8)].join("\n");
+    assert.equal(lessonFloorBytes(content), bytes(kept.join("\n")));
+  });
+
+  test("empty content is zero", () => {
+    assert.equal(lessonFloorBytes(""), 0);
+  });
+
+  test("multibyte lessons are measured by UTF-8 byte length", () => {
+    const content = "- [emoji lesson 🧹](x-note.md) — détail ✳";
+    assert.equal(lessonFloorBytes(content), Buffer.byteLength(content, "utf8"));
+  });
+
+  test("#-prefixed tickets are excluded too", () => {
+    const kept = lesson("a");
+    const content = ["- [#578 mobile ticket](po-578-note.md) — d", kept].join("\n");
+    assert.equal(lessonFloorBytes(content), bytes(kept));
+  });
+});
+
+describe("decideCurationTrigger", () => {
+  const watermark = MEMORY_INDEX_LESSON_WATERMARK_BYTES;
+  const rearm = MEMORY_INDEX_LESSON_REARM_BYTES;
+
+  test("watermark constants: rearm is below the fire watermark (hysteresis)", () => {
+    assert.equal(watermark, 13_000);
+    assert.equal(rearm, 12_500);
+    assert.ok(rearm < watermark);
+  });
+
+  test("at/above watermark with no marker: fire once", () => {
+    assert.deepEqual(
+      decideCurationTrigger({ lessonFloorBytes: 13_000, watermark, rearm, markerPresent: false }),
+      { fire: true, clear: false },
+    );
+    assert.deepEqual(
+      decideCurationTrigger({ lessonFloorBytes: 18_808, watermark, rearm, markerPresent: false }),
+      { fire: true, clear: false },
+    );
+  });
+
+  test("at/above watermark with a marker already present: do not re-fire", () => {
+    assert.deepEqual(
+      decideCurationTrigger({ lessonFloorBytes: 18_808, watermark, rearm, markerPresent: true }),
+      { fire: false, clear: false },
+    );
+  });
+
+  test("in the hysteresis band (rearm..watermark) with a marker: hold, no clear", () => {
+    assert.deepEqual(
+      decideCurationTrigger({ lessonFloorBytes: 12_800, watermark, rearm, markerPresent: true }),
+      { fire: false, clear: false },
+    );
+  });
+
+  test("below rearm with a marker: clear it (re-arm)", () => {
+    assert.deepEqual(
+      decideCurationTrigger({ lessonFloorBytes: 11_449, watermark, rearm, markerPresent: true }),
+      { fire: false, clear: true },
+    );
+  });
+
+  test("below rearm with no marker: nothing to do", () => {
+    assert.deepEqual(
+      decideCurationTrigger({ lessonFloorBytes: 11_449, watermark, rearm, markerPresent: false }),
+      { fire: false, clear: false },
+    );
   });
 });
