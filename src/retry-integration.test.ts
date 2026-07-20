@@ -26,8 +26,16 @@ class FakeClient implements DispatchClient {
   getLatestRetryAtCalls: number[] = [];
   retryAtByIssue = new Map<number, Date | null>();
   failRetryAt: Error | null = null;
+  // Simulate a transient GitHub failure on the counter-label write.
+  failAddLabel: Error | null = null;
+  // Marker comments already on the issue before this run (durable prior
+  // attempts that the counter label never persisted).
+  markerCountByIssue = new Map<number, number>();
 
-  async addLabel(issueNumber: number, label: string) { this.addLabelCalls.push({ issueNumber, label }); }
+  async addLabel(issueNumber: number, label: string) {
+    if (this.failAddLabel && label.startsWith("error-retry-count:")) throw this.failAddLabel;
+    this.addLabelCalls.push({ issueNumber, label });
+  }
   async removeLabel(issueNumber: number, label: string) { this.removeLabelCalls.push({ issueNumber, label }); }
   async addComment(issueNumber: number, body: string) { this.comments.push({ issueNumber, body }); }
   async getIssueLabels() { return []; }
@@ -39,6 +47,10 @@ class FakeClient implements DispatchClient {
     this.getLatestRetryAtCalls.push(issueNumber);
     if (this.failRetryAt) throw this.failRetryAt;
     return this.retryAtByIssue.get(issueNumber) ?? null;
+  }
+  async countRetryMarkers(issueNumber: number) {
+    const posted = this.comments.filter((c) => c.issueNumber === issueNumber && c.body.includes(RETRY_MARKER)).length;
+    return (this.markerCountByIssue.get(issueNumber) ?? 0) + posted;
   }
   labels() { return this.addLabelCalls.map((c) => c.label); }
 }
@@ -147,6 +159,34 @@ describe("handleDispatchError — transient auto-retry (agent-dispatcher#25)", (
     const body = client.comments.map((c) => c.body).join("\n");
     assert.match(body, /Agent Spawn Failed/);
     assert.match(body, /EAGAIN/);
+  });
+
+  test("counter-label write failure → keeps the retry instead of parking (the #1093 bug: a bookkeeping write must not park a healthy ticket)", async () => {
+    const client = new FakeClient();
+    client.failAddLabel = new Error("502 Bad Gateway");
+    const discord: string[] = [];
+    const ctx = makeCtx(makeItem({ issueNumber: 710 }), client, discord);
+    await handleDispatchError(
+      new Error("Agent error (watchdog: PTY quiet for 30s): please run /login · API Error: 401 OAuth access token has expired"),
+      ctx,
+      null,
+    );
+    assert.ok(!client.labels().includes("error:developer"), "must NOT park when only the counter-label write failed");
+    assert.ok(!client.labels().includes("error-retry-count:1"), "counter label did not persist (write threw)");
+    assert.ok(client.comments.some((c) => c.body.includes(RETRY_MARKER)), "still posts the durable marker comment");
+    assert.ok(discord.some((m) => m.includes("auto-retry")), "still notifies a scheduled retry, not a park");
+    assert.ok(!discord.some((m) => m.includes("Manual intervention")), "no manual-intervention alert for a kept retry");
+  });
+
+  test("counter-label write keeps failing → still caps via the durable marker-comment count", async () => {
+    const client = new FakeClient();
+    client.failAddLabel = new Error("502 Bad Gateway");
+    client.markerCountByIssue.set(711, 4); // 4 prior retries recorded ONLY as marker comments (labels never persisted)
+    const discord: string[] = [];
+    const ctx = makeCtx(makeItem({ issueNumber: 711 }), client, discord);
+    await handleDispatchError(new Error("read ECONNRESET"), ctx, null);
+    assert.ok(client.labels().includes("error:developer"), "parks at the cap even though the counter label never persisted");
+    assert.ok(client.comments.some((c) => c.body.includes("Transient retries exhausted")), "notes the exhaustion");
   });
 
   test("scheduling a retry strips the stale counter before adding the next", async () => {

@@ -457,6 +457,10 @@ export class MockGitHubClient implements DispatchClient {
     if (this.failures.getLatestRetryAt) throw this.failures.getLatestRetryAt;
     return this.retryAtByIssue.get(issueNumber) ?? null;
   }
+
+  async countRetryMarkers(_issueNumber: number): Promise<number> {
+    return 0;
+  }
 }
 
 // --------- Factories ---------

@@ -2,15 +2,31 @@ import { graphql } from "@octokit/graphql";
 import type { ProjectConfig, ProjectItem } from "./types.js";
 import { AUTO_RETRY_COMMENT_MARKER } from "./pipeline-decisions.js";
 
+/** Transient GitHub responses worth another attempt for an IDEMPOTENT
+ *  request: server-side 5xx and secondary-rate-limit 429. `fetch()` only
+ *  throws on a network-level failure, so without opting in a 502/429 falls
+ *  straight through to the caller's `!response.ok` throw. Only idempotent
+ *  callers (label add/remove) opt in — retrying a non-idempotent POST like
+ *  addComment could double-post if the first try actually landed server-side
+ *  under a transient 5xx. */
+const RETRYABLE_HTTP_STATUS: ReadonlySet<number> = new Set([429, 500, 502, 503, 504]);
+
 async function fetchWithRetry(
   url: string,
   options: RequestInit,
   retries = 3,
   delayMs = 1000,
+  retryOnStatus = false,
 ): Promise<Response> {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       const response = await fetch(url, options);
+      if (retryOnStatus && !response.ok && RETRYABLE_HTTP_STATUS.has(response.status) && attempt < retries) {
+        console.warn(`   ⚠️  fetch got ${response.status} (attempt ${attempt}/${retries}), retrying in ${delayMs}ms...`);
+        await new Promise((r) => setTimeout(r, delayMs));
+        delayMs *= 2;
+        continue;
+      }
       return response;
     } catch (error) {
       if (attempt === retries) throw error;
@@ -471,7 +487,10 @@ export class GitHubProjectClient {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({ labels: [label] }),
-      }
+      },
+      3,
+      1000,
+      true, // adding a label is idempotent — retry transient GitHub 5xx/429
     );
 
     if (!response.ok) {
@@ -487,7 +506,10 @@ export class GitHubProjectClient {
         headers: {
           Authorization: `token ${this.config.token}`,
         },
-      }
+      },
+      3,
+      1000,
+      true, // removing a label is idempotent (404-tolerant) — retry transient GitHub 5xx/429
     );
 
     if (!response.ok && response.status !== 404) {
@@ -536,5 +558,35 @@ export class GitHubProjectClient {
       }
     }
     return latest;
+  }
+
+  /**
+   * How many dispatcher auto-retry marker comments an issue carries. This is
+   * the durable attempt count the retry scheduler falls back to when the
+   * `error-retry-count:N` label failed to persist — otherwise a repeated
+   * label-write failure would reset the attempt to 1 each time and the cap
+   * could never trip. THROWS on fetch failure; the caller treats an unread
+   * count as 0 and proceeds.
+   */
+  async countRetryMarkers(issueNumber: number): Promise<number> {
+    const response = await fetchWithRetry(
+      `https://api.github.com/repos/${this.config.owner}/${this.config.repo}/issues/${issueNumber}/comments?per_page=100`,
+      {
+        headers: {
+          Authorization: `token ${this.config.token}`,
+        },
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error(`Failed to fetch comments: ${response.statusText}`);
+    }
+
+    const comments: any[] = await response.json();
+    let count = 0;
+    for (const c of comments) {
+      if (typeof c?.body === "string" && c.body.includes(AUTO_RETRY_COMMENT_MARKER)) count++;
+    }
+    return count;
   }
 }

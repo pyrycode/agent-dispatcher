@@ -1255,6 +1255,12 @@ export interface DispatchClient {
    *  lost → caller treats as eligible); throws on fetch failure (caller
    *  holds the ticket a cycle rather than retrying blindly during an outage). */
   getLatestRetryAt(issueNumber: number): Promise<Date | null>;
+  /** How many auto-retry marker comments an issue carries — the durable
+   *  attempt count the retry scheduler falls back to when the
+   *  `error-retry-count:N` label failed to persist, so the cap stays
+   *  bounded even without the label. Throws on fetch failure (caller
+   *  treats an unread count as 0 and proceeds). */
+  countRetryMarkers(issueNumber: number): Promise<number>;
 }
 
 // IO surface every phase function depends on. Threading it through
@@ -1413,7 +1419,22 @@ async function scheduleTransientRetry(opts: {
   signature: string;
 }): Promise<number | null> {
   const { agent, item, client, logFile, signature } = opts;
-  const newAttempt = extractErrorRetryCount(item.labels) + 1;
+
+  // Attempt number comes from the counter label (fast, no I/O). But a prior
+  // label-write failure can leave the counter unpersisted, so when the label
+  // reads 0 fall back to the durable marker-comment count. Without this, a
+  // repeated label-write failure would reset the attempt to 1 every cycle and
+  // the cap could never trip — an unbounded retry loop.
+  let priorAttempts = extractErrorRetryCount(item.labels);
+  if (priorAttempts === 0) {
+    try {
+      priorAttempts = await client.countRetryMarkers(item.issueNumber);
+    } catch {
+      // Best-effort: a read failure just means we can't see unpersisted prior
+      // attempts this cycle; the label count (0) stands.
+    }
+  }
+  const newAttempt = priorAttempts + 1;
 
   if (newAttempt > RETRY_MAX_ATTEMPTS) {
     try {
@@ -1436,11 +1457,17 @@ async function scheduleTransientRetry(opts: {
       try { await client.removeLabel(item.issueNumber, label); } catch {}
     }
   }
+  // The counter label persists the attempt number for the cap and is the
+  // cheap per-cycle signal holdBackoffWaiters uses to gate the backoff. It is
+  // best-effort though: a transient GitHub write failure must NOT park a
+  // healthy ticket — that was the whole bug. On failure we keep the retry. The
+  // marker comment below is the durable attempt record the cap falls back to,
+  // and holdBackoffWaiters treats a label-less ticket as immediately eligible
+  // (degraded backoff, still cap-bounded via the markers, not stuck).
   try {
     await client.addLabel(item.issueNumber, `${ERROR_RETRY_COUNT_PREFIX}${newAttempt}`);
   } catch (e) {
-    console.warn(`   ⚠️  Failed to set ${ERROR_RETRY_COUNT_PREFIX}${newAttempt} on #${item.issueNumber}; parking instead: ${e}`);
-    return null;
+    console.warn(`   ⚠️  Failed to set ${ERROR_RETRY_COUNT_PREFIX}${newAttempt} on #${item.issueNumber}; retrying without the counter label (degraded backoff, cap tracked via marker comments): ${e}`);
   }
 
   // The marker comment's createdAt is the durable last-failure time the
