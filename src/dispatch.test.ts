@@ -38,6 +38,7 @@ import {
   handleDispatchError,
   handlePostRun,
   makeDispatchContext,
+  maybeCurateMemory,
   prepareAgentSpawn,
   runAutoMerge,
   runClosedSweep,
@@ -269,6 +270,7 @@ export function makeMockDeps(opts: MockDepsOptions = {}): { deps: DispatchDeps; 
     runClaudeStreaming: mockRunClaudeStreaming,
     notifyDiscord: mockNotifyDiscord,
     buildPromptForAgent: mockBuildPromptForAgent,
+    curateMemoryIndex: async () => ({ ok: true }),
   };
 
   return { deps, calls };
@@ -4182,5 +4184,79 @@ describe("detached-child teardown uses pgrp-kill", () => {
       /\bchild\.kill\(/,
       "intentional teardown sites in `runClaudeStreamingOnce` must use `killChildPgrp(child, sig)` (pgrp-kill) instead of bare `child.kill`. The latter reaches only `pyry agent-run` and orphans the grandchild — see the comment block above the function for the contract.",
     );
+  });
+});
+
+describe("maybeCurateMemory (inline auto-curation trigger)", () => {
+  const WATERMARK = 13_000;
+  const REARM = 12_500;
+
+  // A curateMemoryIndex fake that records its calls and returns a scripted result.
+  const makeCurator = (ok = true) => {
+    const calls: Array<{ agentsRepoRoot: string }> = [];
+    const deps: Pick<DispatchDeps, "curateMemoryIndex"> = {
+      curateMemoryIndex: async (opts) => {
+        calls.push(opts);
+        return { ok };
+      },
+    };
+    return { deps, calls };
+  };
+
+  const base = {
+    autocurate: true,
+    watermark: WATERMARK,
+    rearm: REARM,
+    agentsRepoRoot: "/x/pyrycode-agents",
+  };
+
+  test("does nothing when auto-curation is off (fork-safety default)", async () => {
+    const { deps, calls } = makeCurator();
+    const armed = await maybeCurateMemory({ ...base, autocurate: false, lessonFloorBytes: 20_000, armed: false, deps });
+    assert.equal(armed, false, "stays disarmed");
+    assert.equal(calls.length, 0, "curator never called when off");
+  });
+
+  test("does not fire below the watermark", async () => {
+    const { deps, calls } = makeCurator();
+    const armed = await maybeCurateMemory({ ...base, lessonFloorBytes: WATERMARK - 1, armed: false, deps });
+    assert.equal(armed, false);
+    assert.equal(calls.length, 0);
+  });
+
+  test("fires once at/over the watermark and arms", async () => {
+    const { deps, calls } = makeCurator();
+    const armed = await maybeCurateMemory({ ...base, lessonFloorBytes: WATERMARK, armed: false, deps });
+    assert.equal(armed, true, "armed after firing");
+    assert.equal(calls.length, 1, "curator invoked exactly once");
+    assert.equal(calls[0].agentsRepoRoot, "/x/pyrycode-agents", "curates this fork");
+  });
+
+  test("does not re-fire while armed and still over the watermark", async () => {
+    const { deps, calls } = makeCurator();
+    const armed = await maybeCurateMemory({ ...base, lessonFloorBytes: 20_000, armed: true, deps });
+    assert.equal(armed, true, "stays armed");
+    assert.equal(calls.length, 0, "no second curation while armed");
+  });
+
+  test("stays armed in the hysteresis band (between rearm and watermark)", async () => {
+    const { deps, calls } = makeCurator();
+    const armed = await maybeCurateMemory({ ...base, lessonFloorBytes: REARM + 100, armed: true, deps });
+    assert.equal(armed, true, "held — not re-armed until below rearm");
+    assert.equal(calls.length, 0);
+  });
+
+  test("re-arms (disarms) once the floor drops below the rearm mark", async () => {
+    const { deps, calls } = makeCurator();
+    const armed = await maybeCurateMemory({ ...base, lessonFloorBytes: REARM - 1, armed: true, deps });
+    assert.equal(armed, false, "cleared so the next crossing can fire again");
+    assert.equal(calls.length, 0);
+  });
+
+  test("stays armed even when the curation pass fails (no per-cycle retry)", async () => {
+    const { deps, calls } = makeCurator(false);
+    const armed = await maybeCurateMemory({ ...base, lessonFloorBytes: 20_000, armed: false, deps });
+    assert.equal(armed, true, "armed despite failure — retry waits for a re-arm");
+    assert.equal(calls.length, 1);
   });
 });

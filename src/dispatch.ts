@@ -1,6 +1,6 @@
 import { type ChildProcess, execSync, spawn, spawnSync } from "node:child_process";
-import { readFileSync, existsSync, writeFileSync, renameSync, mkdirSync, appendFileSync, readdirSync, createReadStream, statSync, symlinkSync, unlinkSync } from "node:fs";
-import { resolve, dirname } from "node:path";
+import { readFileSync, existsSync, writeFileSync, mkdirSync, appendFileSync, readdirSync, createReadStream, statSync, symlinkSync, unlinkSync } from "node:fs";
+import { resolve, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { config } from "dotenv";
 
@@ -57,7 +57,6 @@ import {
 import { runAutoAdvance, runReworkRouting } from "./reconcile.js";
 import {
   trimMemoryIndexFile,
-  memoryIndexPath,
   decideCurationTrigger,
   MEMORY_INDEX_CAP_BYTES,
   MEMORY_INDEX_LESSON_WATERMARK_BYTES,
@@ -103,8 +102,10 @@ const salvageGates = parseSalvageGates(process.env.SALVAGE_GATES);
 
 // Auto-curation of the memory index (opt-in). When the lesson floor — the part
 // the deterministic trim cannot reduce — crosses the watermark, the dispatcher
-// requests an out-of-band curation pass by writing a marker file the launchd
-// runner polls, and pings Discord once per crossing. It never curates itself.
+// curates inline at the top-of-cycle single-writer point: it runs the
+// curate-memory runner synchronously and blocks the next dispatch until it
+// verifies and completes (see maybeCurateMemory). This replaces the old
+// decoupled launchd runner, whose dispatcher-down window almost never opened.
 // Default OFF: a fork opts in with PYRY_AUTOCURATE_MEMORY=1. Off is a strict
 // no-op, which is the fork-safety gate — some forks already sit above the
 // watermark, so a threshold-only trigger would fire on them. Watermark and
@@ -1292,7 +1293,29 @@ export type DispatchDeps = {
   runClaudeStreaming: typeof runClaudeStreaming;
   notifyDiscord: (msg: string) => Promise<void>;
   buildPromptForAgent: typeof buildPromptForAgent;
+  // Run the memory-index curation runner inline for this fork and await it.
+  curateMemoryIndex: (opts: { agentsRepoRoot: string }) => Promise<{ ok: boolean }>;
 };
+
+// Default curation runner: spawn the memory-curation shell runner in inline
+// mode (--now implies --live) for this fork and await its exit. It runs the
+// curate-memory skill + deterministic verifier, backing up first and restoring
+// on any failure. Async spawn (not spawnSync) so a drain SIGTERM isn't ignored
+// for the minutes a curation pass takes. Binary path overridable via
+// PYRY_MEMORY_CURATION_BIN; tests inject their own via deps.
+function runMemoryCuration(opts: { agentsRepoRoot: string }): Promise<{ ok: boolean }> {
+  const bin = process.env.PYRY_MEMORY_CURATION_BIN
+    ?? resolve(process.env.HOME ?? "", ".local/bin/memory-curation.sh");
+  const fork = basename(opts.agentsRepoRoot);
+  return new Promise((res) => {
+    const child = spawn(bin, ["--now", "--fork", fork], { stdio: "inherit" });
+    child.on("close", (code) => res({ ok: code === 0 }));
+    child.on("error", (err) => {
+      console.warn(`   ⚠️  Memory curation runner failed to spawn: ${err.message}`);
+      res({ ok: false });
+    });
+  });
+}
 
 export const DEFAULT_DEPS: DispatchDeps = {
   execSync,
@@ -1305,7 +1328,48 @@ export const DEFAULT_DEPS: DispatchDeps = {
   runClaudeStreaming,
   notifyDiscord,
   buildPromptForAgent,
+  curateMemoryIndex: runMemoryCuration,
 };
+
+// Auto-curation trigger. Given the latest lesson-floor byte count and the
+// in-memory armed state, decide whether to fire an inline curation pass, and
+// return the next armed state. Firing runs deps.curateMemoryIndex synchronously
+// (backup, curate, verify, restore-on-failure) and blocks until it finishes.
+// Size-gated by decideCurationTrigger: fires only when the floor is at/over the
+// watermark, re-arms below the rearm mark. Called at the top-of-cycle
+// single-writer point, so no lease or marker file is needed. A firing sets
+// armed=true whether or not the pass succeeded, so a broken curation is retried
+// only after the floor drops below the rearm mark (never every cycle).
+export async function maybeCurateMemory(opts: {
+  lessonFloorBytes: number;
+  autocurate: boolean;
+  watermark: number;
+  rearm: number;
+  armed: boolean;
+  agentsRepoRoot: string;
+  deps: Pick<DispatchDeps, "curateMemoryIndex">;
+}): Promise<boolean> {
+  if (!opts.autocurate) return opts.armed;
+  const decision = decideCurationTrigger({
+    lessonFloorBytes: opts.lessonFloorBytes,
+    watermark: opts.watermark,
+    rearm: opts.rearm,
+    markerPresent: opts.armed,
+  });
+  if (decision.fire) {
+    console.warn(`   🧹 Memory lessons ${opts.lessonFloorBytes}B ≥ watermark ${opts.watermark}B — curating inline (blocks dispatch until done).`);
+    const res = await opts.deps.curateMemoryIndex({ agentsRepoRoot: opts.agentsRepoRoot });
+    if (!res.ok) {
+      console.warn(`   ⚠️  Inline memory curation did not complete cleanly; will not retry until the lesson floor drops below ${opts.rearm}B.`);
+    }
+    return true;
+  }
+  if (decision.clear) {
+    console.log(`   🧹 Memory lessons ${opts.lessonFloorBytes}B < re-arm ${opts.rearm}B — curation re-armed.`);
+    return false;
+  }
+  return opts.armed;
+}
 
 // Per-dispatch state, computed once at the start of dispatchToAgent and
 // threaded through every phase function. Module-level constants
@@ -3372,6 +3436,13 @@ export async function pollLoop(): Promise<void> {
   // board that's been idle since startup. See decideDrainNotification.
   let sawActiveWork = false;
 
+  // In-memory armed state for inline memory curation. Set true once a curation
+  // fires, so the next cycles don't re-fire while the floor stays over the
+  // watermark; reset false when the floor drops below the re-arm mark. Held in
+  // memory (not a marker file) because the curation runs synchronously within
+  // the cycle — a restart re-attempting once from a stuck floor is benign.
+  let curationArmed = false;
+
   while (true) {
     // Drain check: exit cleanly before starting the next cycle if SIGTERM
     // was received. Placement at top of loop means a cycle that's already
@@ -3389,30 +3460,6 @@ export async function pollLoop(): Promise<void> {
     // the consistency model (single snapshot per cycle, intra-cycle
     // state changes not visible until next cycle).
     client.clearItemsCache();
-
-    // Defense in depth: if the memory-curation runner holds a fresh lease on
-    // the index, skip this whole cycle so we never write MEMORY.md (the trim
-    // below) or spawn an agent (which appends to it) while the runner curates.
-    // The runner only curates when this dispatcher is down, so this rarely
-    // fires; it closes the race where the dispatcher boots mid-curation.
-    // bin/pyry-start has the matching pre-spawn guard. A stale or expired
-    // lease is ignored so a dead runner can never wedge dispatch.
-    if (AUTOCURATE_MEMORY) {
-      try {
-        const leasePath = memoryIndexPath(repoRoot).replace(/MEMORY\.md$/, ".curation-lease.json");
-        if (existsSync(leasePath)) {
-          const lease = JSON.parse(readFileSync(leasePath, "utf8"));
-          const expiresAt = Date.parse(lease?.expiresAt);
-          if (Number.isFinite(expiresAt) && expiresAt > Date.now()) {
-            console.log(`   ⏸️  Memory curation in progress (lease pid ${lease.holderPid}, expires ${lease.expiresAt}); skipping this cycle.`);
-            await new Promise((r) => setTimeout(r, POLL_INTERVAL));
-            continue;
-          }
-        }
-      } catch (e) {
-        console.warn(`   ⚠️  Curation lease check failed (non-fatal): ${(e as any)?.message || e}`);
-      }
-    }
 
     // Keep the per-repo memory index under its safe cap between cycles.
     // The harness fires a built-in PostToolUse hook mid-run that tells the
@@ -3436,36 +3483,19 @@ export async function pollLoop(): Promise<void> {
       }
 
       // Auto-curation watermark (opt-in via PYRY_AUTOCURATE_MEMORY=1). When the
-      // lesson floor crosses the watermark, request an out-of-band curation
-      // pass by writing a marker the launchd runner polls, and ping Discord
-      // once per crossing. The marker's presence is the persisted armed state,
-      // so a dispatcher restart never re-fires. The dispatcher never curates
-      // itself; the runner does, in a single-writer window. See memory-curation.
-      if (AUTOCURATE_MEMORY) {
-        const markerPath = memoryIndexPath(repoRoot).replace(/MEMORY\.md$/, ".curation-request.json");
-        const decision = decideCurationTrigger({
-          lessonFloorBytes: trim.lessonFloor,
-          watermark: CURATION_WATERMARK,
-          rearm: CURATION_REARM,
-          markerPresent: existsSync(markerPath),
-        });
-        if (decision.fire) {
-          const tmp = `${markerPath}.tmp`;
-          writeFileSync(tmp, JSON.stringify({
-            firedAt: new Date().toISOString(),
-            lessonFloorBytes: trim.lessonFloor,
-            watermark: CURATION_WATERMARK,
-            target: CURATION_REARM,
-            repoRoot,
-          }, null, 2));
-          renameSync(tmp, markerPath);
-          console.warn(`   🧹 Memory lessons ${trim.lessonFloor}B ≥ watermark ${CURATION_WATERMARK}B — curation requested.`);
-          await notifyDiscord(`🧹 **${process.env.GITHUB_REPO}**: memory-index lessons at ${trim.lessonFloor}B, over the ${CURATION_WATERMARK}B curation watermark. Auto-curation requested; the runner will curate in the next dispatcher-down window.`);
-        } else if (decision.clear) {
-          unlinkSync(markerPath);
-          console.log(`   🧹 Memory lessons ${trim.lessonFloor}B < re-arm ${CURATION_REARM}B — curation request cleared.`);
-        }
-      }
+      // lesson floor crosses the watermark, curate inline right here — the
+      // top-of-cycle single-writer point — blocking the next dispatch until the
+      // runner verifies and completes. curationArmed is the in-memory armed
+      // state so a crossing fires once, not every cycle. Off is a strict no-op.
+      curationArmed = await maybeCurateMemory({
+        lessonFloorBytes: trim.lessonFloor,
+        autocurate: AUTOCURATE_MEMORY,
+        watermark: CURATION_WATERMARK,
+        rearm: CURATION_REARM,
+        armed: curationArmed,
+        agentsRepoRoot,
+        deps: DEFAULT_DEPS,
+      });
     } catch (e) {
       console.warn(`   ⚠️  Memory index maintenance failed (non-fatal): ${(e as any)?.message || e}`);
     }
