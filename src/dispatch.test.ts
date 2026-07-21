@@ -4187,9 +4187,10 @@ describe("detached-child teardown uses pgrp-kill", () => {
   });
 });
 
-describe("maybeCurateMemory (inline auto-curation trigger)", () => {
+describe("maybeCurateMemory (cooldown-gated inline auto-curation)", () => {
   const WATERMARK = 13_000;
-  const REARM = 12_500;
+  const COOLDOWN = 30 * 60_000;
+  const T0 = 1_000_000_000; // arbitrary base ms; Date.now is avoided in tests
 
   // A curateMemoryIndex fake that records its calls and returns a scripted result.
   const makeCurator = (ok = true) => {
@@ -4206,57 +4207,58 @@ describe("maybeCurateMemory (inline auto-curation trigger)", () => {
   const base = {
     autocurate: true,
     watermark: WATERMARK,
-    rearm: REARM,
+    cooldownMs: COOLDOWN,
     agentsRepoRoot: "/x/pyrycode-agents",
   };
 
   test("does nothing when auto-curation is off (fork-safety default)", async () => {
     const { deps, calls } = makeCurator();
-    const armed = await maybeCurateMemory({ ...base, autocurate: false, lessonFloorBytes: 20_000, armed: false, deps });
-    assert.equal(armed, false, "stays disarmed");
+    const next = await maybeCurateMemory({ ...base, autocurate: false, lessonFloorBytes: 20_000, nowMs: T0, lastAttemptMs: 0, deps });
+    assert.equal(next, 0, "last-attempt unchanged");
     assert.equal(calls.length, 0, "curator never called when off");
   });
 
   test("does not fire below the watermark", async () => {
     const { deps, calls } = makeCurator();
-    const armed = await maybeCurateMemory({ ...base, lessonFloorBytes: WATERMARK - 1, armed: false, deps });
-    assert.equal(armed, false);
+    const next = await maybeCurateMemory({ ...base, lessonFloorBytes: WATERMARK - 1, nowMs: T0, lastAttemptMs: 0, deps });
+    assert.equal(next, 0);
     assert.equal(calls.length, 0);
   });
 
-  test("fires once at/over the watermark and arms", async () => {
+  test("fires at/over the watermark once the cooldown has elapsed, records the attempt time", async () => {
     const { deps, calls } = makeCurator();
-    const armed = await maybeCurateMemory({ ...base, lessonFloorBytes: WATERMARK, armed: false, deps });
-    assert.equal(armed, true, "armed after firing");
+    const next = await maybeCurateMemory({ ...base, lessonFloorBytes: WATERMARK, nowMs: T0, lastAttemptMs: 0, deps });
     assert.equal(calls.length, 1, "curator invoked exactly once");
     assert.equal(calls[0].agentsRepoRoot, "/x/pyrycode-agents", "curates this fork");
+    assert.equal(next, T0, "records nowMs as the last attempt");
   });
 
-  test("does not re-fire while armed and still over the watermark", async () => {
+  test("does not re-fire inside the cooldown window", async () => {
     const { deps, calls } = makeCurator();
-    const armed = await maybeCurateMemory({ ...base, lessonFloorBytes: 20_000, armed: true, deps });
-    assert.equal(armed, true, "stays armed");
-    assert.equal(calls.length, 0, "no second curation while armed");
+    const next = await maybeCurateMemory({ ...base, lessonFloorBytes: 20_000, nowMs: T0 + COOLDOWN - 1, lastAttemptMs: T0, deps });
+    assert.equal(calls.length, 0, "cooldown suppresses the retry");
+    assert.equal(next, T0, "last-attempt unchanged while cooling down");
   });
 
-  test("stays armed in the hysteresis band (between rearm and watermark)", async () => {
+  test("fires again once the cooldown elapses even if the floor is still high", async () => {
     const { deps, calls } = makeCurator();
-    const armed = await maybeCurateMemory({ ...base, lessonFloorBytes: REARM + 100, armed: true, deps });
-    assert.equal(armed, true, "held — not re-armed until below rearm");
-    assert.equal(calls.length, 0);
+    const next = await maybeCurateMemory({ ...base, lessonFloorBytes: 20_000, nowMs: T0 + COOLDOWN, lastAttemptMs: T0, deps });
+    assert.equal(calls.length, 1, "retries after the cooldown");
+    assert.equal(next, T0 + COOLDOWN);
   });
 
-  test("re-arms (disarms) once the floor drops below the rearm mark", async () => {
-    const { deps, calls } = makeCurator();
-    const armed = await maybeCurateMemory({ ...base, lessonFloorBytes: REARM - 1, armed: true, deps });
-    assert.equal(armed, false, "cleared so the next crossing can fire again");
-    assert.equal(calls.length, 0);
-  });
-
-  test("stays armed even when the curation pass fails (no per-cycle retry)", async () => {
+  test("a failed (rolled-back) pass records the attempt and does NOT stick — it retries after the cooldown", async () => {
+    // Regression for the 2026-07-21 bug: a failed curation left the floor high
+    // and a sticky armed flag never re-armed, disabling curation forever. Here
+    // the floor stays high after a failure, yet the next cooldown boundary fires.
     const { deps, calls } = makeCurator(false);
-    const armed = await maybeCurateMemory({ ...base, lessonFloorBytes: 20_000, armed: false, deps });
-    assert.equal(armed, true, "armed despite failure — retry waits for a re-arm");
-    assert.equal(calls.length, 1);
+    const afterFail = await maybeCurateMemory({ ...base, lessonFloorBytes: 20_000, nowMs: T0, lastAttemptMs: 0, deps });
+    assert.equal(calls.length, 1, "attempted once");
+    assert.equal(afterFail, T0, "records the attempt despite the failure");
+    const during = await maybeCurateMemory({ ...base, lessonFloorBytes: 20_000, nowMs: T0 + 60_000, lastAttemptMs: afterFail, deps });
+    assert.equal(calls.length, 1, "no retry inside the cooldown");
+    const after = await maybeCurateMemory({ ...base, lessonFloorBytes: 20_000, nowMs: T0 + COOLDOWN, lastAttemptMs: during, deps });
+    assert.equal(calls.length, 2, "retries after the cooldown — never stuck");
+    assert.equal(after, T0 + COOLDOWN);
   });
 });

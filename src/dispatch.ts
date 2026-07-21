@@ -57,10 +57,8 @@ import {
 import { runAutoAdvance, runReworkRouting } from "./reconcile.js";
 import {
   trimMemoryIndexFile,
-  decideCurationTrigger,
   MEMORY_INDEX_CAP_BYTES,
   MEMORY_INDEX_LESSON_WATERMARK_BYTES,
-  MEMORY_INDEX_LESSON_REARM_BYTES,
 } from "./memory-index.js";
 
 // Load .env from the consumer's agents repo. AGENTS_REPO_PATH (set by
@@ -108,13 +106,17 @@ const salvageGates = parseSalvageGates(process.env.SALVAGE_GATES);
 // decoupled launchd runner, whose dispatcher-down window almost never opened.
 // Default OFF: a fork opts in with PYRY_AUTOCURATE_MEMORY=1. Off is a strict
 // no-op, which is the fork-safety gate — some forks already sit above the
-// watermark, so a threshold-only trigger would fire on them. Watermark and
-// re-arm are overridable per fork for a different lesson budget.
+// watermark, so a threshold-only trigger would fire on them. Watermark and the
+// retry cooldown are overridable per fork.
 const AUTOCURATE_MEMORY = process.env.PYRY_AUTOCURATE_MEMORY === "1";
 const CURATION_WATERMARK =
   Number(process.env.PYRY_MEMORY_LESSON_WATERMARK) || MEMORY_INDEX_LESSON_WATERMARK_BYTES;
-const CURATION_REARM =
-  Number(process.env.PYRY_MEMORY_LESSON_REARM) || MEMORY_INDEX_LESSON_REARM_BYTES;
+// Minimum gap between curation attempts. Bounds retries after a failed (rolled-
+// back) pass so it never fires every cycle, and it never sticks either. Default
+// 30 min; a successful pass drops the floor below the watermark and won't
+// re-fire until churn re-crosses it, so this mainly gates the failure-retry.
+const CURATION_COOLDOWN_MS =
+  (Number(process.env.PYRY_MEMORY_CURATION_COOLDOWN_MIN) || 30) * 60_000;
 
 config({ path: resolve(agentsRepoRoot, ".env") });
 
@@ -1331,44 +1333,43 @@ export const DEFAULT_DEPS: DispatchDeps = {
   curateMemoryIndex: runMemoryCuration,
 };
 
-// Auto-curation trigger. Given the latest lesson-floor byte count and the
-// in-memory armed state, decide whether to fire an inline curation pass, and
-// return the next armed state. Firing runs deps.curateMemoryIndex synchronously
-// (backup, curate, verify, restore-on-failure) and blocks until it finishes.
-// Size-gated by decideCurationTrigger: fires only when the floor is at/over the
-// watermark, re-arms below the rearm mark. Called at the top-of-cycle
-// single-writer point, so no lease or marker file is needed. A firing sets
-// armed=true whether or not the pass succeeded, so a broken curation is retried
-// only after the floor drops below the rearm mark (never every cycle).
+// Auto-curation trigger, cooldown-gated. Fires an inline curation pass when the
+// lesson floor is at/over the watermark AND at least `cooldownMs` has passed
+// since the last attempt; returns the timestamp to record as the last attempt
+// (nowMs if it fired, else the unchanged prior value). Firing runs
+// deps.curateMemoryIndex synchronously (backup, curate, verify, restore-on-
+// failure) and blocks until it finishes. Called at the top-of-cycle single-
+// writer point, so no lease or marker file is needed.
+//
+// Why a cooldown, not a sticky armed flag: a curation that fails verification is
+// rolled back, leaving the floor high. A sticky "armed until floor drops below
+// rearm" flag then never re-arms, so one failed pass permanently disables
+// curation and the index grows unbounded toward the harness hook (observed live
+// 2026-07-21). The cooldown records every attempt, success or fail, so a failed
+// pass simply retries after the cooldown — bounded, never every cycle, never
+// stuck. A successful pass drops the floor below the watermark, so it won't fire
+// again until churn re-crosses it.
 export async function maybeCurateMemory(opts: {
   lessonFloorBytes: number;
   autocurate: boolean;
   watermark: number;
-  rearm: number;
-  armed: boolean;
+  nowMs: number;
+  lastAttemptMs: number;
+  cooldownMs: number;
   agentsRepoRoot: string;
   deps: Pick<DispatchDeps, "curateMemoryIndex">;
-}): Promise<boolean> {
-  if (!opts.autocurate) return opts.armed;
-  const decision = decideCurationTrigger({
-    lessonFloorBytes: opts.lessonFloorBytes,
-    watermark: opts.watermark,
-    rearm: opts.rearm,
-    markerPresent: opts.armed,
-  });
-  if (decision.fire) {
-    console.warn(`   🧹 Memory lessons ${opts.lessonFloorBytes}B ≥ watermark ${opts.watermark}B — curating inline (blocks dispatch until done).`);
-    const res = await opts.deps.curateMemoryIndex({ agentsRepoRoot: opts.agentsRepoRoot });
-    if (!res.ok) {
-      console.warn(`   ⚠️  Inline memory curation did not complete cleanly; will not retry until the lesson floor drops below ${opts.rearm}B.`);
-    }
-    return true;
+}): Promise<number> {
+  if (!opts.autocurate) return opts.lastAttemptMs;
+  if (opts.lessonFloorBytes < opts.watermark) return opts.lastAttemptMs;
+  if (opts.nowMs - opts.lastAttemptMs < opts.cooldownMs) return opts.lastAttemptMs;
+  console.warn(`   🧹 Memory lessons ${opts.lessonFloorBytes}B ≥ watermark ${opts.watermark}B — curating inline (blocks dispatch until done).`);
+  const res = await opts.deps.curateMemoryIndex({ agentsRepoRoot: opts.agentsRepoRoot });
+  if (!res.ok) {
+    console.warn(`   ⚠️  Inline memory curation did not complete cleanly; will retry after the ${Math.round(opts.cooldownMs / 60000)}min cooldown.`);
   }
-  if (decision.clear) {
-    console.log(`   🧹 Memory lessons ${opts.lessonFloorBytes}B < re-arm ${opts.rearm}B — curation re-armed.`);
-    return false;
-  }
-  return opts.armed;
+  // Record the attempt regardless of outcome so a failed pass retries on the
+  // cooldown, not every cycle.
+  return opts.nowMs;
 }
 
 // Per-dispatch state, computed once at the start of dispatchToAgent and
@@ -3436,12 +3437,10 @@ export async function pollLoop(): Promise<void> {
   // board that's been idle since startup. See decideDrainNotification.
   let sawActiveWork = false;
 
-  // In-memory armed state for inline memory curation. Set true once a curation
-  // fires, so the next cycles don't re-fire while the floor stays over the
-  // watermark; reset false when the floor drops below the re-arm mark. Held in
-  // memory (not a marker file) because the curation runs synchronously within
-  // the cycle — a restart re-attempting once from a stuck floor is benign.
-  let curationArmed = false;
+  // Timestamp of the last inline-curation attempt (ms), for the cooldown gate in
+  // maybeCurateMemory. 0 means never attempted. Held in memory; a restart just
+  // allows an immediate first attempt, which is fine.
+  let lastCurationAttemptMs = 0;
 
   while (true) {
     // Drain check: exit cleanly before starting the next cycle if SIGTERM
@@ -3485,14 +3484,16 @@ export async function pollLoop(): Promise<void> {
       // Auto-curation watermark (opt-in via PYRY_AUTOCURATE_MEMORY=1). When the
       // lesson floor crosses the watermark, curate inline right here — the
       // top-of-cycle single-writer point — blocking the next dispatch until the
-      // runner verifies and completes. curationArmed is the in-memory armed
-      // state so a crossing fires once, not every cycle. Off is a strict no-op.
-      curationArmed = await maybeCurateMemory({
+      // runner verifies and completes. Cooldown-gated so a failed (rolled-back)
+      // pass retries on a bounded schedule instead of every cycle or never. Off
+      // is a strict no-op.
+      lastCurationAttemptMs = await maybeCurateMemory({
         lessonFloorBytes: trim.lessonFloor,
         autocurate: AUTOCURATE_MEMORY,
         watermark: CURATION_WATERMARK,
-        rearm: CURATION_REARM,
-        armed: curationArmed,
+        nowMs: Date.now(),
+        lastAttemptMs: lastCurationAttemptMs,
+        cooldownMs: CURATION_COOLDOWN_MS,
         agentsRepoRoot,
         deps: DEFAULT_DEPS,
       });
