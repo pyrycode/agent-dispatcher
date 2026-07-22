@@ -54,7 +54,7 @@ import {
   resolveTargetRepoRoot,
   shouldAutoCommit,
 } from "./worktree.js";
-import { runAutoAdvance, runReworkRouting } from "./reconcile.js";
+import { runAutoAdvance, runRealClaudeGate, runReworkRouting } from "./reconcile.js";
 import {
   trimMemoryIndexFile,
   MEMORY_INDEX_CAP_BYTES,
@@ -3545,6 +3545,7 @@ export async function pollLoop(): Promise<void> {
     // safety net for state changes produced by this cycle's dispatch.
     await runClosedSweep(client);
     await runReworkRouting(client);
+    await runRealClaudeGate(client);
     await runAutoAdvance(client, MAX_CONCURRENT);
     await runDoneCleanup(client);
 
@@ -3604,6 +3605,7 @@ export async function pollLoop(): Promise<void> {
     // changes between cycles).
     await runClosedSweep(client);
     await runReworkRouting(client);
+    await runRealClaudeGate(client);
     await runAutoAdvance(client, MAX_CONCURRENT);
     await runDoneCleanup(client);
 

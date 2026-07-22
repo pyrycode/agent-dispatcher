@@ -64,6 +64,8 @@ import {
   isPipelineInFlight,
   isPipelineLabel,
   isPipelineLabelForAgent,
+  decideRealClaudeGate,
+  REAL_CLAUDE_GATE_LABEL,
   shouldAddReadyLabel,
   shouldSkipDispatch,
 } from "./pipeline-decisions.js";
@@ -1154,6 +1156,116 @@ describe("countPipelineInFlight", () => {
         `mismatch for ${JSON.stringify(c)}`,
       );
     }
+  });
+});
+
+describe("decideRealClaudeGate + auto-advance belt", () => {
+  type Item = { id: string; issueNumber: number; labels: string[]; blockedBy?: { number: number; state: "OPEN" | "CLOSED" }[] };
+  const items = (...rows: [string, Item[]][]): Map<string, Item[]> => new Map(rows);
+
+  test("empty pipeline → no gate routes", () => {
+    assert.deepEqual(decideRealClaudeGate(items()), []);
+  });
+
+  test("In Code Review + done:code-review + needs-real-claude → route to Inbox", () => {
+    const r = decideRealClaudeGate(
+      items(["In Code Review", [{
+        id: "i1",
+        issueNumber: 1168,
+        labels: ["done:code-review", "size:s", REAL_CLAUDE_GATE_LABEL],
+      }]]),
+    );
+    assert.equal(r.length, 1);
+    assert.equal(r[0].issueNumber, 1168);
+    assert.equal(r[0].fromColumn, "In Code Review");
+    assert.equal(r[0].toColumn, "Inbox");
+  });
+
+  test("gate label present but review not done → NOT parked (waits for code review)", () => {
+    // Requiring done:code-review lets a mid-review ticket flow normally and a
+    // real review failure (needs-rework:developer) take precedence — that
+    // ticket never gets done:code-review.
+    const r = decideRealClaudeGate(
+      items(["In Code Review", [{
+        id: "i1",
+        issueNumber: 1168,
+        labels: ["size:s", REAL_CLAUDE_GATE_LABEL],
+      }]]),
+    );
+    assert.deepEqual(r, []);
+  });
+
+  test("done:code-review but no gate label → NOT parked", () => {
+    const r = decideRealClaudeGate(
+      items(["In Code Review", [{
+        id: "i1",
+        issueNumber: 42,
+        labels: ["done:code-review", "size:s"],
+      }]]),
+    );
+    assert.deepEqual(r, []);
+  });
+
+  test("gate label in an earlier column → NOT parked (fires only at the code-review boundary)", () => {
+    const r = decideRealClaudeGate(
+      items(["In Development", [{
+        id: "i1",
+        issueNumber: 42,
+        labels: ["done:developer", REAL_CLAUDE_GATE_LABEL],
+      }]]),
+    );
+    assert.deepEqual(r, []);
+  });
+
+  test("belt: decideAutoAdvance refuses to advance a gated ticket past code review", () => {
+    // The structural guarantee, independent of runRealClaudeGate: a ticket
+    // eligible in every other respect must NOT advance to In Documentation
+    // while it carries the gate label.
+    const gated = decideAutoAdvance(
+      AUTO_ADVANCE_RULES,
+      MANUAL_ADVANCE_GATES,
+      items(["In Code Review", [{
+        id: "i1",
+        issueNumber: 1168,
+        labels: ["done:code-review", REAL_CLAUDE_GATE_LABEL],
+      }]]),
+      0,
+      5,
+    );
+    assert.equal(gated.advances.length, 0);
+
+    // Control: the same ticket WITHOUT the label advances normally.
+    const ungated = decideAutoAdvance(
+      AUTO_ADVANCE_RULES,
+      MANUAL_ADVANCE_GATES,
+      items(["In Code Review", [{
+        id: "i1",
+        issueNumber: 1168,
+        labels: ["done:code-review"],
+      }]]),
+      0,
+      5,
+    );
+    assert.equal(ungated.advances.length, 1);
+    assert.equal(ungated.advances[0].toColumn, "In Documentation");
+  });
+
+  test("belt scoped to the boundary: a gated ticket still advances through earlier stages", () => {
+    // The hold must not strand a gated ticket before code review. A gated
+    // ticket with done:developer in In Development still advances to In QA.
+    const r = decideAutoAdvance(
+      AUTO_ADVANCE_RULES,
+      MANUAL_ADVANCE_GATES,
+      items(["In Development", [{
+        id: "i1",
+        issueNumber: 1168,
+        labels: ["done:developer", REAL_CLAUDE_GATE_LABEL],
+      }]]),
+      0,
+      5,
+    );
+    assert.equal(r.advances.length, 1);
+    assert.equal(r.advances[0].toColumn, "In QA");
   });
 });
 

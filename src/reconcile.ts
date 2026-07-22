@@ -31,9 +31,12 @@ import {
   AUTO_ADVANCE_RULES,
   MANUAL_ADVANCE_GATES,
   MID_PIPELINE_COLUMNS,
+  REAL_CLAUDE_GATE_FROM_COLUMN,
+  REAL_CLAUDE_GATE_LABEL,
   REWORK_LOOP_THRESHOLD,
   countPipelineInFlight,
   decideAutoAdvance,
+  decideRealClaudeGate,
   decideReworkRoutes,
   extractReworkCount,
 } from "./pipeline-decisions.js";
@@ -236,6 +239,56 @@ export async function runReworkRouting(client: ReconcileClient): Promise<void> {
   // this, the per-agent loop in the same cycle would see the OLD labels
   // (`needs-rework:<agent>` still present in the cache) and skip
   // dispatch via `shouldSkipDispatch` — defeating the route's intent.
+  if (mutated) {
+    client.clearItemsCache();
+  }
+}
+
+// Real-claude operator gate: a ticket whose acceptance needs a live-claude run
+// the dispatcher cannot perform is parked in Inbox after code review, for an
+// operator to run `make e2e-realclaude` by hand. See decideRealClaudeGate and
+// REAL_CLAUDE_GATE_LABEL in pipeline-decisions.ts. This MUST run before
+// runAutoAdvance so the ticket is pulled out of In Code Review before the
+// forward-advance rule would move it to In Documentation (belt-and-suspenders:
+// decideAutoAdvance also refuses to advance a gated ticket, so a skipped or
+// removed gate step still cannot un-gate one).
+
+export async function runRealClaudeGate(client: ReconcileClient): Promise<void> {
+  const itemsByColumn = new Map<string, ProjectItem[]>();
+  try {
+    const items = await client.getItemsByStatus(REAL_CLAUDE_GATE_FROM_COLUMN);
+    itemsByColumn.set(REAL_CLAUDE_GATE_FROM_COLUMN, items);
+  } catch (error: any) {
+    console.error(`Error scanning ${REAL_CLAUDE_GATE_FROM_COLUMN} for real-claude gate: ${error.message}`);
+    return;
+  }
+
+  const routes = decideRealClaudeGate(itemsByColumn);
+
+  let mutated = false;
+  for (const route of routes) {
+    try {
+      await client.updateItemStatus(route.itemId, route.toColumn);
+      await client.addComment(
+        route.issueNumber,
+        `## 🧪 Real-claude gate — parked for operator\n\n` +
+        `This ticket carries \`${REAL_CLAUDE_GATE_LABEL}\`: its acceptance needs a live-claude run the ` +
+        `dispatcher cannot perform. The dispatch environment has no Claude login, so the real-claude e2e ` +
+        `suite SKIPS rather than runs, and a skip is not a pass.\n\n` +
+        `Code review passed everything machine-checkable. Moved to **${route.toColumn}** so an operator runs ` +
+        `the live gate by hand:\n\n` +
+        `1. \`make e2e-realclaude\` on a machine with a Claude login.\n` +
+        `2. **Pass** → remove \`${REAL_CLAUDE_GATE_LABEL}\` and move the ticket to **In Documentation**.\n` +
+        `3. **Fail** → add \`needs-rework:developer\` and move it to **In Development**.\n\n` +
+        `Do not move it back to In Code Review with the label still on — it will just re-park here.`,
+      );
+      mutated = true;
+      console.log(`   🧪 Real-claude gate: parked #${route.issueNumber} in ${route.toColumn} for operator (${REAL_CLAUDE_GATE_LABEL})`);
+    } catch (e) {
+      console.warn(`   ⚠️  Failed to park #${route.issueNumber} for real-claude gate: ${e}`);
+    }
+  }
+
   if (mutated) {
     client.clearItemsCache();
   }

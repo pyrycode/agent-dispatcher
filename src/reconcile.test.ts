@@ -14,7 +14,7 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 
-import { runAutoAdvance, runReworkRouting, type ReconcileClient } from "./reconcile.js";
+import { runAutoAdvance, runRealClaudeGate, runReworkRouting, type ReconcileClient } from "./reconcile.js";
 import type { ProjectItem } from "./types.js";
 
 /**
@@ -282,6 +282,37 @@ describe("runReworkRouting — cache invalidation", () => {
     const client = new MockClient([]);
 
     await runReworkRouting(client);
+
+    assert.equal(client.updateItemStatusCalls.length, 0);
+    assert.equal(client.clearItemsCacheCalls, 0);
+  });
+});
+
+describe("runRealClaudeGate — parks gated tickets in Inbox", () => {
+  test("routes a reviewed needs-real-claude ticket to Inbox and clears cache", async () => {
+    const item = makeItem({
+      id: "item-1168",
+      issueNumber: 1168,
+      status: "In Code Review",
+      labels: ["done:code-review", "size:s", "needs-real-claude"],
+    });
+    const client = new MockClient([item]);
+
+    await runRealClaudeGate(client);
+
+    assert.equal(client.updateItemStatusCalls.length, 1);
+    assert.equal(client.updateItemStatusCalls[0]?.itemId, "item-1168");
+    assert.equal(client.updateItemStatusCalls[0]?.newStatus, "Inbox");
+    assert.equal(item.status, "Inbox");
+    assert.equal(client.clearItemsCacheCalls, 1);
+  });
+
+  test("leaves an un-reviewed or unlabelled ticket in place (no mutation, no cache clear)", async () => {
+    const unreviewed = makeItem({ id: "a", issueNumber: 1, status: "In Code Review", labels: ["needs-real-claude"] });
+    const unlabelled = makeItem({ id: "b", issueNumber: 2, status: "In Code Review", labels: ["done:code-review"] });
+    const client = new MockClient([unreviewed, unlabelled]);
+
+    await runRealClaudeGate(client);
 
     assert.equal(client.updateItemStatusCalls.length, 0);
     assert.equal(client.clearItemsCacheCalls, 0);

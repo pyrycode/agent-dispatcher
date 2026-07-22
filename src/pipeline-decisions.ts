@@ -201,15 +201,24 @@ export function decideAutoAdvance(
   const gatedAwaiting: { column: string; itemNumbers: number[] }[] = [];
   const backlogHeld: number[] = [];
 
-  const isEligible = (item: DecisionItem, readyLabel: string): boolean =>
+  const isEligible = (item: DecisionItem, rule: AdvanceRule): boolean =>
     item.issueNumber > 0 &&
-    item.labels.includes(readyLabel) &&
+    item.labels.includes(rule.readyLabel) &&
     !item.labels.some(l => l.startsWith("needs-rework:") || l.startsWith("error:")) &&
+    // Real-claude operator gate (belt to runRealClaudeGate). A ticket needing
+    // a live-claude run must not auto-advance past code review: the dispatch
+    // env has no login token, so the real-claude suite SKIPS rather than runs
+    // and a skip reads as a false pass (pyrycode#1168, 2026-07-22). Scoped to
+    // the code-review→documentation boundary so the ticket still flows through
+    // the earlier stages; it holds here and the gate step parks it in Inbox.
+    // This is the structural guarantee — it does not depend on the gate step
+    // running, so removing or breaking that step cannot un-gate a ticket.
+    !(rule.from === REAL_CLAUDE_GATE_FROM_COLUMN && item.labels.includes(REAL_CLAUDE_GATE_LABEL)) &&
     !hasOpenBlockers(item.blockedBy ?? []);
 
   for (const rule of rules) {
     const all = itemsByColumn.get(rule.from) ?? [];
-    const eligible = all.filter(item => isEligible(item, rule.readyLabel));
+    const eligible = all.filter(item => isEligible(item, rule));
 
     if (gates.has(rule.from)) {
       if (eligible.length > 0) {
@@ -344,6 +353,83 @@ export function decideReworkRoutes(
     }
   }
 
+  return routes;
+}
+
+// --------- Real-claude operator gate ---------
+
+/**
+ * Label marking a ticket whose acceptance requires a live-claude run the
+ * dispatcher cannot perform. The dispatch environment has no Claude login
+ * token, so the real-claude e2e suite (`make e2e-realclaude`) SKIPS rather
+ * than runs — and a skip exits 0, which the code-review agent read as a pass.
+ * That false green shipped an unverified permission-path change (pyrycode
+ * PR #1169 / #1168, 2026-07-22, gate still red after merge).
+ *
+ * The pipeline cannot verify live-claude behaviour, so it must not close a
+ * ticket that depends on it. A ticket carrying this label is held at the
+ * code-review→documentation boundary (the structural belt lives in
+ * `decideAutoAdvance`'s eligibility check) and routed to Inbox by
+ * `runRealClaudeGate` for an operator to run the gate by hand. Recognition is
+ * soft (the PO applies the label during refinement, per po/CLAUDE.md);
+ * enforcement is hard (this label, once present, cannot auto-advance).
+ */
+export const REAL_CLAUDE_GATE_LABEL = "needs-real-claude";
+
+/**
+ * The column the gate fires from: the last stage before Done that the
+ * dispatcher can itself complete. Parking a ticket here means every
+ * machine-checkable stage (architecture, dev, QA, code review) is done and
+ * only the live-claude run remains. Firing at exactly one boundary means a
+ * gated ticket flows normally through the earlier stages and stops once.
+ */
+export const REAL_CLAUDE_GATE_FROM_COLUMN = "In Code Review";
+
+/**
+ * Where gated tickets are parked. Reuses the existing "needs a live claude or
+ * an operator" holding column, which no agent runs on, so the ticket is fully
+ * out of the pipeline until an operator acts.
+ */
+export const REAL_CLAUDE_GATE_TO_COLUMN = "Inbox";
+
+/** A single park-to-Inbox move for a real-claude-gated ticket. */
+export interface RealClaudeGateRoute {
+  itemId: string;
+  issueNumber: number;
+  fromColumn: string;
+  toColumn: string;
+}
+
+/**
+ * Pure decision for `runRealClaudeGate`. A ticket in `In Code Review` that has
+ * finished review (`done:code-review`) AND carries `needs-real-claude` is
+ * routed to Inbox.
+ *
+ * Requiring `done:code-review` ensures the machine-checkable review completed
+ * before parking (a mid-review ticket has no such label, so it is left alone),
+ * and lets a real review failure (`needs-rework:developer`) take precedence via
+ * the rework router — that ticket never gets `done:code-review`. Firing only
+ * from `In Code Review` means once a ticket is parked in Inbox it is out of the
+ * scan set: no loop, and the operator-instruction comment posts exactly once.
+ *
+ * Pure over already-collected items; the caller does the I/O.
+ */
+export function decideRealClaudeGate(
+  itemsByColumn: ReadonlyMap<string, readonly DecisionItem[]>,
+): RealClaudeGateRoute[] {
+  const routes: RealClaudeGateRoute[] = [];
+  const items = itemsByColumn.get(REAL_CLAUDE_GATE_FROM_COLUMN) ?? [];
+  for (const item of items) {
+    if (item.issueNumber <= 0) continue;
+    if (!item.labels.includes("done:code-review")) continue;
+    if (!item.labels.includes(REAL_CLAUDE_GATE_LABEL)) continue;
+    routes.push({
+      itemId: item.id,
+      issueNumber: item.issueNumber,
+      fromColumn: REAL_CLAUDE_GATE_FROM_COLUMN,
+      toColumn: REAL_CLAUDE_GATE_TO_COLUMN,
+    });
+  }
   return routes;
 }
 
