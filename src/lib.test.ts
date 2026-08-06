@@ -396,10 +396,39 @@ describe("isMergeConflictError", () => {
     assert.equal(isMergeConflictError(null), false);
   });
 
+  test("matches `gh pr update-branch --rebase`'s conflict phrasing", () => {
+    // THE GAP THAT LET THE DONE-CARD TRAP RUN FOR MONTHS, captured live
+    // from gh on 2026-08-06 against a deliberately conflicting scratch PR:
+    //   X Cannot update PR branch due to conflicts
+    //
+    // This is a DIFFERENT sentence from `gh pr merge`'s, and it matched
+    // none of the three original patterns. It matters more than the merge
+    // one, because runAutoMerge's Step 1.5 rebase runs FIRST and `continue`s
+    // on a non-conflict verdict — so on a conflicting PR the code never
+    // reached Step 2's working detector at all. The result was a silent
+    // skip every cycle forever: no `error:merge-conflict` label, no Discord
+    // notification, and a Done card sitting over an unmerged PR with nothing
+    // anywhere saying so. #1174 sat that way for ten days, #1240 twice.
+    assert.equal(
+      isMergeConflictError("X Cannot update PR branch due to conflicts"),
+      true,
+    );
+  });
+
+  test("matches the 'due to conflicts' phrase alone", () => {
+    // Robust against gh rewording the prefix, the same posture as the
+    // 'merge commit cannot be cleanly created' test above.
+    assert.equal(isMergeConflictError("failed: due to conflicts"), true);
+  });
+
   test("does not match partial-keyword false positives", () => {
     // 'merge' alone, or 'conflict' alone, should NOT match — too broad.
+    // This is why the update-branch fix adds the phrase 'due to conflicts'
+    // rather than widening to a bare 'conflict' substring, which would
+    // regress this case.
     assert.equal(isMergeConflictError("ready to merge"), false);
     assert.equal(isMergeConflictError("name conflict in resource"), false);
+    assert.equal(isMergeConflictError("resolved a naming conflict"), false);
   });
 });
 

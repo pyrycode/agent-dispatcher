@@ -746,19 +746,40 @@ export const GLOBAL_BLOCK_LABELS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * True if the given subprocess stderr/error indicates `gh pr merge` failed
- * because the PR has a merge conflict against its base. Matches the two
- * canonical phrases gh CLI emits ("is not mergeable" / "merge commit cannot
- * be cleanly created") plus the lower-case "merge conflict" phrase older
- * gh versions and other tooling use. Case-insensitive — gh's wording has
- * shifted across versions.
+ * True if the given subprocess stderr/error indicates a gh command failed
+ * because the PR conflicts with its base.
  *
- * Used by the dispatcher's auto-merge loop on Done tickets: if a merge
- * attempt errors and `isMergeConflictError(stderr) === true`, the
- * dispatcher labels the ticket `error:merge-conflict` (a global block),
- * posts a triage comment with the resolution recipe, and stops retrying.
- * Returns `false` for empty / undefined input — caller decides whether
- * "no stderr" means "no error" (skip) or "unknown failure" (also skip).
+ * `runAutoMerge` feeds this the stderr of TWO different gh commands, and
+ * they do not word the conflict the same way. Both shapes are captured
+ * live, not guessed:
+ *
+ *   `gh pr merge --merge`   →  X Pull request owner/repo#N is not mergeable:
+ *                              the merge commit cannot be cleanly created.
+ *   `gh pr update-branch --rebase`
+ *                           →  X Cannot update PR branch due to conflicts
+ *
+ * **The second one was missing until 2026-08-06, and its absence is the
+ * whole mechanism behind the Done-card trap.** Step 1.5 of `runAutoMerge`
+ * rebases before it merges, and on a non-conflict verdict it `continue`s
+ * rather than falling through. So a conflicting PR failed the rebase,
+ * this predicate said "not a conflict", the loop skipped silently, and
+ * Step 2's working detector was never reached. Every cycle, indefinitely:
+ * no `error:merge-conflict` label, no Discord notification, and a Done
+ * card sitting over an unmerged PR with nothing anywhere saying so.
+ * #1174 sat like that for ten days, #1240 twice, #1260 again on 2026-08-06.
+ *
+ * Deliberately matched by PHRASE, not by a bare "conflict" substring: the
+ * negative tests require "name conflict in resource" to stay false, and
+ * widening to the bare word would trade one silent failure for a noisy one.
+ *
+ * Case-insensitive — gh's wording capitalisation has shifted across versions.
+ *
+ * Used by the dispatcher's auto-merge loop on Done tickets: if an attempt
+ * errors and `isMergeConflictError(stderr) === true`, the dispatcher labels
+ * the ticket `error:merge-conflict` (a global block), posts a triage comment
+ * with the resolution recipe, and stops retrying. Returns `false` for empty
+ * / undefined input — caller decides whether "no stderr" means "no error"
+ * (skip) or "unknown failure" (also skip).
  */
 export function isMergeConflictError(stderr: string | null | undefined): boolean {
   if (!stderr) return false;
@@ -766,7 +787,9 @@ export function isMergeConflictError(stderr: string | null | undefined): boolean
   return (
     s.includes("not mergeable") ||
     s.includes("merge commit cannot be cleanly created") ||
-    s.includes("merge conflict")
+    s.includes("merge conflict") ||
+    // `gh pr update-branch --rebase`, the Step 1.5 path.
+    s.includes("due to conflicts")
   );
 }
 
