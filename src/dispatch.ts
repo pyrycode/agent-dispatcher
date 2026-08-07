@@ -62,6 +62,8 @@ import {
   type RealClaudeGateRunner,
 } from "./reconcile.js";
 import {
+  BASELINE_TESTS_PLACEHOLDER,
+  buildBaselineCommand,
   buildBaselineFilter,
   isGateOutputFormat,
   parseGateOutput,
@@ -3213,13 +3215,12 @@ async function runBaselineComparison(opts: {
       "could not build a safe test filter from the failing names, so no comparison was attempted";
     return;
   }
-  if (!opts.baselineCommand.includes("{{TESTS}}")) {
+  const command = buildBaselineCommand(opts.baselineCommand, filter);
+  if (command === null) {
     report.baselineSkipReason =
-      "the baseline command has no {{TESTS}} placeholder, so it would have re-run the whole suite";
+      `the baseline command has no ${BASELINE_TESTS_PLACEHOLDER} placeholder, so it would have re-run the whole suite`;
     return;
   }
-
-  const command = opts.baselineCommand.replaceAll("{{TESTS}}", filter);
   const worktreeDir = resolve(targetRepo, `../.pyrycode-worktrees/real-claude-gate-base-${opts.issueNumber}`);
   const stdoutPath = resolve(opts.logsDir, `${opts.stamp}_real-claude-gate-base_#${opts.issueNumber}.log`);
   const stderrPath = resolve(opts.logsDir, `${opts.stamp}_real-claude-gate-base_#${opts.issueNumber}.stderr.log`);

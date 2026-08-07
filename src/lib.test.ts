@@ -73,7 +73,7 @@ import {
   shouldAddReadyLabel,
   shouldSkipDispatch,
 } from "./pipeline-decisions.js";
-import { buildBaselineFilter, formatGateEvidenceComment, parseGateOutput, stripPackageQualifier } from "./gate-output.js";
+import { buildBaselineCommand, buildBaselineFilter, formatGateEvidenceComment, parseGateOutput, stripPackageQualifier } from "./gate-output.js";
 import {
   decideBranchSetup,
   decideCodegraphSymlink,
@@ -4474,5 +4474,41 @@ describe("decideBaselineAdjustedVerdict", () => {
     assert.deepEqual(o.addLabels, ["error:real-claude-gate"]);
     assert.deepEqual(o.removeLabels, [], "the gate label must survive");
     assert.equal(o.notify, true);
+  });
+});
+
+describe("buildBaselineCommand", () => {
+  test("does NOT let the filter's trailing $' eat the rest of the command", () => {
+    // The 2026-08-07 live failure. `replaceAll` with a string replacement
+    // treats `$'` as "everything after the match", so the anchor plus
+    // closing quote at the end of the filter swallowed the package path and
+    // left the quote open. bash rejected the whole command, the base run
+    // wrote nothing, and the branch was blamed for failures it had not
+    // caused — the exact bug the baseline exists to fix, one layer down.
+    const filter = buildBaselineFilter(["p.TestA", "p.TestB"]);
+    assert.equal(filter, "'^(TestA|TestB)$'");
+
+    const cmd = buildBaselineCommand("go test -json -run {{TESTS}} ./internal/e2e/...", filter!);
+
+    assert.equal(cmd, "go test -json -run '^(TestA|TestB)$' ./internal/e2e/...");
+    // The specific corruption, named so a regression is unmistakable.
+    assert.ok(!cmd!.includes("./internal/e2e/... ./internal/e2e/..."), "the path was duplicated by $' expansion");
+    assert.equal((cmd!.match(/'/g) ?? []).length % 2, 0, "single quotes must be balanced or bash rejects the command");
+  });
+
+  test("leaves $& and backtick-dollar patterns alone too", () => {
+    // Same family of replacement patterns, same fix.
+    assert.equal(buildBaselineCommand("run {{TESTS}} end", "$&"), "run $& end");
+    assert.equal(buildBaselineCommand("run {{TESTS}} end", "$`"), "run $` end");
+  });
+
+  test("substitutes every occurrence", () => {
+    assert.equal(buildBaselineCommand("a {{TESTS}} b {{TESTS}}", "X"), "a X b X");
+  });
+
+  test("returns null when the template has no placeholder", () => {
+    // Substituting nothing would silently re-run the whole suite against
+    // the base, turning a seconds-long check into a second full run.
+    assert.equal(buildBaselineCommand("go test ./...", "'^(TestA)$'"), null);
   });
 });

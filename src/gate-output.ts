@@ -393,6 +393,34 @@ export function buildBaselineFilter(qualifiedFailedNames: readonly string[]): st
   return `'^(${escaped.join("|")})$'`;
 }
 
+/** Placeholder a baseline command template must carry. */
+export const BASELINE_TESTS_PLACEHOLDER = "{{TESTS}}";
+
+/**
+ * Substitute a test filter into a baseline command template.
+ *
+ * Looks trivial and is not. `String.replaceAll` with a STRING replacement
+ * interprets `$'`, `$&` and `` $` `` as substitution patterns, and a filter
+ * built by `buildBaselineFilter` ends in `)$'` — a regex anchor followed by
+ * the closing shell quote. As a string replacement that `$'` expands to
+ * "everything after the match", so the command comes out as
+ * `-run '^(TestA|TestB) ./path ./path` with the quote never closed.
+ *
+ * Observed live on 2026-08-07: bash rejected it with "unexpected EOF while
+ * looking for matching `'`", the base run wrote a zero-byte artifact, and
+ * the comparison reported itself unavailable — so the branch was blamed for
+ * failures it had not caused, which is the exact bug the baseline exists to
+ * fix, reintroduced one layer down.
+ *
+ * A replacer function disables pattern expansion, which is the whole point
+ * of this wrapper. Returns null when the template has no placeholder, since
+ * substituting nothing would silently re-run the entire suite.
+ */
+export function buildBaselineCommand(template: string, filter: string): string | null {
+  if (!template.includes(BASELINE_TESTS_PLACEHOLDER)) return null;
+  return template.replaceAll(BASELINE_TESTS_PLACEHOLDER, () => filter);
+}
+
 // --------- The finished-run report ---------
 
 /**
