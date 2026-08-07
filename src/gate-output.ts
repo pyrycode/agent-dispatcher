@@ -335,6 +335,64 @@ function extractPlaywrightSkipReason(test: any): string {
   return "no reason recorded";
 }
 
+// --------- Baseline re-run filter ---------
+
+/**
+ * Strip the package qualifier `parseGoJson` adds, leaving the bare test
+ * name a test runner's filter understands. `pkg/path.TestFoo/sub` becomes
+ * `TestFoo/sub`.
+ *
+ * Splits at the first dot that introduces a Go test-function prefix rather
+ * than at the first or last dot, because BOTH of those are wrong on real
+ * input. Package paths carry dots (`github.com/...`, and a final segment
+ * can too, as in `gopkg.in/yaml.v2`), so the first dot lands inside the
+ * package. And a test name can carry a dot of its own, so the last dot
+ * lands inside the name: `pkg.Test-a.b` yields `b`, silently turning one
+ * test into a filter for a different one. Go requires these four prefixes,
+ * which makes the boundary unambiguous.
+ *
+ * Returns the input unchanged when no prefix is found, which covers an
+ * already-bare name and any non-Go format.
+ */
+export function stripPackageQualifier(qualifiedName: string): string {
+  const boundary = qualifiedName.match(/\.(Test|Benchmark|Example|Fuzz)/);
+  if (boundary?.index === undefined) return qualifiedName;
+  return qualifiedName.slice(boundary.index + 1);
+}
+
+/**
+ * Build a shell-safe, anchored filter matching exactly the given failed
+ * tests, for re-running them against the base commit.
+ *
+ * Returns null when there is nothing safe to run. That is a refusal, not a
+ * fallback: an empty or unbuildable filter would make the runner re-run the
+ * WHOLE suite against the base, turning a seconds-long check into a second
+ * five-minute run, and a filter that silently dropped a name would compare
+ * different test sets and call a real regression pre-existing.
+ *
+ * Names are rejected rather than escaped when they contain anything outside
+ * a conservative set. Go subtest names can carry arbitrary text with spaces
+ * mapped to underscores, so a name is not guaranteed to be an identifier,
+ * and quoting arbitrary text into a regex inside a shell command is exactly
+ * the kind of two-layer escaping that goes wrong quietly. If any name is
+ * unsafe the whole filter is refused, so the comparison is never partial.
+ */
+export function buildBaselineFilter(qualifiedFailedNames: readonly string[]): string | null {
+  const safe = /^[A-Za-z0-9_/#.\-]+$/;
+  const bare: string[] = [];
+  for (const qualified of qualifiedFailedNames) {
+    const name = stripPackageQualifier(qualified);
+    if (name === "" || !safe.test(name)) return null;
+    if (!bare.includes(name)) bare.push(name);
+  }
+  if (bare.length === 0) return null;
+  // Escape the regex metacharacters the safe set still allows.
+  const escaped = bare.map(n => n.replace(/[.\-]/g, m => `\\${m}`));
+  // Single-quoted so the shell passes it through untouched. The safe set
+  // excludes a single quote, so this cannot be broken out of.
+  return `'^(${escaped.join("|")})$'`;
+}
+
 // --------- The finished-run report ---------
 
 /**
@@ -373,6 +431,21 @@ export interface GateRunReport {
   /** Where the judged bytes live on the dispatcher host. */
   outputPath: string;
   outputBytes: number;
+  /**
+   * Which of the branch's failing tests also fail on the base commit.
+   *
+   * Null means no baseline was run: the branch had no failures, the fork
+   * configured no baseline command, or the baseline itself could not run.
+   * Null is deliberately NOT the same as an empty array. Empty means the
+   * baseline ran and every failure is new; null means nothing is known,
+   * and the two must not collapse, because one of them exonerates a branch
+   * and the other does not.
+   */
+  baselineFailures: string[] | null;
+  /** Why no baseline ran, for the evidence comment. Null when one did. */
+  baselineSkipReason: string | null;
+  /** Where the baseline's own bytes live, when it ran. */
+  baselineOutputPath: string | null;
 }
 
 /**
@@ -392,6 +465,10 @@ export function formatGateEvidenceComment(opts: {
   minExecuted: number;
   /** What the dispatcher did to the board as a result. */
   action: string;
+  /** Failures the branch introduced, per the base comparison. */
+  introduced?: readonly string[];
+  /** Failures that also fail on the base commit. */
+  preExisting?: readonly string[];
 }): string {
   const { report } = opts;
   const heading: Record<string, string> = {
@@ -399,6 +476,7 @@ export function formatGateEvidenceComment(opts: {
     fail: "❌ Real-claude gate — FAIL",
     "zero-executed": "🚨 Real-claude gate — NOTHING EXECUTED",
     unusable: "🚨 Real-claude gate — NO USABLE RESULT",
+    "inherited-failure": "⚠️ Real-claude gate — FAILURES THIS BRANCH DID NOT CAUSE",
   };
 
   const lines: string[] = [];
@@ -451,12 +529,37 @@ export function formatGateEvidenceComment(opts: {
     lines.push("");
 
     if (tally.failedNames.length > 0) {
-      lines.push(`**Failed (${tally.failed})**`);
-      lines.push("");
-      for (const name of tally.failedNames.slice(0, 25)) lines.push(`- \`${name}\``);
-      if (tally.failedNames.length > 25) {
-        lines.push(`- …and ${tally.failedNames.length - 25} more, see the full output`);
+      const introduced = opts.introduced ?? [];
+      const preExisting = opts.preExisting ?? [];
+      const compared = report.baselineFailures !== null;
+
+      if (compared && preExisting.length > 0) {
+        lines.push(`**Already failing on \`${report.baseRef}\` (${preExisting.length})** — not caused by this branch:`);
+        lines.push("");
+        for (const name of preExisting.slice(0, 25)) lines.push(`- \`${name}\``);
+        lines.push("");
       }
+
+      const own = compared ? introduced : tally.failedNames;
+      if (own.length > 0) {
+        lines.push(
+          compared
+            ? `**Failing here but passing on \`${report.baseRef}\` (${own.length})** — introduced by this branch:`
+            : `**Failed (${tally.failed})**`,
+        );
+        lines.push("");
+        for (const name of own.slice(0, 25)) lines.push(`- \`${name}\``);
+        if (own.length > 25) lines.push(`- …and ${own.length - 25} more, see the full output`);
+        lines.push("");
+      }
+
+      lines.push(
+        compared
+          ? `The failing tests were re-run against \`${report.baseRef}\` alone, unmerged, to separate what this ` +
+            `branch broke from what it inherited. Base output: \`${report.baselineOutputPath}\`.`
+          : `**No base comparison was made**, so these failures are attributed to this branch by default. ` +
+            `Reason: ${report.baselineSkipReason ?? "unknown"}.`,
+      );
       lines.push("");
     }
 

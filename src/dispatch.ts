@@ -62,6 +62,7 @@ import {
   type RealClaudeGateRunner,
 } from "./reconcile.js";
 import {
+  buildBaselineFilter,
   isGateOutputFormat,
   parseGateOutput,
   type GateOutputFormat,
@@ -199,6 +200,23 @@ const REAL_CLAUDE_GATE_TIMEOUT_MS =
 // loses all of itself.
 const REAL_CLAUDE_GATE_MIN_EXECUTED =
   Number(process.env.PYRY_REAL_CLAUDE_GATE_MIN_EXECUTED) || 1;
+
+// Command for the base-commit re-run, used ONLY when the branch run has
+// named failures. `{{TESTS}}` is replaced with an anchored, shell-quoted
+// filter matching exactly those tests, so this costs seconds rather than a
+// second full suite.
+//
+// Without it the gate cannot tell "this branch broke it" from "it was
+// already broken". On the first live run, 2026-08-07, pyrycode#1382 was
+// routed to the developer agent for two failures that reproduce identically
+// on clean main and have nothing to do with the ticket. Unset means no
+// comparison, and a failure is then attributed to the branch as before.
+//
+// Do NOT wrap `{{TESTS}}` in quotes here; the substituted value brings its
+// own. For pyrycode:
+//   go test -tags e2e_realclaude -timeout 20m -json -run {{TESTS}} ./internal/e2e/realclaude/...
+const REAL_CLAUDE_GATE_BASELINE_CMD =
+  (process.env.PYRY_REAL_CLAUDE_GATE_BASELINE_CMD ?? "").trim();
 
 // Env-var validation moved to dispatch-bin.ts (the entry-point module).
 // Library callers don't need the dispatcher's env vars at import time —
@@ -2975,6 +2993,9 @@ export const DEFAULT_GATE_RUNNER_DEPS: GateRunnerDeps = {
 export async function runRealClaudeGateSuite(opts: {
   issueNumber: number;
   command: string;
+  /** Base-commit re-run template with a `{{TESTS}}` placeholder. Empty
+   *  disables the comparison. */
+  baselineCommand?: string;
   format: GateOutputFormat;
   timeoutMs: number;
   /** Overridable for tests; defaults to the module-level target repo. */
@@ -3015,6 +3036,9 @@ export async function runRealClaudeGateSuite(opts: {
     durationMs: 0,
     outputPath: stdoutPath,
     outputBytes: 0,
+    baselineFailures: null,
+    baselineSkipReason: opts.baselineCommand ? null : "no baseline command configured for this fork",
+    baselineOutputPath: null,
   };
   const finish = (runError?: string): GateRunReport => {
     if (runError !== undefined) report.runError = runError;
@@ -3124,9 +3148,141 @@ export async function runRealClaudeGateSuite(opts: {
     }
     if (raw !== null) report.tally = parseGateOutput(raw, opts.format);
 
+    // Base-commit comparison, only when the branch actually failed named
+    // tests. Answers the one question the branch run cannot: did this
+    // branch break these, or were they already broken? Runs against the
+    // base ALONE, unmerged, which is exactly "what happens without my
+    // work". Filtered to the failing names, so it costs seconds.
+    const failedNames = report.tally?.failedNames ?? [];
+    if (failedNames.length > 0 && opts.baselineCommand) {
+      await runBaselineComparison({
+        report,
+        failedNames,
+        baselineCommand: opts.baselineCommand,
+        baseSha: report.baseSha,
+        format: opts.format,
+        timeoutMs: opts.timeoutMs,
+        issueNumber: opts.issueNumber,
+        targetRepo,
+        logsDir,
+        stamp,
+        deps,
+      });
+    } else if (failedNames.length === 0 && report.baselineSkipReason === null) {
+      report.baselineSkipReason = "no named test failures to compare";
+    }
+
     return finish();
   } catch (e: any) {
     return finish(`gate run failed unexpectedly: ${e?.message ?? e}`);
+  } finally {
+    removeWorktree();
+  }
+}
+
+/**
+ * Re-run just the branch's failing tests against the base commit, alone and
+ * unmerged, and record which of them fail there too.
+ *
+ * Mutates `report` rather than returning, because every outcome here is
+ * evidence about the main run and belongs in the same report. It never
+ * throws and never fails the gate: a baseline that cannot run leaves
+ * `baselineFailures` null, which the pure decision reads as "nothing known"
+ * and which leaves the failures attributed to the branch. That is the safe
+ * direction. Treating an unknown as pre-existing would let a genuine
+ * regression park as somebody else's problem.
+ */
+async function runBaselineComparison(opts: {
+  report: GateRunReport;
+  failedNames: readonly string[];
+  baselineCommand: string;
+  baseSha: string;
+  format: GateOutputFormat;
+  timeoutMs: number;
+  issueNumber: number;
+  targetRepo: string;
+  logsDir: string;
+  stamp: string;
+  deps: GateRunnerDeps;
+}): Promise<void> {
+  const { report, deps, targetRepo } = opts;
+
+  const filter = buildBaselineFilter(opts.failedNames);
+  if (filter === null) {
+    report.baselineSkipReason =
+      "could not build a safe test filter from the failing names, so no comparison was attempted";
+    return;
+  }
+  if (!opts.baselineCommand.includes("{{TESTS}}")) {
+    report.baselineSkipReason =
+      "the baseline command has no {{TESTS}} placeholder, so it would have re-run the whole suite";
+    return;
+  }
+
+  const command = opts.baselineCommand.replaceAll("{{TESTS}}", filter);
+  const worktreeDir = resolve(targetRepo, `../.pyrycode-worktrees/real-claude-gate-base-${opts.issueNumber}`);
+  const stdoutPath = resolve(opts.logsDir, `${opts.stamp}_real-claude-gate-base_#${opts.issueNumber}.log`);
+  const stderrPath = resolve(opts.logsDir, `${opts.stamp}_real-claude-gate-base_#${opts.issueNumber}.stderr.log`);
+
+  const removeWorktree = () => {
+    try { deps.execSync(`git worktree remove --force "${worktreeDir}"`, { cwd: targetRepo, stdio: "pipe" }); } catch {}
+    try { deps.execSync(`git worktree prune`, { cwd: targetRepo, stdio: "pipe" }); } catch {}
+  };
+
+  removeWorktree();
+  try {
+    deps.execSync(`git worktree add --detach "${worktreeDir}" ${opts.baseSha}`, {
+      cwd: targetRepo, stdio: "pipe", timeout: 120_000,
+    });
+  } catch (e: any) {
+    removeWorktree();
+    report.baselineSkipReason = `could not create the base worktree: ${e?.message ?? e}`;
+    return;
+  }
+
+  try {
+    console.log(`   🔎 Real-claude gate: re-running ${opts.failedNames.length} failing test(s) against the base commit…`);
+    const outcome = await deps.spawnGate({
+      command,
+      cwd: worktreeDir,
+      env: buildGateSpawnEnv(process.env),
+      timeoutMs: opts.timeoutMs,
+      stdoutPath,
+      stderrPath,
+    });
+    report.baselineOutputPath = stdoutPath;
+
+    if (outcome.timedOut) {
+      report.baselineSkipReason = "the base re-run hit the outer timeout, so its result is a truncated prefix";
+      return;
+    }
+
+    let raw: string;
+    try {
+      raw = deps.readFileSync(stdoutPath, "utf-8").toString();
+    } catch (e: any) {
+      report.baselineSkipReason = `could not read the base re-run's output back: ${e?.message ?? e}`;
+      return;
+    }
+
+    const baseTally = parseGateOutput(raw, opts.format);
+    if (baseTally.recognizedLines === 0) {
+      report.baselineSkipReason = "the base re-run produced no readable test events";
+      return;
+    }
+    // A base run where the tests SKIPPED tells us nothing. It is the same
+    // false green the whole gate exists to reject, and accepting it here
+    // would exonerate every branch by default.
+    if (baseTally.executed === 0) {
+      report.baselineSkipReason =
+        `the base re-run executed nothing (${baseTally.skipped} skipped), so it cannot exonerate or convict anything`;
+      return;
+    }
+
+    report.baselineFailures = baseTally.failedNames;
+    report.baselineSkipReason = null;
+  } catch (e: any) {
+    report.baselineSkipReason = `the base re-run failed unexpectedly: ${e?.message ?? e}`;
   } finally {
     removeWorktree();
   }
@@ -3144,6 +3300,7 @@ export function makeRealClaudeGateRunner(): RealClaudeGateRunner | null {
   return ({ issueNumber }) => runRealClaudeGateSuite({
     issueNumber,
     command: REAL_CLAUDE_GATE_CMD,
+    baselineCommand: REAL_CLAUDE_GATE_BASELINE_CMD,
     format,
     timeoutMs: REAL_CLAUDE_GATE_TIMEOUT_MS,
   });

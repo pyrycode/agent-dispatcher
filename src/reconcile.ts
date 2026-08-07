@@ -37,6 +37,7 @@ import {
   REWORK_LOOP_THRESHOLD,
   countPipelineInFlight,
   decideAutoAdvance,
+  decideBaselineAdjustedVerdict,
   decideGateOutcome,
   decideGateVerdict,
   decideRealClaudeGate,
@@ -424,23 +425,38 @@ export async function runRealClaudeGateExecution(
       durationMs: 0,
       outputPath: "(none)",
       outputBytes: 0,
+      baselineFailures: null,
+      baselineSkipReason: "the runner threw before any comparison could run",
+      baselineOutputPath: null,
     };
   }
 
   try {
-    const { verdict, reason } = decideGateVerdict({
+    const raw = decideGateVerdict({
       runError: report.runError,
       timedOut: report.timedOut,
       tally: report.tally,
       exitCode: report.exitCode,
       minExecuted,
     });
+    // Re-judge a failure against what the base commit already fails, so a
+    // branch is not blamed for breakage it inherited. No-op for every other
+    // verdict, and a no-op when no baseline ran.
+    const { verdict, reason, introduced, preExisting } = decideBaselineAdjustedVerdict({
+      verdict: raw.verdict,
+      reason: raw.reason,
+      branchFailures: report.tally?.failedNames ?? [],
+      baselineFailures: report.baselineFailures,
+    });
     const outcome = decideGateOutcome(verdict);
 
     const action = outcome.toColumn === null
       ? `left it in ${REAL_CLAUDE_GATE_RUN_FROM_COLUMN} and added \`${outcome.addLabels.join("`, `")}\`. ` +
-        `This needs a human: the gate could not produce a trustworthy answer, and no agent can fix that by ` +
-        `rewriting code.`
+        (verdict === "inherited-failure"
+          ? `This needs a human: the failures are real but this branch did not cause them, so there is nothing ` +
+            `for the developer agent to fix. Repair the base, file the failures, or let the ticket through.`
+          : `This needs a human: the gate could not produce a trustworthy answer, and no agent can fix that by ` +
+            `rewriting code.`)
       : `moved it to **${outcome.toColumn}**` +
         (outcome.addLabels.length > 0 ? `, added \`${outcome.addLabels.join("`, `")}\`` : "") +
         (outcome.removeLabels.length > 0 ? `, removed \`${outcome.removeLabels.join("`, `")}\`` : "") +
@@ -461,7 +477,7 @@ export async function runRealClaudeGateExecution(
     try {
       await client.addComment(
         candidate.issueNumber,
-        formatGateEvidenceComment({ verdict, reason, report, minExecuted, action }),
+        formatGateEvidenceComment({ verdict, reason, report, minExecuted, action, introduced, preExisting }),
       );
     } catch (e) {
       console.warn(`   ⚠️  Failed to post real-claude gate evidence on #${candidate.issueNumber}: ${e}`);

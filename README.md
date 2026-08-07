@@ -69,6 +69,7 @@ Optional:
 | `PYRY_REAL_CLAUDE_GATE_FORMAT` | `go-json` | How to read what the command wrote: `go-json` or `playwright-json` |
 | `PYRY_REAL_CLAUDE_GATE_TIMEOUT_MS` | `1800000` | Outer wall clock for one gate run. Must exceed the command's own inner timeout. |
 | `PYRY_REAL_CLAUDE_GATE_MIN_EXECUTED` | `1` | Floor for the executed-test guard. Set near the suite's real count. |
+| `PYRY_REAL_CLAUDE_GATE_BASELINE_CMD` | — | Base-commit re-run template with a `{{TESTS}}` placeholder. Runs only when the branch has named failures, so it costs seconds. Unset means failures are attributed to the branch. |
 
 > **Load order.** `dotenv` now loads the fork's `.env` before any module-top constant reads `process.env`, so every variable in this table works from the file. Before 2026-08-07 the load sat below several of those reads, and `TARGET_REPO_PATH`, `TARGET_DEFAULT_BRANCH`, `SALVAGE_GATES` and `PYRY_AUTOCURATE_MEMORY` were silently file-blind — each fork's launcher pre-exported `TARGET_REPO_PATH` to work around it. Values a launcher exports, or that `op run --env-file` injects, still take precedence over the file.
 
@@ -84,8 +85,19 @@ Some tickets can only be accepted by running against real claude rather than the
 |---|---|---|---|
 | pass | → In Documentation | removes `needs-real-claude` | no |
 | fail | → In Development | adds `needs-rework:developer`, **keeps** `needs-real-claude` | no |
+| failures the branch inherited | stays in Inbox | adds `error:real-claude-gate` | yes |
 | nothing executed | stays in Inbox | adds `error:real-claude-gate` | yes |
 | no usable result | stays in Inbox | adds `error:real-claude-gate` | yes |
+
+**The base comparison, and why it exists.** On the gate's first live run, 2026-08-07, a ticket came back with 519 passed and 2 failed and was routed to the developer agent. Both failures reproduced identically on clean `main` and neither touched the ticket's subject. Without a baseline the gate cannot tell "this branch broke it" from "it was already broken", so it hands an agent work it did not cause and cannot fix, burning rework attempts until the breaker halts it.
+
+So when a run fails with named tests, the gate re-runs **only those tests** against the base commit alone, unmerged, in a second detached worktree. Tests red on both sides are reported as inherited and the ticket parks for a human; only tests green on the base and red on the branch route as rework. Set it up as:
+
+```sh
+PYRY_REAL_CLAUDE_GATE_BASELINE_CMD='go test -tags e2e_realclaude -timeout 20m -json -run {{TESTS}} ./internal/e2e/realclaude/...'
+```
+
+Do not quote `{{TESTS}}` yourself; the substituted filter brings its own quoting. Two refusals are deliberate. A name containing anything outside a conservative character set refuses the whole filter rather than dropping that name, because a partial filter compares different test sets on the two sides. And a base run that executes nothing, the same false green the gate exists to reject, is discarded rather than treated as exoneration. In both cases `baselineFailures` stays null and the failures remain the branch's, since **a missing baseline is not an exoneration**.
 
 A failure keeps `needs-real-claude` so the ticket must pass the gate again after the fix; `runReworkRouting` strips the stale `done:*` trail and brings its three-strike breaker along. Environment failures park rather than routing to the developer agent, which could not fix a missing credential and would burn three spawns discovering that. The `error:` prefix already excludes a ticket from the WIP count and from gate re-selection, so the park is self-limiting.
 

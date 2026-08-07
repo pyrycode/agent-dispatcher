@@ -377,6 +377,9 @@ function report(overrides: Partial<GateRunReport> = {}): GateRunReport {
     durationMs: 308_022,
     outputPath: "/logs/gate.log",
     outputBytes: 2_100_000,
+    baselineFailures: null,
+    baselineSkipReason: "no named test failures to compare",
+    baselineOutputPath: null,
     ...overrides,
   };
 }

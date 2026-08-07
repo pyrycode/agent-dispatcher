@@ -536,7 +536,13 @@ export type GateVerdict =
   /** The suite ran but verified (almost) nothing — the 2026-07-22 shape. */
   | "zero-executed"
   /** No trustworthy answer: run error, timeout, or unreadable artifact. */
-  | "unusable";
+  | "unusable"
+  /**
+   * Real failures, but every one of them also fails on the base commit, so
+   * the branch introduced none of them. Not a pass, because the suite is
+   * genuinely red; not the branch's fault either.
+   */
+  | "inherited-failure";
 
 /** Everything `decideGateVerdict` is allowed to look at. */
 export interface GateVerdictInput {
@@ -656,6 +662,89 @@ export function decideGateVerdict(input: GateVerdictInput): GateVerdictDecision 
   return { verdict: "pass", reason: `${tally.executed} test(s) executed, none failed` };
 }
 
+/** What a baseline comparison concluded about a branch's failures. */
+export interface BaselineAdjustedVerdict {
+  verdict: GateVerdict;
+  reason: string;
+  /** Failures the branch introduced: red here, green on the base. */
+  introduced: string[];
+  /** Failures the branch inherited: red both ways. */
+  preExisting: string[];
+}
+
+/**
+ * Re-judge a failing run against what the base commit already fails.
+ *
+ * **Why this exists.** On the gate's first live run, 2026-08-07, pyrycode
+ * #1382 came back with 519 passed and 2 failed and was routed to the
+ * developer agent. Both failures reproduced identically on clean `main`,
+ * and neither touched the ticket's subject. Without a baseline the gate
+ * cannot tell "this branch broke it" from "it was already broken", so it
+ * hands a developer agent work it did not cause and cannot fix, and burns
+ * rework attempts until the three-strike breaker halts it.
+ *
+ * Kept separate from `decideGateVerdict` rather than folded into it, so
+ * that function stays a judgement about one run and its ordering invariant
+ * stays easy to state and to test. This one only ever runs after it, and
+ * only on a failure.
+ *
+ * **A missing baseline is not an exoneration.** When `baselineFailures` is
+ * null nothing was compared, so the verdict is left alone at `fail`. Null
+ * and empty must not collapse: empty means the baseline ran and every
+ * failure is new, null means nothing is known. Treating unknown as
+ * pre-existing would let a genuine regression park quietly as somebody
+ * else's problem, which is a worse failure than the one this fixes.
+ */
+export function decideBaselineAdjustedVerdict(opts: {
+  verdict: GateVerdict;
+  /** Failing test names from the branch run, package-qualified. */
+  branchFailures: readonly string[];
+  /** Failing names from the base re-run, or null when none ran. */
+  baselineFailures: readonly string[] | null;
+  reason: string;
+}): BaselineAdjustedVerdict {
+  // Only a failure has anything to compare. Every other verdict is about
+  // whether the run is trustworthy at all, which a baseline cannot change.
+  if (opts.verdict !== "fail") {
+    return { verdict: opts.verdict, reason: opts.reason, introduced: [], preExisting: [] };
+  }
+
+  if (opts.baselineFailures === null) {
+    return {
+      verdict: "fail",
+      reason: `${opts.reason}; no base comparison was available, so the failures are treated as this branch's`,
+      introduced: [...opts.branchFailures],
+      preExisting: [],
+    };
+  }
+
+  const baseSet = new Set(opts.baselineFailures);
+  const introduced = opts.branchFailures.filter(name => !baseSet.has(name));
+  const preExisting = opts.branchFailures.filter(name => baseSet.has(name));
+
+  // A package-level failure with no named failing test cannot be attributed
+  // either way, so it keeps the branch on the hook.
+  if (introduced.length === 0 && opts.branchFailures.length > 0) {
+    return {
+      verdict: "inherited-failure",
+      reason:
+        `${preExisting.length} test(s) failed, and every one of them fails on the base commit too, ` +
+        `so this branch introduced none of them`,
+      introduced,
+      preExisting,
+    };
+  }
+
+  return {
+    verdict: "fail",
+    reason: preExisting.length > 0
+      ? `${introduced.length} test(s) failed that pass on the base commit, plus ${preExisting.length} already failing there`
+      : opts.reason,
+    introduced,
+    preExisting,
+  };
+}
+
 /** Board actions for one gate verdict. */
 export interface GateOutcome {
   /** Target column, or null to leave the ticket where it is. */
@@ -707,6 +796,12 @@ export function decideGateOutcome(verdict: GateVerdict): GateOutcome {
       };
     case "zero-executed":
     case "unusable":
+    case "inherited-failure":
+      // `inherited-failure` parks for the same reason the other two do: no
+      // agent can fix it. A developer handed a failure the branch did not
+      // cause has nothing to act on, and would spend all three rework
+      // attempts finding that out. It needs a human to decide whether to
+      // fix the base, file the failure, or let the ticket through.
       return {
         toColumn: null,
         addLabels: [REAL_CLAUDE_GATE_ERROR_LABEL],

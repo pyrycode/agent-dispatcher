@@ -67,12 +67,13 @@ import {
   decideRealClaudeGate,
   decideGateOutcome,
   decideGateVerdict,
+  decideBaselineAdjustedVerdict,
   decideRealClaudeGateRun,
   REAL_CLAUDE_GATE_LABEL,
   shouldAddReadyLabel,
   shouldSkipDispatch,
 } from "./pipeline-decisions.js";
-import { formatGateEvidenceComment, parseGateOutput } from "./gate-output.js";
+import { buildBaselineFilter, formatGateEvidenceComment, parseGateOutput, stripPackageQualifier } from "./gate-output.js";
 import {
   decideBranchSetup,
   decideCodegraphSymlink,
@@ -4327,6 +4328,9 @@ describe("formatGateEvidenceComment", () => {
     durationMs: 308_022,
     outputPath: "/logs/gate.log",
     outputBytes: 2_100_000,
+    baselineFailures: null,
+    baselineSkipReason: null,
+    baselineOutputPath: null,
   };
 
   test("carries the commits-behind figure so the merged-state claim is auditable", () => {
@@ -4360,5 +4364,115 @@ describe("formatGateEvidenceComment", () => {
       report: { ...baseReport, commitsBehind: null }, minExecuted: 150, action: "advanced",
     });
     assert.match(body, /could not be computed/);
+  });
+});
+
+describe("buildBaselineFilter", () => {
+  test("builds an anchored, shell-quoted alternation from qualified names", () => {
+    const f = buildBaselineFilter(["pkg/path.TestA", "pkg/path.TestB/sub_case"]);
+    assert.equal(f, "'^(TestA|TestB/sub_case)$'");
+  });
+
+  test("strips only the package qualifier, keeping subtest paths", () => {
+    assert.equal(stripPackageQualifier("github.com/o/r/internal/e2e.TestA/b/c"), "TestA/b/c");
+    assert.equal(stripPackageQualifier("TestBare"), "TestBare");
+  });
+
+  test("deduplicates repeated names", () => {
+    assert.equal(buildBaselineFilter(["p.TestA", "p.TestA"]), "'^(TestA)$'");
+  });
+
+  test("escapes the regex metacharacters the safe set allows", () => {
+    assert.equal(buildBaselineFilter(["p.TestA-x.y"]), "'^(TestA\\-x\\.y)$'");
+  });
+
+  test("finds the package boundary even when the test name carries a dot", () => {
+    // Splitting on the last dot yields "y" here, a filter for a test that
+    // does not exist, and the base run then finds no failures and
+    // exonerates the branch. Splitting on the first dot lands inside
+    // "github.com". Both are wrong on real input.
+    assert.equal(stripPackageQualifier("github.com/o/r/internal.TestA-x.y"), "TestA-x.y");
+    assert.equal(stripPackageQualifier("gopkg.in/yaml.v2.TestThing"), "TestThing");
+  });
+
+  test("REFUSES rather than dropping when a name is unsafe", () => {
+    // Dropping a name would compare different test sets on the two sides
+    // and could call a real regression pre-existing. Refusing the whole
+    // filter is the only safe partial state.
+    assert.equal(buildBaselineFilter(["p.TestOk", "p.Test'; rm -rf /"]), null);
+    assert.equal(buildBaselineFilter(["p.Test With Space"]), null);
+    assert.equal(buildBaselineFilter(["p.Test$(whoami)"]), null);
+  });
+
+  test("returns null for an empty list rather than a match-everything filter", () => {
+    // An empty filter would re-run the WHOLE suite against the base,
+    // turning a seconds-long check into a second five-minute run.
+    assert.equal(buildBaselineFilter([]), null);
+  });
+});
+
+describe("decideBaselineAdjustedVerdict", () => {
+  const base = { verdict: "fail" as const, reason: "2 test(s) failed", branchFailures: ["p.TestA", "p.TestB"] };
+
+  test("failures that also fail on the base become inherited-failure", () => {
+    // The pyrycode#1382 case, 2026-08-07: 519 passed, 2 failed, and both
+    // failures reproduce identically on clean main with nothing to do with
+    // the ticket. Routing that to the developer wastes rework attempts on
+    // work it cannot do.
+    const d = decideBaselineAdjustedVerdict({ ...base, baselineFailures: ["p.TestA", "p.TestB"] });
+    assert.equal(d.verdict, "inherited-failure");
+    assert.deepEqual(d.introduced, []);
+    assert.deepEqual(d.preExisting, ["p.TestA", "p.TestB"]);
+  });
+
+  test("a single branch-introduced failure keeps the whole run a fail", () => {
+    // One genuine regression is not excused by its neighbours being old.
+    const d = decideBaselineAdjustedVerdict({ ...base, baselineFailures: ["p.TestA"] });
+    assert.equal(d.verdict, "fail");
+    assert.deepEqual(d.introduced, ["p.TestB"]);
+    assert.deepEqual(d.preExisting, ["p.TestA"]);
+  });
+
+  test("no overlap at all is an ordinary fail", () => {
+    const d = decideBaselineAdjustedVerdict({ ...base, baselineFailures: [] });
+    assert.equal(d.verdict, "fail");
+    assert.deepEqual(d.introduced, ["p.TestA", "p.TestB"]);
+  });
+
+  test("INVARIANT: a MISSING baseline never exonerates a branch", () => {
+    // null and empty must not collapse. Empty means the baseline ran and
+    // every failure is new; null means nothing is known. Treating unknown
+    // as pre-existing would let a real regression park as somebody else's
+    // problem, which is worse than the bug this fixes.
+    const d = decideBaselineAdjustedVerdict({ ...base, baselineFailures: null });
+    assert.equal(d.verdict, "fail");
+    assert.match(d.reason, /no base comparison was available/);
+    assert.deepEqual(d.preExisting, []);
+  });
+
+  test("a package-level failure with no named test stays the branch's problem", () => {
+    // Nothing to attribute, so nothing is excused.
+    const d = decideBaselineAdjustedVerdict({
+      verdict: "fail", reason: "suite-level failure", branchFailures: [], baselineFailures: [],
+    });
+    assert.equal(d.verdict, "fail");
+  });
+
+  test("leaves every non-fail verdict untouched", () => {
+    // A baseline says nothing about whether a run is trustworthy at all.
+    for (const v of ["pass", "zero-executed", "unusable"] as const) {
+      const d = decideBaselineAdjustedVerdict({
+        verdict: v, reason: "r", branchFailures: [], baselineFailures: ["p.TestA"],
+      });
+      assert.equal(d.verdict, v);
+    }
+  });
+
+  test("inherited-failure parks rather than routing to the developer", () => {
+    const o = decideGateOutcome("inherited-failure");
+    assert.equal(o.toColumn, null);
+    assert.deepEqual(o.addLabels, ["error:real-claude-gate"]);
+    assert.deepEqual(o.removeLabels, [], "the gate label must survive");
+    assert.equal(o.notify, true);
   });
 });
