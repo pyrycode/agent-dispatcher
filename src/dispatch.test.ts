@@ -24,6 +24,7 @@ import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -54,6 +55,7 @@ import {
   type SigintState,
   buildGateSpawnEnv,
   runRealClaudeGateSuite,
+  spawnGateCommand,
   type GateRunnerDeps,
   type GateSpawnOutcome,
   type GateSpawnRequest,
@@ -4499,5 +4501,107 @@ describe("buildGateSpawnEnv", () => {
     await run();
     assert.ok(!("GITHUB_TOKEN" in spawnRequests[0].env));
     assert.ok(!("ANTHROPIC_API_KEY" in spawnRequests[0].env));
+  });
+});
+
+describe("spawnGateCommand — the real spawner", () => {
+  // The seam exists so no other test needs a child process. These few do,
+  // because the default spawner is the one piece the seam cannot cover, and
+  // the bug it hides is invisible to any fake: a promise that never settles
+  // does not fail, it lets Node's event loop drain and the process exit 0.
+
+  const tmp = (name: string) => resolve(tmpdir(), `gate-spawn-test-${process.pid}-${name}`);
+
+  test("resolves even when the output streams close before the child event", { timeout: 15_000 }, async () => {
+    // The 2026-08-07 hang. A command that finishes instantly closes both
+    // pipes in the same tick the child's own `close` fires. Listeners armed
+    // after that point never hear it, the promise never settles, and the
+    // dispatcher exits silently with the artifact written and no verdict.
+    // Observed twice live against pyrycode#1382.
+    //
+    // A regression here does not throw, it never settles. The explicit
+    // timeout is the assertion, and it must stay: without it the suite would
+    // hang forever instead of reporting a failure.
+    const stdoutPath = tmp("fast.log");
+    const stderrPath = tmp("fast.err.log");
+
+    const outcome = await spawnGateCommand({
+      command: "echo done",
+      cwd: tmpdir(),
+      env: { PATH: process.env.PATH ?? "" },
+      timeoutMs: 30_000,
+      stdoutPath,
+      stderrPath,
+    });
+
+    assert.equal(outcome.exitCode, 0);
+    assert.equal(outcome.timedOut, false);
+    assert.equal(outcome.spawnError, null);
+  });
+
+  test("the output file is complete by the time it returns", { timeout: 15_000 }, async () => {
+    // The caller judges by reading this file back off disk. Returning before
+    // the write stream flushed would let it read a partial artifact and call
+    // a complete run truncated.
+    const stdoutPath = tmp("complete.log");
+    const stderrPath = tmp("complete.err.log");
+
+    await spawnGateCommand({
+      command: "for i in 1 2 3 4 5; do echo \"line $i\"; done",
+      cwd: tmpdir(),
+      env: { PATH: process.env.PATH ?? "" },
+      timeoutMs: 30_000,
+      stdoutPath,
+      stderrPath,
+    });
+
+    assert.equal(readFileSync(stdoutPath, "utf-8").trim().split("\n").length, 5);
+  });
+
+  test("reports a non-zero exit rather than throwing", { timeout: 15_000 }, async () => {
+    const outcome = await spawnGateCommand({
+      command: "exit 7",
+      cwd: tmpdir(),
+      env: { PATH: process.env.PATH ?? "" },
+      timeoutMs: 30_000,
+      stdoutPath: tmp("fail.log"),
+      stderrPath: tmp("fail.err.log"),
+    });
+
+    assert.equal(outcome.exitCode, 7);
+    assert.equal(outcome.spawnError, null);
+  });
+
+  test("keeps stderr out of the judged artifact", { timeout: 15_000 }, async () => {
+    // Merging them could split a JSON event in half. The parser tolerates
+    // junk lines; it cannot reassemble a bisected one.
+    const stdoutPath = tmp("split.log");
+    const stderrPath = tmp("split.err.log");
+
+    await spawnGateCommand({
+      command: "echo to-stdout; echo to-stderr >&2",
+      cwd: tmpdir(),
+      env: { PATH: process.env.PATH ?? "" },
+      timeoutMs: 30_000,
+      stdoutPath,
+      stderrPath,
+    });
+
+    assert.equal(readFileSync(stdoutPath, "utf-8").trim(), "to-stdout");
+    assert.equal(readFileSync(stderrPath, "utf-8").trim(), "to-stderr");
+  });
+
+  test("a timeout tears the command down and reports it", { timeout: 15_000 }, async () => {
+    const outcome = await spawnGateCommand({
+      command: "sleep 30",
+      cwd: tmpdir(),
+      env: { PATH: process.env.PATH ?? "" },
+      timeoutMs: 300,
+      stdoutPath: tmp("timeout.log"),
+      stderrPath: tmp("timeout.err.log"),
+    });
+
+    assert.equal(outcome.timedOut, true, "expected the outer wall clock to fire");
+    assert.notEqual(outcome.exitCode, 0, "a killed command must not look successful");
   });
 });

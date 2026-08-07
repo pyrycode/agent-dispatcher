@@ -2849,6 +2849,29 @@ export const spawnGateCommand: GateSpawner = async (req) => {
 
   const out = createWriteStream(req.stdoutPath);
   const err = createWriteStream(req.stderrPath);
+
+  // Arm the close listeners BEFORE the child can finish, and treat an
+  // already-closed stream as closed.
+  //
+  // Attaching them after `await childDone` looks equivalent and is not. The
+  // pipes end when the child does, so both streams can emit `close` in the
+  // same tick the child's own `close` fires — before a later listener exists.
+  // The promise then never settles, and because nothing else is pending by
+  // then, Node's event loop simply drains and the process EXITS 0, silently:
+  // no error, no stack, no verdict. Observed twice on 2026-08-07 against
+  // pyrycode#1382, each time with the artifact fully written and the
+  // worktree-removal `finally` never reached.
+  const closed = (stream: { closed?: boolean; on(ev: string, cb: () => void): unknown }) =>
+    new Promise<void>((res) => {
+      if (stream.closed) { res(); return; }
+      let done = false;
+      const settle = () => { if (!done) { done = true; res(); } };
+      stream.on("close", settle);
+      stream.on("error", settle);
+    });
+  const outClosed = closed(out);
+  const errClosed = closed(err);
+
   child.stdout!.pipe(out);
   child.stderr!.pipe(err);
 
@@ -2865,14 +2888,6 @@ export const spawnGateCommand: GateSpawner = async (req) => {
     child.on("close", (code) => res({ exitCode: code, spawnError: null }));
     child.on("error", (e) => res({ exitCode: null, spawnError: `gate command failed: ${e.message}` }));
   });
-  const closed = (stream: { on(ev: string, cb: () => void): unknown }) =>
-    new Promise<void>((res) => {
-      let done = false;
-      const settle = () => { if (!done) { done = true; res(); } };
-      stream.on("close", settle);
-      stream.on("error", settle);
-    });
-
   const result = await childDone;
   clearTimeout(timer);
   if (killTimer) clearTimeout(killTimer);
@@ -2886,7 +2901,7 @@ export const spawnGateCommand: GateSpawner = async (req) => {
   // Wait for the files to be fully written BEFORE returning. The caller
   // judges by reading stdoutPath back off disk, so returning early would
   // let it read a partial file and call a complete run truncated.
-  await Promise.all([closed(out), closed(err)]);
+  await Promise.all([outClosed, errClosed]);
 
   untrackChildPgrpIfDrained(child);
   return { exitCode: result.exitCode, timedOut, spawnError: result.spawnError };
