@@ -1,0 +1,529 @@
+// Data shapes, artifact parsing, and evidence formatting for the
+// dispatcher-executed real-claude gate.
+//
+// All pure: takes the raw bytes a gate command wrote, returns a tally;
+// takes a finished run's facts, returns the comment body. The caller
+// (`decideGateVerdict` in pipeline-decisions.ts) turns the tally into a
+// verdict; the I/O lives in dispatch.ts (runs it) and reconcile.ts
+// (applies it). Both of those import the report shape from here, which
+// is why it lives in this file rather than in either of them.
+//
+// WHY THIS FILE EXISTS AT ALL. On 2026-07-22 a real-claude suite that
+// SKIPPED every test still exited 0, the code-review agent read that 0
+// as a pass, and an unverified change shipped (pyrycode PR #1169 /
+// #1168). The fix is not "ask a human" — it is "count what actually
+// ran". Everything here exists to make "0 tests executed" structurally
+// distinguishable from "everything passed", which an exit code cannot
+// express.
+//
+// Consequence for callers: the gate command MUST emit machine-readable
+// per-test events. For Go that means `go test -json`; the bare
+// `make e2e-realclaude` target prints only a package summary on
+// success, so executed tests cannot be counted from it and the guard
+// this file exists to support cannot be built. That is a contract, not
+// a detail.
+
+/** Artifact shapes the gate knows how to read. */
+export type GateOutputFormat = "go-json" | "playwright-json";
+
+/** Every format the parser accepts, for env validation at the caller. */
+export const GATE_OUTPUT_FORMATS: readonly GateOutputFormat[] = ["go-json", "playwright-json"];
+
+/**
+ * Type guard for the env-configured format string. An unrecognised value
+ * must not silently fall back to a default — a fork that typos the format
+ * would then have its artifact parsed by the wrong reader, which reads as
+ * "zero events" and parks. Loud beats silent, so the caller validates.
+ */
+export function isGateOutputFormat(value: string): value is GateOutputFormat {
+  return (GATE_OUTPUT_FORMATS as readonly string[]).includes(value);
+}
+
+/** What the parser extracted from one gate run's artifact. */
+export interface GateTally {
+  /**
+   * Leaf tests that actually ran a body: passed + failed. Skips are
+   * deliberately NOT counted — a skip is the exact failure mode this
+   * whole mechanism exists to catch, so it must never inflate the
+   * number the floor is compared against.
+   */
+  executed: number;
+  passed: number;
+  failed: number;
+  skipped: number;
+  /** Fully-qualified names of failed leaf tests, in encounter order. */
+  failedNames: string[];
+  /** Reason text for each skip, in encounter order. Deduped downstream. */
+  skipReasons: string[];
+  /**
+   * A suite/package reported failure. True for ordinary test failures too
+   * (Go marks the package failed when any test in it fails), so this is
+   * only INDEPENDENTLY informative when `failed === 0` — that combination
+   * is a build error, a panic, or a harness crash, i.e. a failure with no
+   * test to attribute it to.
+   */
+  packageFailed: boolean;
+  /** Packages/suites that reported failure, in encounter order. */
+  packageFailures: string[];
+  /**
+   * How many lines/documents parsed into recognisable events. Zero means
+   * the artifact is unusable — there is nothing to judge, which is a very
+   * different thing from "nothing failed".
+   */
+  recognizedLines: number;
+}
+
+function emptyTally(): GateTally {
+  return {
+    executed: 0,
+    passed: 0,
+    failed: 0,
+    skipped: 0,
+    failedNames: [],
+    skipReasons: [],
+    packageFailed: false,
+    packageFailures: [],
+    recognizedLines: 0,
+  };
+}
+
+/**
+ * Parse a gate command's raw output into a tally.
+ *
+ * Never throws. A malformed artifact comes back as a tally with
+ * `recognizedLines === 0`, which the verdict function reads as unusable.
+ * Throwing here would turn a bad artifact into a dispatcher crash, and a
+ * crashed dispatcher parks nothing at all.
+ */
+export function parseGateOutput(raw: string, format: GateOutputFormat): GateTally {
+  if (format === "playwright-json") return parsePlaywrightJson(raw);
+  return parseGoJson(raw);
+}
+
+// --------- Go: `go test -json` ---------
+
+/** One `go test -json` event. Every field is optional in practice. */
+interface GoTestEvent {
+  Action?: string;
+  Package?: string;
+  Test?: string;
+  Output?: string;
+}
+
+/**
+ * Parse `go test -json` output (one JSON object per line).
+ *
+ * Two rules carry the weight here.
+ *
+ * **Non-JSON lines are ignored, not fatal.** A build error, a panic
+ * trace, or a stray `fmt.Println` from a test interleaves raw text into
+ * the stream. Treating that as a parse failure would discard a run that
+ * is otherwise fully readable — and, worse, would turn a genuine test
+ * failure into an "unusable" park, hiding the failure from the developer
+ * agent that should be fixing it.
+ *
+ * **Counting is leaf-only.** A test counts only when no event names a
+ * subtest beneath it. Without this, a parent whose subtests all skipped
+ * still reports `pass` for itself (its body ran; the subtests declined),
+ * so it would add 1 to `executed` and a suite that verified nothing
+ * would clear a floor of 1. That is the false-green hole reopened, one
+ * level up.
+ */
+function parseGoJson(raw: string): GateTally {
+  const tally = emptyTally();
+
+  // Pass 1: collect events, and learn which test names have children.
+  const events: GoTestEvent[] = [];
+  const namesByPackage = new Map<string, Set<string>>();
+
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed === "" || trimmed[0] !== "{") continue;
+    let event: GoTestEvent;
+    try {
+      event = JSON.parse(trimmed);
+    } catch {
+      continue; // interleaved non-JSON — expected, not exceptional
+    }
+    if (typeof event !== "object" || event === null || typeof event.Action !== "string") continue;
+    events.push(event);
+    tally.recognizedLines++;
+    if (typeof event.Test === "string" && event.Test !== "") {
+      const pkg = event.Package ?? "";
+      let names = namesByPackage.get(pkg);
+      if (!names) { names = new Set(); namesByPackage.set(pkg, names); }
+      names.add(event.Test);
+    }
+  }
+
+  // A test is a parent when another name in the SAME package sits beneath
+  // it. Scoping by package matters: two packages routinely share a test
+  // name, and a subtest in one would otherwise mask a leaf in the other.
+  const hasChildren = (pkg: string, test: string): boolean => {
+    const names = namesByPackage.get(pkg);
+    if (!names) return false;
+    const prefix = `${test}/`;
+    for (const name of names) {
+      if (name.startsWith(prefix)) return true;
+    }
+    return false;
+  };
+
+  // Pass 2: tally terminal events. `seen` guards against a duplicated
+  // terminal event double-counting a test.
+  const seen = new Set<string>();
+  // Last few output lines per test, so a skip can report WHY it skipped.
+  // Bounded at 3 lines per in-flight test and dropped at the terminal
+  // event, so a long run cannot grow this without bound.
+  const outputTail = new Map<string, string[]>();
+
+  for (const event of events) {
+    const pkg = event.Package ?? "";
+    const test = event.Test ?? "";
+    const key = `${pkg}\t${test}`;
+
+    if (test === "") {
+      // Package-level event.
+      if (event.Action === "fail") {
+        tally.packageFailed = true;
+        if (!tally.packageFailures.includes(pkg)) tally.packageFailures.push(pkg);
+      }
+      continue;
+    }
+
+    if (event.Action === "output") {
+      const text = (event.Output ?? "").replace(/\n+$/, "");
+      if (text.trim() === "") continue;
+      const tail = outputTail.get(key) ?? [];
+      tail.push(text);
+      if (tail.length > 3) tail.shift();
+      outputTail.set(key, tail);
+      continue;
+    }
+
+    const isTerminal = event.Action === "pass" || event.Action === "fail" || event.Action === "skip";
+    if (!isTerminal) continue;
+
+    const tail = outputTail.get(key) ?? [];
+    outputTail.delete(key);
+
+    // Parents are reported for completeness by `go test` but verify
+    // nothing themselves; only leaves count.
+    if (hasChildren(pkg, test)) continue;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    const qualified = pkg === "" ? test : `${pkg}.${test}`;
+    if (event.Action === "pass") {
+      tally.passed++;
+      tally.executed++;
+    } else if (event.Action === "fail") {
+      tally.failed++;
+      tally.executed++;
+      tally.failedNames.push(qualified);
+    } else {
+      tally.skipped++;
+      tally.skipReasons.push(`${qualified}: ${extractSkipReason(tail)}`);
+    }
+  }
+
+  return tally;
+}
+
+/**
+ * Pull a human-readable skip reason out of a test's trailing output.
+ *
+ * `go test` writes the reason as an ordinary output line just before the
+ * `--- SKIP:` marker, so the last line that is not a framework marker is
+ * the reason. Falls back to a placeholder rather than an empty string —
+ * "no reason given" is itself worth seeing in an evidence comment.
+ */
+function extractSkipReason(tail: readonly string[]): string {
+  for (let i = tail.length - 1; i >= 0; i--) {
+    const line = tail[i].trim();
+    if (line === "") continue;
+    if (line.startsWith("=== ") || line.startsWith("--- ")) continue;
+    return line.length > 200 ? line.slice(0, 200) + "…" : line;
+  }
+  return "no reason recorded";
+}
+
+// --------- Playwright: `--reporter=json` ---------
+
+/**
+ * Parse Playwright's JSON reporter output.
+ *
+ * Unlike `go test -json` this is ONE document, not a stream of lines, so
+ * the "ignore non-JSON lines" rule takes a different shape: the parser
+ * tries the whole artifact, and on failure retries from the first line
+ * that opens an object, which strips any preamble the runner printed
+ * before the report.
+ *
+ * Outcome is read from each test's aggregate `status` rather than its
+ * individual `results[]`, so a retried test counts once, not once per
+ * attempt. `flaky` counts as executed and passed — it did run and it did
+ * end green; treating a flake as a failure would route a ticket to the
+ * developer agent over test infrastructure it cannot fix.
+ */
+function parsePlaywrightJson(raw: string): GateTally {
+  const tally = emptyTally();
+
+  const doc = parseLooseJsonDocument(raw);
+  if (doc === null || typeof doc !== "object") return tally;
+
+  const suites = (doc as any).suites;
+  if (!Array.isArray(suites)) return tally;
+  tally.recognizedLines = 1;
+
+  // Top-level `errors` is where Playwright reports a failure with no test
+  // to hang it on: a config error, a global-setup throw, a worker crash.
+  const errors = (doc as any).errors;
+  if (Array.isArray(errors) && errors.length > 0) {
+    tally.packageFailed = true;
+    tally.packageFailures.push("playwright (global errors)");
+  }
+
+  const walk = (suite: any, trail: string[]): void => {
+    if (!suite || typeof suite !== "object") return;
+    const title = typeof suite.title === "string" && suite.title !== "" ? suite.title : null;
+    const nextTrail = title ? [...trail, title] : trail;
+
+    if (Array.isArray(suite.specs)) {
+      for (const spec of suite.specs) {
+        if (!spec || typeof spec !== "object") continue;
+        const specTitle = typeof spec.title === "string" ? spec.title : "(unnamed)";
+        const name = [...nextTrail, specTitle].join(" › ");
+        const tests = Array.isArray(spec.tests) ? spec.tests : [];
+        for (const test of tests) {
+          if (!test || typeof test !== "object") continue;
+          tally.recognizedLines++;
+          const status = typeof test.status === "string" ? test.status : "";
+          if (status === "skipped") {
+            tally.skipped++;
+            tally.skipReasons.push(`${name}: ${extractPlaywrightSkipReason(test)}`);
+          } else if (status === "unexpected") {
+            tally.failed++;
+            tally.executed++;
+            tally.failedNames.push(name);
+          } else if (status === "expected" || status === "flaky") {
+            tally.passed++;
+            tally.executed++;
+          }
+          // Any other status is left uncounted on purpose: an unknown
+          // outcome must not become an executed test, because executed
+          // tests are what clear the floor.
+        }
+      }
+    }
+
+    if (Array.isArray(suite.suites)) {
+      for (const child of suite.suites) walk(child, nextTrail);
+    }
+  };
+
+  for (const suite of suites) walk(suite, []);
+  return tally;
+}
+
+function extractPlaywrightSkipReason(test: any): string {
+  const annotations = Array.isArray(test.annotations) ? test.annotations : [];
+  for (const annotation of annotations) {
+    if (annotation && annotation.type === "skip" && typeof annotation.description === "string") {
+      return annotation.description;
+    }
+  }
+  return "no reason recorded";
+}
+
+// --------- The finished-run report ---------
+
+/**
+ * Everything one gate run produced. Built by the runner in dispatch.ts,
+ * consumed by `runRealClaudeGateExecution` in reconcile.ts.
+ *
+ * Deliberately holds facts, not conclusions: no `passed` boolean lives
+ * here. The verdict is `decideGateVerdict`'s alone, so there is exactly
+ * one place where "did this pass?" is decided and exactly one place to
+ * read when auditing that decision.
+ */
+export interface GateRunReport {
+  /** Non-null when the run could not be started or completed at all. */
+  runError: string | null;
+  timedOut: boolean;
+  exitCode: number | null;
+  /** Parsed artifact, read back FROM DISK. Null when nothing was readable. */
+  tally: GateTally | null;
+  /** The shell command that was run, verbatim. */
+  command: string;
+  /** Feature branch the ticket's work sits on. */
+  branchName: string;
+  /** The default branch the feature branch was merged with for the run. */
+  baseRef: string;
+  baseSha: string;
+  headSha: string;
+  /**
+   * How many commits the feature branch was behind the base before the
+   * merge. Null when it could not be computed. This number is in every
+   * evidence comment so the "ran against merged state" claim is auditable
+   * rather than asserted: it was 29 on 2026-08-05 and 127 on 2026-08-06,
+   * so it moves fast enough to matter.
+   */
+  commitsBehind: number | null;
+  durationMs: number;
+  /** Where the judged bytes live on the dispatcher host. */
+  outputPath: string;
+  outputBytes: number;
+}
+
+/**
+ * Build the evidence comment for a finished gate run.
+ *
+ * The audience is a human deciding whether to trust the verdict, so every
+ * claim the gate makes is shown with the number behind it: what ran, what
+ * it ran against, how far behind the base branch it was, how many tests
+ * actually executed, and where the full output is. Skips are listed rather
+ * than summarised — a skip is not a pass, and the 2026-07-22 incident
+ * turned entirely on nobody reading the skip reasons.
+ */
+export function formatGateEvidenceComment(opts: {
+  verdict: string;
+  reason: string;
+  report: GateRunReport;
+  minExecuted: number;
+  /** What the dispatcher did to the board as a result. */
+  action: string;
+}): string {
+  const { report } = opts;
+  const heading: Record<string, string> = {
+    pass: "✅ Real-claude gate — PASS",
+    fail: "❌ Real-claude gate — FAIL",
+    "zero-executed": "🚨 Real-claude gate — NOTHING EXECUTED",
+    unusable: "🚨 Real-claude gate — NO USABLE RESULT",
+  };
+
+  const lines: string[] = [];
+  lines.push(`## ${heading[opts.verdict] ?? `Real-claude gate — ${opts.verdict}`}`);
+  lines.push("");
+  lines.push(`The dispatcher ran the live-claude suite itself. **${opts.reason}.**`);
+  lines.push("");
+
+  lines.push("**What ran**");
+  lines.push("```");
+  lines.push(report.command);
+  lines.push("```");
+  lines.push("");
+
+  lines.push("**What it ran against**");
+  lines.push(`- Branch \`${report.branchName}\` at \`${shortSha(report.headSha)}\``);
+  lines.push(`- Merged with \`${report.baseRef}\` at \`${shortSha(report.baseSha)}\` in a detached worktree`);
+  lines.push(
+    report.commitsBehind === null
+      ? `- Commits behind \`${report.baseRef}\` before the merge: could not be computed`
+      : `- The branch was **${report.commitsBehind} commit(s) behind** \`${report.baseRef}\` before the merge`,
+  );
+  lines.push(
+    `- Exit status \`${report.exitCode ?? "none"}\`` +
+    (report.timedOut ? " (killed by the outer timeout)" : "") +
+    `, wall clock ${(report.durationMs / 1000).toFixed(1)}s`,
+  );
+  lines.push("");
+
+  if (report.runError) {
+    lines.push("**Run error**");
+    lines.push("```");
+    lines.push(report.runError.slice(0, 1500));
+    lines.push("```");
+    lines.push("");
+  }
+
+  const tally = report.tally;
+  if (tally) {
+    lines.push("**Result**");
+    lines.push("");
+    lines.push("| executed | passed | failed | skipped |");
+    lines.push("|---:|---:|---:|---:|");
+    lines.push(`| ${tally.executed} | ${tally.passed} | ${tally.failed} | ${tally.skipped} |`);
+    lines.push("");
+    lines.push(
+      `Executed counts leaf tests that ran a body: passed plus failed, skips excluded. ` +
+      `The floor for this fork is ${Math.max(1, opts.minExecuted)}.`,
+    );
+    lines.push("");
+
+    if (tally.failedNames.length > 0) {
+      lines.push(`**Failed (${tally.failed})**`);
+      lines.push("");
+      for (const name of tally.failedNames.slice(0, 25)) lines.push(`- \`${name}\``);
+      if (tally.failedNames.length > 25) {
+        lines.push(`- …and ${tally.failedNames.length - 25} more, see the full output`);
+      }
+      lines.push("");
+    }
+
+    if (tally.packageFailures.length > 0 && tally.failed === 0) {
+      lines.push("**Suite-level failure with no failing test** — a build error, a panic, or a harness crash:");
+      lines.push("");
+      for (const pkg of tally.packageFailures.slice(0, 15)) lines.push(`- \`${pkg}\``);
+      lines.push("");
+    }
+
+    if (tally.skipReasons.length > 0) {
+      lines.push(`**Skipped (${tally.skipped})** — listed, not counted, because a skip is not a pass:`);
+      lines.push("");
+      for (const reason of tally.skipReasons.slice(0, 25)) lines.push(`- ${reason}`);
+      if (tally.skipReasons.length > 25) {
+        lines.push(`- …and ${tally.skipReasons.length - 25} more, see the full output`);
+      }
+      lines.push("");
+    }
+  } else {
+    lines.push("**Result**");
+    lines.push("");
+    lines.push("No readable test artifact. Nothing was judged, which is not the same as nothing failing.");
+    lines.push("");
+  }
+
+  lines.push(`**What the dispatcher did:** ${opts.action}`);
+  lines.push("");
+  lines.push(
+    `Full output: \`${report.outputPath}\` (${formatBytes(report.outputBytes)}) on the dispatcher host.`,
+  );
+
+  return lines.join("\n");
+}
+
+function shortSha(sha: string): string {
+  return sha && sha.length > 10 ? sha.slice(0, 10) : (sha || "unknown");
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return "unknown size";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+/**
+ * Parse a JSON document that may be preceded by non-JSON preamble.
+ * Returns null when nothing parses. Never throws.
+ */
+function parseLooseJsonDocument(raw: string): unknown {
+  const trimmed = raw.trim();
+  if (trimmed === "") return null;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    // Fall through to the preamble-stripping retry.
+  }
+  const lines = trimmed.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trimStart().startsWith("{")) {
+      try {
+        return JSON.parse(lines.slice(i).join("\n"));
+      } catch {
+        return null;
+      }
+    }
+  }
+  return null;
+}

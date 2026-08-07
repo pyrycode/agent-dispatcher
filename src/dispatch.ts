@@ -1,5 +1,5 @@
 import { type ChildProcess, execSync, spawn, spawnSync } from "node:child_process";
-import { readFileSync, existsSync, writeFileSync, mkdirSync, appendFileSync, readdirSync, createReadStream, statSync, symlinkSync, unlinkSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync, mkdirSync, appendFileSync, readdirSync, createReadStream, createWriteStream, statSync, symlinkSync, unlinkSync } from "node:fs";
 import { resolve, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { config } from "dotenv";
@@ -54,7 +54,19 @@ import {
   resolveTargetRepoRoot,
   shouldAutoCommit,
 } from "./worktree.js";
-import { runAutoAdvance, runRealClaudeGate, runReworkRouting } from "./reconcile.js";
+import {
+  runAutoAdvance,
+  runRealClaudeGate,
+  runRealClaudeGateExecution,
+  runReworkRouting,
+  type RealClaudeGateRunner,
+} from "./reconcile.js";
+import {
+  isGateOutputFormat,
+  parseGateOutput,
+  type GateOutputFormat,
+  type GateRunReport,
+} from "./gate-output.js";
 import {
   trimMemoryIndexFile,
   MEMORY_INDEX_CAP_BYTES,
@@ -74,6 +86,33 @@ const agentsRepoRoot = resolveAgentsRepoRootWithEnv({
   envValue: process.env.AGENTS_REPO_PATH,
   fallbackSrcDir: __dirname,
 });
+
+// Load the fork's .env HERE, before any module-top constant below reads
+// `process.env`. This position is load-bearing.
+//
+// There are two ways a variable reaches `process.env`: inherited from the
+// parent process, which is true the instant this module loads, and
+// `dotenv.config()`, which is true only after this line. Every module-top
+// constant below reads env vars, so any of them placed above this call
+// silently ignores the .env file and quietly takes its fallback instead.
+//
+// That bug was measured on 2026-05-10: `repoRoot` read `TARGET_REPO_PATH`
+// above the old call site, so under a sibling layout it fell back to
+// `Projects/`, which is not a git repo, and the first `git checkout` failed.
+// It was worked around by having each fork's `bin/pyry-start` pre-export that
+// one variable, which fixed the symptom and left the shape in place —
+// `SALVAGE_GATES`, `TARGET_DEFAULT_BRANCH` and `PYRY_AUTOCURATE_MEMORY` were
+// still silently file-blind. Moving the load up fixes the class, not the
+// instance.
+//
+// Safe to hoist: dotenv does not overwrite variables that already exist, so
+// anything a launcher exported, or that `op run --env-file` injected, still
+// wins. This can only ADD values that were previously missing.
+//
+// `agentsRepoRoot` above is exempt and must stay there: it resolves the path
+// this call needs, and it reads `AGENTS_REPO_PATH`, which every launcher
+// exports directly rather than through the .env file.
+config({ path: resolve(agentsRepoRoot, ".env") });
 
 // The target repo — where code lives and agents work.
 // Falls through to resolveTargetRepoRoot (parent of agents/) when unset, so
@@ -118,7 +157,48 @@ const CURATION_WATERMARK =
 const CURATION_COOLDOWN_MS =
   (Number(process.env.PYRY_MEMORY_CURATION_COOLDOWN_MIN) || 30) * 60_000;
 
-config({ path: resolve(agentsRepoRoot, ".env") });
+// --------- Dispatcher-executed real-claude gate: configuration ---------
+//
+// Like every other module-top env read in this file, these must stay below
+// the `config()` call near the top — see the note there for why.
+//
+// The command is the on/off switch. Empty means the dispatcher does not run
+// gates and a gated ticket waits in Inbox for an operator, exactly as before
+// 2026-08-07. That default is what lets the whole feature land on a live
+// dispatcher as a strict no-op.
+const REAL_CLAUDE_GATE_CMD = (process.env.PYRY_REAL_CLAUDE_GATE_CMD ?? "").trim();
+
+// How to read what the command wrote. The command MUST emit per-test
+// machine-readable output: for Go that means `go test -json`, and the bare
+// `make e2e-realclaude` target will NOT do, because without `-json` it prints
+// nothing per-test on success — only a package summary. Executed tests then
+// cannot be counted, and the executed-test floor is the entire point of the
+// gate. This is a contract, not a detail.
+const REAL_CLAUDE_GATE_FORMAT: GateOutputFormat | null = (() => {
+  const raw = (process.env.PYRY_REAL_CLAUDE_GATE_FORMAT ?? "go-json").trim();
+  if (isGateOutputFormat(raw)) return raw;
+  console.error(
+    `   ❌ PYRY_REAL_CLAUDE_GATE_FORMAT="${raw}" is not a format this dispatcher knows. ` +
+    `The real-claude gate is DISABLED for this fork; gated tickets will park for an operator instead.`,
+  );
+  return null;
+})();
+
+// Outer wall clock. Must exceed the command's own inner timeout, so the
+// command gets to fail on its own terms and write a readable artifact — a
+// run the outer timer kills leaves a truncated prefix, which is judged
+// unusable and parks. 30 min default; pyrycode's suite measured 308s.
+const REAL_CLAUDE_GATE_TIMEOUT_MS =
+  Number(process.env.PYRY_REAL_CLAUDE_GATE_TIMEOUT_MS) || 1_800_000;
+
+// Floor for the executed-test guard: below this many tests actually running,
+// the result is treated as "verified nothing" rather than "nothing failed".
+// Default 1 catches the total-skip case that started all this. A fork should
+// set it near its real count (pyrycode: 150, against a measured 176), so a
+// suite that silently loses most of itself is caught too, not just one that
+// loses all of itself.
+const REAL_CLAUDE_GATE_MIN_EXECUTED =
+  Number(process.env.PYRY_REAL_CLAUDE_GATE_MIN_EXECUTED) || 1;
 
 // Env-var validation moved to dispatch-bin.ts (the entry-point module).
 // Library callers don't need the dispatcher's env vars at import time —
@@ -376,6 +456,33 @@ const liveChildPgrpPids = new Set<number>();
  * log loudly instead and let the caller proceed; if the caller is
  * about to `process.exit`, at least the operator gets a signal.
  */
+/**
+ * Stop tracking a finished child's process group, but ONLY once the group
+ * has actually drained.
+ *
+ * The group ID lives in the kernel until its LAST member exits, not until
+ * its LEADER (our immediate child) does. So if the leader crashed while a
+ * grandchild — a test binary, a `claude` under it — is still alive, we must
+ * keep the PID tracked, or the SIGHUP / SIGINT force-exit paths lose their
+ * only handle on the orphan.
+ *
+ * Probe with signal 0: an existence check that sends nothing. ESRCH means
+ * the group is empty and safe to forget. Anything else, including EPERM,
+ * means keep tracking; `killAllChildPgrps` retries and tolerates ESRCH
+ * itself if the group drains in between.
+ */
+function untrackChildPgrpIfDrained(child: ChildProcess): void {
+  if (child.pid === undefined || child.pid <= 1) return;
+  try {
+    process.kill(-child.pid, 0);
+    // Group still has members — keep tracking.
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ESRCH") {
+      liveChildPgrpPids.delete(child.pid);
+    }
+  }
+}
+
 function killChildPgrp(child: ChildProcess, sig: NodeJS.Signals | number): void {
   if (child.pid === undefined || child.pid <= 1) return;
   try {
@@ -594,16 +701,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
       // there, or EPERM) → keep tracking; killAllChildPgrps will retry
       // and is itself ESRCH-tolerant if the pgrp drains in the
       // meantime.
-      if (child.pid !== undefined && child.pid > 1) {
-        try {
-          process.kill(-child.pid, 0);
-          // pgrp still has members — keep tracking
-        } catch (err) {
-          if ((err as NodeJS.ErrnoException).code === "ESRCH") {
-            liveChildPgrpPids.delete(child.pid);
-          }
-        }
-      }
+      untrackChildPgrpIfDrained(child);
 
       // Process remaining buffer
       if (buffer.trim()) {
@@ -2654,6 +2752,388 @@ export async function runDoneCleanup(client: DispatchClient): Promise<void> {
  * an outage; a missing marker comment (null) is treated as eligible so a
  * lost schedule never traps the ticket.
  */
+// --------- Dispatcher-executed real-claude gate: the runner ---------
+//
+// The process half of the gate. `runRealClaudeGateExecution` in reconcile.ts
+// picks the ticket and applies the outcome; `decideGateVerdict` in
+// pipeline-decisions.ts decides what the result means. This code only
+// produces evidence: it builds the merged state, runs the command, and
+// reports facts.
+
+/** One gate command to run. */
+export interface GateSpawnRequest {
+  command: string;
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  timeoutMs: number;
+  /** File the judged bytes are written to. */
+  stdoutPath: string;
+  /** File stderr is written to. Kept separate on purpose, see below. */
+  stderrPath: string;
+}
+
+export interface GateSpawnOutcome {
+  exitCode: number | null;
+  timedOut: boolean;
+  /** Non-null when the process could not be started or died abnormally. */
+  spawnError: string | null;
+}
+
+/**
+ * The seam. Injected in tests so no test ever has to fake a child process,
+ * a shell, or a 300-second suite.
+ */
+export type GateSpawner = (req: GateSpawnRequest) => Promise<GateSpawnOutcome>;
+
+/**
+ * Build the environment the gate command runs in.
+ *
+ * Two properties this must have, and one it must not.
+ *
+ * **Keeps `CLAUDE_CODE_OAUTH_TOKEN`.** This is the credential the real-claude
+ * fixtures actually look for, and the fork's `.env` supplies it. The 2026-07-22
+ * belief that the dispatch environment has no Claude credential was never
+ * measured and is false; a full suite ran from this machine on 2026-08-07 at
+ * 176 passed, 0 failed.
+ *
+ * **Leaves `ANTHROPIC_API_KEY` unset**, deleting it if the parent had one.
+ * With no metered key present, the run bills against the subscription. Four
+ * external-service tests skip as a result. That is the expected consequence
+ * of the billing choice, not a defect, and the executed-test floor is set
+ * with those skips already accounted for.
+ *
+ * **Strips the dispatcher's own secrets** via the shared `scrubSpawnEnv`, so
+ * a test process cannot reach the GitHub token that drives the board.
+ */
+export function buildGateSpawnEnv(parentEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env = scrubSpawnEnv(parentEnv);
+  delete env.ANTHROPIC_API_KEY;
+  return env;
+}
+
+/**
+ * Default spawner: run the command under a non-login shell in the prepared
+ * worktree, streaming stdout and stderr to separate files.
+ *
+ * **`bash -c`, deliberately not `bash -lc`.** A login shell sources the
+ * user's profile, and this machine's profile is where personal secrets live
+ * — including, plausibly, an `ANTHROPIC_API_KEY`. A login shell would quietly
+ * put back the very variable `buildGateSpawnEnv` just removed and move the
+ * run onto metered billing. PATH comes from the dispatcher's own environment,
+ * which already resolves `git`, `go` and `pyry` for every other command it
+ * runs.
+ *
+ * **Separate stdout and stderr files.** The judged artifact must contain only
+ * what the test runner emitted. Merging stderr in would interleave a panic
+ * trace or a build log mid-line and could split a JSON event in half. The
+ * parser tolerates junk lines, but it cannot reassemble a bisected one.
+ *
+ * **Own process group.** `detached: true` makes the child a group leader, so
+ * a timeout or a force-exit reaches the whole tree — shell, test binary, and
+ * every `claude` beneath it — instead of orphaning a live suite.
+ */
+export const spawnGateCommand: GateSpawner = async (req) => {
+  let child: ChildProcess;
+  try {
+    child = spawn("bash", ["-c", req.command], {
+      cwd: req.cwd,
+      env: req.env,
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: true,
+    });
+  } catch (e: any) {
+    return { exitCode: null, timedOut: false, spawnError: `could not spawn gate command: ${e?.message ?? e}` };
+  }
+
+  if (child.pid !== undefined) liveChildPgrpPids.add(child.pid);
+
+  const out = createWriteStream(req.stdoutPath);
+  const err = createWriteStream(req.stderrPath);
+  child.stdout!.pipe(out);
+  child.stderr!.pipe(err);
+
+  let timedOut = false;
+  let killTimer: NodeJS.Timeout | null = null;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    console.warn(`   ⏰ Real-claude gate: outer timeout after ${Math.round(req.timeoutMs / 1000)}s — tearing down the process group`);
+    killChildPgrp(child, "SIGTERM");
+    killTimer = setTimeout(() => killChildPgrp(child, "SIGKILL"), FORCE_EXIT_SIGKILL_GRACE_MS);
+  }, req.timeoutMs);
+
+  const childDone = new Promise<{ exitCode: number | null; spawnError: string | null }>((res) => {
+    child.on("close", (code) => res({ exitCode: code, spawnError: null }));
+    child.on("error", (e) => res({ exitCode: null, spawnError: `gate command failed: ${e.message}` }));
+  });
+  const closed = (stream: { on(ev: string, cb: () => void): unknown }) =>
+    new Promise<void>((res) => {
+      let done = false;
+      const settle = () => { if (!done) { done = true; res(); } };
+      stream.on("close", settle);
+      stream.on("error", settle);
+    });
+
+  const result = await childDone;
+  clearTimeout(timer);
+  if (killTimer) clearTimeout(killTimer);
+
+  // On a spawn error the pipes may never end on their own, which would
+  // hang the awaits below forever. Destroying them emits `close` either way.
+  if (result.spawnError !== null) {
+    out.destroy();
+    err.destroy();
+  }
+  // Wait for the files to be fully written BEFORE returning. The caller
+  // judges by reading stdoutPath back off disk, so returning early would
+  // let it read a partial file and call a complete run truncated.
+  await Promise.all([closed(out), closed(err)]);
+
+  untrackChildPgrpIfDrained(child);
+  return { exitCode: result.exitCode, timedOut, spawnError: result.spawnError };
+};
+
+/** Injectable I/O for `runRealClaudeGateSuite`. */
+export interface GateRunnerDeps {
+  execSync: typeof execSync;
+  spawnSync: typeof spawnSync;
+  mkdirSync: typeof mkdirSync;
+  readFileSync: typeof readFileSync;
+  statSync: typeof statSync;
+  spawnGate: GateSpawner;
+  now: () => number;
+}
+
+export const DEFAULT_GATE_RUNNER_DEPS: GateRunnerDeps = {
+  execSync,
+  spawnSync,
+  mkdirSync,
+  readFileSync,
+  statSync,
+  spawnGate: spawnGateCommand,
+  now: Date.now,
+};
+
+/**
+ * Run the fork's real-claude suite against one ticket's branch, merged with
+ * the default branch, and report what happened.
+ *
+ * Never throws: every failure path comes back as a report with `runError`
+ * set, which `decideGateVerdict` reads as unusable and parks. A throw here
+ * would leave the ticket unlabelled in Inbox and the next cycle would try
+ * again, burning a full suite's wall clock every time.
+ *
+ * The sequence, and why each step is the way it is:
+ *
+ * 1. **Fetch, then resolve base and head from `origin`.** Origin only, never
+ *    a local branch: the ticket has an open pull request, and gating code
+ *    that is not in that pull request would attach a green verdict to
+ *    something nobody is going to merge.
+ *
+ * 2. **Count how far behind the base the branch is.** This number goes in
+ *    the evidence comment so the "ran against merged state" claim can be
+ *    audited instead of taken on trust. It was 29 on 2026-08-05 and 127 on
+ *    2026-08-06, so it moves fast enough to matter.
+ *
+ * 3. **Probe for conflicts with `git merge-tree --write-tree`,** before any
+ *    working tree exists. The probe stays in the object database, so it
+ *    cannot contend with a live dispatch's worktree. Preferred over the pull
+ *    request's `mergeable` field, which GitHub computes asynchronously and
+ *    reports as unknown for a window after every push.
+ *
+ * 4. **Create the worktree DETACHED.** This is load-bearing twice over.
+ *    Checking out the branch and merging the base into it would leave a merge
+ *    commit on the local branch that origin does not have; the next dispatch
+ *    of that ticket would hit `abort-local-strictly-ahead` (see
+ *    `decideBranchSetup`) and park with an error telling the operator to push
+ *    commits that must never be pushed. The gate would poison every ticket it
+ *    passed. Separately, a detached worktree holds no branch, so it can never
+ *    collide with a live dispatch worktree.
+ *
+ * 5. **Run the command, then judge by reading the output file back off
+ *    disk** rather than from an in-memory buffer, so the bytes that produced
+ *    the verdict and the bytes archived for a human to check are provably the
+ *    same bytes.
+ *
+ * 6. **Remove the worktree in a `finally`.** An abandoned gate worktree would
+ *    accumulate one merged checkout per gated ticket.
+ */
+export async function runRealClaudeGateSuite(opts: {
+  issueNumber: number;
+  command: string;
+  format: GateOutputFormat;
+  timeoutMs: number;
+  /** Overridable for tests; defaults to the module-level target repo. */
+  repoRoot?: string;
+  defaultBranch?: string;
+  logsDir?: string;
+  deps?: Partial<GateRunnerDeps>;
+}): Promise<GateRunReport> {
+  const deps: GateRunnerDeps = { ...DEFAULT_GATE_RUNNER_DEPS, ...opts.deps };
+  const targetRepo = opts.repoRoot ?? repoRoot;
+  const base = opts.defaultBranch ?? defaultBranch;
+  const logsDir = opts.logsDir ?? LOGS_DIR;
+
+  const branchName = `feature/${opts.issueNumber}`;
+  const baseRef = `origin/${base}`;
+  // Prefixed so it can never collide with a dispatch worktree, which is
+  // named `<agent>-<issue>` and no agent is called `real-claude-gate`.
+  const worktreeDir = resolve(targetRepo, `../.pyrycode-worktrees/real-claude-gate-${opts.issueNumber}`);
+
+  // `.log` suffix on both files so the existing rotation sweep picks them
+  // up with no code change (see `rotateOldLogs`).
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const stdoutPath = resolve(logsDir, `${stamp}_real-claude-gate_#${opts.issueNumber}.log`);
+  const stderrPath = resolve(logsDir, `${stamp}_real-claude-gate_#${opts.issueNumber}.stderr.log`);
+
+  const started = deps.now();
+  const report: GateRunReport = {
+    runError: null,
+    timedOut: false,
+    exitCode: null,
+    tally: null,
+    command: opts.command,
+    branchName,
+    baseRef,
+    baseSha: "",
+    headSha: "",
+    commitsBehind: null,
+    durationMs: 0,
+    outputPath: stdoutPath,
+    outputBytes: 0,
+  };
+  const finish = (runError?: string): GateRunReport => {
+    if (runError !== undefined) report.runError = runError;
+    report.durationMs = deps.now() - started;
+    return report;
+  };
+
+  const git = (args: string, timeout = 120_000): string =>
+    deps.execSync(`git ${args}`, { cwd: targetRepo, encoding: "utf-8", timeout, stdio: "pipe" }).toString().trim();
+
+  // 1. Fetch and resolve.
+  try {
+    git("fetch origin", 300_000);
+  } catch (e: any) {
+    return finish(`git fetch origin failed: ${e?.message ?? e}`);
+  }
+
+  try {
+    report.baseSha = git(`rev-parse ${baseRef}`);
+  } catch (e: any) {
+    return finish(`could not resolve ${baseRef}: ${e?.message ?? e}`);
+  }
+  try {
+    report.headSha = git(`rev-parse origin/${branchName}`);
+  } catch (e: any) {
+    return finish(
+      `could not resolve origin/${branchName}. The gate runs against the pushed branch only, never a local ` +
+      `one, so that a green verdict always describes the code in the pull request: ${e?.message ?? e}`,
+    );
+  }
+
+  // 2. How far behind the base is it?
+  try {
+    const behind = git(`rev-list --count ${report.headSha}..${report.baseSha}`);
+    const parsed = parseInt(behind, 10);
+    report.commitsBehind = Number.isFinite(parsed) ? parsed : null;
+  } catch {
+    report.commitsBehind = null; // evidence-only; never worth failing the run
+  }
+
+  // 3. Conflict probe, in the object database, before any working tree.
+  const probe = deps.spawnSync(
+    "git",
+    ["merge-tree", "--write-tree", report.baseSha, report.headSha],
+    { cwd: targetRepo, encoding: "utf-8", timeout: 120_000 },
+  );
+  if (probe.status === 1) {
+    return finish(
+      `\`${branchName}\` conflicts with \`${baseRef}\`, so there is no merged state to gate. ` +
+      `Resolve the conflict and the gate will run on the next cycle.`,
+    );
+  }
+  if (probe.status !== 0) {
+    // An unsupported or failing probe must not disable the gate: the merge
+    // in step 4 would surface a real conflict anyway. Note it and continue.
+    console.warn(
+      `   ⚠️  Real-claude gate: merge-tree conflict probe unavailable (status ${probe.status}); relying on the merge itself`,
+    );
+  }
+
+  // 4. Detached worktree at the head commit, then merge the base into it.
+  const removeWorktree = () => {
+    try { deps.execSync(`git worktree remove --force "${worktreeDir}"`, { cwd: targetRepo, stdio: "pipe" }); } catch {}
+    try { deps.execSync(`git worktree prune`, { cwd: targetRepo, stdio: "pipe" }); } catch {}
+  };
+
+  removeWorktree(); // clear anything a crashed earlier run left behind
+  try {
+    deps.mkdirSync(resolve(targetRepo, `../.pyrycode-worktrees`), { recursive: true });
+    git(`worktree add --detach "${worktreeDir}" ${report.headSha}`);
+  } catch (e: any) {
+    removeWorktree();
+    return finish(`could not create the gate worktree: ${e?.message ?? e}`);
+  }
+
+  try {
+    deps.execSync(`git merge ${report.baseSha} --no-edit`, { cwd: worktreeDir, stdio: "pipe", timeout: 120_000 });
+  } catch (e: any) {
+    try { deps.execSync(`git merge --abort`, { cwd: worktreeDir, stdio: "pipe" }); } catch {}
+    removeWorktree();
+    return finish(`could not merge ${baseRef} into ${branchName} for the run: ${e?.message ?? e}`);
+  }
+
+  // 5. Run it, then judge what landed on disk.
+  try {
+    deps.mkdirSync(logsDir, { recursive: true });
+    const outcome = await deps.spawnGate({
+      command: opts.command,
+      cwd: worktreeDir,
+      env: buildGateSpawnEnv(process.env),
+      timeoutMs: opts.timeoutMs,
+      stdoutPath,
+      stderrPath,
+    });
+    report.exitCode = outcome.exitCode;
+    report.timedOut = outcome.timedOut;
+    if (outcome.spawnError !== null) report.runError = outcome.spawnError;
+
+    let raw: string | null = null;
+    try {
+      raw = deps.readFileSync(stdoutPath, "utf-8").toString();
+      report.outputBytes = deps.statSync(stdoutPath).size;
+    } catch (e: any) {
+      // No artifact at all. Left as a null tally, which the verdict reads
+      // as unusable — never as "nothing failed".
+      console.warn(`   ⚠️  Real-claude gate: could not read ${stdoutPath} back: ${e?.message ?? e}`);
+    }
+    if (raw !== null) report.tally = parseGateOutput(raw, opts.format);
+
+    return finish();
+  } catch (e: any) {
+    return finish(`gate run failed unexpectedly: ${e?.message ?? e}`);
+  } finally {
+    removeWorktree();
+  }
+}
+
+/**
+ * Build the gate runner for this fork, or null when the feature is off.
+ * Null is the no-op path: `runRealClaudeGateExecution` returns immediately,
+ * and gated tickets park for an operator exactly as they did before.
+ */
+export function makeRealClaudeGateRunner(): RealClaudeGateRunner | null {
+  if (REAL_CLAUDE_GATE_CMD === "") return null;
+  if (REAL_CLAUDE_GATE_FORMAT === null) return null; // bad format, already reported
+  const format = REAL_CLAUDE_GATE_FORMAT;
+  return ({ issueNumber }) => runRealClaudeGateSuite({
+    issueNumber,
+    command: REAL_CLAUDE_GATE_CMD,
+    format,
+    timeoutMs: REAL_CLAUDE_GATE_TIMEOUT_MS,
+  });
+}
+
 export async function holdBackoffWaiters(
   itemsByColumn: Map<string, ProjectItem[]>,
   client: DispatchClient,
@@ -3432,6 +3912,18 @@ export async function pollLoop(): Promise<void> {
   })();
   console.log(`   Concurrency cap: ${MAX_CONCURRENT} (PYRY_MAX_CONCURRENT)`);
 
+  // Real-claude gate execution. Null when PYRY_REAL_CLAUDE_GATE_CMD is unset,
+  // which makes the whole step a no-op and leaves gated tickets parked for an
+  // operator. Built once per process so the config is reported at startup
+  // rather than discovered on the first gated ticket, hours later.
+  const realClaudeGateRunner = makeRealClaudeGateRunner();
+  console.log(
+    realClaudeGateRunner === null
+      ? `   Real-claude gate: not configured — gated tickets park in Inbox for an operator (PYRY_REAL_CLAUDE_GATE_CMD)`
+      : `   Real-claude gate: enabled, floor ${REAL_CLAUDE_GATE_MIN_EXECUTED} executed test(s), ` +
+        `${Math.round(REAL_CLAUDE_GATE_TIMEOUT_MS / 60_000)}min wall clock, format ${REAL_CLAUDE_GATE_FORMAT}`,
+  );
+
   // Edge-trigger state for the "board drained" ping: flips true once a cycle
   // sees work, so the ping fires on the busy → quiet transition and never on a
   // board that's been idle since startup. See decideDrainNotification.
@@ -3546,6 +4038,25 @@ export async function pollLoop(): Promise<void> {
     await runClosedSweep(client);
     await runReworkRouting(client);
     await runRealClaudeGate(client);
+    // Run the live gate for one parked ticket, here and only here.
+    //
+    // AFTER the park step, so a ticket that finished code review this cycle
+    // is parked and gated in the same cycle rather than waiting for the next.
+    //
+    // BEFORE auto-advance and ticket selection, so a pass moves the ticket
+    // forward and a failure routes it back within this same cycle, and so a
+    // chain of gated tickets drains one link per cycle unattended.
+    //
+    // NOT repeated in the end-of-cycle maintenance block below. A gate run is
+    // minutes of blocking wall clock (308s measured on pyrycode); running it
+    // twice per cycle would roughly double cycle time for no gain, because
+    // the gate step already selects at most one ticket per call.
+    await runRealClaudeGateExecution(
+      client,
+      realClaudeGateRunner,
+      REAL_CLAUDE_GATE_MIN_EXECUTED,
+      notifyDiscord,
+    );
     await runAutoAdvance(client, MAX_CONCURRENT);
     await runDoneCleanup(client);
 

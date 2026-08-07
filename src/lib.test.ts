@@ -65,10 +65,14 @@ import {
   isPipelineLabel,
   isPipelineLabelForAgent,
   decideRealClaudeGate,
+  decideGateOutcome,
+  decideGateVerdict,
+  decideRealClaudeGateRun,
   REAL_CLAUDE_GATE_LABEL,
   shouldAddReadyLabel,
   shouldSkipDispatch,
 } from "./pipeline-decisions.js";
+import { formatGateEvidenceComment, parseGateOutput } from "./gate-output.js";
 import {
   decideBranchSetup,
   decideCodegraphSymlink,
@@ -3897,3 +3901,464 @@ describe("advancePermissionDenialState — watchdog state machine", () => {
   });
 });
 
+
+// ==========================================================================
+// Dispatcher-executed real-claude gate
+//
+// The whole point of this surface is that a suite which verified NOTHING
+// must never read as green. Every test below is ultimately about that one
+// property, approached from a different angle.
+// ==========================================================================
+
+describe("parseGateOutput — go-json", () => {
+  test("counts a normal mix of pass, fail and skip", () => {
+    const raw = [
+      '{"Action":"run","Package":"p","Test":"TestA"}',
+      '{"Action":"pass","Package":"p","Test":"TestA"}',
+      '{"Action":"run","Package":"p","Test":"TestB"}',
+      '{"Action":"fail","Package":"p","Test":"TestB"}',
+      '{"Action":"output","Package":"p","Test":"TestC","Output":"    fixtures.go:96: no login token\\n"}',
+      '{"Action":"skip","Package":"p","Test":"TestC"}',
+      '{"Action":"fail","Package":"p"}',
+    ].join("\n");
+
+    const t = parseGateOutput(raw, "go-json");
+
+    assert.equal(t.executed, 2, "executed is pass + fail; a skip executed nothing");
+    assert.equal(t.passed, 1);
+    assert.equal(t.failed, 1);
+    assert.equal(t.skipped, 1);
+    assert.deepEqual(t.failedNames, ["p.TestB"]);
+    assert.equal(t.packageFailed, true);
+    assert.match(t.skipReasons[0], /no login token/);
+  });
+
+  test("a parent whose subtests ALL skipped counts zero executed", () => {
+    // Go reports the parent as `pass` — its body ran, the subtests declined.
+    // Counting that parent would let a suite verifying nothing clear a floor
+    // of 1, which reopens the exact false-green hole one level up.
+    const raw = [
+      '{"Action":"run","Package":"p","Test":"TestParent"}',
+      '{"Action":"run","Package":"p","Test":"TestParent/case_one"}',
+      '{"Action":"skip","Package":"p","Test":"TestParent/case_one"}',
+      '{"Action":"run","Package":"p","Test":"TestParent/case_two"}',
+      '{"Action":"skip","Package":"p","Test":"TestParent/case_two"}',
+      '{"Action":"pass","Package":"p","Test":"TestParent"}',
+      '{"Action":"pass","Package":"p"}',
+    ].join("\n");
+
+    const t = parseGateOutput(raw, "go-json");
+
+    assert.equal(t.executed, 0, "the parent verified nothing; only leaves count");
+    assert.equal(t.passed, 0);
+    assert.equal(t.skipped, 2);
+  });
+
+  test("a parent with passing subtests counts the subtests, not the parent", () => {
+    const raw = [
+      '{"Action":"pass","Package":"p","Test":"TestParent/one"}',
+      '{"Action":"pass","Package":"p","Test":"TestParent/two"}',
+      '{"Action":"pass","Package":"p","Test":"TestParent"}',
+    ].join("\n");
+
+    const t = parseGateOutput(raw, "go-json");
+
+    assert.equal(t.executed, 2, "two leaves, one parent — the parent is not a third test");
+  });
+
+  test("the same test name in two packages does not mask a leaf", () => {
+    // Scoping parent detection by package matters: `p2.TestX` is a genuine
+    // leaf even though `p1.TestX` has a subtest.
+    const raw = [
+      '{"Action":"pass","Package":"p1","Test":"TestX/sub"}',
+      '{"Action":"pass","Package":"p1","Test":"TestX"}',
+      '{"Action":"pass","Package":"p2","Test":"TestX"}',
+    ].join("\n");
+
+    const t = parseGateOutput(raw, "go-json");
+
+    assert.equal(t.executed, 2, "p1.TestX/sub and p2.TestX; p1.TestX is a parent");
+  });
+
+  test("ignores interleaved non-JSON instead of treating it as fatal", () => {
+    // Build errors and panic traces land in the same stream. Refusing to
+    // parse would turn a readable failure into an unusable park, hiding the
+    // failure from the developer agent that should be fixing it.
+    const raw = [
+      "# github.com/pyrycode/pyrycode/internal/e2e",
+      "panic: something went very wrong",
+      '{"Action":"fail","Package":"p","Test":"TestA"}',
+      "goroutine 1 [running]:",
+      '{"Action":"fail","Package":"p"}',
+      "",
+    ].join("\n");
+
+    const t = parseGateOutput(raw, "go-json");
+
+    assert.equal(t.recognizedLines, 2);
+    assert.equal(t.failed, 1);
+    assert.equal(t.packageFailed, true);
+  });
+
+  test("an empty artifact yields zero recognized lines, not an empty pass", () => {
+    const t = parseGateOutput("", "go-json");
+    assert.equal(t.recognizedLines, 0);
+    assert.equal(t.executed, 0);
+  });
+
+  test("a build failure has a package failure and no failing test", () => {
+    // The combination `packageFailed && failed === 0` is the only shape that
+    // says "something broke and there is no test to blame".
+    const raw = [
+      '{"Action":"output","Package":"p","Output":"undefined: Foo\\n"}',
+      '{"Action":"fail","Package":"p"}',
+    ].join("\n");
+
+    const t = parseGateOutput(raw, "go-json");
+
+    assert.equal(t.failed, 0);
+    assert.equal(t.packageFailed, true);
+    assert.deepEqual(t.packageFailures, ["p"]);
+  });
+
+  test("a duplicated terminal event does not double-count", () => {
+    const raw = [
+      '{"Action":"pass","Package":"p","Test":"TestA"}',
+      '{"Action":"pass","Package":"p","Test":"TestA"}',
+    ].join("\n");
+
+    assert.equal(parseGateOutput(raw, "go-json").executed, 1);
+  });
+});
+
+describe("parseGateOutput — playwright-json", () => {
+  test("reads statuses out of a nested suite tree", () => {
+    const doc = JSON.stringify({
+      errors: [],
+      suites: [{
+        title: "gate.spec.ts",
+        specs: [
+          { title: "passes", tests: [{ status: "expected" }] },
+          { title: "breaks", tests: [{ status: "unexpected" }] },
+          { title: "declines", tests: [{ status: "skipped", annotations: [{ type: "skip", description: "no token" }] }] },
+        ],
+        suites: [{
+          title: "nested",
+          specs: [{ title: "deep", tests: [{ status: "flaky" }] }],
+        }],
+      }],
+    });
+
+    const t = parseGateOutput(doc, "playwright-json");
+
+    assert.equal(t.executed, 3, "expected + unexpected + flaky; skipped executed nothing");
+    assert.equal(t.passed, 2, "a flake did run and did end green");
+    assert.equal(t.failed, 1);
+    assert.equal(t.skipped, 1);
+    assert.match(t.skipReasons[0], /no token/);
+    assert.match(t.failedNames[0], /breaks/);
+  });
+
+  test("a global error is a suite-level failure with no failing test", () => {
+    const doc = JSON.stringify({ errors: [{ message: "global setup threw" }], suites: [] });
+    const t = parseGateOutput(doc, "playwright-json");
+    assert.equal(t.packageFailed, true);
+    assert.equal(t.failed, 0);
+  });
+
+  test("strips a non-JSON preamble before the report", () => {
+    const doc = "Running 3 tests using 1 worker\n" + JSON.stringify({ errors: [], suites: [] });
+    assert.equal(parseGateOutput(doc, "playwright-json").recognizedLines, 1);
+  });
+
+  test("unparseable input yields zero recognized lines rather than throwing", () => {
+    assert.equal(parseGateOutput("not json at all", "playwright-json").recognizedLines, 0);
+    assert.equal(parseGateOutput("{ oops", "playwright-json").recognizedLines, 0);
+  });
+});
+
+describe("decideGateVerdict", () => {
+  const clean = {
+    executed: 176, failed: 0, packageFailed: false, recognizedLines: 400,
+  };
+  const base = { runError: null, timedOut: false, tally: clean, exitCode: 0, minExecuted: 150 };
+
+  test("passes only when the artifact itself says so", () => {
+    assert.equal(decideGateVerdict(base).verdict, "pass");
+  });
+
+  test("an all-skip run with exit 0 is zero-executed, never pass", () => {
+    // The 2026-07-22 failure, reduced to its essence.
+    const d = decideGateVerdict({
+      ...base,
+      tally: { executed: 0, failed: 0, packageFailed: false, recognizedLines: 400 },
+    });
+    assert.equal(d.verdict, "zero-executed");
+    assert.match(d.reason, /below the floor/);
+  });
+
+  test("exit 0 with no artifact is unusable, never pass", () => {
+    assert.equal(decideGateVerdict({ ...base, tally: null }).verdict, "unusable");
+  });
+
+  test("exit 0 with an artifact holding no events is unusable", () => {
+    assert.equal(
+      decideGateVerdict({ ...base, tally: { ...clean, recognizedLines: 0 } }).verdict,
+      "unusable",
+    );
+  });
+
+  test("a run error beats everything, including a clean-looking artifact", () => {
+    assert.equal(decideGateVerdict({ ...base, runError: "worktree missing" }).verdict, "unusable");
+  });
+
+  test("a timeout is unusable even when nothing had failed yet", () => {
+    // The artifact is a prefix of the truth, not the truth. A prefix with no
+    // failures in it is not a pass.
+    assert.equal(decideGateVerdict({ ...base, timedOut: true }).verdict, "unusable");
+  });
+
+  test("a failing test outranks the executed floor", () => {
+    // A run with one failure and only 3 executed is a FAIL, routed to the
+    // developer — not an environment park. Ordering decides which.
+    const d = decideGateVerdict({
+      ...base,
+      tally: { executed: 3, failed: 1, packageFailed: true, recognizedLines: 10 },
+    });
+    assert.equal(d.verdict, "fail");
+  });
+
+  test("a suite-level failure with no failing test is still a fail", () => {
+    const d = decideGateVerdict({
+      ...base,
+      tally: { executed: 176, failed: 0, packageFailed: true, recognizedLines: 400 },
+    });
+    assert.equal(d.verdict, "fail");
+    assert.match(d.reason, /build error, panic, or harness crash/);
+  });
+
+  test("a clean report contradicted by a non-zero exit is unusable, not pass", () => {
+    // The belt. Report says green, process says red; neither is trustworthy,
+    // and there is no failing test to hand a developer.
+    const d = decideGateVerdict({ ...base, exitCode: 1 });
+    assert.equal(d.verdict, "unusable");
+    assert.match(d.reason, /disagree/);
+  });
+
+  test("a floor of 0 is clamped to 1 so the guard cannot be configured away", () => {
+    const d = decideGateVerdict({
+      ...base,
+      minExecuted: 0,
+      tally: { executed: 0, failed: 0, packageFailed: false, recognizedLines: 5 },
+    });
+    assert.equal(d.verdict, "zero-executed");
+  });
+
+  test("INVARIANT: exit code 0 alone never yields a pass", () => {
+    // The named property, table-driven. This is the exact inversion of the
+    // 2026-07-22 failure, where a 0 was read first and treated as sufficient.
+    // Every row here holds exitCode 0 and some other defect; none may pass.
+    const rows: { name: string; input: Parameters<typeof decideGateVerdict>[0] }[] = [
+      { name: "run error", input: { ...base, exitCode: 0, runError: "spawn failed" } },
+      { name: "timed out", input: { ...base, exitCode: 0, timedOut: true } },
+      { name: "no artifact", input: { ...base, exitCode: 0, tally: null } },
+      { name: "artifact with no events", input: { ...base, exitCode: 0, tally: { ...clean, recognizedLines: 0 } } },
+      { name: "one failing test", input: { ...base, exitCode: 0, tally: { ...clean, failed: 1 } } },
+      { name: "package failed", input: { ...base, exitCode: 0, tally: { ...clean, packageFailed: true } } },
+      { name: "nothing executed", input: { ...base, exitCode: 0, tally: { ...clean, executed: 0 } } },
+      { name: "one short of the floor", input: { ...base, exitCode: 0, tally: { ...clean, executed: 149 } } },
+      {
+        name: "everything skipped",
+        input: {
+          ...base,
+          exitCode: 0,
+          tally: { executed: 0, failed: 0, packageFailed: false, recognizedLines: 900 },
+        },
+      },
+    ];
+
+    for (const row of rows) {
+      const d = decideGateVerdict(row.input);
+      assert.notEqual(d.verdict, "pass", `exit 0 must not rescue: ${row.name}`);
+    }
+  });
+
+  test("INVARIANT: flipping the exit code to 0 never improves a verdict", () => {
+    // Stronger than the row table: for each defective input, the verdict must
+    // be IDENTICAL whether the process exited 0 or 1. The exit code is only
+    // ever allowed to make things worse.
+    const defects = [
+      { runError: "boom" },
+      { timedOut: true },
+      { tally: null },
+      { tally: { ...clean, failed: 2 } },
+      { tally: { ...clean, executed: 0 } },
+      { tally: { ...clean, recognizedLines: 0 } },
+    ];
+    for (const defect of defects) {
+      const withZero = decideGateVerdict({ ...base, ...defect, exitCode: 0 });
+      const withOne = decideGateVerdict({ ...base, ...defect, exitCode: 1 });
+      assert.equal(
+        withZero.verdict,
+        withOne.verdict,
+        `exit status changed the verdict for ${JSON.stringify(defect)}`,
+      );
+    }
+  });
+});
+
+describe("decideGateOutcome", () => {
+  test("pass advances and clears the gate label", () => {
+    const o = decideGateOutcome("pass");
+    assert.equal(o.toColumn, "In Documentation");
+    assert.deepEqual(o.removeLabels, ["needs-real-claude"]);
+    assert.deepEqual(o.addLabels, []);
+    assert.equal(o.notify, false);
+  });
+
+  test("fail routes to the developer and KEEPS the gate label", () => {
+    // Dropping it would let the fix reach Done having proved nothing.
+    const o = decideGateOutcome("fail");
+    assert.equal(o.toColumn, "In Development");
+    assert.deepEqual(o.addLabels, ["needs-rework:developer"]);
+    assert.deepEqual(o.removeLabels, [], "the ticket must re-gate after the fix");
+    assert.equal(o.notify, false);
+  });
+
+  test("environment problems park with an error label and ping a human", () => {
+    // Deliberately NOT routed to the developer: an agent cannot fix a missing
+    // credential, and would burn all three rework spawns discovering that.
+    for (const verdict of ["zero-executed", "unusable"] as const) {
+      const o = decideGateOutcome(verdict);
+      assert.equal(o.toColumn, null, `${verdict} must leave the ticket where it is`);
+      assert.deepEqual(o.addLabels, ["error:real-claude-gate"]);
+      assert.equal(o.notify, true);
+    }
+  });
+
+  test("no verdict ever removes the gate label except a pass", () => {
+    for (const verdict of ["fail", "zero-executed", "unusable"] as const) {
+      assert.deepEqual(decideGateOutcome(verdict).removeLabels, [], verdict);
+    }
+  });
+});
+
+describe("decideRealClaudeGateRun", () => {
+  const item = (over: Partial<{ id: string; issueNumber: number; labels: string[]; blockedBy: any[] }> = {}) => ({
+    id: over.id ?? "i1",
+    issueNumber: over.issueNumber ?? 1382,
+    labels: over.labels ?? ["done:code-review", "needs-real-claude"],
+    blockedBy: over.blockedBy ?? [],
+  });
+
+  test("picks the first eligible ticket in board order", () => {
+    const picked = decideRealClaudeGateRun([
+      item({ id: "a", issueNumber: 1382 }),
+      item({ id: "b", issueNumber: 1381 }),
+    ]);
+    assert.deepEqual(picked, { itemId: "a", issueNumber: 1382 });
+  });
+
+  test("returns at most one, never a list", () => {
+    // One gate per cycle: a suite is minutes of blocking wall clock and the
+    // chain drains just as fast one link at a time.
+    const picked = decideRealClaudeGateRun([item({ id: "a" }), item({ id: "b" }), item({ id: "c" })]);
+    assert.equal(picked?.itemId, "a");
+  });
+
+  test("skips a ticket already carrying an error label", () => {
+    // This is what stops a parked ticket re-running the gate forever. The
+    // mechanism is self-limiting because of it.
+    assert.equal(decideRealClaudeGateRun([
+      item({ labels: ["done:code-review", "needs-real-claude", "error:real-claude-gate"] }),
+    ]), null);
+  });
+
+  test("skips a ticket pending rework", () => {
+    assert.equal(decideRealClaudeGateRun([
+      item({ labels: ["done:code-review", "needs-real-claude", "needs-rework:developer"] }),
+    ]), null);
+  });
+
+  test("skips a ticket with an open blocker", () => {
+    assert.equal(decideRealClaudeGateRun([
+      item({ blockedBy: [{ number: 99, state: "OPEN" }] }),
+    ]), null);
+  });
+
+  test("a closed blocker does not disqualify", () => {
+    assert.ok(decideRealClaudeGateRun([item({ blockedBy: [{ number: 99, state: "CLOSED" }] })]));
+  });
+
+  test("requires both a finished review and the gate label", () => {
+    assert.equal(decideRealClaudeGateRun([item({ labels: ["needs-real-claude"] })]), null);
+    assert.equal(decideRealClaudeGateRun([item({ labels: ["done:code-review"] })]), null);
+  });
+
+  test("skips non-issue board items", () => {
+    assert.equal(decideRealClaudeGateRun([item({ issueNumber: 0 })]), null);
+  });
+
+  test("passes over an ineligible ticket to reach an eligible one", () => {
+    const picked = decideRealClaudeGateRun([
+      item({ id: "blocked", labels: ["done:code-review", "needs-real-claude", "error:qa"] }),
+      item({ id: "ready" }),
+    ]);
+    assert.equal(picked?.itemId, "ready");
+  });
+});
+
+describe("formatGateEvidenceComment", () => {
+  const baseReport = {
+    runError: null,
+    timedOut: false,
+    exitCode: 0,
+    tally: {
+      executed: 176, passed: 176, failed: 0, skipped: 14,
+      failedNames: [], skipReasons: ["p.TestExternal: no network"],
+      packageFailed: false, packageFailures: [], recognizedLines: 400,
+    },
+    command: "go test -tags e2e_realclaude -json ./...",
+    branchName: "feature/1382",
+    baseRef: "origin/main",
+    baseSha: "b".repeat(40),
+    headSha: "h".repeat(40),
+    commitsBehind: 29,
+    durationMs: 308_022,
+    outputPath: "/logs/gate.log",
+    outputBytes: 2_100_000,
+  };
+
+  test("carries the commits-behind figure so the merged-state claim is auditable", () => {
+    const body = formatGateEvidenceComment({
+      verdict: "pass", reason: "176 test(s) executed, none failed",
+      report: baseReport, minExecuted: 150, action: "moved it to In Documentation",
+    });
+    assert.match(body, /29 commit\(s\) behind/);
+    assert.match(body, /origin\/main/);
+    assert.match(body, /308\.0s/);
+  });
+
+  test("states the floor alongside the executed count", () => {
+    const body = formatGateEvidenceComment({
+      verdict: "pass", reason: "ok", report: baseReport, minExecuted: 150, action: "advanced",
+    });
+    assert.match(body, /floor for this fork is 150/);
+  });
+
+  test("says plainly that nothing was judged when there is no artifact", () => {
+    const body = formatGateEvidenceComment({
+      verdict: "unusable", reason: "no readable test events",
+      report: { ...baseReport, tally: null }, minExecuted: 150, action: "parked",
+    });
+    assert.match(body, /not the same as nothing failing/);
+  });
+
+  test("reports an uncomputable commits-behind rather than omitting it", () => {
+    const body = formatGateEvidenceComment({
+      verdict: "pass", reason: "ok",
+      report: { ...baseReport, commitsBehind: null }, minExecuted: 150, action: "advanced",
+    });
+    assert.match(body, /could not be computed/);
+  });
+});
