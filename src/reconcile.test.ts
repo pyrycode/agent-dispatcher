@@ -14,7 +14,14 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 
-import { runAutoAdvance, runRealClaudeGate, runReworkRouting, type ReconcileClient } from "./reconcile.js";
+import {
+  runAutoAdvance,
+  runRealClaudeGate,
+  runRealClaudeGateExecution,
+  runReworkRouting,
+  type ReconcileClient,
+} from "./reconcile.js";
+import type { GateRunReport, GateTally } from "./gate-output.js";
 import type { ProjectItem } from "./types.js";
 
 /**
@@ -60,8 +67,26 @@ class MockClient implements ReconcileClient {
     if (item && !item.labels.includes(label)) item.labels.push(label);
   }
 
-  async addComment(): Promise<void> {
-    /* no-op for tests */
+  addCommentCalls: { issueNumber: number; body: string }[] = [];
+  async addComment(issueNumber: number, body: string): Promise<void> {
+    this.addCommentCalls.push({ issueNumber, body });
+  }
+
+  /**
+   * Fresh label read. Defaults to whatever the board snapshot holds, which
+   * is the common case; a test that needs the snapshot and the truth to
+   * DIVERGE — the label-truncation hazard the fresh read exists for —
+   * overrides this map.
+   */
+  freshLabels = new Map<number, string[]>();
+  getIssueLabelsCalls: number[] = [];
+  getIssueLabelsError: Error | null = null;
+  async getIssueLabels(issueNumber: number): Promise<string[]> {
+    this.getIssueLabelsCalls.push(issueNumber);
+    if (this.getIssueLabelsError) throw this.getIssueLabelsError;
+    const override = this.freshLabels.get(issueNumber);
+    if (override) return [...override];
+    return [...(this.items.find(i => i.issueNumber === issueNumber)?.labels ?? [])];
   }
 
   clearItemsCache(): void {
@@ -316,5 +341,280 @@ describe("runRealClaudeGate — parks gated tickets in Inbox", () => {
 
     assert.equal(client.updateItemStatusCalls.length, 0);
     assert.equal(client.clearItemsCacheCalls, 0);
+  });
+});
+
+// --------- Dispatcher-executed real-claude gate ---------
+
+/** Build a tally with only the fields a test cares about. */
+function tally(overrides: Partial<GateTally> = {}): GateTally {
+  return {
+    executed: 0,
+    passed: 0,
+    failed: 0,
+    skipped: 0,
+    failedNames: [],
+    skipReasons: [],
+    packageFailed: false,
+    packageFailures: [],
+    recognizedLines: 1,
+    ...overrides,
+  };
+}
+
+function report(overrides: Partial<GateRunReport> = {}): GateRunReport {
+  return {
+    runError: null,
+    timedOut: false,
+    exitCode: 0,
+    tally: tally({ executed: 176, passed: 176, skipped: 14 }),
+    command: "go test -tags e2e_realclaude -json ./...",
+    branchName: "feature/1382",
+    baseRef: "origin/main",
+    baseSha: "b".repeat(40),
+    headSha: "h".repeat(40),
+    commitsBehind: 29,
+    durationMs: 308_022,
+    outputPath: "/logs/gate.log",
+    outputBytes: 2_100_000,
+    baselineFailures: null,
+    baselineSkipReason: "no named test failures to compare",
+    baselineOutputPath: null,
+    ...overrides,
+  };
+}
+
+/** A parked, fully eligible gate candidate. */
+function parkedItem(overrides: Partial<ProjectItem> = {}): ProjectItem {
+  return makeItem({
+    id: "item-1382",
+    issueNumber: 1382,
+    status: "Inbox",
+    labels: ["done:code-review", "needs-real-claude", "size:m"],
+    ...overrides,
+  });
+}
+
+describe("runRealClaudeGateExecution — the off switch", () => {
+  test("a null runner touches nothing at all", async () => {
+    // The whole feature ships disabled. This is the property that lets it
+    // land on a live dispatcher: with no command configured, the step must
+    // not read the board, mutate it, or clear the cache.
+    const client = new MockClient([parkedItem()]);
+
+    await runRealClaudeGateExecution(client, null, 150, async () => {});
+
+    assert.equal(client.updateItemStatusCalls.length, 0);
+    assert.equal(client.addLabelCalls.length, 0);
+    assert.equal(client.addCommentCalls.length, 0);
+    assert.equal(client.clearItemsCacheCalls, 0);
+    assert.equal(client.getIssueLabelsCalls.length, 0);
+  });
+});
+
+describe("runRealClaudeGateExecution — selection", () => {
+  test("runs exactly ONE gate even when two tickets are eligible", async () => {
+    // A gate is minutes of blocking wall clock. Two per cycle would stall
+    // ticket selection for the sum of both, so the step takes the first in
+    // board order and leaves the rest for later cycles.
+    const first = parkedItem({ id: "item-1382", issueNumber: 1382 });
+    const second = parkedItem({ id: "item-1381", issueNumber: 1381 });
+    const client = new MockClient([first, second]);
+    const ran: number[] = [];
+
+    await runRealClaudeGateExecution(
+      client,
+      async ({ issueNumber }) => { ran.push(issueNumber); return report(); },
+      150,
+      async () => {},
+    );
+
+    assert.deepEqual(ran, [1382], "expected exactly one gate run, on the first ticket in board order");
+  });
+
+  test("skips a ticket the FRESH label read disqualifies", async () => {
+    // The board snapshot asks GitHub for `labels(first: 10)`, and a ticket
+    // this far down the pipeline can carry ten already — so the snapshot can
+    // be missing the error label that should stop the run. The fresh read is
+    // the only thing standing between that and a pointless 5-minute suite.
+    const item = parkedItem();
+    const client = new MockClient([item]);
+    client.freshLabels.set(1382, [...item.labels, "error:developer"]);
+    let ranCount = 0;
+
+    await runRealClaudeGateExecution(
+      client,
+      async () => { ranCount++; return report(); },
+      150,
+      async () => {},
+    );
+
+    assert.equal(ranCount, 0, "a ticket carrying error:* must not be gated");
+    assert.equal(client.updateItemStatusCalls.length, 0);
+  });
+
+  test("does not run when the fresh label read fails", async () => {
+    // No fresh read means no confirmed eligibility. Falling back to the
+    // possibly-truncated snapshot is exactly the guess this guard exists
+    // to prevent.
+    const client = new MockClient([parkedItem()]);
+    client.getIssueLabelsError = new Error("REST 502");
+    let ranCount = 0;
+
+    await runRealClaudeGateExecution(client, async () => { ranCount++; return report(); }, 150, async () => {});
+
+    assert.equal(ranCount, 0);
+    assert.equal(client.clearItemsCacheCalls, 0);
+  });
+
+  test("ignores a ticket that is merely parked without a finished review", async () => {
+    const noReview = parkedItem({ id: "a", issueNumber: 1, labels: ["needs-real-claude"] });
+    const noLabel = parkedItem({ id: "b", issueNumber: 2, labels: ["done:code-review"] });
+    const client = new MockClient([noReview, noLabel]);
+    let ranCount = 0;
+
+    await runRealClaudeGateExecution(client, async () => { ranCount++; return report(); }, 150, async () => {});
+
+    assert.equal(ranCount, 0);
+  });
+});
+
+describe("runRealClaudeGateExecution — outcomes", () => {
+  test("pass advances the ticket and clears the gate label", async () => {
+    const item = parkedItem();
+    const client = new MockClient([item]);
+
+    await runRealClaudeGateExecution(client, async () => report(), 150, async () => {});
+
+    assert.deepEqual(client.updateItemStatusCalls, [{ itemId: "item-1382", newStatus: "In Documentation" }]);
+    assert.deepEqual(client.removeLabelCalls, [{ issueNumber: 1382, label: "needs-real-claude" }]);
+    assert.equal(client.addLabelCalls.length, 0);
+    assert.equal(item.status, "In Documentation");
+  });
+
+  test("failure routes to the developer and KEEPS needs-real-claude", async () => {
+    // Dropping the label would let the fix walk to Done having proved
+    // nothing. Keeping it forces a re-gate after the rework.
+    const item = parkedItem();
+    const client = new MockClient([item]);
+    const failing = report({
+      exitCode: 1,
+      tally: tally({ executed: 176, passed: 175, failed: 1, failedNames: ["pkg.TestThing"], packageFailed: true }),
+    });
+
+    await runRealClaudeGateExecution(client, async () => failing, 150, async () => {});
+
+    assert.deepEqual(client.updateItemStatusCalls, [{ itemId: "item-1382", newStatus: "In Development" }]);
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1382, label: "needs-rework:developer" }]);
+    assert.equal(client.removeLabelCalls.length, 0, "needs-real-claude must survive a failure");
+    assert.ok(item.labels.includes("needs-real-claude"));
+  });
+
+  test("an all-skip suite with exit 0 parks loudly instead of advancing", async () => {
+    // The 2026-07-22 shape, end to end: every test skipped, exit 0. This is
+    // the single most important assertion in the file. If it ever goes
+    // green-by-advancing, the gate has become the bug it was built to stop.
+    const item = parkedItem();
+    const client = new MockClient([item]);
+    const notifications: string[] = [];
+    const allSkipped = report({
+      exitCode: 0,
+      tally: tally({ executed: 0, passed: 0, skipped: 190, skipReasons: ["pkg.TestX: CLAUDE_CODE_OAUTH_TOKEN not set"] }),
+    });
+
+    await runRealClaudeGateExecution(client, async () => allSkipped, 150, async (m) => { notifications.push(m); });
+
+    assert.equal(client.updateItemStatusCalls.length, 0, "must not move the ticket anywhere");
+    assert.equal(item.status, "Inbox");
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1382, label: "error:real-claude-gate" }]);
+    assert.equal(client.removeLabelCalls.length, 0);
+    assert.equal(notifications.length, 1, "a gate that cannot judge must ping a human");
+  });
+
+  test("exit 0 with no artifact at all parks rather than passing", async () => {
+    const client = new MockClient([parkedItem()]);
+    const notifications: string[] = [];
+
+    await runRealClaudeGateExecution(
+      client,
+      async () => report({ exitCode: 0, tally: null }),
+      150,
+      async (m) => { notifications.push(m); },
+    );
+
+    assert.equal(client.updateItemStatusCalls.length, 0);
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1382, label: "error:real-claude-gate" }]);
+    assert.equal(notifications.length, 1);
+  });
+
+  test("a runner that throws still parks the ticket", async () => {
+    // Without this, the exception escapes, the card sits in Inbox with no
+    // error label, and the next cycle picks it up and throws again — an
+    // invisible loop that burns a full suite's wall clock each time.
+    const client = new MockClient([parkedItem()]);
+    const notifications: string[] = [];
+
+    await runRealClaudeGateExecution(
+      client,
+      async () => { throw new Error("worktree exploded"); },
+      150,
+      async (m) => { notifications.push(m); },
+    );
+
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1382, label: "error:real-claude-gate" }]);
+    assert.equal(notifications.length, 1);
+    assert.match(client.addCommentCalls[0]?.body ?? "", /worktree exploded/);
+  });
+});
+
+describe("runRealClaudeGateExecution — evidence and cache", () => {
+  test("clears the items cache after ANY run, including one that changed nothing", async () => {
+    // Not the usual mutated-only rule. A suite is 300s-plus, so by the time
+    // it returns the cycle's board snapshot is minutes stale — and ticket
+    // selection still runs after this step.
+    const client = new MockClient([parkedItem()]);
+
+    await runRealClaudeGateExecution(
+      client,
+      async () => report({ exitCode: 0, tally: null }),  // parks, moves nothing
+      150,
+      async () => {},
+    );
+
+    assert.equal(client.updateItemStatusCalls.length, 0, "sanity: this run moved nothing");
+    assert.equal(client.clearItemsCacheCalls, 1, "the cache is stale by wall clock, not by mutation");
+  });
+
+  test("the evidence comment carries the commits-behind figure and the executed count", async () => {
+    // Both numbers are what make the verdict auditable rather than asserted.
+    const client = new MockClient([parkedItem()]);
+
+    await runRealClaudeGateExecution(client, async () => report(), 150, async () => {});
+
+    const body = client.addCommentCalls[0]?.body ?? "";
+    assert.match(body, /29 commit\(s\) behind/);
+    assert.match(body, /\| 176 \| 176 \| 0 \| 14 \|/);
+    assert.match(body, /go test -tags e2e_realclaude/);
+    assert.match(body, /In Documentation/);
+  });
+
+  test("skip reasons are listed on a pass, not silently absorbed", async () => {
+    // 14 deliberate skips are expected on this suite. Listing them is how a
+    // reader can tell a deliberate skip from a credential that fell out.
+    const client = new MockClient([parkedItem()]);
+    const withSkips = report({
+      tally: tally({
+        executed: 176,
+        passed: 176,
+        skipped: 2,
+        skipReasons: ["pkg.TestExternal: no network", "pkg.TestBilling: metered key absent"],
+      }),
+    });
+
+    await runRealClaudeGateExecution(client, async () => withSkips, 150, async () => {});
+
+    const body = client.addCommentCalls[0]?.body ?? "";
+    assert.match(body, /metered key absent/);
+    assert.match(body, /a skip is not a pass/);
   });
 });

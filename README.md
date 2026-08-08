@@ -65,6 +65,54 @@ Optional:
 | `DISCORD_WEBHOOK_URL` | — | Notify on dispatch start/end |
 | `PYRY_LOG_RETENTION_DAYS` | `30` | Rotate logs older than N days; `0` disables |
 | `OWNER_TYPE` | `user` | `user` or `organization` for GitHub Project owner |
+| `PYRY_REAL_CLAUDE_GATE_CMD` | — | Shell command that runs the fork's live-claude suite. **Empty disables the gate entirely** and gated tickets park for an operator. See below. |
+| `PYRY_REAL_CLAUDE_GATE_FORMAT` | `go-json` | How to read what the command wrote: `go-json` or `playwright-json` |
+| `PYRY_REAL_CLAUDE_GATE_TIMEOUT_MS` | `1800000` | Outer wall clock for one gate run. Must exceed the command's own inner timeout. |
+| `PYRY_REAL_CLAUDE_GATE_MIN_EXECUTED` | `1` | Floor for the executed-test guard. Set near the suite's real count. |
+| `PYRY_REAL_CLAUDE_GATE_BASELINE_CMD` | — | Base-commit re-run template with a `{{TESTS}}` placeholder. Runs only when the branch has named failures, so it costs seconds. Unset means failures are attributed to the branch. |
+
+> **Load order.** `dotenv` now loads the fork's `.env` before any module-top constant reads `process.env`, so every variable in this table works from the file. Before 2026-08-07 the load sat below several of those reads, and `TARGET_REPO_PATH`, `TARGET_DEFAULT_BRANCH`, `SALVAGE_GATES` and `PYRY_AUTOCURATE_MEMORY` were silently file-blind — each fork's launcher pre-exported `TARGET_REPO_PATH` to work around it. Values a launcher exports, or that `op run --env-file` injects, still take precedence over the file.
+
+### Real-claude gate
+
+Some tickets can only be accepted by running against real claude rather than the pipeline's fakes. The PO marks them `needs-real-claude` during refinement. After code review such a ticket is parked in Inbox, and if this fork sets `PYRY_REAL_CLAUDE_GATE_CMD` the dispatcher then runs the suite itself, once per cycle, before it picks any other ticket.
+
+**What it does per run.** Fetches, resolves the branch from `origin` only, records how many commits behind the base branch it is, probes for conflicts with `git merge-tree --write-tree` before touching the disk, creates a **detached** worktree at the head commit, merges the base branch into it, runs the command, then judges by reading the output file back off disk. The worktree is removed either way. Both log files end in `.log`, so the existing rotation sweeps them.
+
+**Outcomes.**
+
+| Verdict | Board | Labels | Discord |
+|---|---|---|---|
+| pass | → In Documentation | removes `needs-real-claude` | no |
+| fail | → In Development | adds `needs-rework:developer`, **keeps** `needs-real-claude` | no |
+| failures the branch inherited | stays in Inbox | adds `error:real-claude-gate` | yes |
+| nothing executed | stays in Inbox | adds `error:real-claude-gate` | yes |
+| no usable result | stays in Inbox | adds `error:real-claude-gate` | yes |
+
+**The base comparison, and why it exists.** On the gate's first live run, 2026-08-07, a ticket came back with 519 passed and 2 failed and was routed to the developer agent. Both failures reproduced identically on clean `main` and neither touched the ticket's subject. Without a baseline the gate cannot tell "this branch broke it" from "it was already broken", so it hands an agent work it did not cause and cannot fix, burning rework attempts until the breaker halts it.
+
+So when a run fails with named tests, the gate re-runs **only those tests** against the base commit alone, unmerged, in a second detached worktree. Tests red on both sides are reported as inherited and the ticket parks for a human; only tests green on the base and red on the branch route as rework. Set it up as:
+
+```sh
+PYRY_REAL_CLAUDE_GATE_BASELINE_CMD='go test -tags e2e_realclaude -timeout 20m -json -run {{TESTS}} ./internal/e2e/realclaude/...'
+```
+
+Do not quote `{{TESTS}}` yourself; the substituted filter brings its own quoting. Two refusals are deliberate. A name containing anything outside a conservative character set refuses the whole filter rather than dropping that name, because a partial filter compares different test sets on the two sides. And a base run that executes nothing, the same false green the gate exists to reject, is discarded rather than treated as exoneration. In both cases `baselineFailures` stays null and the failures remain the branch's, since **a missing baseline is not an exoneration**.
+
+A failure keeps `needs-real-claude` so the ticket must pass the gate again after the fix; `runReworkRouting` strips the stale `done:*` trail and brings its three-strike breaker along. Environment failures park rather than routing to the developer agent, which could not fix a missing credential and would burn three spawns discovering that. The `error:` prefix already excludes a ticket from the WIP count and from gate re-selection, so the park is self-limiting.
+
+**The command must emit per-test JSON.** For Go that means:
+
+```sh
+PYRY_REAL_CLAUDE_GATE_CMD='go test -tags e2e_realclaude -timeout 20m -json ./internal/e2e/realclaude/...'
+PYRY_REAL_CLAUDE_GATE_MIN_EXECUTED=150
+```
+
+A bare `make e2e-realclaude` target will **not** work. Without `-json` it prints nothing per-test on success, only a package summary, so executed tests cannot be counted — and the executed-test count is the whole guard. This is a contract, not a detail.
+
+**Why the count, and not the exit code.** On 2026-07-22 a real-claude suite skipped every test, exited 0, and the code-review agent read that 0 as a pass; an unverified change shipped (pyrycode PR #1169 / #1168). A skip and a pass are indistinguishable to an exit code. So `decideGateVerdict` consults the exit status last and only to make a verdict worse: a zero exit can never turn a non-pass into a pass. Counting is also leaf-only — a parent test whose subtests all skipped reports `pass` for itself, and counting it would reopen the same hole one level up.
+
+**Billing.** The spawn environment keeps `CLAUDE_CODE_OAUTH_TOKEN` and leaves `ANTHROPIC_API_KEY` unset, so runs bill against the subscription. Tests that need a metered key skip; the executed floor should be set with those skips already accounted for.
 
 ## Layout
 

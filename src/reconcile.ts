@@ -33,13 +33,19 @@ import {
   MID_PIPELINE_COLUMNS,
   REAL_CLAUDE_GATE_FROM_COLUMN,
   REAL_CLAUDE_GATE_LABEL,
+  REAL_CLAUDE_GATE_RUN_FROM_COLUMN,
   REWORK_LOOP_THRESHOLD,
   countPipelineInFlight,
   decideAutoAdvance,
+  decideBaselineAdjustedVerdict,
+  decideGateOutcome,
+  decideGateVerdict,
   decideRealClaudeGate,
+  decideRealClaudeGateRun,
   decideReworkRoutes,
   extractReworkCount,
 } from "./pipeline-decisions.js";
+import { formatGateEvidenceComment, type GateRunReport } from "./gate-output.js";
 
 /**
  * Subset of `GitHubProjectClient` that reconciliation actually uses.
@@ -52,6 +58,19 @@ export interface ReconcileClient {
   removeLabel(issueNumber: number, label: string): Promise<void>;
   addLabel(issueNumber: number, label: string): Promise<void>;
   addComment(issueNumber: number, body: string): Promise<void>;
+  /**
+   * Authoritative label list for one issue, straight from the REST API.
+   *
+   * The board snapshot is NOT authoritative here: its GraphQL query asks
+   * for `labels(first: 10)` (github.ts), and a ticket that has walked the
+   * whole pipeline plausibly carries nine or ten already — `done:po`,
+   * `done:architect`, `done:developer`, `done:qa`, `done:code-review`, a
+   * size, a priority, a type, `needs-real-claude`. One more and the
+   * truncation starts eating exactly the labels the gate decides on.
+   * Cheap REST call, read once per gate run, only where correctness turns
+   * on it.
+   */
+  getIssueLabels(issueNumber: number): Promise<string[]>;
   clearItemsCache(): void;
 }
 
@@ -244,14 +263,17 @@ export async function runReworkRouting(client: ReconcileClient): Promise<void> {
   }
 }
 
-// Real-claude operator gate: a ticket whose acceptance needs a live-claude run
-// the dispatcher cannot perform is parked in Inbox after code review, for an
-// operator to run `make e2e-realclaude` by hand. See decideRealClaudeGate and
-// REAL_CLAUDE_GATE_LABEL in pipeline-decisions.ts. This MUST run before
-// runAutoAdvance so the ticket is pulled out of In Code Review before the
-// forward-advance rule would move it to In Documentation (belt-and-suspenders:
-// decideAutoAdvance also refuses to advance a gated ticket, so a skipped or
-// removed gate step still cannot un-gate one).
+// Real-claude gate, part one: park. A ticket whose acceptance needs a live run
+// against real claude is pulled out of In Code Review into Inbox, where part
+// two (`runRealClaudeGateExecution`, below) runs the suite for it on the same
+// cycle. With no gate command configured the ticket simply waits there for an
+// operator, which is the pre-2026-08-07 behaviour unchanged.
+//
+// See decideRealClaudeGate and REAL_CLAUDE_GATE_LABEL in pipeline-decisions.ts.
+// This MUST run before runAutoAdvance so the ticket is pulled out of In Code
+// Review before the forward-advance rule would move it to In Documentation
+// (belt-and-suspenders: decideAutoAdvance also refuses to advance a gated
+// ticket, so a skipped or removed gate step still cannot un-gate one).
 
 export async function runRealClaudeGate(client: ReconcileClient): Promise<void> {
   const itemsByColumn = new Map<string, ProjectItem[]>();
@@ -271,16 +293,23 @@ export async function runRealClaudeGate(client: ReconcileClient): Promise<void> 
       await client.updateItemStatus(route.itemId, route.toColumn);
       await client.addComment(
         route.issueNumber,
-        `## 🧪 Real-claude gate — parked for operator\n\n` +
-        `This ticket carries \`${REAL_CLAUDE_GATE_LABEL}\`: its acceptance needs a live-claude run the ` +
-        `dispatcher cannot perform. The dispatch environment has no Claude login, so the real-claude e2e ` +
-        `suite SKIPS rather than runs, and a skip is not a pass.\n\n` +
-        `Code review passed everything machine-checkable. Moved to **${route.toColumn}** so an operator runs ` +
-        `the live gate by hand:\n\n` +
-        `1. \`make e2e-realclaude\` on a machine with a Claude login.\n` +
+        `## 🧪 Real-claude gate — parked for the live run\n\n` +
+        `This ticket carries \`${REAL_CLAUDE_GATE_LABEL}\`: its acceptance needs a live run against real ` +
+        `claude, which the rest of the pipeline's fakes cannot stand in for. Code review passed everything ` +
+        `machine-checkable, so it is moved to **${route.toColumn}**, out of the pipeline, until that run happens.\n\n` +
+        `**Why it does not just advance.** A real-claude suite with no credential SKIPS every test and still ` +
+        `exits 0. On 2026-07-22 that 0 was read as a pass and an unverified change shipped ` +
+        `(pyrycode PR #1169 / #1168). Only a count of tests that actually executed can tell a pass from a ` +
+        `skip, so nothing advances until something has counted.\n\n` +
+        `**What happens next.** If this fork sets \`PYRY_REAL_CLAUDE_GATE_CMD\`, the dispatcher runs the suite ` +
+        `itself on its next cycle and posts an evidence comment with the executed-test count. Otherwise an ` +
+        `operator runs it by hand:\n\n` +
+        `1. Run the fork's real-claude suite with per-test JSON output, on a machine with a Claude login.\n` +
         `2. **Pass** → remove \`${REAL_CLAUDE_GATE_LABEL}\` and move the ticket to **In Documentation**.\n` +
-        `3. **Fail** → add \`needs-rework:developer\` and move it to **In Development**.\n\n` +
-        `Do not move it back to In Code Review with the label still on — it will just re-park here.`,
+        `3. **Fail** → add \`needs-rework:developer\` and move it to **In Development**, keeping ` +
+        `\`${REAL_CLAUDE_GATE_LABEL}\` on so it re-gates after the fix.\n\n` +
+        `Read the skip reasons, not the exit code. Do not move it back to In Code Review with the label ` +
+        `still on — it will just re-park here.`,
       );
       mutated = true;
       console.log(`   🧪 Real-claude gate: parked #${route.issueNumber} in ${route.toColumn} for operator (${REAL_CLAUDE_GATE_LABEL})`);
@@ -290,6 +319,203 @@ export async function runRealClaudeGate(client: ReconcileClient): Promise<void> 
   }
 
   if (mutated) {
+    client.clearItemsCache();
+  }
+}
+
+// Real-claude gate, part two: execute.
+//
+// Runs the fork's live-claude suite against one parked ticket, reads the
+// result, and moves the ticket accordingly. This is what makes a chain of
+// gated tickets drain unattended — on board #1, four tickets deep, where
+// each pass only revealed the next gate and each one cost a human
+// interruption.
+//
+// The process work (git, worktree, spawn) lives in dispatch.ts behind the
+// `runner` seam; the verdict logic is pure in pipeline-decisions.ts. This
+// function owns only the board I/O between them.
+
+/**
+ * Runs the gate for one ticket and reports what happened. Supplied by
+ * dispatch.ts; null when `PYRY_REAL_CLAUDE_GATE_CMD` is unset, which is
+ * the feature's off switch.
+ */
+export type RealClaudeGateRunner = (opts: { issueNumber: number }) => Promise<GateRunReport>;
+
+export async function runRealClaudeGateExecution(
+  client: ReconcileClient,
+  runner: RealClaudeGateRunner | null,
+  minExecuted: number,
+  notifyDiscord: (message: string) => Promise<void>,
+): Promise<void> {
+  // Off switch. No command configured means this step never touches the
+  // board, so the whole feature can land on a live dispatcher before any
+  // fork opts in.
+  if (runner === null) return;
+
+  let parked: ProjectItem[];
+  try {
+    parked = await client.getItemsByStatus(REAL_CLAUDE_GATE_RUN_FROM_COLUMN);
+  } catch (error: any) {
+    console.error(`Error scanning ${REAL_CLAUDE_GATE_RUN_FROM_COLUMN} for real-claude gate runs: ${error.message}`);
+    return;
+  }
+
+  const candidate = decideRealClaudeGateRun(parked);
+  if (candidate === null) return;
+
+  const snapshot = parked.find(item => item.id === candidate.itemId);
+
+  // Re-read labels from the REST API before committing minutes of wall
+  // clock to a run. The board snapshot truncates at ten labels and a
+  // ticket this far down the pipeline is plausibly at nine, so the
+  // snapshot can be missing the very label that disqualifies it — a
+  // freshly-added `error:*` or `needs-rework:*`, or a `needs-real-claude`
+  // an operator just cleared by hand.
+  let freshLabels: string[];
+  try {
+    freshLabels = await client.getIssueLabels(candidate.issueNumber);
+  } catch (error: any) {
+    // No fresh read, no run. Gating on a possibly-truncated label set is
+    // how a ticket gets gated after someone already parked it.
+    console.warn(
+      `   ⚠️  Real-claude gate: could not re-read labels for #${candidate.issueNumber}, skipping this cycle: ${error.message}`,
+    );
+    return;
+  }
+
+  const confirmed = decideRealClaudeGateRun([
+    {
+      id: candidate.itemId,
+      issueNumber: candidate.issueNumber,
+      labels: freshLabels,
+      blockedBy: snapshot?.blockedBy ?? [],
+    },
+  ]);
+  if (confirmed === null) {
+    console.log(
+      `   🧪 Real-claude gate: #${candidate.issueNumber} no longer eligible on a fresh label read — skipping`,
+    );
+    return;
+  }
+
+  console.log(
+    `   🧪 Real-claude gate: running the live suite for #${candidate.issueNumber} (this blocks the cycle)…`,
+  );
+
+  let report: GateRunReport;
+  try {
+    report = await runner({ issueNumber: candidate.issueNumber });
+  } catch (error: any) {
+    // A runner that throws must still park the ticket. Letting the
+    // exception escape would leave the card sitting in Inbox with no
+    // error label, so the next cycle would pick it up and throw again —
+    // an invisible loop that burns a full suite's wall clock each time.
+    report = {
+      runError: `gate runner threw: ${error?.message ?? error}`,
+      timedOut: false,
+      exitCode: null,
+      tally: null,
+      command: "(runner threw before reporting the command)",
+      branchName: `feature/${candidate.issueNumber}`,
+      baseRef: "unknown",
+      baseSha: "",
+      headSha: "",
+      commitsBehind: null,
+      durationMs: 0,
+      outputPath: "(none)",
+      outputBytes: 0,
+      baselineFailures: null,
+      baselineSkipReason: "the runner threw before any comparison could run",
+      baselineOutputPath: null,
+    };
+  }
+
+  try {
+    const raw = decideGateVerdict({
+      runError: report.runError,
+      timedOut: report.timedOut,
+      tally: report.tally,
+      exitCode: report.exitCode,
+      minExecuted,
+    });
+    // Re-judge a failure against what the base commit already fails, so a
+    // branch is not blamed for breakage it inherited. No-op for every other
+    // verdict, and a no-op when no baseline ran.
+    const { verdict, reason, introduced, preExisting } = decideBaselineAdjustedVerdict({
+      verdict: raw.verdict,
+      reason: raw.reason,
+      branchFailures: report.tally?.failedNames ?? [],
+      baselineFailures: report.baselineFailures,
+    });
+    const outcome = decideGateOutcome(verdict);
+
+    const action = outcome.toColumn === null
+      ? `left it in ${REAL_CLAUDE_GATE_RUN_FROM_COLUMN} and added \`${outcome.addLabels.join("`, `")}\`. ` +
+        (verdict === "inherited-failure"
+          ? `This needs a human: the failures are real but this branch did not cause them, so there is nothing ` +
+            `for the developer agent to fix. Repair the base, file the failures, or let the ticket through.`
+          : `This needs a human: the gate could not produce a trustworthy answer, and no agent can fix that by ` +
+            `rewriting code.`)
+      : `moved it to **${outcome.toColumn}**` +
+        (outcome.addLabels.length > 0 ? `, added \`${outcome.addLabels.join("`, `")}\`` : "") +
+        (outcome.removeLabels.length > 0 ? `, removed \`${outcome.removeLabels.join("`, `")}\`` : "") +
+        (verdict === "fail"
+          ? `. \`${REAL_CLAUDE_GATE_LABEL}\` stays on, so this ticket must pass the gate again after the fix.`
+          : ".");
+
+    // Comment first, mutate second. If a label write fails, the evidence
+    // is already on the ticket and an operator can finish by hand; the
+    // reverse order can move a card with no record of why.
+    //
+    // Then column BEFORE labels, which matters on a pass. If the move
+    // fails after `needs-real-claude` was already stripped, the ticket sits
+    // in Inbox with nothing marking it as gated: it would never re-gate and
+    // never advance, stuck silently. This order fails the other way — the
+    // label survives, the ticket re-gates next cycle, and the worst cost is
+    // one repeated suite run.
+    try {
+      await client.addComment(
+        candidate.issueNumber,
+        formatGateEvidenceComment({ verdict, reason, report, minExecuted, action, introduced, preExisting }),
+      );
+    } catch (e) {
+      console.warn(`   ⚠️  Failed to post real-claude gate evidence on #${candidate.issueNumber}: ${e}`);
+    }
+
+    if (outcome.toColumn !== null) {
+      try {
+        await client.updateItemStatus(candidate.itemId, outcome.toColumn);
+      } catch (e) {
+        console.warn(`   ⚠️  Failed to move #${candidate.issueNumber} to ${outcome.toColumn}: ${e}`);
+      }
+    }
+    for (const label of outcome.addLabels) {
+      try { await client.addLabel(candidate.issueNumber, label); } catch (e) {
+        console.warn(`   ⚠️  Failed to add ${label} to #${candidate.issueNumber}: ${e}`);
+      }
+    }
+    for (const label of outcome.removeLabels) {
+      try { await client.removeLabel(candidate.issueNumber, label); } catch (e) {
+        console.warn(`   ⚠️  Failed to remove ${label} from #${candidate.issueNumber}: ${e}`);
+      }
+    }
+
+    const icon = verdict === "pass" ? "✅" : verdict === "fail" ? "❌" : "🚨";
+    console.log(`   ${icon} Real-claude gate #${candidate.issueNumber}: ${verdict} — ${reason}`);
+
+    if (outcome.notify) {
+      await notifyDiscord(
+        `🚨 **Real-claude gate could not judge #${candidate.issueNumber}** (${verdict}): ${reason}\n` +
+        `Parked in ${REAL_CLAUDE_GATE_RUN_FROM_COLUMN} with \`${outcome.addLabels.join("`, `")}\`. ` +
+        `Needs a human — see the evidence comment.`,
+      );
+    }
+  } finally {
+    // Unconditionally, not just on mutation. The board snapshot this cycle
+    // started with is now minutes old — a full suite is 300s-plus — and
+    // ticket selection still runs after this step. Even a run that changed
+    // nothing has invalidated the cache by outliving it.
     client.clearItemsCache();
   }
 }

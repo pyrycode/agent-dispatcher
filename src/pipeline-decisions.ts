@@ -205,12 +205,16 @@ export function decideAutoAdvance(
     item.issueNumber > 0 &&
     item.labels.includes(rule.readyLabel) &&
     !item.labels.some(l => l.startsWith("needs-rework:") || l.startsWith("error:")) &&
-    // Real-claude operator gate (belt to runRealClaudeGate). A ticket needing
-    // a live-claude run must not auto-advance past code review: the dispatch
-    // env has no login token, so the real-claude suite SKIPS rather than runs
-    // and a skip reads as a false pass (pyrycode#1168, 2026-07-22). Scoped to
-    // the code-review→documentation boundary so the ticket still flows through
-    // the earlier stages; it holds here and the gate step parks it in Inbox.
+    // Real-claude gate (belt to runRealClaudeGate). A ticket needing a
+    // live-claude run must not auto-advance past code review until the gate
+    // has actually RUN and its result has been READ. The 2026-07-22 failure
+    // (pyrycode#1168) was not a missing human — it was a missing guard: the
+    // suite skipped, a skip exits 0, and the code-review agent read that 0 as
+    // a pass. Only an executed-test count can tell those apart, so nothing
+    // advances until something has counted. Scoped to the code-review→
+    // documentation boundary so the ticket still flows through the earlier
+    // stages; it holds here, and the gate step parks it in Inbox for
+    // `runRealClaudeGateExecution` to run.
     // This is the structural guarantee — it does not depend on the gate step
     // running, so removing or breaking that step cannot un-gate a ticket.
     !(rule.from === REAL_CLAUDE_GATE_FROM_COLUMN && item.labels.includes(REAL_CLAUDE_GATE_LABEL)) &&
@@ -359,20 +363,40 @@ export function decideReworkRoutes(
 // --------- Real-claude operator gate ---------
 
 /**
- * Label marking a ticket whose acceptance requires a live-claude run the
- * dispatcher cannot perform. The dispatch environment has no Claude login
- * token, so the real-claude e2e suite (`make e2e-realclaude`) SKIPS rather
- * than runs — and a skip exits 0, which the code-review agent read as a pass.
- * That false green shipped an unverified permission-path change (pyrycode
- * PR #1169 / #1168, 2026-07-22, gate still red after merge).
+ * Label marking a ticket whose acceptance requires a live run against real
+ * claude, rather than the fakes the rest of the pipeline uses.
  *
- * The pipeline cannot verify live-claude behaviour, so it must not close a
- * ticket that depends on it. A ticket carrying this label is held at the
- * code-review→documentation boundary (the structural belt lives in
- * `decideAutoAdvance`'s eligibility check) and routed to Inbox by
- * `runRealClaudeGate` for an operator to run the gate by hand. Recognition is
- * soft (the PO applies the label during refinement, per po/CLAUDE.md);
- * enforcement is hard (this label, once present, cannot auto-advance).
+ * **What actually went wrong on 2026-07-22, and what did not.** The failure
+ * (pyrycode PR #1169 / #1168) was that the real-claude suite SKIPPED, a skip
+ * exits 0, and the code-review agent read that 0 as a pass — so an unverified
+ * permission-path change shipped and the gate was still red after merge. The
+ * missing thing was a guard that counts executed tests. It was NOT a missing
+ * human.
+ *
+ * **The "no login token here" premise was never measured, and it is false.**
+ * Commit `affd97b` (2026-07-22) asserted in four places that the dispatch
+ * environment has no Claude credential, so the suite could only skip. Nothing
+ * in the dispatcher ever probed for one. Measured 2026-08-07 on the same
+ * machine: the fork's `.env` supplies `CLAUDE_CODE_OAUTH_TOKEN`,
+ * `SPAWN_ENV_DENYLIST` does not strip it, and the real skip guard
+ * (`WithWorktreeAuthenticated`, pyrycode `internal/e2e/realclaude/fixtures.go`)
+ * wants exactly that variable plus a readable `~/.claude.json`. Both hold. A
+ * full suite run from this machine that day: exit 0, 308.022s, 176 passed,
+ * 0 failed, 14 skipped, every skip deliberate.
+ *
+ * So the dispatcher runs the gate itself. A ticket carrying this label is held
+ * at the code-review→documentation boundary (the structural belt lives in
+ * `decideAutoAdvance`'s eligibility check), parked in Inbox by
+ * `runRealClaudeGate`, and executed there by `runRealClaudeGateExecution`. A
+ * pass advances it and clears the label; a failure routes it back to the
+ * developer with the label KEPT, so it must re-gate after the fix; an
+ * environment problem parks it under `error:real-claude-gate` and pings
+ * Discord. Recognition is soft (the PO applies the label during refinement,
+ * per po/CLAUDE.md); enforcement is hard (this label, once present, cannot
+ * auto-advance).
+ *
+ * With `PYRY_REAL_CLAUDE_GATE_CMD` unset the execution step is a strict no-op
+ * and the park-for-operator behaviour is exactly what it was.
  */
 export const REAL_CLAUDE_GATE_LABEL = "needs-real-claude";
 
@@ -431,6 +455,360 @@ export function decideRealClaudeGate(
     });
   }
   return routes;
+}
+
+// --------- Dispatcher-executed real-claude gate ---------
+
+/**
+ * Parked gated tickets wait here, and this is where the execution step
+ * looks for its next candidate. Same column `runRealClaudeGate` parks
+ * into, so a ticket that finishes code review this cycle is parked and
+ * then gated in the same cycle.
+ */
+export const REAL_CLAUDE_GATE_RUN_FROM_COLUMN = REAL_CLAUDE_GATE_TO_COLUMN;
+
+/** Where a passing ticket lands: the normal next stage after code review. */
+export const REAL_CLAUDE_GATE_PASS_COLUMN = "In Documentation";
+
+/** Where a failing ticket lands: back to the developer agent. */
+export const REAL_CLAUDE_GATE_FAIL_COLUMN = "In Development";
+
+/**
+ * Applied when the gate could not produce a trustworthy answer — the run
+ * errored, timed out, wrote an unreadable artifact, or executed too few
+ * tests to mean anything.
+ *
+ * The `error:` prefix is load-bearing rather than cosmetic. It already
+ * excludes a ticket from the work-in-progress count (`countPipelineInFlight`)
+ * and from gate re-selection (`decideRealClaudeGateRun`), so a ticket that
+ * parks this way stops consuming pipeline capacity and never re-runs the
+ * gate on a loop. The mechanism is self-limiting without any extra counter.
+ */
+export const REAL_CLAUDE_GATE_ERROR_LABEL = "error:real-claude-gate";
+
+/** The label a failed gate adds, routing the ticket back to the developer. */
+export const REAL_CLAUDE_GATE_REWORK_LABEL = "needs-rework:developer";
+
+/** The one ticket the dispatcher will gate this cycle. */
+export interface RealClaudeGateRunCandidate {
+  itemId: string;
+  issueNumber: number;
+}
+
+/**
+ * Pick at most ONE parked ticket to gate this cycle.
+ *
+ * One, not all: a real-claude suite is minutes of wall clock (308s measured
+ * on pyrycode, 2026-08-07) and the dispatcher is single-threaded at the
+ * top of its cycle. Gating two tickets back-to-back would stall ticket
+ * selection for the sum of both, and the chain drains just as fast one per
+ * cycle because each pass unblocks the next ticket's build anyway.
+ *
+ * Eligibility mirrors the rest of the pipeline: review finished
+ * (`done:code-review`), the gate is wanted (`needs-real-claude`), nothing is
+ * already wrong (`error:*`), no rework is pending (`needs-rework:*`), and no
+ * blocker is open. Excluding `error:*` is what stops a ticket the gate
+ * already parked from being re-selected forever.
+ *
+ * Input order is the board's own ordering (`POSITION` ascending), which is
+ * the user's prioritisation signal. First eligible wins; don't re-sort.
+ */
+export function decideRealClaudeGateRun(
+  items: readonly DecisionItem[],
+): RealClaudeGateRunCandidate | null {
+  for (const item of items) {
+    if (item.issueNumber <= 0) continue;
+    if (!item.labels.includes("done:code-review")) continue;
+    if (!item.labels.includes(REAL_CLAUDE_GATE_LABEL)) continue;
+    if (item.labels.some(l => l.startsWith("error:") || l.startsWith("needs-rework:"))) continue;
+    if (hasOpenBlockers(item.blockedBy ?? [])) continue;
+    return { itemId: item.id, issueNumber: item.issueNumber };
+  }
+  return null;
+}
+
+/** The four things a gate run can mean. */
+export type GateVerdict =
+  /** The suite ran, enough of it executed, and none of it failed. */
+  | "pass"
+  /** Real test failures, or a suite-level failure like a build error. */
+  | "fail"
+  /** The suite ran but verified (almost) nothing — the 2026-07-22 shape. */
+  | "zero-executed"
+  /** No trustworthy answer: run error, timeout, or unreadable artifact. */
+  | "unusable"
+  /**
+   * Real failures, but every one of them also fails on the base commit, so
+   * the branch introduced none of them. Not a pass, because the suite is
+   * genuinely red; not the branch's fault either.
+   */
+  | "inherited-failure";
+
+/** Everything `decideGateVerdict` is allowed to look at. */
+export interface GateVerdictInput {
+  /** Non-null when the run could not be started or completed at all. */
+  runError: string | null;
+  /** True when the outer wall clock fired. */
+  timedOut: boolean;
+  /** Parsed artifact. Null when no artifact could be read from disk. */
+  tally: GateTallyLike | null;
+  /** The command's exit status. Null when it never produced one. */
+  exitCode: number | null;
+  /** Floor for the executed-test guard. Clamped to at least 1. */
+  minExecuted: number;
+}
+
+/**
+ * The slice of `GateTally` the verdict depends on. Declared structurally so
+ * pipeline-decisions.ts stays free of a runtime import on the parser — this
+ * file is the pure decision layer and has no business knowing how a Go test
+ * event is shaped.
+ */
+export interface GateTallyLike {
+  executed: number;
+  failed: number;
+  packageFailed: boolean;
+  recognizedLines: number;
+}
+
+export interface GateVerdictDecision {
+  verdict: GateVerdict;
+  /** One line, suitable for a log and for the evidence comment. */
+  reason: string;
+}
+
+/**
+ * Turn one gate run into a verdict. This function IS the safety property;
+ * everything else around it is plumbing.
+ *
+ * **The invariant: a zero exit code never upgrades anything.** The exit
+ * status is consulted at exactly one point, step 6, and only to make a
+ * verdict WORSE. It can never turn a non-pass into a pass, because every
+ * check that could reject has already run by then. That ordering is the
+ * exact inversion of the 2026-07-22 failure, where a 0 was read first and
+ * treated as sufficient. `lib.test.ts` pins it with a table-driven test
+ * over every input shape.
+ *
+ * Strict evaluation order, worst evidence first:
+ *
+ *   1. **Run error** — the command never really ran. Nothing to judge.
+ *   2. **Timeout** — the run was cut off mid-flight, so the artifact is a
+ *      prefix of the truth, not the truth. A prefix with no failures in it
+ *      is not a pass.
+ *   3. **Unreadable artifact** — zero recognisable events. "Nothing to
+ *      judge" and "nothing failed" look identical to an exit code and must
+ *      never look identical here.
+ *   4. **Any failure** — a failed test, or a suite-level failure with no
+ *      test to attribute it to (a build error or panic).
+ *   5. **Below the executed floor** — the suite ran and verified nothing.
+ *      This is the check the whole mechanism exists for.
+ *   6. **Non-zero exit with a clean artifact** — the belt. The report says
+ *      green and the process says red, so the two disagree and neither can
+ *      be trusted. Unusable rather than fail: there is no failing test to
+ *      hand a developer, and sending one a contradiction burns rework
+ *      cycles it cannot resolve.
+ *   7. Otherwise: pass.
+ */
+export function decideGateVerdict(input: GateVerdictInput): GateVerdictDecision {
+  if (input.runError) {
+    return { verdict: "unusable", reason: `gate run failed to complete: ${input.runError}` };
+  }
+
+  if (input.timedOut) {
+    return {
+      verdict: "unusable",
+      reason: "gate run hit the outer wall-clock timeout; the artifact is a truncated prefix, not a result",
+    };
+  }
+
+  const tally = input.tally;
+  if (tally === null || tally.recognizedLines <= 0) {
+    return {
+      verdict: "unusable",
+      reason:
+        "no readable test events in the gate output — nothing was judged, which is not the same as nothing failing " +
+        "(does the command emit machine-readable per-test output, e.g. `go test -json`?)",
+    };
+  }
+
+  if (tally.failed > 0 || tally.packageFailed) {
+    const detail = tally.failed > 0
+      ? `${tally.failed} test(s) failed`
+      : "a suite-level failure with no failing test (build error, panic, or harness crash)";
+    return { verdict: "fail", reason: detail };
+  }
+
+  // A floor of 0 would disable the guard this whole file exists for, so a
+  // misconfigured fork gets 1 rather than an unguarded gate.
+  const floor = Math.max(1, input.minExecuted);
+  if (tally.executed < floor) {
+    return {
+      verdict: "zero-executed",
+      reason:
+        `only ${tally.executed} test(s) actually executed, below the floor of ${floor}. ` +
+        "A suite that skips everything still exits 0; that is exactly the false green this gate exists to catch",
+    };
+  }
+
+  if (input.exitCode !== 0) {
+    return {
+      verdict: "unusable",
+      reason:
+        `the test report is clean but the command exited ${input.exitCode ?? "with no status"}. ` +
+        "Report and process disagree, so neither is trustworthy",
+    };
+  }
+
+  return { verdict: "pass", reason: `${tally.executed} test(s) executed, none failed` };
+}
+
+/** What a baseline comparison concluded about a branch's failures. */
+export interface BaselineAdjustedVerdict {
+  verdict: GateVerdict;
+  reason: string;
+  /** Failures the branch introduced: red here, green on the base. */
+  introduced: string[];
+  /** Failures the branch inherited: red both ways. */
+  preExisting: string[];
+}
+
+/**
+ * Re-judge a failing run against what the base commit already fails.
+ *
+ * **Why this exists.** On the gate's first live run, 2026-08-07, pyrycode
+ * #1382 came back with 519 passed and 2 failed and was routed to the
+ * developer agent. Both failures reproduced identically on clean `main`,
+ * and neither touched the ticket's subject. Without a baseline the gate
+ * cannot tell "this branch broke it" from "it was already broken", so it
+ * hands a developer agent work it did not cause and cannot fix, and burns
+ * rework attempts until the three-strike breaker halts it.
+ *
+ * Kept separate from `decideGateVerdict` rather than folded into it, so
+ * that function stays a judgement about one run and its ordering invariant
+ * stays easy to state and to test. This one only ever runs after it, and
+ * only on a failure.
+ *
+ * **A missing baseline is not an exoneration.** When `baselineFailures` is
+ * null nothing was compared, so the verdict is left alone at `fail`. Null
+ * and empty must not collapse: empty means the baseline ran and every
+ * failure is new, null means nothing is known. Treating unknown as
+ * pre-existing would let a genuine regression park quietly as somebody
+ * else's problem, which is a worse failure than the one this fixes.
+ */
+export function decideBaselineAdjustedVerdict(opts: {
+  verdict: GateVerdict;
+  /** Failing test names from the branch run, package-qualified. */
+  branchFailures: readonly string[];
+  /** Failing names from the base re-run, or null when none ran. */
+  baselineFailures: readonly string[] | null;
+  reason: string;
+}): BaselineAdjustedVerdict {
+  // Only a failure has anything to compare. Every other verdict is about
+  // whether the run is trustworthy at all, which a baseline cannot change.
+  if (opts.verdict !== "fail") {
+    return { verdict: opts.verdict, reason: opts.reason, introduced: [], preExisting: [] };
+  }
+
+  if (opts.baselineFailures === null) {
+    return {
+      verdict: "fail",
+      reason: `${opts.reason}; no base comparison was available, so the failures are treated as this branch's`,
+      introduced: [...opts.branchFailures],
+      preExisting: [],
+    };
+  }
+
+  const baseSet = new Set(opts.baselineFailures);
+  const introduced = opts.branchFailures.filter(name => !baseSet.has(name));
+  const preExisting = opts.branchFailures.filter(name => baseSet.has(name));
+
+  // A package-level failure with no named failing test cannot be attributed
+  // either way, so it keeps the branch on the hook.
+  if (introduced.length === 0 && opts.branchFailures.length > 0) {
+    return {
+      verdict: "inherited-failure",
+      reason:
+        `${preExisting.length} test(s) failed, and every one of them fails on the base commit too, ` +
+        `so this branch introduced none of them`,
+      introduced,
+      preExisting,
+    };
+  }
+
+  return {
+    verdict: "fail",
+    reason: preExisting.length > 0
+      ? `${introduced.length} test(s) failed that pass on the base commit, plus ${preExisting.length} already failing there`
+      : opts.reason,
+    introduced,
+    preExisting,
+  };
+}
+
+/** Board actions for one gate verdict. */
+export interface GateOutcome {
+  /** Target column, or null to leave the ticket where it is. */
+  toColumn: string | null;
+  addLabels: string[];
+  removeLabels: string[];
+  /** Whether this outcome deserves a Discord ping. */
+  notify: boolean;
+}
+
+/**
+ * Map a verdict onto board actions.
+ *
+ *   pass          → In Documentation, clear `needs-real-claude`
+ *   fail          → In Development, add `needs-rework:developer`
+ *   zero-executed → stays in Inbox, add `error:real-claude-gate`, notify
+ *   unusable      → stays in Inbox, add `error:real-claude-gate`, notify
+ *
+ * **A failure deliberately KEEPS `needs-real-claude`.** The ticket must
+ * re-gate once the developer fixes it; dropping the label would let the
+ * fix walk to Done having proved nothing. Stripping the stale `done:*`
+ * trail is left to `runReworkRouting`, which already owns that job the
+ * moment the card lands in In Development — and which brings the existing
+ * three-strike rework breaker along with it, so a ticket that cannot be
+ * fixed halts instead of looping.
+ *
+ * **Environment problems park rather than route.** This is a deliberate
+ * deviation from "route failures back to the pipeline", which is the right
+ * rule for genuine test failures and the wrong one here: a developer agent
+ * handed a missing credential or a timed-out suite cannot fix it, and would
+ * burn all three rework spawns discovering that. Parking under an `error:`
+ * label is self-limiting, and no path here reads as green.
+ */
+export function decideGateOutcome(verdict: GateVerdict): GateOutcome {
+  switch (verdict) {
+    case "pass":
+      return {
+        toColumn: REAL_CLAUDE_GATE_PASS_COLUMN,
+        addLabels: [],
+        removeLabels: [REAL_CLAUDE_GATE_LABEL],
+        notify: false,
+      };
+    case "fail":
+      return {
+        toColumn: REAL_CLAUDE_GATE_FAIL_COLUMN,
+        addLabels: [REAL_CLAUDE_GATE_REWORK_LABEL],
+        removeLabels: [],
+        notify: false,
+      };
+    case "zero-executed":
+    case "unusable":
+    case "inherited-failure":
+      // `inherited-failure` parks for the same reason the other two do: no
+      // agent can fix it. A developer handed a failure the branch did not
+      // cause has nothing to act on, and would spend all three rework
+      // attempts finding that out. It needs a human to decide whether to
+      // fix the base, file the failure, or let the ticket through.
+      return {
+        toColumn: null,
+        addLabels: [REAL_CLAUDE_GATE_ERROR_LABEL],
+        removeLabels: [],
+        notify: true,
+      };
+  }
 }
 
 // --------- Done-column cleanup decision ---------

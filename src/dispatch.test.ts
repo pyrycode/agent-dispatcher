@@ -24,6 +24,7 @@ import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -52,6 +53,12 @@ import {
   type DispatchContext,
   type DispatchDeps,
   type SigintState,
+  buildGateSpawnEnv,
+  runRealClaudeGateSuite,
+  spawnGateCommand,
+  type GateRunnerDeps,
+  type GateSpawnOutcome,
+  type GateSpawnRequest,
   type StreamResult,
 } from "./dispatch.js";
 import type { AgentConfig, BlockerInfo, ProjectItem } from "./types.js";
@@ -4260,5 +4267,341 @@ describe("maybeCurateMemory (cooldown-gated inline auto-curation)", () => {
     const after = await maybeCurateMemory({ ...base, lessonFloorBytes: 20_000, nowMs: T0 + COOLDOWN, lastAttemptMs: during, deps });
     assert.equal(calls.length, 2, "retries after the cooldown — never stuck");
     assert.equal(after, T0 + COOLDOWN);
+  });
+});
+
+// ==========================================================================
+// Dispatcher-executed real-claude gate — the runner
+//
+// The process half: git plumbing, worktree creation, and the spawn
+// environment. Everything here goes through injected deps, so no test
+// runs a shell, a suite, or a child process.
+// ==========================================================================
+
+/** Records every git call and lets a test make a chosen one fail. */
+function makeGateDeps(over: Partial<GateRunnerDeps> & {
+  gitFail?: (cmd: string) => boolean;
+  gitOut?: (cmd: string) => string;
+  probeStatus?: number;
+  fileContents?: string | null;
+  spawnOutcome?: Partial<GateSpawnOutcome>;
+} = {}) {
+  const calls: string[] = [];
+  const spawnRequests: GateSpawnRequest[] = [];
+
+  const deps: Partial<GateRunnerDeps> = {
+    execSync: ((cmd: string) => {
+      calls.push(cmd);
+      if (over.gitFail?.(cmd)) throw new Error(`boom: ${cmd}`);
+      return Buffer.from(over.gitOut?.(cmd) ?? "");
+    }) as any,
+    spawnSync: (() => ({ status: over.probeStatus ?? 0, stdout: "", stderr: "" })) as any,
+    mkdirSync: (() => undefined) as any,
+    readFileSync: ((path: string) => {
+      if (over.fileContents === null) throw new Error("ENOENT");
+      return over.fileContents ?? '{"Action":"pass","Package":"p","Test":"TestA"}';
+    }) as any,
+    statSync: (() => ({ size: 42 })) as any,
+    now: () => 0,
+    spawnGate: async (req: GateSpawnRequest) => {
+      spawnRequests.push(req);
+      return { exitCode: 0, timedOut: false, spawnError: null, ...over.spawnOutcome };
+    },
+    ...over,
+  };
+
+  return { deps, calls, spawnRequests };
+}
+
+const GATE_BASE_SHA = "b".repeat(40);
+const GATE_HEAD_SHA = "h".repeat(40);
+const GATE_SHAS: Record<string, string> = {
+  "git rev-parse origin/main": GATE_BASE_SHA,
+  "git rev-parse origin/feature/1382": GATE_HEAD_SHA,
+  [`git rev-list --count ${GATE_HEAD_SHA}..${GATE_BASE_SHA}`]: "29",
+};
+
+function gateRun(over: Parameters<typeof makeGateDeps>[0] = {}) {
+  const harness = makeGateDeps({ gitOut: (cmd) => GATE_SHAS[cmd] ?? "", ...over });
+  return {
+    ...harness,
+    run: () => runRealClaudeGateSuite({
+      issueNumber: 1382,
+      command: "go test -json ./...",
+      format: "go-json",
+      timeoutMs: 60_000,
+      repoRoot: "/tmp/fake-repo",
+      defaultBranch: "main",
+      logsDir: "/tmp/fake-logs",
+      deps: harness.deps,
+    }),
+  };
+}
+
+describe("runRealClaudeGateSuite — worktree safety", () => {
+  test("creates the worktree DETACHED", async () => {
+    // Load-bearing twice over. Checking the branch out and merging main into
+    // it would leave a merge commit on the local branch that origin lacks;
+    // the next dispatch of that ticket would then hit
+    // `abort-local-strictly-ahead` and park, telling the operator to push
+    // commits that must never be pushed. The gate would poison every ticket
+    // it passed. A detached worktree also holds no branch, so it can never
+    // collide with a live dispatch worktree.
+    const { run, calls } = gateRun();
+    await run();
+
+    const add = calls.find(c => c.includes("worktree add"));
+    assert.ok(add, "expected a worktree to be created");
+    assert.match(add!, /worktree add --detach/);
+    assert.ok(!add!.includes("feature/1382"), "must check out the SHA, never the branch");
+  });
+
+  test("removes the worktree even when the run fails", async () => {
+    const { run, calls } = gateRun({ spawnOutcome: { exitCode: 1, spawnError: "died" } });
+    await run();
+
+    const removes = calls.filter(c => c.includes("worktree remove"));
+    assert.ok(removes.length >= 2, "expected a pre-run cleanup and a post-run removal");
+  });
+
+  test("removes the worktree when the merge conflicts, and reports it", async () => {
+    const { run, calls } = gateRun({ gitFail: (c) => c.startsWith("git merge ") });
+    const report = await run();
+
+    assert.match(report.runError ?? "", /could not merge/);
+    assert.ok(calls.some(c => c.includes("merge --abort")));
+    assert.ok(calls.some(c => c.includes("worktree remove")));
+  });
+
+  test("uses a worktree path that cannot collide with a dispatch worktree", async () => {
+    // Dispatch worktrees are `<agent>-<issue>`; no agent is called
+    // `real-claude-gate`.
+    const { run, calls } = gateRun();
+    await run();
+    assert.match(calls.find(c => c.includes("worktree add"))!, /real-claude-gate-1382/);
+  });
+});
+
+describe("runRealClaudeGateSuite — evidence gathering", () => {
+  test("records how many commits behind the base the branch was", async () => {
+    const report = await gateRun().run();
+    assert.equal(report.commitsBehind, 29);
+    assert.equal(report.baseRef, "origin/main");
+    assert.equal(report.headSha, "h".repeat(40));
+  });
+
+  test("an uncomputable commits-behind does not fail the run", async () => {
+    // Evidence-only. Losing it is worth a null in the comment, not a park.
+    const report = await gateRun({ gitFail: (c) => c.startsWith("git rev-list") }).run();
+    assert.equal(report.commitsBehind, null);
+    assert.equal(report.runError, null);
+  });
+
+  test("judges the bytes read back FROM DISK", async () => {
+    // Not an in-memory buffer: the judged bytes and the archived bytes have
+    // to be provably the same bytes.
+    const report = await gateRun({
+      fileContents: [
+        '{"Action":"pass","Package":"p","Test":"TestA"}',
+        '{"Action":"skip","Package":"p","Test":"TestB"}',
+      ].join("\n"),
+    }).run();
+
+    assert.equal(report.tally?.executed, 1);
+    assert.equal(report.tally?.skipped, 1);
+    assert.equal(report.outputBytes, 42);
+  });
+
+  test("a missing output file leaves a null tally, never an empty pass", async () => {
+    const report = await gateRun({ fileContents: null }).run();
+    assert.equal(report.tally, null);
+    assert.equal(report.exitCode, 0, "the process exited fine; there is just nothing to judge");
+  });
+
+  test("names both log files with a .log suffix so rotation sweeps them", async () => {
+    const { run, spawnRequests } = gateRun();
+    await run();
+    assert.match(spawnRequests[0].stdoutPath, /\.log$/);
+    assert.match(spawnRequests[0].stderrPath, /\.log$/);
+    assert.notEqual(spawnRequests[0].stdoutPath, spawnRequests[0].stderrPath);
+  });
+});
+
+describe("runRealClaudeGateSuite — refusing to run", () => {
+  test("reports a conflict from the merge-tree probe without touching the disk", async () => {
+    // The probe stays in the object database, so it cannot contend with a
+    // live dispatch. Preferred over the pull request's `mergeable` field,
+    // which GitHub computes asynchronously and reports as unknown for a
+    // window after each push.
+    const { run, calls } = gateRun({ probeStatus: 1 });
+    const report = await run();
+
+    assert.match(report.runError ?? "", /conflicts with/);
+    assert.ok(!calls.some(c => c.includes("worktree add")), "no worktree should be created");
+  });
+
+  test("an unsupported probe does not disable the gate", async () => {
+    // Old git lacks `merge-tree --write-tree`. The merge itself would still
+    // surface a real conflict, so a broken probe must not become a park.
+    const { run, calls } = gateRun({ probeStatus: 129 });
+    const report = await run();
+
+    assert.equal(report.runError, null);
+    assert.ok(calls.some(c => c.includes("worktree add")));
+  });
+
+  test("refuses to gate a branch that is not on origin", async () => {
+    // The ticket has an open pull request. Gating a local-only branch would
+    // attach a green verdict to code nobody is going to merge.
+    const report = await gateRun({ gitFail: (c) => c === "git rev-parse origin/feature/1382" }).run();
+    assert.match(report.runError ?? "", /pushed branch only/);
+  });
+
+  test("a failed fetch parks rather than running against stale refs", async () => {
+    const report = await gateRun({ gitFail: (c) => c.startsWith("git fetch") }).run();
+    assert.match(report.runError ?? "", /git fetch origin failed/);
+  });
+
+  test("never throws — every failure comes back as a report", async () => {
+    // A throw would leave the ticket unlabelled in Inbox, so the next cycle
+    // would try again and burn a full suite's wall clock every time.
+    const report = await gateRun({ gitFail: () => true }).run();
+    assert.ok(report.runError, "expected a runError, not an exception");
+  });
+});
+
+describe("buildGateSpawnEnv", () => {
+  test("keeps the Claude OAuth token", () => {
+    // The credential the real-claude fixtures actually look for. The
+    // 2026-07-22 belief that it is absent here was never measured and is
+    // false: a full suite ran from this machine on 2026-08-07, 176 passed.
+    const env = buildGateSpawnEnv({ CLAUDE_CODE_OAUTH_TOKEN: "sk-oauth-xyz", PATH: "/usr/bin" });
+    assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, "sk-oauth-xyz");
+    assert.equal(env.PATH, "/usr/bin");
+  });
+
+  test("does NOT define the metered API key, even when the parent has one", () => {
+    // Absent means the run bills against the subscription. Four
+    // external-service tests skip as a consequence; that is the expected
+    // cost of the billing choice, not a defect.
+    const env = buildGateSpawnEnv({ ANTHROPIC_API_KEY: "sk-ant-metered", CLAUDE_CODE_OAUTH_TOKEN: "t" });
+    assert.equal(env.ANTHROPIC_API_KEY, undefined);
+    assert.ok(!("ANTHROPIC_API_KEY" in env), "the key must be absent, not empty");
+  });
+
+  test("strips the dispatcher's GitHub token", () => {
+    // A test process must not be able to reach the credential that drives
+    // the board.
+    const env = buildGateSpawnEnv({ GITHUB_TOKEN: "ghp_secret", CLAUDE_CODE_OAUTH_TOKEN: "t" });
+    assert.equal(env.GITHUB_TOKEN, undefined);
+  });
+
+  test("the gate command receives that environment", async () => {
+    const { run, spawnRequests } = gateRun();
+    await run();
+    assert.ok(!("GITHUB_TOKEN" in spawnRequests[0].env));
+    assert.ok(!("ANTHROPIC_API_KEY" in spawnRequests[0].env));
+  });
+});
+
+describe("spawnGateCommand — the real spawner", () => {
+  // The seam exists so no other test needs a child process. These few do,
+  // because the default spawner is the one piece the seam cannot cover, and
+  // the bug it hides is invisible to any fake: a promise that never settles
+  // does not fail, it lets Node's event loop drain and the process exit 0.
+
+  const tmp = (name: string) => resolve(tmpdir(), `gate-spawn-test-${process.pid}-${name}`);
+
+  test("resolves even when the output streams close before the child event", { timeout: 15_000 }, async () => {
+    // The 2026-08-07 hang. A command that finishes instantly closes both
+    // pipes in the same tick the child's own `close` fires. Listeners armed
+    // after that point never hear it, the promise never settles, and the
+    // dispatcher exits silently with the artifact written and no verdict.
+    // Observed twice live against pyrycode#1382.
+    //
+    // A regression here does not throw, it never settles. The explicit
+    // timeout is the assertion, and it must stay: without it the suite would
+    // hang forever instead of reporting a failure.
+    const stdoutPath = tmp("fast.log");
+    const stderrPath = tmp("fast.err.log");
+
+    const outcome = await spawnGateCommand({
+      command: "echo done",
+      cwd: tmpdir(),
+      env: { PATH: process.env.PATH ?? "" },
+      timeoutMs: 30_000,
+      stdoutPath,
+      stderrPath,
+    });
+
+    assert.equal(outcome.exitCode, 0);
+    assert.equal(outcome.timedOut, false);
+    assert.equal(outcome.spawnError, null);
+  });
+
+  test("the output file is complete by the time it returns", { timeout: 15_000 }, async () => {
+    // The caller judges by reading this file back off disk. Returning before
+    // the write stream flushed would let it read a partial artifact and call
+    // a complete run truncated.
+    const stdoutPath = tmp("complete.log");
+    const stderrPath = tmp("complete.err.log");
+
+    await spawnGateCommand({
+      command: "for i in 1 2 3 4 5; do echo \"line $i\"; done",
+      cwd: tmpdir(),
+      env: { PATH: process.env.PATH ?? "" },
+      timeoutMs: 30_000,
+      stdoutPath,
+      stderrPath,
+    });
+
+    assert.equal(readFileSync(stdoutPath, "utf-8").trim().split("\n").length, 5);
+  });
+
+  test("reports a non-zero exit rather than throwing", { timeout: 15_000 }, async () => {
+    const outcome = await spawnGateCommand({
+      command: "exit 7",
+      cwd: tmpdir(),
+      env: { PATH: process.env.PATH ?? "" },
+      timeoutMs: 30_000,
+      stdoutPath: tmp("fail.log"),
+      stderrPath: tmp("fail.err.log"),
+    });
+
+    assert.equal(outcome.exitCode, 7);
+    assert.equal(outcome.spawnError, null);
+  });
+
+  test("keeps stderr out of the judged artifact", { timeout: 15_000 }, async () => {
+    // Merging them could split a JSON event in half. The parser tolerates
+    // junk lines; it cannot reassemble a bisected one.
+    const stdoutPath = tmp("split.log");
+    const stderrPath = tmp("split.err.log");
+
+    await spawnGateCommand({
+      command: "echo to-stdout; echo to-stderr >&2",
+      cwd: tmpdir(),
+      env: { PATH: process.env.PATH ?? "" },
+      timeoutMs: 30_000,
+      stdoutPath,
+      stderrPath,
+    });
+
+    assert.equal(readFileSync(stdoutPath, "utf-8").trim(), "to-stdout");
+    assert.equal(readFileSync(stderrPath, "utf-8").trim(), "to-stderr");
+  });
+
+  test("a timeout tears the command down and reports it", { timeout: 15_000 }, async () => {
+    const outcome = await spawnGateCommand({
+      command: "sleep 30",
+      cwd: tmpdir(),
+      env: { PATH: process.env.PATH ?? "" },
+      timeoutMs: 300,
+      stdoutPath: tmp("timeout.log"),
+      stderrPath: tmp("timeout.err.log"),
+    });
+
+    assert.equal(outcome.timedOut, true, "expected the outer wall clock to fire");
+    assert.notEqual(outcome.exitCode, 0, "a killed command must not look successful");
   });
 });
