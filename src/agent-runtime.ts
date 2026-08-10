@@ -124,21 +124,45 @@ export function timeoutFor(agent: AgentConfig, labels: string[] = []): number {
   return 1_200_000;
 }
 
-// --------- Safer max_turns salvage ---------
+// --------- Safer budget-exhaustion salvage ---------
 
 /**
  * True when the dispatcher should attempt the safer-salvage path on a
- * `max_turns` failure: auto-commit the agent's uncommitted work, push
- * it, open a draft PR with the agent's last messages in the body, and
- * label the ticket `error:max_turns_salvaged` for human triage.
+ * budget-exhaustion failure: auto-commit the agent's uncommitted work,
+ * push it, open a draft PR with the agent's last messages in the body,
+ * and label the ticket `error:max_turns_salvaged` for human triage.
  *
  * Distinct from the existing PR-already-exists salvage (which treats
  * max_turns + open PR as success). This fires when the agent didn't
  * get to PR creation but did produce buildable code worth preserving.
  *
  * **All four gates must pass:**
- * 1. `terminalReason === "max_turns"` — other failure shapes (api_error,
- *    timeout) don't fit the salvage pattern.
+ * 1. The agent ran out of budget: either `terminalReason === "max_turns"`
+ *    (turn budget) or `timedOut` (wall-clock budget). Both mean "stopped
+ *    mid-work with the worktree about to be torn down", which is the only
+ *    thing this path cares about. Other shapes (api_error, a clean
+ *    non-zero exit) are genuine failures and still skip salvage.
+ *
+ *    `timedOut` is the dispatcher's OWN record that it fired the SIGTERM,
+ *    not an inference from claude's self-reported result. That matters:
+ *    on a wall-clock kill claude still emits a `result`, but with
+ *    `subtype=error_during_execution` and an EMPTY `terminal_reason`, so
+ *    reading the reason alone cannot tell a timeout from any other wedge.
+ *    The same ambiguity is already noted at the error-message site, which
+ *    prints elapsed-vs-budget for exactly this reason.
+ *
+ *    Added 2026-08-10 after pyrycode#1452: a developer run was killed at
+ *    its 25-minute wall on turn 104 having spent $11.91, this gate read
+ *    the empty reason, salvage was skipped, and the worktree teardown
+ *    destroyed every edit — the branch kept only the architect's spec
+ *    commit. The previous wording of this gate claimed timeout "doesn't
+ *    fit the salvage pattern"; #1452 refutes it. A wall-clock kill with a
+ *    dirty worktree IS the pattern, and gates 2-4 below carry the entire
+ *    safety argument on their own without caring which budget ran out.
+ *    pyrycode#1417 the day before is the control: same thrash, same
+ *    25-minute wall, but it exited via the permission-denial door, a
+ *    different salvage fired, the work was pushed, and the next run
+ *    finished it from that branch.
  * 2. No PR already exists — the existing salvage path handles that case.
  * 3. Working tree has changes — nothing to salvage if the worktree is
  *    clean (the agent did no productive work).
@@ -156,20 +180,35 @@ export function timeoutFor(agent: AgentConfig, labels: string[] = []): number {
  * work. A draft PR + `error:max_turns_salvaged` label keeps the work
  * visible while forcing a human triage step before it advances.
  *
- * Earned its slot from four observed independent failure modes:
+ * Earned its slot from five observed independent failure modes:
  * - #55 run 1: comprehension surface (mode A)
  * - #29, #40, #45: edit fan-out (mode B)
  * - #55 run 2: developer found a real production bug, thrashed trying
  *   to fix it instead of bailing (mode C)
  * - #81: OS-service polling time eats budget (mode D)
- * In all four, the developer produced real value the dispatcher
+ * - pyrycode#1452: line-cite bookkeeping eats the wall clock (mode E,
+ *   and the first to arrive through the timeout door)
+ * In all five, the developer produced real value the dispatcher
  * silently destroyed via worktree teardown. Salvage preserves it.
+ *
+ * NOTE the label `error:max_turns_salvaged` is now shape-inaccurate for
+ * a timeout salvage. It is kept deliberately: the label's FUNCTION is
+ * "salvaged work sits in a draft PR, block every agent until a human
+ * triages", it is wired into `GLOBAL_BLOCK_LABELS` and the selection
+ * filter, and renaming it would strand tickets already carrying it. The
+ * triage comment and PR body name the real shape instead.
  *
  * Pure decision; the caller does the I/O (commit, push, gh pr create,
  * label) so this stays testable.
  */
 export function shouldAttemptSafeSalvage(opts: {
   terminalReason: string;
+  /**
+   * True when the dispatcher itself killed the agent at its wall-clock
+   * budget. Authoritative, unlike `terminalReason`, which a timeout
+   * leaves empty. See gate 1 above.
+   */
+  timedOut: boolean;
   prAlreadyExists: boolean;
   gitStatusOutput: string;
   /**
@@ -179,7 +218,7 @@ export function shouldAttemptSafeSalvage(opts: {
    */
   gateExitCodes: number[];
 }): boolean {
-  if (opts.terminalReason !== "max_turns") return false;
+  if (opts.terminalReason !== "max_turns" && !opts.timedOut) return false;
   if (opts.prAlreadyExists) return false;
   if (opts.gitStatusOutput.trim().length === 0) return false;
   if (opts.gateExitCodes.some((code) => code !== 0)) return false;

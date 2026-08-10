@@ -1998,6 +1998,7 @@ describe("shouldAttemptSafeSalvage", () => {
 
   const baseOk = {
     terminalReason: "max_turns",
+    timedOut: false,
     prAlreadyExists: false,
     gitStatusOutput: " M internal/e2e/rotation_test.go\n?? internal/e2e/internal/fakeclaude/main.go\n",
     gateExitCodes: [0, 0],
@@ -2007,14 +2008,70 @@ describe("shouldAttemptSafeSalvage", () => {
     assert.equal(shouldAttemptSafeSalvage(baseOk), true);
   });
 
-  test("non-max_turns error → no salvage (different failure shape)", () => {
+  test("a genuine error shape, with no timeout kill → no salvage", () => {
+    // api_error is a real failure, not a budget running out. Nothing to
+    // preserve on purpose.
     assert.equal(
       shouldAttemptSafeSalvage({ ...baseOk, terminalReason: "api_error" }),
       false,
     );
+  });
+
+  test("the REASON STRING 'timeout' does not trigger salvage — only the dispatcher's own kill flag does", () => {
+    // Guards the distinction the pyrycode#1452 fix turns on. A reason
+    // field that happens to read "timeout" is claude's self-report and is
+    // NOT authoritative; the dispatcher's `timedOut` is. Keeping these
+    // apart is what stops a future refactor from "simplifying" the gate
+    // into a string match that a real wall-clock kill would miss, since a
+    // real one leaves the reason EMPTY (see the next test).
     assert.equal(
-      shouldAttemptSafeSalvage({ ...baseOk, terminalReason: "timeout" }),
+      shouldAttemptSafeSalvage({ ...baseOk, terminalReason: "timeout", timedOut: false }),
       false,
+    );
+  });
+
+  test("pyrycode#1452: wall-clock kill leaves an EMPTY reason and still salvages", () => {
+    // The exact shape that destroyed 25 minutes of work on 2026-08-10.
+    // The agent was SIGTERM'd at its wall; claude still emitted a result,
+    // but with subtype=error_during_execution and no terminal_reason. The
+    // old gate read the empty reason, skipped salvage, and the worktree
+    // teardown took every edit with it.
+    //
+    // This assertion fails on the pre-fix predicate, which is the point.
+    assert.equal(
+      shouldAttemptSafeSalvage({ ...baseOk, terminalReason: "", timedOut: true }),
+      true,
+    );
+  });
+
+  test("a timeout kill still has to clear every other gate", () => {
+    // Widening gate 1 must not weaken 2-4. These carry the whole safety
+    // argument: don't double-handle a ticket that already has a PR, don't
+    // open an empty PR, don't ship code that doesn't build.
+    const timedOutBase = { ...baseOk, terminalReason: "", timedOut: true };
+    assert.equal(
+      shouldAttemptSafeSalvage({ ...timedOutBase, prAlreadyExists: true }),
+      false,
+      "timeout + existing PR must not salvage",
+    );
+    assert.equal(
+      shouldAttemptSafeSalvage({ ...timedOutBase, gitStatusOutput: "" }),
+      false,
+      "timeout + clean worktree has nothing to preserve",
+    );
+    assert.equal(
+      shouldAttemptSafeSalvage({ ...timedOutBase, gateExitCodes: [0, 1] }),
+      false,
+      "timeout + failing build gate must not ship a draft PR",
+    );
+  });
+
+  test("both budgets exhausted at once → salvage (no double-counting)", () => {
+    // A run can hit max_turns and be SIGTERM'd in the same breath. The
+    // gate is an OR, so this is just the happy path twice over.
+    assert.equal(
+      shouldAttemptSafeSalvage({ ...baseOk, terminalReason: "max_turns", timedOut: true }),
+      true,
     );
   });
 

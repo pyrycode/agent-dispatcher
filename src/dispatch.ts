@@ -341,6 +341,17 @@ export interface StreamResult {
    *  Captures the agent's intent for the diagnostic comment. Null when
    *  no text was emitted (rare). */
   lastAssistantText: string | null;
+  /**
+   * True when the dispatcher fired its own wall-clock SIGTERM at this
+   * agent. This is the dispatcher's record of what IT did, and it is the
+   * only reliable timeout signal: a killed agent still emits a `result`,
+   * but with `subtype=error_during_execution` and an empty
+   * `terminal_reason`, so the reason field cannot distinguish a wall-clock
+   * kill from any other mid-stream wedge. Consumed by
+   * `shouldAttemptSafeSalvage` so a timeout preserves the agent's work
+   * instead of losing it to worktree teardown (pyrycode#1452).
+   */
+  timedOut: boolean;
 }
 
 /**
@@ -756,6 +767,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
           hadPermissionDenial: denialState.hadPermissionDenial,
           deniedOpContent: denialState.deniedContent,
           lastAssistantText: denialState.lastAssistantText,
+          timedOut,
         });
       } else if (denialState.hadPermissionDenial) {
         // Force-exit produced no `result` event — synthesize a
@@ -775,6 +787,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
           hadPermissionDenial: true,
           deniedOpContent: denialState.deniedContent,
           lastAssistantText: denialState.lastAssistantText,
+          timedOut,
         });
       } else if (timedOut) {
         reject(new Error(`Agent timed out after ${opts.timeoutMs / 1000}s`));
@@ -1034,6 +1047,7 @@ async function attemptSaferSalvage(opts: {
 
     if (!shouldAttemptSafeSalvage({
       terminalReason: opts.streamResult.terminalReason || "",
+      timedOut: opts.streamResult.timedOut === true,
       prAlreadyExists: false,
       gitStatusOutput: dirty,
       gateExitCodes,
@@ -1074,10 +1088,19 @@ async function attemptSaferSalvage(opts: {
     }
 
     const tail = (opts.streamResult.output || "").slice(-2500);
+    // Name the budget that actually ran out. The label stays
+    // `error:max_turns_salvaged` for wiring reasons, so this is the only
+    // place a triaging human learns which door the run exited through —
+    // and the two want different follow-ups: a turn-budget kill argues
+    // for a bigger budget, a wall-clock kill argues the agent was slow,
+    // not verbose.
+    const budget = opts.streamResult.timedOut === true && opts.streamResult.terminalReason !== "max_turns"
+      ? { head: "wall-clock timeout", detail: "ran out of wall-clock time" }
+      : { head: "`max_turns`", detail: "hit `max_turns`" };
     const prBody = [
-      `## Auto-salvaged from \`max_turns\``,
+      `## Auto-salvaged from ${budget.head}`,
       ``,
-      `The **${opts.agent.name}** agent hit \`max_turns\` (${opts.streamResult.numTurns} turns, $${opts.streamResult.totalCostUsd.toFixed(2)}) on #${opts.item.issueNumber} while work was in progress. The dispatcher auto-committed the uncommitted changes and opened this **draft** PR for human triage.`,
+      `The **${opts.agent.name}** agent ${budget.detail} (${opts.streamResult.numTurns} turns, $${opts.streamResult.totalCostUsd.toFixed(2)}) on #${opts.item.issueNumber} while work was in progress. The dispatcher auto-committed the uncommitted changes and opened this **draft** PR for human triage.`,
       ``,
       `**Build status at salvage:** clean (${salvageGates.length === 0 ? "no gates configured" : salvageGates.map((g) => `\`${g}\``).join(" + ") + " all passed"}). Tests were not run as a salvage gate — failing tests are often the signal the agent was chasing.`,
       ``,
@@ -1126,7 +1149,7 @@ async function attemptSaferSalvage(opts: {
       "gh",
       [
         "pr", "create", "--draft",
-        "--title", `[max_turns] ${opts.item.title}`,
+        "--title", `[${budget.head === "wall-clock timeout" ? "timeout" : "max_turns"}] ${opts.item.title}`,
         "--head", opts.branchName,
         "--base", defaultBranch,
         "--body-file", "-",
@@ -1142,7 +1165,7 @@ async function attemptSaferSalvage(opts: {
     try {
       await opts.client.addComment(
         opts.item.issueNumber,
-        `## ⚠️ Salvaged from \`max_turns\`\n\nThe ${opts.agent.name} agent hit max_turns at ${opts.streamResult.numTurns} turns ($${opts.streamResult.totalCostUsd.toFixed(2)}) but had clean uncommitted work. The dispatcher auto-committed the changes and opened a draft PR for human triage.\n\nLabel \`error:max_turns_salvaged\` is set; the ticket does **not** auto-advance.\n\n**Reviewer:** check the draft PR — decide whether to fix-and-promote (mark ready), recover via JSONL replay, or close as wontfix.`,
+        `## ⚠️ Salvaged from ${budget.head}\n\nThe ${opts.agent.name} agent ${budget.detail} at ${opts.streamResult.numTurns} turns ($${opts.streamResult.totalCostUsd.toFixed(2)}) but had clean uncommitted work. The dispatcher auto-committed the changes and opened a draft PR for human triage.\n\nLabel \`error:max_turns_salvaged\` is set; the ticket does **not** auto-advance.\n\n**Reviewer:** check the draft PR — decide whether to fix-and-promote (mark ready), recover via JSONL replay, or close as wontfix.`,
       );
     } catch (e) { console.warn(`   ⚠️  Failed to post salvage comment: ${e}`); }
 
@@ -2276,14 +2299,22 @@ export async function handleAgentResultErrors(
     }
   }
 
-  // Safer salvage: max_turns + clean vet/build + uncommitted work
+  // Safer salvage: budget exhausted + clean vet/build + uncommitted work
   // → auto-commit, push, open DRAFT PR, label `error:max_turns_salvaged`.
   // Distinct from the PR-already-exists path above (which treats
   // max_turns as success). This path preserves work the agent
   // produced but didn't get to PR-create — keeps it visible while
   // forcing human triage (no auto-advance via `done:<agent>`).
+  //
+  // "Budget exhausted" is BOTH doors: the turn budget (`max_turns`) and
+  // the wall clock (`timedOut`). The timeout door was added 2026-08-10
+  // after pyrycode#1452 lost 25 minutes of edits to worktree teardown;
+  // see `shouldAttemptSafeSalvage` for the evidence. Deliberately NOT
+  // widened here: the PR-already-exists path above still requires
+  // `max_turns`, because that path AUTO-ADVANCES the ticket as a success
+  // and no observed failure justifies loosening an auto-advance.
   if (!salvaged
-      && streamResult.terminalReason === "max_turns"
+      && (streamResult.terminalReason === "max_turns" || streamResult.timedOut === true)
       && useWorktree
       && item.issueNumber > 0) {
     const ok = await attemptSaferSalvage({

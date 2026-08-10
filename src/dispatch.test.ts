@@ -245,6 +245,7 @@ export function makeMockDeps(opts: MockDepsOptions = {}): { deps: DispatchDeps; 
     hadPermissionDenial: false,
     deniedOpContent: null,
     lastAssistantText: null,
+    timedOut: false,
   };
   const streamResolver = opts.streamResult ?? defaultStream;
   const mockRunClaudeStreaming = (async (...args: any[]) => {
@@ -1325,6 +1326,7 @@ function streamResult(overrides: Partial<StreamResult> = {}): StreamResult {
     hadPermissionDenial: false,
     deniedOpContent: null,
     lastAssistantText: null,
+    timedOut: false,
     ...overrides,
   };
 }
