@@ -2182,7 +2182,18 @@ export async function prepareAgentSpawn(
   // file's `permissions.deny`, which removes them from the model's surface
   // entirely (spike-verified 2026-07-04). Requires pyry-side --disallowed-tools
   // support (pyrycode/pyrycode#411); ship + reinstall pyry BEFORE this goes live.
-  const disallowedTools = "AskUserQuestion,EnterPlanMode,ExitPlanMode";
+  //
+  // `Skill` joins the list 2026-08-20 for the same reason, one step removed:
+  // skills sit on the model's surface unconditionally but are not on the
+  // allowlist, so a ticket whose text trips some skill's trigger description
+  // costs a denial and then a force-exit. pyrycode/pyrycode#1646 — a wire-shape
+  // ticket dense with Claude model identifiers and effort levels — tripped the
+  // built-in `claude-api` skill on both of its dispatches (2026-08-20 16:15 and
+  // 17:32), and the po agent answered the denial with another tool call both
+  // times, so the watchdog killed it. Deterministic in the ticket body, so
+  // re-dispatch could never clear it. No pipeline agent invokes a skill (the
+  // architect `cat`s its security-review guidance), so denying it costs nothing.
+  const disallowedTools = "AskUserQuestion,EnterPlanMode,ExitPlanMode,Skill";
 
   // Timeout tiers live in `timeoutFor` (agent-runtime.ts): code-review 40min,
   // security-sensitive architect 40min (spec + adversarial security-review),
