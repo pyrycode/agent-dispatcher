@@ -2486,7 +2486,10 @@ describe("dispatchToAgent — orchestrator integration", () => {
       execImpls: fullHappyExecImpls("feature/702"),
       fsMap: { [claudeMd]: "developer system prompt" },
       // Stream returns a non-max_turns error → handleAgentResultErrors throws.
-      streamResult: streamResult({ isError: true, terminalReason: "api_error", output: "Anthropic API failure" }),
+      // Deliberately NOT `api_error`: that reason auto-retries now (it is
+      // claude reporting a server-side failure), so it would schedule a
+      // backoff instead of parking and this park invariant would never fire.
+      streamResult: streamResult({ isError: true, terminalReason: "timeout", output: "agent killed after 25min" }),
     });
 
     await dispatchToAgent(agent, item, client, deps);
@@ -2735,12 +2738,15 @@ describe("dispatchToAgent — concurrent dispatches (pollLoop's Promise.allSettl
         "git rev-parse --verify origin/feature/805": () => execError({ stderr: "fatal" }),
       },
       fsMap: { [claudeMd]: "developer system prompt" },
-      // Per-dispatch stream resolution via opts.cwd: 804 returns
-      // api_error, 805 returns timeout. Both should hit the
-      // non-max_turns throw path independently.
+      // Per-dispatch stream resolution via opts.cwd: 804 returns a failed
+      // test run, 805 returns timeout. Both should hit the non-max_turns
+      // throw path independently. Neither reason may be `api_error`: that
+      // one now auto-retries rather than parking, which would defeat the
+      // error-label assertions below without testing anything about
+      // concurrent isolation.
       streamResult: (opts) => {
         if (opts?.cwd?.includes("developer-804")) {
-          return streamResult({ isError: true, terminalReason: "api_error", output: "Anthropic API failure" });
+          return streamResult({ isError: true, terminalReason: "completed", output: "go test ./... FAILED: 3 tests failing" });
         }
         return streamResult({ isError: true, terminalReason: "timeout", output: "agent killed after 25min" });
       },

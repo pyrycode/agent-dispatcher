@@ -100,6 +100,83 @@ describe("classifyAgentError", () => {
       assert.equal(classifyAgentError(entry.match).transient, true, entry.match);
     }
   });
+
+  // ---- structural arm: terminal_reason === "api_error" -------------------
+  // The two real strings that parked pyrycode#1731 and #1747 on 2026-08-24.
+  // Both are server-side failures the WORDING list has never seen; both
+  // carried `terminal_reason: "api_error"` on the result frame.
+
+  const OBSERVED_403 =
+    "Agent error (api_error): subtype=success api_error_status=403 stop_reason=stop_sequence. " +
+    "Ran 4m 29s (timeout 20min). Last agent text (not the failure cause): " +
+    "Failed to authenticate. API Error: 403 Unable to verify organization membership.";
+
+  const OBSERVED_MID_RESPONSE =
+    "Agent error (api_error): subtype=success stop_reason=stop_sequence. " +
+    "Ran 4m 38s (timeout 20min). Last agent text (not the failure cause): " +
+    "API Error: Server error mid-response. The response above may be incomplete.";
+
+  test("the wording list alone is blind to both 2026-08-24 failures", () => {
+    // Establishes WHY the structural arm is needed: with no terminal_reason
+    // supplied these park, which is exactly what happened on the day.
+    for (const text of [OBSERVED_403, OBSERVED_MID_RESPONSE]) {
+      assert.equal(classifyAgentError(text).transient, false, text);
+    }
+  });
+
+  test("terminal_reason api_error classifies transient whatever the wording", () => {
+    for (const text of [OBSERVED_403, OBSERVED_MID_RESPONSE]) {
+      const r = classifyAgentError(text, { terminalReason: "api_error" });
+      assert.equal(r.transient, true, text);
+      assert.equal(r.signature, "API error (server-side)", text);
+    }
+  });
+
+  test("terminal_reason api_error covers a wording nobody has seen yet", () => {
+    const r = classifyAgentError(
+      "Agent error (api_error): API Error: 418 I am a teapot",
+      { terminalReason: "api_error" },
+    );
+    assert.equal(r.transient, true);
+    assert.equal(r.signature, "API error (server-side)");
+  });
+
+  test("the never-retry reasons stay non-transient", () => {
+    // `completed` is where the deterministic 400 thinking/redacted_thinking
+    // harness bug surfaces (3 instances, 2026-05-28, relay board) — retrying
+    // it burns the full backoff and parks anyway.
+    const thinkingBlocks =
+      "Agent error (completed): API Error: 400 messages.1.content.11: `thinking` or " +
+      "`redacted_thinking` blocks in the latest assistant message cannot be modified.";
+    assert.equal(classifyAgentError(thinkingBlocks, { terminalReason: "completed" }).transient, false);
+    assert.equal(
+      classifyAgentError("Agent error (timeout): agent killed after 25min", { terminalReason: "timeout" }).transient,
+      false,
+    );
+  });
+
+  test("a never-retry reason overrides an allowlist match in the narration", () => {
+    // Guard, not an observed case: no timeout/completed failure in the log
+    // corpus matches the allowlist today. It exists so an agent narrating
+    // "fetch failed" before a wall-clock kill can't buy itself a re-run.
+    const r = classifyAgentError(
+      "Agent error (timeout): Last agent text (not the failure cause): TypeError: fetch failed",
+      { terminalReason: "timeout" },
+    );
+    assert.equal(r.transient, false);
+    assert.equal(r.signature, "");
+  });
+
+  test("the structural arm tolerates a missing / odd terminal_reason", () => {
+    // Absent, null and empty all fall through to the wording list unchanged.
+    assert.equal(classifyAgentError("TypeError: fetch failed", {}).transient, true);
+    assert.equal(classifyAgentError("TypeError: fetch failed", { terminalReason: null }).transient, true);
+    assert.equal(classifyAgentError("TypeError: fetch failed", { terminalReason: "" }).transient, true);
+    // Case and stray whitespace off the result frame still match.
+    assert.equal(classifyAgentError("", { terminalReason: " API_ERROR " }).transient, true);
+    // A reason with no error text at all is still classifiable.
+    assert.equal(classifyAgentError(null, { terminalReason: "api_error" }).transient, true);
+  });
 });
 
 describe("backoffDelayMs", () => {

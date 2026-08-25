@@ -1745,7 +1745,14 @@ export async function handleDispatchError(
     const classifyText = isResourceExhausted
       ? `${error.message} ${(error as ResourceExhaustedError).errno}`
       : (error?.message ?? "");
-    const { transient, signature } = classifyAgentError(classifyText);
+    // The structured `terminal_reason` is passed alongside the text so a
+    // server-side API failure retries on claude's own classification rather
+    // than on whichever wording the API happened to use. 15 of 79 such
+    // failures parked a human on a wording the allowlist had never seen
+    // (measured 2026-08-24 over 4103 logs) — see API_ERROR_TERMINAL_REASON.
+    const { transient, signature } = classifyAgentError(classifyText, {
+      terminalReason: streamResult?.terminalReason,
+    });
     if (transient) {
       const attempt = await scheduleTransientRetry({ agent, item, client, logFile, signature });
       if (attempt !== null) {

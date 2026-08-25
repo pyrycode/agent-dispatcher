@@ -1433,16 +1433,72 @@ export const RETRY_ALLOWLIST: readonly RetrySignature[] = [
 ];
 
 /**
- * Classify an agent error string against the transient allowlist.
- * Case-insensitive substring match. Returns the first matching signature
- * (for the comment) and `transient: true`; otherwise `{ transient: false }`.
+ * claude's own `terminal_reason` for "the API returned an error", read off
+ * the result frame (`StreamResult.terminalReason`). Structural, not prose:
+ * matching on it covers every wording the API has used and every wording it
+ * has yet to use, which is what the allowlist below cannot do.
+ *
+ * Measured 2026-08-24 over all 4103 agent logs back to 2026-05-09: 79 runs
+ * ended with this reason and ALL 79 were server-side transients — 529
+ * overload (64), "Anthropic API failure" (9), "Server error mid-response"
+ * (3), "403 Unable to verify organization membership" (2), "Connection
+ * closed mid-response" (1). Zero deterministic failures in the class.
+ *
+ * 15 of those 79 (19%) matched no allowlist entry and parked a ticket for a
+ * human that a retry would have cleared. The wording list has now been
+ * extended twice (2026-07-04 for the 401 strings, and would need two more
+ * entries today) and each extension only ever covers the wording already
+ * seen. Hence the structural arm.
+ */
+export const API_ERROR_TERMINAL_REASON = "api_error";
+
+/**
+ * `terminal_reason` values that must NEVER take the structural retry arm,
+ * even if claude relabels a failure into one. Belt-and-braces: today none of
+ * these carry `api_error`, so the guard is inert — it exists so a future
+ * relabelling can't silently widen the retry into a deterministic class.
+ *
+ *   - `completed` — the `400 thinking/redacted_thinking blocks` harness bug
+ *     surfaces here, NOT under `api_error` (3 instances, 2026-05-28, relay
+ *     board). It is deterministic: retrying burns the full ~75-min backoff
+ *     and parks anyway. Fix the harness, don't mask it.
+ *   - `timeout` — a wall-clock kill. A re-run just buys another overrun,
+ *     the same reason `max_turns` stays off the allowlist.
+ */
+export const NEVER_RETRY_TERMINAL_REASONS: readonly string[] = ["completed", "timeout"];
+
+/**
+ * Classify an agent failure as transient (auto-retry) or not (park).
+ *
+ * Two arms, structural first:
+ *   1. `opts.terminalReason === "api_error"` — claude itself reporting that
+ *      the API errored. Covers any wording, present or future.
+ *   2. Case-insensitive substring match against RETRY_ALLOWLIST. Still the
+ *      only arm for failures that never reach a result frame at all —
+ *      spawn-side (`cannot fork`, EAGAIN), the watchdog's synthetic
+ *      `idle_stall`, and the shared-keychain 401 strings.
+ *
+ * Returns the matching signature (for the auto-retry comment) and
+ * `transient: true`; otherwise `{ transient: false }`.
+ *
+ * `opts` is optional so every existing caller and test keeps its behaviour:
+ * with no structured reason supplied, this is exactly the allowlist match it
+ * always was.
  *
  * Pure — no I/O. Unit-tested against captured real error strings including
  * a non-matching one.
  */
 export function classifyAgentError(
   errText: string | null | undefined,
+  opts?: { terminalReason?: string | null },
 ): { transient: boolean; signature: string } {
+  const reason = (opts?.terminalReason ?? "").trim().toLowerCase();
+  if (reason && NEVER_RETRY_TERMINAL_REASONS.includes(reason)) {
+    return { transient: false, signature: "" };
+  }
+  if (reason === API_ERROR_TERMINAL_REASON) {
+    return { transient: true, signature: "API error (server-side)" };
+  }
   if (!errText) return { transient: false, signature: "" };
   const s = errText.toLowerCase();
   for (const entry of RETRY_ALLOWLIST) {

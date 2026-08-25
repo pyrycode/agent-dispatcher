@@ -13,6 +13,7 @@ import {
   DEFAULT_DEPS,
   type DispatchClient,
   type DispatchContext,
+  type StreamResult,
 } from "./dispatch.js";
 import { ResourceExhaustedError } from "./agent-runtime.js";
 import { AGENTS, type ProjectItem } from "./types.js";
@@ -90,6 +91,26 @@ function makeCtx(
   };
 }
 
+/** Minimal StreamResult carrying just the field the retry decision reads.
+ *  handleDispatchError only touches `sessionId` and `terminalReason`. */
+function makeStreamResult(terminalReason: string): StreamResult {
+  return {
+    output: "",
+    sessionId: "unknown",
+    isError: true,
+    numTurns: 0,
+    totalCostUsd: 0,
+    durationMs: 0,
+    usage: {},
+    terminalReason,
+    rawResult: {},
+    hadPermissionDenial: false,
+    deniedOpContent: null,
+    lastAssistantText: null,
+    timedOut: false,
+  };
+}
+
 describe("handleDispatchError — transient auto-retry (agent-dispatcher#25)", () => {
   test("transient error → schedules a retry (counter + marker comment), no error: park, no manual-intervention alert", async () => {
     const client = new FakeClient();
@@ -131,6 +152,61 @@ describe("handleDispatchError — transient auto-retry (agent-dispatcher#25)", (
     assert.ok(client.labels().includes("error:developer"), "parks after the cap");
     assert.ok(client.comments.some((c) => c.body.includes("Transient retries exhausted")));
     assert.ok(!client.labels().includes("error-retry-count:5"), "does not bump past the cap");
+  });
+
+  // The structural arm: claude's own `terminal_reason` on the result frame,
+  // not the wording. Both strings below are verbatim from the two runs that
+  // parked pyrycode#1731 and #1747 on 2026-08-24 — neither matches any
+  // RETRY_ALLOWLIST entry, and 15 of 79 such failures over the whole log
+  // corpus parked a human on a wording the list had never seen.
+  test("terminal_reason api_error → schedules a retry even though the wording matches nothing", async () => {
+    for (const [issueNumber, message] of [
+      [710, "Agent error (api_error): subtype=success api_error_status=403 stop_reason=stop_sequence. "
+        + "Ran 4m 29s (timeout 20min). Last agent text (not the failure cause): "
+        + "Failed to authenticate. API Error: 403 Unable to verify organization membership."],
+      [711, "Agent error (api_error): subtype=success stop_reason=stop_sequence. "
+        + "Ran 4m 38s (timeout 20min). Last agent text (not the failure cause): "
+        + "API Error: Server error mid-response. The response above may be incomplete."],
+    ] as [number, string][]) {
+      const client = new FakeClient();
+      const discord: string[] = [];
+      const ctx = makeCtx(makeItem({ issueNumber }), client, discord);
+      await handleDispatchError(new Error(message), ctx, makeStreamResult("api_error"));
+      assert.ok(client.labels().includes("error-retry-count:1"), `#${issueNumber} bumps the retry counter`);
+      assert.ok(!client.labels().includes("error:developer"), `#${issueNumber} must NOT park a server-side API failure`);
+      assert.ok(client.comments.some((c) => c.body.includes(RETRY_MARKER)), `#${issueNumber} posts the marker comment`);
+      assert.ok(discord.some((m) => m.includes("API error (server-side)")), `#${issueNumber} names the signature`);
+      assert.ok(!discord.some((m) => m.includes("Manual intervention")), `#${issueNumber} raises no manual alert`);
+    }
+  });
+
+  test("the same api_error failure still parks once the cap is reached", async () => {
+    const client = new FakeClient();
+    const discord: string[] = [];
+    const ctx = makeCtx(makeItem({ issueNumber: 712, labels: ["error-retry-count:4"] }), client, discord);
+    await handleDispatchError(
+      new Error("Agent error (api_error): API Error: Server error mid-response."),
+      ctx,
+      makeStreamResult("api_error"),
+    );
+    assert.ok(client.labels().includes("error:developer"), "a persistent API outage still reaches a human");
+    assert.ok(client.comments.some((c) => c.body.includes("Transient retries exhausted")));
+  });
+
+  test("terminal_reason timeout parks even when the narration matches the allowlist", async () => {
+    // Guard against the structured reason widening into the deterministic
+    // classes: a wall-clock kill must not buy a re-run because the agent
+    // happened to narrate "fetch failed" before it died.
+    const client = new FakeClient();
+    const discord: string[] = [];
+    const ctx = makeCtx(makeItem({ issueNumber: 713 }), client, discord);
+    await handleDispatchError(
+      new Error("Agent error (timeout): Last agent text (not the failure cause): TypeError: fetch failed"),
+      ctx,
+      makeStreamResult("timeout"),
+    );
+    assert.ok(client.labels().includes("error:developer"), "a wall-clock kill parks");
+    assert.ok(!client.labels().some((l) => l.startsWith("error-retry-count:")), "and buys no retry");
   });
 
   test("non-transient error → parks immediately with error:<agent>, no retry counter", async () => {
