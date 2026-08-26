@@ -88,6 +88,84 @@ export const MEMORY_INDEX_LESSON_REARM_BYTES = 12_500;
  */
 export const TICKET_LINE = /^\s*[-*]\s+\[#?\d/;
 
+// ---------------------------------------------------------------------------
+// Ticket entries do not belong in the index at all (2026-08-26).
+//
+// `TICKET_LINE` above keys on the title's FIRST character, and that is what
+// broke. Any decoration in front of the number defeats it: desktop's pipeline
+// wrote `⭐⭐⭐ #675 …`, pyrycode's writes `po: #1254 …`, and neither was
+// classified as a ticket. Both forks' finished ticket work therefore counted
+// as permanent lessons, which is what drove 216 curation passes and about 34
+// hours of blocked dispatch between 2026-07-20 and 2026-08-25.
+//
+// The deeper point is that the pointer was redundant the whole time. A
+// ticket's knowledge lives in the repo and is committed: pyrycode folds it
+// into the package overview at `docs/knowledge/features/<package>.md`, and
+// desktop does the same as of 2026-08-26. So the index only needs to carry a
+// lesson that outlives its ticket, and a ticket entry can be dropped outright
+// rather than aged out against a byte cap. The note file itself always stays
+// on disk, so a strip removes a pointer and never knowledge.
+// ---------------------------------------------------------------------------
+
+/** One index entry, split into its title and its note filename. */
+const ENTRY_LINE = /^\s*[-*]\s+\[([^\]]*)\]\(([^)]+\.md)\)/;
+
+/**
+ * A ticket-number-shaped token in a title: a hash then 3 to 5 digits
+ * anywhere, or 3 to 5 digits at the very start. A bare number mid-prose
+ * ("raise the 1024 byte cap") is deliberately not a match, because without
+ * the hash or the leading position it is a quantity and not a reference.
+ */
+const TICKET_IN_TITLE = /#\d{3,5}(?!\d)|^\s*\d{3,5}(?!\d)/;
+
+/**
+ * The same token in a note filename, which every fork embeds identically:
+ * `ticket-757-clears.md`, `po-1254-grep.md`, `994-note.md`. Anchored on a
+ * dash or the string start, so digits fused to a word (`adr025-…`) do not
+ * match.
+ */
+const TICKET_IN_FILENAME = /(?:^|-)\d{3,5}(?=[-.])/;
+
+/**
+ * Does this line name a ticket? Checks the title and the note filename, and
+ * consults no prefix, so a fork's title style cannot break the rule. Either
+ * half agreeing is enough: the title is composed fresh on every write, the
+ * filename is composed once, so requiring both would let a single sloppy
+ * write escape. Pure.
+ */
+export function isTicketEntry(line: string): boolean {
+  const m = ENTRY_LINE.exec(line);
+  if (m === null) return false;
+  return TICKET_IN_TITLE.test(m[1]) || TICKET_IN_FILENAME.test(m[2]);
+}
+
+/**
+ * Remove every ticket entry. Headers, comments and lesson entries are kept
+ * verbatim and in order. Pure.
+ *
+ * Returns the input unchanged when there is nothing to remove, so the common
+ * path is byte-identical and the caller's write is skipped.
+ *
+ * Removing an entry leaves behind the blank line that separated it, so runs
+ * of blanks are collapsed to one. Without that, an index that has been
+ * stripped for months would be mostly whitespace. Only files that actually
+ * lost an entry are reflowed.
+ */
+export function stripTicketEntries(content: string): string {
+  const lines = content.split("\n");
+  const kept = lines.filter((line) => !isTicketEntry(line));
+  if (kept.length === lines.length) return content;
+
+  const collapsed: string[] = [];
+  for (const line of kept) {
+    const blank = line.trim() === "";
+    const prevBlank = collapsed.length > 0 && collapsed[collapsed.length - 1].trim() === "";
+    if (blank && prevBlank) continue;
+    collapsed.push(line);
+  }
+  return collapsed.join("\n");
+}
+
 /**
  * Drop the oldest ticket entries until the content is at or under `capBytes`,
  * always keeping every non-ticket line. Pure.
@@ -251,7 +329,11 @@ export function trimMemoryIndexFile(opts: {
 
   const content = fs.readFileSync(path);
   const before = Buffer.byteLength(content, "utf8");
-  const trimmed = trimMemoryIndex(content, capBytes);
+  // Strip first. A ticket entry is never wanted, so it goes regardless of
+  // size; the cap trim then only ever sees lessons, headers and blanks, and
+  // is a no-op unless the lessons alone exceed the cap.
+  const stripped = stripTicketEntries(content);
+  const trimmed = trimMemoryIndex(stripped, capBytes);
   const after = Buffer.byteLength(trimmed, "utf8");
   const overCap = after > capBytes;
   const lessonFloor = lessonFloorBytes(trimmed);

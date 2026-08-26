@@ -16,6 +16,8 @@ import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  isTicketEntry,
+  stripTicketEntries,
   MEMORY_INDEX_CAP_BYTES,
   MEMORY_INDEX_LESSON_WATERMARK_BYTES,
   MEMORY_INDEX_LESSON_REARM_BYTES,
@@ -436,5 +438,86 @@ describe("decideCurationTrigger", () => {
       decideCurationTrigger({ lessonFloorBytes: 11_449, watermark, rearm, markerPresent: false }),
       { fire: false, clear: false },
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Ticket entries are stripped outright, and the classifier is fork-independent.
+//
+// Written test-first, 2026-08-26. The old `TICKET_LINE` classifier keyed on
+// the title's first character, which any decoration in front of the number
+// defeats: desktop's pipeline wrote `⭐⭐⭐ #675 …` and pyrycode's writes
+// `po: #1254 …`, so neither fork's ticket entries were classified as tickets
+// and both accumulated in the protected lesson floor. These tests pin the
+// replacement: a ticket-number-shaped token ANYWHERE in the title, or in the
+// note filename, marks the entry — no prefix is consulted, so a fork's title
+// style cannot break it.
+// ---------------------------------------------------------------------------
+
+describe("isTicketEntry", () => {
+  const cases: Array<[string, boolean, string]> = [
+    ["- [994 fix the drain](994-note.md) — s", true, "legacy digit-first title"],
+    ["- [#578 mobile arm](po-578-note.md) — s", true, "hash-prefixed title"],
+    ["- [#675 ⭐⭐⭐ timeline split](ticket-675-split.md) — s", true, "number first, stars after"],
+    ["- [⭐⭐⭐ #757 clears](ticket-757-clears.md) — s", true, "stars BEFORE the number"],
+    ["- [po: #1254 a grep recipe](po-1254-grep-recipe.md) — s", true, "role-prefixed title"],
+    ["- [**#784** arm widening](ticket-784-arm.md) — s", true, "bold around the number"],
+    ["- [a lesson with no number](po-1312-note.md) — s", true, "number only in the filename"],
+    ["- [code-review: baseline noise](code-review-baseline-noise.md) — s", false, "true lesson"],
+    ["- [an ADR pointer](adr025-phase-scoping.md) — s", false, "digits fused to a word in the filename"],
+    ["- [raise the 1024 byte cap](buffer-cap-note.md) — s", false, "bare number in prose, no hash"],
+    ["# Memory index — pyrycode", false, "header is not an entry"],
+    ["", false, "blank is not an entry"],
+    ["<!-- a comment -->", false, "comment is not an entry"],
+  ];
+  for (const [line, expected, why] of cases) {
+    test(`${expected ? "ticket" : "keep "} — ${why}`, () => {
+      assert.equal(isTicketEntry(line), expected);
+    });
+  }
+});
+
+describe("stripTicketEntries", () => {
+  test("removes every ticket entry regardless of fork title style", () => {
+    const content = [
+      "# Memory index — fork",
+      "",
+      "- [⭐⭐⭐ #757 clears](ticket-757-clears.md) — s",
+      "",
+      "- [po: #1254 grep recipe](po-1254-grep.md) — s",
+      "",
+      "- [code-review: baseline noise](code-review-baseline-noise.md) — s",
+      "",
+    ].join("\n");
+    assert.equal(
+      stripTicketEntries(content),
+      ["# Memory index — fork", "", "- [code-review: baseline noise](code-review-baseline-noise.md) — s", ""].join("\n"),
+    );
+  });
+
+  test("keeps headers, comments and a single separating blank line", () => {
+    const content = ["# H", "", "<!-- c -->", "", "- [994 t](994-n.md) — s", "", "- [a lesson](a-note.md) — s"].join("\n");
+    assert.equal(stripTicketEntries(content), ["# H", "", "<!-- c -->", "", "- [a lesson](a-note.md) — s"].join("\n"));
+  });
+
+  test("all-lesson content is returned unchanged (idempotent no-op path)", () => {
+    const content = ["# H", "", "- [a lesson](a-note.md) — s", ""].join("\n");
+    assert.equal(stripTicketEntries(content), content);
+  });
+
+  test("stripping is idempotent", () => {
+    const content = ["# H", "", "- [#675 t](ticket-675-x.md) — s", "", "- [a lesson](a-note.md) — s", ""].join("\n");
+    const once = stripTicketEntries(content);
+    assert.equal(stripTicketEntries(once), once);
+  });
+
+  test("an all-ticket index collapses to just its header", () => {
+    const content = ["# H", "", "- [#675 t](ticket-675-x.md) — s", "", "- [#677 u](ticket-677-y.md) — s", ""].join("\n");
+    assert.equal(stripTicketEntries(content), ["# H", ""].join("\n"));
+  });
+
+  test("multibyte entries are removed whole, not by byte slicing", () => {
+    const content = ["- [#675 ⭐⭐⭐ détail](ticket-675-x.md) — ✳", "- [a lesson 🧹](a-note.md) — s"].join("\n");
+    assert.equal(stripTicketEntries(content), "- [a lesson 🧹](a-note.md) — s");
   });
 });
