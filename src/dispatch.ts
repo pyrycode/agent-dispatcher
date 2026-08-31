@@ -4332,6 +4332,33 @@ export async function pollLoop(): Promise<void> {
     await runPreDispatchPrep(candidates, client);
     await runConcurrentDispatches(candidates, client);
 
+    // Drop the snapshot the agents just invalidated.
+    //
+    // The agents ARE mutators: a finished run adds `done:<agent>` and strips
+    // `wip:<agent>` on the ticket, straight through the GitHub API. Those
+    // writes never touch the per-cycle cache, so without this clear the
+    // end-of-cycle maintenance block below reads the pre-dispatch snapshot
+    // and cannot see its own cycle's results. `runAutoAdvance` then leaves a
+    // finished ticket in `In Documentation`, `runDoneCleanup` finds nothing,
+    // and `runAutoMerge` reads a Done column the ticket isn't in yet — so the
+    // merge is skipped. The ticket only reaches Done in the NEXT cycle's
+    // opening maintenance pass, which has no auto-merge step, and its merge
+    // waits for THAT cycle's tail: one full agent run later.
+    //
+    // Cost of leaving it stale is dependency ordering. The merged PR closes
+    // the issue, and `hasOpenBlockers` gates every dependent on that close.
+    // Measured on pyrycode 2026-08-31: #1885 landed in Done at 15:22:39, the
+    // dispatcher picked unrelated #1900 one second later while #1885 was
+    // still open, and the merge only landed at 15:29:08 — 6.5 minutes and one
+    // whole PO run late. Four consecutive tickets showed 4-11 minute gaps.
+    // Anything blocked by them sat out every selection in that window.
+    //
+    // Costs one extra full board fetch per cycle, which is noise against the
+    // minutes an agent run takes. Same class of bug as the 2026-05-03
+    // priority inversion: that fix taught the reconcile sub-steps to clear
+    // after mutating, but nobody taught the agent runs to do the same.
+    client.clearItemsCache();
+
     // Maintenance: closed-sweep, route rework labels, auto-advance, and
     // strip pipeline labels off Done tickets. Runs even when nothing was
     // dispatched (catches tickets advanced/closed by humans or label
