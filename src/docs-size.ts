@@ -10,21 +10,25 @@
 // result. pyrycode reached 10 overviews over 50KB and 7 over 100KB, the
 // largest at 350KB, and that breaks retrieval outright.
 //
-// QMD is the search surface every agent uses. Its structure-aware chunker
-// covers typescript, tsx, javascript, python, go and rust; markdown is not
-// on that list, so markdown is cut at a fixed ~2295 bytes with no regard for
-// headings. A 315KB overview becomes 150 slices that start and end
-// mid-sentence and carry no heading context. Measured 2026-08-31 against
-// `v2-session-manager.md`: a semantic query, a hybrid query and a keyword
-// query with reranking off, all aimed at a topic whose canonical home is a
-// section of that file, and none of the three returned the file. What came
-// back instead was the frozen `docs/knowledge/codebase/` archive that was
-// closed on 2026-08-19 for being read by nobody.
+// QMD is the search surface every agent uses. It cuts a document into
+// roughly 900-token chunks and it does prefer a heading boundary — its break
+// table scores an h1 at 100, an h2 at 90, on down to a bare newline at 1 —
+// but it only looks for one inside a narrow window around each 900-token
+// mark. When a document's sections run far larger than a chunk, no heading
+// falls inside that window, so the cut lands on a paragraph break and the
+// chunk carries no heading with it.
 //
-// File path and title are the only structural signal QMD has for markdown.
-// In a 20KB document every chunk is about the document's topic; in a 315KB
-// document no chunk is about anything nameable. So the fix is to keep each
-// overview small, and this module is the detector half of that.
+// Measured 2026-08-31 against `v2-session-manager.md`, then 315KB with
+// sections averaging 7000 bytes: a semantic query, a hybrid query and a
+// keyword query with reranking off, all aimed at a topic whose canonical
+// home is a section of that file, and none of the three returned the file.
+// What came back instead was the frozen `docs/knowledge/codebase/` archive
+// that was closed on 2026-08-19 for being read by nobody.
+//
+// So the cap is really a statement about section size. Keep a document small
+// enough that its sections are comparable to a chunk and the heading
+// preference starts working; let it grow and that preference becomes
+// unreachable. This module is the detector half of that.
 //
 // **Read-only by design.** Unlike the memory-index trim, nothing here
 // writes, so it needs no single-writer seam and no cooldown. It runs

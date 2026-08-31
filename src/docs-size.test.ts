@@ -4,15 +4,15 @@
 // are exercised against hand-built fixtures with byte-accurate caps;
 // `scanFeatureDocs` against a mock filesystem so no real directory is read.
 //
-// Why this module exists: QMD chunks markdown at a fixed ~2295 bytes with
-// no heading awareness (its structure-aware chunker covers code languages
-// only), so a 315KB package overview becomes 150 context-free slices and
-// stops being retrievable at all. Measured 2026-08-31: three query shapes
-// against a topic whose canonical home is a section of
-// `v2-session-manager.md` returned the frozen per-ticket archive and never
-// the overview itself. Keeping each overview small is what makes its path
-// and title — the only structural signal QMD has for markdown — line up
-// with its content.
+// Why this module exists: QMD cuts a document into ~900-token chunks and
+// prefers a heading boundary, but only searches a narrow window around each
+// cut. A 315KB overview whose sections average 7000 bytes offers no heading
+// inside that window, so its 150 chunks are cut at paragraph breaks and
+// carry no heading. Measured 2026-08-31: three query shapes against a topic
+// whose canonical home is a section of `v2-session-manager.md` returned the
+// frozen per-ticket archive and never the overview itself. Keeping each
+// overview small keeps its sections near chunk size, which is what lets the
+// heading preference fire at all.
 
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
