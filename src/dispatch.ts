@@ -75,6 +75,11 @@ import {
   MEMORY_INDEX_CAP_BYTES,
   MEMORY_INDEX_LESSON_WATERMARK_BYTES,
 } from "./memory-index.js";
+import {
+  scanFeatureDocs,
+  formatSplitDirective,
+  FEATURE_DOCS_CAP_BYTES,
+} from "./docs-size.js";
 
 // Load .env from the consumer's agents repo. AGENTS_REPO_PATH (set by
 // bin/pyry-start in the agents repo) takes precedence; falls back to a
@@ -2141,7 +2146,30 @@ export async function prepareAgentSpawn(
   // keeps runtime files out of the submodule.
   const promptFile = resolve(agentsRepoRoot, `.prompt-${item.issueNumber}.txt`);
   const systemPromptFile = resolve(agentsRepoRoot, `.system-prompt-${agent.name}.txt`);
-  writeFileSync(promptFile, prompt);
+
+  // An oversized package overview is not retrievable by QMD at all — markdown
+  // is chunked at a fixed ~2295 bytes with no heading awareness, so a 315KB
+  // document becomes 150 context-free slices and search returns none of them
+  // (measured 2026-08-31; see docs-size.ts). Tell the documentation agent
+  // which overviews need splitting before it folds this ticket's lessons in.
+  //
+  // Documentation only: it is the sole writer under `docs/knowledge/` and is
+  // `serial: true`, so it is the one agent that can safely restructure these,
+  // and the other five would only be distracted by the notice. Scanned in the
+  // agent's own worktree so it reflects the branch about to be written rather
+  // than a cached view of main. Read-only and failure-tolerant by
+  // construction — a scan that cannot read returns nothing and dispatch is
+  // byte-identical to before.
+  const oversizedOverviews =
+    agent.name === "documentation" ? scanFeatureDocs({ repoRoot: agentCwd }) : [];
+  if (oversizedOverviews.length > 0) {
+    console.log(
+      `   📏 ${oversizedOverviews.length} package overview(s) over ${FEATURE_DOCS_CAP_BYTES}B — split directive added`,
+    );
+  }
+  const splitDirective = formatSplitDirective(oversizedOverviews, FEATURE_DOCS_CAP_BYTES);
+
+  writeFileSync(promptFile, prompt + splitDirective);
   writeFileSync(systemPromptFile, systemPrompt);
 
   // Turn limits: see `maxTurnsFor` in lib.ts for rationale (base 90,
