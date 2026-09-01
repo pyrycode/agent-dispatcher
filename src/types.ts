@@ -113,6 +113,22 @@ export interface AgentConfig {
    * `prepareAgentSpawn` as `agent.effort ?? "xhigh"`.
    */
   effort?: string;
+  /**
+   * Per-agent `claude --max-turns` override. Omit to use the name-keyed
+   * tiers in `maxTurnsFor` (agent-runtime.ts). Declared by stage-set
+   * agents (stage-sets.ts) whose budgets don't map onto the classic
+   * names — the builder set's `builder` (200) and `verifier` (150). No
+   * classic agent sets this, so classic budgets are untouched.
+   */
+  maxTurns?: number;
+  /**
+   * Per-agent wall-clock timeout override (ms). Omit to use the
+   * name-keyed tiers in `timeoutFor`. The override is flat — the
+   * label-conditional bump (security-sensitive architect) applies only
+   * on the name-keyed path. Declared by the builder set's `builder` and
+   * `verifier` (both 40min).
+   */
+  timeoutMs?: number;
 }
 
 // 6-agent pipeline: PO → Architect → Developer → QA → Code Review → Documentation
