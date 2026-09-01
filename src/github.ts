@@ -1,6 +1,10 @@
 import { graphql } from "@octokit/graphql";
 import type { ProjectConfig, ProjectItem } from "./types.js";
-import { AUTO_RETRY_COMMENT_MARKER } from "./pipeline-decisions.js";
+import {
+  AUTO_RETRY_COMMENT_MARKER,
+  FAMILY_BREAKER_COMMENT_MARKER,
+  FAMILY_DISPATCH_COMMENT_MARKER,
+} from "./pipeline-decisions.js";
 
 /** Transient GitHub responses worth another attempt for an IDEMPOTENT
  *  request: server-side 5xx and secondary-rate-limit 429. `fetch()` only
@@ -354,6 +358,21 @@ export class GitHubProjectClient {
   }
 
   /**
+   * Every item on the board — all columns, closed issues included — from
+   * the same per-cycle cached fetch the status-filtered reads use.
+   *
+   * The family circuit breaker needs a label lookup for family ROOTS,
+   * and a split family's root usually sits CLOSED in Done — visible to
+   * neither `getItemsByStatus` (open only) nor `getClosedItemsNotInDone`
+   * (closed outside Done only). This is the one reader that sees the
+   * whole board. Costs nothing extra: same snapshot, same cache.
+   */
+  async getAllProjectItems(): Promise<ProjectItem[]> {
+    const all = await this.getAllItems();
+    return all.map(stripState);
+  }
+
+  /**
    * Return project items whose issue is CLOSED and whose status is NOT
    * "Done". Used by the closed-sweep step to keep the board tidy: tickets
    * closed by PO during a split (parent → children), tickets the user closed
@@ -618,5 +637,50 @@ export class GitHubProjectClient {
       if (typeof c?.body === "string" && c.body.includes(AUTO_RETRY_COMMENT_MARKER)) count++;
     }
     return count;
+  }
+
+  /**
+   * The family circuit breaker's durable state on a family ROOT issue,
+   * read from its comments in one fetch:
+   *
+   *   - `markerCount` — how many family-dispatch marker comments the root
+   *     carries. One is posted per dispatch of any family member, so the
+   *     count IS the family's dispatch tally (comments are durable; labels
+   *     can fail to write silently — the transient-retry code learned this).
+   *   - `breakerCommented` — whether the one-time trip explanation has
+   *     already been posted, so a family that stays tripped across cycles
+   *     explains itself exactly once.
+   *
+   * One page (100 comments) mirrors `countRetryMarkers`; a root that
+   * accrues more than 100 comments under-counts and trips late rather
+   * than crashing. THROWS on fetch failure — the caller
+   * (`runFamilyBreaker`) fails open for the cycle, falling back to the
+   * convenience label.
+   */
+  async getFamilyDispatchState(
+    issueNumber: number,
+  ): Promise<{ markerCount: number; breakerCommented: boolean }> {
+    const response = await fetchWithRetry(
+      `https://api.github.com/repos/${this.config.owner}/${this.config.repo}/issues/${issueNumber}/comments?per_page=100`,
+      {
+        headers: {
+          Authorization: `token ${this.config.token}`,
+        },
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error(`Failed to fetch comments: ${response.statusText}`);
+    }
+
+    const comments: any[] = await response.json();
+    let markerCount = 0;
+    let breakerCommented = false;
+    for (const c of comments) {
+      if (typeof c?.body !== "string") continue;
+      if (c.body.includes(FAMILY_DISPATCH_COMMENT_MARKER)) markerCount++;
+      if (c.body.includes(FAMILY_BREAKER_COMMENT_MARKER)) breakerCommented = true;
+    }
+    return { markerCount, breakerCommented };
   }
 }

@@ -53,6 +53,9 @@ class FakeClient implements DispatchClient {
     const posted = this.comments.filter((c) => c.issueNumber === issueNumber && c.body.includes(RETRY_MARKER)).length;
     return (this.markerCountByIssue.get(issueNumber) ?? 0) + posted;
   }
+  async getFamilyDispatchState(_issueNumber: number) {
+    return { markerCount: 0, breakerCommented: false };
+  }
   labels() { return this.addLabelCalls.map((c) => c.label); }
 }
 
