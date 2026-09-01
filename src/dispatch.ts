@@ -52,6 +52,7 @@ import {
   FAMILY_BREAKER_LABEL,
   FAMILY_DISPATCH_COMMENT_MARKER,
   FAMILY_DISPATCH_COUNT_PREFIX,
+  FAMILY_DISPATCH_RESET_MARKER,
 } from "./pipeline-decisions.js";
 import {
   decideBranchSetup,
@@ -3474,9 +3475,11 @@ export async function holdBackoffWaiters(
  * auto-merge, the closed sweep, or rework routing — the breaker only
  * filters DISPATCH candidates and marks the root. A ticket mid-run when
  * its family trips finishes normally (its dispatch already left this
- * seam). To resume: remove `error:family-breaker` from the root — and
- * raise PYRY_FAMILY_DISPATCH_LIMIT, since a tally still at/over the
- * limit re-trips on the next cycle. Marker comments persist harmlessly.
+ * seam). To resume ONE family: post a comment containing
+ * FAMILY_DISPATCH_RESET_MARKER on the root (zeroes that family's tally
+ * — only markers after the latest reset count), then remove
+ * `error:family-breaker`. Raising PYRY_FAMILY_DISPATCH_LIMIT stays the
+ * global fallback. Marker comments persist harmlessly.
  *
  * Every board write is best-effort: a failed label or comment write is
  * logged and skipped while the veto itself stands — a missed park
@@ -3557,10 +3560,14 @@ export async function runFamilyBreaker(
           `limit of **${threshold}** (\`PYRY_FAMILY_DISPATCH_LIMIT\`). The dispatcher has paused dispatch ` +
           `for the whole family — every ticket whose parent chain leads here — to stop a runaway split ` +
           `lineage from burning further agent runs. Tickets already mid-run finish normally.\n\n` +
-          `**To resume:** remove the \`${FAMILY_BREAKER_LABEL}\` label from this issue. If the tally still ` +
-          `exceeds the limit, the breaker trips again next cycle — so also raise ` +
-          `\`PYRY_FAMILY_DISPATCH_LIMIT\`, or leave the family parked. The family-dispatch marker ` +
-          `comments stay harmlessly as the family's audit trail.`,
+          `**To resume this family:**\n` +
+          `1. Post a comment on this issue containing exactly \`${FAMILY_DISPATCH_RESET_MARKER}\` ` +
+          `(add any human note beside it). That resets this family's tally to zero — only dispatches ` +
+          `after it count.\n` +
+          `2. Remove the \`${FAMILY_BREAKER_LABEL}\` label from this issue.\n\n` +
+          `Raising \`PYRY_FAMILY_DISPATCH_LIMIT\` remains the global fallback; it raises the budget for ` +
+          `every family at once. The family-dispatch marker comments stay harmlessly as the family's ` +
+          `audit trail.`,
         );
       } catch (e) {
         console.warn(`   ⚠️  Failed to post family-breaker trip comment on #${root}: ${e}`);

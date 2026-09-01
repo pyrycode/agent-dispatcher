@@ -1095,6 +1095,12 @@ export function shouldAddReadyLabel(opts: {
 //                      root directly (GLOBAL_BLOCK_LABELS) and every
 //                      descendant through the parent chain on the snapshot
 //                      (shouldSkipDispatch's rootLabels arm).
+//   - reset         -> a comment containing FAMILY_DISPATCH_RESET_MARKER on
+//                      the root zeroes the tally: only markers posted after
+//                      the LATEST reset count, and the trip-comment dedupe
+//                      also looks only past it, so a resumed family that
+//                      runs away again explains itself again
+//                      (tallyFamilyComments).
 //
 // The root is resolved WITHOUT walking descendants: the PO's split-depth
 // cap keeps chains at most 3 deep, so `grandparentNumber ?? parentNumber
@@ -1105,10 +1111,11 @@ export function shouldAddReadyLabel(opts: {
 // The breaker only filters DISPATCH candidates and marks the root. It
 // never blocks the real-claude gate, auto-merge, the closed sweep, or
 // rework routing, and a ticket mid-run when the family trips finishes
-// normally. To resume a parked family: remove `error:family-breaker`
-// from the root — and raise PYRY_FAMILY_DISPATCH_LIMIT, because a tally
-// still at/over the limit trips the breaker again on the next cycle.
-// The marker comments persist harmlessly as the family's audit trail.
+// normally. To resume ONE parked family: post a comment containing the
+// reset marker on the root (zeroes that family's tally), then remove
+// `error:family-breaker`. Raising PYRY_FAMILY_DISPATCH_LIMIT is the
+// global fallback — it raises the budget for every family at once. The
+// marker comments persist harmlessly as the family's audit trail.
 
 /** Park switch on the family root. The `error:` prefix is load-bearing:
  *  it already excludes the root from the WIP count and blocks its own
@@ -1134,8 +1141,20 @@ export const FAMILY_DISPATCH_COMMENT_MARKER = "<!-- family-dispatch-marker -->";
 
 /** Hidden marker embedded in the one explanatory comment posted when the
  *  breaker trips. Its presence is the cross-cycle dedupe: a family that
- *  stays tripped re-vetoes every cycle but explains itself only once. */
+ *  stays tripped re-vetoes every cycle but explains itself only once —
+ *  measured from the latest reset (see FAMILY_DISPATCH_RESET_MARKER). */
 export const FAMILY_BREAKER_COMMENT_MARKER = "<!-- family-breaker-tripped -->";
+
+/** The operator's per-family reset switch: a comment containing this
+ *  marker on the family ROOT zeroes that family's tally. Only dispatch
+ *  markers posted AFTER the latest reset count, and the trip-comment
+ *  dedupe also looks only past it. This keeps resume per-family — no
+ *  global PYRY_FAMILY_DISPATCH_LIMIT raise needed to free one lineage.
+ *  The trip comment QUOTES this string in its instructions, so
+ *  `tallyFamilyComments` never treats a trip comment as a reset. The
+ *  three family markers are mutually distinct, non-substring strings
+ *  (locked by test). */
+export const FAMILY_DISPATCH_RESET_MARKER = "<!-- family-dispatch-reset -->";
 
 /** Default dispatch budget per family — about four clean six-stage tickets
  *  (a clean ticket takes ~6 runs). The 213$ overnight spiral would have
@@ -1205,6 +1224,61 @@ export function resolveFamilyTally(
 ): number {
   if (markerCount !== null) return markerCount;
   return extractFamilyDispatchCount(rootLabels);
+}
+
+/**
+ * Fold one issue's comment stream into the family breaker's durable
+ * state: the dispatch tally and whether the trip explanation stands.
+ *
+ * Semantics, per comment in chronological order:
+ *   - a TRIP comment (contains FAMILY_BREAKER_COMMENT_MARKER) arms the
+ *     dedupe. It also quotes the reset marker in its operator
+ *     instructions, so trip detection wins: a body carrying both markers
+ *     is a trip, never a reset — otherwise every trip would immediately
+ *     zero the tally it tripped on.
+ *   - a RESET comment (contains FAMILY_DISPATCH_RESET_MARKER, and is not
+ *     a trip) zeroes the running tally AND clears the dedupe. Only what
+ *     comes after the LATEST reset counts, so an operator resume is
+ *     per-family and a resumed family that runs away again both trips
+ *     again and explains itself again.
+ *   - a DISPATCH marker (contains FAMILY_DISPATCH_COMMENT_MARKER)
+ *     increments the running tally.
+ *
+ * Ordering: when EVERY comment carries a parseable `created_at`, the
+ * stream is sorted by it (array position as tiebreak) — belt-and-braces
+ * against a future ordering change. Otherwise array order stands;
+ * GitHub's REST API returns issue comments oldest-first.
+ *
+ * Pure — shared by the real client (github.ts) and the test mock, so
+ * the two can never disagree about reset semantics.
+ */
+export function tallyFamilyComments(
+  comments: ReadonlyArray<{ body?: unknown; created_at?: unknown }>,
+): { markerCount: number; breakerCommented: boolean } {
+  const dated = comments.map((c, i) => ({
+    c,
+    i,
+    t: typeof c?.created_at === "string" ? Date.parse(c.created_at) : NaN,
+  }));
+  const ordered = dated.every((x) => !isNaN(x.t))
+    ? [...dated].sort((a, b) => a.t - b.t || a.i - b.i)
+    : dated;
+
+  let markerCount = 0;
+  let breakerCommented = false;
+  for (const { c } of ordered) {
+    const body = c?.body;
+    if (typeof body !== "string") continue;
+    const isTrip = body.includes(FAMILY_BREAKER_COMMENT_MARKER);
+    if (!isTrip && body.includes(FAMILY_DISPATCH_RESET_MARKER)) {
+      markerCount = 0;
+      breakerCommented = false;
+      continue;
+    }
+    if (body.includes(FAMILY_DISPATCH_COMMENT_MARKER)) markerCount++;
+    if (isTrip) breakerCommented = true;
+  }
+  return { markerCount, breakerCommented };
 }
 
 /** What `decideFamilyBreaker` returns: the veto plus a loggable reason. */
