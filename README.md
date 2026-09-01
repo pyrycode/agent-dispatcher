@@ -23,9 +23,17 @@ Each transition is gated by a `done:<agent>` label, advanced automatically when 
 
 Each dispatch creates a fresh `git worktree` under `.<target>-worktrees/<agent>-<issue#>/`. Concurrent dispatches don't interfere; failures leave the worktree as evidence for triage; `git worktree remove --force` cleans up.
 
+### Resume-in-place
+
+Before any salvage, a run that exhausted its budget — the `max_turns` turn cap or the dispatcher's wall-clock timeout — gets up to `PYRY_RESUME_LEGS` continuation legs (default 1; `0` disables the feature and restores the pre-resume behaviour byte-for-byte). A continuation leg resumes the **same claude session** via `claude --resume <session-id>` with a fresh budget, inside the same dispatch and the same worktree, with every flag re-passed (they do not carry over on resume). Session ids are captured from the stream's init frame, so even a killed run that never emitted a result frame stays resumable. Most budget exhaustions are "ran out mid-task", not "stuck" — one fresh budget converts most of those human-triage interruptions into automatic completions. If the final leg is still exhausted, the salvage paths below run unchanged, keyed on the original run's result. Permission denials never resume; they keep their own salvage.
+
+**Claude-binary bridge caveat:** continuation legs always spawn the `claude` CLI directly, regardless of `PYRY_USE_LEGACY_CLAUDE`, because the `pyry agent-run` wrapper has no resume support yet. This is a pilot bridge; it retires once the wrapper grows a `--resume` flag.
+
+**Economics note:** graceful resumption changes the economics of ticket splitting — a ticket that would previously burn a human triage cycle on a budget miss now just costs a second leg, so oversized-but-coherent tickets get cheaper relative to eager splits. The refiner guides flip their split-leaning default separately once this is observed live.
+
 ### Salvage
 
-When an agent hits `max_turns` mid-dispatch, the dispatcher tries two recovery paths before flagging the run as errored:
+When an agent exhausts its budget mid-dispatch (and any resume-in-place legs are spent), the dispatcher tries two recovery paths before flagging the run as errored:
 
 1. **PR-already-exists** — if the agent opened a non-draft PR before timing out, treat the run as success.
 2. **Safer-salvage** — if the worktree has uncommitted changes that pass `go vet` + `go build` (or the consumer's configured salvage gates), open a draft PR with `error:max_turns_salvaged` and let the next dispatch continue from there.
@@ -68,6 +76,7 @@ Optional:
 | `SALVAGE_GATES` | `go vet ./...; go build ./...` | `;`-delimited shell commands that gate the safer-salvage path on `max_turns`. Each runs in the agent's worktree; all must exit 0 for the dispatcher to commit + push uncommitted work as a draft PR. Set to `""` to skip gating entirely. Override per ecosystem (e.g. `cargo check --all-targets; cargo test --no-run` for Rust). |
 | `DISCORD_WEBHOOK_URL` | — | Notify on dispatch start/end |
 | `PYRY_LOG_RETENTION_DAYS` | `30` | Rotate logs older than N days; `0` disables |
+| `PYRY_RESUME_LEGS` | `1` | Resume-in-place: how many same-session continuation legs a budget-exhausted run gets before salvage. `0` disables the feature entirely (byte-identical pre-resume behaviour). See above. |
 | `PYRY_FAMILY_DISPATCH_LIMIT` | `24` | Family circuit breaker: dispatch budget per ticket family before the whole lineage is parked under `error:family-breaker` on its root. Per-family resume via a reset comment on the root; this knob is the global fallback. See above. |
 | `OWNER_TYPE` | `user` | `user` or `organization` for GitHub Project owner |
 | `PYRY_REAL_CLAUDE_GATE_CMD` | — | Shell command that runs the fork's live-claude suite. **Empty disables the gate entirely** and gated tickets park for an operator. See below. |
