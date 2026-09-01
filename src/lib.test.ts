@@ -345,6 +345,40 @@ describe("shouldSkipDispatch", () => {
       );
     }
   });
+
+  test("needs-human:sizing blocks ALL agents until the human decides the split", () => {
+    // The sizing label means "an agent hit the split-depth gate and
+    // stopped; a human decides whether this ships as one ticket or as
+    // the split the agent described." Without a global block the ticket
+    // keeps its column and no per-agent label, so the next cycle
+    // re-dispatches the same agent, which re-derives the same
+    // measurement and bails again. pyrycode#1938's architect run cost
+    // $2.88 and 314s; that is the price of each lap.
+    //
+    // Until now the loop was only prevented by accident: the
+    // empty-branch guard's false-positive `error:architect` happened to
+    // park the ticket. Removing that false positive without adding this
+    // block would turn a mislabeled ticket into a spending loop.
+    for (const agent of AGENTS) {
+      assert.equal(
+        shouldSkipDispatch(["needs-human:sizing"], agent.name),
+        true,
+        `needs-human:sizing should block dispatch for ${agent.name}`,
+      );
+    }
+  });
+
+  test("needs-human:sizing combines with the labels a real bail carries", () => {
+    // #1938's actual set at the moment of the bail, minus the
+    // false-positive error label this fix removes.
+    assert.equal(
+      shouldSkipDispatch(
+        ["enhancement", "size:s", "done:po", "security-sensitive", "needs-real-claude", "needs-human:sizing"],
+        "architect",
+      ),
+      true,
+    );
+  });
 });
 
 describe("isMergeConflictError", () => {
@@ -3415,6 +3449,37 @@ describe("shouldFlagEmptyBranch", () => {
     // than silently producing nothing. Same suppression applies.
     const arch = AGENTS.find(a => a.name === "architect")!;
     assert.equal(shouldFlagEmptyBranch(arch, 0, ["needs-rework:architect"]), false);
+  });
+
+  test("architect + 0 commits + needs-human:sizing → false (legitimate bail)", () => {
+    // Surfaced on pyrycode#1938 (2026-09-01), the first ticket ever to
+    // take this path. Both the architect and PO prompts tell the agent
+    // that when a ticket is over its size boundary AND already a
+    // grandchild, the split-depth gate forbids proposing a split: add
+    // `needs-human:sizing`, comment with the split it would have made,
+    // and stop without writing a spec. The architect did exactly that,
+    // exited success at 36 turns, and got `error:architect` anyway
+    // because `feature/1938` was 0 ahead of main.
+    //
+    // Same class as the relay#26 `needs-rework:po` false positive
+    // above: an empty branch is the EXPECTED outcome of a documented
+    // bail, and the escape hatch existed in the prompts while the
+    // dispatcher had never been taught the label.
+    const arch = AGENTS.find(a => a.name === "architect")!;
+    assert.equal(shouldFlagEmptyBranch(arch, 0, ["needs-human:sizing"]), false);
+  });
+
+  test("architect + 0 commits + needs-human:sizing alongside done:po → false", () => {
+    // #1938's actual post-run label set: PO had already run and the
+    // dispatcher had added `done:po`, so the suppression has to survive
+    // a stale prior-agent label sitting next to it. The `done:po`-only
+    // test above proves the reverse — that label alone does NOT
+    // suppress.
+    const arch = AGENTS.find(a => a.name === "architect")!;
+    assert.equal(
+      shouldFlagEmptyBranch(arch, 0, ["enhancement", "size:s", "done:po", "needs-human:sizing"]),
+      false,
+    );
   });
 });
 

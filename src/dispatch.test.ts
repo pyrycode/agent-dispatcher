@@ -1824,6 +1824,48 @@ describe("handlePostRun — failure modes", () => {
     // postLabels has needs-rework:po — that's tested in lib.test.ts.)
   });
 
+  test("empty branch + architect added needs-human:sizing → guard skipped (legitimate bail, no false-positive error:architect)", async () => {
+    // Surfaced on `pyrycode#1938` (2026-09-01). The architect measured
+    // the ticket over its `size:s` boundary, confirmed via the GraphQL
+    // `parent` field that it was a grandchild, and so hit the
+    // split-depth gate that forbids it proposing a split. Per its own
+    // prompt it applied `needs-human:sizing`, commented with the split
+    // it would have made, and stopped without writing a spec — exiting
+    // success at 36 turns. It got `error:architect` anyway, with a
+    // comment accusing it of having "silently refused or pattern-matched
+    // its way out of the work."
+    //
+    // Same class as the relay#26 case above, and the first ticket in
+    // the pipeline's history to take this path — which is why the gap
+    // between the prompts and the dispatcher went unnoticed. The other
+    // half of the fix is `GLOBAL_BLOCK_LABELS`: without it, dropping
+    // the false-positive error label would let the next cycle
+    // re-dispatch the architect into the identical bail.
+    const client = new MockGitHubClient({
+      status: { 1938: "In Architecture" },
+      labels: { 1938: ["size:s", "done:po", "needs-human:sizing"] },
+    });
+    const { ctx } = makeTestContext({
+      agent: { name: "architect", column: "In Architecture", claudeMdPath: "architect/CLAUDE.md", usesWorktree: true, producesCommits: true },
+      item: { issueNumber: 1938 },
+      client,
+      mockOptions: {
+        execImpls: {
+          "git status --porcelain": () => "",
+          "git rev-list --count main..": () => "0\n",  // architect wrote no spec, by design
+        },
+      },
+    });
+
+    const result = await handlePostRun(STREAM_OK(), ctx, false);
+
+    assert.deepEqual(result, { ok: true }, "architect bail must not propagate as ok:false");
+    assert.ok(!client.addLabelCalls.some(c => c.label === "error:architect"),
+      "needs-human:sizing + 0 commits is a legitimate bail; must NOT add error:architect");
+    assert.ok(!client.comments.some(c => c.body.includes("produced no commits")),
+      "empty-branch error comment must not be posted on legitimate bail");
+  });
+
   test("empty branch + agent-doesn't-produce-commits (code-review) → guard skipped via shouldFlagEmptyBranch", async () => {
     // code-review uses a worktree (reads code locally to review) but
     // its output is PR comments via `gh pr review` — never commits.
