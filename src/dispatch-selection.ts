@@ -69,6 +69,16 @@ export interface DispatchCandidate<T extends DecisionItem = DecisionItem> {
  * (older callers, lookup build failure) selection behaves exactly as
  * before and the veto is left to `runFamilyBreaker`'s tally check.
  *
+ * **`excludedRoots`.** Families the caller has already established are
+ * parked THIS cycle — a tally trip the root's labels do not yet show.
+ * Selection spends its `maxConcurrent` budget before the tally check
+ * runs, so without a way to re-select minus the parked family, a single
+ * parked lineage at the head of a column starves the whole board: the
+ * budget is handed to candidates that are guaranteed to be dropped, and
+ * the next cycle repeats it from the same snapshot order. The poll loop
+ * re-selects with this set filled in. Empty or absent behaves exactly as
+ * before.
+ *
  * Pure function over a snapshot. Caller is responsible for invalidating the
  * snapshot (per-cycle items cache) at appropriate boundaries.
  */
@@ -77,8 +87,9 @@ export function selectDispatches<T extends DecisionItem>(opts: {
   pollOrder: readonly AgentConfig[];
   maxConcurrent: number;
   rootLabelsByIssue?: ReadonlyMap<number, readonly string[]>;
+  excludedRoots?: ReadonlySet<number>;
 }): DispatchCandidate<T>[] {
-  const { itemsByColumn, pollOrder, maxConcurrent, rootLabelsByIssue } = opts;
+  const { itemsByColumn, pollOrder, maxConcurrent, rootLabelsByIssue, excludedRoots } = opts;
   const out: DispatchCandidate<T>[] = [];
   if (maxConcurrent <= 0) return out;
   for (const agent of pollOrder) {
@@ -104,7 +115,9 @@ export function selectDispatches<T extends DecisionItem>(opts: {
     for (const item of items) {
       if (out.length >= maxConcurrent) break;
       if (serialBudget <= 0) break;
-      if (shouldSkipDispatch(item.labels, agent.name, rootLabelsByIssue?.get(resolveFamilyRoot(item)))) continue;
+      const familyRoot = resolveFamilyRoot(item);
+      if (excludedRoots?.has(familyRoot)) continue;
+      if (shouldSkipDispatch(item.labels, agent.name, rootLabelsByIssue?.get(familyRoot))) continue;
       if (item.issueNumber > 0 && hasOpenBlockers(item.blockedBy ?? [])) continue;
       out.push({ agent, item });
       if (agent.serial) serialBudget--;

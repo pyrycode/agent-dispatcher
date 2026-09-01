@@ -1205,6 +1205,43 @@ export function resolveFamilyRoot(item: {
 }
 
 /**
+ * Family roots that no board lookup can see.
+ *
+ * `rootLabelsByIssue` is built from the project board, so it only knows
+ * issues that are ON the board. A split family's root is closed the
+ * moment its children are filed, and a closed root leaves the board for
+ * two ordinary reasons: the operator archives a crowded Done column
+ * (which is what happened to #1906 on 2026-09-01), or the root was never
+ * added to the board at all. Either way the root's `error:family-breaker`
+ * label becomes unreadable, the selection-layer veto silently stops
+ * vetoing, and the parked family keeps taking dispatch slots it can only
+ * lose — see the starvation note on `runFamilyBreaker`.
+ *
+ * This returns exactly the roots worth a direct issue fetch: referenced
+ * by a board item, not the item itself (an item is its own root only
+ * when it has no parent, and then its labels are already in hand), and
+ * missing from the board lookup. On a board of unsplit tickets that set
+ * is empty and the cycle costs nothing extra.
+ */
+export function collectOffBoardFamilyRoots(
+  items: Iterable<{
+    issueNumber: number;
+    parentNumber?: number | null;
+    grandparentNumber?: number | null;
+  }>,
+  known: ReadonlyMap<number, readonly string[]>,
+): Set<number> {
+  const missing = new Set<number>();
+  for (const item of items) {
+    const root = resolveFamilyRoot(item);
+    if (root === item.issueNumber) continue;
+    if (known.has(root)) continue;
+    missing.add(root);
+  }
+  return missing;
+}
+
+/**
  * Read the convenience counter from the root's labels. Max-of-found
  * (same defensive shape as `extractReworkCount`): duplicate counters
  * shouldn't co-exist, but if a partial label-strip race leaves
