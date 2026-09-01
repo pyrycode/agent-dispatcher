@@ -56,8 +56,16 @@ import {
   decideMergeRetry,
   decidePostRunLabels,
   decideReworkRoutes,
+  decideFamilyBreaker,
+  extractFamilyDispatchCount,
   extractMergeAttemptCount,
   extractReworkCount,
+  FAMILY_BREAKER_LABEL,
+  FAMILY_DISPATCH_COUNT_PREFIX,
+  FAMILY_DISPATCH_LIMIT_DEFAULT,
+  resolveFamilyDispatchLimit,
+  resolveFamilyRoot,
+  resolveFamilyTally,
   extractReworkTarget,
   findAdvanceRule,
   isMergeConflictError,
@@ -4676,5 +4684,267 @@ describe("mapParentChain — GraphQL parent chain → ProjectItem fields", () =>
       parentNumber: null,
       grandparentNumber: null,
     });
+  });
+});
+
+// =====================================================================
+// Family circuit breaker — pure decision layer
+// =====================================================================
+
+describe("resolveFamilyRoot", () => {
+  test("a ticket with no parent is its own family root", () => {
+    assert.equal(resolveFamilyRoot({ issueNumber: 7 }), 7);
+    assert.equal(resolveFamilyRoot({ issueNumber: 7, parentNumber: null, grandparentNumber: null }), 7);
+  });
+
+  test("a child resolves to its parent as the family root", () => {
+    assert.equal(resolveFamilyRoot({ issueNumber: 41, parentNumber: 40, grandparentNumber: null }), 40);
+  });
+
+  test("a grandchild resolves to its grandparent as the family root", () => {
+    assert.equal(resolveFamilyRoot({ issueNumber: 42, parentNumber: 41, grandparentNumber: 40 }), 40);
+  });
+});
+
+describe("decideFamilyBreaker", () => {
+  test("a family one dispatch under the threshold is allowed (23 of 24)", () => {
+    const d = decideFamilyBreaker({ rootNumber: 40, markerCount: 23, threshold: 24 });
+    assert.equal(d.veto, false);
+  });
+
+  test("a family exactly at the threshold is vetoed (24 of 24)", () => {
+    const d = decideFamilyBreaker({ rootNumber: 40, markerCount: 24, threshold: 24 });
+    assert.equal(d.veto, true);
+    assert.ok(d.reason.includes("24"), "reason should carry the tally");
+  });
+
+  test("a family over the threshold stays vetoed", () => {
+    assert.equal(decideFamilyBreaker({ rootNumber: 40, markerCount: 213, threshold: 24 }).veto, true);
+  });
+
+  test("a fresh family with zero dispatches is allowed", () => {
+    assert.equal(decideFamilyBreaker({ rootNumber: 40, markerCount: 0, threshold: 24 }).veto, false);
+  });
+
+  test("the default limit is 24 — about four clean six-stage tickets", () => {
+    assert.equal(FAMILY_DISPATCH_LIMIT_DEFAULT, 24);
+  });
+});
+
+describe("resolveFamilyDispatchLimit — PYRY_FAMILY_DISPATCH_LIMIT parsing", () => {
+  test("unset falls back to the default of 24", () => {
+    assert.equal(resolveFamilyDispatchLimit(undefined), FAMILY_DISPATCH_LIMIT_DEFAULT);
+    assert.equal(resolveFamilyDispatchLimit(""), FAMILY_DISPATCH_LIMIT_DEFAULT);
+  });
+
+  test("a positive integer is honoured", () => {
+    assert.equal(resolveFamilyDispatchLimit("48"), 48);
+    assert.equal(resolveFamilyDispatchLimit("1"), 1);
+  });
+
+  test("zero, negatives, and garbage fall back to the default — a limit of 0 would park every family", () => {
+    assert.equal(resolveFamilyDispatchLimit("0"), FAMILY_DISPATCH_LIMIT_DEFAULT);
+    assert.equal(resolveFamilyDispatchLimit("-5"), FAMILY_DISPATCH_LIMIT_DEFAULT);
+    assert.equal(resolveFamilyDispatchLimit("many"), FAMILY_DISPATCH_LIMIT_DEFAULT);
+  });
+});
+
+describe("extractFamilyDispatchCount", () => {
+  test("reads the count from a family-dispatches:N label", () => {
+    assert.equal(extractFamilyDispatchCount(["size:m", "family-dispatches:7"]), 7);
+  });
+
+  test("no counter label reads as zero", () => {
+    assert.equal(extractFamilyDispatchCount([]), 0);
+    assert.equal(extractFamilyDispatchCount(["size:m", "done:po"]), 0);
+  });
+
+  test("multiple counters read as the maximum (bias toward tripping, mirrors extractReworkCount)", () => {
+    assert.equal(extractFamilyDispatchCount(["family-dispatches:3", "family-dispatches:9"]), 9);
+  });
+
+  test("malformed and negative tails are treated as zero", () => {
+    assert.equal(extractFamilyDispatchCount(["family-dispatches:", "family-dispatches:abc", "family-dispatches:-2"]), 0);
+  });
+});
+
+describe("resolveFamilyTally — comments are the source of truth", () => {
+  test("when the marker-comment count and the label disagree, the comments win", () => {
+    // Label says 50 (stale or corrupted), comments say 3 → the family is fine.
+    assert.equal(resolveFamilyTally(3, ["family-dispatches:50"]), 3);
+    // Label says 3 (failed writes), comments say 30 → the family trips.
+    assert.equal(resolveFamilyTally(30, ["family-dispatches:3"]), 30);
+  });
+
+  test("an unreadable comment count falls back to the convenience label", () => {
+    assert.equal(resolveFamilyTally(null, ["family-dispatches:12"]), 12);
+  });
+
+  test("an unreadable comment count with no label reads as zero — fail open, a crashed cycle is worse", () => {
+    assert.equal(resolveFamilyTally(null, []), 0);
+  });
+});
+
+describe("family labels do not collide with the pipeline label scheme", () => {
+  test("family-dispatches:N is not a pipeline label, so pre-dispatch prep never strips it", () => {
+    assert.equal(isPipelineLabel("family-dispatches:24"), false);
+    for (const agent of AGENTS) {
+      assert.equal(
+        isPipelineLabelForAgent(`family-dispatches:${agent.name}`, agent.name),
+        false,
+        `family-dispatches: must not read as a pipeline label for ${agent.name}`,
+      );
+      assert.equal(isPipelineLabelForAgent("family-dispatches:24", agent.name), false);
+    }
+  });
+
+  test("the counter prefix is disjoint from every pipeline prefix", () => {
+    for (const prefix of PIPELINE_LABEL_PREFIXES) {
+      assert.ok(
+        !FAMILY_DISPATCH_COUNT_PREFIX.startsWith(prefix),
+        `${FAMILY_DISPATCH_COUNT_PREFIX} must not start with ${prefix}`,
+      );
+    }
+  });
+
+  test("error:family-breaker IS a pipeline label but belongs to no agent name", () => {
+    // The error: prefix is load-bearing: it already excludes the root from
+    // the WIP count. No agent is named family-breaker, so the per-agent
+    // strip loop never touches it.
+    assert.equal(isPipelineLabel(FAMILY_BREAKER_LABEL), true);
+    for (const agent of AGENTS) {
+      assert.equal(isPipelineLabelForAgent(FAMILY_BREAKER_LABEL, agent.name), false);
+    }
+  });
+});
+
+describe("shouldSkipDispatch — family breaker veto", () => {
+  test("error:family-breaker on the ticket itself blocks every agent (the parked root)", () => {
+    for (const agent of AGENTS) {
+      assert.equal(
+        shouldSkipDispatch([FAMILY_BREAKER_LABEL], agent.name),
+        true,
+        `error:family-breaker should block dispatch for ${agent.name}`,
+      );
+    }
+  });
+
+  test("error:family-breaker on the ROOT's labels blocks a clean descendant for every agent", () => {
+    for (const agent of AGENTS) {
+      assert.equal(
+        shouldSkipDispatch([], agent.name, [FAMILY_BREAKER_LABEL]),
+        true,
+        `a root carrying error:family-breaker should veto descendants for ${agent.name}`,
+      );
+    }
+  });
+
+  test("a root without the breaker label does not veto the descendant", () => {
+    assert.equal(shouldSkipDispatch([], "developer", ["size:m", "done:po"]), false);
+    assert.equal(shouldSkipDispatch([], "developer", []), false);
+    assert.equal(shouldSkipDispatch([], "developer", undefined), false);
+  });
+
+  test("other error labels on the root do NOT veto the descendant — only the family breaker crosses the parent chain", () => {
+    // A root parked on its own error (say error:po) is that ticket's
+    // problem; its siblings and children keep flowing.
+    assert.equal(shouldSkipDispatch([], "developer", ["error:po"]), false);
+    assert.equal(shouldSkipDispatch([], "developer", ["error:merge-conflict"]), false);
+  });
+});
+
+describe("decideDoneCleanup — family breaker labels", () => {
+  test("strips the family-dispatches:N counter when a ticket reaches Done", () => {
+    const cleanups = decideDoneCleanup([
+      { id: "a", issueNumber: 40, labels: ["family-dispatches:11", "size:m"] },
+    ]);
+    assert.equal(cleanups.length, 1);
+    assert.deepEqual(cleanups[0].labelsToStrip, ["family-dispatches:11"]);
+  });
+
+  test("preserves error:family-breaker on a Done root — it is the park switch, not a stale trail", () => {
+    // A split family's root sits closed in Done while its descendants
+    // dispatch. Stripping the breaker label there would erase the
+    // operator's board signal every cycle and re-arm nothing.
+    const cleanups = decideDoneCleanup([
+      { id: "a", issueNumber: 40, labels: [FAMILY_BREAKER_LABEL, "done:po", "family-dispatches:24"] },
+    ]);
+    assert.equal(cleanups.length, 1);
+    assert.ok(!cleanups[0].labelsToStrip.includes(FAMILY_BREAKER_LABEL), "the park switch must survive Done cleanup");
+    assert.ok(cleanups[0].labelsToStrip.includes("done:po"));
+    assert.ok(cleanups[0].labelsToStrip.includes("family-dispatches:24"));
+  });
+
+  test("a Done root carrying ONLY the breaker label needs no cleanup at all", () => {
+    const cleanups = decideDoneCleanup([
+      { id: "a", issueNumber: 40, labels: [FAMILY_BREAKER_LABEL] },
+    ]);
+    assert.deepEqual(cleanups, []);
+  });
+
+  test("other error labels are still stripped on Done", () => {
+    const cleanups = decideDoneCleanup([
+      { id: "a", issueNumber: 41, labels: ["error:developer"] },
+    ]);
+    assert.equal(cleanups.length, 1);
+    assert.deepEqual(cleanups[0].labelsToStrip, ["error:developer"]);
+  });
+});
+
+describe("selectDispatches — family breaker veto at the selection layer", () => {
+  const POLL_ORDER = [...AGENTS].reverse();
+
+  const child = (n: number, root: number, labels: string[] = []) =>
+    ({ id: `item-${n}`, issueNumber: n, labels, blockedBy: [], parentNumber: root, grandparentNumber: null });
+
+  test("a breaker label on the family root vetoes a clean child candidate", () => {
+    const r = selectDispatches({
+      itemsByColumn: new Map([["Backlog", [child(41, 40)]]]),
+      pollOrder: POLL_ORDER,
+      maxConcurrent: 2,
+      rootLabelsByIssue: new Map([[40, [FAMILY_BREAKER_LABEL]]]),
+    });
+    assert.deepEqual(r, []);
+  });
+
+  test("a grandchild is vetoed through its grandparent root", () => {
+    const grandchild = { id: "item-42", issueNumber: 42, labels: [], blockedBy: [], parentNumber: 41, grandparentNumber: 40 };
+    const r = selectDispatches({
+      itemsByColumn: new Map([["Backlog", [grandchild]]]),
+      pollOrder: POLL_ORDER,
+      maxConcurrent: 2,
+      rootLabelsByIssue: new Map([[40, [FAMILY_BREAKER_LABEL]]]),
+    });
+    assert.deepEqual(r, []);
+  });
+
+  test("a healthy family is unaffected by the lookup", () => {
+    const r = selectDispatches({
+      itemsByColumn: new Map([["Backlog", [child(41, 40)]]]),
+      pollOrder: POLL_ORDER,
+      maxConcurrent: 2,
+      rootLabelsByIssue: new Map([[40, ["size:l"]]]),
+    });
+    assert.equal(r.length, 1);
+    assert.equal(r[0].item.issueNumber, 41);
+  });
+
+  test("without the lookup (older callers), selection behaves exactly as before", () => {
+    const r = selectDispatches({
+      itemsByColumn: new Map([["Backlog", [child(41, 40)]]]),
+      pollOrder: POLL_ORDER,
+      maxConcurrent: 2,
+    });
+    assert.equal(r.length, 1);
+  });
+
+  test("a parked root selected directly is vetoed by its own labels even without the lookup", () => {
+    const root = { id: "item-40", issueNumber: 40, labels: [FAMILY_BREAKER_LABEL], blockedBy: [] };
+    const r = selectDispatches({
+      itemsByColumn: new Map([["Backlog", [root]]]),
+      pollOrder: POLL_ORDER,
+      maxConcurrent: 2,
+    });
+    assert.deepEqual(r, []);
   });
 });

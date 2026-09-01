@@ -9,7 +9,7 @@
 // pipeline-decisions.ts and `hasOpenBlockers` from blockers.ts.
 
 import { AGENTS, type AgentConfig } from "./types.js";
-import { shouldSkipDispatch, type DecisionItem } from "./pipeline-decisions.js";
+import { resolveFamilyRoot, shouldSkipDispatch, type DecisionItem } from "./pipeline-decisions.js";
 import { hasOpenBlockers } from "./blockers.js";
 
 // Built from AGENTS — single source of truth for the name → column mapping.
@@ -57,6 +57,15 @@ export interface DispatchCandidate<T extends DecisionItem = DecisionItem> {
  * conflicts the dispatcher's pre-merge step can't resolve. Surfaced
  * 2026-05-10 by concurrent documentation runs on #1 and #2.
  *
+ * **Family breaker veto.** `rootLabelsByIssue` maps issue number → label
+ * set for every item on the board (all columns, closed included — a split
+ * family's root usually sits closed in Done). Each candidate's family
+ * root is resolved from its parent-chain snapshot fields, and a root
+ * carrying `error:family-breaker` vetoes the candidate via
+ * `shouldSkipDispatch`'s rootLabels arm. Optional: without the lookup
+ * (older callers, lookup build failure) selection behaves exactly as
+ * before and the veto is left to `runFamilyBreaker`'s tally check.
+ *
  * Pure function over a snapshot. Caller is responsible for invalidating the
  * snapshot (per-cycle items cache) at appropriate boundaries.
  */
@@ -64,8 +73,9 @@ export function selectDispatches<T extends DecisionItem>(opts: {
   itemsByColumn: ReadonlyMap<string, readonly T[]>;
   pollOrder: readonly AgentConfig[];
   maxConcurrent: number;
+  rootLabelsByIssue?: ReadonlyMap<number, readonly string[]>;
 }): DispatchCandidate<T>[] {
-  const { itemsByColumn, pollOrder, maxConcurrent } = opts;
+  const { itemsByColumn, pollOrder, maxConcurrent, rootLabelsByIssue } = opts;
   const out: DispatchCandidate<T>[] = [];
   if (maxConcurrent <= 0) return out;
   for (const agent of pollOrder) {
@@ -91,7 +101,7 @@ export function selectDispatches<T extends DecisionItem>(opts: {
     for (const item of items) {
       if (out.length >= maxConcurrent) break;
       if (serialBudget <= 0) break;
-      if (shouldSkipDispatch(item.labels, agent.name)) continue;
+      if (shouldSkipDispatch(item.labels, agent.name, rootLabelsByIssue?.get(resolveFamilyRoot(item)))) continue;
       if (item.issueNumber > 0 && hasOpenBlockers(item.blockedBy ?? [])) continue;
       out.push({ agent, item });
       if (agent.serial) serialBudget--;
