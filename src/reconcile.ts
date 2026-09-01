@@ -25,12 +25,10 @@
 // tests).
 
 import type { GitHubProjectClient } from "./github.js";
-import { AGENTS, type ProjectItem } from "./types.js";
-import { AGENT_COLUMN_MAP } from "./dispatch-selection.js";
+import { type ProjectItem } from "./types.js";
+import { activeStageSet } from "./stage-sets.js";
 import {
-  AUTO_ADVANCE_RULES,
   MANUAL_ADVANCE_GATES,
-  MID_PIPELINE_COLUMNS,
   REAL_CLAUDE_GATE_FROM_COLUMN,
   REAL_CLAUDE_GATE_LABEL,
   REAL_CLAUDE_GATE_RUN_FROM_COLUMN,
@@ -79,13 +77,19 @@ export interface ReconcileClient {
 // lib.ts so they can be unit-tested without spinning up the dispatcher.
 
 export async function runAutoAdvance(client: ReconcileClient, maxConcurrent: number): Promise<void> {
+  // Rules + WIP-probe columns come from the stage set resolved at startup.
+  // Classic wraps AUTO_ADVANCE_RULES / MID_PIPELINE_COLUMNS by reference,
+  // so this is byte-identical to the pre-stage-set dispatcher there; the
+  // builder set's chain skips In Architecture and In QA entirely.
+  const { advanceRules, midPipelineColumns } = activeStageSet();
+
   // Probe in-flight count: non-errored tickets in mid-pipeline columns.
   // The Backlog promotion budget is `max(0, maxConcurrent - inFlightCount)`,
   // so we need the count, not just a boolean.
   let inFlightCount = 0;
   try {
     const midItems = await Promise.all(
-      MID_PIPELINE_COLUMNS.map(c => client.getItemsByStatus(c)),
+      midPipelineColumns.map(c => client.getItemsByStatus(c)),
     );
     inFlightCount = countPipelineInFlight(midItems.flat());
   } catch (error: any) {
@@ -98,7 +102,7 @@ export async function runAutoAdvance(client: ReconcileClient, maxConcurrent: num
   // Fetch items for each unique `from` column referenced by the rule table.
   // Building once and passing into the pure decision keeps I/O bounded and
   // the decision deterministic.
-  const fromColumns = [...new Set(AUTO_ADVANCE_RULES.map(r => r.from))];
+  const fromColumns = [...new Set(advanceRules.map(r => r.from))];
   const itemsByColumn = new Map<string, ProjectItem[]>();
   try {
     const fetched = await Promise.all(fromColumns.map(c => client.getItemsByStatus(c)));
@@ -112,7 +116,7 @@ export async function runAutoAdvance(client: ReconcileClient, maxConcurrent: num
   // capacity-bounded Backlog promotion, mid-pipeline advance-all).
   // Test surface lives in lib.test.ts.
   const decision = decideAutoAdvance(
-    AUTO_ADVANCE_RULES,
+    advanceRules,
     MANUAL_ADVANCE_GATES,
     itemsByColumn,
     inFlightCount,
@@ -138,7 +142,7 @@ export async function runAutoAdvance(client: ReconcileClient, maxConcurrent: num
   // holds aren't silent.
   for (const gate of decision.gatedAwaiting) {
     const numbers = gate.itemNumbers.map(n => `#${n}`).join(", ");
-    const target = AUTO_ADVANCE_RULES.find(r => r.from === gate.column)?.to ?? "?";
+    const target = advanceRules.find(r => r.from === gate.column)?.to ?? "?";
     console.log(`   🚦 ${gate.column}: ${numbers} awaiting human review (move to ${target} when ready)`);
   }
   if (decision.backlogHeld.length > 0) {
@@ -159,12 +163,17 @@ export async function runAutoAdvance(client: ReconcileClient, maxConcurrent: num
 
 // Backward routing: when an agent adds needs-rework:{target}, move the ticket
 // to the target agent's column and strip the label so the target can pick it
-// up. AGENT_COLUMN_MAP and extractReworkTarget live in lib.ts.
+// up. The name→column map comes from the stage set; extractReworkTarget
+// lives in pipeline-decisions.ts.
 
 export async function runReworkRouting(client: ReconcileClient): Promise<void> {
+  // Agents + the name→column routing map come from the resolved stage set
+  // (classic: identical to the old AGENTS / AGENT_COLUMN_MAP pair).
+  const { agents, columnByAgent } = activeStageSet();
+
   // Fetch items in every agent's column (one query per column, in parallel).
   const itemsByColumn = new Map<string, ProjectItem[]>();
-  for (const agent of AGENTS) {
+  for (const agent of agents) {
     try {
       const items = await client.getItemsByStatus(agent.column);
       itemsByColumn.set(agent.column, items);
@@ -176,7 +185,7 @@ export async function runReworkRouting(client: ReconcileClient): Promise<void> {
   // Pure decision — see decideReworkRoutes for semantics (first valid
   // rework label wins, self-loops skipped, label stripping rules). Test
   // surface lives in lib.test.ts.
-  const routes = decideReworkRoutes(AGENT_COLUMN_MAP, itemsByColumn);
+  const routes = decideReworkRoutes(columnByAgent, itemsByColumn);
 
   // Apply each route: check rework counter (halt at threshold), move
   // the item, strip stale labels, increment the counter. Track

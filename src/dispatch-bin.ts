@@ -23,7 +23,7 @@ import { fileURLToPath } from "node:url";
 
 import { dispatchInbox, installSignalHandlers, pollLoop } from "./dispatch.js";
 import { decideCodegraphHealth, findMissingAgentClaudeMds } from "./agent-runtime.js";
-import { AGENTS } from "./types.js";
+import { activeStageSet, type StageSet } from "./stage-sets.js";
 import { resolveAgentsRepoRootWithEnv, resolveTargetRepoRoot } from "./worktree.js";
 
 // Validate required environment variables. dispatch.ts loads .env at
@@ -40,6 +40,20 @@ for (const key of REQUIRED_ENV) {
 }
 if (isNaN(parseInt(process.env.PROJECT_NUMBER!, 10))) {
   console.error(`PROJECT_NUMBER must be a number, got: "${process.env.PROJECT_NUMBER}"`);
+  process.exit(1);
+}
+
+// Resolve the stage set once for the process (PYRY_STAGE_SET; the fork's
+// .env is already loaded by dispatch.ts's module body, which ESM evaluates
+// before this file's body runs). An unknown value fails fast HERE, with
+// the valid names, before any pre-flight or polling — a typo'd stage set
+// must never silently run the wrong pipeline. Every later consumer (poll
+// loop, spawn prep, reconciliation) reads the same memoized instance.
+let stageSet: StageSet;
+try {
+  stageSet = activeStageSet();
+} catch (e) {
+  console.error(e instanceof Error ? e.message : String(e));
   process.exit(1);
 }
 
@@ -60,7 +74,7 @@ const agentsRepoRoot = resolveAgentsRepoRootWithEnv({
   fallbackSrcDir: __dirname,
 });
 const missingClaudeMds = findMissingAgentClaudeMds({
-  agents: AGENTS,
+  agents: stageSet.agents,
   agentsRepoRoot,
   existsSync,
 });
@@ -69,7 +83,7 @@ if (missingClaudeMds.length > 0) {
   for (const m of missingClaudeMds) {
     console.error(`  ${m.name}: ${m.path}`);
   }
-  console.error(`Restore the prompts (or fix the AGENTS config paths) before restarting the dispatcher.`);
+  console.error(`Restore the prompts (or fix the "${stageSet.name}" stage set's config paths) before restarting the dispatcher.`);
   process.exit(1);
 }
 
