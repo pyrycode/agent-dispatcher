@@ -19,7 +19,11 @@ import {
   AUTO_ADVANCE_RULES,
   MANUAL_ADVANCE_GATES,
   MID_PIPELINE_COLUMNS,
+  REAL_CLAUDE_GATE_LABEL,
   decideAutoAdvance,
+  decideGateOutcome,
+  decideRealClaudeGate,
+  decideRealClaudeGateRun,
   decideReworkRoutes,
 } from "./pipeline-decisions.js";
 import { AGENT_COLUMN_MAP } from "./dispatch-selection.js";
@@ -213,6 +217,13 @@ describe("classic stage set — identity with today's pipeline", () => {
     assert.equal(classic.preSpawnGate, null);
   });
 
+  test("real-claude gate keys: literal current values (done:code-review, needs-rework:developer)", () => {
+    assert.deepStrictEqual(classic.realClaudeGate, {
+      reviewDoneLabel: "done:code-review",
+      failReworkLabel: "needs-rework:developer",
+    });
+  });
+
   test("classic budgets unchanged (spot-check through maxTurnsFor / timeoutFor)", () => {
     const byName = new Map(classic.agents.map((a) => [a.name, a]));
     assert.equal(maxTurnsFor(byName.get("po")!), 135);
@@ -358,10 +369,16 @@ describe("builder stage set — collapsed four-role pipeline", () => {
     assert.deepStrictEqual(builder.webSearchToolNames, new Set(["builder"]));
   });
 
-  test("pre-spawn gates: verifier gated, red routes to builder", () => {
+  test("pre-spawn gates: the verifier is the gated agent", () => {
     assert.ok(builder.preSpawnGate, "builder set must configure the pre-verifier gate");
     assert.deepStrictEqual(builder.preSpawnGate!.agentNames, new Set(["verifier"]));
-    assert.equal(builder.preSpawnGate!.reworkTarget, "builder");
+  });
+
+  test("real-claude gate keys derive from the set: done:verifier triggers, failures route to the builder", () => {
+    assert.deepStrictEqual(builder.realClaudeGate, {
+      reviewDoneLabel: "done:verifier",
+      failReworkLabel: "needs-rework:builder",
+    });
   });
 });
 
@@ -393,7 +410,7 @@ describe("builder stage set — pure decision plumbing", () => {
     );
   });
 
-  test("decideReworkRoutes sends needs-rework:builder from In Code Review to In Development (the red-gate router)", () => {
+  test("decideReworkRoutes sends needs-rework:builder from In Code Review to In Development (the label the verifier's triage applies)", () => {
     const itemsByColumn = new Map([
       ["In Code Review", [item("i3", 12, ["needs-rework:builder"])]],
     ]);
@@ -410,6 +427,51 @@ describe("builder stage set — pure decision plumbing", () => {
     ]);
     const routes = decideReworkRoutes(builder.columnByAgent, itemsByColumn);
     assert.equal(routes.length, 0);
+  });
+
+  test("decideRealClaudeGate parks on done:verifier under the builder set's review label", () => {
+    const itemsByColumn = new Map([
+      ["In Code Review", [item("g1", 20, ["done:verifier", REAL_CLAUDE_GATE_LABEL])]],
+    ]);
+    const routes = decideRealClaudeGate(itemsByColumn, builder.realClaudeGate.reviewDoneLabel);
+    assert.equal(routes.length, 1);
+    assert.equal(routes[0]!.issueNumber, 20);
+    assert.equal(routes[0]!.toColumn, "Inbox");
+  });
+
+  test("decideRealClaudeGate under builder does NOT park on the classic done:code-review (no builder agent emits it)", () => {
+    const itemsByColumn = new Map([
+      ["In Code Review", [item("g2", 21, ["done:code-review", REAL_CLAUDE_GATE_LABEL])]],
+    ]);
+    const routes = decideRealClaudeGate(itemsByColumn, builder.realClaudeGate.reviewDoneLabel);
+    assert.equal(routes.length, 0);
+  });
+
+  test("decideRealClaudeGate default argument stays the classic literal (identity)", () => {
+    const itemsByColumn = new Map([
+      ["In Code Review", [item("g3", 22, ["done:code-review", REAL_CLAUDE_GATE_LABEL])]],
+    ]);
+    assert.equal(decideRealClaudeGate(itemsByColumn).length, 1);
+  });
+
+  test("decideRealClaudeGateRun selects on the builder review label", () => {
+    const parked = [item("g4", 23, ["done:verifier", REAL_CLAUDE_GATE_LABEL])];
+    const picked = decideRealClaudeGateRun(parked, builder.realClaudeGate.reviewDoneLabel);
+    assert.ok(picked);
+    assert.equal(picked!.issueNumber, 23);
+    assert.equal(
+      decideRealClaudeGateRun(parked),
+      null,
+      "the classic default must not select a builder-reviewed ticket",
+    );
+  });
+
+  test("decideGateOutcome('fail') routes with the set's fail rework label", () => {
+    const o = decideGateOutcome("fail", builder.realClaudeGate.failReworkLabel);
+    assert.equal(o.toColumn, "In Development");
+    assert.deepStrictEqual(o.addLabels, ["needs-rework:builder"]);
+    const classicO = decideGateOutcome("fail");
+    assert.deepStrictEqual(classicO.addLabels, ["needs-rework:developer"], "default stays the classic literal");
   });
 });
 

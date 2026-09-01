@@ -431,26 +431,32 @@ export interface RealClaudeGateRoute {
 
 /**
  * Pure decision for `runRealClaudeGate`. A ticket in `In Code Review` that has
- * finished review (`done:code-review`) AND carries `needs-real-claude` is
- * routed to Inbox.
+ * finished review AND carries `needs-real-claude` is routed to Inbox.
  *
- * Requiring `done:code-review` ensures the machine-checkable review completed
- * before parking (a mid-review ticket has no such label, so it is left alone),
- * and lets a real review failure (`needs-rework:developer`) take precedence via
- * the rework router — that ticket never gets `done:code-review`. Firing only
- * from `In Code Review` means once a ticket is parked in Inbox it is out of the
- * scan set: no loop, and the operator-instruction comment posts exactly once.
+ * `reviewDoneLabel` is the stage set's final pre-documentation review
+ * signal — `done:code-review` in classic (the default, so existing callers
+ * and tests are byte-identical), `done:verifier` in the builder set; the
+ * caller passes `activeStageSet().realClaudeGate.reviewDoneLabel`.
+ *
+ * Requiring the review done label ensures the machine-checkable review
+ * completed before parking (a mid-review ticket has no such label, so it is
+ * left alone), and lets a real review failure (the set's rework label) take
+ * precedence via the rework router — that ticket never gets the done label.
+ * Firing only from `In Code Review` means once a ticket is parked in Inbox
+ * it is out of the scan set: no loop, and the operator-instruction comment
+ * posts exactly once.
  *
  * Pure over already-collected items; the caller does the I/O.
  */
 export function decideRealClaudeGate(
   itemsByColumn: ReadonlyMap<string, readonly DecisionItem[]>,
+  reviewDoneLabel = "done:code-review",
 ): RealClaudeGateRoute[] {
   const routes: RealClaudeGateRoute[] = [];
   const items = itemsByColumn.get(REAL_CLAUDE_GATE_FROM_COLUMN) ?? [];
   for (const item of items) {
     if (item.issueNumber <= 0) continue;
-    if (!item.labels.includes("done:code-review")) continue;
+    if (!item.labels.includes(reviewDoneLabel)) continue;
     if (!item.labels.includes(REAL_CLAUDE_GATE_LABEL)) continue;
     routes.push({
       itemId: item.id,
@@ -491,7 +497,10 @@ export const REAL_CLAUDE_GATE_FAIL_COLUMN = "In Development";
  */
 export const REAL_CLAUDE_GATE_ERROR_LABEL = "error:real-claude-gate";
 
-/** The label a failed gate adds, routing the ticket back to the developer. */
+/** The label a failed gate adds in the CLASSIC set, routing the ticket
+ *  back to the developer. Default for `decideGateOutcome`; other stage
+ *  sets pass their own (`activeStageSet().realClaudeGate.failReworkLabel`,
+ *  e.g. builder's `needs-rework:builder`). */
 export const REAL_CLAUDE_GATE_REWORK_LABEL = "needs-rework:developer";
 
 /** The one ticket the dispatcher will gate this cycle. */
@@ -509,8 +518,9 @@ export interface RealClaudeGateRunCandidate {
  * selection for the sum of both, and the chain drains just as fast one per
  * cycle because each pass unblocks the next ticket's build anyway.
  *
- * Eligibility mirrors the rest of the pipeline: review finished
- * (`done:code-review`), the gate is wanted (`needs-real-claude`), nothing is
+ * Eligibility mirrors the rest of the pipeline: review finished (the stage
+ * set's review done label — classic default `done:code-review`), the gate
+ * is wanted (`needs-real-claude`), nothing is
  * already wrong (`error:*`), no rework is pending (`needs-rework:*`), and no
  * blocker is open. Excluding `error:*` is what stops a ticket the gate
  * already parked from being re-selected forever.
@@ -520,10 +530,11 @@ export interface RealClaudeGateRunCandidate {
  */
 export function decideRealClaudeGateRun(
   items: readonly DecisionItem[],
+  reviewDoneLabel = "done:code-review",
 ): RealClaudeGateRunCandidate | null {
   for (const item of items) {
     if (item.issueNumber <= 0) continue;
-    if (!item.labels.includes("done:code-review")) continue;
+    if (!item.labels.includes(reviewDoneLabel)) continue;
     if (!item.labels.includes(REAL_CLAUDE_GATE_LABEL)) continue;
     if (item.labels.some(l => l.startsWith("error:") || l.startsWith("needs-rework:"))) continue;
     if (hasOpenBlockers(item.blockedBy ?? [])) continue;
@@ -764,7 +775,7 @@ export interface GateOutcome {
  * Map a verdict onto board actions.
  *
  *   pass          → In Documentation, clear `needs-real-claude`
- *   fail          → In Development, add `needs-rework:developer`
+ *   fail          → In Development, add the set's fail rework label (classic: `needs-rework:developer`)
  *   zero-executed → stays in Inbox, add `error:real-claude-gate`, notify
  *   unusable      → stays in Inbox, add `error:real-claude-gate`, notify
  *
@@ -783,7 +794,12 @@ export interface GateOutcome {
  * burn all three rework spawns discovering that. Parking under an `error:`
  * label is self-limiting, and no path here reads as green.
  */
-export function decideGateOutcome(verdict: GateVerdict): GateOutcome {
+export function decideGateOutcome(
+  verdict: GateVerdict,
+  /** The stage set's rework label for a genuine failure — classic default
+   *  `needs-rework:developer`; builder passes `needs-rework:builder`. */
+  failReworkLabel: string = REAL_CLAUDE_GATE_REWORK_LABEL,
+): GateOutcome {
   switch (verdict) {
     case "pass":
       return {
@@ -795,7 +811,7 @@ export function decideGateOutcome(verdict: GateVerdict): GateOutcome {
     case "fail":
       return {
         toColumn: REAL_CLAUDE_GATE_FAIL_COLUMN,
-        addLabels: [REAL_CLAUDE_GATE_REWORK_LABEL],
+        addLabels: [failReworkLabel],
         removeLabels: [],
         notify: false,
       };

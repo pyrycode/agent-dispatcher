@@ -1675,16 +1675,14 @@ export async function dispatchToAgent(
   if (!setup.ok) return;
 
   // Builder-set pre-verifier gates: deterministic gate commands run in the
-  // ticket's worktree BEFORE any model is spawned. Red applies
-  // `needs-rework:builder` (the rework router moves the ticket next cycle)
-  // and tears the worktree down without spending a token; green threads a
-  // gates-passed note into the agent's prompt. In the classic set this is
-  // a no-op returning `{ ok: true }` without reading any env.
+  // ticket's worktree BEFORE the model spawns, but they only decide green
+  // vs red — the model always runs. Green threads a gates-passed note into
+  // the agent's prompt; red threads the failure context in TRIAGE MODE and
+  // the verifier owns the baseline partition + bounce-vs-advance call (a
+  // blind bounce would loop forever on a failure the branch merely
+  // inherited from main). In the classic set this is a no-op returning an
+  // empty note without reading any env.
   const gates = await maybeRunPreSpawnGates(ctx);
-  if (!gates.ok) {
-    await cleanupAfterDispatch(ctx);
-    return;
-  }
 
   const spawn = await prepareAgentSpawn(ctx, gates.promptNote);
   if (!spawn.ok) return;
@@ -2976,8 +2974,9 @@ export async function cleanupAfterDispatch(ctx: DispatchContext): Promise<void> 
 /** Wall-clock cap per pre-verifier gate command. */
 export const VERIFIER_GATE_TIMEOUT_MS = 600_000; // 10min
 
-/** Cap on the failing gate's output tail quoted in the rework comment. */
-export const VERIFIER_GATE_TAIL_CAP = 2000;
+/** Cap on the failing gate's output tail injected into the verifier's
+ *  triage-mode prompt note. */
+export const VERIFIER_GATE_TAIL_CAP = 4000;
 
 export interface VerifierGatesOutcome {
   ok: boolean;
@@ -3060,40 +3059,41 @@ export async function runVerifierGates(opts: {
  * Pre-spawn gate step for `dispatchToAgent`, between worktree setup and
  * spawn prep. Only the resolved stage set's `preSpawnGate` agents run it
  * (builder set: the verifier); for everyone else — the entire classic
- * set included — this returns immediately without reading any env or
- * spawning anything, so classic dispatch is byte-identical to before.
+ * set included — this returns an empty note immediately without reading
+ * any env or spawning anything, so classic dispatch is byte-identical to
+ * before.
  *
  * Gate commands come from `PYRY_VERIFIER_GATES` (parse contract shared
  * with SALVAGE_GATES: `;`-delimited, unset → the Go vet+build pair,
  * empty string → no gates and the step is skipped). Read at dispatch
  * time, not module load, matching PYRY_RESUME_LEGS.
  *
- * - **All green** → `{ ok: true, promptNote }`: a GATES section in the
- *   dispatch log plus a note for the prompt file telling the agent the
- *   deterministic gates already passed (so it spends judgment turns, not
- *   re-verification turns).
- * - **Any red** → `{ ok: false }` after applying
- *   `needs-rework:<reworkTarget>` and a comment quoting the failing
- *   gate + output tail. NO model is spawned; the existing rework
- *   routing moves the ticket back next cycle. Label first, comment
- *   second — the label is the router, the comment is the diagnosis
- *   (same ordering discipline as attemptSaferSalvage's label-before-PR).
- *   If even the label write fails, the ticket is simply left for the
- *   next cycle to re-gate: the loop is bounded by the gates themselves
- *   staying red, and each pass costs zero model tokens.
+ * The deterministic layer decides ONLY green vs red — the model spawns
+ * either way, and the note tells it which world it woke up in:
+ *
+ * - **All green** → a gates-passed note (plus a GATES section in the
+ *   dispatch log), so the agent spends judgment turns, not
+ *   re-verification turns.
+ * - **Any red** → a TRIAGE MODE note carrying the failing gate, its
+ *   verdict line (exit code / timeout / spawn error) and the output tail
+ *   (capped at `VERIFIER_GATE_TAIL_CAP`). The verifier owns the baseline
+ *   partition and the bounce-vs-advance call, exactly as QA does today —
+ *   a deterministic bounce would loop forever on a failure that
+ *   pre-exists on the merge base. Nothing is labelled or commented here;
+ *   routing is the model's verdict, not the gate's.
  */
 export async function maybeRunPreSpawnGates(
   ctx: DispatchContext,
-): Promise<{ ok: true; promptNote: string } | { ok: false }> {
-  const { agent, item, client, agentCwd, logFile } = ctx;
+): Promise<{ promptNote: string }> {
+  const { agent, item, agentCwd, logFile } = ctx;
   const preSpawnGate = activeStageSet().preSpawnGate;
   if (preSpawnGate === null || !preSpawnGate.agentNames.has(agent.name)) {
-    return { ok: true, promptNote: "" };
+    return { promptNote: "" };
   }
   const gates = parseVerifierGates(process.env.PYRY_VERIFIER_GATES);
   if (gates.length === 0) {
     // Consumer opted out (PYRY_VERIFIER_GATES=""): no gates, no note.
-    return { ok: true, promptNote: "" };
+    return { promptNote: "" };
   }
 
   console.log(`   🧪 Pre-${agent.name} gates (${gates.length}): ${gates.map((g) => `\`${g}\``).join(", ")}`);
@@ -3117,40 +3117,32 @@ export async function maybeRunPreSpawnGates(
       "",
       "Treat these as green — do not spend turns re-running them just to establish a baseline.",
     ].join("\n");
-    return { ok: true, promptNote };
+    return { promptNote };
   }
 
-  const reworkLabel = `needs-rework:${preSpawnGate.reworkTarget}`;
   console.log(
-    `   ❌ Pre-${agent.name} gate red (${result.failedGate}) — applying ${reworkLabel} on #${item.issueNumber}, no model spawned`,
+    `   ❌ Pre-${agent.name} gate red (${result.failedGate}) — spawning ${agent.name} in TRIAGE MODE`,
   );
-  try {
-    await client.addLabel(item.issueNumber, reworkLabel);
-  } catch (e) {
-    console.warn(`   ⚠️  Failed to add ${reworkLabel} on #${item.issueNumber} (next cycle re-gates, costing no tokens): ${e}`);
-  }
-  try {
-    await client.addComment(item.issueNumber, [
-      `## ❌ Pre-${agent.name} gates failed`,
-      ``,
-      `The dispatcher ran the deterministic gates in the ticket's worktree before spawning **${agent.name}**. \`${result.failedGate}\` failed, so no model was spawned. Applied \`${reworkLabel}\` — the rework router returns this ticket to **${preSpawnGate.reworkTarget}**.`,
-      ``,
-      `**Gates:**`,
-      ``,
-      "```",
-      ...result.summary,
-      "```",
-      ``,
-      `**Output tail (last ${VERIFIER_GATE_TAIL_CAP} chars):**`,
-      ``,
-      "```",
-      result.outputTail || "(no output captured)",
-      "```",
-    ].join("\n"));
-  } catch (e) {
-    console.warn(`   ⚠️  Failed to post pre-${agent.name} gate comment on #${item.issueNumber}: ${e}`);
-  }
-  return { ok: false };
+  const promptNote = [
+    "",
+    "",
+    "## Deterministic gates — TRIAGE MODE",
+    "",
+    `The dispatcher ran the fork's deterministic gates in this worktree before spawning you, and a gate FAILED:`,
+    "",
+    ...result.summary.map((line) => `- ${line}`),
+    "",
+    `Failing gate: \`${result.failedGate}\``,
+    "",
+    `Output tail (last ${VERIFIER_GATE_TAIL_CAP} chars):`,
+    "",
+    "```",
+    result.outputTail || "(no output captured)",
+    "```",
+    "",
+    "Triage this failure before reviewing: determine whether it is caused by this ticket's changes or already present on the merge base, then route per your triage contract (bounce vs advance). The dispatcher deliberately did not apply any rework label — that call is yours.",
+  ].join("\n");
+  return { promptNote };
 }
 
 // Closed-sweep: any closed issue that isn't already in Done gets moved
