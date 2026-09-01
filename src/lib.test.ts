@@ -18,6 +18,9 @@ import assert from "node:assert/strict";
 import { AGENTS } from "./types.js";
 import {
   advancePermissionDenialState,
+  buildResumeArgv,
+  buildResumePrompt,
+  captureSessionId,
   decideCodegraphHealth,
   detectPermissionDenial,
   extractRateLimitInfo,
@@ -28,10 +31,14 @@ import {
   MAX_SPAWN_ATTEMPTS,
   maxTurnsFor,
   timeoutFor,
+  mergeLegResults,
+  parseResumeLegs,
   parseSalvageGates,
+  pickFinalSessionId,
   ResourceExhaustedError,
   retrySpawnOnTransientError,
   scrubSpawnEnv,
+  shouldAttemptResume,
   shouldAttemptSafeSalvage,
   shouldUseWorktree,
   SPAWN_ENV_DENYLIST,
@@ -5043,5 +5050,322 @@ describe("selectDispatches — a reset alone does not resume a parked family", (
       rootLabelsByIssue: new Map([[40, [FAMILY_BREAKER_LABEL]]]),
     });
     assert.deepEqual(r, []);
+  });
+});
+
+// =====================================================================
+// Resume-in-place — pure decisions (same-dispatch continuation leg)
+// =====================================================================
+//
+// When a run exhausts its turn budget or wall clock, the dispatcher may
+// resume the SAME claude session with a fresh budget before falling back
+// to salvage. The pure pieces: session-id capture from the stream,
+// the resume decision gates, the forced-claude argv bridge, the
+// continuation prompt, and the cross-leg usage merge.
+
+describe("captureSessionId — init-frame stream capture", () => {
+  // Spike-proven (claude CLI 2.1.239): a run killed by SIGTERM/SIGKILL
+  // emits NO result frame, so the result-frame-only capture loses the
+  // session id exactly when a resume needs it. Every stream event
+  // carries session_id and the system/init frame arrives within
+  // seconds of spawn — so the FIRST event that carries one wins.
+
+  test("the system/init frame's session id is captured as the first carrier", () => {
+    const init = { type: "system", subtype: "init", session_id: "sess-abc" };
+    assert.equal(captureSessionId("", init), "sess-abc");
+  });
+
+  test("a session id already captured is never overwritten by a later event", () => {
+    const later = { type: "assistant", session_id: "sess-DIFFERENT" };
+    assert.equal(captureSessionId("sess-abc", later), "sess-abc");
+  });
+
+  test("events without a session id leave the capture unchanged", () => {
+    assert.equal(captureSessionId("", { type: "assistant" }), "");
+    assert.equal(captureSessionId("sess-abc", { type: "assistant" }), "sess-abc");
+  });
+
+  test("a non-string or empty session_id field is ignored", () => {
+    assert.equal(captureSessionId("", { session_id: 42 }), "");
+    assert.equal(captureSessionId("", { session_id: "" }), "");
+    assert.equal(captureSessionId("", { session_id: null }), "");
+  });
+
+  test("the no-result-frame kill shape still yields the init session id", () => {
+    // Sequence a SIGKILLed run actually produces: init frame, a few
+    // assistant/tool frames, then nothing — no result frame ever.
+    const events: Record<string, unknown>[] = [
+      { type: "system", subtype: "init", session_id: "sess-kill-7" },
+      { type: "assistant", session_id: "sess-kill-7", message: {} },
+      { type: "assistant", session_id: "sess-kill-7", message: {} },
+    ];
+    const captured = events.reduce(captureSessionId, "");
+    assert.equal(captured, "sess-kill-7");
+  });
+});
+
+describe("pickFinalSessionId — result frame wins over init capture", () => {
+  test("the result frame's value wins when both exist and differ", () => {
+    assert.equal(pickFinalSessionId("sess-result", "sess-init"), "sess-result");
+  });
+
+  test("falls back to the init-captured value when the result frame carries none", () => {
+    assert.equal(pickFinalSessionId("", "sess-init"), "sess-init");
+    assert.equal(pickFinalSessionId(undefined, "sess-init"), "sess-init");
+    assert.equal(pickFinalSessionId(null, "sess-init"), "sess-init");
+  });
+
+  test("a non-string result-frame value falls back to the init capture", () => {
+    assert.equal(pickFinalSessionId(42, "sess-init"), "sess-init");
+  });
+
+  test("empty on both sides stays empty", () => {
+    assert.equal(pickFinalSessionId("", ""), "");
+  });
+});
+
+describe("parseResumeLegs — the PYRY_RESUME_LEGS knob", () => {
+  test("unset defaults to one continuation leg", () => {
+    assert.equal(parseResumeLegs(undefined), 1);
+  });
+
+  test("empty string defaults to one continuation leg", () => {
+    assert.equal(parseResumeLegs(""), 1);
+  });
+
+  test("zero disables the feature entirely", () => {
+    assert.equal(parseResumeLegs("0"), 0);
+  });
+
+  test("a positive integer grants that many continuation legs", () => {
+    assert.equal(parseResumeLegs("2"), 2);
+    assert.equal(parseResumeLegs("5"), 5);
+  });
+
+  test("garbage falls back to the default of one", () => {
+    assert.equal(parseResumeLegs("banana"), 1);
+  });
+
+  test("a negative value disables, same as zero", () => {
+    assert.equal(parseResumeLegs("-3"), 0);
+  });
+});
+
+describe("shouldAttemptResume — decision gates", () => {
+  // All five gates must pass: budget exhaustion (max_turns OR timedOut),
+  // a captured session id, a worktree run, legs remaining, and NOT a
+  // permission denial (denials keep their existing salvage).
+  const baseOk = {
+    terminalReason: "max_turns",
+    timedOut: false,
+    sessionId: "sess-abc",
+    usedWorktree: true,
+    hadPermissionDenial: false,
+    legsUsed: 0,
+    maxLegs: 1,
+  };
+
+  test("max_turns with a session id in a worktree and legs remaining → resume", () => {
+    assert.equal(shouldAttemptResume(baseOk), true);
+  });
+
+  test("a wall-clock timeout (empty terminal reason) also resumes", () => {
+    assert.equal(
+      shouldAttemptResume({ ...baseOk, terminalReason: "", timedOut: true }),
+      true,
+    );
+  });
+
+  test("a genuine error shape (no exhaustion, no timeout) never resumes", () => {
+    assert.equal(
+      shouldAttemptResume({ ...baseOk, terminalReason: "api_error" }),
+      false,
+    );
+  });
+
+  test("no captured session id → no resume (nothing to resume into)", () => {
+    assert.equal(shouldAttemptResume({ ...baseOk, sessionId: "" }), false);
+  });
+
+  test("a non-worktree run never resumes", () => {
+    assert.equal(shouldAttemptResume({ ...baseOk, usedWorktree: false }), false);
+  });
+
+  test("legs already used up → no resume", () => {
+    assert.equal(shouldAttemptResume({ ...baseOk, legsUsed: 1, maxLegs: 1 }), false);
+  });
+
+  test("maxLegs=0 (feature disabled) → no resume even on a perfect shape", () => {
+    assert.equal(shouldAttemptResume({ ...baseOk, maxLegs: 0 }), false);
+  });
+
+  test("a permission denial never resumes, even on a max_turns reason", () => {
+    assert.equal(
+      shouldAttemptResume({ ...baseOk, hadPermissionDenial: true }),
+      false,
+    );
+  });
+
+  test("a permission denial never resumes, even when the wall clock also fired", () => {
+    assert.equal(
+      shouldAttemptResume({
+        ...baseOk,
+        terminalReason: "permission_denied",
+        timedOut: true,
+        hadPermissionDenial: true,
+      }),
+      false,
+    );
+  });
+
+  test("a second leg is granted when maxLegs allows it", () => {
+    assert.equal(shouldAttemptResume({ ...baseOk, legsUsed: 1, maxLegs: 2 }), true);
+  });
+});
+
+describe("buildResumeArgv — forced-claude continuation argv", () => {
+  const baseOpts = {
+    sessionId: "sess-abc",
+    model: "opus",
+    effort: "xhigh",
+    maxTurns: 135,
+    allowedTools: "Bash,Read,Write",
+    disallowedTools: "AskUserQuestion,Skill",
+    systemPromptFile: "/agents/.system-prompt-developer.txt",
+  };
+
+  test("the continuation leg always spawns the claude binary, never pyry agent-run", () => {
+    // The pyry agent-run wrapper has no resume support yet; the resume
+    // leg bridges through the claude CLI regardless of
+    // PYRY_USE_LEGACY_CLAUDE.
+    assert.equal(buildResumeArgv(baseOpts).bin, "claude");
+  });
+
+  test("argv re-passes every flag the resumed session does NOT inherit", () => {
+    // Permissions and flags do not carry over on --resume: model,
+    // effort, max-turns, allowedTools, disallowedTools, and the
+    // system-prompt file must all be re-passed per invocation.
+    const { args } = buildResumeArgv(baseOpts);
+    assert.deepEqual(args, [
+      "-p",
+      "--verbose",
+      "--output-format", "stream-json",
+      "--resume", "sess-abc",
+      "--model", "opus",
+      "--effort", "xhigh",
+      "--max-turns", "135",
+      "--allowedTools", "Bash,Read,Write",
+      "--disallowedTools", "AskUserQuestion,Skill",
+      "--append-system-prompt-file", "/agents/.system-prompt-developer.txt",
+    ]);
+  });
+
+  test("an empty disallowedTools omits the flag entirely", () => {
+    const { args } = buildResumeArgv({ ...baseOpts, disallowedTools: "" });
+    assert.ok(!args.includes("--disallowedTools"));
+    assert.ok(args.includes("--allowedTools"));
+  });
+
+  test("--verbose is present (required with stream-json)", () => {
+    assert.ok(buildResumeArgv(baseOpts).args.includes("--verbose"));
+  });
+});
+
+describe("buildResumePrompt — continuation prompt content", () => {
+  test("states the budget exhaustion, the intact worktree, and the no-redo instruction", () => {
+    const prompt = buildResumePrompt("max_turns");
+    assert.match(prompt, /turn budget/i);
+    assert.match(prompt, /worktree and branch are intact/i);
+    assert.match(prompt, /without redoing/i);
+    assert.match(prompt, /commit and push/i);
+    assert.match(prompt, /gates/i);
+  });
+
+  test("names the wall-clock timeout when that was the exhausted budget", () => {
+    const prompt = buildResumePrompt("timeout");
+    assert.match(prompt, /wall-clock/i);
+    assert.doesNotMatch(prompt, /turn budget/i);
+  });
+});
+
+describe("mergeLegResults — cross-leg usage aggregation", () => {
+  const firstLeg = {
+    output: "ran out of turns",
+    sessionId: "sess-abc",
+    isError: true,
+    numTurns: 135,
+    totalCostUsd: 4.5,
+    durationMs: 600_000,
+    usage: { input_tokens: 1000, output_tokens: 2000, cache_read_input_tokens: 500, cache_creation_input_tokens: 100 },
+    terminalReason: "max_turns",
+    rawResult: { subtype: "error_max_turns" },
+    hadPermissionDenial: false,
+    deniedOpContent: null,
+    lastAssistantText: "still working",
+    timedOut: false,
+  };
+  const resumeLeg = {
+    ...firstLeg,
+    output: "finished cleanly",
+    sessionId: "sess-abc",
+    isError: false,
+    numTurns: 40,
+    totalCostUsd: 1.25,
+    durationMs: 200_000,
+    usage: { input_tokens: 300, output_tokens: 700, cache_read_input_tokens: 50, cache_creation_input_tokens: 20 },
+    terminalReason: "stop",
+    rawResult: { subtype: "success" },
+    lastAssistantText: "done",
+  };
+
+  test("turns, cost, and duration sum across legs", () => {
+    const merged = mergeLegResults(firstLeg, resumeLeg);
+    assert.equal(merged.numTurns, 175);
+    assert.equal(merged.totalCostUsd, 5.75);
+    assert.equal(merged.durationMs, 800_000);
+  });
+
+  test("the token counters the USAGE line reads sum across legs", () => {
+    const merged = mergeLegResults(firstLeg, resumeLeg);
+    assert.equal(merged.usage.input_tokens, 1300);
+    assert.equal(merged.usage.output_tokens, 2700);
+    assert.equal(merged.usage.cache_read_input_tokens, 550);
+    assert.equal(merged.usage.cache_creation_input_tokens, 120);
+  });
+
+  test("the last leg's session id is kept (same session anyway)", () => {
+    const merged = mergeLegResults(firstLeg, { ...resumeLeg, sessionId: "sess-abc" });
+    assert.equal(merged.sessionId, "sess-abc");
+  });
+
+  test("an empty last-leg session id falls back to the first leg's", () => {
+    const merged = mergeLegResults(firstLeg, { ...resumeLeg, sessionId: "" });
+    assert.equal(merged.sessionId, "sess-abc");
+  });
+
+  test("terminal fields (output, error state, reason, raw result) come from the last leg", () => {
+    const merged = mergeLegResults(firstLeg, resumeLeg);
+    assert.equal(merged.output, "finished cleanly");
+    assert.equal(merged.isError, false);
+    assert.equal(merged.terminalReason, "stop");
+    assert.deepEqual(merged.rawResult, { subtype: "success" });
+    assert.equal(merged.lastAssistantText, "done");
+  });
+
+  test("usage keys outside the known counters keep the last leg's value", () => {
+    const merged = mergeLegResults(
+      { ...firstLeg, usage: { ...firstLeg.usage, service_tier: "standard" } },
+      { ...resumeLeg, usage: { ...resumeLeg.usage, service_tier: "priority" } },
+    );
+    assert.equal(merged.usage.service_tier, "priority");
+  });
+
+  test("a counter missing on one side sums as if it were zero", () => {
+    const merged = mergeLegResults(
+      { ...firstLeg, usage: { input_tokens: 1000 } },
+      { ...resumeLeg, usage: { output_tokens: 700 } },
+    );
+    assert.equal(merged.usage.input_tokens, 1000);
+    assert.equal(merged.usage.output_tokens, 700);
   });
 });
