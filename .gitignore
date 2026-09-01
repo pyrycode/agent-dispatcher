@@ -29,3 +29,7 @@ logs/
 # target (no auto-commit chain to bite it) — cheaper than the chance
 # of a future scenario where it does.
 /.codegraph
+
+# Eval harness cache of raw GitHub responses (src/eval/) — rebuildable,
+# potentially large, never source.
+/.eval-cache/
