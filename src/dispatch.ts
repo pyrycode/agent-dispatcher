@@ -44,6 +44,14 @@ import {
   RETRY_MAX_ATTEMPTS,
   ERROR_RETRY_COUNT_PREFIX,
   AUTO_RETRY_COMMENT_MARKER,
+  decideFamilyBreaker,
+  resolveFamilyDispatchLimit,
+  resolveFamilyRoot,
+  resolveFamilyTally,
+  FAMILY_BREAKER_COMMENT_MARKER,
+  FAMILY_BREAKER_LABEL,
+  FAMILY_DISPATCH_COMMENT_MARKER,
+  FAMILY_DISPATCH_COUNT_PREFIX,
 } from "./pipeline-decisions.js";
 import {
   decideBranchSetup,
@@ -233,6 +241,15 @@ const REAL_CLAUDE_GATE_BASELINE_CMD =
 // without GITHUB_TOKEN set.
 
 // Discord notifications
+/**
+ * Family circuit breaker: dispatch budget per ticket family (a split
+ * lineage counted on its ROOT issue). At/over the limit the breaker
+ * drops the family's candidates each cycle and parks the root under
+ * `error:family-breaker`. Default 24 — about four clean six-stage
+ * tickets (a clean ticket takes ~6 runs). See `runFamilyBreaker`.
+ */
+const FAMILY_DISPATCH_LIMIT = resolveFamilyDispatchLimit(process.env.PYRY_FAMILY_DISPATCH_LIMIT);
+
 async function notifyDiscord(message: string): Promise<void> {
   const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
   if (!webhookUrl) return;
@@ -1410,6 +1427,13 @@ export interface DispatchClient {
    *  bounded even without the label. Throws on fetch failure (caller
    *  treats an unread count as 0 and proceeds). */
   countRetryMarkers(issueNumber: number): Promise<number>;
+  /** The family circuit breaker's durable state on a family ROOT: the
+   *  count of family-dispatch marker comments (the family's dispatch
+   *  tally) and whether the one-time trip explanation was already
+   *  posted. One comments fetch serves both. Throws on fetch failure
+   *  (`runFamilyBreaker` fails open for the cycle, falling back to the
+   *  convenience label). */
+  getFamilyDispatchState(issueNumber: number): Promise<{ markerCount: number; breakerCommented: boolean }>;
 }
 
 // IO surface every phase function depends on. Threading it through
@@ -3424,6 +3448,130 @@ export async function holdBackoffWaiters(
 }
 
 /**
+ * The family circuit breaker's veto seam. Runs BETWEEN `selectDispatches`
+ * and `runPreDispatchPrep` — before any `wip:<agent>` is written or
+ * worktree created — so a dropped candidate leaves no trace this cycle.
+ *
+ * Per candidate: resolve its family ROOT from the parent-chain snapshot
+ * fields, read the root's marker-comment tally (ONE comments fetch per
+ * root per cycle — the per-root cache below — with the convenience label
+ * as fallback when the fetch fails), and ask `decideFamilyBreaker`. On a
+ * trip, the candidate is dropped AND the root is parked:
+ *
+ *   - `error:family-breaker` on the ROOT. Blocks the root itself via
+ *     GLOBAL_BLOCK_LABELS and every descendant via the selection layer's
+ *     rootLabels veto. `addLabel`'s REST endpoint auto-creates a label
+ *     that doesn't exist in the repo yet (same bootstrap story as
+ *     `rework-count:N` / `error-retry-count:N`), so no ensure-labels
+ *     step is needed.
+ *   - ONE explanatory comment on the root — deduped across cycles by the
+ *     `FAMILY_BREAKER_COMMENT_MARKER` already present in its comments
+ *     (same halted-once shape as the rework-loop breaker in
+ *     reconcile.ts). Parking is silent by design beyond the board; the
+ *     operator finds the parked root the way they find Inbox.
+ *
+ * What this deliberately does NOT do: touch the real-claude gate,
+ * auto-merge, the closed sweep, or rework routing — the breaker only
+ * filters DISPATCH candidates and marks the root. A ticket mid-run when
+ * its family trips finishes normally (its dispatch already left this
+ * seam). To resume: remove `error:family-breaker` from the root — and
+ * raise PYRY_FAMILY_DISPATCH_LIMIT, since a tally still at/over the
+ * limit re-trips on the next cycle. Marker comments persist harmlessly.
+ *
+ * Every board write is best-effort: a failed label or comment write is
+ * logged and skipped while the veto itself stands — a missed park
+ * bookkeeping entry is acceptable, a crashed cycle is not.
+ *
+ * Returns the kept candidates plus the per-root tallies read this cycle,
+ * which `runPreDispatchPrep` uses to number the convenience label
+ * without a second fetch.
+ */
+export async function runFamilyBreaker(
+  candidates: ReadonlyArray<{ agent: AgentConfig; item: ProjectItem }>,
+  client: DispatchClient,
+  opts?: {
+    /** Veto threshold; defaults to PYRY_FAMILY_DISPATCH_LIMIT (24). */
+    threshold?: number;
+    /** issueNumber → labels for the whole board (closed roots included),
+     *  built by pollLoop from the same per-cycle snapshot. Used for the
+     *  already-labelled quiet path and the fetch-failure fallback. */
+    rootLabelsByIssue?: ReadonlyMap<number, readonly string[]>;
+  },
+): Promise<{
+  kept: Array<{ agent: AgentConfig; item: ProjectItem }>;
+  tallies: Map<number, number>;
+}> {
+  const threshold = opts?.threshold ?? FAMILY_DISPATCH_LIMIT;
+  const kept: Array<{ agent: AgentConfig; item: ProjectItem }> = [];
+  const tallies = new Map<number, number>();
+  const stateByRoot = new Map<number, { markerCount: number | null; breakerCommented: boolean }>();
+  const trippedThisCycle = new Set<number>();
+
+  for (const candidate of candidates) {
+    const root = resolveFamilyRoot(candidate.item);
+
+    if (!stateByRoot.has(root)) {
+      try {
+        stateByRoot.set(root, await client.getFamilyDispatchState(root));
+      } catch (e: any) {
+        console.warn(
+          `   ⚠️  Family tally fetch failed for root #${root} (${e?.message ?? e}); ` +
+          `falling back to the ${FAMILY_DISPATCH_COUNT_PREFIX}N label for this cycle`,
+        );
+        stateByRoot.set(root, { markerCount: null, breakerCommented: false });
+      }
+    }
+    const state = stateByRoot.get(root)!;
+    const rootLabels =
+      opts?.rootLabelsByIssue?.get(root) ??
+      (root === candidate.item.issueNumber ? candidate.item.labels : []);
+    const tally = resolveFamilyTally(state.markerCount, rootLabels);
+    tallies.set(root, tally);
+
+    const decision = decideFamilyBreaker({ rootNumber: root, markerCount: tally, threshold });
+    if (!decision.veto) {
+      kept.push(candidate);
+      continue;
+    }
+
+    console.log(
+      `   🔌 Family breaker: dropping ${candidate.agent.name}#${candidate.item.issueNumber} — ${decision.reason}`,
+    );
+    if (trippedThisCycle.has(root)) continue;
+    trippedThisCycle.add(root);
+
+    if (!rootLabels.includes(FAMILY_BREAKER_LABEL)) {
+      try {
+        await client.addLabel(root, FAMILY_BREAKER_LABEL);
+        console.log(`   🏷️  Added ${FAMILY_BREAKER_LABEL} to family root #${root}`);
+      } catch (e) {
+        console.warn(`   ⚠️  Failed to add ${FAMILY_BREAKER_LABEL} to #${root} (veto still holds): ${e}`);
+      }
+    }
+    if (!state.breakerCommented) {
+      try {
+        await client.addComment(
+          root,
+          `${FAMILY_BREAKER_COMMENT_MARKER}\n## 🔌 Family circuit breaker tripped\n\n` +
+          `This ticket family (root #${root}) has consumed **${tally}** agent dispatches, at/over the ` +
+          `limit of **${threshold}** (\`PYRY_FAMILY_DISPATCH_LIMIT\`). The dispatcher has paused dispatch ` +
+          `for the whole family — every ticket whose parent chain leads here — to stop a runaway split ` +
+          `lineage from burning further agent runs. Tickets already mid-run finish normally.\n\n` +
+          `**To resume:** remove the \`${FAMILY_BREAKER_LABEL}\` label from this issue. If the tally still ` +
+          `exceeds the limit, the breaker trips again next cycle — so also raise ` +
+          `\`PYRY_FAMILY_DISPATCH_LIMIT\`, or leave the family parked. The family-dispatch marker ` +
+          `comments stay harmlessly as the family's audit trail.`,
+        );
+      } catch (e) {
+        console.warn(`   ⚠️  Failed to post family-breaker trip comment on #${root}: ${e}`);
+      }
+    }
+  }
+
+  return { kept, tallies };
+}
+
+/**
  * Pre-dispatch label prep: for each candidate, strip any stale
  * pipeline labels SCOPED TO THIS AGENT (not other agents — see
  * #9 review lesson 2026-05-08), strip the legacy
@@ -3440,10 +3588,31 @@ export async function holdBackoffWaiters(
  * `error:OTHER_AGENT`), silently erasing the human-actionable failure
  * signal from a prior run on a different agent. Other agents' labels
  * aren't this dispatch's concern.
+ *
+ * **Family dispatch accounting** (when `family` is passed — pollLoop
+ * always does): every dispatch of any family member increments ONE
+ * counter on the family ROOT, so the tally survives children closing
+ * and needs no descendant walk. The increment is a marker comment
+ * (`FAMILY_DISPATCH_COMMENT_MARKER` — comments are durable; labels can
+ * fail to write silently, the transient-retry lesson) plus a rewrite of
+ * the `family-dispatches:N` convenience label from the running tally
+ * `runFamilyBreaker` fetched this cycle. The label only bumps after the
+ * marker actually posts, so it never runs ahead of the comments it
+ * mirrors. Both labels auto-create on first use (`addLabel`'s REST
+ * endpoint creates unknown labels, same as `rework-count:N`). A failed
+ * marker post is logged and skipped — a missed increment is acceptable,
+ * a crashed cycle is not.
  */
 export async function runPreDispatchPrep(
   candidates: ReadonlyArray<{ agent: AgentConfig; item: ProjectItem }>,
   client: DispatchClient,
+  family?: {
+    /** Per-root tallies from `runFamilyBreaker`'s cycle fetch; advanced
+     *  in place as markers post so same-cycle siblings number correctly. */
+    tallies: Map<number, number>;
+    /** Board-wide label lookup for sweeping stale counters off the root. */
+    rootLabelsByIssue?: ReadonlyMap<number, readonly string[]>;
+  },
 ): Promise<void> {
   for (const { agent, item } of candidates) {
     const wipLabel = `wip:${agent.name}`;
@@ -3467,6 +3636,45 @@ export async function runPreDispatchPrep(
       await client.addLabel(item.issueNumber, wipLabel);
       console.log(`   🏷️  Added ${wipLabel} to #${item.issueNumber}`);
     } catch {}
+
+    if (family) {
+      const root = resolveFamilyRoot(item);
+      const prior = family.tallies.get(root) ?? 0;
+      const next = prior + 1;
+      try {
+        await client.addComment(
+          root,
+          `${FAMILY_DISPATCH_COMMENT_MARKER}\n` +
+          `🧮 Family dispatch ${next}: **${agent.name}** on #${item.issueNumber} (family root #${root}).`,
+        );
+        family.tallies.set(root, next);
+        // Rewrite the convenience label from the comment-derived tally.
+        // Sweep every stale counter we can see — the snapshot's plus the
+        // one this cycle's previous sibling wrote — so duplicates never
+        // accumulate. All best-effort: the comments are the truth.
+        const knownRootLabels =
+          family.rootLabelsByIssue?.get(root) ??
+          (root === item.issueNumber ? item.labels : []);
+        const stale = new Set(
+          knownRootLabels.filter((l) => l.startsWith(FAMILY_DISPATCH_COUNT_PREFIX)),
+        );
+        if (prior > 0) stale.add(`${FAMILY_DISPATCH_COUNT_PREFIX}${prior}`);
+        stale.delete(`${FAMILY_DISPATCH_COUNT_PREFIX}${next}`);
+        for (const label of stale) {
+          try { await client.removeLabel(root, label); } catch {}
+        }
+        try {
+          await client.addLabel(root, `${FAMILY_DISPATCH_COUNT_PREFIX}${next}`);
+        } catch (e) {
+          console.warn(`   ⚠️  Failed to set ${FAMILY_DISPATCH_COUNT_PREFIX}${next} on root #${root} (comments remain the tally): ${e}`);
+        }
+      } catch (e) {
+        console.warn(
+          `   ⚠️  Failed to post family-dispatch marker on root #${root} for ` +
+          `${agent.name}#${item.issueNumber} (missed increment, continuing): ${e}`,
+        );
+      }
+    }
   }
 }
 
@@ -4161,6 +4369,7 @@ export async function pollLoop(): Promise<void> {
     return Number.isFinite(n) && n > 0 ? n : 2;
   })();
   console.log(`   Concurrency cap: ${MAX_CONCURRENT} (PYRY_MAX_CONCURRENT)`);
+  console.log(`   Family breaker: ${FAMILY_DISPATCH_LIMIT} dispatches per ticket family (PYRY_FAMILY_DISPATCH_LIMIT)`);
 
   // Real-claude gate execution. Null when PYRY_REAL_CLAUDE_GATE_CMD is unset,
   // which makes the whole step a no-op and leaves gated tickets parked for an
@@ -4338,7 +4547,28 @@ export async function pollLoop(): Promise<void> {
     // restart-safe (a mid-wait restart resumes, doesn't reset).
     await holdBackoffWaiters(itemsByColumn, client);
 
-    const candidates = selectDispatches({ itemsByColumn, pollOrder, maxConcurrent: MAX_CONCURRENT });
+    // Family circuit breaker inputs: a board-wide issue → labels lookup so a
+    // parked family ROOT vetoes its descendants at selection. Built from the
+    // same cached snapshot (no extra GraphQL); a split family's root usually
+    // sits CLOSED in Done, which only getAllProjectItems can see. Best-effort:
+    // without the lookup, selection behaves as before and the veto is left to
+    // runFamilyBreaker's tally check.
+    let rootLabelsByIssue: ReadonlyMap<number, readonly string[]> | undefined;
+    try {
+      rootLabelsByIssue = new Map(
+        (await client.getAllProjectItems()).map((i) => [i.issueNumber, i.labels] as const),
+      );
+    } catch (e: any) {
+      console.warn(`   ⚠️  Board-wide label lookup failed (family veto degraded this cycle): ${e?.message ?? e}`);
+    }
+
+    const selected = selectDispatches({ itemsByColumn, pollOrder, maxConcurrent: MAX_CONCURRENT, rootLabelsByIssue });
+
+    // Family circuit breaker: between selection and prep, before any
+    // wip:<agent> write or worktree creation. Drops candidates whose family
+    // has consumed its dispatch budget and parks the family root. See
+    // runFamilyBreaker for the full mechanism.
+    const { kept: candidates, tallies: familyTallies } = await runFamilyBreaker(selected, client, { rootLabelsByIssue });
     dispatched = candidates.length > 0;
 
     // Edge-triggered "board drained" ping: fire once when the board goes from
@@ -4357,7 +4587,7 @@ export async function pollLoop(): Promise<void> {
     // Pre-dispatch mutations + concurrent dispatch — both extracted to
     // testable helpers below pollLoop. See `runPreDispatchPrep` and
     // `runConcurrentDispatches` for invariants.
-    await runPreDispatchPrep(candidates, client);
+    await runPreDispatchPrep(candidates, client, { tallies: familyTallies, rootLabelsByIssue });
     await runConcurrentDispatches(candidates, client);
 
     // Drop the snapshot the agents just invalidated.
