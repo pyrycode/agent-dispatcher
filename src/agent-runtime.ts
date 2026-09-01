@@ -346,6 +346,224 @@ export function parseSalvageGates(envValue: string | undefined): string[] {
     .filter((s) => s.length > 0);
 }
 
+// --------- Same-dispatch resume-in-place (continuation legs) ---------
+//
+// When a run exhausts its turn budget or wall clock, the dispatcher can
+// resume the SAME claude session with a fresh budget — same dispatch,
+// same worktree — before falling back to salvage. Most budget
+// exhaustions are "ran out mid-task", not "stuck", so one continuation
+// leg converts most human interruptions into automatic completions.
+// The pure pieces live here; dispatch.ts does the spawn.
+
+/**
+ * Stream-loop reducer: capture the session id from the FIRST event that
+ * carries one. Spike-proven on claude CLI 2.1.239 (2026-08-31): every
+ * stream-json event carries `session_id` and the `system/init` frame
+ * arrives within seconds of spawn, while a run killed by SIGTERM/SIGKILL
+ * emits NO result frame at all — so capturing at init time is the only
+ * reliable way to keep the id on the kill paths. First carrier wins;
+ * later events never overwrite (same session anyway — this just keeps
+ * the reducer deterministic).
+ */
+export function captureSessionId(current: string, msg: Record<string, unknown>): string {
+  if (current) return current;
+  const sid = msg.session_id;
+  return typeof sid === "string" && sid.length > 0 ? sid : current;
+}
+
+/**
+ * Final session id for a StreamResult: the result frame's value wins
+ * when present (it is claude's authoritative self-report); the
+ * init-captured value fills in when no result frame ever arrived
+ * (timeout/kill paths, denial force-exit).
+ */
+export function pickFinalSessionId(resultSessionId: unknown, initSessionId: string): string {
+  return typeof resultSessionId === "string" && resultSessionId.length > 0
+    ? resultSessionId
+    : initSessionId;
+}
+
+/**
+ * Parse the `PYRY_RESUME_LEGS` env var: how many continuation legs a
+ * budget-exhausted run may get before salvage.
+ *
+ * - **Unset / empty**: 1 — the pilot default. One fresh budget catches
+ *   the common "ran out mid-task" shape without letting a genuinely
+ *   stuck run burn budgets forever.
+ * - **0**: feature disabled — dispatch behaviour is byte-identical to
+ *   the pre-resume dispatcher (proven by tests).
+ * - **N > 0**: up to N continuation legs.
+ * - **Negative**: treated as 0 (a below-zero budget reads as "off").
+ * - **Garbage / NaN**: falls back to the default of 1 — a typo in the
+ *   knob should not silently disable the safety net.
+ */
+export function parseResumeLegs(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return 1;
+  const n = Number.parseInt(raw, 10);
+  if (Number.isNaN(n)) return 1;
+  return n < 0 ? 0 : n;
+}
+
+/**
+ * True when the dispatcher should resume the exhausted run in place —
+ * spawn a continuation leg of the SAME claude session with a fresh
+ * budget — instead of going straight to the salvage paths.
+ *
+ * **All five gates must pass:**
+ * 1. The run ended by budget exhaustion: `terminalReason === "max_turns"`
+ *    (turn budget) or `timedOut` (the dispatcher's own wall-clock
+ *    SIGTERM — authoritative, since a killed run's terminal reason is
+ *    empty; see `shouldAttemptSafeSalvage` gate 1).
+ * 2. A session id was captured. `--resume` needs it; without one there
+ *    is nothing to resume into (the init-frame capture makes this
+ *    nearly always available — see `captureSessionId`).
+ * 3. The run executed in a worktree. The continuation leg re-enters the
+ *    same cwd; a non-worktree agent (PO) mutates external state where
+ *    "continue where you left off" has no branch to anchor to.
+ * 4. Legs remain: `legsUsed < maxLegs` (`PYRY_RESUME_LEGS`, default 1;
+ *    0 disables the feature entirely).
+ * 5. NOT a permission denial. A denial is a policy stop, not a budget
+ *    stop — resuming would re-attempt the denied operation with a
+ *    fresh budget. Denials keep their existing salvage path.
+ *
+ * Pure decision; `maybeResumeExhaustedRun` in dispatch.ts does the
+ * spawn, logging, and outcome merging.
+ */
+export function shouldAttemptResume(opts: {
+  terminalReason: string;
+  /** True when the dispatcher itself killed the agent at its wall-clock
+   *  budget. See `shouldAttemptSafeSalvage` for why this flag, not the
+   *  terminal reason, is the timeout signal. */
+  timedOut: boolean;
+  sessionId: string;
+  usedWorktree: boolean;
+  hadPermissionDenial: boolean;
+  /** Continuation legs already consumed in this dispatch (0 before the
+   *  first resume). */
+  legsUsed: number;
+  /** From `parseResumeLegs(process.env.PYRY_RESUME_LEGS)`. */
+  maxLegs: number;
+}): boolean {
+  if (opts.terminalReason !== "max_turns" && !opts.timedOut) return false;
+  if (!opts.sessionId) return false;
+  if (!opts.usedWorktree) return false;
+  if (opts.legsUsed >= opts.maxLegs) return false;
+  if (opts.hadPermissionDenial) return false;
+  return true;
+}
+
+/**
+ * Argv for a continuation leg.
+ *
+ * **Pilot bridge: always the `claude` binary, regardless of
+ * PYRY_USE_LEGACY_CLAUDE.** The `pyry agent-run` wrapper (the default
+ * spawn since the 2026-05-14 Phase C cutover) has no resume support
+ * yet, so the resume leg goes through the claude CLI directly until it
+ * does. The properties the wrapper exists for still hold here: argv-only
+ * (no shell), prompt piped on stdin, stream-json on stdout.
+ *
+ * Spike-proven (claude CLI 2.1.239): permissions and flags do NOT carry
+ * over on `--resume`, so every flag is re-passed — model, effort,
+ * max-turns (per-invocation, hence the fresh budget), allowedTools,
+ * disallowedTools, and the system-prompt file. `--verbose` is required
+ * with stream-json.
+ */
+export function buildResumeArgv(opts: {
+  sessionId: string;
+  model: string;
+  effort: string;
+  maxTurns: number;
+  allowedTools: string;
+  disallowedTools: string;
+  systemPromptFile: string;
+}): { bin: "claude"; args: string[] } {
+  return {
+    bin: "claude",
+    args: [
+      "-p",
+      "--verbose",
+      "--output-format", "stream-json",
+      "--resume", opts.sessionId,
+      "--model", opts.model,
+      "--effort", opts.effort,
+      "--max-turns", String(opts.maxTurns),
+      "--allowedTools", opts.allowedTools,
+      ...(opts.disallowedTools ? ["--disallowedTools", opts.disallowedTools] : []),
+      "--append-system-prompt-file", opts.systemPromptFile,
+    ],
+  };
+}
+
+/**
+ * Continuation prompt piped on the resume leg's stdin. The resumed
+ * session has its full history (including partial tool calls from a
+ * killed run), so the prompt only needs to orient: which budget ran
+ * out, that the worktree/branch survived, and what "finish" means.
+ */
+export function buildResumePrompt(reason: "max_turns" | "timeout"): string {
+  const budget = reason === "max_turns"
+    ? "its turn budget (max turns)"
+    : "its wall-clock time limit";
+  return [
+    `Your previous run hit ${budget} mid-task and was stopped. This is a continuation of the same session with a fresh budget.`,
+    "",
+    "The worktree and branch are intact — every file edit and commit you made is still there. Check `git status` and `git log` to see exactly where you stopped, then continue without redoing completed work.",
+    "",
+    "Finish the remaining work. Run the gates, and when they pass, commit and push.",
+    "",
+  ].join("\n");
+}
+
+/**
+ * Merge a continuation leg's StreamResult into the run-so-far view, for
+ * the USAGE log line and the downstream success path.
+ *
+ * - **Terminal fields** (output, error state, terminal reason, raw
+ *   result, denial state, timedOut) come from the LAST leg — it
+ *   describes how the run actually ended.
+ * - **Turns, cost, duration sum** across legs, so the USAGE line
+ *   reports what the whole dispatch consumed and the wall clock spans
+ *   all legs.
+ * - **Token counters** the USAGE line reads (input/output/cache read/
+ *   cache creation) sum when either side has them; other usage keys
+ *   keep the last leg's value.
+ * - **Session id**: the last leg's, falling back to the first's (same
+ *   session either way — `--resume` continues it, not forks it).
+ *
+ * Generic over the concrete StreamResult shape (defined in dispatch.ts)
+ * to keep this module import-cycle-free.
+ */
+export function mergeLegResults<T extends {
+  sessionId: string;
+  numTurns: number;
+  totalCostUsd: number;
+  durationMs: number;
+  usage: Record<string, unknown>;
+}>(first: T, leg: T): T {
+  const TOKEN_KEYS = [
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+  ] as const;
+  const usage: Record<string, unknown> = { ...first.usage, ...leg.usage };
+  for (const key of TOKEN_KEYS) {
+    const a = first.usage[key];
+    const b = leg.usage[key];
+    if (typeof a === "number" || typeof b === "number") {
+      usage[key] = (typeof a === "number" ? a : 0) + (typeof b === "number" ? b : 0);
+    }
+  }
+  return {
+    ...leg,
+    sessionId: leg.sessionId || first.sessionId,
+    numTurns: first.numTurns + leg.numTurns,
+    totalCostUsd: first.totalCostUsd + leg.totalCostUsd,
+    durationMs: first.durationMs + leg.durationMs,
+    usage,
+  };
+}
+
 /**
  * Parse the output of `gh pr list --head <branch> --state open --json
  * number,isDraft` and return the number of the first NON-DRAFT (ready)
