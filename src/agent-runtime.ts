@@ -80,6 +80,11 @@ export function shouldUseWorktree(agent: AgentConfig): boolean {
  * 2026-05-19 doc/PR-body trim accounts for the rest of the headroom.
  */
 export function maxTurnsFor(agent: AgentConfig): number {
+  // Config-carried override first: stage-set agents (stage-sets.ts) whose
+  // budgets don't map onto the classic names declare them inline (the
+  // builder set's builder=200 / verifier=150). No classic agent sets the
+  // field, so classic budgets below are untouched.
+  if (agent.maxTurns !== undefined) return agent.maxTurns;
   if (agent.name === "code-review") return 150;
   // QA: hot path (run gates → green → exit) is 5-10 turns; cold path
   // (red → baseline-comparison routing → triage comment + needs-rework
@@ -116,6 +121,10 @@ export function maxTurnsFor(agent: AgentConfig): number {
  * scope can omit it (defaults to none → base tiers only).
  */
 export function timeoutFor(agent: AgentConfig, labels: string[] = []): number {
+  // Config-carried override first (flat — the label-conditional bump below
+  // applies only to the name-keyed path). Used by the builder stage set's
+  // builder + verifier (both 40min); no classic agent sets the field.
+  if (agent.timeoutMs !== undefined) return agent.timeoutMs;
   if (agent.name === "code-review") return 2_400_000;
   if (agent.name === "architect" && labels.includes("security-sensitive")) {
     return 2_400_000;
@@ -344,6 +353,25 @@ export function parseSalvageGates(envValue: string | undefined): string[] {
     .split(";")
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
+}
+
+/**
+ * Parse the `PYRY_VERIFIER_GATES` env var — the deterministic gate
+ * commands the dispatcher itself runs in the ticket's worktree before
+ * spawning the builder stage set's verifier agent (see
+ * `maybeRunPreSpawnGates` in dispatch.ts). Classic stage set: never read.
+ *
+ * Deliberately the exact same parsing contract as `SALVAGE_GATES`
+ * (delegates to `parseSalvageGates`):
+ * - **Unset**: the Go pair `go vet ./...` + `go build ./...`.
+ * - **Empty string**: zero gates — the pre-verifier gate step is skipped
+ *   entirely (consumer opted out).
+ * - **Set**: `;`-delimited shell commands, trimmed, empties dropped. A
+ *   fork's `.env` sets the full list, e.g.
+ *   `PYRY_VERIFIER_GATES="make check;make build"`.
+ */
+export function parseVerifierGates(envValue: string | undefined): string[] {
+  return parseSalvageGates(envValue);
 }
 
 // --------- Same-dispatch resume-in-place (continuation legs) ---------
