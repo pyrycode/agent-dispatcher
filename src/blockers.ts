@@ -104,21 +104,22 @@ export function parseCommitsAhead(revListOutput: string): number {
  * architect run — see Lessons.md "Empty-branch guard false-positives
  * on legitimate `needs-rework` bails (2026-05-10 morning)".
  *
- * Returns false on any `needs-human:*` label for the same reason, with
- * a different destination. `needs-rework:*` hands the ticket to another
- * agent and `runReworkRouting` moves it; `needs-human:*` hands it to a
- * person and nothing moves it until they decide. Both are documented
- * stop-without-committing paths in the agent prompts, so both produce
- * an empty branch by design. The architect and PO prompts prescribe
- * `needs-human:sizing` when a ticket is over its size boundary and the
- * split-depth gate ("stop at two") forbids proposing a split.
+ * `needs-human:*` is deliberately NOT exempt, and the distinction is
+ * the destination. `needs-rework:*` hands the ticket to another agent
+ * and `runReworkRouting` moves it, so the empty branch is a handoff.
+ * `needs-human:sizing` is only a marker: since 2026-09-01 the architect
+ * and PO prompts tell the agent that when the split-depth gate ("stop
+ * at two") forbids a split it should record the split it would have
+ * made, apply the label so the judgement is findable, and then do its
+ * normal job. An empty branch under those prompts means the agent
+ * stopped when it was told to continue, which is precisely what this
+ * guard is for. Exempting it would put `done:architect` on a ticket
+ * with no spec and dispatch a developer against it.
  *
- * Surfaced 2026-09-01 on `pyrycode#1938` — the first ticket in the
- * pipeline's history to take that path, which is why the gap between
- * the prompts and the dispatcher sat unnoticed. `GLOBAL_BLOCK_LABELS`
- * carries the other half of this fix: it parks the bailed ticket, which
- * is what stops it being re-dispatched into the same bail now that this
- * guard no longer parks it by accident under an `error:<agent>` label.
+ * That label was briefly exempt here, and briefly a `GLOBAL_BLOCK_LABELS`
+ * entry, when hitting the gate meant stopping for a person. Both were
+ * reverted the same day with the prompt change. History and the
+ * reasoning: `pyrycode#1938`.
  *
  * See `shouldProduceCommits` for the per-agent classification and the
  * relay #5 incident that motivated this guard.
@@ -134,9 +135,5 @@ export function shouldFlagEmptyBranch(
   // Legitimate bail: agent added a needs-rework:* label deliberately.
   // Empty branch is expected; rework routing handles the next step.
   if (postLabels.some(l => l.startsWith("needs-rework:"))) return false;
-  // Legitimate bail: agent handed the ticket to a human deliberately.
-  // Same shape as needs-rework:*, different destination — no agent
-  // picks this up, so there is no routing step, just a parked ticket.
-  if (postLabels.some(l => l.startsWith("needs-human:"))) return false;
   return true;
 }

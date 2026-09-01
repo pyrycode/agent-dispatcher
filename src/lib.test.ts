@@ -346,37 +346,39 @@ describe("shouldSkipDispatch", () => {
     }
   });
 
-  test("needs-human:sizing blocks ALL agents until the human decides the split", () => {
-    // The sizing label means "an agent hit the split-depth gate and
-    // stopped; a human decides whether this ships as one ticket or as
-    // the split the agent described." Without a global block the ticket
-    // keeps its column and no per-agent label, so the next cycle
-    // re-dispatches the same agent, which re-derives the same
-    // measurement and bails again. pyrycode#1938's architect run cost
-    // $2.88 and 314s; that is the price of each lap.
+  test("needs-human:sizing does NOT block dispatch — it is a marker, not a gate", () => {
+    // Design change, same day it was introduced. The label was briefly a
+    // global block, on the reading that an agent hitting the split-depth
+    // gate stops and waits for a person to choose between one ticket and
+    // the split it described.
     //
-    // Until now the loop was only prevented by accident: the
-    // empty-branch guard's false-positive `error:architect` happened to
-    // park the ticket. Removing that false positive without adding this
-    // block would turn a mislabeled ticket into a spending loop.
+    // The operator's call after seeing it fire on pyrycode#1938: once
+    // splitting is off the table there is no "do not build this"
+    // outcome, so the wait only buys a delay and a second run at the
+    // same measurement. The agent now records the split it would have
+    // made, applies this label so the judgement is findable on the
+    // board, and carries on. The prompts changed with this commit.
+    //
+    // The label therefore MUST NOT block. It survives on the ticket
+    // after the agent commits its spec, so a block here would stall the
+    // developer on the very ticket the agent just unblocked.
     for (const agent of AGENTS) {
       assert.equal(
         shouldSkipDispatch(["needs-human:sizing"], agent.name),
-        true,
-        `needs-human:sizing should block dispatch for ${agent.name}`,
+        false,
+        `needs-human:sizing must not block dispatch for ${agent.name}`,
       );
     }
   });
 
-  test("needs-human:sizing combines with the labels a real bail carries", () => {
-    // #1938's actual set at the moment of the bail, minus the
-    // false-positive error label this fix removes.
+  test("needs-human:sizing alongside a real ticket's labels still does not block", () => {
+    // #1938's actual set at the moment the gate fired.
     assert.equal(
       shouldSkipDispatch(
         ["enhancement", "size:s", "done:po", "security-sensitive", "needs-real-claude", "needs-human:sizing"],
         "architect",
       ),
-      true,
+      false,
     );
   });
 });
@@ -3451,34 +3453,34 @@ describe("shouldFlagEmptyBranch", () => {
     assert.equal(shouldFlagEmptyBranch(arch, 0, ["needs-rework:architect"]), false);
   });
 
-  test("architect + 0 commits + needs-human:sizing → false (legitimate bail)", () => {
-    // Surfaced on pyrycode#1938 (2026-09-01), the first ticket ever to
-    // take this path. Both the architect and PO prompts tell the agent
-    // that when a ticket is over its size boundary AND already a
-    // grandchild, the split-depth gate forbids proposing a split: add
-    // `needs-human:sizing`, comment with the split it would have made,
-    // and stop without writing a spec. The architect did exactly that,
-    // exited success at 36 turns, and got `error:architect` anyway
-    // because `feature/1938` was 0 ahead of main.
+  test("architect + 0 commits + needs-human:sizing → TRUE (a stop is now a deviation)", () => {
+    // The mirror of the dispatch-block test above, and it flips for the
+    // same reason. `needs-human:sizing` was briefly exempted here, when
+    // hitting the split-depth gate meant stopping without a spec and an
+    // empty branch was the expected outcome.
     //
-    // Same class as the relay#26 `needs-rework:po` false positive
-    // above: an empty branch is the EXPECTED outcome of a documented
-    // bail, and the escape hatch existed in the prompts while the
-    // dispatcher had never been taught the label.
+    // Under the prompts shipped with this commit the agent no longer
+    // stops. It records the split it would have made, applies the label
+    // as a marker, and writes the spec. So an empty branch carrying this
+    // label means the agent stopped when its prompt told it to continue,
+    // and that is exactly what the guard exists to catch. Exempting it
+    // would hand the developer a ticket with no spec under a
+    // `done:architect` label.
+    //
+    // Contrast `needs-rework:*` below, which stays exempt: that one
+    // still means "handed to another agent", and `runReworkRouting`
+    // moves the ticket rather than advancing it.
     const arch = AGENTS.find(a => a.name === "architect")!;
-    assert.equal(shouldFlagEmptyBranch(arch, 0, ["needs-human:sizing"]), false);
+    assert.equal(shouldFlagEmptyBranch(arch, 0, ["needs-human:sizing"]), true);
   });
 
-  test("architect + 0 commits + needs-human:sizing alongside done:po → false", () => {
-    // #1938's actual post-run label set: PO had already run and the
-    // dispatcher had added `done:po`, so the suppression has to survive
-    // a stale prior-agent label sitting next to it. The `done:po`-only
-    // test above proves the reverse — that label alone does NOT
-    // suppress.
+  test("architect + 0 commits + needs-human:sizing alongside done:po → true", () => {
+    // #1938's actual post-run label set. No label in it suppresses the
+    // guard, and none should: the run produced no spec.
     const arch = AGENTS.find(a => a.name === "architect")!;
     assert.equal(
       shouldFlagEmptyBranch(arch, 0, ["enhancement", "size:s", "done:po", "needs-human:sizing"]),
-      false,
+      true,
     );
   });
 });

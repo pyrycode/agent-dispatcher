@@ -1117,26 +1117,21 @@ export function isPipelineLabelForAgent(label: string, agentName: string): boole
  *   the label to resume. Mirrors `error:max_turns_salvaged` shape: preserve
  *   work, force human attention, stop the loop. Detection uses
  *   `isMergeConflictError` on the gh CLI's stderr.
- * - `needs-human:sizing` — an agent measured the ticket over its size
- *   boundary but the split-depth gate ("stop at two", i.e. the ticket is
- *   already a grandchild) forbids it proposing a split. Both the
- *   architect and PO prompts tell the agent to apply this label, comment
- *   with the split it would have made, and stop. Nothing else routes it:
- *   `decideReworkRoutes` only reads `needs-rework:*`, so the ticket keeps
- *   its column and carries no per-agent label, and the next cycle would
- *   re-dispatch the same agent to re-derive the same measurement and bail
- *   again. pyrycode#1938's architect lap cost $2.88 over 314s.
  *
- *   Unlike the two error labels this is not a failure — the agent did the
- *   right thing. The block is here because the semantics are identical
- *   from the dispatcher's side: work is preserved, a human must look, and
- *   the loop must stop. The human resolves it by deciding the size and
- *   stripping the label, per the prompts' own instructions.
+ * `needs-human:sizing` is deliberately NOT a member, though it was one
+ * for a few hours on 2026-09-01. It marks a ticket where an agent
+ * measured past its size boundary but the split-depth gate forbade a
+ * split. When that meant "stop and wait for a person" the block was
+ * needed, or the next cycle re-dispatched the same agent to re-derive
+ * the same measurement. The prompts changed the same day: the agent now
+ * records the split it would have made, applies the label so the call is
+ * findable on the board, and does its normal job. The label therefore
+ * outlives the run that set it, and blocking on it would stall the
+ * developer on a ticket the architect had already specced.
  */
 export const GLOBAL_BLOCK_LABELS: ReadonlySet<string> = new Set([
   "error:max_turns_salvaged",
   "error:merge-conflict",
-  "needs-human:sizing",
 ]);
 
 /**

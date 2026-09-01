@@ -1824,23 +1824,17 @@ describe("handlePostRun — failure modes", () => {
     // postLabels has needs-rework:po — that's tested in lib.test.ts.)
   });
 
-  test("empty branch + architect added needs-human:sizing → guard skipped (legitimate bail, no false-positive error:architect)", async () => {
-    // Surfaced on `pyrycode#1938` (2026-09-01). The architect measured
-    // the ticket over its `size:s` boundary, confirmed via the GraphQL
-    // `parent` field that it was a grandchild, and so hit the
-    // split-depth gate that forbids it proposing a split. Per its own
-    // prompt it applied `needs-human:sizing`, commented with the split
-    // it would have made, and stopped without writing a spec — exiting
-    // success at 36 turns. It got `error:architect` anyway, with a
-    // comment accusing it of having "silently refused or pattern-matched
-    // its way out of the work."
+  test("empty branch + architect added needs-human:sizing → error:architect (a stop is now a deviation)", async () => {
+    // The end-to-end mirror of the unit test in lib.test.ts. When the
+    // split-depth gate meant "stop and wait for a person", an empty
+    // branch here was expected and the guard was suppressed. The
+    // prompts shipped alongside this commit tell the agent to record the
+    // split it would have made, apply the label as a marker and write
+    // the spec anyway, so an empty branch now means it stopped when it
+    // was told to continue.
     //
-    // Same class as the relay#26 case above, and the first ticket in
-    // the pipeline's history to take this path — which is why the gap
-    // between the prompts and the dispatcher went unnoticed. The other
-    // half of the fix is `GLOBAL_BLOCK_LABELS`: without it, dropping
-    // the false-positive error label would let the next cycle
-    // re-dispatch the architect into the identical bail.
+    // That has to reach a human. The alternative is `done:architect` on
+    // a ticket with no spec, and a developer dispatched against it.
     const client = new MockGitHubClient({
       status: { 1938: "In Architecture" },
       labels: { 1938: ["size:s", "done:po", "needs-human:sizing"] },
@@ -1852,18 +1846,18 @@ describe("handlePostRun — failure modes", () => {
       mockOptions: {
         execImpls: {
           "git status --porcelain": () => "",
-          "git rev-list --count main..": () => "0\n",  // architect wrote no spec, by design
+          "git rev-list --count main..": () => "0\n",  // no spec written
         },
       },
     });
 
     const result = await handlePostRun(STREAM_OK(), ctx, false);
 
-    assert.deepEqual(result, { ok: true }, "architect bail must not propagate as ok:false");
-    assert.ok(!client.addLabelCalls.some(c => c.label === "error:architect"),
-      "needs-human:sizing + 0 commits is a legitimate bail; must NOT add error:architect");
-    assert.ok(!client.comments.some(c => c.body.includes("produced no commits")),
-      "empty-branch error comment must not be posted on legitimate bail");
+    assert.deepEqual(result, { ok: false }, "a specless architect run must not report success");
+    assert.ok(client.addLabelCalls.some(c => c.label === "error:architect"),
+      "an empty branch under the continue-by-default prompts is a deviation and must be flagged");
+    assert.ok(client.comments.some(c => c.body.includes("produced no commits")),
+      "the empty-branch diagnostic comment must be posted");
   });
 
   test("empty branch + agent-doesn't-produce-commits (code-review) → guard skipped via shouldFlagEmptyBranch", async () => {
