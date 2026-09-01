@@ -499,6 +499,8 @@ export function makeProjectItem(overrides: Partial<ProjectItem> = {}): ProjectIt
     labels: overrides.labels ?? [],
     url: overrides.url ?? "https://github.com/test/repo/issues/100",
     blockedBy,
+    parentNumber: overrides.parentNumber ?? null,
+    grandparentNumber: overrides.grandparentNumber ?? null,
   };
 }
 

@@ -105,6 +105,8 @@ function makeItem(overrides: Partial<ProjectItem>): ProjectItem {
     labels: overrides.labels ?? [],
     url: overrides.url ?? "https://example.com",
     blockedBy: overrides.blockedBy ?? [],
+    parentNumber: overrides.parentNumber ?? null,
+    grandparentNumber: overrides.grandparentNumber ?? null,
   };
 }
 

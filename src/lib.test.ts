@@ -74,6 +74,7 @@ import {
   shouldSkipDispatch,
 } from "./pipeline-decisions.js";
 import { buildBaselineCommand, buildBaselineFilter, formatGateEvidenceComment, parseGateOutput, stripPackageQualifier } from "./gate-output.js";
+import { mapParentChain } from "./github.js";
 import {
   decideBranchSetup,
   decideCodegraphSymlink,
@@ -4634,5 +4635,46 @@ describe("buildBaselineCommand", () => {
     // Substituting nothing would silently re-run the whole suite against
     // the base, turning a seconds-long check into a second full run.
     assert.equal(buildBaselineCommand("go test ./...", "'^(TestA)$'"), null);
+  });
+});
+
+// =====================================================================
+// Family circuit breaker — parent-chain mapping (github.ts)
+// =====================================================================
+
+describe("mapParentChain — GraphQL parent chain → ProjectItem fields", () => {
+  test("maps a two-level chain: parent and grandparent numbers both surface", () => {
+    const mapped = mapParentChain({
+      parent: { number: 40, parent: { number: 12 } },
+    });
+    assert.deepEqual(mapped, { parentNumber: 40, grandparentNumber: 12 });
+  });
+
+  test("maps a single-level chain: parent surfaces, grandparent is null", () => {
+    const mapped = mapParentChain({
+      parent: { number: 40, parent: null },
+    });
+    assert.deepEqual(mapped, { parentNumber: 40, grandparentNumber: null });
+  });
+
+  test("a parentless issue maps to null for both fields", () => {
+    assert.deepEqual(mapParentChain({ parent: null }), { parentNumber: null, grandparentNumber: null });
+  });
+
+  test("a node with no parent key at all maps to null for both fields", () => {
+    // Defensive: GraphQL omits the key when the fragment doesn't match.
+    assert.deepEqual(mapParentChain({}), { parentNumber: null, grandparentNumber: null });
+    assert.deepEqual(mapParentChain(null), { parentNumber: null, grandparentNumber: null });
+    assert.deepEqual(mapParentChain(undefined), { parentNumber: null, grandparentNumber: null });
+  });
+
+  test("a parent node without a usable number is treated as no parent", () => {
+    // A parent that is a PR fragment or an inaccessible issue yields no
+    // number; the chain must not invent one, and a grandparent hanging
+    // off an unresolved parent is unreachable by definition.
+    assert.deepEqual(mapParentChain({ parent: { parent: { number: 3 } } } as any), {
+      parentNumber: null,
+      grandparentNumber: null,
+    });
   });
 });
