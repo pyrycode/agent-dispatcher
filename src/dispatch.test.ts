@@ -47,6 +47,7 @@ import {
   runConcurrentDispatches,
   runDoneCleanup,
   runFamilyBreaker,
+  selectPastParkedFamilies,
   runPreDispatchPrep,
   setupBranchAndWorktree,
   SIGINT_DEBOUNCE_MS,
@@ -5954,6 +5955,181 @@ describe("stage-set threading tripwires (source assertions)", () => {
       source,
       /Stage set: \$\{stageSet\.name\}/,
       "the startup banner must name the active stage set",
+    );
+  });
+});
+
+// =====================================================================
+// selectPastParkedFamilies — the board must not starve behind a parked
+// family
+// =====================================================================
+//
+// Regression cover for the 2026-09-01 stall on board #1. The breaker can
+// only drop candidates; selection spends the whole concurrency budget
+// before the drop happens. At concurrency 1 with three parked
+// descendants of #1906 at the head of Backlog, every cycle handed its
+// only slot to a ticket it then threw away, and 48 unrelated tickets
+// never got looked at.
+
+describe("selectPastParkedFamilies — a parked family must not starve the board", () => {
+  const PO = AGENTS.find(a => a.name === "po")!;
+  const child = (n: number, root: number) =>
+    makeProjectItem({ issueNumber: n, status: "Backlog", parentNumber: root });
+  const loner = (n: number) => makeProjectItem({ issueNumber: n, status: "Backlog" });
+
+  test("at concurrency 1 the slot goes to the next unrelated ticket, not to the void", async () => {
+    const client = new MockGitHubClient();
+    client.familyStateByIssue.set(1906, { markerCount: 24, breakerCommented: false });
+    // Board order is the live one: three parked descendants at the head,
+    // an unrelated ticket behind them.
+    const backlog = [child(1927, 1906), child(1928, 1906), child(1907, 1906), loner(1958)];
+
+    const out = await selectPastParkedFamilies({
+      itemsByColumn: new Map([["Backlog", backlog]]),
+      pollOrder: [PO],
+      maxConcurrent: 1,
+      client,
+      threshold: 24,
+    });
+
+    assert.equal(out.candidates.length, 1, "the cycle must dispatch, not idle");
+    assert.equal(out.candidates[0].item.issueNumber, 1958, "the slot goes to the unrelated ticket");
+  });
+
+  test("one comments fetch and one park write per root, however many passes it takes", async () => {
+    const client = new MockGitHubClient();
+    client.familyStateByIssue.set(1906, { markerCount: 24, breakerCommented: false });
+    const backlog = [child(1927, 1906), child(1928, 1906), child(1907, 1906), loner(1958)];
+
+    await selectPastParkedFamilies({
+      itemsByColumn: new Map([["Backlog", backlog]]),
+      pollOrder: [PO],
+      maxConcurrent: 1,
+      client,
+      threshold: 24,
+    });
+
+    assert.deepEqual(
+      client.getFamilyDispatchStateCalls.filter(n => n === 1906).length,
+      1,
+      "the shared cycle state means a re-selection pass refetches nothing",
+    );
+    assert.deepEqual(
+      client.addLabelCalls.filter(c => c.label === FAMILY_BREAKER_LABEL),
+      [{ issueNumber: 1906, label: FAMILY_BREAKER_LABEL }],
+      "the root is parked once, not once per pass",
+    );
+    assert.equal(
+      client.comments.filter(c => c.body.includes(FAMILY_BREAKER_COMMENT_MARKER)).length,
+      1,
+      "one trip explanation per cycle",
+    );
+  });
+
+  test("two parked families in a row both get skipped and the third family dispatches", async () => {
+    const client = new MockGitHubClient();
+    client.familyStateByIssue.set(500, { markerCount: 30, breakerCommented: false });
+    client.familyStateByIssue.set(600, { markerCount: 24, breakerCommented: false });
+    const backlog = [child(501, 500), child(601, 600), loner(700)];
+
+    const out = await selectPastParkedFamilies({
+      itemsByColumn: new Map([["Backlog", backlog]]),
+      pollOrder: [PO],
+      maxConcurrent: 1,
+      client,
+      threshold: 24,
+    });
+
+    assert.equal(out.candidates[0]?.item.issueNumber, 700);
+    assert.deepEqual([...out.cycle.vetoedRoots].sort((a, b) => a - b), [500, 600]);
+  });
+
+  test("a healthy board takes exactly one pass — no extra selection, no extra fetch", async () => {
+    const client = new MockGitHubClient();
+    const backlog = [loner(10), loner(11)];
+
+    const out = await selectPastParkedFamilies({
+      itemsByColumn: new Map([["Backlog", backlog]]),
+      pollOrder: [PO],
+      maxConcurrent: 2,
+      client,
+      threshold: 24,
+    });
+
+    assert.deepEqual(out.candidates.map(c => c.item.issueNumber), [10, 11]);
+    assert.equal(out.cycle.vetoedRoots.size, 0);
+  });
+
+  test("a board that is nothing but parked families dispatches nothing and says so", async () => {
+    const client = new MockGitHubClient();
+    client.familyStateByIssue.set(800, { markerCount: 24, breakerCommented: false });
+    const backlog = [child(801, 800), child(802, 800)];
+
+    const out = await selectPastParkedFamilies({
+      itemsByColumn: new Map([["Backlog", backlog]]),
+      pollOrder: [PO],
+      maxConcurrent: 1,
+      client,
+      threshold: 24,
+    });
+
+    assert.deepEqual(out.candidates, [], "nothing dispatchable is the honest answer here");
+    assert.deepEqual([...out.cycle.vetoedRoots], [800]);
+  });
+
+  test("the pass cap bounds the work and still dispatches what it found", async () => {
+    const client = new MockGitHubClient();
+    // Five parked families ahead of the healthy ticket, two passes allowed.
+    for (const root of [10, 20, 30, 40, 50]) {
+      client.familyStateByIssue.set(root, { markerCount: 24, breakerCommented: false });
+    }
+    const backlog = [
+      child(11, 10), child(21, 20), child(31, 30), child(41, 40), child(51, 50), loner(99),
+    ];
+
+    const out = await selectPastParkedFamilies({
+      itemsByColumn: new Map([["Backlog", backlog]]),
+      pollOrder: [PO],
+      maxConcurrent: 1,
+      client,
+      threshold: 24,
+      maxPasses: 2,
+    });
+
+    assert.deepEqual(out.candidates, [], "the cap holds — this cycle gives up rather than walking the board");
+    assert.equal(out.cycle.vetoedRoots.size, 2, "but every family it did examine is parked on the board");
+    // The next cycle starts with those two vetoed at selection for free,
+    // so progress is monotonic even when the cap bites.
+    const next = await selectPastParkedFamilies({
+      itemsByColumn: new Map([["Backlog", backlog]]),
+      pollOrder: [PO],
+      maxConcurrent: 1,
+      rootLabelsByIssue: new Map([[10, [FAMILY_BREAKER_LABEL]], [20, [FAMILY_BREAKER_LABEL]]]),
+      client,
+      threshold: 24,
+      maxPasses: 2,
+    });
+    assert.equal(next.cycle.vetoedRoots.size, 2, "two fresh families examined, not the two already labelled");
+  });
+
+  test("an already-labelled root costs no pass at all — the label veto absorbs it at selection", async () => {
+    const client = new MockGitHubClient();
+    client.familyStateByIssue.set(1906, { markerCount: 24, breakerCommented: true });
+    const backlog = [child(1927, 1906), loner(1958)];
+
+    const out = await selectPastParkedFamilies({
+      itemsByColumn: new Map([["Backlog", backlog]]),
+      pollOrder: [PO],
+      maxConcurrent: 1,
+      rootLabelsByIssue: new Map([[1906, [FAMILY_BREAKER_LABEL]]]),
+      client,
+      threshold: 24,
+    });
+
+    assert.equal(out.candidates[0]?.item.issueNumber, 1958);
+    assert.ok(
+      !client.getFamilyDispatchStateCalls.includes(1906),
+      "the parked root costs no tally fetch — selection never offered its child",
     );
   });
 });

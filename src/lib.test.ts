@@ -72,6 +72,7 @@ import {
   FAMILY_DISPATCH_COMMENT_MARKER,
   FAMILY_DISPATCH_COUNT_PREFIX,
   FAMILY_DISPATCH_LIMIT_DEFAULT,
+  collectOffBoardFamilyRoots,
   FAMILY_DISPATCH_RESET_MARKER,
   tallyFamilyComments,
   resolveFamilyDispatchLimit,
@@ -5367,5 +5368,85 @@ describe("mergeLegResults — cross-leg usage aggregation", () => {
     );
     assert.equal(merged.usage.input_tokens, 1000);
     assert.equal(merged.usage.output_tokens, 700);
+  });
+});
+
+// =====================================================================
+// collectOffBoardFamilyRoots — the family veto must survive a Done sweep
+// =====================================================================
+//
+// The board-wide label lookup only knows issues that are ON the board.
+// Archiving a crowded Done column takes closed family roots off it, and
+// the root's error:family-breaker label then reads as absent. That is
+// how #1906 kept passing the selection veto on 2026-09-01 while its
+// tally vetoed it every cycle. This helper names the roots worth one
+// direct issue read to close that hole.
+
+describe("collectOffBoardFamilyRoots", () => {
+  const item = (n: number, parent: number | null = null, grandparent: number | null = null) =>
+    ({ issueNumber: n, parentNumber: parent, grandparentNumber: grandparent });
+
+  test("a descendant whose root left the board is worth a direct read", () => {
+    const known = new Map<number, readonly string[]>([[1927, []]]);
+    assert.deepEqual([...collectOffBoardFamilyRoots([item(1927, 1906)], known)], [1906]);
+  });
+
+  test("a root still on the board needs no read", () => {
+    const known = new Map<number, readonly string[]>([[1927, []], [1906, [FAMILY_BREAKER_LABEL]]]);
+    assert.deepEqual([...collectOffBoardFamilyRoots([item(1927, 1906)], known)], []);
+  });
+
+  test("a ticket with no parent is its own root — its labels are already in hand", () => {
+    assert.deepEqual([...collectOffBoardFamilyRoots([item(1958)], new Map())], []);
+  });
+
+  test("a grandchild resolves to the grandparent, not the parent", () => {
+    assert.deepEqual([...collectOffBoardFamilyRoots([item(42, 41, 40)], new Map())], [40]);
+  });
+
+  test("siblings of one off-board root collapse to a single read", () => {
+    const siblings = [item(1927, 1906), item(1928, 1906), item(1907, 1906)];
+    assert.deepEqual([...collectOffBoardFamilyRoots(siblings, new Map())], [1906]);
+  });
+
+  test("a board of unsplit tickets costs nothing", () => {
+    const flat = [item(10), item(11), item(12)];
+    assert.equal(collectOffBoardFamilyRoots(flat, new Map()).size, 0);
+  });
+});
+
+describe("selectDispatches — excludedRoots breaks the starvation loop", () => {
+  const POLL_ORDER = [...AGENTS].reverse();
+  const child = (n: number, root: number) =>
+    ({ id: `item-${n}`, issueNumber: n, labels: [], blockedBy: [], parentNumber: root, grandparentNumber: null });
+  const loner = (n: number) =>
+    ({ id: `item-${n}`, issueNumber: n, labels: [], blockedBy: [], parentNumber: null, grandparentNumber: null });
+
+  test("an excluded root's descendants stop consuming the concurrency budget", () => {
+    const r = selectDispatches({
+      itemsByColumn: new Map([["Backlog", [child(1927, 1906), child(1928, 1906), loner(1958)]]]),
+      pollOrder: POLL_ORDER,
+      maxConcurrent: 1,
+      excludedRoots: new Set([1906]),
+    });
+    assert.deepEqual(r.map(c => c.item.issueNumber), [1958]);
+  });
+
+  test("an empty set behaves exactly as no set at all", () => {
+    const items = new Map([["Backlog", [child(1927, 1906), loner(1958)]]]);
+    const withEmpty = selectDispatches({ itemsByColumn: items, pollOrder: POLL_ORDER, maxConcurrent: 1, excludedRoots: new Set() });
+    const without = selectDispatches({ itemsByColumn: items, pollOrder: POLL_ORDER, maxConcurrent: 1 });
+    assert.deepEqual(withEmpty.map(c => c.item.issueNumber), without.map(c => c.item.issueNumber));
+    assert.deepEqual(without.map(c => c.item.issueNumber), [1927]);
+  });
+
+  test("exclusion is by family, not by ticket — a sibling of the excluded ticket is excluded too", () => {
+    const r = selectDispatches({
+      itemsByColumn: new Map([["Backlog", [child(1928, 1906), loner(1958)]]]),
+      pollOrder: POLL_ORDER,
+      maxConcurrent: 2,
+      excludedRoots: new Set([1906]),
+    });
+    assert.deepEqual(r.map(c => c.item.issueNumber), [1958]);
   });
 });
