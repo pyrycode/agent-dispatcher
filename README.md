@@ -30,6 +30,10 @@ When an agent hits `max_turns` mid-dispatch, the dispatcher tries two recovery p
 1. **PR-already-exists** — if the agent opened a non-draft PR before timing out, treat the run as success.
 2. **Safer-salvage** — if the worktree has uncommitted changes that pass `go vet` + `go build` (or the consumer's configured salvage gates), open a draft PR with `error:max_turns_salvaged` and let the next dispatch continue from there.
 
+### Family circuit breaker
+
+Every dispatch of a ticket increments a counter on its family ROOT (the top of its split lineage, resolved via the sub-issue parent chain) — a marker comment as the durable tally, mirrored by a `family-dispatches:N` label. Once a family consumes `PYRY_FAMILY_DISPATCH_LIMIT` dispatches (default 24, about four clean six-stage tickets), the breaker drops the family's candidates each cycle and parks the root under `error:family-breaker`, which vetoes every descendant at selection. Caps the runaway-split failure mode where a lineage keeps splitting and reworking past every per-ticket breaker (one such spiral burned ~213$ overnight across 11 descendants). Parking is silent beyond the board; tickets mid-run finish normally. To resume: remove the label from the root and raise the limit — a tally still at/over the limit re-trips next cycle.
+
 ## Install
 
 Currently consumed via `git submodule` from each agents repo. (Future: npm package once external adopters appear.)
@@ -64,6 +68,7 @@ Optional:
 | `SALVAGE_GATES` | `go vet ./...; go build ./...` | `;`-delimited shell commands that gate the safer-salvage path on `max_turns`. Each runs in the agent's worktree; all must exit 0 for the dispatcher to commit + push uncommitted work as a draft PR. Set to `""` to skip gating entirely. Override per ecosystem (e.g. `cargo check --all-targets; cargo test --no-run` for Rust). |
 | `DISCORD_WEBHOOK_URL` | — | Notify on dispatch start/end |
 | `PYRY_LOG_RETENTION_DAYS` | `30` | Rotate logs older than N days; `0` disables |
+| `PYRY_FAMILY_DISPATCH_LIMIT` | `24` | Family circuit breaker: dispatch budget per ticket family before the whole lineage is parked under `error:family-breaker` on its root. See above. |
 | `OWNER_TYPE` | `user` | `user` or `organization` for GitHub Project owner |
 | `PYRY_REAL_CLAUDE_GATE_CMD` | — | Shell command that runs the fork's live-claude suite. **Empty disables the gate entirely** and gated tickets park for an operator. See below. |
 | `PYRY_REAL_CLAUDE_GATE_FORMAT` | `go-json` | How to read what the command wrote: `go-json` or `playwright-json` |
