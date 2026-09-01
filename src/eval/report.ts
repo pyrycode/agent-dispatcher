@@ -47,6 +47,7 @@ export function parseArgs(argv: string[]): CliArgs {
       if (v === undefined) throw new Error(`${flag} needs a value\n${USAGE}`);
       return v;
     };
+    if (flag === "--") continue;
     if (flag === "--agents-repo") args.agentsRepo = value();
     else if (flag === "--gh-repo") args.ghRepo = value();
     else if (flag === "--cache-dir") args.cacheDir = value();
