@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { config } from "dotenv";
 
 import { GitHubProjectClient } from "./github.js";
-import { AGENTS, type AgentConfig, type ProjectItem } from "./types.js";
+import { type AgentConfig, type ProjectItem } from "./types.js";
 import {
   advancePermissionDenialState,
   buildResumeArgv,
@@ -19,6 +19,7 @@ import {
   shouldAttemptResume,
   timeoutFor,
   parseSalvageGates,
+  parseVerifierGates,
   ResourceExhaustedError,
   retrySpawnOnTransientError,
   scrubSpawnEnv,
@@ -33,6 +34,7 @@ import {
   shouldProduceCommits,
 } from "./blockers.js";
 import { selectDispatches } from "./dispatch-selection.js";
+import { activeStageSet } from "./stage-sets.js";
 import {
   decideDoneCleanup,
   decideMergeRetry,
@@ -936,7 +938,9 @@ async function buildPromptForAgent(
   const ticketNum = item.issueNumber;
 
   // Architecture docs — needed by developer, code-review, documentation.
-  const needsArchDoc = !["po"].includes(agent.name);
+  // The builder set's refiner is the PO contract under a new name, so it
+  // is excluded the same way.
+  const needsArchDoc = !["po", "refiner"].includes(agent.name);
   if (needsArchDoc) {
     try {
       // readdirSync + filter — no shell, no template-string, no `2>/dev/null`
@@ -958,8 +962,9 @@ async function buildPromptForAgent(
   }
 
   // Selective context injection — only give agents the upstream context they need.
-  // Review findings are primarily for the developer (rework).
-  const needsCodeReview = ["developer"].includes(agent.name);
+  // Review findings are primarily for the developer (rework). The builder
+  // set's builder carries the developer contract.
+  const needsCodeReview = ["developer", "builder"].includes(agent.name);
 
   // Check for code review (file-based, overwritten each run)
   if (needsCodeReview) {
@@ -978,7 +983,9 @@ async function buildPromptForAgent(
   // QA posts test results + baseline-comparison findings via PR comments;
   // code-review posts review comments via `gh pr review`. Both need the PR
   // number/URL injected to avoid each agent re-discovering it via `gh pr list`.
-  const needsPr = ["qa", "code-review"].includes(agent.name);
+  // The builder set's verifier carries the code-review contract (reviews
+  // via `gh pr review`), so it needs the same PR injection.
+  const needsPr = ["qa", "code-review", "verifier"].includes(agent.name);
   if (needsPr && ticketNum > 0) {
     try {
       // Query isDraft and prefer non-draft PRs over drafts. Without this,
@@ -1008,8 +1015,9 @@ async function buildPromptForAgent(
     }
   }
 
-  // PO rework: include issue comments so the PO can see upstream splitting guidance
-  if (agent.name === "po" && ticketNum > 0) {
+  // PO rework: include issue comments so the PO can see upstream splitting
+  // guidance. Applies equally to the builder set's refiner (same contract).
+  if (["po", "refiner"].includes(agent.name) && ticketNum > 0) {
     try {
       const commentsJson = execSync(
         `gh issue view ${ticketNum} --json comments --jq '.comments[].body'`,
@@ -1048,7 +1056,7 @@ async function buildPromptForAgent(
   // a "this is a hotfix vs. normal" flag), add it here. Resist the urge
   // to re-add role-level "Your Task" text — that's the system prompt's
   // job.
-  if (agent.name === "po") {
+  if (["po", "refiner"].includes(agent.name)) {
     parts.push(
       ticketNum > 0
         ? "\n## Mode\nrework — existing ticket routed back. Read the previous agent comments above for the rework reason."
@@ -1514,6 +1522,12 @@ export type DispatchDeps = {
   buildPromptForAgent: typeof buildPromptForAgent;
   // Run the memory-index curation runner inline for this fork and await it.
   curateMemoryIndex: (opts: { agentsRepoRoot: string }) => Promise<{ ok: boolean }>;
+  /** Pre-verifier deterministic gates (builder stage set). Same seam as
+   *  the real-claude gate's `GateRunnerDeps.spawnGate` — async so a
+   *  10-minute gate never blocks the event loop the way execSync would,
+   *  which matters because sibling dispatch streams and their watchdogs
+   *  run on the same loop. */
+  spawnGate: GateSpawner;
 };
 
 // Default curation runner: spawn the memory-curation shell runner in inline
@@ -1548,6 +1562,10 @@ export const DEFAULT_DEPS: DispatchDeps = {
   notifyDiscord,
   buildPromptForAgent,
   curateMemoryIndex: runMemoryCuration,
+  // Deferred through an arrow: `spawnGateCommand` is a `const` declared
+  // further down the module, so a direct reference here would hit the
+  // temporal dead zone at load. The arrow resolves it at call time.
+  spawnGate: (req) => spawnGateCommand(req),
 };
 
 // Auto-curation trigger, cooldown-gated. Fires an inline curation pass when the
@@ -1656,7 +1674,19 @@ export async function dispatchToAgent(
   const setup = await setupBranchAndWorktree(ctx);
   if (!setup.ok) return;
 
-  const spawn = await prepareAgentSpawn(ctx);
+  // Builder-set pre-verifier gates: deterministic gate commands run in the
+  // ticket's worktree BEFORE any model is spawned. Red applies
+  // `needs-rework:builder` (the rework router moves the ticket next cycle)
+  // and tears the worktree down without spending a token; green threads a
+  // gates-passed note into the agent's prompt. In the classic set this is
+  // a no-op returning `{ ok: true }` without reading any env.
+  const gates = await maybeRunPreSpawnGates(ctx);
+  if (!gates.ok) {
+    await cleanupAfterDispatch(ctx);
+    return;
+  }
+
+  const spawn = await prepareAgentSpawn(ctx, gates.promptNote);
   if (!spawn.ok) return;
 
   // streamResult is declared outside the try so handleDispatchError
@@ -2168,6 +2198,11 @@ type SpawnConfig = Parameters<typeof runClaudeStreaming>[0];
 // would NOT run on this early-return path).
 export async function prepareAgentSpawn(
   ctx: DispatchContext,
+  /** Extra text appended to the prompt file after the split directive —
+   *  the pre-verifier gate's "gates passed" note (builder stage set).
+   *  Empty for every other dispatch, which keeps the written prompt
+   *  byte-identical to the pre-stage-set dispatcher. */
+  promptNote = "",
 ): Promise<{ ok: true; config: SpawnConfig } | { ok: false }> {
   const { agent, item, client, agentCwd, useWorktree, worktreeDir, branchName, logFile } = ctx;
   const { execSync, readFileSync, writeFileSync, buildPromptForAgent } = ctx.deps;
@@ -2245,7 +2280,7 @@ export async function prepareAgentSpawn(
   }
   const splitDirective = formatSplitDirective(oversizedOverviews, FEATURE_DOCS_CAP_BYTES);
 
-  writeFileSync(promptFile, prompt + splitDirective);
+  writeFileSync(promptFile, prompt + splitDirective + promptNote);
   writeFileSync(systemPromptFile, systemPrompt);
 
   // Turn limits: see `maxTurnsFor` in lib.ts for rationale (base 90,
@@ -2270,11 +2305,17 @@ export async function prepareAgentSpawn(
   // context7 tools carry the plugin prefix (mcp__plugin_context7_context7__*) so the
   // allowlist matches the tool the agent actually loads. The bare mcp__context7__* form
   // never matched, so every context7 call was silently denied (desktop #29, 2026-07-03).
-  const needsAgent = ["architect", "code-review"].includes(agent.name);
-  // WebSearch is architect-only: the architect is the role that researches and picks a
-  // library or approach for the spec (e.g. desktop #29's Noise_IK library spike). Other
-  // roles implement against the chosen design, so they don't get open web access.
-  const needsWebSearch = agent.name === "architect";
+  // Sub-agent + web-search grants come from the resolved stage set. Classic
+  // grants Agent to architect + code-review — the two roles that dispatch
+  // adversarial sub-agents — and WebSearch to the architect only: the
+  // architect is the role that researches and picks a library or approach
+  // for the spec (e.g. desktop #29's Noise_IK library spike); other roles
+  // implement against the chosen design, so they don't get open web access.
+  // The builder set grants Agent to builder + verifier and WebSearch to the
+  // builder (it absorbs the architect's research role). See stage-sets.ts.
+  const stageSet = activeStageSet();
+  const needsAgent = stageSet.agentToolNames.has(agent.name);
+  const needsWebSearch = stageSet.webSearchToolNames.has(agent.name);
   let allowedTools = baseTools;
   if (needsAgent) allowedTools += ",Agent";
   if (needsWebSearch) allowedTools += ",WebSearch";
@@ -2928,6 +2969,188 @@ export async function cleanupAfterDispatch(ctx: DispatchContext): Promise<void> 
       console.warn(`   ⚠️  Failed to return repoRoot to ${defaultBranch} after PO run: ${e?.message ?? e}`);
     }
   }
+}
+
+// --------- Pre-verifier deterministic gates (builder stage set) ---------
+
+/** Wall-clock cap per pre-verifier gate command. */
+export const VERIFIER_GATE_TIMEOUT_MS = 600_000; // 10min
+
+/** Cap on the failing gate's output tail quoted in the rework comment. */
+export const VERIFIER_GATE_TAIL_CAP = 2000;
+
+export interface VerifierGatesOutcome {
+  ok: boolean;
+  /** The first failing gate command, or null when all passed. */
+  failedGate: string | null;
+  /** Tail of the failing gate's combined stdout+stderr, capped at
+   *  `VERIFIER_GATE_TAIL_CAP` chars. Empty on green. */
+  outputTail: string;
+  /** One human-readable line per executed gate, for the GATES log. */
+  summary: string[];
+}
+
+/**
+ * Run the fork's deterministic gate commands in a ticket's worktree,
+ * stopping at the first red. Same execution fabric as the real-claude
+ * gate: each command goes through the `GateSpawner` seam (async spawn in
+ * its own process group, stdout/stderr streamed to files, SIGTERM →
+ * SIGKILL teardown on timeout), never `execSync` — a 10-minute gate on
+ * the event loop would starve sibling dispatches' stream watchdogs.
+ *
+ * Output files land in the logs dir with deterministic names
+ * (`verifier-gate_#<issue>_<n>.log` + `.stderr.log`) so a re-dispatch
+ * overwrites the previous attempt instead of accumulating, and the
+ * `.log` suffix keeps them inside the existing rotation sweep. Red reads
+ * both files back and returns the tail; a file that cannot be read
+ * degrades to an empty tail rather than failing the failure path.
+ */
+export async function runVerifierGates(opts: {
+  gates: readonly string[];
+  cwd: string;
+  issueNumber: number;
+  /** Overridable for tests; defaults to the module-level logs dir. */
+  logsDir?: string;
+  deps: Pick<DispatchDeps, "spawnGate" | "readFileSync">;
+}): Promise<VerifierGatesOutcome> {
+  const logsDir = opts.logsDir ?? LOGS_DIR;
+  const summary: string[] = [];
+  for (let i = 0; i < opts.gates.length; i++) {
+    const gate = opts.gates[i]!;
+    const stdoutPath = resolve(logsDir, `verifier-gate_#${opts.issueNumber}_${i + 1}.log`);
+    const stderrPath = resolve(logsDir, `verifier-gate_#${opts.issueNumber}_${i + 1}.stderr.log`);
+    const outcome = await opts.deps.spawnGate({
+      command: gate,
+      cwd: opts.cwd,
+      // Same env discipline as the real-claude gate: dispatcher secrets
+      // scrubbed, ANTHROPIC_API_KEY removed (see buildGateSpawnEnv).
+      env: buildGateSpawnEnv(process.env),
+      timeoutMs: VERIFIER_GATE_TIMEOUT_MS,
+      stdoutPath,
+      stderrPath,
+    });
+    const failed = outcome.spawnError !== null || outcome.timedOut || outcome.exitCode !== 0;
+    const verdict = outcome.spawnError !== null
+      ? `spawn error: ${outcome.spawnError}`
+      : outcome.timedOut
+        ? `timed out after ${VERIFIER_GATE_TIMEOUT_MS / 60_000}min`
+        : `exit ${outcome.exitCode}`;
+    summary.push(`${failed ? "✗" : "✓"} ${gate} (${verdict})`);
+    if (failed) {
+      const readTail = (path: string): string => {
+        try {
+          return String(opts.deps.readFileSync(path, "utf-8")).trim();
+        } catch {
+          return "";
+        }
+      };
+      const combined = [readTail(stdoutPath), readTail(stderrPath)]
+        .filter((s) => s.length > 0)
+        .join("\n");
+      const outputTail = combined.length > VERIFIER_GATE_TAIL_CAP
+        ? combined.slice(-VERIFIER_GATE_TAIL_CAP)
+        : combined;
+      return { ok: false, failedGate: gate, outputTail, summary };
+    }
+  }
+  return { ok: true, failedGate: null, outputTail: "", summary };
+}
+
+/**
+ * Pre-spawn gate step for `dispatchToAgent`, between worktree setup and
+ * spawn prep. Only the resolved stage set's `preSpawnGate` agents run it
+ * (builder set: the verifier); for everyone else — the entire classic
+ * set included — this returns immediately without reading any env or
+ * spawning anything, so classic dispatch is byte-identical to before.
+ *
+ * Gate commands come from `PYRY_VERIFIER_GATES` (parse contract shared
+ * with SALVAGE_GATES: `;`-delimited, unset → the Go vet+build pair,
+ * empty string → no gates and the step is skipped). Read at dispatch
+ * time, not module load, matching PYRY_RESUME_LEGS.
+ *
+ * - **All green** → `{ ok: true, promptNote }`: a GATES section in the
+ *   dispatch log plus a note for the prompt file telling the agent the
+ *   deterministic gates already passed (so it spends judgment turns, not
+ *   re-verification turns).
+ * - **Any red** → `{ ok: false }` after applying
+ *   `needs-rework:<reworkTarget>` and a comment quoting the failing
+ *   gate + output tail. NO model is spawned; the existing rework
+ *   routing moves the ticket back next cycle. Label first, comment
+ *   second — the label is the router, the comment is the diagnosis
+ *   (same ordering discipline as attemptSaferSalvage's label-before-PR).
+ *   If even the label write fails, the ticket is simply left for the
+ *   next cycle to re-gate: the loop is bounded by the gates themselves
+ *   staying red, and each pass costs zero model tokens.
+ */
+export async function maybeRunPreSpawnGates(
+  ctx: DispatchContext,
+): Promise<{ ok: true; promptNote: string } | { ok: false }> {
+  const { agent, item, client, agentCwd, logFile } = ctx;
+  const preSpawnGate = activeStageSet().preSpawnGate;
+  if (preSpawnGate === null || !preSpawnGate.agentNames.has(agent.name)) {
+    return { ok: true, promptNote: "" };
+  }
+  const gates = parseVerifierGates(process.env.PYRY_VERIFIER_GATES);
+  if (gates.length === 0) {
+    // Consumer opted out (PYRY_VERIFIER_GATES=""): no gates, no note.
+    return { ok: true, promptNote: "" };
+  }
+
+  console.log(`   🧪 Pre-${agent.name} gates (${gates.length}): ${gates.map((g) => `\`${g}\``).join(", ")}`);
+  const result = await runVerifierGates({
+    gates,
+    cwd: agentCwd,
+    issueNumber: item.issueNumber,
+    deps: ctx.deps,
+  });
+  writeLog(logFile, "GATES", result.summary.join("\n"));
+
+  if (result.ok) {
+    console.log(`   ✅ Pre-${agent.name} gates green`);
+    const promptNote = [
+      "",
+      "",
+      "## Deterministic gates",
+      "",
+      "The dispatcher ran the fork's deterministic gates in this worktree before spawning you; all passed:",
+      ...gates.map((g) => `- \`${g}\``),
+      "",
+      "Treat these as green — do not spend turns re-running them just to establish a baseline.",
+    ].join("\n");
+    return { ok: true, promptNote };
+  }
+
+  const reworkLabel = `needs-rework:${preSpawnGate.reworkTarget}`;
+  console.log(
+    `   ❌ Pre-${agent.name} gate red (${result.failedGate}) — applying ${reworkLabel} on #${item.issueNumber}, no model spawned`,
+  );
+  try {
+    await client.addLabel(item.issueNumber, reworkLabel);
+  } catch (e) {
+    console.warn(`   ⚠️  Failed to add ${reworkLabel} on #${item.issueNumber} (next cycle re-gates, costing no tokens): ${e}`);
+  }
+  try {
+    await client.addComment(item.issueNumber, [
+      `## ❌ Pre-${agent.name} gates failed`,
+      ``,
+      `The dispatcher ran the deterministic gates in the ticket's worktree before spawning **${agent.name}**. \`${result.failedGate}\` failed, so no model was spawned. Applied \`${reworkLabel}\` — the rework router returns this ticket to **${preSpawnGate.reworkTarget}**.`,
+      ``,
+      `**Gates:**`,
+      ``,
+      "```",
+      ...result.summary,
+      "```",
+      ``,
+      `**Output tail (last ${VERIFIER_GATE_TAIL_CAP} chars):**`,
+      ``,
+      "```",
+      result.outputTail || "(no output captured)",
+      "```",
+    ].join("\n"));
+  } catch (e) {
+    console.warn(`   ⚠️  Failed to post pre-${agent.name} gate comment on #${item.issueNumber}: ${e}`);
+  }
+  return { ok: false };
 }
 
 // Closed-sweep: any closed issue that isn't already in Done gets moved
@@ -4504,10 +4727,15 @@ export async function pollLoop(): Promise<void> {
 
   // Poll later pipeline stages first — finish what's closest to Done before
   // starting new work. This minimizes WIP and maximizes throughput.
-  // PO is included — it owns Backlog and handles rework/split requests.
-  const pollOrder = [...AGENTS].reverse();
+  // The Backlog agent (PO / refiner) is included — it owns Backlog and
+  // handles rework/split requests. Agents come from the stage set resolved
+  // at startup (PYRY_STAGE_SET; classic is byte-identical to the old
+  // AGENTS-const behaviour).
+  const stageSet = activeStageSet();
+  const pollOrder = [...stageSet.agents].reverse();
 
   console.log("🔄 Starting dispatch loop...");
+  console.log(`   Stage set: ${stageSet.name} (PYRY_STAGE_SET)`);
   console.log(`   Watching columns (finish-first): ${pollOrder.map((a) => a.column).join(", ")}`);
 
   // Rotate dispatch logs older than PYRY_LOG_RETENTION_DAYS at startup. One

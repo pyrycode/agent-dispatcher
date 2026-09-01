@@ -58,11 +58,16 @@ import {
   buildGateSpawnEnv,
   runRealClaudeGateSuite,
   spawnGateCommand,
+  maybeRunPreSpawnGates,
+  runVerifierGates,
+  VERIFIER_GATE_TAIL_CAP,
+  VERIFIER_GATE_TIMEOUT_MS,
   type GateRunnerDeps,
   type GateSpawnOutcome,
   type GateSpawnRequest,
   type StreamResult,
 } from "./dispatch.js";
+import { resetActiveStageSetForTests, resolveStageSet } from "./stage-sets.js";
 import type { AgentConfig, BlockerInfo, ProjectItem } from "./types.js";
 import {
   FAMILY_BREAKER_COMMENT_MARKER,
@@ -101,6 +106,8 @@ export type CallLog = {
   discord: string[];
   /** Count of `runClaudeStreaming` invocations (not the streamed output). */
   claudeStreams: number;
+  /** Every `deps.spawnGate` request (pre-verifier deterministic gates). */
+  gates: GateSpawnRequest[];
 };
 
 function emptyCallLog(): CallLog {
@@ -111,6 +118,7 @@ function emptyCallLog(): CallLog {
     client: [],
     discord: [],
     claudeStreams: 0,
+    gates: [],
   };
 }
 
@@ -164,6 +172,12 @@ export type MockDepsOptions = {
    * containing the issue number for round-trip assertion if needed.
    */
   buildPromptResult?: string | ((agent: AgentConfig, item: ProjectItem) => string);
+  /**
+   * Outcome `deps.spawnGate` returns per request (pre-verifier gates).
+   * Defaults to a clean pass (`exitCode: 0`). Requests are recorded in
+   * `calls.gates` either way.
+   */
+  gateImpl?: (req: GateSpawnRequest) => GateSpawnOutcome;
 };
 
 export function makeMockDeps(opts: MockDepsOptions = {}): { deps: DispatchDeps; calls: CallLog } {
@@ -276,6 +290,13 @@ export function makeMockDeps(opts: MockDepsOptions = {}): { deps: DispatchDeps; 
     return opts.buildPromptResult ?? `# Mock prompt for #${item.issueNumber} (${agent.name})`;
   }) as unknown as DispatchDeps["buildPromptForAgent"];
 
+  const mockSpawnGate = (async (req: GateSpawnRequest): Promise<GateSpawnOutcome> => {
+    calls.gates.push(req);
+    return opts.gateImpl
+      ? opts.gateImpl(req)
+      : { exitCode: 0, timedOut: false, spawnError: null };
+  }) as DispatchDeps["spawnGate"];
+
   const deps: DispatchDeps = {
     execSync: mockExecSync,
     spawnSync: mockSpawnSync,
@@ -288,6 +309,7 @@ export function makeMockDeps(opts: MockDepsOptions = {}): { deps: DispatchDeps; 
     notifyDiscord: mockNotifyDiscord,
     buildPromptForAgent: mockBuildPromptForAgent,
     curateMemoryIndex: async () => ({ ok: true }),
+    spawnGate: mockSpawnGate,
   };
 
   return { deps, calls };
@@ -5505,5 +5527,399 @@ describe("dispatchToAgent — resume-in-place integration", () => {
         "no continuation prompt may be written when the feature is off",
       );
     });
+  });
+});
+
+// =====================================================================
+// Stage sets — spawn grants, pre-verifier gates, threading tripwires
+// =====================================================================
+//
+// The pure stage-set shapes (classic identity, builder chain, budgets)
+// live in stage-sets.test.ts. This block covers the IO-bearing side:
+// what `prepareAgentSpawn` grants under each set, how the pre-verifier
+// deterministic gates behave inside `dispatchToAgent`, and the source
+// tripwires that keep the poll loop reading the resolved set.
+
+/** Run `fn` with PYRY_STAGE_SET pinned (or unset), resetting the
+ *  memoized active set on entry and exit. Mirrors `withResumeLegs`. */
+async function withStageSet<T>(value: string | undefined, fn: () => Promise<T>): Promise<T> {
+  const prior = process.env.PYRY_STAGE_SET;
+  if (value === undefined) delete process.env.PYRY_STAGE_SET;
+  else process.env.PYRY_STAGE_SET = value;
+  resetActiveStageSetForTests();
+  try {
+    return await fn();
+  } finally {
+    if (prior === undefined) delete process.env.PYRY_STAGE_SET;
+    else process.env.PYRY_STAGE_SET = prior;
+    resetActiveStageSetForTests();
+  }
+}
+
+/** Pin PYRY_VERIFIER_GATES (or unset it) for the duration of `fn`. */
+async function withVerifierGates<T>(value: string | undefined, fn: () => Promise<T>): Promise<T> {
+  const prior = process.env.PYRY_VERIFIER_GATES;
+  if (value === undefined) delete process.env.PYRY_VERIFIER_GATES;
+  else process.env.PYRY_VERIFIER_GATES = value;
+  try {
+    return await fn();
+  } finally {
+    if (prior === undefined) delete process.env.PYRY_VERIFIER_GATES;
+    else process.env.PYRY_VERIFIER_GATES = prior;
+  }
+}
+
+const BUILDER_SET = resolveStageSet("builder");
+const builderAgent = (name: string): AgentConfig =>
+  BUILDER_SET.agents.find((a) => a.name === name)!;
+
+describe("stage sets — prepareAgentSpawn grants + budgets", () => {
+  test("builder set: builder gets Agent AND WebSearch, 200 turns, 40min", async () => {
+    await withStageSet("builder", async () => {
+      const claudeMd = claudeMdAbsPath("builder/CLAUDE.md");
+      const { ctx } = makeTestContext({
+        agent: builderAgent("builder"),
+        item: { issueNumber: 900 },
+        mockOptions: { fsMap: { [claudeMd]: "builder system prompt" } },
+      });
+      const result = await prepareAgentSpawn(ctx);
+      assert.ok(result.ok);
+      const tools = result.config.allowedTools.split(",");
+      assert.ok(tools.includes("Agent"), "builder must get the Agent sub-agent tool");
+      assert.ok(tools.includes("WebSearch"), "builder absorbs the architect's research → WebSearch");
+      assert.equal(result.config.maxTurns, 200);
+      assert.equal(result.config.timeoutMs, 2_400_000);
+      assert.equal(result.config.model, "opus");
+      assert.equal(result.config.effort, "xhigh");
+    });
+  });
+
+  test("builder set: verifier gets Agent but NOT WebSearch, code-review budgets", async () => {
+    await withStageSet("builder", async () => {
+      const claudeMd = claudeMdAbsPath("verifier/CLAUDE.md");
+      const { ctx } = makeTestContext({
+        agent: builderAgent("verifier"),
+        item: { issueNumber: 901 },
+        mockOptions: { fsMap: { [claudeMd]: "verifier system prompt" } },
+      });
+      const result = await prepareAgentSpawn(ctx);
+      assert.ok(result.ok);
+      const tools = result.config.allowedTools.split(",");
+      assert.ok(tools.includes("Agent"), "verifier must get the Agent sub-agent tool");
+      assert.ok(!tools.includes("WebSearch"), "verifier gets no open web access");
+      assert.equal(result.config.maxTurns, 150);
+      assert.equal(result.config.timeoutMs, 2_400_000);
+    });
+  });
+
+  test("builder set: refiner and documentation get neither Agent nor WebSearch; budgets carry over", async () => {
+    await withStageSet("builder", async () => {
+      for (const [name, maxTurns, timeoutMs, model] of [
+        ["refiner", 135, 1_200_000, "opus"],
+        ["documentation", 135, 1_500_000, "claude-sonnet-5"],
+      ] as const) {
+        const agent = builderAgent(name);
+        const claudeMd = claudeMdAbsPath(agent.claudeMdPath);
+        const { ctx } = makeTestContext({
+          agent,
+          item: { issueNumber: 902 },
+          mockOptions: { fsMap: { [claudeMd]: `${name} system prompt` } },
+        });
+        const result = await prepareAgentSpawn(ctx);
+        assert.ok(result.ok, `${name} spawn prep must succeed`);
+        const tools = result.config.allowedTools.split(",");
+        assert.ok(!tools.includes("Agent"), `${name} must not get Agent`);
+        assert.ok(!tools.includes("WebSearch"), `${name} must not get WebSearch`);
+        assert.equal(result.config.maxTurns, maxTurns, `${name} maxTurns`);
+        assert.equal(result.config.timeoutMs, timeoutMs, `${name} timeoutMs`);
+        assert.equal(result.config.model, model, `${name} model`);
+      }
+    });
+  });
+
+  test("classic set (env unset): architect grants byte-identical to today (Agent + WebSearch)", async () => {
+    await withStageSet(undefined, async () => {
+      const claudeMd = claudeMdAbsPath("architect/CLAUDE.md");
+      const { ctx } = makeTestContext({
+        agent: { name: "architect", column: "In Architecture", claudeMdPath: "architect/CLAUDE.md", producesCommits: true },
+        item: { issueNumber: 903 },
+        mockOptions: { fsMap: { [claudeMd]: "architect system prompt" } },
+      });
+      const result = await prepareAgentSpawn(ctx);
+      assert.ok(result.ok);
+      const tools = result.config.allowedTools.split(",");
+      assert.ok(tools.includes("Agent"));
+      assert.ok(tools.includes("WebSearch"));
+    });
+  });
+});
+
+describe("runVerifierGates — deterministic gate execution", () => {
+  const gateDeps = (opts: MockDepsOptions = {}) => {
+    const { deps, calls } = makeMockDeps(opts);
+    return { deps, calls };
+  };
+
+  test("runs every gate in the worktree cwd with the 10-minute cap, in order", async () => {
+    const { deps, calls } = gateDeps();
+    const result = await runVerifierGates({
+      gates: ["make check", "make build"],
+      cwd: "/worktrees/verifier-7",
+      issueNumber: 7,
+      deps,
+    });
+    assert.ok(result.ok);
+    assert.equal(result.failedGate, null);
+    assert.deepEqual(calls.gates.map((g) => g.command), ["make check", "make build"]);
+    for (const req of calls.gates) {
+      assert.equal(req.cwd, "/worktrees/verifier-7", "gates must run in the ticket's worktree");
+      assert.equal(req.timeoutMs, VERIFIER_GATE_TIMEOUT_MS, "each gate gets the 10min cap");
+      assert.equal(req.timeoutMs, 600_000);
+    }
+    assert.deepEqual(result.summary, [
+      "✓ make check (exit 0)",
+      "✓ make build (exit 0)",
+    ]);
+  });
+
+  test("red exit code → stops at the failing gate, names it, later gates never run", async () => {
+    const { deps, calls } = gateDeps({
+      gateImpl: (req) =>
+        req.command === "make check"
+          ? { exitCode: 2, timedOut: false, spawnError: null }
+          : { exitCode: 0, timedOut: false, spawnError: null },
+    });
+    const result = await runVerifierGates({
+      gates: ["go vet ./...", "make check", "make build"],
+      cwd: "/wt",
+      issueNumber: 8,
+      deps,
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.failedGate, "make check");
+    assert.deepEqual(
+      calls.gates.map((g) => g.command),
+      ["go vet ./...", "make check"],
+      "the gate after the red one must not run",
+    );
+    assert.match(result.summary[1]!, /^✗ make check \(exit 2\)$/);
+  });
+
+  test("output tail comes from the gate's stdout+stderr files, capped at 2000 chars (the tail, not the head)", async () => {
+    const stdoutBody = "HEAD-" + "x".repeat(3000) + "-TAIL";
+    const logsDir = "/gate-logs";
+    const { deps } = gateDeps({
+      gateImpl: () => ({ exitCode: 1, timedOut: false, spawnError: null }),
+      fsMap: {
+        [resolve(logsDir, "verifier-gate_#9_1.log")]: stdoutBody,
+        [resolve(logsDir, "verifier-gate_#9_1.stderr.log")]: "",
+      },
+    });
+    const result = await runVerifierGates({
+      gates: ["make check"],
+      cwd: "/wt",
+      issueNumber: 9,
+      logsDir,
+      deps,
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.outputTail.length, VERIFIER_GATE_TAIL_CAP);
+    assert.ok(result.outputTail.endsWith("-TAIL"), "must keep the tail of the output");
+    assert.ok(!result.outputTail.startsWith("HEAD-"), "the head is what gets cut");
+  });
+
+  test("timeout counts as red", async () => {
+    const { deps } = gateDeps({
+      gateImpl: () => ({ exitCode: null, timedOut: true, spawnError: null }),
+    });
+    const result = await runVerifierGates({ gates: ["make slow"], cwd: "/wt", issueNumber: 10, deps });
+    assert.equal(result.ok, false);
+    assert.equal(result.failedGate, "make slow");
+    assert.match(result.summary[0]!, /timed out after 10min/);
+  });
+
+  test("spawn error counts as red", async () => {
+    const { deps } = gateDeps({
+      gateImpl: () => ({ exitCode: null, timedOut: false, spawnError: "could not spawn gate command: ENOENT" }),
+    });
+    const result = await runVerifierGates({ gates: ["make check"], cwd: "/wt", issueNumber: 11, deps });
+    assert.equal(result.ok, false);
+    assert.match(result.summary[0]!, /spawn error/);
+  });
+});
+
+describe("pre-verifier gates — dispatchToAgent wiring", () => {
+  test("classic set: entirely inert even with PYRY_VERIFIER_GATES set — no gate runs, agent spawns as today", async () => {
+    await withStageSet(undefined, () => withVerifierGates("exit 1", async () => {
+      const claudeMd = claudeMdAbsPath("code-review/CLAUDE.md");
+      const client = new MockGitHubClient({ status: { 910: "In Code Review" }, labels: { 910: [] } });
+      const item = makeProjectItem({ issueNumber: 910 });
+      const agent = makeAgentConfig({
+        name: "code-review",
+        column: "In Code Review",
+        claudeMdPath: "code-review/CLAUDE.md",
+        producesCommits: false,
+      });
+      const { deps, calls } = makeMockDeps({
+        execImpls: fullHappyExecImpls("feature/910"),
+        fsMap: { [claudeMd]: "code-review system prompt" },
+      });
+
+      await dispatchToAgent(agent, item, client, deps);
+
+      assert.equal(calls.gates.length, 0, "classic set must never invoke the gate spawner");
+      assert.equal(calls.claudeStreams, 1, "the model spawn is unchanged");
+      assert.ok(client.addLabelCalls.some((c) => c.label === "done:code-review"));
+      assert.ok(!client.addLabelCalls.some((c) => c.label.startsWith("needs-rework:")));
+    }));
+  });
+
+  test("builder set, gates green → verifier spawned with a gates-passed note appended to the prompt file", async () => {
+    await withStageSet("builder", () => withVerifierGates(undefined, async () => {
+      const claudeMd = claudeMdAbsPath("verifier/CLAUDE.md");
+      const client = new MockGitHubClient({ status: { 911: "In Code Review" }, labels: { 911: [] } });
+      const item = makeProjectItem({ issueNumber: 911 });
+      const { deps, calls } = makeMockDeps({
+        execImpls: fullHappyExecImpls("feature/911"),
+        fsMap: { [claudeMd]: "verifier system prompt" },
+      });
+
+      await dispatchToAgent(builderAgent("verifier"), item, client, deps);
+
+      // Default PYRY_VERIFIER_GATES → the Go pair, both green.
+      assert.deepEqual(calls.gates.map((g) => g.command), ["go vet ./...", "go build ./..."]);
+      assert.equal(calls.claudeStreams, 1, "green gates must spawn the verifier");
+      assert.ok(client.addLabelCalls.some((c) => c.label === "done:verifier"));
+      const promptWrite = calls.fs.find((f) => f.kind === "write" && f.path.endsWith(".prompt-911.txt"));
+      assert.ok(promptWrite, "prompt file must be written");
+      assert.match(promptWrite!.content!, /## Deterministic gates/);
+      assert.match(promptWrite!.content!, /go vet \.\/\.\.\./);
+    }));
+  });
+
+  test("builder set, gate red → needs-rework:builder + tail comment, NO model spawn, worktree cleaned up", async () => {
+    await withStageSet("builder", () => withVerifierGates(undefined, async () => {
+      const claudeMd = claudeMdAbsPath("verifier/CLAUDE.md");
+      const client = new MockGitHubClient({ status: { 912: "In Code Review" }, labels: { 912: [] } });
+      const item = makeProjectItem({ issueNumber: 912 });
+      const { deps, calls } = makeMockDeps({
+        execImpls: fullHappyExecImpls("feature/912"),
+        fsMap: { [claudeMd]: "verifier system prompt" },
+        gateImpl: (req) =>
+          req.command === "go vet ./..."
+            ? { exitCode: 1, timedOut: false, spawnError: null }
+            : { exitCode: 0, timedOut: false, spawnError: null },
+      });
+
+      await dispatchToAgent(builderAgent("verifier"), item, client, deps);
+
+      assert.equal(calls.claudeStreams, 0, "a red gate must not spawn a model at all");
+      assert.ok(
+        client.addLabelCalls.some((c) => c.label === "needs-rework:builder"),
+        "red gate routes back to the builder",
+      );
+      assert.ok(!client.addLabelCalls.some((c) => c.label === "done:verifier"));
+      assert.ok(!client.addLabelCalls.some((c) => c.label.startsWith("error:")));
+      const comment = client.comments.find((c) => c.body.includes("go vet ./..."));
+      assert.ok(comment, "comment must name the failing gate");
+      assert.match(comment!.body, /needs-rework:builder/);
+      assert.ok(cleanupRan(calls.exec), "worktree must be torn down after the red-gate route");
+    }));
+  });
+
+  test("builder set, PYRY_VERIFIER_GATES='' → gating opted out, verifier spawns with no note", async () => {
+    await withStageSet("builder", () => withVerifierGates("", async () => {
+      const claudeMd = claudeMdAbsPath("verifier/CLAUDE.md");
+      const client = new MockGitHubClient({ status: { 913: "In Code Review" }, labels: { 913: [] } });
+      const item = makeProjectItem({ issueNumber: 913 });
+      const { deps, calls } = makeMockDeps({
+        execImpls: fullHappyExecImpls("feature/913"),
+        fsMap: { [claudeMd]: "verifier system prompt" },
+      });
+
+      await dispatchToAgent(builderAgent("verifier"), item, client, deps);
+
+      assert.equal(calls.gates.length, 0);
+      assert.equal(calls.claudeStreams, 1);
+      const promptWrite = calls.fs.find((f) => f.kind === "write" && f.path.endsWith(".prompt-913.txt"));
+      assert.ok(promptWrite);
+      assert.ok(!promptWrite!.content!.includes("Deterministic gates"));
+    }));
+  });
+
+  test("builder set: non-gated agents (builder itself) skip the gate step", async () => {
+    await withStageSet("builder", () => withVerifierGates(undefined, async () => {
+      const claudeMd = claudeMdAbsPath("builder/CLAUDE.md");
+      const client = new MockGitHubClient({ status: { 914: "In Development" }, labels: { 914: [] } });
+      const item = makeProjectItem({ issueNumber: 914 });
+      const { deps, calls } = makeMockDeps({
+        execImpls: fullHappyExecImpls("feature/914"),
+        fsMap: { [claudeMd]: "builder system prompt" },
+      });
+
+      await dispatchToAgent(builderAgent("builder"), item, client, deps);
+
+      assert.equal(calls.gates.length, 0, "only the verifier is gate-gated");
+      assert.equal(calls.claudeStreams, 1);
+    }));
+  });
+
+  test("maybeRunPreSpawnGates green: GATES section written to the dispatch log, prompt note returned", async () => {
+    await withStageSet("builder", () => withVerifierGates("make check", async () => {
+      const { ctx } = makeTestContext({
+        agent: builderAgent("verifier"),
+        item: { issueNumber: 915 },
+      });
+
+      const result = await maybeRunPreSpawnGates(ctx);
+
+      assert.ok(result.ok);
+      assert.match(result.promptNote, /## Deterministic gates/);
+      assert.match(result.promptNote, /make check/);
+      const log = readFileSync(ctx.logFile, "utf-8");
+      assert.match(log, /GATES/);
+      assert.match(log, /✓ make check \(exit 0\)/);
+    }));
+  });
+
+  test("maybeRunPreSpawnGates red: gate output tail lands in the ticket comment (capped)", async () => {
+    await withStageSet("builder", () => withVerifierGates("make check", async () => {
+      const { ctx, client } = makeTestContext({
+        agent: builderAgent("verifier"),
+        item: { issueNumber: 916 },
+        mockOptions: {
+          gateImpl: () => ({ exitCode: 3, timedOut: false, spawnError: null }),
+        },
+      });
+
+      const result = await maybeRunPreSpawnGates(ctx);
+
+      assert.equal(result.ok, false);
+      assert.ok(client.addLabelCalls.some((c) => c.label === "needs-rework:builder"));
+      assert.equal(client.comments.length, 1);
+      assert.match(client.comments[0]!.body, /make check/);
+      const log = readFileSync(ctx.logFile, "utf-8");
+      assert.match(log, /✗ make check \(exit 3\)/);
+    }));
+  });
+});
+
+describe("stage-set threading tripwires (source assertions)", () => {
+  test("pollLoop derives its poll order from the resolved stage set, not the AGENTS const", () => {
+    const source = readDispatchSource();
+    assert.match(
+      source,
+      /const pollOrder = \[\.\.\.stageSet\.agents\]\.reverse\(\);/,
+      "pollLoop must build pollOrder from the resolved stage set",
+    );
+  });
+
+  test("startup banner prints the active stage set", () => {
+    const source = readDispatchSource();
+    assert.match(
+      source,
+      /Stage set: \$\{stageSet\.name\}/,
+      "the startup banner must name the active stage set",
+    );
   });
 });

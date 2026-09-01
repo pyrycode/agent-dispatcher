@@ -12,7 +12,10 @@ import { AGENTS, type AgentConfig } from "./types.js";
 import { resolveFamilyRoot, shouldSkipDispatch, type DecisionItem } from "./pipeline-decisions.js";
 import { hasOpenBlockers } from "./blockers.js";
 
-// Built from AGENTS — single source of truth for the name → column mapping.
+// Built from AGENTS — the CLASSIC stage set's name → column mapping. Kept
+// for callers pinned to the classic shape (tests); live routing reads the
+// resolved stage set's `columnByAgent` instead (see stage-sets.ts), which
+// is identical to this map when PYRY_STAGE_SET is unset or `classic`.
 export const AGENT_COLUMN_MAP: ReadonlyMap<string, string> = new Map(
   AGENTS.map((a: AgentConfig) => [a.name, a.column]),
 );
