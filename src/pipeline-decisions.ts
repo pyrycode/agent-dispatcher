@@ -141,6 +141,11 @@ export interface DecisionItem {
   /** GitHub-native blocked-by relationships. Optional; defaults to empty
    *  (no blockers). Auto-advance excludes items with any OPEN blocker. */
   blockedBy?: { number: number; state: "OPEN" | "CLOSED" }[];
+  /** Sub-issue parent chain from the board snapshot. Optional; defaults
+   *  to "no parent" (the ticket is its own family root). Read by
+   *  `resolveFamilyRoot` for the family circuit breaker. */
+  parentNumber?: number | null;
+  grandparentNumber?: number | null;
 }
 
 /** A single column-to-column move the dispatcher will execute. */
@@ -848,9 +853,19 @@ export interface DoneCleanup {
  *   - any `rework-count:N` label (counter — reset so a re-opened ticket
  *     starts fresh rather than carrying stale rounds toward the loop
  *     threshold)
+ *   - any `family-dispatches:N` convenience counter (the durable family
+ *     tally lives in the root's marker comments, so the board copy can
+ *     go; a family whose root reaches Done and later re-opens should not
+ *     wear a stale badge)
  *
  * Does NOT touch:
  *   - `size:`, `priority:`, `merged`, or any free-form tag
+ *   - `error:family-breaker` specifically, despite its `error:` prefix —
+ *     it is the family circuit breaker's park switch on the (often
+ *     closed, Done-column) family root, not a stale trail. Stripping it
+ *     here would erase the operator's board signal every cycle while the
+ *     breaker re-vetoes on the comment tally anyway. Only the operator
+ *     removes it.
  *   - the `merged` label specifically — its semantic is "PR was merged,"
  *     set only by the auto-merge path; reaching Done some other way
  *     shouldn't grant it
@@ -870,10 +885,12 @@ export function decideDoneCleanup(
     if (item.issueNumber <= 0) continue;
 
     const labelsToStrip = item.labels.filter(
-      l => isPipelineLabel(l)
-        || l.startsWith("rework-count:")
-        || l.startsWith("merge-attempt:")
-        || l.startsWith(ERROR_RETRY_COUNT_PREFIX),
+      l => l !== FAMILY_BREAKER_LABEL
+        && (isPipelineLabel(l)
+          || l.startsWith("rework-count:")
+          || l.startsWith("merge-attempt:")
+          || l.startsWith(ERROR_RETRY_COUNT_PREFIX)
+          || l.startsWith(FAMILY_DISPATCH_COUNT_PREFIX)),
     );
 
     if (labelsToStrip.length === 0) continue;
@@ -1054,6 +1071,177 @@ export function shouldAddReadyLabel(opts: {
   return opts.currentColumn === opts.agentColumn;
 }
 
+// --------- Family circuit breaker (agent-dispatcher family-breaker) ---------
+//
+// A runaway ticket FAMILY — a split lineage where agents keep splitting,
+// reworking, and re-splitting — can consume agent runs far past what any
+// single-ticket breaker sees. A recursive-split spiral once burned ~213$
+// overnight across 11 descendant tickets; each individual ticket looked
+// healthy, so neither the rework-loop breaker nor the transient-retry cap
+// could trip. The family breaker counts DISPATCHES per family and parks
+// the whole lineage on the board once the tally crosses a limit.
+//
+// State is board-encoded, on the family ROOT issue, copying the durable
+// pattern of the transient-retry system:
+//
+//   - tally         -> count of marker comments (FAMILY_DISPATCH_COMMENT_MARKER)
+//                      on the root; one is posted per dispatch of any family
+//                      member. Comments are durable; labels can fail to
+//                      write silently (the transient-retry code learned this).
+//   - convenience   -> `family-dispatches:N` label on the root, rewritten
+//                      from the comment tally each dispatch. Cosmetic; the
+//                      comments win whenever the two disagree.
+//   - park switch   -> `error:family-breaker` label on the root. Vetoes the
+//                      root directly (GLOBAL_BLOCK_LABELS) and every
+//                      descendant through the parent chain on the snapshot
+//                      (shouldSkipDispatch's rootLabels arm).
+//
+// The root is resolved WITHOUT walking descendants: the PO's split-depth
+// cap keeps chains at most 3 deep, so `grandparentNumber ?? parentNumber
+// ?? own number` (two levels of parent on the board snapshot) is exact.
+// Anchoring the counter on the root means the tally survives children
+// closing.
+//
+// The breaker only filters DISPATCH candidates and marks the root. It
+// never blocks the real-claude gate, auto-merge, the closed sweep, or
+// rework routing, and a ticket mid-run when the family trips finishes
+// normally. To resume a parked family: remove `error:family-breaker`
+// from the root — and raise PYRY_FAMILY_DISPATCH_LIMIT, because a tally
+// still at/over the limit trips the breaker again on the next cycle.
+// The marker comments persist harmlessly as the family's audit trail.
+
+/** Park switch on the family root. The `error:` prefix is load-bearing:
+ *  it already excludes the root from the WIP count and blocks its own
+ *  dispatch via GLOBAL_BLOCK_LABELS. No agent is named `family-breaker`,
+ *  so `isPipelineLabelForAgent` never strips it, and `decideDoneCleanup`
+ *  explicitly preserves it (a split family's root sits closed in Done
+ *  while its descendants dispatch — stripping there would erase the
+ *  operator's board signal every cycle). */
+export const FAMILY_BREAKER_LABEL = "error:family-breaker";
+
+/** Convenience-counter prefix on the family root: `family-dispatches:N`.
+ *  Single colon, and deliberately disjoint from the `done:`/`needs-rework:`/
+ *  `wip:`/`error:` pipeline prefixes so no per-agent strip loop can eat it
+ *  (locked by a test in lib.test.ts). Comments are the source of truth when
+ *  the two disagree; this label is the human-readable mirror. */
+export const FAMILY_DISPATCH_COUNT_PREFIX = "family-dispatches:";
+
+/** Hidden marker embedded in the per-dispatch comment posted on the family
+ *  root. The count of these comments IS the family tally. An HTML comment
+ *  renders invisibly in GitHub's Markdown (same shape as
+ *  AUTO_RETRY_COMMENT_MARKER). */
+export const FAMILY_DISPATCH_COMMENT_MARKER = "<!-- family-dispatch-marker -->";
+
+/** Hidden marker embedded in the one explanatory comment posted when the
+ *  breaker trips. Its presence is the cross-cycle dedupe: a family that
+ *  stays tripped re-vetoes every cycle but explains itself only once. */
+export const FAMILY_BREAKER_COMMENT_MARKER = "<!-- family-breaker-tripped -->";
+
+/** Default dispatch budget per family — about four clean six-stage tickets
+ *  (a clean ticket takes ~6 runs). The 213$ overnight spiral would have
+ *  been capped after roughly a quarter of its burn. Override with
+ *  PYRY_FAMILY_DISPATCH_LIMIT. */
+export const FAMILY_DISPATCH_LIMIT_DEFAULT = 24;
+
+/**
+ * Parse PYRY_FAMILY_DISPATCH_LIMIT. Positive integers are honoured;
+ * unset, zero, negative, or garbage falls back to the default — a limit
+ * of 0 would park every family on its first dispatch, which is never
+ * what a typo intends.
+ */
+export function resolveFamilyDispatchLimit(raw: string | undefined): number {
+  if (!raw) return FAMILY_DISPATCH_LIMIT_DEFAULT;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : FAMILY_DISPATCH_LIMIT_DEFAULT;
+}
+
+/**
+ * A ticket's family ROOT: the top of its split lineage. The PO's
+ * split-depth cap guarantees chains are at most 3 deep (grandchild), so
+ * two levels of parent — carried on the board snapshot — fully resolve
+ * the root without any descendant walk or extra query.
+ */
+export function resolveFamilyRoot(item: {
+  issueNumber: number;
+  parentNumber?: number | null;
+  grandparentNumber?: number | null;
+}): number {
+  return item.grandparentNumber ?? item.parentNumber ?? item.issueNumber;
+}
+
+/**
+ * Read the convenience counter from the root's labels. Max-of-found
+ * (same defensive shape as `extractReworkCount`): duplicate counters
+ * shouldn't co-exist, but if a partial label-strip race leaves
+ * stragglers, biasing high errs toward tripping rather than
+ * under-counting. Malformed / negative tails are treated as 0.
+ */
+export function extractFamilyDispatchCount(labels: readonly string[]): number {
+  let max = 0;
+  for (const label of labels) {
+    if (!label.startsWith(FAMILY_DISPATCH_COUNT_PREFIX)) continue;
+    const tail = label.slice(FAMILY_DISPATCH_COUNT_PREFIX.length);
+    if (tail.length === 0) continue;
+    const n = parseInt(tail, 10);
+    if (isNaN(n) || n < 0) continue;
+    if (n > max) max = n;
+  }
+  return max;
+}
+
+/**
+ * The family's effective tally. The marker-comment count is the source
+ * of truth whenever it could be read — labels can silently fail to
+ * write, so when the two disagree the comments win in BOTH directions
+ * (a stale-high label must not park a healthy family; a stale-low label
+ * must not hide a runaway one). A null `markerCount` means the comments
+ * could not be fetched this cycle; the convenience label is the
+ * fallback, and no label at all reads as 0 — fail open, because a
+ * missed veto costs one dispatch while a spurious park stalls a family.
+ */
+export function resolveFamilyTally(
+  markerCount: number | null,
+  rootLabels: readonly string[],
+): number {
+  if (markerCount !== null) return markerCount;
+  return extractFamilyDispatchCount(rootLabels);
+}
+
+/** What `decideFamilyBreaker` returns: the veto plus a loggable reason. */
+export interface FamilyBreakerDecision {
+  veto: boolean;
+  reason: string;
+}
+
+/**
+ * The breaker decision: given a candidate's family root, the root's
+ * dispatch tally, and the limit, veto or allow. Tally at or over the
+ * limit vetoes (24 vetoes at the default 24; 23 does not).
+ *
+ * Deliberately dumb — no rates, no windows, no exemptions. The limit is
+ * a hard budget per family lineage; a deterministic cap is the whole
+ * point (the 213$ spiral was invisible to every clever per-ticket
+ * heuristic already in place).
+ */
+export function decideFamilyBreaker(opts: {
+  rootNumber: number;
+  markerCount: number;
+  threshold: number;
+}): FamilyBreakerDecision {
+  if (opts.markerCount >= opts.threshold) {
+    return {
+      veto: true,
+      reason:
+        `family root #${opts.rootNumber} has consumed ${opts.markerCount} dispatches, ` +
+        `at/over the limit of ${opts.threshold} (PYRY_FAMILY_DISPATCH_LIMIT)`,
+    };
+  }
+  return {
+    veto: false,
+    reason: `family root #${opts.rootNumber} at ${opts.markerCount}/${opts.threshold} dispatches`,
+  };
+}
+
 // --------- Label predicates ---------
 
 // The four label prefixes the dispatcher uses for per-agent state.
@@ -1132,6 +1320,11 @@ export function isPipelineLabelForAgent(label: string, agentName: string): boole
 export const GLOBAL_BLOCK_LABELS: ReadonlySet<string> = new Set([
   "error:max_turns_salvaged",
   "error:merge-conflict",
+  // The family circuit breaker's park switch, applied to the family ROOT.
+  // Membership here blocks the root itself; descendants are vetoed through
+  // the parent chain by shouldSkipDispatch's rootLabels arm. See the
+  // family-breaker section above for the full mechanism.
+  FAMILY_BREAKER_LABEL,
 ]);
 
 /**
@@ -1194,10 +1387,23 @@ export function isMergeConflictError(stderr: string | null | undefined): boolean
  * labels scoped to the agent currently being considered.
  *
  * Global-block labels (`GLOBAL_BLOCK_LABELS`) skip ALL agents until a
- * human strips them. Currently just `error:max_turns_salvaged`.
+ * human strips them.
+ *
+ * `rootLabels` is the label set of the ticket's family ROOT (resolved via
+ * the parent chain on the board snapshot). Only `error:family-breaker`
+ * crosses the parent chain: a root parked by the family circuit breaker
+ * vetoes every descendant for every agent, while a root parked on its own
+ * unrelated error (`error:po`, `error:merge-conflict`) stays that ticket's
+ * problem and its family keeps flowing. Optional so label-only callers
+ * (and every pre-breaker test) keep their exact semantics.
  */
-export function shouldSkipDispatch(labels: string[], agentName: string): boolean {
+export function shouldSkipDispatch(
+  labels: string[],
+  agentName: string,
+  rootLabels?: readonly string[],
+): boolean {
   if (labels.some((l) => GLOBAL_BLOCK_LABELS.has(l))) return true;
+  if (rootLabels?.includes(FAMILY_BREAKER_LABEL)) return true;
   return PIPELINE_LABEL_PREFIXES.some((p) => labels.includes(p + agentName));
 }
 
