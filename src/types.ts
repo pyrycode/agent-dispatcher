@@ -25,6 +25,16 @@ export interface ProjectItem {
    *  Empty when the ticket has no dependencies. The dispatcher skips
    *  dispatch on tickets where any entry is `OPEN`. */
   blockedBy: BlockerInfo[];
+  /** Issue number of this issue's parent in GitHub's sub-issue hierarchy
+   *  (the PO's split lineage), or null when the ticket has no parent.
+   *  Read by the family circuit breaker to resolve a ticket's family
+   *  ROOT without walking descendants. */
+  parentNumber: number | null;
+  /** The parent's own parent, or null. The PO's split-depth cap keeps
+   *  chains at most 3 deep (grandchild), so two levels fully resolve any
+   *  ticket's root: `grandparentNumber ?? parentNumber ?? issueNumber`
+   *  (see `resolveFamilyRoot` in pipeline-decisions.ts). */
+  grandparentNumber: number | null;
 }
 
 export interface AgentConfig {

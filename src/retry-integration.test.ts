@@ -67,6 +67,8 @@ function makeItem(over: Partial<ProjectItem> & { issueNumber: number }): Project
     labels: over.labels ?? [],
     url: over.url ?? "https://example.com/1",
     blockedBy: over.blockedBy ?? [],
+    parentNumber: over.parentNumber ?? null,
+    grandparentNumber: over.grandparentNumber ?? null,
   };
 }
 

@@ -69,6 +69,31 @@ function stripState(raw: RawItem): ProjectItem {
   return item;
 }
 
+/**
+ * Map an item's Issue content node onto the parent-chain fields the family
+ * circuit breaker reads (`parentNumber` / `grandparentNumber`). Pure — the
+ * only piece of the GraphQL mapping with branching worth unit-testing.
+ *
+ * A parent node without a usable number (PR fragment, inaccessible issue)
+ * counts as no parent, and a grandparent hanging off an unresolved parent
+ * is unreachable by definition — both collapse to null rather than
+ * inventing a chain link.
+ */
+export function mapParentChain(
+  content:
+    | { parent?: { number?: number | null; parent?: { number?: number | null } | null } | null }
+    | null
+    | undefined,
+): { parentNumber: number | null; grandparentNumber: number | null } {
+  const parent = content?.parent ?? null;
+  const parentNumber = typeof parent?.number === "number" ? parent.number : null;
+  const grandparentNumber =
+    parentNumber !== null && typeof parent?.parent?.number === "number"
+      ? parent.parent.number
+      : null;
+  return { parentNumber, grandparentNumber };
+}
+
 export class GitHubProjectClient {
   private gql: typeof graphql;
   private config: ProjectConfig;
@@ -227,6 +252,10 @@ export class GitHubProjectClient {
                       blockedBy(first: 10) {
                         nodes { number state }
                       }
+                      parent {
+                        number
+                        parent { number }
+                      }
                     }
                   }
                 }
@@ -270,6 +299,7 @@ export class GitHubProjectClient {
             number: b.number,
             state: b.state,
           })),
+          ...mapParentChain(node.content),
         });
       }
 
