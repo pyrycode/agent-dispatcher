@@ -74,6 +74,8 @@ Optional:
 |---|---|---|
 | `TARGET_DEFAULT_BRANCH` | `main` | Default branch of the target repo. Set to `master` or your trunk-based branch name as needed. Threaded through `git checkout`, `git rev-list --count`, merge targets, and the empty-branch guard. |
 | `SALVAGE_GATES` | `go vet ./...; go build ./...` | `;`-delimited shell commands that gate the safer-salvage path on `max_turns`. Each runs in the agent's worktree; all must exit 0 for the dispatcher to commit + push uncommitted work as a draft PR. Set to `""` to skip gating entirely. Override per ecosystem (e.g. `cargo check --all-targets; cargo test --no-run` for Rust). |
+| `PYRY_STAGE_SET` | `classic` | Which agent pipeline this fork runs: `classic` (the six-agent relay, byte-identical default) or `builder` (collapsed four-role pipeline, piloted on one fork). Unknown values fail fast at startup. See below. |
+| `PYRY_VERIFIER_GATES` | `go vet ./...; go build ./...` | Builder stage set only: `;`-delimited deterministic gate commands the dispatcher itself runs in the ticket's worktree before spawning the verifier. Same parsing as `SALVAGE_GATES`; set to `""` to skip the pre-verifier gate step. A fork's `.env` sets the full list, e.g. `make check;make build`. Inert in the classic set. |
 | `DISCORD_WEBHOOK_URL` | — | Notify on dispatch start/end |
 | `PYRY_LOG_RETENTION_DAYS` | `30` | Rotate logs older than N days; `0` disables |
 | `PYRY_RESUME_LEGS` | `1` | Resume-in-place: how many same-session continuation legs a budget-exhausted run gets before salvage. `0` disables the feature entirely (byte-identical pre-resume behaviour). See above. |
@@ -86,6 +88,30 @@ Optional:
 | `PYRY_REAL_CLAUDE_GATE_BASELINE_CMD` | — | Base-commit re-run template with a `{{TESTS}}` placeholder. Runs only when the branch has named failures, so it costs seconds. Unset means failures are attributed to the branch. |
 
 > **Load order.** `dotenv` now loads the fork's `.env` before any module-top constant reads `process.env`, so every variable in this table works from the file. Before 2026-08-07 the load sat below several of those reads, and `TARGET_REPO_PATH`, `TARGET_DEFAULT_BRANCH`, `SALVAGE_GATES` and `PYRY_AUTOCURATE_MEMORY` were silently file-blind — each fork's launcher pre-exported `TARGET_REPO_PATH` to work around it. Values a launcher exports, or that `op run --env-file` injects, still take precedence over the file.
+
+### Stage sets
+
+`PYRY_STAGE_SET` selects which agent pipeline the dispatcher runs. It is resolved once at startup, printed in the startup banner, and an unknown value exits immediately with the valid names.
+
+**`classic`** (default, also when the variable is unset) — the six-agent relay exactly as documented everywhere else in this README: PO → Architect → Developer → QA → Code Review → Documentation, advancing Backlog → In Architecture → In Development → In QA → In Code Review → In Documentation → Done. With this set the dispatcher's behaviour is byte-identical to before stage sets existed; the identity is locked by tests against literal copies of the classic config.
+
+**`builder`** — a collapsed four-role pipeline, currently piloted on one fork:
+
+| Role | Column | Notes |
+|---|---|---|
+| `refiner` | Backlog | The PO contract under a new name (`refiner/CLAUDE.md`, no worktree). |
+| `builder` | In Development | Absorbs architect + developer: gets the Agent sub-agent tool AND WebSearch, 200 turns, 40min. |
+| `verifier` | In Code Review | Absorbs QA + code review: Agent tool, code-review budgets (150 turns, 40min). |
+| `documentation` | In Documentation | Unchanged from classic (serial, sonnet). |
+
+The advance chain is Backlog → In Development → In Code Review → In Documentation → Done. The In Architecture and In QA columns are simply absent: never polled, never advanced into. Rework labels route against the set's own roles (`needs-rework:builder`, `needs-rework:refiner`, …), so create those labels in the fork's repo.
+
+**Pre-verifier gates (builder set only).** Before spawning the verifier on a ticket, the dispatcher runs the fork's deterministic gates itself — the `PYRY_VERIFIER_GATES` commands, each capped at 10 minutes, in the ticket's worktree:
+
+- **All green** → the verifier is spawned with a note in its prompt that the gates already passed, so it spends its budget on judgment rather than re-verification. A `GATES` section in the dispatch log records each command's verdict.
+- **Any red** → no model is spawned at all. The ticket gets `needs-rework:builder` plus a comment naming the failing gate and the tail of its output (capped at 2000 chars), and the normal rework routing returns it to the builder next cycle. A red gate costs zero tokens.
+
+In the classic set this feature is entirely inert (locked by test): no gate runs, no env is read.
 
 ### Real-claude gate
 
