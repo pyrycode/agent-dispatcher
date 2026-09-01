@@ -285,6 +285,13 @@ export async function runReworkRouting(client: ReconcileClient): Promise<void> {
 // ticket, so a skipped or removed gate step still cannot un-gate one).
 
 export async function runRealClaudeGate(client: ReconcileClient): Promise<void> {
+  // The gate's trigger + rework labels come from the resolved stage set:
+  // classic keys on done:code-review / needs-rework:developer (identical
+  // to the pre-stage-set literals), builder on done:verifier /
+  // needs-rework:builder — so the pilot fork's needs-real-claude tickets
+  // keep their e2e proof instead of silently losing the gate.
+  const { realClaudeGate } = activeStageSet();
+
   const itemsByColumn = new Map<string, ProjectItem[]>();
   try {
     const items = await client.getItemsByStatus(REAL_CLAUDE_GATE_FROM_COLUMN);
@@ -294,7 +301,7 @@ export async function runRealClaudeGate(client: ReconcileClient): Promise<void> 
     return;
   }
 
-  const routes = decideRealClaudeGate(itemsByColumn);
+  const routes = decideRealClaudeGate(itemsByColumn, realClaudeGate.reviewDoneLabel);
 
   let mutated = false;
   for (const route of routes) {
@@ -315,7 +322,7 @@ export async function runRealClaudeGate(client: ReconcileClient): Promise<void> 
         `operator runs it by hand:\n\n` +
         `1. Run the fork's real-claude suite with per-test JSON output, on a machine with a Claude login.\n` +
         `2. **Pass** → remove \`${REAL_CLAUDE_GATE_LABEL}\` and move the ticket to **In Documentation**.\n` +
-        `3. **Fail** → add \`needs-rework:developer\` and move it to **In Development**, keeping ` +
+        `3. **Fail** → add \`${realClaudeGate.failReworkLabel}\` and move it to **In Development**, keeping ` +
         `\`${REAL_CLAUDE_GATE_LABEL}\` on so it re-gates after the fix.\n\n` +
         `Read the skip reasons, not the exit code. Do not move it back to In Code Review with the label ` +
         `still on — it will just re-park here.`,
@@ -362,6 +369,9 @@ export async function runRealClaudeGateExecution(
   // fork opts in.
   if (runner === null) return;
 
+  // Same stage-set keys as the park step above.
+  const { realClaudeGate } = activeStageSet();
+
   let parked: ProjectItem[];
   try {
     parked = await client.getItemsByStatus(REAL_CLAUDE_GATE_RUN_FROM_COLUMN);
@@ -370,7 +380,7 @@ export async function runRealClaudeGateExecution(
     return;
   }
 
-  const candidate = decideRealClaudeGateRun(parked);
+  const candidate = decideRealClaudeGateRun(parked, realClaudeGate.reviewDoneLabel);
   if (candidate === null) return;
 
   const snapshot = parked.find(item => item.id === candidate.itemId);
@@ -400,7 +410,7 @@ export async function runRealClaudeGateExecution(
       labels: freshLabels,
       blockedBy: snapshot?.blockedBy ?? [],
     },
-  ]);
+  ], realClaudeGate.reviewDoneLabel);
   if (confirmed === null) {
     console.log(
       `   🧪 Real-claude gate: #${candidate.issueNumber} no longer eligible on a fresh label read — skipping`,
@@ -457,7 +467,7 @@ export async function runRealClaudeGateExecution(
       branchFailures: report.tally?.failedNames ?? [],
       baselineFailures: report.baselineFailures,
     });
-    const outcome = decideGateOutcome(verdict);
+    const outcome = decideGateOutcome(verdict, realClaudeGate.failReworkLabel);
 
     const action = outcome.toColumn === null
       ? `left it in ${REAL_CLAUDE_GATE_RUN_FROM_COLUMN} and added \`${outcome.addLabels.join("`, `")}\`. ` +

@@ -5705,8 +5705,8 @@ describe("runVerifierGates — deterministic gate execution", () => {
     assert.match(result.summary[1]!, /^✗ make check \(exit 2\)$/);
   });
 
-  test("output tail comes from the gate's stdout+stderr files, capped at 2000 chars (the tail, not the head)", async () => {
-    const stdoutBody = "HEAD-" + "x".repeat(3000) + "-TAIL";
+  test("output tail comes from the gate's stdout+stderr files, capped at 4000 chars (the tail, not the head)", async () => {
+    const stdoutBody = "HEAD-" + "x".repeat(5000) + "-TAIL";
     const logsDir = "/gate-logs";
     const { deps } = gateDeps({
       gateImpl: () => ({ exitCode: 1, timedOut: false, spawnError: null }),
@@ -5749,6 +5749,11 @@ describe("runVerifierGates — deterministic gate execution", () => {
 });
 
 describe("pre-verifier gates — dispatchToAgent wiring", () => {
+  // Contract: the deterministic layer decides green vs red only. Green →
+  // gates-passed note (judgment-only review). Red → the verifier is STILL
+  // spawned, with the failure context injected as a TRIAGE MODE prompt
+  // note; the verifier owns baseline partition and bounce-vs-advance.
+
   test("classic set: entirely inert even with PYRY_VERIFIER_GATES set — no gate runs, agent spawns as today", async () => {
     await withStageSet(undefined, () => withVerifierGates("exit 1", async () => {
       const claudeMd = claudeMdAbsPath("code-review/CLAUDE.md");
@@ -5797,7 +5802,11 @@ describe("pre-verifier gates — dispatchToAgent wiring", () => {
     }));
   });
 
-  test("builder set, gate red → needs-rework:builder + tail comment, NO model spawn, worktree cleaned up", async () => {
+  test("builder set, gate red → verifier STILL spawned, prompt note in TRIAGE MODE with gate facts", async () => {
+    // The deterministic layer decides only green vs red. A red gate must
+    // not bounce blind: a pre-existing failure on the merge base would
+    // bounce forever. The verifier gets the failure context and owns the
+    // baseline partition + bounce-vs-advance call (like QA today).
     await withStageSet("builder", () => withVerifierGates(undefined, async () => {
       const claudeMd = claudeMdAbsPath("verifier/CLAUDE.md");
       const client = new MockGitHubClient({ status: { 912: "In Code Review" }, labels: { 912: [] } });
@@ -5813,17 +5822,20 @@ describe("pre-verifier gates — dispatchToAgent wiring", () => {
 
       await dispatchToAgent(builderAgent("verifier"), item, client, deps);
 
-      assert.equal(calls.claudeStreams, 0, "a red gate must not spawn a model at all");
+      assert.equal(calls.claudeStreams, 1, "red always gets a model — the verifier triages the failure");
       assert.ok(
-        client.addLabelCalls.some((c) => c.label === "needs-rework:builder"),
-        "red gate routes back to the builder",
+        !client.addLabelCalls.some((c) => c.label === "needs-rework:builder"),
+        "the dispatcher must not route rework on red — that call belongs to the verifier",
       );
-      assert.ok(!client.addLabelCalls.some((c) => c.label === "done:verifier"));
-      assert.ok(!client.addLabelCalls.some((c) => c.label.startsWith("error:")));
-      const comment = client.comments.find((c) => c.body.includes("go vet ./..."));
-      assert.ok(comment, "comment must name the failing gate");
-      assert.match(comment!.body, /needs-rework:builder/);
-      assert.ok(cleanupRan(calls.exec), "worktree must be torn down after the red-gate route");
+      assert.ok(
+        !client.comments.some((c) => c.body.includes("gates failed")),
+        "no gate-failure ticket comment — the failure context goes to the verifier's prompt",
+      );
+      const promptWrite = calls.fs.find((f) => f.kind === "write" && f.path.endsWith(".prompt-912.txt"));
+      assert.ok(promptWrite, "prompt file must be written");
+      assert.match(promptWrite!.content!, /TRIAGE MODE/);
+      assert.match(promptWrite!.content!, /go vet \.\/\.\.\./, "note must name the failing gate");
+      assert.match(promptWrite!.content!, /exit 1/, "note must carry the exit code");
     }));
   });
 
@@ -5873,8 +5885,8 @@ describe("pre-verifier gates — dispatchToAgent wiring", () => {
 
       const result = await maybeRunPreSpawnGates(ctx);
 
-      assert.ok(result.ok);
       assert.match(result.promptNote, /## Deterministic gates/);
+      assert.ok(!result.promptNote.includes("TRIAGE MODE"), "green note must not read as a failure");
       assert.match(result.promptNote, /make check/);
       const log = readFileSync(ctx.logFile, "utf-8");
       assert.match(log, /GATES/);
@@ -5882,7 +5894,7 @@ describe("pre-verifier gates — dispatchToAgent wiring", () => {
     }));
   });
 
-  test("maybeRunPreSpawnGates red: gate output tail lands in the ticket comment (capped)", async () => {
+  test("maybeRunPreSpawnGates red: TRIAGE MODE note carries gate, verdict and output tail; no board mutation", async () => {
     await withStageSet("builder", () => withVerifierGates("make check", async () => {
       const { ctx, client } = makeTestContext({
         agent: builderAgent("verifier"),
@@ -5894,12 +5906,34 @@ describe("pre-verifier gates — dispatchToAgent wiring", () => {
 
       const result = await maybeRunPreSpawnGates(ctx);
 
-      assert.equal(result.ok, false);
-      assert.ok(client.addLabelCalls.some((c) => c.label === "needs-rework:builder"));
-      assert.equal(client.comments.length, 1);
-      assert.match(client.comments[0]!.body, /make check/);
+      assert.match(result.promptNote, /TRIAGE MODE/);
+      assert.match(result.promptNote, /make check/);
+      assert.match(result.promptNote, /exit 3/);
+      assert.equal(client.addLabelCalls.length, 0, "red gates mutate nothing — the verifier owns routing");
+      assert.equal(client.comments.length, 0);
       const log = readFileSync(ctx.logFile, "utf-8");
       assert.match(log, /✗ make check \(exit 3\)/);
+    }));
+  });
+
+  test("maybeRunPreSpawnGates red: output tail (capped at 4000) is embedded in the triage note", async () => {
+    await withStageSet("builder", () => withVerifierGates("make check", async () => {
+      const logsTail = "Z".repeat(120) + "-END";
+      const { ctx } = makeTestContext({
+        agent: builderAgent("verifier"),
+        item: { issueNumber: 917 },
+        mockOptions: {
+          gateImpl: () => ({ exitCode: 2, timedOut: false, spawnError: null }),
+          fsMap: {
+            [resolve(TEST_AGENTS_REPO_ROOT, "logs", "verifier-gate_#917_1.log")]: logsTail,
+            [resolve(TEST_AGENTS_REPO_ROOT, "logs", "verifier-gate_#917_1.stderr.log")]: "",
+          },
+        },
+      });
+
+      const result = await maybeRunPreSpawnGates(ctx);
+
+      assert.match(result.promptNote, /Z{120}-END/, "the gate's output tail must reach the verifier");
     }));
   });
 });

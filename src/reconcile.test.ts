@@ -23,6 +23,7 @@ import {
 } from "./reconcile.js";
 import type { GateRunReport, GateTally } from "./gate-output.js";
 import type { ProjectItem } from "./types.js";
+import { resetActiveStageSetForTests } from "./stage-sets.js";
 
 /**
  * Minimal in-memory ReconcileClient. Records every call to
@@ -618,5 +619,126 @@ describe("runRealClaudeGateExecution — evidence and cache", () => {
     const body = client.addCommentCalls[0]?.body ?? "";
     assert.match(body, /metered key absent/);
     assert.match(body, /a skip is not a pass/);
+  });
+});
+
+// --------- Real-claude gate under the builder stage set ---------
+//
+// The gate's trigger and rework labels derive from the active stage set:
+// done:code-review / needs-rework:developer in classic (every test above,
+// unchanged), done:verifier / needs-rework:builder under builder. These
+// tests walk a needs-real-claude ticket through park + execute under the
+// builder set exactly the way the classic tests above do, so the pilot
+// fork keeps its e2e proof.
+
+/** Pin PYRY_STAGE_SET for one test, resetting the memoized set both ways. */
+async function withStageSet<T>(value: string | undefined, fn: () => Promise<T>): Promise<T> {
+  const prior = process.env.PYRY_STAGE_SET;
+  if (value === undefined) delete process.env.PYRY_STAGE_SET;
+  else process.env.PYRY_STAGE_SET = value;
+  resetActiveStageSetForTests();
+  try {
+    return await fn();
+  } finally {
+    if (prior === undefined) delete process.env.PYRY_STAGE_SET;
+    else process.env.PYRY_STAGE_SET = prior;
+    resetActiveStageSetForTests();
+  }
+}
+
+/** A builder-set ticket that finished verifier review and wants the gate. */
+function builderParkedItem(overrides: Partial<ProjectItem> = {}): ProjectItem {
+  return makeItem({
+    id: "item-77",
+    issueNumber: 77,
+    status: "Inbox",
+    labels: ["done:verifier", "needs-real-claude", "size:m"],
+    ...overrides,
+  });
+}
+
+describe("real-claude gate — builder stage set", () => {
+  test("parks a verifier-reviewed needs-real-claude ticket in Inbox (done:verifier triggers)", async () => {
+    await withStageSet("builder", async () => {
+      const item = makeItem({
+        id: "item-70",
+        issueNumber: 70,
+        status: "In Code Review",
+        labels: ["done:verifier", "needs-real-claude"],
+      });
+      const client = new MockClient([item]);
+
+      await runRealClaudeGate(client);
+
+      assert.deepEqual(client.updateItemStatusCalls, [{ itemId: "item-70", newStatus: "Inbox" }]);
+      assert.equal(item.status, "Inbox");
+      assert.equal(client.clearItemsCacheCalls, 1);
+      // The operator instructions must name the SET's fail label, not the
+      // classic one — needs-rework:developer would never route here.
+      assert.match(client.addCommentCalls[0]?.body ?? "", /needs-rework:builder/);
+      assert.ok(!(client.addCommentCalls[0]?.body ?? "").includes("needs-rework:developer"));
+    });
+  });
+
+  test("does NOT park on the classic done:code-review under builder (no builder agent emits it)", async () => {
+    await withStageSet("builder", async () => {
+      const item = makeItem({
+        id: "item-71",
+        issueNumber: 71,
+        status: "In Code Review",
+        labels: ["done:code-review", "needs-real-claude"],
+      });
+      const client = new MockClient([item]);
+
+      await runRealClaudeGate(client);
+
+      assert.equal(client.updateItemStatusCalls.length, 0);
+      assert.equal(client.clearItemsCacheCalls, 0);
+    });
+  });
+
+  test("execute: pass advances to In Documentation and clears the gate label (as classic)", async () => {
+    await withStageSet("builder", async () => {
+      const item = builderParkedItem();
+      const client = new MockClient([item]);
+
+      await runRealClaudeGateExecution(client, async () => report(), 150, async () => {});
+
+      assert.deepEqual(client.updateItemStatusCalls, [{ itemId: "item-77", newStatus: "In Documentation" }]);
+      assert.deepEqual(client.removeLabelCalls, [{ issueNumber: 77, label: "needs-real-claude" }]);
+      assert.equal(client.addLabelCalls.length, 0);
+      assert.equal(item.status, "In Documentation");
+    });
+  });
+
+  test("execute: failure routes to In Development with needs-rework:builder, keeping needs-real-claude", async () => {
+    await withStageSet("builder", async () => {
+      const item = builderParkedItem();
+      const client = new MockClient([item]);
+      const failing = report({
+        exitCode: 1,
+        tally: tally({ executed: 176, passed: 175, failed: 1, failedNames: ["pkg.TestThing"], packageFailed: true }),
+      });
+
+      await runRealClaudeGateExecution(client, async () => failing, 150, async () => {});
+
+      assert.deepEqual(client.updateItemStatusCalls, [{ itemId: "item-77", newStatus: "In Development" }]);
+      assert.deepEqual(client.addLabelCalls, [{ issueNumber: 77, label: "needs-rework:builder" }]);
+      assert.equal(client.removeLabelCalls.length, 0, "needs-real-claude must survive a failure");
+      assert.ok(item.labels.includes("needs-real-claude"));
+    });
+  });
+
+  test("execute: a classic-reviewed ticket (done:code-review) is not selected under builder", async () => {
+    await withStageSet("builder", async () => {
+      const item = builderParkedItem({ labels: ["done:code-review", "needs-real-claude"] });
+      const client = new MockClient([item]);
+      let ranCount = 0;
+
+      await runRealClaudeGateExecution(client, async () => { ranCount++; return report(); }, 150, async () => {});
+
+      assert.equal(ranCount, 0, "no run may start for a ticket the set's review stage never signed off");
+      assert.equal(client.updateItemStatusCalls.length, 0);
+    });
   });
 });

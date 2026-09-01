@@ -22,7 +22,12 @@
 // unknown values), after dispatch.ts's dotenv load has run.
 
 import { AGENTS, type AgentConfig } from "./types.js";
-import { AUTO_ADVANCE_RULES, type AdvanceRule } from "./pipeline-decisions.js";
+import {
+  AUTO_ADVANCE_RULES,
+  REAL_CLAUDE_GATE_FAIL_COLUMN,
+  REAL_CLAUDE_GATE_FROM_COLUMN,
+  type AdvanceRule,
+} from "./pipeline-decisions.js";
 
 /** Operator-facing list of valid PYRY_STAGE_SET values, printed by the
  *  fail-fast error. Keep in lockstep with `resolveStageSet`. */
@@ -51,11 +56,26 @@ export interface StageSet {
    * Pre-spawn deterministic gates (the builder set's pre-verifier gate),
    * or null when the feature is inert (classic). `agentNames` are the
    * agents whose dispatch runs the `PYRY_VERIFIER_GATES` commands in the
-   * ticket's worktree BEFORE any model is spawned; a red gate applies
-   * `needs-rework:<reworkTarget>` instead of spawning. See
-   * `maybeRunPreSpawnGates` in dispatch.ts.
+   * ticket's worktree BEFORE the model spawns. The deterministic layer
+   * decides green vs red only: green injects a gates-passed note into the
+   * agent's prompt, red STILL spawns the agent with the failure context
+   * injected in TRIAGE MODE — the agent owns the baseline partition and
+   * the bounce-vs-advance call, so a failure the branch merely inherited
+   * never bounces forever. See `maybeRunPreSpawnGates` in dispatch.ts.
    */
-  preSpawnGate: { agentNames: ReadonlySet<string>; reworkTarget: string } | null;
+  preSpawnGate: { agentNames: ReadonlySet<string> } | null;
+  /**
+   * The real-claude gate's per-set label keys (see pipeline-decisions.ts
+   * for the gate itself). Derived, not declared: `reviewDoneLabel` is the
+   * ready label of the advance rule leaving the gate's from-column (the
+   * set's final pre-documentation review stage — done:code-review in
+   * classic, done:verifier in builder), and `failReworkLabel` targets the
+   * agent owning the gate's fail column (needs-rework:developer /
+   * needs-rework:builder). Deriving keeps them consistent with the chain
+   * by construction — a set whose review stage is renamed cannot leave
+   * the gate keyed to a label nobody emits.
+   */
+  realClaudeGate: { reviewDoneLabel: string; failReworkLabel: string };
 }
 
 /** Derived pieces shared by both set constructors. */
@@ -67,12 +87,27 @@ function deriveStageSet(opts: {
   webSearchToolNames: ReadonlySet<string>;
   preSpawnGate: StageSet["preSpawnGate"];
 }): StageSet {
+  const reviewRule = opts.advanceRules.find((r) => r.from === REAL_CLAUDE_GATE_FROM_COLUMN);
+  const failAgent = opts.agents.find((a) => a.column === REAL_CLAUDE_GATE_FAIL_COLUMN);
+  if (!reviewRule || !failAgent) {
+    // Config error in this file, caught at module load by any test run:
+    // every stage set must own the gate's from-column and fail-column so
+    // needs-real-claude tickets keep their e2e proof under it.
+    throw new Error(
+      `stage set "${opts.name}" cannot key the real-claude gate: it needs an advance rule ` +
+        `from "${REAL_CLAUDE_GATE_FROM_COLUMN}" and an agent owning "${REAL_CLAUDE_GATE_FAIL_COLUMN}".`,
+    );
+  }
   return {
     ...opts,
     columnByAgent: new Map(opts.agents.map((a) => [a.name, a.column])),
     midPipelineColumns: opts.advanceRules
       .map((r) => r.from)
       .filter((c) => c !== "Backlog"),
+    realClaudeGate: {
+      reviewDoneLabel: reviewRule.readyLabel,
+      failReworkLabel: `needs-rework:${failAgent.name}`,
+    },
   };
 }
 
@@ -153,7 +188,7 @@ const BUILDER_STAGE_SET: StageSet = deriveStageSet({
   advanceRules: BUILDER_ADVANCE_RULES,
   agentToolNames: new Set(["builder", "verifier"]),
   webSearchToolNames: new Set(["builder"]),
-  preSpawnGate: { agentNames: new Set(["verifier"]), reworkTarget: "builder" },
+  preSpawnGate: { agentNames: new Set(["verifier"]) },
 });
 
 // --------- resolution ---------
