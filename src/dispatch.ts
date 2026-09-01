@@ -8,8 +8,15 @@ import { GitHubProjectClient } from "./github.js";
 import { AGENTS, type AgentConfig, type ProjectItem } from "./types.js";
 import {
   advancePermissionDenialState,
+  buildResumeArgv,
+  buildResumePrompt,
+  captureSessionId,
   initPermissionDenialState,
   maxTurnsFor,
+  mergeLegResults,
+  parseResumeLegs,
+  pickFinalSessionId,
+  shouldAttemptResume,
   timeoutFor,
   parseSalvageGates,
   ResourceExhaustedError,
@@ -451,6 +458,15 @@ interface RunClaudeOpts {
   timeoutMs: number;
   logFile: string;
   env: NodeJS.ProcessEnv;
+  /**
+   * Resume-in-place continuation leg: when set, resume this claude
+   * session with a fresh budget instead of starting a new one. Forces
+   * the `claude` binary regardless of PYRY_USE_LEGACY_CLAUDE (the pyry
+   * agent-run wrapper has no resume support yet — pilot bridge, see
+   * `buildResumeArgv`). `promptFile` then carries the continuation
+   * prompt, piped on stdin like the legacy spawn.
+   */
+  resumeSessionId?: string;
 }
 
 // =====================================================================
@@ -598,9 +614,26 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
     // shell-quoting surface (review issue #8/#22); the property holds for
     // pyry agent-run unchanged.
     const useLegacyClaude = process.env.PYRY_USE_LEGACY_CLAUDE === "1";
+    // PILOT BRIDGE: a resume-in-place continuation leg spawns the
+    // `claude` binary EXPLICITLY, regardless of PYRY_USE_LEGACY_CLAUDE —
+    // the pyry agent-run wrapper has no resume support yet. Retire this
+    // branch into the default spawn once the wrapper grows a --resume
+    // flag (README "Resume-in-place" carries the caveat).
+    const isResumeLeg = Boolean(opts.resumeSessionId);
+    const claudeReadsStdin = isResumeLeg || useLegacyClaude;
     let bin: string;
     let args: string[];
-    if (useLegacyClaude) {
+    if (isResumeLeg) {
+      ({ bin, args } = buildResumeArgv({
+        sessionId: opts.resumeSessionId!,
+        model: opts.model,
+        effort: opts.effort,
+        maxTurns: opts.maxTurns,
+        allowedTools: opts.allowedTools,
+        disallowedTools: opts.disallowedTools,
+        systemPromptFile: opts.systemPromptFile,
+      }));
+    } else if (useLegacyClaude) {
       bin = "claude";
       args = [
         "-p",
@@ -662,6 +695,14 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
 
     let buffer = "";
     let resultMsg: Record<string, unknown> | null = null;
+    // Session id from the FIRST stream event that carries one — the
+    // system/init frame arrives within seconds of spawn. A run killed by
+    // SIGTERM/SIGKILL emits NO result frame (spike-verified on claude
+    // CLI 2.1.239), so this early capture is the only reliable way to
+    // keep the id on the kill paths. It feeds the denial-synthesis
+    // result below and the resume-in-place decision upstream; the
+    // result frame's own value still wins at resolve time.
+    let initSessionId = "";
     let timedOut = false;
     // Watchdog state for the permission-denial Layer 2 detector
     // (agent-dispatcher#8). See `advancePermissionDenialState` for the
@@ -696,7 +737,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
       }
     };
 
-    if (useLegacyClaude) {
+    if (claudeReadsStdin) {
       // Pipe the prompt file content into claude's stdin, then close. Replaces
       // the prior `bash -c "cat ${file} | claude ..."` which made promptFile
       // pass through a shell quoting layer.
@@ -722,6 +763,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
         if (!line.trim()) continue;
         try {
           const msg = JSON.parse(line);
+          initSessionId = captureSessionId(initSessionId, msg);
           logStreamMessage(opts.logFile, msg);
           if (msg.type === "result") resultMsg = msg;
           // Drive the Layer 2 denial watchdog. State transitions are
@@ -761,6 +803,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
       if (buffer.trim()) {
         try {
           const msg = JSON.parse(buffer);
+          initSessionId = captureSessionId(initSessionId, msg);
           logStreamMessage(opts.logFile, msg);
           if (msg.type === "result") resultMsg = msg;
           const advanced = advancePermissionDenialState(denialState, msg);
@@ -779,7 +822,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
         const r = resultMsg as any;
         resolve({
           output: r.result || "",
-          sessionId: r.session_id || "",
+          sessionId: pickFinalSessionId(r.session_id, initSessionId),
           isError: r.is_error || false,
           numTurns: r.num_turns || 0,
           totalCostUsd: r.total_cost_usd || 0,
@@ -799,7 +842,10 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
         // generic outer catch (which would label `error:<agent>` only).
         resolve({
           output: denialState.lastAssistantText ?? "",
-          sessionId: "",
+          // Init-captured: the force-exit kill means no result frame ever
+          // arrived, and "" would strip the salvage PR body of its
+          // `claude --resume` pointer.
+          sessionId: initSessionId,
           isError: true,
           numTurns: 0,
           totalCostUsd: 0,
@@ -1619,6 +1665,11 @@ export async function dispatchToAgent(
   let saferSalvaged = false;
   try {
     streamResult = await ctx.deps.runClaudeStreaming(spawn.config);
+    // Budget-exhausted runs may get a same-session continuation leg
+    // (PYRY_RESUME_LEGS, default 1) before any salvage. A success comes
+    // back merged and walks the normal success path below; anything
+    // else comes back as the original result and salvages as today.
+    streamResult = await maybeResumeExhaustedRun(streamResult, spawn.config, ctx);
     saferSalvaged = await handleAgentResultErrors(streamResult, ctx);
     const postRun = await handlePostRun(streamResult, ctx, saferSalvaged);
     if (!postRun.ok) return;
@@ -2284,6 +2335,116 @@ export async function prepareAgentSpawn(
       env: { ...scrubSpawnEnv(process.env), CLAUDE_CODE_ENTRYPOINT: agent.name } as NodeJS.ProcessEnv,
     },
   };
+}
+
+/**
+ * Same-dispatch resume-in-place: the continuation leg. Sits between the
+ * first spawn and `handleAgentResultErrors`. When the run ended by
+ * budget exhaustion (turn budget or wall clock), a session id was
+ * captured, the run had a worktree, and `PYRY_RESUME_LEGS` (default 1)
+ * still grants a leg, the dispatcher resumes the SAME claude session —
+ * same dispatch, same worktree (teardown only happens after the whole
+ * dispatch), fresh per-leg budgets — BEFORE any salvage. Most budget
+ * exhaustions are "ran out mid-task", not "stuck", so this converts
+ * most max_turns/timeout human interruptions into automatic
+ * completions.
+ *
+ * Outcomes:
+ * - **Success** → returns the legs MERGED (`mergeLegResults`: turns,
+ *   cost, duration and token counters summed; terminal fields and
+ *   session id from the last leg) so the normal success path — done
+ *   label, comment, USAGE line — runs exactly as if the first run had
+ *   succeeded, with the USAGE line reporting whole-dispatch
+ *   consumption.
+ * - **Still exhausted, errored, or threw** → returns the ORIGINAL
+ *   first-leg result, so the salvage paths in
+ *   `handleAgentResultErrors` run byte-identically to a world without
+ *   this feature: same decision inputs, same session-id references in
+ *   the salvage commit and PR body (the session is the same across
+ *   legs anyway).
+ *
+ * `PYRY_RESUME_LEGS=0` disables the feature entirely: the input result
+ * passes through untouched, nothing is spawned, written, or logged.
+ * Permission denials never resume — a denial is a policy stop, not a
+ * budget stop, and keeps its existing salvage. Drain semantics are
+ * unchanged: a drain signal during a continuation leg is honoured the
+ * way it is during a first leg (the dispatcher finishes the current
+ * dispatch, resume legs included, then exits).
+ */
+export async function maybeResumeExhaustedRun(
+  first: StreamResult,
+  config: SpawnConfig,
+  ctx: DispatchContext,
+): Promise<StreamResult> {
+  if (!first.isError) return first;
+  const maxLegs = parseResumeLegs(process.env.PYRY_RESUME_LEGS);
+  if (maxLegs === 0) return first;
+
+  let current = first;
+  let legsUsed = 0;
+  while (
+    current.isError &&
+    shouldAttemptResume({
+      terminalReason: current.terminalReason,
+      timedOut: current.timedOut,
+      sessionId: current.sessionId,
+      usedWorktree: ctx.useWorktree,
+      hadPermissionDenial: current.hadPermissionDenial,
+      legsUsed,
+      maxLegs,
+    })
+  ) {
+    const legNumber = legsUsed + 1;
+    const reason: "max_turns" | "timeout" =
+      current.terminalReason === "max_turns" ? "max_turns" : "timeout";
+    writeLog(
+      ctx.logFile,
+      "RESUME",
+      `Leg: ${legNumber}/${maxLegs}\nSession: ${current.sessionId}\nReason: ${reason}\nFresh budget: ${config.maxTurns} turns / ${config.timeoutMs / 60_000}min`,
+    );
+    console.log(`   🔁 Resume leg ${legNumber}/${maxLegs} — continuing session ${current.sessionId} after ${reason}`);
+
+    // The continuation prompt gets its own file (`.prompt-resume-*.txt`,
+    // covered by the agents repo's `.prompt-*.txt` gitignore pattern) so
+    // the original prompt file stays intact for post-mortems.
+    const resumePromptFile = resolve(agentsRepoRoot, `.prompt-resume-${ctx.item.issueNumber}.txt`);
+    ctx.deps.writeFileSync(resumePromptFile, buildResumePrompt(reason));
+
+    let leg: StreamResult;
+    try {
+      leg = await ctx.deps.runClaudeStreaming({
+        ...config,
+        promptFile: resumePromptFile,
+        resumeSessionId: current.sessionId,
+      });
+    } catch (e: any) {
+      // A continuation leg that cannot even complete must not make the
+      // dispatch worse than it would have been without the feature:
+      // swallow, log, and hand the ORIGINAL result to the salvage paths.
+      writeLog(
+        ctx.logFile,
+        "RESUME_FAILED",
+        `Resume leg ${legNumber} failed: ${e?.message ?? e}\nFalling through to the original error path.`,
+      );
+      console.warn(`   ⚠️  Resume leg ${legNumber} failed (${e?.message ?? e}) — falling back to the original result`);
+      return first;
+    }
+    legsUsed += 1;
+    current = mergeLegResults(current, leg);
+  }
+
+  if (current.isError) {
+    if (legsUsed > 0) {
+      writeLog(
+        ctx.logFile,
+        "RESUME_EXHAUSTED",
+        `Still exhausted after ${legsUsed} resume leg(s) (last: ${current.terminalReason || (current.timedOut ? "timeout" : "error")}, ${current.numTurns} total turns, $${current.totalCostUsd.toFixed(2)} total). Falling through to salvage with the original first-leg result.`,
+      );
+      console.log(`   ⚠️  Still exhausted after ${legsUsed} resume leg(s) — salvage runs on the original result`);
+    }
+    return first;
+  }
+  return current;
 }
 
 // Inspect a stream result that came back with isError set. Two salvage

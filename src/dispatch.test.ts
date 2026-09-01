@@ -40,6 +40,7 @@ import {
   handlePostRun,
   makeDispatchContext,
   maybeCurateMemory,
+  maybeResumeExhaustedRun,
   prepareAgentSpawn,
   runAutoMerge,
   runClosedSweep,
@@ -5046,5 +5047,463 @@ describe("runFamilyBreaker — per-family reset", () => {
 
     assert.deepEqual(out.kept, [], "a trip comment must never count as a reset");
     assert.equal(out.tallies.get(40), 24);
+  });
+});
+
+// =====================================================================
+// maybeResumeExhaustedRun — same-dispatch resume-in-place
+// =====================================================================
+//
+// A budget-exhausted run (max_turns or wall-clock timeout) gets up to
+// PYRY_RESUME_LEGS continuation legs of the SAME claude session — same
+// dispatch, same worktree, fresh budget — before the salvage paths run.
+// Success merges the legs and takes the normal success path; a still-
+// exhausted (or errored) final leg falls through to salvage with the
+// ORIGINAL first-leg result, so salvage behaves byte-identically to a
+// world without the feature.
+
+/** Build the SpawnConfig a resume test hands to maybeResumeExhaustedRun. */
+function makeSpawnConfig(
+  logFile: string,
+  overrides: Partial<Parameters<DispatchDeps["runClaudeStreaming"]>[0]> = {},
+): Parameters<DispatchDeps["runClaudeStreaming"]>[0] {
+  return {
+    promptFile: resolve(TEST_AGENTS_REPO_ROOT, ".prompt-100.txt"),
+    systemPromptFile: resolve(TEST_AGENTS_REPO_ROOT, ".system-prompt-developer.txt"),
+    model: "opus",
+    effort: "xhigh",
+    maxTurns: 135,
+    allowedTools: "Bash,Read,Write",
+    disallowedTools: "AskUserQuestion,Skill",
+    cwd: "/worktrees/developer-100",
+    timeoutMs: 1_500_000,
+    logFile,
+    env: { CLAUDE_CODE_ENTRYPOINT: "developer" } as NodeJS.ProcessEnv,
+    ...overrides,
+  };
+}
+
+/** Run `fn` with PYRY_RESUME_LEGS set (or deleted for undefined), restoring after. */
+async function withResumeLegs<T>(value: string | undefined, fn: () => Promise<T>): Promise<T> {
+  const prior = process.env.PYRY_RESUME_LEGS;
+  if (value === undefined) delete process.env.PYRY_RESUME_LEGS;
+  else process.env.PYRY_RESUME_LEGS = value;
+  try {
+    return await fn();
+  } finally {
+    if (prior === undefined) delete process.env.PYRY_RESUME_LEGS;
+    else process.env.PYRY_RESUME_LEGS = prior;
+  }
+}
+
+const EXHAUSTED_MAX_TURNS = (): StreamResult => streamResult({
+  isError: true,
+  terminalReason: "max_turns",
+  sessionId: "sess-first",
+  numTurns: 135,
+  totalCostUsd: 4.5,
+  durationMs: 600_000,
+  usage: { input_tokens: 1000, output_tokens: 2000 },
+  output: "ran out of turns mid-task",
+});
+
+describe("maybeResumeExhaustedRun — same-dispatch continuation leg", () => {
+  test("an exhausted max_turns run gets one continuation leg and the merged success takes over", async () => {
+    await withResumeLegs(undefined, async () => {
+      const seenConfigs: any[] = [];
+      const { ctx, calls } = makeTestContext({
+        mockOptions: {
+          streamResult: (opts: any) => {
+            seenConfigs.push(opts);
+            return streamResult({
+              isError: false,
+              terminalReason: "stop",
+              sessionId: "sess-first",
+              numTurns: 40,
+              totalCostUsd: 1.5,
+              durationMs: 200_000,
+              usage: { input_tokens: 300, output_tokens: 700 },
+              output: "finished cleanly",
+            });
+          },
+        },
+      });
+      const first = EXHAUSTED_MAX_TURNS();
+      const config = makeSpawnConfig(ctx.logFile);
+
+      const result = await maybeResumeExhaustedRun(first, config, ctx);
+
+      // One continuation leg spawned, through the deps seam.
+      assert.equal(calls.claudeStreams, 1);
+      // The merged result is a success carrying cross-leg usage sums.
+      assert.equal(result.isError, false);
+      assert.equal(result.numTurns, 175);
+      assert.equal(result.totalCostUsd, 6);
+      assert.equal(result.durationMs, 800_000);
+      assert.equal(result.usage.input_tokens, 1300);
+      assert.equal(result.usage.output_tokens, 2700);
+      assert.equal(result.sessionId, "sess-first");
+      assert.equal(result.output, "finished cleanly");
+    });
+  });
+
+  test("the continuation config re-passes every flag, keeps cwd/timeout, and swaps only the prompt", async () => {
+    await withResumeLegs(undefined, async () => {
+      const seenConfigs: any[] = [];
+      const { ctx, calls } = makeTestContext({
+        mockOptions: {
+          streamResult: (opts: any) => {
+            seenConfigs.push(opts);
+            return streamResult({ isError: false, sessionId: "sess-first" });
+          },
+        },
+      });
+      const first = EXHAUSTED_MAX_TURNS();
+      const config = makeSpawnConfig(ctx.logFile);
+
+      await maybeResumeExhaustedRun(first, config, ctx);
+
+      assert.equal(seenConfigs.length, 1);
+      const resumeConfig = seenConfigs[0];
+      // The session to resume — this is what forces the claude-binary
+      // bridge inside the spawn helper.
+      assert.equal(resumeConfig.resumeSessionId, "sess-first");
+      // Flags do NOT carry over on --resume, so the config re-passes
+      // them all unchanged.
+      assert.equal(resumeConfig.model, config.model);
+      assert.equal(resumeConfig.effort, config.effort);
+      assert.equal(resumeConfig.maxTurns, config.maxTurns);
+      assert.equal(resumeConfig.allowedTools, config.allowedTools);
+      assert.equal(resumeConfig.disallowedTools, config.disallowedTools);
+      assert.equal(resumeConfig.systemPromptFile, config.systemPromptFile);
+      // Same worktree, same per-leg wall clock, same log, same env.
+      assert.equal(resumeConfig.cwd, config.cwd);
+      assert.equal(resumeConfig.timeoutMs, config.timeoutMs);
+      assert.equal(resumeConfig.logFile, config.logFile);
+      assert.deepEqual(resumeConfig.env, config.env);
+      // Only the prompt swaps: a continuation prompt in its own file.
+      assert.notEqual(resumeConfig.promptFile, config.promptFile);
+      const promptWrite = calls.fs.find(
+        (f) => f.kind === "write" && f.path === resumeConfig.promptFile,
+      );
+      assert.ok(promptWrite, "continuation prompt written before the leg");
+      assert.match(promptWrite!.content!, /continuation of the same session/);
+      assert.match(promptWrite!.content!, /turn budget/);
+      assert.match(promptWrite!.content!, /without redoing completed work/);
+    });
+  });
+
+  test("a RESUME section lands in the run log before the leg, naming leg number, session, and reason", async () => {
+    await withResumeLegs(undefined, async () => {
+      const { ctx } = makeTestContext({
+        item: { issueNumber: 951 },
+        mockOptions: {
+          streamResult: () => streamResult({ isError: false, sessionId: "sess-first" }),
+        },
+      });
+      const first = EXHAUSTED_MAX_TURNS();
+
+      await maybeResumeExhaustedRun(first, makeSpawnConfig(ctx.logFile), ctx);
+
+      const log = readFileSync(ctx.logFile, "utf-8");
+      assert.match(log, /RESUME/);
+      assert.match(log, /Leg: 1/);
+      assert.match(log, /Session: sess-first/);
+      assert.match(log, /Reason: max_turns/);
+    });
+  });
+
+  test("a wall-clock timeout resumes too, logging reason: timeout and a wall-clock prompt", async () => {
+    await withResumeLegs(undefined, async () => {
+      const { ctx, calls } = makeTestContext({
+        item: { issueNumber: 952 },
+        mockOptions: {
+          streamResult: () => streamResult({ isError: false, sessionId: "sess-t" }),
+        },
+      });
+      // The timeout shape: dispatcher SIGTERM, empty terminal reason.
+      const first = streamResult({
+        isError: true,
+        terminalReason: "",
+        timedOut: true,
+        sessionId: "sess-t",
+      });
+
+      await maybeResumeExhaustedRun(first, makeSpawnConfig(ctx.logFile), ctx);
+
+      assert.equal(calls.claudeStreams, 1);
+      const log = readFileSync(ctx.logFile, "utf-8");
+      assert.match(log, /Reason: timeout/);
+      const promptWrite = calls.fs.find(
+        (f) => f.kind === "write" && f.path.includes(".prompt-resume-952"),
+      );
+      assert.ok(promptWrite);
+      assert.match(promptWrite!.content!, /wall-clock/);
+    });
+  });
+
+  test("a still-exhausted continuation falls through with the ORIGINAL first-leg result", async () => {
+    await withResumeLegs(undefined, async () => {
+      const { ctx, calls } = makeTestContext({
+        mockOptions: {
+          // The continuation leg ALSO jams the cap.
+          streamResult: () => streamResult({
+            isError: true,
+            terminalReason: "max_turns",
+            sessionId: "sess-first",
+            numTurns: 135,
+          }),
+        },
+      });
+      const first = EXHAUSTED_MAX_TURNS();
+
+      const result = await maybeResumeExhaustedRun(first, makeSpawnConfig(ctx.logFile), ctx);
+
+      // Default budget is one leg; it was spent.
+      assert.equal(calls.claudeStreams, 1);
+      // Salvage must see the original inputs — the very same object.
+      assert.equal(result, first);
+    });
+  });
+
+  test("a continuation leg that throws is swallowed and the original result falls through to salvage", async () => {
+    await withResumeLegs(undefined, async () => {
+      const { ctx, calls } = makeTestContext({
+        item: { issueNumber: 953 },
+        mockOptions: {
+          streamResult: () => { throw new Error("spawn claude ENOENT"); },
+        },
+      });
+      const first = EXHAUSTED_MAX_TURNS();
+
+      const result = await maybeResumeExhaustedRun(first, makeSpawnConfig(ctx.logFile), ctx);
+
+      assert.equal(calls.claudeStreams, 1);
+      assert.equal(result, first);
+      const log = readFileSync(ctx.logFile, "utf-8");
+      assert.match(log, /RESUME_FAILED/);
+      assert.match(log, /spawn claude ENOENT/);
+    });
+  });
+
+  test("PYRY_RESUME_LEGS=0 short-circuits: no spawn, no prompt write, the result passes through untouched", async () => {
+    await withResumeLegs("0", async () => {
+      const { ctx, calls } = makeTestContext();
+      const first = EXHAUSTED_MAX_TURNS();
+
+      const result = await maybeResumeExhaustedRun(first, makeSpawnConfig(ctx.logFile), ctx);
+
+      assert.equal(result, first);
+      assert.equal(calls.claudeStreams, 0);
+      assert.ok(
+        !calls.fs.some((f) => f.kind === "write" && f.path.includes(".prompt-resume-")),
+        "no continuation prompt may be written when the feature is off",
+      );
+    });
+  });
+
+  test("a permission denial never resumes, even when the wall clock also fired", async () => {
+    await withResumeLegs(undefined, async () => {
+      const { ctx, calls } = makeTestContext();
+      const first = streamResult({
+        isError: true,
+        terminalReason: "permission_denied",
+        timedOut: true,
+        hadPermissionDenial: true,
+        sessionId: "sess-denied",
+      });
+
+      const result = await maybeResumeExhaustedRun(first, makeSpawnConfig(ctx.logFile), ctx);
+
+      assert.equal(result, first);
+      assert.equal(calls.claudeStreams, 0);
+    });
+  });
+
+  test("no captured session id → no resume (the kill happened before the init frame)", async () => {
+    await withResumeLegs(undefined, async () => {
+      const { ctx, calls } = makeTestContext();
+      const first = streamResult({ isError: true, terminalReason: "max_turns", sessionId: "" });
+
+      const result = await maybeResumeExhaustedRun(first, makeSpawnConfig(ctx.logFile), ctx);
+
+      assert.equal(result, first);
+      assert.equal(calls.claudeStreams, 0);
+    });
+  });
+
+  test("a non-worktree agent (PO shape) never resumes", async () => {
+    await withResumeLegs(undefined, async () => {
+      const { ctx, calls } = makeTestContext({
+        agent: { name: "po", usesWorktree: false, producesCommits: false },
+      });
+      const first = EXHAUSTED_MAX_TURNS();
+
+      const result = await maybeResumeExhaustedRun(first, makeSpawnConfig(ctx.logFile), ctx);
+
+      assert.equal(result, first);
+      assert.equal(calls.claudeStreams, 0);
+    });
+  });
+
+  test("a clean success passes through with no resume machinery at all", async () => {
+    await withResumeLegs(undefined, async () => {
+      const { ctx, calls } = makeTestContext();
+      const first = streamResult({ isError: false });
+
+      const result = await maybeResumeExhaustedRun(first, makeSpawnConfig(ctx.logFile), ctx);
+
+      assert.equal(result, first);
+      assert.equal(calls.claudeStreams, 0);
+    });
+  });
+
+  test("PYRY_RESUME_LEGS=2 grants a second continuation after an exhausted first one, merging all three legs", async () => {
+    await withResumeLegs("2", async () => {
+      let leg = 0;
+      const { ctx, calls } = makeTestContext({
+        mockOptions: {
+          streamResult: () => {
+            leg += 1;
+            if (leg === 1) {
+              return streamResult({
+                isError: true,
+                terminalReason: "max_turns",
+                sessionId: "sess-first",
+                numTurns: 135,
+                totalCostUsd: 4,
+                durationMs: 500_000,
+              });
+            }
+            return streamResult({
+              isError: false,
+              terminalReason: "stop",
+              sessionId: "sess-first",
+              numTurns: 20,
+              totalCostUsd: 0.5,
+              durationMs: 100_000,
+              output: "done on the third leg",
+            });
+          },
+        },
+      });
+      const first = EXHAUSTED_MAX_TURNS();
+
+      const result = await maybeResumeExhaustedRun(first, makeSpawnConfig(ctx.logFile), ctx);
+
+      assert.equal(calls.claudeStreams, 2);
+      assert.equal(result.isError, false);
+      assert.equal(result.numTurns, 135 + 135 + 20);
+      assert.equal(result.totalCostUsd, 4.5 + 4 + 0.5);
+      assert.equal(result.durationMs, 600_000 + 500_000 + 100_000);
+      assert.equal(result.output, "done on the third leg");
+    });
+  });
+});
+
+describe("dispatchToAgent — resume-in-place integration", () => {
+  test("success-after-resume walks the normal success path exactly as if the first run had succeeded", async () => {
+    await withResumeLegs(undefined, async () => {
+      const claudeMd = claudeMdAbsPath("developer/CLAUDE.md");
+      const client = new MockGitHubClient({
+        status: { 960: "In Development" },
+        labels: { 960: [] },
+      });
+      const item = makeProjectItem({ issueNumber: 960 });
+      const agent = makeAgentConfig({});
+      const { deps, calls } = makeMockDeps({
+        execImpls: fullHappyExecImpls("feature/960"),
+        fsMap: { [claudeMd]: "developer system prompt" },
+        streamResult: (opts: any) => opts?.resumeSessionId
+          ? streamResult({ isError: false, terminalReason: "stop", sessionId: "sess-960", numTurns: 30, output: "wrapped up after resume" })
+          : streamResult({ isError: true, terminalReason: "max_turns", sessionId: "sess-960", numTurns: 135 }),
+      });
+
+      await dispatchToAgent(agent, item, client, deps);
+
+      // First leg + one continuation leg.
+      assert.equal(calls.claudeStreams, 2);
+      // Normal success path: done label, no error/salvage labels, cleanup.
+      assert.ok(client.addLabelCalls.some((c) => c.label === "done:developer"));
+      assert.ok(!client.addLabelCalls.some((c) => c.label.startsWith("error:")));
+      assert.ok(cleanupRan(calls.exec), "success-after-resume must run cleanupAfterDispatch");
+      assert.equal(calls.discord.length, 0);
+    });
+  });
+
+  test("exhausted-after-resume falls through to safer salvage with the original session references", async () => {
+    await withResumeLegs(undefined, async () => {
+      const claudeMd = claudeMdAbsPath("developer/CLAUDE.md");
+      const client = new MockGitHubClient({
+        status: { 961: "In Development" },
+        labels: { 961: [] },
+      });
+      const item = makeProjectItem({ issueNumber: 961 });
+      const agent = makeAgentConfig({});
+      const { deps, calls } = makeMockDeps({
+        execImpls: {
+          ...fullHappyExecImpls("feature/961"),
+          "gh pr list --head": () => "[]",
+          "git status --porcelain": () => "M file.go\n",
+        },
+        fsMap: { [claudeMd]: "developer system prompt" },
+        // Both legs jam the cap. The continuation leg reports a
+        // different session id (contrived — a real resume keeps it) so
+        // the assertion below can PROVE salvage saw the original.
+        streamResult: (opts: any) => opts?.resumeSessionId
+          ? streamResult({ isError: true, terminalReason: "max_turns", sessionId: "sess-continuation", numTurns: 135 })
+          : streamResult({ isError: true, terminalReason: "max_turns", sessionId: "sess-original", numTurns: 135, output: "first leg tail" }),
+      });
+
+      await dispatchToAgent(agent, item, client, deps);
+
+      assert.equal(calls.claudeStreams, 2);
+      // Salvage ran exactly as today.
+      assert.ok(client.addLabelCalls.some((c) => c.label === "error:max_turns_salvaged"));
+      assert.ok(!client.addLabelCalls.some((c) => c.label === "done:developer"));
+      // The salvage commit cites the ORIGINAL run's session id.
+      const commit = calls.spawn.find((sp) => sp.cmd === "git" && sp.args[0] === "commit");
+      assert.ok(commit, "salvage must commit the worktree");
+      assert.ok(
+        commit!.args.some((a) => a.includes("Session: sess-original")),
+        "salvage commit must reference the original session id",
+      );
+      assert.ok(cleanupRan(calls.exec));
+    });
+  });
+
+  test("PYRY_RESUME_LEGS=0 restores the pre-resume dispatch byte-for-byte: one leg, straight to salvage", async () => {
+    await withResumeLegs("0", async () => {
+      const claudeMd = claudeMdAbsPath("developer/CLAUDE.md");
+      const client = new MockGitHubClient({
+        status: { 962: "In Development" },
+        labels: { 962: [] },
+      });
+      const item = makeProjectItem({ issueNumber: 962 });
+      const agent = makeAgentConfig({});
+      const { deps, calls } = makeMockDeps({
+        execImpls: {
+          ...fullHappyExecImpls("feature/962"),
+          "gh pr list --head": () => "[]",
+          "git status --porcelain": () => "M file.go\n",
+        },
+        fsMap: { [claudeMd]: "developer system prompt" },
+        streamResult: streamResult({
+          isError: true,
+          terminalReason: "max_turns",
+          sessionId: "sess-962",
+          numTurns: 135,
+        }),
+      });
+
+      await dispatchToAgent(agent, item, client, deps);
+
+      assert.equal(calls.claudeStreams, 1, "the feature off must spawn exactly one leg");
+      assert.ok(client.addLabelCalls.some((c) => c.label === "error:max_turns_salvaged"));
+      assert.ok(
+        !calls.fs.some((f) => f.kind === "write" && f.path.includes(".prompt-resume-")),
+        "no continuation prompt may be written when the feature is off",
+      );
+    });
   });
 });
