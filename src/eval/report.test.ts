@@ -64,6 +64,11 @@ describe("parseArgs", () => {
     assert.equal(got.jsonPath, "out.json");
   });
 
+  test("skips the bare -- that pnpm run forwards", () => {
+    const got = parseArgs(["--", "--agents-repo", "/p"]);
+    assert.equal(got.agentsRepo, "/p");
+  });
+
   test("throws a usage error without --agents-repo or on unknown flags", () => {
     assert.throws(() => parseArgs([]), /--agents-repo/);
     assert.throws(() => parseArgs(["--agents-repo", "/p", "--bogus"]), /--bogus/);
