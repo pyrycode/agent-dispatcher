@@ -60,9 +60,13 @@ import {
   extractFamilyDispatchCount,
   extractMergeAttemptCount,
   extractReworkCount,
+  FAMILY_BREAKER_COMMENT_MARKER,
   FAMILY_BREAKER_LABEL,
+  FAMILY_DISPATCH_COMMENT_MARKER,
   FAMILY_DISPATCH_COUNT_PREFIX,
   FAMILY_DISPATCH_LIMIT_DEFAULT,
+  FAMILY_DISPATCH_RESET_MARKER,
+  tallyFamilyComments,
   resolveFamilyDispatchLimit,
   resolveFamilyRoot,
   resolveFamilyTally,
@@ -4944,6 +4948,99 @@ describe("selectDispatches — family breaker veto at the selection layer", () =
       itemsByColumn: new Map([["Backlog", [root]]]),
       pollOrder: POLL_ORDER,
       maxConcurrent: 2,
+    });
+    assert.deepEqual(r, []);
+  });
+});
+
+// =====================================================================
+// Family circuit breaker — per-family reset (tallyFamilyComments)
+// =====================================================================
+
+describe("tallyFamilyComments — dispatch tally with per-family reset", () => {
+  const marker = (n = 1) => ({ body: `${FAMILY_DISPATCH_COMMENT_MARKER}\n🧮 Family dispatch ${n}` });
+  const reset = () => ({ body: `${FAMILY_DISPATCH_RESET_MARKER} resetting after triage` });
+  const trip = () => ({ body: `${FAMILY_BREAKER_COMMENT_MARKER}\ntripped — post \`${FAMILY_DISPATCH_RESET_MARKER}\` to reset` });
+
+  test("counts every dispatch marker when no reset comment exists", () => {
+    const out = tallyFamilyComments([marker(), { body: "unrelated chatter" }, marker(), marker()]);
+    assert.deepEqual(out, { markerCount: 3, breakerCommented: false });
+  });
+
+  test("a reset comment zeroes the tally — only markers posted after the latest reset count", () => {
+    const out = tallyFamilyComments([marker(), marker(), reset(), marker()]);
+    assert.deepEqual(out, { markerCount: 1, breakerCommented: false });
+  });
+
+  test("with several resets, only markers after the LAST one count", () => {
+    const out = tallyFamilyComments([marker(), reset(), marker(), marker(), reset(), marker()]);
+    assert.deepEqual(out, { markerCount: 1, breakerCommented: false });
+  });
+
+  test("a reset also clears the trip-comment dedupe, so a resumed family that runs away again explains itself again", () => {
+    const out = tallyFamilyComments([marker(), trip(), reset(), marker()]);
+    assert.deepEqual(out, { markerCount: 1, breakerCommented: false });
+  });
+
+  test("the trip comment quotes the reset marker in its instructions but never counts as a reset itself", () => {
+    // The trip comment MUST show the operator the exact string to post, so
+    // its body contains the reset marker. If that mention counted as a
+    // reset, every trip would immediately zero the tally it tripped on.
+    const out = tallyFamilyComments([marker(), marker(), trip(), marker()]);
+    assert.deepEqual(out, { markerCount: 3, breakerCommented: true });
+  });
+
+  test("a trip comment after the latest reset re-arms the dedupe", () => {
+    const out = tallyFamilyComments([trip(), reset(), marker(), trip()]);
+    assert.deepEqual(out, { markerCount: 1, breakerCommented: true });
+  });
+
+  test("comments are ordered by created_at when every comment carries one", () => {
+    // Positionally the reset comes first, chronologically it comes last —
+    // the tally must follow time, not array position, when GitHub's
+    // ordering can be trusted from timestamps.
+    const out = tallyFamilyComments([
+      { body: `${FAMILY_DISPATCH_RESET_MARKER}`, created_at: "2026-09-01T12:00:00Z" },
+      { body: FAMILY_DISPATCH_COMMENT_MARKER, created_at: "2026-09-01T10:00:00Z" },
+      { body: FAMILY_DISPATCH_COMMENT_MARKER, created_at: "2026-09-01T11:00:00Z" },
+    ]);
+    assert.deepEqual(out, { markerCount: 0, breakerCommented: false });
+  });
+
+  test("without timestamps, array order stands (GitHub returns issue comments oldest-first)", () => {
+    const out = tallyFamilyComments([reset(), marker(), marker()]);
+    assert.deepEqual(out, { markerCount: 2, breakerCommented: false });
+  });
+
+  test("non-string bodies are skipped, not crashed on", () => {
+    const out = tallyFamilyComments([{ body: null }, {}, marker()]);
+    assert.deepEqual(out, { markerCount: 1, breakerCommented: false });
+  });
+
+  test("the three family marker strings are mutually distinct — none contains another", () => {
+    const markers = [FAMILY_DISPATCH_COMMENT_MARKER, FAMILY_BREAKER_COMMENT_MARKER, FAMILY_DISPATCH_RESET_MARKER];
+    for (const a of markers) {
+      for (const b of markers) {
+        if (a === b) continue;
+        assert.ok(!a.includes(b), `${a} must not contain ${b} — substring collision would corrupt the tally`);
+      }
+    }
+  });
+});
+
+describe("selectDispatches — a reset alone does not resume a parked family", () => {
+  test("the breaker label wins at selection even after the tally was reset to zero", () => {
+    // The reset comment zeroes the tally; the label is the park switch.
+    // Both steps of the resume gesture are required: selection never
+    // consults tallies, so a root still wearing error:family-breaker
+    // keeps vetoing its descendants regardless of the reset.
+    const POLL_ORDER = [...AGENTS].reverse();
+    const child = { id: "item-41", issueNumber: 41, labels: [], blockedBy: [], parentNumber: 40, grandparentNumber: null };
+    const r = selectDispatches({
+      itemsByColumn: new Map([["Backlog", [child]]]),
+      pollOrder: POLL_ORDER,
+      maxConcurrent: 2,
+      rootLabelsByIssue: new Map([[40, [FAMILY_BREAKER_LABEL]]]),
     });
     assert.deepEqual(r, []);
   });

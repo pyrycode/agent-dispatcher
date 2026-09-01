@@ -67,6 +67,8 @@ import {
   FAMILY_BREAKER_COMMENT_MARKER,
   FAMILY_BREAKER_LABEL,
   FAMILY_DISPATCH_COMMENT_MARKER,
+  FAMILY_DISPATCH_RESET_MARKER,
+  tallyFamilyComments,
 } from "./pipeline-decisions.js";
 import { AGENTS } from "./types.js";
 import { ResourceExhaustedError } from "./agent-runtime.js";
@@ -488,17 +490,22 @@ export class MockGitHubClient implements DispatchClient {
   async getFamilyDispatchState(issueNumber: number): Promise<{ markerCount: number; breakerCommented: boolean }> {
     this.getFamilyDispatchStateCalls.push(issueNumber);
     if (this.failures.getFamilyDispatchState) throw this.failures.getFamilyDispatchState;
+    // Synthesize the root's chronological comment stream: the preset
+    // tallies stand for comments that existed before the test's writes
+    // (oldest first), followed by everything posted through this client
+    // in posted order. The tally semantics — including the per-family
+    // reset marker — are the production ones: tallyFamilyComments is
+    // shared, so mock and dispatcher can never disagree about resets.
     const preset = this.familyStateByIssue.get(issueNumber);
-    const posted = this.comments.filter(
-      (c) => c.issueNumber === issueNumber && c.body.includes(FAMILY_DISPATCH_COMMENT_MARKER),
-    ).length;
-    const breakerPosted = this.comments.some(
-      (c) => c.issueNumber === issueNumber && c.body.includes(FAMILY_BREAKER_COMMENT_MARKER),
-    );
-    return {
-      markerCount: (preset?.markerCount ?? 0) + posted,
-      breakerCommented: (preset?.breakerCommented ?? false) || breakerPosted,
-    };
+    const stream: { body: string }[] = [];
+    for (let i = 0; i < (preset?.markerCount ?? 0); i++) {
+      stream.push({ body: FAMILY_DISPATCH_COMMENT_MARKER });
+    }
+    if (preset?.breakerCommented) stream.push({ body: FAMILY_BREAKER_COMMENT_MARKER });
+    for (const c of this.comments) {
+      if (c.issueNumber === issueNumber) stream.push({ body: c.body });
+    }
+    return tallyFamilyComments(stream);
   }
 }
 
@@ -4954,5 +4961,90 @@ describe("runPreDispatchPrep — family dispatch accounting", () => {
     assert.equal(client.comments.length, 0);
     assert.ok(!client.addLabelCalls.some(c => c.label.startsWith("family-dispatches:")));
     assert.ok(client.addLabelCalls.some(c => c.label === "wip:developer"));
+  });
+});
+
+// =====================================================================
+// runFamilyBreaker — per-family reset and resume
+// =====================================================================
+
+describe("runFamilyBreaker — per-family reset", () => {
+  const DEV = AGENTS.find(a => a.name === "developer")!;
+  const child = (n: number, root: number) =>
+    makeProjectItem({ issueNumber: n, parentNumber: root });
+
+  test("the trip comment instructs the two-step resume: reset comment first, then the label — env knob only as global fallback", async () => {
+    const client = new MockGitHubClient();
+    client.familyStateByIssue.set(40, { markerCount: 24, breakerCommented: false });
+
+    await runFamilyBreaker([{ agent: DEV, item: child(41, 40) }], client, { threshold: 24 });
+
+    assert.equal(client.comments.length, 1);
+    const body = client.comments[0].body;
+    assert.ok(body.includes(FAMILY_DISPATCH_RESET_MARKER), "operator must be shown the exact reset marker to post");
+    assert.ok(body.includes(FAMILY_BREAKER_LABEL), "operator must be told which label to remove");
+    assert.ok(body.includes("PYRY_FAMILY_DISPATCH_LIMIT"), "env knob stays documented as the global fallback");
+  });
+
+  test("a reset comment zeroes the family tally so the freed family dispatches again", async () => {
+    const client = new MockGitHubClient();
+    client.familyStateByIssue.set(40, { markerCount: 24, breakerCommented: false });
+    // Operator posted the reset marker on the root.
+    await client.addComment(40, `${FAMILY_DISPATCH_RESET_MARKER} resuming after fixing the split loop`);
+    const candidates = [{ agent: DEV, item: child(41, 40) }];
+
+    const out = await runFamilyBreaker(candidates, client, { threshold: 24 });
+
+    assert.deepEqual(out.kept, candidates, "post-reset the tally is 0 — the family flows");
+    assert.equal(out.tallies.get(40), 0, "prep numbering restarts from the reset");
+    assert.ok(!client.addLabelCalls.some(c => c.label === FAMILY_BREAKER_LABEL), "no re-park after a reset");
+  });
+
+  test("trip, reset, resume, second runaway: the breaker trips again and posts a FRESH explanation", async () => {
+    const client = new MockGitHubClient();
+    client.familyStateByIssue.set(40, { markerCount: 24, breakerCommented: false });
+    const candidates = [{ agent: DEV, item: child(41, 40) }];
+
+    // Cycle 1: the family trips and explains itself.
+    const first = await runFamilyBreaker(candidates, client, { threshold: 24 });
+    assert.deepEqual(first.kept, []);
+    assert.equal(client.comments.filter(c => c.body.includes(FAMILY_BREAKER_COMMENT_MARKER)).length, 1);
+
+    // Operator resumes: reset comment, then removes the label (the label
+    // never reached rootLabelsByIssue here, so nothing else to clear).
+    await client.addComment(40, `${FAMILY_DISPATCH_RESET_MARKER} resuming`);
+
+    // Cycle 2: family flows again.
+    const second = await runFamilyBreaker(candidates, client, { threshold: 24 });
+    assert.deepEqual(second.kept, candidates);
+
+    // The resumed family runs away again: 24 fresh dispatch markers.
+    for (let i = 1; i <= 24; i++) {
+      await client.addComment(40, `${FAMILY_DISPATCH_COMMENT_MARKER}\n🧮 Family dispatch ${i}`);
+    }
+
+    // Cycle 3: trips again AND explains again — the pre-reset trip comment
+    // must not suppress the fresh explanation.
+    const third = await runFamilyBreaker(candidates, client, { threshold: 24 });
+    assert.deepEqual(third.kept, []);
+    assert.equal(
+      client.comments.filter(c => c.body.includes(FAMILY_BREAKER_COMMENT_MARKER)).length,
+      2,
+      "a second runaway after a reset gets its own trip comment",
+    );
+  });
+
+  test("the trip comment's own reset-marker mention does not reset the tally it just tripped on", async () => {
+    const client = new MockGitHubClient();
+    client.familyStateByIssue.set(40, { markerCount: 24, breakerCommented: false });
+    const candidates = [{ agent: DEV, item: child(41, 40) }];
+
+    // Trip posts the explanation (whose body quotes the reset marker).
+    await runFamilyBreaker(candidates, client, { threshold: 24 });
+    // Next cycle: the tally must still be 24, the family still vetoed.
+    const out = await runFamilyBreaker(candidates, client, { threshold: 24 });
+
+    assert.deepEqual(out.kept, [], "a trip comment must never count as a reset");
+    assert.equal(out.tallies.get(40), 24);
   });
 });

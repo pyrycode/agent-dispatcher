@@ -2,8 +2,7 @@ import { graphql } from "@octokit/graphql";
 import type { ProjectConfig, ProjectItem } from "./types.js";
 import {
   AUTO_RETRY_COMMENT_MARKER,
-  FAMILY_BREAKER_COMMENT_MARKER,
-  FAMILY_DISPATCH_COMMENT_MARKER,
+  tallyFamilyComments,
 } from "./pipeline-decisions.js";
 
 /** Transient GitHub responses worth another attempt for an IDEMPOTENT
@@ -644,12 +643,18 @@ export class GitHubProjectClient {
    * read from its comments in one fetch:
    *
    *   - `markerCount` — how many family-dispatch marker comments the root
-   *     carries. One is posted per dispatch of any family member, so the
-   *     count IS the family's dispatch tally (comments are durable; labels
-   *     can fail to write silently — the transient-retry code learned this).
-   *   - `breakerCommented` — whether the one-time trip explanation has
-   *     already been posted, so a family that stays tripped across cycles
-   *     explains itself exactly once.
+   *     carries SINCE THE LATEST RESET comment. One marker is posted per
+   *     dispatch of any family member, so the count IS the family's
+   *     dispatch tally (comments are durable; labels can fail to write
+   *     silently — the transient-retry code learned this). An operator
+   *     posting the reset marker zeroes the tally for that family alone.
+   *   - `breakerCommented` — whether the trip explanation has been posted
+   *     since the latest reset, so a family that stays tripped explains
+   *     itself exactly once per runaway, and a resumed family that runs
+   *     away again explains itself again.
+   *
+   * The fold itself is `tallyFamilyComments` (pipeline-decisions.ts) —
+   * pure and shared with the test mock, so the two never disagree.
    *
    * One page (100 comments) mirrors `countRetryMarkers`; a root that
    * accrues more than 100 comments under-counts and trips late rather
@@ -674,13 +679,6 @@ export class GitHubProjectClient {
     }
 
     const comments: any[] = await response.json();
-    let markerCount = 0;
-    let breakerCommented = false;
-    for (const c of comments) {
-      if (typeof c?.body !== "string") continue;
-      if (c.body.includes(FAMILY_DISPATCH_COMMENT_MARKER)) markerCount++;
-      if (c.body.includes(FAMILY_BREAKER_COMMENT_MARKER)) breakerCommented = true;
-    }
-    return { markerCount, breakerCommented };
+    return tallyFamilyComments(comments);
   }
 }
