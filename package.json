@@ -7,7 +7,7 @@
   "scripts": {
     "start": "tsx src/dispatch-bin.ts",
     "watch": "tsx --watch src/dispatch-bin.ts",
-    "test": "tsx --test src/*.test.ts",
+    "test": "tsx --test src/*.test.ts src/eval/*.test.ts",
     "typecheck": "tsc --noEmit -p .",
     "drain": "pkill -TERM -f 'tsx.*src/dispatch-bin\\.ts' && echo 'SIGTERM sent — dispatcher will exit after current dispatch completes.'"
   },
