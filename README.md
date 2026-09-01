@@ -106,12 +106,14 @@ Optional:
 
 The advance chain is Backlog → In Development → In Code Review → In Documentation → Done. The In Architecture and In QA columns are simply absent: never polled, never advanced into. Rework labels route against the set's own roles (`needs-rework:builder`, `needs-rework:refiner`, …), so create those labels in the fork's repo.
 
-**Pre-verifier gates (builder set only).** Before spawning the verifier on a ticket, the dispatcher runs the fork's deterministic gates itself — the `PYRY_VERIFIER_GATES` commands, each capped at 10 minutes, in the ticket's worktree:
+**Pre-verifier gates (builder set only).** Before spawning the verifier on a ticket, the dispatcher runs the fork's deterministic gates itself — the `PYRY_VERIFIER_GATES` commands, each capped at 10 minutes, in the ticket's worktree. The deterministic layer decides only green vs red; the verifier spawns either way, and a `GATES` section in the dispatch log records each command's verdict:
 
-- **All green** → the verifier is spawned with a note in its prompt that the gates already passed, so it spends its budget on judgment rather than re-verification. A `GATES` section in the dispatch log records each command's verdict.
-- **Any red** → no model is spawned at all. The ticket gets `needs-rework:builder` plus a comment naming the failing gate and the tail of its output (capped at 2000 chars), and the normal rework routing returns it to the builder next cycle. A red gate costs zero tokens.
+- **All green** → the verifier's prompt gets a gates-passed note, so it spends its budget on judgment rather than re-verification.
+- **Any red** → the verifier's prompt gets the failure context in **TRIAGE MODE**: the failing gate, its verdict (exit code / timeout / spawn error) and the tail of its output (capped at 4000 chars). The verifier then owns the baseline partition and the bounce-vs-advance call, exactly as QA does today — failures that already exist on the merge base get filed and advanced rather than bounced, and only regressions this ticket caused go back to the builder. The dispatcher deliberately applies no rework label on red: a deterministic bounce would loop forever on a pre-existing failure.
 
 In the classic set this feature is entirely inert (locked by test): no gate runs, no env is read.
+
+**Real-claude gate under stage sets.** The gate's trigger and rework labels derive from the active set: it fires on the set's final pre-documentation review signal (`done:code-review` in classic, `done:verifier` in builder) and routes genuine failures back with the set's own rework label (`needs-rework:developer` / `needs-rework:builder`). A `needs-real-claude` ticket on the builder fork therefore parks and executes through the gate exactly as it does under classic.
 
 ### Real-claude gate
 
@@ -124,7 +126,7 @@ Some tickets can only be accepted by running against real claude rather than the
 | Verdict | Board | Labels | Discord |
 |---|---|---|---|
 | pass | → In Documentation | removes `needs-real-claude` | no |
-| fail | → In Development | adds `needs-rework:developer`, **keeps** `needs-real-claude` | no |
+| fail | → In Development | adds the set's fail rework label (`needs-rework:developer` classic, `needs-rework:builder` builder), **keeps** `needs-real-claude` | no |
 | failures the branch inherited | stays in Inbox | adds `error:real-claude-gate` | yes |
 | nothing executed | stays in Inbox | adds `error:real-claude-gate` | yes |
 | no usable result | stays in Inbox | adds `error:real-claude-gate` | yes |
