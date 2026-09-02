@@ -14,6 +14,7 @@ import {
   parseArgs,
   percentile,
   renderMarkdown,
+  reviewInputs,
   summarizeWallClock,
   WAITING_TELLS,
 } from "./report.js";
@@ -191,6 +192,7 @@ describe("renderMarkdown", () => {
         withoutOutcome: 0,
         rows: [],
       },
+      backtestByAgent: [],
       fetch: { networkCalls: 0, reducedScope: false, missingTickets: 0, incompleteTimelines: 0 },
     });
     assert.match(md, /# Dispatcher eval report/);
@@ -198,5 +200,81 @@ describe("renderMarkdown", () => {
     assert.match(md, /## Developer no-op rate, remeasured/);
     assert.match(md, /## Review-verdict backtest/);
     assert.match(md, /\| developer \|/);
+  });
+});
+
+describe("reviewInputs", () => {
+  const usage = [{ name: "USAGE", timestamp: "2026-09-01T20:18:15.360Z" }];
+  const runs = [
+    run({ agent: "code-review", wallClockSeconds: 100, ticket: 1, sections: usage }),
+    run({ agent: "verifier", wallClockSeconds: 100, ticket: 2, sections: usage }),
+    run({ agent: "developer", wallClockSeconds: 100, ticket: 3, sections: usage }),
+  ];
+
+  test("takes the classic and the builder review stages, nothing else", () => {
+    assert.deepEqual(reviewInputs(runs).map((r) => r.ticket), [1, 2]);
+  });
+
+  test("narrows to one stage on request", () => {
+    assert.deepEqual(reviewInputs(runs, ["verifier"]).map((r) => r.ticket), [2]);
+  });
+});
+
+describe("renderMarkdown per review stage", () => {
+  const oneClean = {
+    reviewsTotal: 1,
+    byVerdict: { PASS: 1, FAIL: 0, UNKNOWN: 0 },
+    passCleanCount: 1,
+    passThenBounced: [],
+    failCount: 0,
+    failThenBounced: 0,
+    mustFixBuckets: [
+      { bucket: "0" as const, reviews: 1, bounced: 0 },
+      { bucket: "1" as const, reviews: 0, bounced: 0 },
+      { bucket: "2" as const, reviews: 0, bounced: 0 },
+      { bucket: "3+" as const, reviews: 0, bounced: 0 },
+    ],
+    withoutOutcome: 0,
+    rows: [],
+  };
+  const empty = { ...oneClean, reviewsTotal: 0, byVerdict: { PASS: 0, FAIL: 0, UNKNOWN: 0 }, passCleanCount: 0 };
+  const data = (byAgent: { agent: string; backtest: typeof oneClean }[]) => ({
+    logsDir: "/p/logs",
+    ghRepo: "pyrycode/pyrycode",
+    corpus: {
+      runs: 1,
+      byStatus: { success: 1, failed: 0, salvaged: 0 },
+      excludedByReason: { filename: 0, "test-ticket": 0, "mock-prompt": 0, "no-dispatch": 0 },
+      distinctTickets: 1,
+      firstRunAt: null,
+      lastRunAt: null,
+    },
+    wallClock: [],
+    noop: computeNoopStats([], "developer"),
+    priorClaimUnder60Share: 0.3,
+    backtest: oneClean,
+    backtestByAgent: byAgent,
+    fetch: { networkCalls: 0, reducedScope: false, missingTickets: 0, incompleteTimelines: 0 },
+  });
+
+  test("splits by stage when the corpus spans both review stages", () => {
+    const md = renderMarkdown(
+      data([
+        { agent: "code-review", backtest: oneClean },
+        { agent: "verifier", backtest: oneClean },
+      ]),
+    );
+    assert.match(md, /### By review stage: code-review/);
+    assert.match(md, /### By review stage: verifier/);
+  });
+
+  test("stays a single section when only one stage has reviews", () => {
+    const md = renderMarkdown(
+      data([
+        { agent: "code-review", backtest: oneClean },
+        { agent: "verifier", backtest: empty },
+      ]),
+    );
+    assert.doesNotMatch(md, /By review stage/);
   });
 });

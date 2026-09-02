@@ -191,11 +191,43 @@ export interface ReportData {
   /** The prior analysis's claim this report re-measures. */
   priorClaimUnder60Share: number;
   backtest: BacktestReport;
+  /** The same backtest split per review stage — code-review in the
+   *  classic set, verifier in the builder pilot — so a corpus that spans
+   *  the cutover can be read one stage at a time. */
+  backtestByAgent: { agent: string; backtest: BacktestReport }[];
   fetch: { networkCalls: number; reducedScope: boolean; missingTickets: number; incompleteTimelines: number };
 }
 
 const pct = (share: number) => `${(100 * share).toFixed(1)}%`;
 const secs = (s: number) => `${Math.round(s)}s`;
+
+/** The backtest bullets, MUST FIX table and the passed-then-bounced
+ *  list, at the given heading depth for the sub-table. */
+function renderBacktest(lines: string[], backtest: BacktestReport, subHeading: string): void {
+  lines.push(`- reviews with output: ${backtest.reviewsTotal} (${backtest.byVerdict.PASS} PASS, ${backtest.byVerdict.FAIL} FAIL, ${backtest.byVerdict.UNKNOWN} unknown verdict)`);
+  lines.push(`- PASS then bounced anyway (missed-defect proxy): ${backtest.passThenBounced.length}`);
+  lines.push(`- PASS and stayed clean: ${backtest.passCleanCount}`);
+  lines.push(`- FAIL (caught before shipping): ${backtest.failCount}, of which ${backtest.failThenBounced} show the rework on the timeline`);
+  lines.push(`- reviews without a fetched ticket outcome: ${backtest.withoutOutcome}`);
+  lines.push("");
+  lines.push(`| MUST FIX count | reviews | later bounced | bounce rate |`);
+  lines.push(`|---|---|---|---|`);
+  for (const b of backtest.mustFixBuckets) {
+    const rate = b.reviews === 0 ? "-" : pct(b.bounced / b.reviews);
+    lines.push(`| ${b.bucket} | ${b.reviews} | ${b.bounced} | ${rate} |`);
+  }
+  lines.push("");
+  if (backtest.passThenBounced.length > 0) {
+    lines.push(`${subHeading} Passed clean, bounced later`);
+    lines.push("");
+    lines.push(`| ticket | review ended | bounce signal | bounced at |`);
+    lines.push(`|---|---|---|---|`);
+    for (const row of backtest.passThenBounced) {
+      lines.push(`| #${row.ticket} | ${row.endAt} | ${row.bounce.signal} | ${row.bounce.at} |`);
+    }
+    lines.push("");
+  }
+}
 
 export function renderMarkdown(data: ReportData): string {
   const { corpus, noop, backtest } = data;
@@ -244,28 +276,16 @@ export function renderMarkdown(data: ReportData): string {
 
   lines.push(`## Review-verdict backtest`);
   lines.push("");
-  lines.push(`- reviews with output: ${backtest.reviewsTotal} (${backtest.byVerdict.PASS} PASS, ${backtest.byVerdict.FAIL} FAIL, ${backtest.byVerdict.UNKNOWN} unknown verdict)`);
-  lines.push(`- PASS then bounced anyway (missed-defect proxy): ${backtest.passThenBounced.length}`);
-  lines.push(`- PASS and stayed clean: ${backtest.passCleanCount}`);
-  lines.push(`- FAIL (caught before shipping): ${backtest.failCount}, of which ${backtest.failThenBounced} show the rework on the timeline`);
-  lines.push(`- reviews without a fetched ticket outcome: ${backtest.withoutOutcome}`);
-  lines.push("");
-  lines.push(`| MUST FIX count | reviews | later bounced | bounce rate |`);
-  lines.push(`|---|---|---|---|`);
-  for (const b of backtest.mustFixBuckets) {
-    const rate = b.reviews === 0 ? "-" : pct(b.bounced / b.reviews);
-    lines.push(`| ${b.bucket} | ${b.reviews} | ${b.bounced} | ${rate} |`);
-  }
-  lines.push("");
-  if (backtest.passThenBounced.length > 0) {
-    lines.push(`### Passed clean, bounced later`);
-    lines.push("");
-    lines.push(`| ticket | review ended | bounce signal | bounced at |`);
-    lines.push(`|---|---|---|---|`);
-    for (const row of backtest.passThenBounced) {
-      lines.push(`| #${row.ticket} | ${row.endAt} | ${row.bounce.signal} | ${row.bounce.at} |`);
+  renderBacktest(lines, backtest, "###");
+  // Split per stage only when the corpus holds more than one review
+  // stage; otherwise the section above already is the whole story.
+  const staged = data.backtestByAgent.filter((b) => b.backtest.reviewsTotal > 0);
+  if (staged.length > 1) {
+    for (const { agent, backtest: stageBacktest } of staged) {
+      lines.push(`### By review stage: ${agent}`);
+      lines.push("");
+      renderBacktest(lines, stageBacktest, "####");
     }
-    lines.push("");
   }
 
   lines.push(`## Fetch`);
@@ -292,11 +312,16 @@ export function summarizeCorpus(runs: ParsedRun[], excludedByReason: Record<Excl
   };
 }
 
-/** Successful code-review runs joined into backtest inputs. The end
+/** Review stages whose verdicts the backtest scores: the classic set's
+ *  code-review and the builder set's verifier. Both write the
+ *  `Decision: PASS|FAIL` verdict shape the extractor reads. */
+export const REVIEW_AGENTS: readonly string[] = ["code-review", "verifier"];
+
+/** Successful review runs joined into backtest inputs. The end
  *  timestamp is the USAGE header — the moment the verdict existed. */
-export function reviewInputs(runs: ParsedRun[]): ReviewInput[] {
+export function reviewInputs(runs: ParsedRun[], agents: readonly string[] = REVIEW_AGENTS): ReviewInput[] {
   return runs
-    .filter((r) => r.agent === "code-review" && r.output !== null && r.usage !== null)
+    .filter((r) => agents.includes(r.agent) && r.output !== null && r.usage !== null)
     .map((r) => ({
       ticket: r.ticket,
       file: r.file,
@@ -355,6 +380,10 @@ async function main(): Promise<void> {
     noop: computeNoopStats(runs, "developer"),
     priorClaimUnder60Share: 0.3,
     backtest: backtestReviews(reviewInputs(runs), outcomes),
+    backtestByAgent: REVIEW_AGENTS.map((agent) => ({
+      agent,
+      backtest: backtestReviews(reviewInputs(runs, [agent]), outcomes),
+    })),
     fetch: {
       networkCalls: fetchResult.networkCalls,
       reducedScope: fetchResult.reducedScope,
