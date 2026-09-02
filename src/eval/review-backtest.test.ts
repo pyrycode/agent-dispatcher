@@ -45,6 +45,41 @@ describe("extractReviewVerdict", () => {
     assert.equal(got.verdict, "PASS");
   });
 
+  test("a bold or heading first line carries the verdict, ahead of any bold token below it", () => {
+    const table = "**PR #1969 (#1968): PASS.**\n\n## Triage\n\n| check | result |\n|---|---|\n| row | (a) **FAIL**, (b) **executes and PASSES** |\n";
+    assert.equal(extractReviewVerdict(table).verdict, "PASS");
+    assert.equal(extractReviewVerdict("**Triage verdict: FAIL — regression. Routed back to the builder.**\n").verdict, "FAIL");
+    assert.equal(extractReviewVerdict("**PASS.** Verdict posted: https://example/pr/2019\n").verdict, "PASS");
+    assert.equal(extractReviewVerdict("## PR #1971 (#1964) — PASS\n\nTree clean.\n").verdict, "PASS");
+  });
+
+  test("a plain-prose first line is not a headline, even when it mentions a verdict word", () => {
+    const got = extractReviewVerdict("Baseline worktree removed, no labels applied (correct for a PASS).\n\n## Verdict: FAIL — #900 / PR #903\n");
+    assert.equal(got.verdict, "FAIL");
+  });
+
+  test("reads the verifier's Verdict line in its three observed shapes", () => {
+    assert.equal(extractReviewVerdict("**Verdict: PASS** — posted to PR #893.\n").verdict, "PASS");
+    assert.equal(extractReviewVerdict("Tree clean.\n\n## Verdict: FAIL — #900 / PR #903\n").verdict, "FAIL");
+    assert.equal(extractReviewVerdict("**Verdict on PR #909 (#906): PASS.** Tree clean.\n").verdict, "PASS");
+  });
+
+  test("a Verdict line yields to an explicit Decision: line", () => {
+    const got = extractReviewVerdict("Verdict: PASS on the plan.\n\n**Decision: FAIL** — needs-rework applied.\n");
+    assert.equal(got.verdict, "FAIL");
+  });
+
+  test("prose about a verdict, not at a line start, is not a verdict", () => {
+    assert.equal(extractReviewVerdict("The plan's security review carries a PASS verdict: fine.\n").verdict, "UNKNOWN");
+  });
+
+  test("'No MUST FIX' is a zero claim, not one occurrence", () => {
+    const got = extractReviewVerdict("**Verdict: PASS** on #921. No MUST FIX, no SHOULD FIX, no NIT.\n");
+    assert.equal(got.mustFix, 0);
+    assert.equal(got.shouldFix, 0);
+    assert.equal(got.nit, 0);
+  });
+
   test("falls back to a bare PASS/FAIL on the Review complete line", () => {
     assert.equal(extractReviewVerdict("Review complete — PASS, posted as a PR comment.\n").verdict, "PASS");
   });

@@ -27,13 +27,22 @@ export interface ReviewVerdict {
 function countFindings(output: string, kindPattern: string): number {
   const numeric = output.match(new RegExp(`(\\d+)\\s+${kindPattern}\\b`));
   if (numeric) return Number(numeric[1]);
+  // "No MUST FIX" is a zero claim, not one bare occurrence.
+  if (new RegExp(`\\b[Nn]o\\s+${kindPattern}\\b`).test(output)) return 0;
   return (output.match(new RegExp(`\\b${kindPattern}\\b`, "g")) ?? []).length;
 }
 
 /** Verdict shapes observed in the corpus, most reliable first:
- *  `Decision: FAIL` (with or without bold), a bold `**PASS**`/`**FAIL**`
- *  headline (earliest occurrence wins when prose mentions the other),
- *  and a bare PASS/FAIL on the "Review complete" line. Anything else is
+ *  `Decision: FAIL` (with or without bold); a bold or heading first
+ *  line carrying the verdict, which is how the builder set's verifier
+ *  opens (`**PR #1969 (#1968): PASS.**`, `**Triage verdict: FAIL —
+ *  regression.**`, `**PASS.** Verdict posted`) — read before any bold
+ *  token because a results table further down can carry a bold FAIL
+ *  of its own; a line opening with `Verdict` that reaches its colon
+ *  within a few words (`## Verdict: PASS — #900`, `**Verdict on PR
+ *  #909 (#906): PASS.**`); a bold `**PASS**`/`**FAIL**` headline
+ *  (earliest occurrence wins when prose mentions the other); and a
+ *  bare PASS/FAIL on the "Review complete" line. Anything else is
  *  UNKNOWN rather than guessed. */
 export function extractReviewVerdict(output: string): ReviewVerdict {
   const counts = {
@@ -44,6 +53,15 @@ export function extractReviewVerdict(output: string): ReviewVerdict {
 
   const decision = output.match(/Decision:\s*\**(PASS|FAIL)/);
   if (decision) return { verdict: decision[1] as "PASS" | "FAIL", ...counts };
+
+  const headline = output.split("\n").find((line) => line.trim() !== "") ?? "";
+  if (/^\s*(\*\*|#)/.test(headline)) {
+    const token = headline.match(/\b(PASS|FAIL)\b/);
+    if (token) return { verdict: token[1] as "PASS" | "FAIL", ...counts };
+  }
+
+  const verdictLine = output.match(/(?:^|\n)[ #*]*Verdict\b[^\n:]{0,40}:\s*\**\s*(PASS|FAIL)\b/);
+  if (verdictLine) return { verdict: verdictLine[1] as "PASS" | "FAIL", ...counts };
 
   const bold = output.match(/\*\*(PASS|FAIL)\*\*/);
   if (bold) return { verdict: bold[1] as "PASS" | "FAIL", ...counts };
