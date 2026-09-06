@@ -53,6 +53,20 @@ export interface GateTally {
   skipped: number;
   /** Fully-qualified names of failed leaf tests, in encounter order. */
   failedNames: string[];
+  /**
+   * Fully-qualified names of passed leaf tests, in encounter order. The
+   * same-tree re-run reads this to say which of the tests it was asked
+   * about actually ran and passed; a name in neither list stays failing.
+   */
+  passedNames: string[];
+  /**
+   * The subset of `failedNames` that never reached a terminal event because
+   * the test binary's OWN deadline fired first (`go test -timeout`). Go
+   * reports that as a panic listing every test still running, and nothing
+   * else in the stream names them. Counted as failed — a hang is a failure
+   * with a name — and listed separately so the evidence comment can say so.
+   */
+  timedOutTests: string[];
   /** Reason text for each skip, in encounter order. Deduped downstream. */
   skipReasons: string[];
   /**
@@ -80,12 +94,24 @@ function emptyTally(): GateTally {
     failed: 0,
     skipped: 0,
     failedNames: [],
+    passedNames: [],
+    timedOutTests: [],
     skipReasons: [],
     packageFailed: false,
     packageFailures: [],
     recognizedLines: 0,
   };
 }
+
+/**
+ * The first line of the panic `go test` raises when its own `-timeout`
+ * fires. What follows is `running tests:` and one indented line per test
+ * still in flight, then a blank line and the goroutine dump.
+ */
+const GO_TIMEOUT_PANIC = /^\s*panic: test timed out after /;
+
+/** One entry of that `running tests:` list: `\t\tTestFoo/case (2m59s)`. */
+const GO_RUNNING_TEST_LINE = /^\s+((?:Test|Benchmark|Example|Fuzz)\S*) \([^)]*\)\s*$/;
 
 /**
  * Parse a gate command's raw output into a tally.
@@ -177,10 +203,32 @@ function parseGoJson(raw: string): GateTally {
   // event, so a long run cannot grow this without bound.
   const outputTail = new Map<string, string[]>();
 
+  // Tests still running when `go test`'s own deadline fired. They get no
+  // terminal event, so without this the run reads as a package failure with
+  // no test to attribute — which skips the base comparison and the re-run
+  // and routes straight to rework. On 2026-09-06 (pyrycode #2089) that
+  // happened over one hung offline test the panic had named in full.
+  let inTimeoutList = false;
+  const timedOut: { pkg: string; test: string }[] = [];
+
   for (const event of events) {
     const pkg = event.Package ?? "";
     const test = event.Test ?? "";
     const key = `${pkg}\t${test}`;
+
+    if (event.Action === "output") {
+      const text = event.Output ?? "";
+      if (GO_TIMEOUT_PANIC.test(text)) {
+        inTimeoutList = true;
+      } else if (inTimeoutList) {
+        const match = text.match(GO_RUNNING_TEST_LINE);
+        if (match) {
+          timedOut.push({ pkg, test: match[1] });
+        } else if (!text.startsWith("\t")) {
+          inTimeoutList = false; // blank line, then the goroutine dump
+        }
+      }
+    }
 
     if (test === "") {
       // Package-level event.
@@ -217,6 +265,7 @@ function parseGoJson(raw: string): GateTally {
     if (event.Action === "pass") {
       tally.passed++;
       tally.executed++;
+      tally.passedNames.push(qualified);
     } else if (event.Action === "fail") {
       tally.failed++;
       tally.executed++;
@@ -225,6 +274,20 @@ function parseGoJson(raw: string): GateTally {
       tally.skipped++;
       tally.skipReasons.push(`${qualified}: ${extractSkipReason(tail)}`);
     }
+  }
+
+  // A hung test ran a body and never finished: failed, executed, and named.
+  // Same leaf-only and seen-once rules as a terminal event, so a parent
+  // listed alongside its hung subtest is not a second failure.
+  for (const { pkg, test } of timedOut) {
+    const key = `${pkg}\t${test}`;
+    if (hasChildren(pkg, test) || seen.has(key)) continue;
+    seen.add(key);
+    const qualified = pkg === "" ? test : `${pkg}.${test}`;
+    tally.failed++;
+    tally.executed++;
+    tally.failedNames.push(qualified);
+    tally.timedOutTests.push(qualified);
   }
 
   return tally;
@@ -308,6 +371,7 @@ function parsePlaywrightJson(raw: string): GateTally {
           } else if (status === "expected" || status === "flaky") {
             tally.passed++;
             tally.executed++;
+            tally.passedNames.push(name);
           }
           // Any other status is left uncounted on purpose: an unknown
           // outcome must not become an executed test, because executed
@@ -376,6 +440,13 @@ export function stripPackageQualifier(qualifiedName: string): string {
  * and quoting arbitrary text into a regex inside a shell command is exactly
  * the kind of two-layer escaping that goes wrong quietly. If any name is
  * unsafe the whole filter is refused, so the comparison is never partial.
+ *
+ * A subtest is filtered by its TOP-LEVEL test. `go test -run` splits the
+ * pattern on `/` and matches each level separately, so an alternation that
+ * contains a slash — `^(TestA/sub|TestB)$` — is split into `^(TestA` and
+ * `sub|TestB)$`, two broken regexps, and the run refuses to start. Running
+ * the whole parent re-runs sibling subtests too, which costs a little and
+ * changes nothing: results are still compared by full leaf name.
  */
 export function buildBaselineFilter(qualifiedFailedNames: readonly string[]): string | null {
   const safe = /^[A-Za-z0-9_/#.\-]+$/;
@@ -383,7 +454,9 @@ export function buildBaselineFilter(qualifiedFailedNames: readonly string[]): st
   for (const qualified of qualifiedFailedNames) {
     const name = stripPackageQualifier(qualified);
     if (name === "" || !safe.test(name)) return null;
-    if (!bare.includes(name)) bare.push(name);
+    const top = name.split("/")[0];
+    if (top === "") return null;
+    if (!bare.includes(top)) bare.push(top);
   }
   if (bare.length === 0) return null;
   // Escape the regex metacharacters the safe set still allows.
@@ -474,6 +547,24 @@ export interface GateRunReport {
   baselineSkipReason: string | null;
   /** Where the baseline's own bytes live, when it ran. */
   baselineOutputPath: string | null;
+  /**
+   * Which of the branch's failing tests failed AGAIN when re-run on the same
+   * merged tree, before any base comparison.
+   *
+   * Null means no re-run happened: nothing failed, no baseline command is
+   * configured (the re-run reuses its template), or the re-run could not
+   * run. Same null-versus-empty discipline as `baselineFailures`: empty
+   * means every failure passed on the second try and is nondeterministic,
+   * null means nothing is known and every failure stays on the hook. A
+   * flake that passes on the base commit looks exactly like a regression to
+   * the base comparison alone, which is how pyrycode #2089 tripped the
+   * rework breaker on 2026-09-06 over a test its branch never reaches.
+   */
+  rerunFailures: string[] | null;
+  /** Why no re-run happened, for the evidence comment. Null when one did. */
+  rerunSkipReason: string | null;
+  /** Where the re-run's own bytes live, when it ran. */
+  rerunOutputPath: string | null;
 }
 
 /**
@@ -497,10 +588,13 @@ export function formatGateEvidenceComment(opts: {
   introduced?: readonly string[];
   /** Failures that also fail on the base commit. */
   preExisting?: readonly string[];
+  /** Failures that passed when re-run on the same merged tree. */
+  flaky?: readonly string[];
 }): string {
   const { report } = opts;
   const heading: Record<string, string> = {
     pass: "✅ Real-claude gate — PASS",
+    "flaky-pass": "⚠️ Real-claude gate — PASS, AFTER A RE-RUN",
     fail: "❌ Real-claude gate — FAIL",
     "zero-executed": "🚨 Real-claude gate — NOTHING EXECUTED",
     unusable: "🚨 Real-claude gate — NO USABLE RESULT",
@@ -556,7 +650,26 @@ export function formatGateEvidenceComment(opts: {
     );
     lines.push("");
 
-    if (tally.failedNames.length > 0) {
+    const flaky = opts.flaky ?? [];
+    if (flaky.length > 0) {
+      lines.push(
+        `**Failed once, then passed when re-run on the same merged tree (${flaky.length})** — ` +
+        `nondeterministic, so not attributed to this branch:`,
+      );
+      lines.push("");
+      for (const name of flaky.slice(0, 25)) lines.push(`- \`${name}\``);
+      if (flaky.length > 25) lines.push(`- …and ${flaky.length - 25} more, see the re-run output`);
+      lines.push("");
+      lines.push(
+        `Re-run output: \`${report.rerunOutputPath ?? "(none)"}\`. A test on this list is a flake in the suite ` +
+        `until someone shows otherwise; it is named here so it can be tracked rather than forgotten.`,
+      );
+      lines.push("");
+    }
+
+    const flakySet = new Set(flaky);
+    const remaining = tally.failedNames.filter(name => !flakySet.has(name));
+    if (remaining.length > 0) {
       const introduced = opts.introduced ?? [];
       const preExisting = opts.preExisting ?? [];
       const compared = report.baselineFailures !== null;
@@ -568,12 +681,12 @@ export function formatGateEvidenceComment(opts: {
         lines.push("");
       }
 
-      const own = compared ? introduced : tally.failedNames;
+      const own = compared ? introduced : remaining;
       if (own.length > 0) {
         lines.push(
           compared
             ? `**Failing here but passing on \`${report.baseRef}\` (${own.length})** — introduced by this branch:`
-            : `**Failed (${tally.failed})**`,
+            : `**Failed (${own.length})**`,
         );
         lines.push("");
         for (const name of own.slice(0, 25)) lines.push(`- \`${name}\``);
@@ -588,6 +701,21 @@ export function formatGateEvidenceComment(opts: {
           : `**No base comparison was made**, so these failures are attributed to this branch by default. ` +
             `Reason: ${report.baselineSkipReason ?? "unknown"}.`,
       );
+      lines.push("");
+      if (report.rerunFailures === null && report.rerunSkipReason !== null) {
+        lines.push(`**No same-tree re-run was made** either, so a flake could not be told from a regression. ` +
+          `Reason: ${report.rerunSkipReason}.`);
+        lines.push("");
+      }
+    }
+
+    if (tally.timedOutTests.length > 0) {
+      lines.push(
+        `**Still running when the test binary's own timeout fired (${tally.timedOutTests.length})** — ` +
+        `counted as failed, because a hang is a failure with a name:`,
+      );
+      lines.push("");
+      for (const name of tally.timedOutTests.slice(0, 15)) lines.push(`- \`${name}\``);
       lines.push("");
     }
 

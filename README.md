@@ -19,6 +19,8 @@ Inbox → Backlog → In Architecture → In Development → In Code Review → 
 
 Each transition is gated by a `done:<agent>` label, advanced automatically when the previous agent finishes. Failures route via `needs-rework:<agent>` (back to that agent) or `error:<agent>` (held for human triage).
 
+A `needs-rework:<agent>` naming an agent the active stage set does not run parks the ticket under `error:rework-target` with a comment listing the agents that exist. Without that, the label stays on, nothing moves, and the agent that applied it is re-dispatched every cycle: on 2026-09-06 a verifier on the builder set applied `needs-rework:po`, a role that set lacks, and ran again 27 seconds later.
+
 ### Worktree isolation
 
 Each dispatch creates a fresh `git worktree` under `.<target>-worktrees/<agent>-<issue#>/`. Concurrent dispatches don't interfere; failures leave the worktree as evidence for triage; `git worktree remove --force` cleans up.
@@ -128,10 +130,13 @@ Some tickets can only be accepted by running against real claude rather than the
 | Verdict | Board | Labels | Discord |
 |---|---|---|---|
 | pass | → In Documentation | removes `needs-real-claude` | no |
+| flaky: every failure passed on a same-tree re-run | → In Documentation | removes `needs-real-claude` | yes, naming the flaky tests |
 | fail | → In Development | adds the set's fail rework label (`needs-rework:developer` classic, `needs-rework:builder` builder), **keeps** `needs-real-claude` | no |
 | failures the branch inherited | stays in Inbox | adds `error:real-claude-gate` | yes |
 | nothing executed | stays in Inbox | adds `error:real-claude-gate` | yes |
 | no usable result | stays in Inbox | adds `error:real-claude-gate` | yes |
+
+**The same-tree re-run, and why it comes first.** A base comparison tells a regression from an inherited failure. It cannot tell either from a flake, because a flake passes on the base too and so reads as a regression. On 2026-09-06 pyrycode #2089, a finished ticket with a fifth-pass review PASS, failed one liveness test its diff never reaches; the test had passed the previous nineteen gate runs and passed three of three by hand minutes later, but it passed on the base, so the gate routed the ticket to rework and the three-strike breaker tripped. So when a run fails with named tests, the gate first re-runs **only those tests** in the same merged worktree, using the baseline command template. A test that passes there is set aside as flaky and never reaches the base; only tests that fail again are compared. When every failure was flaky the verdict is flaky-pass: the ticket advances exactly as on a pass, the flaky tests are named in the evidence comment, and Discord is pinged so the suite gets looked at. Only a test seen passing is excused; a name the re-run skipped or never reported stays failing, and a re-run that executes nothing proves nothing. Hangs the test binary's own `-timeout` killed are not re-tried, since a hang costs the whole timeout again; the panic names them, so they are counted as failures and compared against the base like any other.
 
 **The base comparison, and why it exists.** On the gate's first live run, 2026-08-07, a ticket came back with 519 passed and 2 failed and was routed to the developer agent. Both failures reproduced identically on clean `main` and neither touched the ticket's subject. Without a baseline the gate cannot tell "this branch broke it" from "it was already broken", so it hands an agent work it did not cause and cannot fix, burning rework attempts until the breaker halts it.
 

@@ -3535,6 +3535,9 @@ export async function runRealClaudeGateSuite(opts: {
     baselineFailures: null,
     baselineSkipReason: opts.baselineCommand ? null : "no baseline command configured for this fork",
     baselineOutputPath: null,
+    rerunFailures: null,
+    rerunSkipReason: opts.baselineCommand ? null : "no baseline command configured for this fork, and the re-run reuses its template",
+    rerunOutputPath: null,
   };
   const finish = (runError?: string): GateRunReport => {
     if (runError !== undefined) report.runError = runError;
@@ -3644,16 +3647,47 @@ export async function runRealClaudeGateSuite(opts: {
     }
     if (raw !== null) report.tally = parseGateOutput(raw, opts.format);
 
-    // Base-commit comparison, only when the branch actually failed named
-    // tests. Answers the one question the branch run cannot: did this
-    // branch break these, or were they already broken? Runs against the
-    // base ALONE, unmerged, which is exactly "what happens without my
-    // work". Filtered to the failing names, so it costs seconds.
+    // Same-tree re-run, only when the branch failed named tests. Answers
+    // the question a single run cannot: does this fail every time, or did
+    // it fail once? Runs in the SAME merged worktree, filtered to the
+    // failing names, so it costs seconds. Tests the binary's own deadline
+    // killed are not re-tried here — a hang costs the full timeout again
+    // and is not the shape a flake takes.
     const failedNames = report.tally?.failedNames ?? [];
-    if (failedNames.length > 0 && opts.baselineCommand) {
+    const timedOutTests = new Set(report.tally?.timedOutTests ?? []);
+    const rerunCandidates = failedNames.filter(name => !timedOutTests.has(name));
+    if (rerunCandidates.length > 0 && opts.baselineCommand) {
+      await runBranchRerun({
+        report,
+        failedNames: rerunCandidates,
+        commandTemplate: opts.baselineCommand,
+        worktreeDir,
+        format: opts.format,
+        timeoutMs: opts.timeoutMs,
+        issueNumber: opts.issueNumber,
+        logsDir,
+        stamp,
+        deps,
+      });
+    } else if (rerunCandidates.length === 0 && report.rerunSkipReason === null) {
+      report.rerunSkipReason = failedNames.length === 0
+        ? "no named test failures to re-run"
+        : "every named failure was a hang the test binary's own timeout killed, and a hang is not re-tried";
+    }
+
+    // Base-commit comparison, over the failures that survived the re-run.
+    // Answers the one question the branch run cannot: did this branch
+    // break these, or were they already broken? Runs against the base
+    // ALONE, unmerged, which is exactly "what happens without my work".
+    // Filtered to the failing names, so it costs seconds.
+    const rerunSet = report.rerunFailures === null ? null : new Set(report.rerunFailures);
+    const persistent = rerunSet === null
+      ? failedNames
+      : failedNames.filter(name => rerunSet.has(name) || timedOutTests.has(name));
+    if (persistent.length > 0 && opts.baselineCommand) {
       await runBaselineComparison({
         report,
-        failedNames,
+        failedNames: persistent,
         baselineCommand: opts.baselineCommand,
         baseSha: report.baseSha,
         format: opts.format,
@@ -3664,8 +3698,10 @@ export async function runRealClaudeGateSuite(opts: {
         stamp,
         deps,
       });
-    } else if (failedNames.length === 0 && report.baselineSkipReason === null) {
-      report.baselineSkipReason = "no named test failures to compare";
+    } else if (persistent.length === 0 && report.baselineSkipReason === null) {
+      report.baselineSkipReason = failedNames.length === 0
+        ? "no named test failures to compare"
+        : "every named failure passed on the same-tree re-run, so there was nothing to compare against the base";
     }
 
     return finish();
@@ -3780,6 +3816,99 @@ async function runBaselineComparison(opts: {
     report.baselineSkipReason = `the base re-run failed unexpectedly: ${e?.message ?? e}`;
   } finally {
     removeWorktree();
+  }
+}
+
+/**
+ * Re-run just the branch's failing tests in the SAME merged worktree, and
+ * record which of them fail again.
+ *
+ * The base comparison tells a regression from an inherited failure; it
+ * cannot tell either from a flake, because a flake passes on the base too.
+ * This runs first, so only failures that reproduce reach the base. Same
+ * contract as `runBaselineComparison`: mutates `report`, never throws, and
+ * a re-run that cannot run leaves `rerunFailures` null, which the decision
+ * reads as "nothing known" — every failure stays the branch's. Excusing a
+ * failure because the re-run broke would be the false green again.
+ *
+ * Reuses the baseline command template and its `{{TESTS}}` placeholder: the
+ * filtered invocation is the same shape, only the tree differs.
+ */
+async function runBranchRerun(opts: {
+  report: GateRunReport;
+  failedNames: readonly string[];
+  commandTemplate: string;
+  /** The merged worktree the main run used. Still on disk at this point. */
+  worktreeDir: string;
+  format: GateOutputFormat;
+  timeoutMs: number;
+  issueNumber: number;
+  logsDir: string;
+  stamp: string;
+  deps: GateRunnerDeps;
+}): Promise<void> {
+  const { report, deps } = opts;
+
+  const filter = buildBaselineFilter(opts.failedNames);
+  if (filter === null) {
+    report.rerunSkipReason =
+      "could not build a safe test filter from the failing names, so no re-run was attempted";
+    return;
+  }
+  const command = buildBaselineCommand(opts.commandTemplate, filter);
+  if (command === null) {
+    report.rerunSkipReason =
+      `the baseline command has no ${BASELINE_TESTS_PLACEHOLDER} placeholder, so a re-run would repeat the whole suite`;
+    return;
+  }
+  const stdoutPath = resolve(opts.logsDir, `${opts.stamp}_real-claude-gate-rerun_#${opts.issueNumber}.log`);
+  const stderrPath = resolve(opts.logsDir, `${opts.stamp}_real-claude-gate-rerun_#${opts.issueNumber}.stderr.log`);
+
+  try {
+    console.log(`   🔁 Real-claude gate: re-running ${opts.failedNames.length} failing test(s) on the same merged tree…`);
+    const outcome = await deps.spawnGate({
+      command,
+      cwd: opts.worktreeDir,
+      env: buildGateSpawnEnv(process.env),
+      timeoutMs: opts.timeoutMs,
+      stdoutPath,
+      stderrPath,
+    });
+    report.rerunOutputPath = stdoutPath;
+
+    if (outcome.timedOut) {
+      report.rerunSkipReason = "the re-run hit the outer timeout, so its result is a truncated prefix";
+      return;
+    }
+
+    let raw: string;
+    try {
+      raw = deps.readFileSync(stdoutPath, "utf-8").toString();
+    } catch (e: any) {
+      report.rerunSkipReason = `could not read the re-run's output back: ${e?.message ?? e}`;
+      return;
+    }
+
+    const tally = parseGateOutput(raw, opts.format);
+    if (tally.recognizedLines === 0) {
+      report.rerunSkipReason = "the re-run produced no readable test events";
+      return;
+    }
+    // A re-run that SKIPPED the tests proves nothing, the same false green
+    // the gate exists to reject. Accepting it would excuse every failure.
+    if (tally.executed === 0) {
+      report.rerunSkipReason =
+        `the re-run executed nothing (${tally.skipped} skipped), so it cannot tell a flake from a regression`;
+      return;
+    }
+    // Per name, and only a test seen PASSING is excused. A name the re-run
+    // never reported on — skipped, not matched by the filter, or lost in a
+    // crash — stays failing. Absence of a failure is not a pass.
+    const passed = new Set(tally.passedNames);
+    report.rerunFailures = opts.failedNames.filter(name => !passed.has(name));
+    report.rerunSkipReason = null;
+  } catch (e: any) {
+    report.rerunSkipReason = `the re-run failed unexpectedly: ${e?.message ?? e}`;
   }
 }
 

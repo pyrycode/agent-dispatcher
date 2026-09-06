@@ -365,6 +365,64 @@ export function decideReworkRoutes(
   return routes;
 }
 
+/**
+ * Label the dispatcher adds when a ticket carries a `needs-rework:<target>`
+ * whose target is not an agent in the active stage set. The `error:` prefix
+ * is what stops dispatch; the specific name says why.
+ */
+export const REWORK_TARGET_ERROR_LABEL = "error:rework-target";
+
+/** A ticket whose rework labels all name agents this board does not run. */
+export interface UnroutableRework {
+  itemId: string;
+  issueNumber: number;
+  fromColumn: string;
+  /** The rework labels that could not be routed, in label order. */
+  labels: string[];
+}
+
+/**
+ * Companion to `decideReworkRoutes`: the tickets it silently passed over.
+ *
+ * `decideReworkRoutes` skips a rework label whose target is not in the
+ * agent map, which is right for a typo but wrong as the whole story. The
+ * label stays on the ticket, nothing moves, and `shouldSkipDispatch` only
+ * blocks the agent the label names — so the agent that APPLIED it runs
+ * again on the next cycle. On 2026-09-06 a verifier on the builder set
+ * applied `needs-rework:po`, a role that set does not have; the dispatcher
+ * re-ran the verifier 27 seconds later and bumped the family counter for
+ * nothing (pyrycode #2089). The honest translation of "route to an agent
+ * that is not here" is "stop and tell a human", which is what the caller
+ * does with these.
+ *
+ * Only tickets with NO routable rework label are returned: a ticket that
+ * carries both a known and an unknown target routes on the known one,
+ * exactly as `decideReworkRoutes` already does, and the unknown label is
+ * stripped with the rest of the state trail.
+ */
+export function decideUnroutableRework(
+  agentColumnMap: ReadonlyMap<string, string>,
+  itemsByColumn: ReadonlyMap<string, readonly DecisionItem[]>,
+): UnroutableRework[] {
+  const out: UnroutableRework[] = [];
+  for (const [fromColumn, items] of itemsByColumn) {
+    for (const item of items) {
+      if (item.issueNumber <= 0) continue;
+      const unknown: string[] = [];
+      let routable = false;
+      for (const label of item.labels) {
+        const target = extractReworkTarget(label);
+        if (target === null) continue;
+        if (agentColumnMap.has(target)) { routable = true; break; }
+        unknown.push(label);
+      }
+      if (routable || unknown.length === 0) continue;
+      out.push({ itemId: item.id, issueNumber: item.issueNumber, fromColumn, labels: unknown });
+    }
+  }
+  return out;
+}
+
 // --------- Real-claude operator gate ---------
 
 /**
@@ -543,10 +601,16 @@ export function decideRealClaudeGateRun(
   return null;
 }
 
-/** The four things a gate run can mean. */
+/** The things a gate run can mean. */
 export type GateVerdict =
   /** The suite ran, enough of it executed, and none of it failed. */
   | "pass"
+  /**
+   * Every failure passed when re-run on the same merged tree, so the suite
+   * is green and the failures were nondeterministic. Advances like a pass,
+   * but pings a human so the flaky tests get looked at rather than buried.
+   */
+  | "flaky-pass"
   /** Real test failures, or a suite-level failure like a build error. */
   | "fail"
   /** The suite ran but verified (almost) nothing — the 2026-07-22 shape. */
@@ -686,6 +750,8 @@ export interface BaselineAdjustedVerdict {
   introduced: string[];
   /** Failures the branch inherited: red both ways. */
   preExisting: string[];
+  /** Failures that passed when re-run on the same merged tree: flaky. */
+  flaky: string[];
 }
 
 /**
@@ -710,6 +776,21 @@ export interface BaselineAdjustedVerdict {
  * failure is new, null means nothing is known. Treating unknown as
  * pre-existing would let a genuine regression park quietly as somebody
  * else's problem, which is a worse failure than the one this fixes.
+ *
+ * **The same-tree re-run comes first, and a missing re-run excuses nothing
+ * either.** A base comparison answers "did this branch break it?" and a
+ * flake answers "yes" to that by accident: it fails on the branch, passes
+ * on the base, and reads as a regression. On 2026-09-06 pyrycode #2089, a
+ * finished ticket with a fifth-pass review PASS, was routed to rework and
+ * tripped the three-strike breaker over a liveness test its diff never
+ * reaches, which had passed the previous nineteen gate runs and passed
+ * three of three by hand minutes later. So before the base is consulted,
+ * every named failure is re-run on the same merged tree. A failure that
+ * passes there is set aside as flaky; only the ones that fail again are
+ * compared against the base. When every failure was flaky the verdict is
+ * `flaky-pass`, which advances like a pass and pings a human. Null
+ * `rerunFailures` means nothing was re-run, and every failure stays on
+ * the hook exactly as before.
  */
 export function decideBaselineAdjustedVerdict(opts: {
   verdict: GateVerdict;
@@ -717,47 +798,76 @@ export function decideBaselineAdjustedVerdict(opts: {
   branchFailures: readonly string[];
   /** Failing names from the base re-run, or null when none ran. */
   baselineFailures: readonly string[] | null;
+  /**
+   * Names that failed AGAIN when re-run on the merged tree, or null when no
+   * re-run happened. Optional so a caller with no re-run stage behaves
+   * exactly as before.
+   */
+  rerunFailures?: readonly string[] | null;
   reason: string;
 }): BaselineAdjustedVerdict {
   // Only a failure has anything to compare. Every other verdict is about
   // whether the run is trustworthy at all, which a baseline cannot change.
   if (opts.verdict !== "fail") {
-    return { verdict: opts.verdict, reason: opts.reason, introduced: [], preExisting: [] };
+    return { verdict: opts.verdict, reason: opts.reason, introduced: [], preExisting: [], flaky: [] };
   }
+
+  const rerunSet = opts.rerunFailures == null ? null : new Set(opts.rerunFailures);
+  const flaky = rerunSet === null ? [] : opts.branchFailures.filter(name => !rerunSet.has(name));
+  const persistent = rerunSet === null ? [...opts.branchFailures] : opts.branchFailures.filter(name => rerunSet.has(name));
+
+  if (rerunSet !== null && opts.branchFailures.length > 0 && persistent.length === 0) {
+    return {
+      verdict: "flaky-pass",
+      reason:
+        `${flaky.length} test(s) failed once and passed when re-run on the same merged tree, ` +
+        `so the failure is nondeterministic rather than this branch's`,
+      introduced: [],
+      preExisting: [],
+      flaky,
+    };
+  }
+
+  const flakyNote = flaky.length > 0
+    ? `; ${flaky.length} other(s) passed on re-run and are set aside as flaky`
+    : "";
 
   if (opts.baselineFailures === null) {
     return {
       verdict: "fail",
-      reason: `${opts.reason}; no base comparison was available, so the failures are treated as this branch's`,
-      introduced: [...opts.branchFailures],
+      reason: `${opts.reason}; no base comparison was available, so the failures are treated as this branch's${flakyNote}`,
+      introduced: persistent,
       preExisting: [],
+      flaky,
     };
   }
 
   const baseSet = new Set(opts.baselineFailures);
-  const introduced = opts.branchFailures.filter(name => !baseSet.has(name));
-  const preExisting = opts.branchFailures.filter(name => baseSet.has(name));
+  const introduced = persistent.filter(name => !baseSet.has(name));
+  const preExisting = persistent.filter(name => baseSet.has(name));
 
   // A package-level failure with no named failing test cannot be attributed
   // either way, so it keeps the branch on the hook.
-  if (introduced.length === 0 && opts.branchFailures.length > 0) {
+  if (introduced.length === 0 && persistent.length > 0) {
     return {
       verdict: "inherited-failure",
       reason:
         `${preExisting.length} test(s) failed, and every one of them fails on the base commit too, ` +
-        `so this branch introduced none of them`,
+        `so this branch introduced none of them${flakyNote}`,
       introduced,
       preExisting,
+      flaky,
     };
   }
 
   return {
     verdict: "fail",
-    reason: preExisting.length > 0
+    reason: (preExisting.length > 0
       ? `${introduced.length} test(s) failed that pass on the base commit, plus ${preExisting.length} already failing there`
-      : opts.reason,
+      : opts.reason) + flakyNote,
     introduced,
     preExisting,
+    flaky,
   };
 }
 
@@ -775,6 +885,7 @@ export interface GateOutcome {
  * Map a verdict onto board actions.
  *
  *   pass          → In Documentation, clear `needs-real-claude`
+ *   flaky-pass    → the same, plus a Discord ping naming the flaky tests
  *   fail          → In Development, add the set's fail rework label (classic: `needs-rework:developer`)
  *   zero-executed → stays in Inbox, add `error:real-claude-gate`, notify
  *   unusable      → stays in Inbox, add `error:real-claude-gate`, notify
@@ -807,6 +918,15 @@ export function decideGateOutcome(
         addLabels: [],
         removeLabels: [REAL_CLAUDE_GATE_LABEL],
         notify: false,
+      };
+    case "flaky-pass":
+      // Same board actions as a pass: the suite is green on re-run and the
+      // ticket did nothing wrong. The ping is for the suite, not the ticket.
+      return {
+        toColumn: REAL_CLAUDE_GATE_PASS_COLUMN,
+        addLabels: [],
+        removeLabels: [REAL_CLAUDE_GATE_LABEL],
+        notify: true,
       };
     case "fail":
       return {

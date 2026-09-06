@@ -88,6 +88,8 @@ import {
   decideGateOutcome,
   decideGateVerdict,
   decideBaselineAdjustedVerdict,
+  decideUnroutableRework,
+  REWORK_TARGET_ERROR_LABEL,
   decideRealClaudeGateRun,
   REAL_CLAUDE_GATE_LABEL,
   shouldAddReadyLabel,
@@ -1503,6 +1505,50 @@ describe("decideReworkRoutes", () => {
     assert.equal(r.length, 1);
     assert.equal(r[0].triggerLabel, "needs-rework:developer");
     assert.equal(r[0].toColumn, "In Development");
+  });
+});
+
+describe("decideUnroutableRework", () => {
+  type Item = { id: string; issueNumber: number; labels: string[] };
+  const items = (...rows: [string, Item[]][]): Map<string, Item[]> => new Map(rows);
+
+  test("a rework label naming an agent the set lacks is reported", () => {
+    // 2026-09-06, pyrycode #2089: a verifier on the builder set applied
+    // needs-rework:po, a role that set does not have. The route decision
+    // skipped it, the label stayed, and the verifier was re-dispatched 27
+    // seconds later for a guaranteed repeat.
+    const r = decideUnroutableRework(
+      AGENT_COLUMN_MAP,
+      items(["In Code Review", [{ id: "i1", issueNumber: 2089, labels: ["needs-rework:designer", "done:verifier"] }]]),
+    );
+    assert.equal(r.length, 1);
+    assert.equal(r[0].issueNumber, 2089);
+    assert.equal(r[0].fromColumn, "In Code Review");
+    assert.deepEqual(r[0].labels, ["needs-rework:designer"]);
+  });
+
+  test("a routable label alongside an unknown one is a route, not a park", () => {
+    const r = decideUnroutableRework(
+      AGENT_COLUMN_MAP,
+      items(["In Code Review", [{ id: "i1", issueNumber: 1, labels: ["needs-rework:designer", "needs-rework:developer"] }]]),
+    );
+    assert.deepEqual(r, []);
+  });
+
+  test("no rework label, a bare one, or a non-issue item is nothing to report", () => {
+    const r = decideUnroutableRework(
+      AGENT_COLUMN_MAP,
+      items(["Backlog", [
+        { id: "i1", issueNumber: 1, labels: ["size:s"] },
+        { id: "i2", issueNumber: 2, labels: ["needs-rework:"] },
+        { id: "i3", issueNumber: 0, labels: ["needs-rework:designer"] },
+      ]]),
+    );
+    assert.deepEqual(r, []);
+  });
+
+  test("the park label carries the error: prefix that stops dispatch", () => {
+    assert.ok(REWORK_TARGET_ERROR_LABEL.startsWith("error:"));
   });
 });
 
@@ -4075,8 +4121,38 @@ describe("parseGateOutput — go-json", () => {
     assert.equal(t.failed, 1);
     assert.equal(t.skipped, 1);
     assert.deepEqual(t.failedNames, ["p.TestB"]);
+    assert.deepEqual(t.passedNames, ["p.TestA"]);
     assert.equal(t.packageFailed, true);
     assert.match(t.skipReasons[0], /no login token/);
+  });
+
+  test("a go test timeout panic names the hung tests as failures", () => {
+    // pyrycode #2089, 2026-09-06 12:06: 939 passed, 0 failed, and the binary
+    // died on its own 20-minute deadline with one offline test still
+    // running. With no name to attribute, the run read as a suite-level
+    // failure, skipped the base comparison, and routed straight to rework.
+    // The panic had named the test in full.
+    const raw = [
+      '{"Action":"run","Package":"p","Test":"TestOk"}',
+      '{"Action":"pass","Package":"p","Test":"TestOk"}',
+      '{"Action":"run","Package":"p","Test":"TestHold"}',
+      '{"Action":"run","Package":"p","Test":"TestHold/release_returns"}',
+      '{"Action":"output","Package":"p","Test":"TestHold/release_returns","Output":"panic: test timed out after 20m0s\\n"}',
+      '{"Action":"output","Package":"p","Test":"TestHold/release_returns","Output":"\\trunning tests:\\n"}',
+      '{"Action":"output","Package":"p","Test":"TestHold/release_returns","Output":"\\t\\tTestHold (3m0s)\\n"}',
+      '{"Action":"output","Package":"p","Test":"TestHold/release_returns","Output":"\\t\\tTestHold/release_returns (2m59s)\\n"}',
+      '{"Action":"output","Package":"p","Test":"TestHold/release_returns","Output":"\\n"}',
+      '{"Action":"output","Package":"p","Test":"TestHold/release_returns","Output":"goroutine 2026 [running]:\\n"}',
+      '{"Action":"fail","Package":"p"}',
+    ].join("\n");
+
+    const t = parseGateOutput(raw, "go-json");
+
+    assert.deepEqual(t.failedNames, ["p.TestHold/release_returns"], "the hung leaf, not its parent");
+    assert.deepEqual(t.timedOutTests, ["p.TestHold/release_returns"]);
+    assert.equal(t.failed, 1);
+    assert.equal(t.executed, 2, "the hung test ran a body; it counts as executed");
+    assert.deepEqual(t.passedNames, ["p.TestOk"]);
   });
 
   test("a parent whose subtests ALL skipped counts zero executed", () => {
@@ -4461,7 +4537,7 @@ describe("formatGateEvidenceComment", () => {
     exitCode: 0,
     tally: {
       executed: 176, passed: 176, failed: 0, skipped: 14,
-      failedNames: [], skipReasons: ["p.TestExternal: no network"],
+      failedNames: [], passedNames: [], timedOutTests: [], skipReasons: ["p.TestExternal: no network"],
       packageFailed: false, packageFailures: [], recognizedLines: 400,
     },
     command: "go test -tags e2e_realclaude -json ./...",
@@ -4476,7 +4552,40 @@ describe("formatGateEvidenceComment", () => {
     baselineFailures: null,
     baselineSkipReason: null,
     baselineOutputPath: null,
+    rerunFailures: null,
+    rerunSkipReason: null,
+    rerunOutputPath: null,
   };
+
+  test("names flaky tests and does not blame the branch for them", () => {
+    const body = formatGateEvidenceComment({
+      verdict: "flaky-pass", reason: "1 test(s) failed once and passed when re-run",
+      report: {
+        ...baseReport,
+        tally: { ...baseReport.tally, failed: 1, failedNames: ["p.TestLive"] },
+        rerunFailures: [], rerunOutputPath: "/logs/rerun.log",
+      },
+      minExecuted: 150, action: "moved it to In Documentation", flaky: ["p.TestLive"],
+    });
+    assert.match(body, /PASS, AFTER A RE-RUN/);
+    assert.match(body, /passed when re-run on the same merged tree \(1\)/);
+    assert.match(body, /p\.TestLive/);
+    assert.doesNotMatch(body, /introduced by this branch/);
+    assert.doesNotMatch(body, /No base comparison was made/);
+  });
+
+  test("lists tests the test binary's own timeout killed", () => {
+    const body = formatGateEvidenceComment({
+      verdict: "fail", reason: "1 test(s) failed",
+      report: {
+        ...baseReport,
+        tally: { ...baseReport.tally, failed: 1, failedNames: ["p.TestHang"], timedOutTests: ["p.TestHang"], packageFailed: true },
+      },
+      minExecuted: 150, action: "moved it to In Development",
+    });
+    assert.match(body, /own timeout fired \(1\)/);
+    assert.doesNotMatch(body, /Suite-level failure with no failing test/);
+  });
 
   test("carries the commits-behind figure so the merged-state claim is auditable", () => {
     const body = formatGateEvidenceComment({
@@ -4513,9 +4622,17 @@ describe("formatGateEvidenceComment", () => {
 });
 
 describe("buildBaselineFilter", () => {
-  test("builds an anchored, shell-quoted alternation from qualified names", () => {
+  test("builds an anchored, shell-quoted alternation from qualified names, at the top level", () => {
+    // `go test -run` splits its pattern on `/` and matches each level on its
+    // own, so `^(TestA|TestB/sub_case)$` becomes `^(TestA` and `sub_case)$`,
+    // two broken regexps and a run that refuses to start. The parent is
+    // filtered instead; results are still compared by full leaf name.
     const f = buildBaselineFilter(["pkg/path.TestA", "pkg/path.TestB/sub_case"]);
-    assert.equal(f, "'^(TestA|TestB/sub_case)$'");
+    assert.equal(f, "'^(TestA|TestB)$'");
+  });
+
+  test("two subtests of one parent collapse to that parent", () => {
+    assert.equal(buildBaselineFilter(["p.TestA/x", "p.TestA/y"]), "'^(TestA)$'");
   });
 
   test("strips only the package qualifier, keeping subtest paths", () => {
@@ -4611,6 +4728,53 @@ describe("decideBaselineAdjustedVerdict", () => {
       });
       assert.equal(d.verdict, v);
     }
+  });
+
+  test("every failure passing on the same-tree re-run is a flaky-pass, not a fail", () => {
+    // pyrycode #2089, 2026-09-06 12:47: a finished ticket with a fifth-pass
+    // review PASS failed one liveness test its diff never reaches. The test
+    // had passed the previous nineteen gate runs and passed three of three
+    // by hand minutes later; it passed on the base too, so the base
+    // comparison called it a regression and the rework breaker tripped.
+    const d = decideBaselineAdjustedVerdict({ ...base, baselineFailures: null, rerunFailures: [] });
+    assert.equal(d.verdict, "flaky-pass");
+    assert.deepEqual(d.flaky, ["p.TestA", "p.TestB"]);
+    assert.deepEqual(d.introduced, []);
+    assert.deepEqual(d.preExisting, []);
+  });
+
+  test("a failure that fails again is judged against the base; the flaky one is set aside", () => {
+    const d = decideBaselineAdjustedVerdict({ ...base, baselineFailures: [], rerunFailures: ["p.TestB"] });
+    assert.equal(d.verdict, "fail");
+    assert.deepEqual(d.introduced, ["p.TestB"]);
+    assert.deepEqual(d.flaky, ["p.TestA"]);
+    assert.match(d.reason, /set aside as flaky/);
+  });
+
+  test("a persistent failure that is also red on the base is inherited, flaky ones aside", () => {
+    const d = decideBaselineAdjustedVerdict({ ...base, baselineFailures: ["p.TestB"], rerunFailures: ["p.TestB"] });
+    assert.equal(d.verdict, "inherited-failure");
+    assert.deepEqual(d.preExisting, ["p.TestB"]);
+    assert.deepEqual(d.flaky, ["p.TestA"]);
+  });
+
+  test("INVARIANT: a MISSING re-run never excuses a failure", () => {
+    // Null and empty must not collapse here either. Empty means every
+    // failure ran again and passed; null means nothing was re-run.
+    for (const rerun of [null, undefined]) {
+      const d = decideBaselineAdjustedVerdict({ ...base, baselineFailures: [], rerunFailures: rerun });
+      assert.equal(d.verdict, "fail");
+      assert.deepEqual(d.introduced, ["p.TestA", "p.TestB"]);
+      assert.deepEqual(d.flaky, []);
+    }
+  });
+
+  test("flaky-pass advances like a pass but pings a human", () => {
+    const o = decideGateOutcome("flaky-pass");
+    assert.equal(o.toColumn, "In Documentation");
+    assert.deepEqual(o.removeLabels, ["needs-real-claude"]);
+    assert.deepEqual(o.addLabels, []);
+    assert.equal(o.notify, true);
   });
 
   test("inherited-failure parks rather than routing to the developer", () => {
