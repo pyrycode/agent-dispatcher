@@ -41,7 +41,9 @@ import {
   decideRealClaudeGate,
   decideRealClaudeGateRun,
   decideReworkRoutes,
+  decideUnroutableRework,
   extractReworkCount,
+  REWORK_TARGET_ERROR_LABEL,
 } from "./pipeline-decisions.js";
 import { formatGateEvidenceComment, type GateRunReport } from "./gate-output.js";
 
@@ -262,6 +264,34 @@ export async function runReworkRouting(client: ReconcileClient): Promise<void> {
     }
   }
 
+  // Rework labels naming an agent this stage set does not run. The loop
+  // above passed over them, and without this the agent that APPLIED the
+  // label is simply re-dispatched next cycle (see decideUnroutableRework).
+  // Park once, with a comment naming the label and the agents that exist;
+  // the `error:` prefix keeps every agent off the ticket until a human acts.
+  for (const stuck of decideUnroutableRework(columnByAgent, itemsByColumn)) {
+    const item = (itemsByColumn.get(stuck.fromColumn) ?? []).find(it => it.id === stuck.itemId);
+    if ((item?.labels ?? []).includes(REWORK_TARGET_ERROR_LABEL)) continue; // already parked
+    const agents = [...columnByAgent.keys()].map(a => `\`${a}\``).join(", ");
+    try {
+      await client.addLabel(stuck.issueNumber, REWORK_TARGET_ERROR_LABEL);
+      await client.addComment(
+        stuck.issueNumber,
+        `## 🛑 Rework label routes nowhere\n\n` +
+        `${stuck.labels.map(l => `\`${l}\``).join(", ")} names an agent this board's stage set does not run. ` +
+        `The agents here are ${agents}.\n\n` +
+        `Dispatch is paused on this ticket. Swap the label for one of those agents, or clear it and route the ` +
+        `ticket by hand, then remove \`${REWORK_TARGET_ERROR_LABEL}\` to resume.`,
+      );
+      mutated = true;
+      console.log(
+        `   🛑 Unroutable rework: #${stuck.issueNumber} carries ${stuck.labels.join(", ")} in ${stuck.fromColumn} — parked`,
+      );
+    } catch (e) {
+      console.warn(`   ⚠️  Failed to park unroutable rework on #${stuck.issueNumber}: ${e}`);
+    }
+  }
+
   // Same rationale as runAutoAdvance: invalidate the cache so subsequent
   // sub-steps see the new column placement / stripped labels. Without
   // this, the per-agent loop in the same cycle would see the OLD labels
@@ -447,6 +477,9 @@ export async function runRealClaudeGateExecution(
       baselineFailures: null,
       baselineSkipReason: "the runner threw before any comparison could run",
       baselineOutputPath: null,
+      rerunFailures: null,
+      rerunSkipReason: "the runner threw before any re-run could happen",
+      rerunOutputPath: null,
     };
   }
 
@@ -461,11 +494,12 @@ export async function runRealClaudeGateExecution(
     // Re-judge a failure against what the base commit already fails, so a
     // branch is not blamed for breakage it inherited. No-op for every other
     // verdict, and a no-op when no baseline ran.
-    const { verdict, reason, introduced, preExisting } = decideBaselineAdjustedVerdict({
+    const { verdict, reason, introduced, preExisting, flaky } = decideBaselineAdjustedVerdict({
       verdict: raw.verdict,
       reason: raw.reason,
       branchFailures: report.tally?.failedNames ?? [],
       baselineFailures: report.baselineFailures,
+      rerunFailures: report.rerunFailures,
     });
     const outcome = decideGateOutcome(verdict, realClaudeGate.failReworkLabel);
 
@@ -481,7 +515,10 @@ export async function runRealClaudeGateExecution(
         (outcome.removeLabels.length > 0 ? `, removed \`${outcome.removeLabels.join("`, `")}\`` : "") +
         (verdict === "fail"
           ? `. \`${REAL_CLAUDE_GATE_LABEL}\` stays on, so this ticket must pass the gate again after the fix.`
-          : ".");
+          : verdict === "flaky-pass"
+            ? `. The suite is green on re-run and the ticket did nothing wrong. The flaky test(s) named above ` +
+              `are the suite's problem, not this branch's, and a human has been pinged about them.`
+            : ".");
 
     // Comment first, mutate second. If a label write fails, the evidence
     // is already on the ticket and an operator can finish by hand; the
@@ -496,7 +533,7 @@ export async function runRealClaudeGateExecution(
     try {
       await client.addComment(
         candidate.issueNumber,
-        formatGateEvidenceComment({ verdict, reason, report, minExecuted, action, introduced, preExisting }),
+        formatGateEvidenceComment({ verdict, reason, report, minExecuted, action, introduced, preExisting, flaky }),
       );
     } catch (e) {
       console.warn(`   ⚠️  Failed to post real-claude gate evidence on #${candidate.issueNumber}: ${e}`);
@@ -520,14 +557,18 @@ export async function runRealClaudeGateExecution(
       }
     }
 
-    const icon = verdict === "pass" ? "✅" : verdict === "fail" ? "❌" : "🚨";
+    const icon = verdict === "pass" ? "✅" : verdict === "flaky-pass" ? "⚠️" : verdict === "fail" ? "❌" : "🚨";
     console.log(`   ${icon} Real-claude gate #${candidate.issueNumber}: ${verdict} — ${reason}`);
 
     if (outcome.notify) {
       await notifyDiscord(
-        `🚨 **Real-claude gate could not judge #${candidate.issueNumber}** (${verdict}): ${reason}\n` +
-        `Parked in ${REAL_CLAUDE_GATE_RUN_FROM_COLUMN} with \`${outcome.addLabels.join("`, `")}\`. ` +
-        `Needs a human — see the evidence comment.`,
+        verdict === "flaky-pass"
+          ? `⚠️ **Real-claude gate passed #${candidate.issueNumber} only on re-run.** ` +
+            `${flaky.map(name => `\`${name}\``).join(", ")} failed once and passed the second time on the same ` +
+            `merged tree. The ticket advanced; the flake is the suite's to fix — see the evidence comment.`
+          : `🚨 **Real-claude gate could not judge #${candidate.issueNumber}** (${verdict}): ${reason}\n` +
+            `Parked in ${REAL_CLAUDE_GATE_RUN_FROM_COLUMN} with \`${outcome.addLabels.join("`, `")}\`. ` +
+            `Needs a human — see the evidence comment.`,
       );
     }
   } finally {

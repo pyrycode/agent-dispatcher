@@ -314,6 +314,31 @@ describe("runReworkRouting — cache invalidation", () => {
     assert.equal(client.updateItemStatusCalls.length, 0);
     assert.equal(client.clearItemsCacheCalls, 0);
   });
+
+  test("a rework label naming an agent the set lacks parks the ticket once, with a comment", async () => {
+    // pyrycode #2089, 2026-09-06: `needs-rework:po` on the builder set. The
+    // label routed nowhere, stayed on, and the verifier that applied it was
+    // simply re-dispatched next cycle.
+    const item = makeItem({
+      id: "item-2089",
+      issueNumber: 2089,
+      status: "In Code Review",
+      labels: ["needs-rework:nobody", "size:s"],
+    });
+    const client = new MockClient([item]);
+
+    await runReworkRouting(client);
+
+    assert.deepEqual(client.updateItemStatusCalls, [], "nothing to move it to");
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 2089, label: "error:rework-target" }]);
+    assert.match(client.addCommentCalls[0]?.body ?? "", /needs-rework:nobody/);
+    assert.equal(client.clearItemsCacheCalls, 1);
+
+    // Next cycle: already parked, so nothing more is written.
+    await runReworkRouting(client);
+    assert.equal(client.addLabelCalls.length, 1);
+    assert.equal(client.addCommentCalls.length, 1);
+  });
 });
 
 describe("runRealClaudeGate — parks gated tickets in Inbox", () => {
@@ -357,6 +382,8 @@ function tally(overrides: Partial<GateTally> = {}): GateTally {
     failed: 0,
     skipped: 0,
     failedNames: [],
+    passedNames: [],
+    timedOutTests: [],
     skipReasons: [],
     packageFailed: false,
     packageFailures: [],
@@ -383,6 +410,9 @@ function report(overrides: Partial<GateRunReport> = {}): GateRunReport {
     baselineFailures: null,
     baselineSkipReason: "no named test failures to compare",
     baselineOutputPath: null,
+    rerunFailures: null,
+    rerunSkipReason: "no named test failures to re-run",
+    rerunOutputPath: null,
     ...overrides,
   };
 }
@@ -511,6 +541,30 @@ describe("runRealClaudeGateExecution — outcomes", () => {
     assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1382, label: "needs-rework:developer" }]);
     assert.equal(client.removeLabelCalls.length, 0, "needs-real-claude must survive a failure");
     assert.ok(item.labels.includes("needs-real-claude"));
+  });
+
+  test("a failure that passed on the same-tree re-run advances like a pass and pings a human", async () => {
+    // pyrycode #2089, 2026-09-06: one flaky liveness test, green on re-run,
+    // must not cost the ticket a rework lap. The ping is about the suite.
+    const item = parkedItem();
+    const client = new MockClient([item]);
+    const notifications: string[] = [];
+    const flaky = report({
+      exitCode: 1,
+      tally: tally({ executed: 176, passed: 175, failed: 1, failedNames: ["pkg.TestLiveness"], packageFailed: true }),
+      rerunFailures: [],
+      rerunSkipReason: null,
+      rerunOutputPath: "/logs/rerun.log",
+    });
+
+    await runRealClaudeGateExecution(client, async () => flaky, 150, async (m) => { notifications.push(m); });
+
+    assert.deepEqual(client.updateItemStatusCalls, [{ itemId: "item-1382", newStatus: "In Documentation" }]);
+    assert.deepEqual(client.removeLabelCalls, [{ issueNumber: 1382, label: "needs-real-claude" }]);
+    assert.equal(client.addLabelCalls.length, 0, "no rework label, no error label");
+    assert.equal(notifications.length, 1, "the flake gets a human's attention");
+    assert.match(notifications[0], /TestLiveness/);
+    assert.match(client.addCommentCalls[0]?.body ?? "", /passed when re-run on the same merged tree/);
   });
 
   test("an all-skip suite with exit 0 parks loudly instead of advancing", async () => {

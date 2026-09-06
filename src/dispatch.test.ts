@@ -4533,6 +4533,102 @@ describe("runRealClaudeGateSuite — evidence gathering", () => {
   });
 });
 
+describe("runRealClaudeGateSuite — same-tree re-run before the base comparison", () => {
+  // pyrycode #2089, 2026-09-06: a flaky liveness test failed once on the
+  // branch and passed on the base, so the base comparison called it a
+  // regression and the rework breaker tripped on a finished ticket. The
+  // failing names are now re-run on the same merged tree first.
+  const branchRun = [
+    '{"Action":"run","Package":"p","Test":"TestFlaky"}',
+    '{"Action":"fail","Package":"p","Test":"TestFlaky"}',
+    '{"Action":"pass","Package":"p","Test":"TestSolid"}',
+    '{"Action":"fail","Package":"p"}',
+  ].join("\n");
+  const rerunGreen = '{"Action":"pass","Package":"p","Test":"TestFlaky"}';
+  const rerunRed = '{"Action":"fail","Package":"p","Test":"TestFlaky"}';
+
+  function rerunHarness(byPath: (path: string) => string) {
+    const harness = makeGateDeps({
+      gitOut: (cmd) => GATE_SHAS[cmd] ?? "",
+      spawnOutcome: { exitCode: 1 },
+      readFileSync: ((path: string) => byPath(path)) as any,
+    });
+    return {
+      ...harness,
+      run: () => runRealClaudeGateSuite({
+        issueNumber: 1382,
+        command: "go test -json ./...",
+        baselineCommand: "go test -json -run {{TESTS}} ./...",
+        format: "go-json",
+        timeoutMs: 60_000,
+        repoRoot: "/tmp/fake-repo",
+        defaultBranch: "main",
+        logsDir: "/tmp/fake-logs",
+        deps: harness.deps,
+      }),
+    };
+  }
+  const contents = (rerun: string, base: string = rerunGreen) => (path: string) =>
+    path.includes("-rerun_") ? rerun : path.includes("-base_") ? base : branchRun;
+
+  test("a failure that passes on re-run is recorded as flaky and never reaches the base", async () => {
+    const { run, spawnRequests } = rerunHarness(contents(rerunGreen));
+    const report = await run();
+
+    assert.deepEqual(report.rerunFailures, []);
+    assert.equal(report.rerunSkipReason, null);
+    assert.equal(spawnRequests.length, 2, "the main run and the re-run; no base run");
+    assert.equal(spawnRequests[1].cwd, spawnRequests[0].cwd, "the re-run uses the SAME merged worktree");
+    assert.match(spawnRequests[1].command, /-run '\^\(TestFlaky\)\$'/);
+    assert.equal(report.baselineFailures, null);
+    assert.match(report.baselineSkipReason ?? "", /passed on the same-tree re-run/);
+  });
+
+  test("a failure that fails again is compared against the base as before", async () => {
+    const { run, spawnRequests } = rerunHarness(contents(rerunRed, rerunGreen));
+    const report = await run();
+
+    assert.deepEqual(report.rerunFailures, ["p.TestFlaky"]);
+    assert.equal(spawnRequests.length, 3, "main run, re-run, then the base run");
+    assert.ok(spawnRequests[2].cwd.includes("real-claude-gate-base-1382"));
+    assert.deepEqual(report.baselineFailures, []);
+  });
+
+  test("a re-run that skipped the test excuses nothing", async () => {
+    // The same false green the gate exists to reject, one layer down.
+    const skipped = '{"Action":"skip","Package":"p","Test":"TestFlaky"}';
+    const { run } = rerunHarness(contents(skipped, rerunRed));
+    const report = await run();
+
+    assert.equal(report.rerunFailures, null);
+    assert.match(report.rerunSkipReason ?? "", /executed nothing/);
+    assert.deepEqual(report.baselineFailures, ["p.TestFlaky"], "the base comparison still runs over the full set");
+  });
+
+  test("a hang killed by the test binary's own timeout is not re-tried", async () => {
+    // Re-trying a hang costs the whole timeout again; it goes straight to
+    // the base comparison, named.
+    const hung = [
+      '{"Action":"run","Package":"p","Test":"TestHang"}',
+      '{"Action":"output","Package":"p","Test":"TestHang","Output":"panic: test timed out after 20m0s\\n"}',
+      '{"Action":"output","Package":"p","Test":"TestHang","Output":"\\trunning tests:\\n"}',
+      '{"Action":"output","Package":"p","Test":"TestHang","Output":"\\t\\tTestHang (2m59s)\\n"}',
+      '{"Action":"output","Package":"p","Test":"TestHang","Output":"\\n"}',
+      '{"Action":"fail","Package":"p"}',
+    ].join("\n");
+    const { run, spawnRequests } = rerunHarness(
+      (path) => path.includes("-base_") ? '{"Action":"pass","Package":"p","Test":"TestHang"}' : hung,
+    );
+    const report = await run();
+
+    assert.deepEqual(report.tally?.timedOutTests, ["p.TestHang"]);
+    assert.equal(report.rerunFailures, null);
+    assert.match(report.rerunSkipReason ?? "", /hang/);
+    assert.equal(spawnRequests.length, 2, "main run and base run; no re-run");
+    assert.ok(spawnRequests[1].cwd.includes("real-claude-gate-base-1382"));
+  });
+});
+
 describe("runRealClaudeGateSuite — refusing to run", () => {
   test("reports a conflict from the merge-tree probe without touching the disk", async () => {
     // The probe stays in the object database, so it cannot contend with a
