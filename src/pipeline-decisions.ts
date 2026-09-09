@@ -1041,6 +1041,122 @@ export function decideDoneCleanup(
   return cleanups;
 }
 
+// --------- Stranded `wip:` sweep ---------
+
+/**
+ * Hidden marker the sweep posts the FIRST time it sees a `wip:<agent>` on a
+ * ticket outside Done. Its createdAt is the clock the age gate reads. An
+ * HTML comment renders invisibly in GitHub's Markdown, same as the
+ * auto-retry and family-dispatch markers.
+ */
+export const STRANDED_WIP_OBSERVED_MARKER = "<!-- pyry-stranded-wip-observed -->";
+
+/**
+ * Hidden marker the sweep posts AFTER it strips a stranded `wip:`.
+ *
+ * This is the piece that makes the sweep safe to run forever. Without it,
+ * the observed marker from an old incident stays the newest one on the
+ * ticket for good — so the ticket's NEXT legitimate dispatch would be seen
+ * with a `wip:` label and an observation hours old, and the sweep would
+ * strip the label off a live agent within one poll. The swept marker
+ * invalidates the observation that caused it: whenever the newest swept
+ * marker is newer than the newest observed one, the sweep re-observes from
+ * scratch instead of stripping.
+ */
+export const STRANDED_WIP_SWEPT_MARKER = "<!-- pyry-stranded-wip-swept -->";
+
+/**
+ * Safety margin added on top of the longest possible agent run when
+ * deriving the sweep's age gate. Covers pre-spawn gates, worktree setup and
+ * the post-run GitHub writes — everything inside a dispatch that isn't the
+ * agent's own wall-clock budget.
+ */
+export const STRANDED_WIP_MARGIN_MS = 30 * 60_000;
+
+/** The two marker timestamps the sweep reads, newest of each kind. */
+export interface StrandedWipMarkers {
+  observedAt: Date | null;
+  sweptAt: Date | null;
+}
+
+/** What the sweep should do about one ticket carrying a `wip:` label. */
+export type StrandedWipAction =
+  | { kind: "mark"; issueNumber: number }
+  | { kind: "strip"; issueNumber: number; labelsToStrip: string[] }
+  | { kind: "hold"; issueNumber: number; msRemaining: number };
+
+/**
+ * Tickets the sweep must consider: anything outside the Done column that
+ * carries a `wip:<agent>` label.
+ *
+ * Split out from `decideStrandedWip` so the caller pays for one comments
+ * fetch per CANDIDATE rather than one per board item. On a healthy board
+ * this returns nothing at all, because a dispatch that is genuinely running
+ * only exists inside `runConcurrentDispatches`, which the poll loop awaits
+ * before it comes back around to the sweep.
+ *
+ * Done is excluded because `decideDoneCleanup` already strips `wip:` there,
+ * and closed-but-stranded tickets reach Done via the closed sweep first.
+ * Items with `issueNumber <= 0` (epics, virtual items) are skipped, same as
+ * `decideDoneCleanup` and `decideReworkRoutes`.
+ */
+export function selectStrandedWipCandidates(
+  items: readonly (DecisionItem & { status?: string })[],
+): { issueNumber: number; wipLabels: string[] }[] {
+  const out: { issueNumber: number; wipLabels: string[] }[] = [];
+  for (const item of items) {
+    if (item.issueNumber <= 0) continue;
+    if (item.status === "Done") continue;
+    const wipLabels = item.labels.filter((l) => l.startsWith("wip:"));
+    if (wipLabels.length === 0) continue;
+    out.push({ issueNumber: item.issueNumber, wipLabels });
+  }
+  return out;
+}
+
+/**
+ * Pure age gate for one stranded-`wip:` candidate.
+ *
+ * A `wip:<agent>` label on the board at the top of a poll cycle means no
+ * dispatch in THIS process is running it — but it does not prove no agent
+ * anywhere is. A dispatcher killed with SIGKILL leaves detached `claude`
+ * grandchildren still writing into the ticket's worktree, and stripping the
+ * label under them would let a second run start and `git worktree remove
+ * --force` the directory the first one is working in. So the sweep waits
+ * out the longest a legitimate run could still be going before it decides
+ * the label is dead. `minAgeMs` is derived from the configured agent
+ * timeouts rather than hardcoded, so raising a timeout cannot silently make
+ * this gate too short.
+ *
+ * Returns null when the ticket carries no `wip:` label at all.
+ */
+export function decideStrandedWip(opts: {
+  issueNumber: number;
+  wipLabels: string[];
+  markers: StrandedWipMarkers;
+  minAgeMs: number;
+  now: number;
+}): StrandedWipAction | null {
+  const { issueNumber, wipLabels, markers, minAgeMs, now } = opts;
+  if (wipLabels.length === 0) return null;
+
+  const observed = markers.observedAt?.getTime() ?? null;
+  const swept = markers.sweptAt?.getTime() ?? null;
+
+  // No observation yet, or the newest one has already been acted on (its
+  // strip posted a swept marker after it). Either way this `wip:` label is
+  // newly seen as far as the sweep is concerned — start its clock.
+  if (observed === null || (swept !== null && swept >= observed)) {
+    return { kind: "mark", issueNumber };
+  }
+
+  const elapsed = now - observed;
+  if (elapsed >= minAgeMs) {
+    return { kind: "strip", issueNumber, labelsToStrip: [...wipLabels] };
+  }
+  return { kind: "hold", issueNumber, msRemaining: minAgeMs - elapsed };
+}
+
 // --------- Post-run label decision (pure layer for #16 extraction) ---------
 
 /**

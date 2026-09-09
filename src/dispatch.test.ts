@@ -46,6 +46,8 @@ import {
   runClosedSweep,
   runConcurrentDispatches,
   runDoneCleanup,
+  runStrandedWipSweep,
+  strandedWipMinAgeMs,
   runFamilyBreaker,
   selectPastParkedFamilies,
   runPreDispatchPrep,
@@ -75,10 +77,12 @@ import {
   FAMILY_BREAKER_LABEL,
   FAMILY_DISPATCH_COMMENT_MARKER,
   FAMILY_DISPATCH_RESET_MARKER,
+  STRANDED_WIP_OBSERVED_MARKER,
+  STRANDED_WIP_SWEPT_MARKER,
   tallyFamilyComments,
 } from "./pipeline-decisions.js";
 import { AGENTS } from "./types.js";
-import { ResourceExhaustedError } from "./agent-runtime.js";
+import { ResourceExhaustedError, timeoutFor } from "./agent-runtime.js";
 import { resolveAgentsRepoRoot, resolveTargetRepoRoot } from "./worktree.js";
 
 // Recompute agentsRepoRoot the same way dispatch.ts does so test
@@ -357,7 +361,7 @@ export class MockGitHubClient implements DispatchClient {
    *  via the `items` constructor option. */
   itemsByIssueNumber: Map<number, ProjectItem & { state: "OPEN" | "CLOSED" }>;
   defaultStatus: string | null;
-  comments: { issueNumber: number; body: string }[] = [];
+  comments: { issueNumber: number; body: string; postedAt: Date }[] = [];
   addLabelCalls: { issueNumber: number; label: string }[] = [];
   removeLabelCalls: { issueNumber: number; label: string }[] = [];
   /**
@@ -380,6 +384,17 @@ export class MockGitHubClient implements DispatchClient {
    *  semantics, mirrors FakeClient.countRetryMarkers). */
   familyStateByIssue: Map<number, { markerCount: number; breakerCommented: boolean }> = new Map();
   getFamilyDispatchStateCalls: number[] = [];
+  /** Pre-seeded stranded-wip marker times — markers that existed on the
+   *  ticket before this test's writes. Comments posted through THIS client
+   *  during the test override them, so a sweep's own mark is visible to the
+   *  next sweep (same durable-comment semantics as the family tally). */
+  strandedWipMarkersByIssue: Map<number, { observedAt: Date | null; sweptAt: Date | null }> = new Map();
+  getStrandedWipMarkersCalls: number[] = [];
+  getAllProjectItemsCalls = 0;
+  clearItemsCacheCalls = 0;
+  /** Clock stamped onto comments posted through this client. Overridable so
+   *  a test can post a marker and then have it read back as old. */
+  commentClock: () => Date = () => new Date();
   failures: {
     addLabel?: Error | ((issueNumber: number, label: string) => Error | null);
     removeLabel?: Error | ((issueNumber: number, label: string) => Error | null);
@@ -391,6 +406,8 @@ export class MockGitHubClient implements DispatchClient {
     updateItemStatus?: Error | ((itemId: string, newStatus: string) => Error | null);
     getLatestRetryAt?: Error;
     getFamilyDispatchState?: Error;
+    getAllProjectItems?: Error;
+    getStrandedWipMarkers?: Error | ((issueNumber: number) => Error | null);
   } = {};
 
   constructor(opts: {
@@ -453,7 +470,7 @@ export class MockGitHubClient implements DispatchClient {
   }
 
   async addComment(issueNumber: number, body: string): Promise<void> {
-    this.comments.push({ issueNumber, body });
+    this.comments.push({ issueNumber, body, postedAt: this.commentClock() });
     if (this.failures.addComment) throw this.failures.addComment;
   }
 
@@ -509,6 +526,35 @@ export class MockGitHubClient implements DispatchClient {
 
   async countRetryMarkers(_issueNumber: number): Promise<number> {
     return 0;
+  }
+
+  async getAllProjectItems(): Promise<ProjectItem[]> {
+    this.getAllProjectItemsCalls += 1;
+    if (this.failures.getAllProjectItems) throw this.failures.getAllProjectItems;
+    return [...this.itemsByIssueNumber.values()].map(({ state: _state, ...item }) => item);
+  }
+
+  async getStrandedWipMarkers(issueNumber: number): Promise<{ observedAt: Date | null; sweptAt: Date | null }> {
+    this.getStrandedWipMarkersCalls.push(issueNumber);
+    if (typeof this.failures.getStrandedWipMarkers === "function") {
+      const e = this.failures.getStrandedWipMarkers(issueNumber);
+      if (e) throw e;
+    } else if (this.failures.getStrandedWipMarkers) {
+      throw this.failures.getStrandedWipMarkers;
+    }
+    const preset = this.strandedWipMarkersByIssue.get(issueNumber);
+    let observedAt: Date | null = preset?.observedAt ?? null;
+    let sweptAt: Date | null = preset?.sweptAt ?? null;
+    for (const c of this.comments) {
+      if (c.issueNumber !== issueNumber) continue;
+      if (c.body.includes(STRANDED_WIP_OBSERVED_MARKER)) observedAt = c.postedAt;
+      if (c.body.includes(STRANDED_WIP_SWEPT_MARKER)) sweptAt = c.postedAt;
+    }
+    return { observedAt, sweptAt };
+  }
+
+  clearItemsCache(): void {
+    this.clearItemsCacheCalls += 1;
   }
 
   async getFamilyDispatchState(issueNumber: number): Promise<{ markerCount: number; breakerCommented: boolean }> {
@@ -3013,6 +3059,215 @@ describe("runDoneCleanup", () => {
     // console.warn; we can't assert it directly without exporting the
     // Set. The behavioral guarantee tested is "two cycles → two
     // removeLabel attempts that both fail without crashing the pass."
+  });
+});
+
+// =====================================================================
+// runStrandedWipSweep
+// =====================================================================
+//
+// Clears `wip:<agent>` labels that no dispatch is behind, on a two-stage
+// board-encoded schedule: observe, then strip once the observation has
+// outlived the longest possible agent run. The stall it exists to end
+// froze two boards for seven hours on 2026-09-08, when an outage took out
+// every write on the failure path at once and left each ticket carrying
+// nothing but its running label.
+
+describe("runStrandedWipSweep", () => {
+  const MIN_AGE = 120 * 60_000;
+  const hoursAgo = (h: number) => new Date(Date.now() - h * 60 * 60_000);
+  const silentDiscord = async () => {};
+
+  test("clean board → no marker reads, no writes, no cache clear", async () => {
+    const client = new MockGitHubClient({
+      items: [{ issueNumber: 10, status: "In Review", labels: ["done:builder"] }],
+    });
+    await runStrandedWipSweep(client, silentDiscord, MIN_AGE);
+    assert.deepEqual(client.getStrandedWipMarkersCalls, []);
+    assert.deepEqual(client.removeLabelCalls, []);
+    assert.equal(client.comments.length, 0);
+    assert.equal(client.clearItemsCacheCalls, 0);
+  });
+
+  test("first sight of a stranded label → posts the observe marker, strips nothing", async () => {
+    const client = new MockGitHubClient({
+      items: [{ issueNumber: 2191, status: "In Review", labels: ["done:builder", "wip:verifier"] }],
+    });
+    const pings: string[] = [];
+    await runStrandedWipSweep(client, async (m) => { pings.push(m); }, MIN_AGE);
+
+    assert.equal(client.comments.length, 1);
+    assert.ok(client.comments[0].body.includes(STRANDED_WIP_OBSERVED_MARKER));
+    assert.deepEqual(client.removeLabelCalls, []);
+    // Nothing has been decided yet, so nothing should reach the operator.
+    assert.deepEqual(pings, []);
+    assert.equal(client.clearItemsCacheCalls, 0);
+  });
+
+  test("observation still inside the gate → holds, no second marker", async () => {
+    const client = new MockGitHubClient({
+      items: [{ issueNumber: 2191, status: "In Review", labels: ["wip:verifier"] }],
+    });
+    client.strandedWipMarkersByIssue.set(2191, { observedAt: hoursAgo(1), sweptAt: null });
+    await runStrandedWipSweep(client, silentDiscord, MIN_AGE);
+
+    assert.deepEqual(client.removeLabelCalls, []);
+    assert.equal(client.comments.length, 0, "a held ticket must not accumulate a marker per cycle");
+  });
+
+  test("observation older than the gate → strips, posts the swept marker, pings, clears the cache", async () => {
+    const client = new MockGitHubClient({
+      items: [{ issueNumber: 2191, status: "In Review", labels: ["done:builder", "wip:verifier"] }],
+    });
+    client.strandedWipMarkersByIssue.set(2191, { observedAt: hoursAgo(3), sweptAt: null });
+    const pings: string[] = [];
+    await runStrandedWipSweep(client, async (m) => { pings.push(m); }, MIN_AGE);
+
+    assert.deepEqual(client.removeLabelCalls, [{ issueNumber: 2191, label: "wip:verifier" }]);
+    assert.ok(!client.labelsByIssue.get(2191)!.includes("wip:verifier"));
+    // done:builder is another agent's signal and is not the sweep's to take.
+    assert.ok(client.labelsByIssue.get(2191)!.includes("done:builder"));
+    assert.equal(client.comments.length, 1);
+    assert.ok(client.comments[0].body.includes(STRANDED_WIP_SWEPT_MARKER));
+    assert.equal(pings.length, 1);
+    assert.ok(pings[0].includes("2191"));
+    // Without this the swept ticket stays invisible to the rest of the cycle.
+    assert.equal(client.clearItemsCacheCalls, 1);
+  });
+
+  test("a swept marker newer than the observation → re-observes instead of stripping", async () => {
+    // The live-agent regression. Ticket stranded and was swept hours ago,
+    // then legitimately re-dispatched; the old observation is still older
+    // than the gate. Stripping here would pull the running label out from
+    // under an agent that started minutes ago.
+    const client = new MockGitHubClient({
+      items: [{ issueNumber: 2191, status: "In Review", labels: ["wip:verifier"] }],
+    });
+    client.strandedWipMarkersByIssue.set(2191, { observedAt: hoursAgo(6), sweptAt: hoursAgo(5) });
+    await runStrandedWipSweep(client, silentDiscord, MIN_AGE);
+
+    assert.deepEqual(client.removeLabelCalls, []);
+    assert.equal(client.comments.length, 1);
+    assert.ok(client.comments[0].body.includes(STRANDED_WIP_OBSERVED_MARKER));
+  });
+
+  test("two cycles: the sweep's own marker is what the next sweep reads", async () => {
+    // The marker is durable board state, not dispatcher memory — the whole
+    // point, since the dispatcher restarts constantly. Cycle 1 observes;
+    // cycle 2 must see that observation rather than starting over.
+    const client = new MockGitHubClient({
+      items: [{ issueNumber: 2191, status: "In Review", labels: ["wip:verifier"] }],
+    });
+    await runStrandedWipSweep(client, silentDiscord, MIN_AGE);
+    assert.equal(client.comments.length, 1);
+
+    await runStrandedWipSweep(client, silentDiscord, MIN_AGE);
+    assert.equal(client.comments.length, 1, "cycle 2 must read cycle 1's marker, not post a second");
+    assert.deepEqual(client.removeLabelCalls, []);
+
+    // Same marker, now old enough: cycle 3 strips.
+    client.commentClock = () => hoursAgo(3);
+    client.comments = [{ issueNumber: 2191, body: STRANDED_WIP_OBSERVED_MARKER, postedAt: hoursAgo(3) }];
+    await runStrandedWipSweep(client, silentDiscord, MIN_AGE);
+    assert.deepEqual(client.removeLabelCalls, [{ issueNumber: 2191, label: "wip:verifier" }]);
+  });
+
+  test("strip fails → no ping, no cache clear, ticket waits another gate", async () => {
+    // An outage that reaches the sweep itself. The label stays on, and the
+    // swept marker written just before it retires the observation, so the
+    // next cycle re-observes rather than stripping on stale authority.
+    // Pinging on the attempt would fire every poll for the whole outage.
+    const client = new MockGitHubClient({
+      items: [{ issueNumber: 2191, status: "In Review", labels: ["wip:verifier"] }],
+    });
+    client.strandedWipMarkersByIssue.set(2191, { observedAt: hoursAgo(3), sweptAt: null });
+    client.failures.removeLabel = new Error("502 Bad Gateway");
+    const pings: string[] = [];
+    await runStrandedWipSweep(client, async (m) => { pings.push(m); }, MIN_AGE);
+
+    assert.equal(client.labelsByIssue.get(2191)!.includes("wip:verifier"), true);
+    assert.deepEqual(pings, []);
+    assert.equal(client.clearItemsCacheCalls, 0);
+
+    // Next cycle re-observes: the swept marker is now newer than the
+    // observation that authorised the failed strip.
+    client.removeLabelCalls = [];
+    await runStrandedWipSweep(client, silentDiscord, MIN_AGE);
+    assert.deepEqual(client.removeLabelCalls, [], "must not strip on the retired observation");
+    assert.ok(client.comments.some((c) => c.body.includes(STRANDED_WIP_OBSERVED_MARKER)));
+  });
+
+  test("the swept marker fails to post → nothing is stripped at all", async () => {
+    // The ordering guard. If the strip landed first and the marker were
+    // lost, the ticket would be dispatchable again with an expired
+    // observation still the newest marker on it — and the very next cycle
+    // would strip the running label off the agent that just started, whose
+    // replacement would force-remove the worktree under it.
+    const client = new MockGitHubClient({
+      items: [{ issueNumber: 2191, status: "In Review", labels: ["wip:verifier"] }],
+    });
+    client.strandedWipMarkersByIssue.set(2191, { observedAt: hoursAgo(3), sweptAt: null });
+    client.failures.addComment = new Error("502 Bad Gateway");
+    const pings: string[] = [];
+    await runStrandedWipSweep(client, async (m) => { pings.push(m); }, MIN_AGE);
+
+    assert.deepEqual(client.removeLabelCalls, [], "a strip must never outrun its own marker");
+    assert.ok(client.labelsByIssue.get(2191)!.includes("wip:verifier"));
+    assert.deepEqual(pings, []);
+    assert.equal(client.clearItemsCacheCalls, 0);
+  });
+
+  test("marker read fails → that ticket is skipped, the rest of the board still sweeps", async () => {
+    const client = new MockGitHubClient({
+      items: [
+        { issueNumber: 1, status: "In Review", labels: ["wip:verifier"] },
+        { issueNumber: 2, status: "In Development", labels: ["wip:developer"] },
+      ],
+    });
+    client.strandedWipMarkersByIssue.set(2, { observedAt: hoursAgo(3), sweptAt: null });
+    client.failures.getStrandedWipMarkers = (n) => (n === 1 ? new Error("503") : null);
+    await runStrandedWipSweep(client, silentDiscord, MIN_AGE);
+
+    assert.deepEqual(client.removeLabelCalls, [{ issueNumber: 2, label: "wip:developer" }]);
+  });
+
+  test("board read fails → the sweep does nothing at all", async () => {
+    const client = new MockGitHubClient({
+      items: [{ issueNumber: 2191, status: "In Review", labels: ["wip:verifier"] }],
+    });
+    client.failures.getAllProjectItems = new Error("GraphQL down");
+    await runStrandedWipSweep(client, silentDiscord, MIN_AGE);
+
+    assert.deepEqual(client.getStrandedWipMarkersCalls, []);
+    assert.deepEqual(client.removeLabelCalls, []);
+  });
+
+  test("several stranded labels on one ticket strip together, one ping", async () => {
+    const client = new MockGitHubClient({
+      items: [{ issueNumber: 9, status: "In Development", labels: ["wip:developer", "wip:qa", "size:m"] }],
+    });
+    client.strandedWipMarkersByIssue.set(9, { observedAt: hoursAgo(3), sweptAt: null });
+    const pings: string[] = [];
+    await runStrandedWipSweep(client, async (m) => { pings.push(m); }, MIN_AGE);
+
+    assert.equal(client.removeLabelCalls.length, 2);
+    assert.ok(client.labelsByIssue.get(9)!.includes("size:m"));
+    assert.equal(pings.length, 1);
+  });
+});
+
+describe("strandedWipMinAgeMs", () => {
+  test("outlasts the longest agent budget the stage set can spend", async () => {
+    // Derived rather than hardcoded so raising a stage's timeout cannot
+    // silently shorten the gate. `timeoutFor` tops out at 40min today, and
+    // one resume leg can spend that budget twice.
+    const gate = strandedWipMinAgeMs(AGENTS);
+    const longest = Math.max(...AGENTS.map((a) => timeoutFor(a, ["security-sensitive"])));
+    assert.ok(gate > longest * 2, `gate ${gate} must exceed two full runs of the longest agent (${longest})`);
+  });
+
+  test("an empty stage set still yields the margin, never zero", async () => {
+    assert.ok(strandedWipMinAgeMs([]) > 0);
   });
 });
 

@@ -60,6 +60,8 @@ import {
   countPipelineInFlight,
   decideAutoAdvance,
   decideDoneCleanup,
+  decideStrandedWip,
+  selectStrandedWipCandidates,
   decideMergeRetry,
   decidePostRunLabels,
   decideReworkRoutes,
@@ -1695,6 +1697,117 @@ describe("decideDoneCleanup", () => {
     }];
     const c = decideDoneCleanup(items);
     assert.deepEqual(c, []);
+  });
+});
+
+describe("selectStrandedWipCandidates", () => {
+  type Item = { id: string; issueNumber: number; labels: string[]; status?: string };
+
+  test("clean board → nothing to consider", () => {
+    // The normal case, and the one that has to stay free: a dispatch that
+    // is genuinely running only exists inside runConcurrentDispatches,
+    // which the poll loop awaits before it reaches the sweep. So a healthy
+    // board yields no candidates and the sweep costs zero comments fetches.
+    const items: Item[] = [
+      { id: "i1", issueNumber: 1, labels: ["done:builder"], status: "In Review" },
+      { id: "i2", issueNumber: 2, labels: [], status: "Backlog" },
+    ];
+    assert.deepEqual(selectStrandedWipCandidates(items), []);
+  });
+
+  test("wip: label outside Done → a candidate carrying its wip labels", () => {
+    const items: Item[] = [
+      { id: "i1", issueNumber: 2191, labels: ["done:builder", "wip:verifier"], status: "In Review" },
+    ];
+    const c = selectStrandedWipCandidates(items);
+    assert.equal(c.length, 1);
+    assert.equal(c[0].issueNumber, 2191);
+    assert.deepEqual(c[0].wipLabels, ["wip:verifier"]);
+  });
+
+  test("Done column is left to the Done cleanup", () => {
+    // decideDoneCleanup already strips wip: there, and it does so without
+    // an age gate because a ticket in Done is finished by definition.
+    const items: Item[] = [
+      { id: "i1", issueNumber: 7, labels: ["wip:documentation"], status: "Done" },
+    ];
+    assert.deepEqual(selectStrandedWipCandidates(items), []);
+  });
+
+  test("epics and virtual items (issueNumber <= 0) are skipped", () => {
+    const items: Item[] = [
+      { id: "i1", issueNumber: 0, labels: ["wip:developer"], status: "Backlog" },
+    ];
+    assert.deepEqual(selectStrandedWipCandidates(items), []);
+  });
+
+  test("several wip labels on one ticket all come back together", () => {
+    // Two stages both stranded means two failed cleanups, which is exactly
+    // what a sustained outage produces. They strip as one unit.
+    const items: Item[] = [
+      { id: "i1", issueNumber: 9, labels: ["wip:developer", "wip:qa", "size:m"], status: "In Development" },
+    ];
+    const c = selectStrandedWipCandidates(items);
+    assert.equal(c.length, 1);
+    assert.deepEqual(c[0].wipLabels, ["wip:developer", "wip:qa"]);
+  });
+});
+
+describe("decideStrandedWip", () => {
+  const MIN_AGE = 120 * 60_000;
+  const NOW = new Date("2026-09-09T12:00:00Z").getTime();
+  const base = { issueNumber: 2191, wipLabels: ["wip:verifier"], minAgeMs: MIN_AGE, now: NOW };
+
+  test("never observed → start the clock, strip nothing", () => {
+    const a = decideStrandedWip({ ...base, markers: { observedAt: null, sweptAt: null } });
+    assert.deepEqual(a, { kind: "mark", issueNumber: 2191 });
+  });
+
+  test("observed a moment ago → hold, with the time left", () => {
+    // The window a legitimately running agent lives in. Stripping here is
+    // what would let a second run force-remove the first one's worktree.
+    const observedAt = new Date(NOW - 10 * 60_000);
+    const a = decideStrandedWip({ ...base, markers: { observedAt, sweptAt: null } });
+    assert.equal(a?.kind, "hold");
+    assert.equal((a as { msRemaining: number }).msRemaining, MIN_AGE - 10 * 60_000);
+  });
+
+  test("observed longer ago than the gate → strip", () => {
+    const observedAt = new Date(NOW - MIN_AGE - 60_000);
+    const a = decideStrandedWip({ ...base, markers: { observedAt, sweptAt: null } });
+    assert.deepEqual(a, { kind: "strip", issueNumber: 2191, labelsToStrip: ["wip:verifier"] });
+  });
+
+  test("exactly at the gate → strip (the boundary is inclusive)", () => {
+    const observedAt = new Date(NOW - MIN_AGE);
+    assert.equal(decideStrandedWip({ ...base, markers: { observedAt, sweptAt: null } })?.kind, "strip");
+  });
+
+  test("a sweep already acted on the newest observation → re-observe, do NOT strip", () => {
+    // The regression this marker pair exists for. Ticket was stranded and
+    // swept hours ago, then legitimately re-dispatched. Without the swept
+    // marker the old observation is still the newest one and still older
+    // than the gate, so the sweep would strip the running label off a live
+    // agent within one poll of it starting.
+    const observedAt = new Date(NOW - 5 * 60 * 60_000);
+    const sweptAt = new Date(NOW - 5 * 60 * 60_000 + 1000);
+    const a = decideStrandedWip({ ...base, markers: { observedAt, sweptAt } });
+    assert.deepEqual(a, { kind: "mark", issueNumber: 2191 });
+  });
+
+  test("a swept marker OLDER than the observation does not block the strip", () => {
+    // The second time a ticket strands. The older swept marker belongs to
+    // the previous incident and must not veto this one forever.
+    const sweptAt = new Date(NOW - 10 * 60 * 60_000);
+    const observedAt = new Date(NOW - MIN_AGE - 60_000);
+    assert.equal(decideStrandedWip({ ...base, markers: { observedAt, sweptAt } })?.kind, "strip");
+  });
+
+  test("no wip labels → no action at all", () => {
+    assert.equal(
+      decideStrandedWip({ ...base, wipLabels: [], markers: { observedAt: null, sweptAt: null } }),
+      null,
+    );
   });
 });
 

@@ -53,6 +53,11 @@ import {
   RETRY_MAX_ATTEMPTS,
   ERROR_RETRY_COUNT_PREFIX,
   AUTO_RETRY_COMMENT_MARKER,
+  decideStrandedWip,
+  selectStrandedWipCandidates,
+  STRANDED_WIP_MARGIN_MS,
+  STRANDED_WIP_OBSERVED_MARKER,
+  STRANDED_WIP_SWEPT_MARKER,
   decideFamilyBreaker,
   resolveFamilyDispatchLimit,
   resolveFamilyRoot,
@@ -1498,6 +1503,18 @@ export interface DispatchClient {
    *  bounded even without the label. Throws on fetch failure (caller
    *  treats an unread count as 0 and proceeds). */
   countRetryMarkers(issueNumber: number): Promise<number>;
+  /** Every item on the board, all columns, closed issues included. Used by
+   *  the stranded-`wip:` sweep so a ticket parked in Inbox by the live gate
+   *  is covered too, not just the per-stage columns. */
+  getAllProjectItems(): Promise<ProjectItem[]>;
+  /** The stranded-`wip:` sweep's durable state on a ticket: when the sweep
+   *  first observed a `wip:` label it believes nothing is running, and when
+   *  it last stripped one. One comments fetch serves both. Throws on fetch
+   *  failure (the sweep skips that ticket for the cycle). */
+  getStrandedWipMarkers(issueNumber: number): Promise<{ observedAt: Date | null; sweptAt: Date | null }>;
+  /** Drop the per-cycle board snapshot so later sub-steps in the same cycle
+   *  see mutations this one applied. Mirrors `ReconcileClient`. */
+  clearItemsCache(): void;
   /** The family circuit breaker's durable state on a family ROOT: the
    *  count of family-dispatch marker comments (the family's dispatch
    *  tally) and whether the one-time trip explanation was already
@@ -1725,22 +1742,50 @@ export async function dispatchToAgent(
 }
 
 /**
+ * The outcome of trying to schedule a transient-error auto-retry. `park`
+ * carries its reason so the caller's comment and Discord line can say which
+ * of the two very different situations it is in.
+ */
+type TransientRetryOutcome =
+  | { kind: "retry"; attempt: number }
+  /** The retry budget is spent. A human decides what happens next. */
+  | { kind: "park"; reason: "cap" }
+  /** Neither the counter label nor the marker comment could be written, so
+   *  nothing on the board records that a retry is owed. Parking is the safe
+   *  read: an unrecorded retry has no attempt count, so the cap can never
+   *  trip and the ticket re-runs every cycle with no backoff between runs. */
+  | { kind: "park"; reason: "unrecorded" };
+
+/**
  * Schedule (or decline) a transient-error auto-retry for a failed dispatch
  * (agent-dispatcher#25). Reads the current `error-retry-count:N` off the
  * item's labels and:
  *
  *   - **Under the cap:** bumps the counter to N+1, posts a marker-tagged
  *     auto-retry comment (whose createdAt the poll loop reads as the
- *     last-failure time), and returns N+1. The caller then skips the
- *     `error:<agent>` park entirely — the ticket sits with just the counter
- *     and is re-dispatched once `backoffDelayMs(N+1)` has elapsed.
- *   - **At/over the cap:** posts a "retries exhausted" note and returns
- *     null. The caller falls through to its normal `error:<agent>` park.
+ *     last-failure time), and returns that attempt. The caller then skips
+ *     the `error:<agent>` park entirely — the ticket sits with just the
+ *     counter and is re-dispatched once `backoffDelayMs(N+1)` has elapsed.
+ *   - **At/over the cap:** posts a "retries exhausted" note and asks the
+ *     caller to park. The caller falls through to its normal `error:<agent>`.
+ *   - **Nothing recorded:** both durable writes failed, so asks the caller
+ *     to park too. See below.
  *
  * State is entirely board-encoded (counter label + comment createdAt), so a
  * dispatcher restart mid-wait resumes the same schedule rather than
- * resetting it. If the counter can't be persisted, returns null (park) —
- * an untracked retry would loop without backoff.
+ * resetting it.
+ *
+ * The two durable writes are deliberately independent: a bookkeeping write
+ * failing must not park a healthy ticket, so either one landing alone is
+ * enough to keep the retry (the label gates the backoff, the marker is the
+ * durable attempt record the cap falls back to). What the original fix did
+ * not cover is BOTH failing together, which is exactly what a network
+ * outage produces — and it is the case where the retry becomes invisible.
+ * With no counter and no marker the attempt resets to 1 every cycle, the
+ * cap never trips, `holdBackoffWaiters` sees nothing to hold, and the
+ * ticket is re-dispatched back to back with no poll interval between runs,
+ * bounded only by the family breaker two dozen agent runs later. So when
+ * neither write lands, park.
  */
 async function scheduleTransientRetry(opts: {
   agent: AgentConfig;
@@ -1748,7 +1793,7 @@ async function scheduleTransientRetry(opts: {
   client: DispatchClient;
   logFile: string;
   signature: string;
-}): Promise<number | null> {
+}): Promise<TransientRetryOutcome> {
   const { agent, item, client, logFile, signature } = opts;
 
   // Attempt number comes from the counter label (fast, no I/O). But a prior
@@ -1777,7 +1822,7 @@ async function scheduleTransientRetry(opts: {
         `auto-retries. Parking for human triage.`,
       );
     } catch {}
-    return null;
+    return { kind: "park", reason: "cap" };
   }
 
   // Bump the counter — strip any stale ones first (mirrors rework-count
@@ -1795,8 +1840,10 @@ async function scheduleTransientRetry(opts: {
   // marker comment below is the durable attempt record the cap falls back to,
   // and holdBackoffWaiters treats a label-less ticket as immediately eligible
   // (degraded backoff, still cap-bounded via the markers, not stuck).
+  let counterPersisted = false;
   try {
     await client.addLabel(item.issueNumber, `${ERROR_RETRY_COUNT_PREFIX}${newAttempt}`);
+    counterPersisted = true;
   } catch (e) {
     console.warn(`   ⚠️  Failed to set ${ERROR_RETRY_COUNT_PREFIX}${newAttempt} on #${item.issueNumber}; retrying without the counter label (degraded backoff, cap tracked via marker comments): ${e}`);
   }
@@ -1805,6 +1852,7 @@ async function scheduleTransientRetry(opts: {
   // poll loop reads to compute eligibility. If it fails to post, the poll
   // loop sees no marker (getLatestRetryAt → null) and treats the ticket as
   // immediately eligible — degraded but not stuck, so keep the retry.
+  let markerPosted = false;
   try {
     await client.addComment(
       item.issueNumber,
@@ -1813,13 +1861,23 @@ async function scheduleTransientRetry(opts: {
       `The dispatcher will re-dispatch after an exponential backoff — ` +
       `no action needed unless this recurs through all ${RETRY_MAX_ATTEMPTS} attempts.`,
     );
+    markerPosted = true;
   } catch (e) {
     console.warn(`   ⚠️  Failed to post auto-retry comment on #${item.issueNumber}: ${e}`);
   }
 
+  // Neither durable write landed, so the board holds no record that a retry
+  // is owed. Park instead — see this function's doc comment for why an
+  // unrecorded retry is worse than a park.
+  if (!counterPersisted && !markerPosted) {
+    writeLog(logFile, "AUTO_RETRY_UNRECORDED", `transient "${signature}" — neither the counter label nor the marker comment could be written; parking instead of retrying`);
+    console.warn(`   ⚠️  #${item.issueNumber} transient "${signature}" — could not record the retry on the board (both writes failed); parking instead`);
+    return { kind: "park", reason: "unrecorded" };
+  }
+
   writeLog(logFile, "AUTO_RETRY", `transient "${signature}" — attempt ${newAttempt}/${RETRY_MAX_ATTEMPTS}`);
   console.log(`   ♻️  #${item.issueNumber} transient "${signature}" — auto-retry ${newAttempt}/${RETRY_MAX_ATTEMPTS} scheduled`);
-  return newAttempt;
+  return { kind: "retry", attempt: newAttempt };
 }
 
 // Outer catch-block body for dispatchToAgent. Logs the error, posts
@@ -1859,6 +1917,10 @@ export async function handleDispatchError(
   const errorLabel = isResourceExhausted
     ? `error:${agent.name}:resource_exhausted`
     : `error:${agent.name}`;
+  // Set when the transient path below gave up because it could not write
+  // the retry down. Changes the wording of the park comment and the Discord
+  // line, which are the only two places the operator can learn it.
+  let unrecordedRetry = false;
 
   // agent-dispatcher#25: auto-retry transient transport/API errors on a
   // board-encoded backoff before parking for a human. The classified text
@@ -1879,17 +1941,22 @@ export async function handleDispatchError(
       terminalReason: streamResult?.terminalReason,
     });
     if (transient) {
-      const attempt = await scheduleTransientRetry({ agent, item, client, logFile, signature });
-      if (attempt !== null) {
+      const outcome = await scheduleTransientRetry({ agent, item, client, logFile, signature });
+      if (outcome.kind === "retry") {
         await notifyDiscord(
           `♻️ **${agent.name}** transient error on #${item.issueNumber} ("${signature}") — ` +
-          `auto-retry ${attempt}/${RETRY_MAX_ATTEMPTS} scheduled (backoff). No action needed yet.`,
+          `auto-retry ${outcome.attempt}/${RETRY_MAX_ATTEMPTS} scheduled (backoff). No action needed yet.`,
         );
         return; // retry scheduled — do NOT park with error:<agent>
       }
-      // attempt === null → cap reached (or counter couldn't be persisted);
-      // scheduleTransientRetry already noted the exhaustion. Fall through to
-      // the normal park path below (errorLabel + comment + Discord).
+      // Park. Two reasons, and the operator needs to be able to tell them
+      // apart: "cap" means four retries genuinely did not help, "unrecorded"
+      // means GitHub would not take the writes that make a retry safe. The
+      // second one usually arrives during an outage, when the park's own
+      // label and comment below may not land either — so it is the Discord
+      // line at the end that has to carry the message, because Discord is a
+      // different service from the GitHub API and is often still up.
+      unrecordedRetry = outcome.reason === "unrecorded";
     }
   }
 
@@ -1909,11 +1976,17 @@ export async function handleDispatchError(
           `**Operator action:** investigate process pressure on the host ` +
           `(\`ps -ef | wc -l\`, \`ulimit -u\`, look for orphaned \`claude\` / \`pyry\` processes). ` +
           `The ticket will re-queue on the next pickup cycle once \`${errorLabel}\` is removed.`
-        : `## ⚠️ Agent Error: ${agent.name}\n\nThe ${agent.name} agent encountered an error:\n\n\`\`\`\n${error.message.slice(-2000)}\n\`\`\`${sessionId !== "unknown" ? `\n\n**Debug**: \`claude --resume ${sessionId}\`` : ""}\n\nManual intervention required.`;
+        : `## ⚠️ Agent Error: ${agent.name}\n\nThe ${agent.name} agent encountered an error:\n\n\`\`\`\n${error.message.slice(-2000)}\n\`\`\`${sessionId !== "unknown" ? `\n\n**Debug**: \`claude --resume ${sessionId}\`` : ""}${unrecordedRetry ? `\n\nThe error was a transient one the dispatcher would normally retry, but neither the retry counter nor the retry marker comment could be written — GitHub was refusing writes at the time. A retry nothing recorded would re-run every cycle with no backoff and no cap, so the ticket is parked instead. Strip \`${errorLabel}\` to re-queue it once GitHub is healthy.` : ""}\n\nManual intervention required.`;
       await client.addComment(item.issueNumber, commentBody);
     } catch {}
   }
-  await notifyDiscord(`❌ **${agent.name}** failed on #${item.issueNumber}: ${item.title}\n${item.url}\nManual intervention required.`);
+  await notifyDiscord(
+    unrecordedRetry
+      ? `❌ **${agent.name}** transient error on #${item.issueNumber}: ${item.title}\n${item.url}\n` +
+        `The retry could not be recorded on the board (GitHub writes failing), so the ticket is parked rather than retried. ` +
+        `Strip \`${errorLabel}\` to re-queue once GitHub is healthy.`
+      : `❌ **${agent.name}** failed on #${item.issueNumber}: ${item.title}\n${item.url}\nManual intervention required.`,
+  );
 }
 
 // Branch + worktree setup. Six early-return points, each applying
@@ -3245,6 +3318,192 @@ export async function runDoneCleanup(client: DispatchClient): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------
+// Stranded `wip:` sweep
+// ---------------------------------------------------------------------
+//
+// A `wip:<agent>` label is the dispatcher's "this agent is running now"
+// signal, and it is written in exactly one place and removed in exactly
+// one place — the `finally` in `runConcurrentDispatches`. Every other
+// write on the failure path is best-effort with a swallowed error, and so
+// is that one. When a network outage takes the whole failure path out at
+// once, the board is left holding a ticket with NOTHING on it but the
+// running label: no retry counter, no marker comment, no `error:` park.
+//
+// That state is a permanent stall, and it is silent. `shouldSkipDispatch`
+// skips a ticket carrying its own stage's `wip:` forever, so it is never
+// picked again; `countActiveWork` counts it as busy, so the board-drained
+// ping never fires; and for a serial agent it holds the only seat. It has
+// now happened three times, through three different doors — a stale lock
+// from an interrupted run (2026-05-29), a failed status write-back
+// (2026-08-18), and a failed cleanup write during an API outage
+// (2026-09-08, which cost two boards seven hours). Writing the removal
+// more carefully cannot fix this class: the fix has to be a check of a
+// different kind, run on a schedule, that reads the board and asks whether
+// the label still means anything.
+//
+// Why an age gate rather than an immediate strip. At the top of a poll
+// cycle THIS process has no dispatch in flight — `runConcurrentDispatches`
+// is fully awaited inside the cycle — so every `wip:` on the board is
+// stranded as far as this process knows. But that is not the same as no
+// agent running anywhere. Children are spawned detached, and a dispatcher
+// killed with SIGKILL (or a host that reboots under it) leaves `claude`
+// grandchildren still writing into the ticket's worktree. Stripping the
+// label under one of those lets a second run start and
+// `git worktree remove --force` the directory the first is working in.
+// So the sweep waits out the longest a legitimate run could still be
+// going, then strips. Recovery lands around two hours instead of seven,
+// and it needs no lock, no pidfile and no in-memory registry — this
+// dispatcher keeps no daemon-side state by design, and every other
+// cross-cycle counter here is encoded on the board for the same reason.
+
+/**
+ * How old a `wip:<agent>` label must be before the sweep will strip it:
+ * the longest agent budget any configured stage can take, multiplied by
+ * the run legs a single dispatch may consume (the original plus any
+ * resume legs), plus a fixed margin for the pre-spawn gates, worktree
+ * setup and post-run writes that sit outside the agent's own clock.
+ *
+ * Derived rather than hardcoded so raising a stage's timeout cannot
+ * silently make this gate too short. `security-sensitive` is passed
+ * because it is the label that bumps the architect's budget — this wants
+ * the worst case, not the typical one.
+ */
+export function strandedWipMinAgeMs(agents: readonly AgentConfig[]): number {
+  const longestAgentMs = agents.reduce(
+    (max, agent) => Math.max(max, timeoutFor(agent, ["security-sensitive"])),
+    0,
+  );
+  const legs = 1 + parseResumeLegs(process.env.PYRY_RESUME_LEGS);
+  return longestAgentMs * legs + STRANDED_WIP_MARGIN_MS;
+}
+
+/**
+ * Strip `wip:<agent>` labels that no longer mean anything, on a two-stage
+ * board-encoded schedule: observe first, strip a full agent budget later.
+ *
+ * Reads the WHOLE board rather than the per-stage snapshot, so a ticket the
+ * live gate parked in Inbox is covered too. Done is left to
+ * `runDoneCleanup`, which already strips `wip:` there.
+ *
+ * Every failure is soft. A board read that fails skips the cycle; a marker
+ * read that fails skips that ticket; a strip that fails leaves the ticket
+ * exactly as it was, to be retried next cycle. Discord is pinged only after
+ * a strip actually lands — pinging on the attempt would fire every poll for
+ * the whole duration of an outage, which is the failure mode this sweep
+ * exists to end, not to re-create.
+ */
+export async function runStrandedWipSweep(
+  client: DispatchClient,
+  notifyDiscord: DispatchDeps["notifyDiscord"],
+  minAgeMs: number,
+  now: number = Date.now(),
+): Promise<void> {
+  let items: ProjectItem[];
+  try {
+    items = await client.getAllProjectItems();
+  } catch (error: any) {
+    console.error(`Error fetching board for stranded-wip sweep: ${error.message}`);
+    return;
+  }
+
+  const candidates = selectStrandedWipCandidates(items);
+  if (candidates.length === 0) return;
+
+  let stripped = false;
+  for (const { issueNumber, wipLabels } of candidates) {
+    let markers: { observedAt: Date | null; sweptAt: Date | null };
+    try {
+      markers = await client.getStrandedWipMarkers(issueNumber);
+    } catch (e: any) {
+      console.warn(`   ⚠️  #${issueNumber} stranded-wip marker read failed (${e?.message ?? e}); skipping this cycle`);
+      continue;
+    }
+
+    const action = decideStrandedWip({ issueNumber, wipLabels, markers, minAgeMs, now });
+    if (action === null) continue;
+
+    if (action.kind === "hold") {
+      const minsLeft = Math.max(0, Math.round(action.msRemaining / 60_000));
+      console.log(`   ⏳ #${issueNumber} carrying ${wipLabels.join(", ")} with no dispatch running — stranded-wip clock has ~${minsLeft}min left`);
+      continue;
+    }
+
+    if (action.kind === "mark") {
+      const minsToWait = Math.round(minAgeMs / 60_000);
+      try {
+        await client.addComment(
+          issueNumber,
+          `${STRANDED_WIP_OBSERVED_MARKER}\n## 👀 Running label with no dispatch behind it\n\n` +
+          `This ticket carries \`${wipLabels.join("`, `")}\` but no agent run is in flight. ` +
+          `That is normal for a few minutes after a dispatcher restart, and normal while an agent ` +
+          `orphaned by a hard kill finishes. If the label is still here in about ${minsToWait} minutes ` +
+          `the dispatcher will strip it and let the ticket be picked up again. No action needed.`,
+        );
+        console.log(`   👀 Stranded-wip: started the clock on #${issueNumber} (${wipLabels.join(", ")})`);
+      } catch (e) {
+        warnOnceCleanup(issueNumber, wipLabels.join(","), "stranded-wip observe comment", e);
+      }
+      continue;
+    }
+
+    // action.kind === "strip". The swept marker goes down BEFORE the
+    // labels come off, and a failure to write it aborts the strip.
+    //
+    // That ordering is load-bearing. The marker is what retires the
+    // observation authorising this strip. Strip first and lose the marker,
+    // and the ticket becomes dispatchable immediately — this sweep clears
+    // the board cache, so selection can pick it up later in this very cycle
+    // — while the newest marker on it is still an observation older than
+    // the gate. The next cycle would then read a fresh agent's `wip:` label
+    // against that expired observation and strip it, and the dispatch after
+    // that would force-remove the worktree the live agent is writing in.
+    // One failed comment would reach exactly the collision the age gate
+    // exists to prevent. Waiting another gate is the cheaper mistake.
+    try {
+      await client.addComment(
+        issueNumber,
+        `${STRANDED_WIP_SWEPT_MARKER}\n## 🧹 Stripping a stranded running label\n\n` +
+        `\`${action.labelsToStrip.join("`, `")}\` outlived the longest possible agent run with no ` +
+        `dispatch behind it, so the dispatcher is removing it and the ticket becomes eligible again. ` +
+        `The run that set it did not finish — check the agent log for that stage before trusting ` +
+        `any partial work on the branch.`,
+      );
+    } catch (e) {
+      warnOnceCleanup(issueNumber, action.labelsToStrip.join(","), "stranded-wip swept comment", e);
+      continue;
+    }
+
+    // A label that will not come off leaves the ticket stranded for another
+    // gate: the swept marker above has already retired the observation, so
+    // the next cycle re-observes from scratch rather than stripping on
+    // stale authority. Slower, and safe in the direction that matters.
+    let strippedAny = false;
+    for (const label of action.labelsToStrip) {
+      try {
+        await client.removeLabel(issueNumber, label);
+        strippedAny = true;
+        stripped = true;
+      } catch (e) {
+        warnOnceCleanup(issueNumber, label, "stranded-wip removeLabel", e);
+      }
+    }
+    if (!strippedAny) continue;
+
+    console.log(`   🧹 Stranded-wip: stripped ${action.labelsToStrip.join(", ")} from #${issueNumber}`);
+    await notifyDiscord(
+      `🧹 **stranded running label** on #${issueNumber}: \`${action.labelsToStrip.join("`, `")}\` ` +
+      `outlived the longest agent run with nothing behind it and was stripped. The ticket is dispatchable again. ` +
+      `The run that set it never finished — worth a look at that stage's log.`,
+    );
+  }
+
+  // Later sub-steps in this same cycle read a cached board snapshot, so
+  // without this the swept ticket stays invisible until the next poll.
+  // Same idiom as `runReworkRouting` and `runAutoAdvance`.
+  if (stripped) client.clearItemsCache();
+}
+
 // =====================================================================
 // pollLoop coordination helpers (extracted for testability)
 // =====================================================================
@@ -4282,7 +4541,14 @@ export async function runPreDispatchPrep(
     try {
       await client.addLabel(item.issueNumber, wipLabel);
       console.log(`   🏷️  Added ${wipLabel} to #${item.issueNumber}`);
-    } catch {}
+    } catch (e) {
+      // Soft-fail: a dispatch that cannot claim its label still runs, and
+      // that is the right call — refusing to work because bookkeeping failed
+      // would be worse. But it was silent, and a missing wip label means
+      // nothing stops the next cycle dispatching the same ticket again, so
+      // say so.
+      console.warn(`   ⚠️  Failed to add ${wipLabel} to #${item.issueNumber}; dispatching anyway, but nothing marks this ticket as running: ${e}`);
+    }
 
     if (family) {
       const root = resolveFamilyRoot(item);
@@ -4354,7 +4620,16 @@ export async function runConcurrentDispatches(
       } catch (error: any) {
         console.error(`Error dispatching ${agent.name} on #${item.issueNumber}: ${error.message}`);
       } finally {
-        try { await client.removeLabel(item.issueNumber, wipLabel); } catch {}
+        try {
+          await client.removeLabel(item.issueNumber, wipLabel);
+        } catch (e) {
+          // This is the write whose silent failure stalls a whole board:
+          // the label left behind makes the ticket skip dispatch forever.
+          // `runStrandedWipSweep` clears it after the age gate, so this is
+          // no longer fatal — but it must be visible, because until the
+          // sweep fires the ticket looks busy and is not.
+          warnOnceCleanup(item.issueNumber, wipLabel, "post-dispatch removeLabel", e);
+        }
       }
     })()
   ));
@@ -4994,6 +5269,12 @@ export async function pollLoop(): Promise<void> {
   console.log(`   Stage set: ${stageSet.name} (PYRY_STAGE_SET)`);
   console.log(`   Watching columns (finish-first): ${pollOrder.map((a) => a.column).join(", ")}`);
 
+  // How long a `wip:<agent>` must sit with no dispatch behind it before the
+  // sweep strips it. Derived from this stage set's own timeouts, so a fork
+  // that runs longer agents automatically waits longer.
+  const STRANDED_WIP_MIN_AGE_MS = strandedWipMinAgeMs(pollOrder);
+  console.log(`   Stranded-wip gate: ${Math.round(STRANDED_WIP_MIN_AGE_MS / 60_000)}min`);
+
   // Rotate dispatch logs older than PYRY_LOG_RETENTION_DAYS at startup. One
   // pass per dispatcher process is enough at current dispatch rates (~50/day);
   // restarts happen often enough that the log dir doesn't grow unbounded.
@@ -5147,6 +5428,17 @@ export async function pollLoop(): Promise<void> {
     // through code-review. The end-of-cycle maintenance (below) stays as a
     // safety net for state changes produced by this cycle's dispatch.
     await runClosedSweep(client);
+    // Ordered with the other maintenance passes. The closed sweep runs
+    // first as a courtesy, though the board snapshot is cached and it does
+    // not clear it, so a ticket it just moved to Done can still read as
+    // being in its old column here and collect one observe marker on its
+    // way out. Harmless: it lands in Done next cycle and `runDoneCleanup`
+    // strips its `wip:` there without an age gate.
+    //
+    // Once per cycle only. The age gate means a second pass at the end of
+    // the cycle could never strip anything the opening pass didn't, and it
+    // would cost a comments fetch per candidate to learn that.
+    await runStrandedWipSweep(client, notifyDiscord, STRANDED_WIP_MIN_AGE_MS);
     await runReworkRouting(client);
     await runRealClaudeGate(client);
     // Run the live gate for one parked ticket, here and only here.

@@ -29,6 +29,9 @@ class FakeClient implements DispatchClient {
   failRetryAt: Error | null = null;
   // Simulate a transient GitHub failure on the counter-label write.
   failAddLabel: Error | null = null;
+  // Simulate a transient GitHub failure on the marker-comment write. Set
+  // alongside failAddLabel to model an outage taking BOTH durable writes.
+  failAddComment: Error | null = null;
   // Marker comments already on the issue before this run (durable prior
   // attempts that the counter label never persisted).
   markerCountByIssue = new Map<number, number>();
@@ -38,11 +41,17 @@ class FakeClient implements DispatchClient {
     this.addLabelCalls.push({ issueNumber, label });
   }
   async removeLabel(issueNumber: number, label: string) { this.removeLabelCalls.push({ issueNumber, label }); }
-  async addComment(issueNumber: number, body: string) { this.comments.push({ issueNumber, body }); }
+  async addComment(issueNumber: number, body: string) {
+    if (this.failAddComment) throw this.failAddComment;
+    this.comments.push({ issueNumber, body });
+  }
   async getIssueLabels() { return []; }
   async getItemStatus() { return null; }
   async getItemsByStatus() { return []; }
   async getClosedItemsNotInDone() { return []; }
+  async getAllProjectItems() { return []; }
+  async getStrandedWipMarkers() { return { observedAt: null, sweptAt: null }; }
+  clearItemsCache() { /* no-op */ }
   async updateItemStatus() { /* no-op */ }
   async getLatestRetryAt(issueNumber: number) {
     this.getLatestRetryAtCalls.push(issueNumber);
@@ -268,6 +277,46 @@ describe("handleDispatchError — transient auto-retry (agent-dispatcher#25)", (
     await handleDispatchError(new Error("read ECONNRESET"), ctx, null);
     assert.ok(client.labels().includes("error:developer"), "parks at the cap even though the counter label never persisted");
     assert.ok(client.comments.some((c) => c.body.includes("Transient retries exhausted")), "notes the exhaustion");
+  });
+
+  test("BOTH durable writes fail → parks instead of scheduling a retry nothing recorded", async () => {
+    // The 2026-09-08 stall. An outage takes the counter label AND the
+    // marker comment, and the old code still returned a live attempt, so
+    // handleDispatchError returned without parking. Nothing on the board
+    // then said a retry was owed: the attempt count resets to 1 every
+    // cycle, so the cap can never trip, holdBackoffWaiters has nothing to
+    // hold, and the ticket re-runs back to back with no interval between
+    // runs. Parking is the safe read of "we could not write this down".
+    const client = new FakeClient();
+    client.failAddLabel = new Error("502 Bad Gateway");
+    client.failAddComment = new Error("502 Bad Gateway");
+    const discord: string[] = [];
+    const ctx = makeCtx(makeItem({ issueNumber: 712 }), client, discord);
+    await handleDispatchError(new Error("read ECONNRESET"), ctx, null);
+
+    assert.ok(client.labels().includes("error:developer"), "parks when the retry could not be recorded");
+    assert.ok(!client.labels().includes("error-retry-count:1"), "no counter landed");
+    assert.ok(!client.comments.some((c) => c.body.includes(RETRY_MARKER)), "no marker landed");
+    assert.ok(!discord.some((m) => m.includes("auto-retry")), "must not claim a retry is scheduled");
+    // Discord is a different service from the GitHub API and is usually
+    // still up during one of these, so it is the alert that has to carry
+    // the reason — the park's own label and comment may not land either.
+    assert.ok(discord.some((m) => m.includes("could not be recorded")), "the alert says why it parked");
+  });
+
+  test("marker-comment write failure alone → keeps the retry (the counter label is record enough)", async () => {
+    // The mirror of the #1093 case: either durable write landing on its
+    // own is enough to keep a healthy ticket moving. Only losing BOTH is
+    // a park.
+    const client = new FakeClient();
+    client.failAddComment = new Error("502 Bad Gateway");
+    const discord: string[] = [];
+    const ctx = makeCtx(makeItem({ issueNumber: 713 }), client, discord);
+    await handleDispatchError(new Error("read ECONNRESET"), ctx, null);
+
+    assert.ok(!client.labels().includes("error:developer"), "must NOT park when the counter landed");
+    assert.ok(client.labels().includes("error-retry-count:1"));
+    assert.ok(discord.some((m) => m.includes("auto-retry")));
   });
 
   test("scheduling a retry strips the stale counter before adding the next", async () => {

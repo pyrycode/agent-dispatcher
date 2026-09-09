@@ -2,8 +2,29 @@ import { graphql } from "@octokit/graphql";
 import type { ProjectConfig, ProjectItem } from "./types.js";
 import {
   AUTO_RETRY_COMMENT_MARKER,
+  STRANDED_WIP_OBSERVED_MARKER,
+  STRANDED_WIP_SWEPT_MARKER,
   tallyFamilyComments,
 } from "./pipeline-decisions.js";
+
+/**
+ * Newest createdAt among an issue's comments carrying `marker`, or null
+ * when none does.
+ *
+ * Scans for the max rather than trusting sort order — robust regardless of
+ * how GitHub paginates or orders the page.
+ */
+function latestMarkerAt(comments: any[], marker: string): Date | null {
+  let latest: Date | null = null;
+  for (const c of comments) {
+    if (typeof c?.body !== "string" || !c.body.includes(marker)) continue;
+    const created = c.created_at ? new Date(c.created_at) : null;
+    if (created && !isNaN(created.getTime())) {
+      if (latest === null || created.getTime() > latest.getTime()) latest = created;
+    }
+  }
+  return latest;
+}
 
 /** Transient GitHub responses worth another attempt for an IDEMPOTENT
  *  request: server-side 5xx and secondary-rate-limit 429. `fetch()` only
@@ -583,6 +604,18 @@ export class GitHubProjectClient {
    * (100) is far more than any ticket accrues in practice.
    */
   async getLatestRetryAt(issueNumber: number): Promise<Date | null> {
+    return latestMarkerAt(await this.fetchIssueComments(issueNumber), AUTO_RETRY_COMMENT_MARKER);
+  }
+
+  /**
+   * One page of an issue's comments. Shared by the three marker readers
+   * below (auto-retry time, auto-retry count, stranded-`wip:` markers) so
+   * they can't drift apart. THROWS on fetch failure (fetchWithRetry
+   * exhausted); each caller decides what a failed read means for it.
+   *
+   * One page (100) is far more than any ticket accrues in practice.
+   */
+  private async fetchIssueComments(issueNumber: number): Promise<any[]> {
     const response = await fetchWithRetry(
       `https://api.github.com/repos/${this.config.owner}/${this.config.repo}/issues/${issueNumber}/comments?per_page=100`,
       {
@@ -596,16 +629,26 @@ export class GitHubProjectClient {
       throw new Error(`Failed to fetch comments: ${response.statusText}`);
     }
 
-    const comments: any[] = await response.json();
-    let latest: Date | null = null;
-    for (const c of comments) {
-      if (typeof c?.body !== "string" || !c.body.includes(AUTO_RETRY_COMMENT_MARKER)) continue;
-      const created = c.created_at ? new Date(c.created_at) : null;
-      if (created && !isNaN(created.getTime())) {
-        if (latest === null || created.getTime() > latest.getTime()) latest = created;
-      }
-    }
-    return latest;
+    return await response.json();
+  }
+
+  /**
+   * The two stranded-`wip:` sweep markers on an issue, newest of each kind,
+   * from one comments fetch. `observedAt` is when the sweep first saw a
+   * `wip:` label it believes nothing is running; `sweptAt` is when it last
+   * acted on one. The sweep compares them: a swept marker at or newer than
+   * the observed one means the observation has already been spent, so the
+   * clock restarts rather than firing again on a fresh dispatch.
+   *
+   * THROWS on fetch failure — the sweep skips that ticket for the cycle
+   * rather than stripping a label it could not justify.
+   */
+  async getStrandedWipMarkers(issueNumber: number): Promise<{ observedAt: Date | null; sweptAt: Date | null }> {
+    const comments = await this.fetchIssueComments(issueNumber);
+    return {
+      observedAt: latestMarkerAt(comments, STRANDED_WIP_OBSERVED_MARKER),
+      sweptAt: latestMarkerAt(comments, STRANDED_WIP_SWEPT_MARKER),
+    };
   }
 
   /**
@@ -617,20 +660,7 @@ export class GitHubProjectClient {
    * count as 0 and proceeds.
    */
   async countRetryMarkers(issueNumber: number): Promise<number> {
-    const response = await fetchWithRetry(
-      `https://api.github.com/repos/${this.config.owner}/${this.config.repo}/issues/${issueNumber}/comments?per_page=100`,
-      {
-        headers: {
-          Authorization: `token ${this.config.token}`,
-        },
-      }
-    );
-
-    if (!response.ok) {
-      throw new Error(`Failed to fetch comments: ${response.statusText}`);
-    }
-
-    const comments: any[] = await response.json();
+    const comments = await this.fetchIssueComments(issueNumber);
     let count = 0;
     for (const c of comments) {
       if (typeof c?.body === "string" && c.body.includes(AUTO_RETRY_COMMENT_MARKER)) count++;
