@@ -67,6 +67,15 @@ export interface GateTally {
    * with a name — and listed separately so the evidence comment can say so.
    */
   timedOutTests: string[];
+  /** The deadline the binary reported when it fired, e.g. `20m0s`. */
+  timedOutBudget?: string;
+  /**
+   * How long each entry of `timedOutTests` had been running when the
+   * deadline fired, e.g. `5m50s`, keyed by the same qualified name. A test
+   * that had most of the budget to itself hung; one killed seconds in was
+   * squeezed by everything that ran before it.
+   */
+  timedOutRunningFor?: Record<string, string>;
   /** Reason text for each skip, in encounter order. Deduped downstream. */
   skipReasons: string[];
   /**
@@ -108,10 +117,10 @@ function emptyTally(): GateTally {
  * fires. What follows is `running tests:` and one indented line per test
  * still in flight, then a blank line and the goroutine dump.
  */
-const GO_TIMEOUT_PANIC = /^\s*panic: test timed out after /;
+const GO_TIMEOUT_PANIC = /^\s*panic: test timed out after (\S+)/;
 
 /** One entry of that `running tests:` list: `\t\tTestFoo/case (2m59s)`. */
-const GO_RUNNING_TEST_LINE = /^\s+((?:Test|Benchmark|Example|Fuzz)\S*) \([^)]*\)\s*$/;
+const GO_RUNNING_TEST_LINE = /^\s+((?:Test|Benchmark|Example|Fuzz)\S*) \(([^)]*)\)\s*$/;
 
 /**
  * Parse a gate command's raw output into a tally.
@@ -205,11 +214,12 @@ function parseGoJson(raw: string): GateTally {
 
   // Tests still running when `go test`'s own deadline fired. They get no
   // terminal event, so without this the run reads as a package failure with
-  // no test to attribute — which skips the base comparison and the re-run
-  // and routes straight to rework. On 2026-09-06 (pyrycode #2089) that
-  // happened over one hung offline test the panic had named in full.
+  // no test to attribute. On 2026-09-06 (pyrycode #2089) that happened over
+  // one hung offline test the panic had named in full. The budget and each
+  // test's running time are kept too: they are what tells a hang from a
+  // suite that outran its budget, which the verdict treats differently.
   let inTimeoutList = false;
-  const timedOut: { pkg: string; test: string }[] = [];
+  const timedOut: { pkg: string; test: string; runningFor: string }[] = [];
 
   for (const event of events) {
     const pkg = event.Package ?? "";
@@ -218,12 +228,14 @@ function parseGoJson(raw: string): GateTally {
 
     if (event.Action === "output") {
       const text = event.Output ?? "";
-      if (GO_TIMEOUT_PANIC.test(text)) {
+      const panic = text.match(GO_TIMEOUT_PANIC);
+      if (panic) {
         inTimeoutList = true;
+        tally.timedOutBudget = panic[1];
       } else if (inTimeoutList) {
         const match = text.match(GO_RUNNING_TEST_LINE);
         if (match) {
-          timedOut.push({ pkg, test: match[1] });
+          timedOut.push({ pkg, test: match[1], runningFor: match[2] });
         } else if (!text.startsWith("\t")) {
           inTimeoutList = false; // blank line, then the goroutine dump
         }
@@ -279,7 +291,7 @@ function parseGoJson(raw: string): GateTally {
   // A hung test ran a body and never finished: failed, executed, and named.
   // Same leaf-only and seen-once rules as a terminal event, so a parent
   // listed alongside its hung subtest is not a second failure.
-  for (const { pkg, test } of timedOut) {
+  for (const { pkg, test, runningFor } of timedOut) {
     const key = `${pkg}\t${test}`;
     if (hasChildren(pkg, test) || seen.has(key)) continue;
     seen.add(key);
@@ -288,6 +300,7 @@ function parseGoJson(raw: string): GateTally {
     tally.executed++;
     tally.failedNames.push(qualified);
     tally.timedOutTests.push(qualified);
+    (tally.timedOutRunningFor ??= {})[qualified] = runningFor;
   }
 
   return tally;
@@ -710,12 +723,17 @@ export function formatGateEvidenceComment(opts: {
     }
 
     if (tally.timedOutTests.length > 0) {
+      const budget = tally.timedOutBudget ? ` (${tally.timedOutBudget})` : "";
       lines.push(
-        `**Still running when the test binary's own timeout fired (${tally.timedOutTests.length})** — ` +
-        `counted as failed, because a hang is a failure with a name:`,
+        `**Still running when the test binary's own timeout${budget} fired (${tally.timedOutTests.length})** — ` +
+        `the suite outran its budget. A test that had most of the budget to itself hung; one killed seconds ` +
+        `in was squeezed by everything that ran before it, and is not the regression:`,
       );
       lines.push("");
-      for (const name of tally.timedOutTests.slice(0, 15)) lines.push(`- \`${name}\``);
+      for (const name of tally.timedOutTests.slice(0, 15)) {
+        const ran = tally.timedOutRunningFor?.[name];
+        lines.push(ran ? `- \`${name}\` — running for ${ran}` : `- \`${name}\``);
+      }
       lines.push("");
     }
 

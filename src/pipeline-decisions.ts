@@ -649,6 +649,16 @@ export interface GateTallyLike {
   failed: number;
   packageFailed: boolean;
   recognizedLines: number;
+  /**
+   * Tests still running when the test binary's OWN deadline fired, as
+   * opposed to the outer wall clock in `timedOut`. Optional because only
+   * the Go parser produces it.
+   */
+  timedOutTests?: readonly string[];
+  /** The deadline the binary reported, e.g. `20m0s`, when it fired. */
+  timedOutBudget?: string;
+  /** How long each killed test had been running when the deadline fired. */
+  timedOutRunningFor?: Readonly<Record<string, string>>;
 }
 
 export interface GateVerdictDecision {
@@ -662,7 +672,7 @@ export interface GateVerdictDecision {
  * everything else around it is plumbing.
  *
  * **The invariant: a zero exit code never upgrades anything.** The exit
- * status is consulted at exactly one point, step 6, and only to make a
+ * status is consulted at exactly one point, step 7, and only to make a
  * verdict WORSE. It can never turn a non-pass into a pass, because every
  * check that could reject has already run by then. That ordering is the
  * exact inversion of the 2026-07-22 failure, where a 0 was read first and
@@ -678,16 +688,24 @@ export interface GateVerdictDecision {
  *   3. **Unreadable artifact** — zero recognisable events. "Nothing to
  *      judge" and "nothing failed" look identical to an exit code and must
  *      never look identical here.
- *   4. **Any failure** — a failed test, or a suite-level failure with no
+ *   4. **The test binary's own deadline** — `go test -timeout` fired with
+ *      tests still running. The suite outran its budget; the test holding
+ *      the floor when the alarm went off is not the regression, and every
+ *      parallel test parked behind it never ran at all. Unusable like the
+ *      outer timeout, and checked BEFORE failures because the parser counts
+ *      the killed test as a failure. On 2026-09-09 pyrycode #2279 spent a
+ *      rework leg on a 361-second test its diff never touched, because a
+ *      base re-run of that test alone had the whole budget and passed.
+ *   5. **Any failure** — a failed test, or a suite-level failure with no
  *      test to attribute it to (a build error or panic).
- *   5. **Below the executed floor** — the suite ran and verified nothing.
+ *   6. **Below the executed floor** — the suite ran and verified nothing.
  *      This is the check the whole mechanism exists for.
- *   6. **Non-zero exit with a clean artifact** — the belt. The report says
+ *   7. **Non-zero exit with a clean artifact** — the belt. The report says
  *      green and the process says red, so the two disagree and neither can
  *      be trusted. Unusable rather than fail: there is no failing test to
  *      hand a developer, and sending one a contradiction burns rework
  *      cycles it cannot resolve.
- *   7. Otherwise: pass.
+ *   8. Otherwise: pass.
  */
 export function decideGateVerdict(input: GateVerdictInput): GateVerdictDecision {
   if (input.runError) {
@@ -708,6 +726,24 @@ export function decideGateVerdict(input: GateVerdictInput): GateVerdictDecision 
       reason:
         "no readable test events in the gate output — nothing was judged, which is not the same as nothing failing " +
         "(does the command emit machine-readable per-test output, e.g. `go test -json`?)",
+    };
+  }
+
+  const timedOutTests = tally.timedOutTests ?? [];
+  if (timedOutTests.length > 0) {
+    const runningFor = tally.timedOutRunningFor ?? {};
+    const named = timedOutTests
+      .slice(0, 5)
+      .map(name => (runningFor[name] ? `${name} (running for ${runningFor[name]})` : name))
+      .join(", ");
+    const more = timedOutTests.length > 5 ? `, and ${timedOutTests.length - 5} more` : "";
+    const budget = tally.timedOutBudget ? `${tally.timedOutBudget} ` : "";
+    return {
+      verdict: "unusable",
+      reason:
+        `the test binary's own ${budget}deadline fired with ${timedOutTests.length} test(s) still running: ` +
+        `${named}${more}. The suite has outrun its budget, so this is not a regression in the test that ` +
+        "happened to be running, and every test parked behind it never ran. Raise the budget or shorten the suite",
     };
   }
 

@@ -4263,6 +4263,8 @@ describe("parseGateOutput — go-json", () => {
 
     assert.deepEqual(t.failedNames, ["p.TestHold/release_returns"], "the hung leaf, not its parent");
     assert.deepEqual(t.timedOutTests, ["p.TestHold/release_returns"]);
+    assert.equal(t.timedOutBudget, "20m0s");
+    assert.deepEqual(t.timedOutRunningFor, { "p.TestHold/release_returns": "2m59s" });
     assert.equal(t.failed, 1);
     assert.equal(t.executed, 2, "the hung test ran a body; it counts as executed");
     assert.deepEqual(t.passedNames, ["p.TestOk"]);
@@ -4453,6 +4455,31 @@ describe("decideGateVerdict", () => {
     assert.equal(decideGateVerdict({ ...base, timedOut: true }).verdict, "unusable");
   });
 
+  test("the test binary's own deadline is a budget exhaustion, not a failure of whoever was running", () => {
+    // pyrycode #2279, 2026-09-09: the suite had grown to within seconds of
+    // its 20-minute deadline, the alarm fired during a 361-second test the
+    // branch never touched, and a base re-run of that test alone passed, so
+    // the gate called it a regression and sent the ticket to rework. The
+    // parser counts the killed test as failed; this check must outrank
+    // that count and name the budget and the running time instead.
+    const d = decideGateVerdict({
+      ...base,
+      exitCode: 1,
+      tally: {
+        ...clean,
+        failed: 1,
+        packageFailed: true,
+        timedOutTests: ["p.TestRealClaude_TaskNotificationCapture"],
+        timedOutBudget: "20m0s",
+        timedOutRunningFor: { "p.TestRealClaude_TaskNotificationCapture": "5m50s" },
+      },
+    });
+    assert.equal(d.verdict, "unusable");
+    assert.match(d.reason, /20m0s/);
+    assert.match(d.reason, /TaskNotificationCapture \(running for 5m50s\)/);
+    assert.match(d.reason, /outrun its budget/);
+  });
+
   test("a failing test outranks the executed floor", () => {
     // A run with one failure and only 3 executed is a FAIL, routed to the
     // developer — not an environment park. Ordering decides which.
@@ -4496,6 +4523,10 @@ describe("decideGateVerdict", () => {
     const rows: { name: string; input: Parameters<typeof decideGateVerdict>[0] }[] = [
       { name: "run error", input: { ...base, exitCode: 0, runError: "spawn failed" } },
       { name: "timed out", input: { ...base, exitCode: 0, timedOut: true } },
+      {
+        name: "binary deadline fired",
+        input: { ...base, exitCode: 0, tally: { ...clean, failed: 1, packageFailed: true, timedOutTests: ["p.TestX"] } },
+      },
       { name: "no artifact", input: { ...base, exitCode: 0, tally: null } },
       { name: "artifact with no events", input: { ...base, exitCode: 0, tally: { ...clean, recognizedLines: 0 } } },
       { name: "one failing test", input: { ...base, exitCode: 0, tally: { ...clean, failed: 1 } } },

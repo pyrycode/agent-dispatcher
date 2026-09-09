@@ -3943,7 +3943,18 @@ export async function runRealClaudeGateSuite(opts: {
     const persistent = rerunSet === null
       ? failedNames
       : failedNames.filter(name => rerunSet.has(name) || timedOutTests.has(name));
-    if (persistent.length > 0 && opts.baselineCommand) {
+    if (timedOutTests.size > 0) {
+      // The binary's own deadline fired, so the verdict is a budget
+      // exhaustion whatever the base says, and the comparison cannot help:
+      // the killed test re-run alone against the base has the whole budget
+      // to itself and always passes, which reads as a regression the branch
+      // introduced. On 2026-09-09 pyrycode #2279 was sent to rework twice
+      // that way, over a 361-second test its diff never touched, and each
+      // base re-run cost another six minutes of live claude.
+      report.baselineSkipReason =
+        `the test binary's own timeout killed ${timedOutTests.size} test(s), so the run is a budget exhaustion ` +
+        "and a base re-run of the killed test alone would always pass";
+    } else if (persistent.length > 0 && opts.baselineCommand) {
       await runBaselineComparison({
         report,
         failedNames: persistent,

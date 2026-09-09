@@ -4860,9 +4860,12 @@ describe("runRealClaudeGateSuite — same-tree re-run before the base comparison
     assert.deepEqual(report.baselineFailures, ["p.TestFlaky"], "the base comparison still runs over the full set");
   });
 
-  test("a hang killed by the test binary's own timeout is not re-tried", async () => {
-    // Re-trying a hang costs the whole timeout again; it goes straight to
-    // the base comparison, named.
+  test("a hang killed by the test binary's own timeout is neither re-tried nor compared", async () => {
+    // Re-trying a hang costs the whole timeout again. And a base comparison
+    // cannot attribute it either: the killed test re-run alone has the whole
+    // budget and always passes, which is how pyrycode #2279 was sent to
+    // rework over a test its diff never touched (2026-09-09). The verdict is
+    // a budget exhaustion, decided from the tally alone, so neither leg runs.
     const hung = [
       '{"Action":"run","Package":"p","Test":"TestHang"}',
       '{"Action":"output","Package":"p","Test":"TestHang","Output":"panic: test timed out after 20m0s\\n"}',
@@ -4879,8 +4882,9 @@ describe("runRealClaudeGateSuite — same-tree re-run before the base comparison
     assert.deepEqual(report.tally?.timedOutTests, ["p.TestHang"]);
     assert.equal(report.rerunFailures, null);
     assert.match(report.rerunSkipReason ?? "", /hang/);
-    assert.equal(spawnRequests.length, 2, "main run and base run; no re-run");
-    assert.ok(spawnRequests[1].cwd.includes("real-claude-gate-base-1382"));
+    assert.equal(report.baselineFailures, null);
+    assert.match(report.baselineSkipReason ?? "", /budget exhaustion/);
+    assert.equal(spawnRequests.length, 1, "the main run only; no re-run and no base run");
   });
 });
 
