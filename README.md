@@ -251,6 +251,14 @@ parks the ticket without automatic retry and preserves its worktree for recovery
 This avoids deleting edits after a required commit or external action is rejected.
 The operator must inspect that worktree before re-queueing the ticket.
 
+A builder may instead return `status: needs_refinement` for a planning problem.
+The dispatcher posts its explanation on the assigned issue and adds
+`needs-rework:refiner`. The existing rework router moves it back to refinement.
+No implementation-complete label, automatic commit or push occurs. Its worktree
+is retained. Other roles cannot use this outcome. A failed run or observed
+approval rejection cannot use this route. Permission denials still require
+operator review; the dispatcher does not retry the denied action.
+
 Codex has no Claude-style max-turn budget. The existing per-stage wall-clock
 budget applies, with process-group termination and a two-second forced-stop grace
 period. Codex does not enter the Claude continuation path. Timeout results retain

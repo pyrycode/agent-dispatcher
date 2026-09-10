@@ -64,6 +64,7 @@ export class CodexStreamAdapter {
   private lastText = "";
   private errorText = "";
   private failed = false;
+  private approvalRejected = false;
   private completed = false;
   private turns = 0;
   private usage: Record<string, unknown> = {};
@@ -74,6 +75,11 @@ export class CodexStreamAdapter {
         if (typeof event.thread_id === "string") this.sessionId = event.thread_id;
         break;
       case "item.completed":
+        // Tool denial evidence is sticky. A later outcome must not route the
+        // rejected action through the dispatcher instead.
+        if (event.item?.type !== "agent_message" && /This action was rejected due to unacceptable risk/.test(JSON.stringify(event.item ?? {}))) {
+          this.approvalRejected = true;
+        }
         if (event.item?.type === "agent_message" && typeof event.item.text === "string") {
           this.lastText = event.item.text;
         }
@@ -104,15 +110,16 @@ export class CodexStreamAdapter {
   }
 
   finish(code: number | null, timedOut: boolean, durationMs: number, stderr = ""): StreamResult {
-    let outcome: { status: "completed" | "blocked"; summary: string } | undefined;
+    let outcome: { status: "completed" | "blocked" | "needs_refinement"; summary: string } | undefined;
     try {
       const parsed = JSON.parse(this.lastText);
-      if ((parsed.status === "completed" || parsed.status === "blocked") && typeof parsed.summary === "string" && parsed.summary.trim()) outcome = parsed;
+      if ((parsed.status === "completed" || parsed.status === "blocked" || parsed.status === "needs_refinement") && typeof parsed.summary === "string" && parsed.summary.trim()) outcome = parsed;
     } catch { /* Missing or malformed task outcome fails closed. */ }
-    const blocked = outcome?.status === "blocked";
+    this.approvalRejected ||= /This action was rejected due to unacceptable risk/.test(stderr);
+    const blocked = this.approvalRejected || outcome?.status === "blocked";
     const isError = timedOut || code !== 0 || this.failed || !this.completed || !outcome || blocked;
-    const terminalReason = blocked ? "codex_blocked" : timedOut ? "timeout" : isError ? "codex_error" : "stop";
-    const failure = blocked ? outcome!.summary : this.errorText || stderr.trim() || `Codex exited with code ${code} without a successful completed task outcome`;
+    const terminalReason = blocked ? "codex_blocked" : timedOut ? "timeout" : isError ? "codex_error" : outcome?.status === "needs_refinement" ? "needs_refinement" : "stop";
+    const failure = blocked ? (this.approvalRejected ? "Automatic approval review rejected an action. Operator review required." : outcome!.summary) : this.errorText || stderr.trim() || `Codex exited with code ${code} without a successful completed task outcome`;
     return {
       runner: "codex", costKnown: false,
       output: isError ? failure : outcome!.summary,
@@ -121,7 +128,7 @@ export class CodexStreamAdapter {
       // all human-facing cost reports say unavailable, not a measured zero.
       totalCostUsd: 0, durationMs, usage: this.usage, terminalReason,
       rawResult: { is_error: isError, subtype: isError ? terminalReason : "success", result: isError ? failure : outcome!.summary },
-      hadPermissionDenial: false, deniedOpContent: null,
+      hadPermissionDenial: this.approvalRejected, deniedOpContent: null,
       lastAssistantText: this.lastText || null, timedOut,
     };
   }
@@ -147,5 +154,6 @@ This dispatch uses Codex. Apply the role instructions above with these runtime a
 - Use available Codex tools. Claude MCP names and tool allowlists do not configure Codex. If a named search tool is unavailable, use repository files and command-line search.
 - Stay within this role's allowed files and assigned ticket. Git commits, pushes, and GitHub changes explicitly required by the assigned role are part of the task. Do not change unrelated tickets, host credentials, or sandbox policy.
 - Ordinary sandbox restrictions can be escalated through automatic approval review. If the reviewer rejects a necessary action, stop and report status blocked. Do not work around rejection.
+- Builder only: when planning finds a scope, sizing, overlap or missing-information problem requiring refinement, return status needs_refinement with a self-contained explanation and any split proposal or blocker issue numbers. Do not post the routing comment or apply needs-rework:refiner yourself. The dispatcher owns this handoff for the assigned issue. Do not use it for permission denials, failed tools, or documentation work owned by the later documentation stage. After a reviewer rejection, status blocked is mandatory.
 - Report status completed only after the assigned work and required checks are done. Missing access, incomplete work, or a rejected necessary action means status blocked. Return the required JSON outcome with a concise summary.
 `;

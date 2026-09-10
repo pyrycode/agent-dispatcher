@@ -32,6 +32,7 @@ process.stdin.on('end', async () => {
   }
   if (process.env.TEST_MODE === 'reconnect') events.splice(2, 0, {type:'error',message:'Reconnecting 1/5: connection reset'});
   if (process.env.TEST_MODE === 'failed-command') events.splice(2, 0, {type:'item.completed',item:{id:'red-test',type:'command_execution',status:'failed',exit_code:1,aggregated_output:'Expected red test'}});
+  if (process.env.TEST_MODE === 'refinement') events[2].item.text = JSON.stringify({status:'needs_refinement', summary:'Scope conflict requires refinement'});
   if (process.env.TEST_MODE === 'blocked') events[2].item.text = JSON.stringify({status:'blocked', summary:'Required action rejected by review'});
   if (process.env.TEST_MODE === 'unicode') events[2].item.text = JSON.stringify({status:'completed', summary:'Fixture café finished'});
   if (process.env.TEST_MODE === 'missing-terminal') events.pop();
@@ -106,7 +107,7 @@ test("Codex subprocess receives literal stdin, additive role, schema and reviewe
   assert.ok(args.includes('model_reasoning_effort="high"'));
   assert.ok(args.includes('project_doc_fallback_filenames=["CLAUDE.md"]'));
   const schema = JSON.parse(readFileSync(args[args.indexOf("--output-schema") + 1], "utf8"));
-  assert.deepEqual(schema.properties.status.enum, ["completed", "blocked"]);
+  assert.deepEqual(schema.properties.status.enum, ["completed", "blocked", "needs_refinement"]);
   for (const forbidden of ["--max-turns", "--allowedTools", "--disallowedTools", "--dangerously-bypass-approvals-and-sandbox"]) assert.ok(!args.includes(forbidden));
 });
 
@@ -166,4 +167,12 @@ test("Codex timeout preserves thread and kills a process that ignores SIGTERM", 
   assert.ok(Date.now() - start < 8000, "SIGKILL must bound an ignored SIGTERM");
   const { pid } = JSON.parse(readFileSync(join(f.dir, "observed.json"), "utf8"));
   assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+});
+
+
+test("Codex subprocess preserves the explicit refinement outcome", async t => {
+  const result = await runClaudeStreaming(fixture(t, "refinement").options);
+  assert.equal(result.isError, false);
+  assert.equal(result.terminalReason, "needs_refinement");
+  assert.equal(result.output, "Scope conflict requires refinement");
 });

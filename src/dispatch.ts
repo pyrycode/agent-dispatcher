@@ -1763,7 +1763,8 @@ export async function dispatchToAgent(
     const postRun = await handlePostRun(streamResult, ctx, saferSalvaged);
     if (!postRun.ok) return;
   } catch (error: any) {
-    const preserveBlockedWork = streamResult?.runner === "codex" && streamResult.terminalReason === "codex_blocked" && ctx.useWorktree;
+    const preserveBlockedWork = streamResult?.runner === "codex"
+      && ["codex_blocked", "needs_refinement"].includes(streamResult.terminalReason) && ctx.useWorktree;
     if (preserveBlockedWork) error.message += `\nWorktree preserved for recovery: ${ctx.worktreeDir}`;
     await handleDispatchError(error, ctx, streamResult);
     // A rejected commit can leave useful edits. Never erase them or use
@@ -1970,7 +1971,7 @@ export async function handleDispatchError(
     // than on whichever wording the API happened to use. 15 of 79 such
     // failures parked a human on a wording the allowlist had never seen
     // (measured 2026-08-24 over 4103 logs) — see API_ERROR_TERMINAL_REASON.
-    const { transient, signature } = streamResult?.terminalReason === "codex_blocked"
+    const { transient, signature } = ["codex_blocked", "needs_refinement"].includes(streamResult?.terminalReason ?? "")
       ? { transient: false, signature: "" }
       : classifyAgentError(classifyText, { terminalReason: streamResult?.terminalReason });
     if (transient) {
@@ -2775,6 +2776,22 @@ export async function handlePostRun(
 ): Promise<{ ok: true } | { ok: false }> {
   const { agent, item, client, agentCwd, useWorktree, branchName, logFile, startTime } = ctx;
   const { execSync, spawnSync, notifyDiscord } = ctx.deps;
+
+  // A builder planning handoff is neither completed implementation nor an
+  // approval escape hatch. Keep partial work local; the existing rework router
+  // owns the column move and done-label cleanup on its next pass.
+  if (streamResult.terminalReason === "needs_refinement") {
+    if (streamResult.runner !== "codex" || agent.name !== "builder" || item.issueNumber <= 0
+        || streamResult.isError || streamResult.hadPermissionDenial || saferSalvaged) {
+      throw new Error("Invalid refinement handoff; operator review required");
+    }
+    await client.addComment(item.issueNumber,
+      `## Builder requests refinement\n\n${streamResult.output}\n\nWorktree retained for recovery: ${agentCwd}`);
+    await client.addLabel(item.issueNumber, "needs-rework:refiner");
+    writeLog(logFile, "REFINEMENT HANDOFF", streamResult.output);
+    console.log(`   🔄 #${item.issueNumber} requests refinement; worktree retained`);
+    return { ok: false };
+  }
 
   const output = streamResult.output;
   const u = streamResult.usage;

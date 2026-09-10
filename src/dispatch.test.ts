@@ -6552,3 +6552,33 @@ test("Codex blocked work, including shutdown timeout, preserves edits without sa
   assert.ok(client.comments.some(c=>c.body.includes("Worktree preserved")));
  }
 });
+
+
+describe("Codex builder refinement handoff", () => {
+  const request = () => streamResult({runner:"codex", isError:false, terminalReason:"needs_refinement", output:"ACs conflict"});
+  test("dispatcher comments and labels assigned issue without committing or advancing", async () => {
+    const {ctx, client, calls} = makeTestContext({agent:{name:"builder"}});
+    assert.deepEqual(await handlePostRun(request(), ctx, false), {ok:false});
+    assert.deepEqual(client.addLabelCalls, [{issueNumber:100, label:"needs-rework:refiner"}]);
+    assert.equal(client.comments.length, 1);
+    assert.match(client.comments[0].body, /ACs conflict/);
+    assert.equal(calls.exec.length, 0);
+    assert.equal(calls.spawn.length, 0);
+  });
+  test("comment failure cannot route or advance", async () => {
+    const {ctx, client} = makeTestContext({agent:{name:"builder"}});
+    client.failures.addComment = new Error("offline");
+    await assert.rejects(handlePostRun(request(), ctx, false), /offline/);
+    assert.equal(client.addLabelCalls.length, 0);
+  });
+  test("other roles and failed or denied outcomes cannot request routing", async () => {
+    for (const patch of [{runner:"claude" as const}, {isError:true}, {hadPermissionDenial:true}]) {
+      const {ctx, client} = makeTestContext({agent:{name:"builder"}});
+      await assert.rejects(handlePostRun({...request(), ...patch}, ctx, false));
+      assert.equal(client.addLabelCalls.length, 0);
+    }
+    const {ctx, client} = makeTestContext({agent:{name:"verifier"}});
+    await assert.rejects(handlePostRun(request(), ctx, false));
+    assert.equal(client.addLabelCalls.length, 0);
+  });
+});

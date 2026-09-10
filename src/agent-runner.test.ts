@@ -130,3 +130,35 @@ test("missing configured binary stops real startup before role or board processi
   assert.doesNotMatch(child.stdout+child.stderr,/Missing per-agent|Dispatching|Polling/);
  } finally {rmSync(root,{recursive:true,force:true});}
 });
+
+
+test("refinement is a distinct successful handoff, never implementation completion", () => {
+  const adapter = new CodexStreamAdapter();
+  adapter.accept({type:"item.completed", item:{type:"agent_message", text:JSON.stringify({status:"needs_refinement", summary:"Acceptance criteria contradict each other"})}});
+  adapter.accept({type:"turn.completed", usage:{}});
+  const result = adapter.finish(0, false, 1);
+  assert.equal(result.isError, false);
+  assert.equal(result.terminalReason, "needs_refinement");
+  assert.equal(adapter.finish(1, false, 1).isError, true);
+  assert.equal(adapter.finish(null, true, 1).isError, true);
+});
+
+test("an approval rejection cannot be converted into a refinement request", () => {
+  const adapter = new CodexStreamAdapter();
+  adapter.accept({type:"item.completed", item:{type:"command_execution", aggregated_output:'CreateProcess Rejected("This action was rejected due to unacceptable risk.")'}});
+  adapter.accept({type:"item.completed", item:{type:"agent_message", text:JSON.stringify({status:"needs_refinement", summary:"Try routing through dispatcher"})}});
+  adapter.accept({type:"turn.completed", usage:{}});
+  const result = adapter.finish(0, false, 1);
+  assert.equal(result.isError, true);
+  assert.equal(result.terminalReason, "codex_blocked");
+});
+
+
+test("approval rejection on stderr also blocks refinement", () => {
+  const adapter = new CodexStreamAdapter();
+  adapter.accept({type:"item.completed", item:{type:"agent_message", text:JSON.stringify({status:"needs_refinement", summary:"Scope conflict"})}});
+  adapter.accept({type:"turn.completed", usage:{}});
+  const result = adapter.finish(0, false, 1, "This action was rejected due to unacceptable risk");
+  assert.equal(result.terminalReason, "codex_blocked");
+  assert.equal(result.isError, true);
+});
