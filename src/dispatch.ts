@@ -5355,6 +5355,9 @@ export async function pollLoop(): Promise<void> {
     // state changes not visible until next cycle).
     client.clearItemsCache();
 
+    // Legacy consumers keep their local memory index under its cap. Consumers
+    // setting CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 do no memory I/O here and return
+    // a zero lesson floor, so neither trimming nor curation runs.
     // Keep the per-repo memory index under its safe cap between cycles.
     // The harness fires a built-in PostToolUse hook mid-run that tells the
     // agent to hand-compact MEMORY.md when it nears the ~24.4KB read limit;

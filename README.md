@@ -192,3 +192,18 @@ Pre-1.0. Default branch + salvage gates are now config-driven via env vars (`TAR
 ## License
 
 Apache-2.0.
+
+## Shared project knowledge
+
+Set `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` in a consumer's launch environment to
+use repository documentation instead of Claude's local memory. This disables
+Claude auto memory and makes dispatcher memory maintenance a no-op without
+reading the memory directory. The returned lesson floor is zero, so the
+auto-curation watermark cannot fire. Leave the flag unset for consumers that
+still use the existing memory workflow. The flag survives the child environment
+scrub. Configure interactive Claude sessions with `autoMemoryEnabled: false`
+in their project settings too.
+
+Role prompts should route new lessons through ticket comments and pull-request
+notes into the existing documentation stage. Do not move the private memory
+directory into the repository or inject the entire archive into each run.

@@ -304,7 +304,8 @@ const defaultFs: MemoryIndexFs = {
 
 /**
  * Read the repo's memory index, apply `trimMemoryIndex`, and write it back
- * only if it changed. No-op if the file is missing.
+ * only if it changed. No-op without any filesystem access when auto memory
+ * is disabled. Also a no-op if the file is missing.
  *
  * The write is atomic: it writes a temp file in the same directory then
  * renames over `MEMORY.md`, so a crash mid-write can never leave a
@@ -318,7 +319,12 @@ export function trimMemoryIndexFile(opts: {
   capBytes?: number;
   homeDir?: string;
   fs?: Partial<MemoryIndexFs>;
+  /** The same switch Claude uses; shared-knowledge consumers never access local memory. */
+  env?: NodeJS.ProcessEnv;
 }): TrimMemoryIndexResult {
+  if ((opts.env ?? process.env).CLAUDE_CODE_DISABLE_AUTO_MEMORY === "1") {
+    return { changed: false, before: 0, after: 0, overCap: false, lessonFloor: 0 };
+  }
   const capBytes = opts.capBytes ?? MEMORY_INDEX_CAP_BYTES;
   const fs: MemoryIndexFs = { ...defaultFs, ...opts.fs };
   const path = memoryIndexPath(opts.repoRoot, opts.homeDir);

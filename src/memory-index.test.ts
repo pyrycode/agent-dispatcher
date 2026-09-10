@@ -300,6 +300,31 @@ describe("trimMemoryIndexFile", () => {
   const homeDir = "/Users/u";
   const path = memoryIndexPath(repoRoot, homeDir);
 
+  test("disabled auto memory never probes or changes the private directory", () => {
+    const fs = new MockFs();
+    const content = "# Index\n" + ticket(42) + "\n" + lesson("keep");
+    fs.files.set(path, content);
+    const result = trimMemoryIndexFile({
+      repoRoot, homeDir, fs, capBytes: 1,
+      env: { CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1" },
+    });
+    assert.deepEqual(fs.calls, [], "not even an existence probe is allowed");
+    assert.equal(fs.files.get(path), content, "old memory remains untouched");
+    assert.deepEqual(result, {
+      changed: false, before: 0, after: 0, overCap: false, lessonFloor: 0,
+    }, "zero lesson floor must not trigger auto-curation");
+  });
+
+  test("an explicit zero retains the existing memory maintenance", () => {
+    const fs = new MockFs();
+    fs.files.set(path, "# Index\n" + ticket(42));
+    const result = trimMemoryIndexFile({
+      repoRoot, homeDir, fs, capBytes: 1, env: { CLAUDE_CODE_DISABLE_AUTO_MEMORY: "0" },
+    });
+    assert.equal(result.changed, true);
+    assert.ok(fs.calls.includes(`read:${path}`));
+  });
+
   test("missing file is a no-op with no writes", () => {
     const fs = new MockFs();
     const result = trimMemoryIndexFile({ repoRoot, homeDir, fs });
