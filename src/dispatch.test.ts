@@ -6488,3 +6488,67 @@ describe("selectPastParkedFamilies — a parked family must not starve the board
     );
   });
 });
+
+// Codex thread identifiers must never be handed to Claude's resume path.
+test("Codex timeout keeps salvage result without a Claude continuation", async () => {
+  const { ctx, calls } = makeTestContext({});
+  const first = streamResult({ runner: "codex", isError: true, timedOut: true, sessionId: "codex-thread" });
+  const result = await maybeResumeExhaustedRun(first, makeSpawnConfig(ctx.logFile, { runner: "codex" }), ctx);
+  assert.equal(result, first);
+  assert.equal(calls.claudeStreams, 0);
+});
+
+test("Codex spawn selection does not inherit Claude model overrides", async () => {
+  const keys = ["PYRY_AGENT_RUNNER", "PYRY_CODEX_MODEL", "PYRY_CODEX_EFFORT"] as const;
+  const previous = Object.fromEntries(keys.map(k => [k, process.env[k]]));
+  try {
+    process.env.PYRY_AGENT_RUNNER = "codex";
+    delete process.env.PYRY_CODEX_MODEL;
+    delete process.env.PYRY_CODEX_EFFORT;
+    const { ctx } = makeTestContext({
+      agent: { model: "claude-sonnet-5", effort: "high" },
+      mockOptions: { fsMap: { [claudeMdAbsPath("developer/CLAUDE.md")]: "role" } },
+    });
+    const result = await prepareAgentSpawn(ctx);
+    assert.ok(result.ok);
+    assert.equal(result.config.runner, "codex");
+    assert.equal(result.config.model, "");
+    assert.equal(result.config.effort, "");
+    process.env.PYRY_CODEX_MODEL = "selected-codex-model";
+    process.env.PYRY_CODEX_EFFORT = "medium";
+    const selected = await prepareAgentSpawn(ctx);
+    assert.ok(selected.ok);
+    assert.equal(selected.config.model, "selected-codex-model");
+    assert.equal(selected.config.effort, "medium");
+  } finally {
+    for (const k of keys) {
+      if (previous[k] === undefined) delete process.env[k]; else process.env[k] = previous[k];
+    }
+  }
+});
+
+test("Codex blocked outcome never retries even if its summary mentions a transient error", async () => {
+  const { ctx, client } = makeTestContext({});
+  await handleDispatchError(new Error("connection reset; reviewer rejected required action"), ctx,
+    streamResult({ runner: "codex", isError: true, terminalReason: "codex_blocked", sessionId: "codex-thread" }));
+  assert.ok(client.addLabelCalls.some(x => x.label === "error:developer"));
+  assert.ok(!client.addLabelCalls.some(x => x.label.startsWith("error-retry-count:")));
+  assert.ok(client.comments.some(x => x.body.includes("codex resume codex-thread")));
+  assert.ok(!client.comments.some(x => x.body.includes("claude --resume codex-thread")));
+});
+
+test("Codex blocked work, including shutdown timeout, preserves edits without salvage", async () => {
+ for (const timedOut of [false, true]) {
+  const client=new MockGitHubClient({status:{799:"In Development"},labels:{799:[]}});
+  let spawnIndex=0;
+  const {deps,calls}=makeMockDeps({execImpls:fullHappyExecImpls("feature/799"),
+   fsMap:{[claudeMdAbsPath("developer/CLAUDE.md")]:"role"},
+   streamResult:()=>{spawnIndex=calls.exec.length;return streamResult({runner:"codex",isError:true,terminalReason:"codex_blocked",output:"Commit was rejected",sessionId:"codex-thread",timedOut});}});
+  await dispatchToAgent(makeAgentConfig({}),makeProjectItem({issueNumber:799}),client,deps);
+  assert.ok(client.addLabelCalls.some(c=>c.label==="error:developer"));
+  assert.ok(!client.addLabelCalls.some(c=>c.label==="done:developer"));
+  assert.ok(!cleanupRan(calls.exec));
+  assert.ok(!calls.exec.slice(spawnIndex).some(c=>c.cmd.includes("git worktree remove --force") || c.cmd.includes("git add") || c.cmd.includes("git push")));
+  assert.ok(client.comments.some(c=>c.body.includes("Worktree preserved")));
+ }
+});
