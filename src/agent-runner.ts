@@ -1,3 +1,6 @@
+import { accessSync, constants, statSync } from "node:fs";
+import { delimiter, resolve } from "node:path";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import type { StreamResult } from "./dispatch.js";
 
@@ -8,6 +11,32 @@ export function resolveAgentRunner(env: NodeJS.ProcessEnv): AgentRunner {
   const value = env.PYRY_AGENT_RUNNER ?? "claude";
   if (value === "claude" || value === "codex") return value;
   throw new Error(`Invalid PYRY_AGENT_RUNNER ${JSON.stringify(value)}; expected claude or codex`);
+}
+
+/** Resolve once at startup, before any ticket is selected or labelled. */
+export function resolveCodexExecutable(env: NodeJS.ProcessEnv, options: {
+  platform?: string;
+  isExecutable?: (path: string) => boolean;
+} = {}): string {
+  const isExecutable = options.isExecutable ?? ((path: string) => {
+    try { accessSync(path, constants.X_OK); return statSync(path).isFile(); } catch { return false; }
+  });
+  const fromPath = (name: string) => (env.PATH ?? "").split(delimiter)
+    .filter(Boolean).map(dir => resolve(dir, name)).find(isExecutable);
+  const configured = env.PYRY_CODEX_BIN;
+  if (configured) {
+    const candidate = configured.includes("/") ? resolve(configured) : fromPath(configured);
+    if (candidate && isExecutable(candidate)) return candidate;
+    throw new Error("PYRY_CODEX_BIN does not identify an executable Codex CLI. Fix it before starting the dispatcher.");
+  }
+  const found = fromPath("codex");
+  if (found) return found;
+  if ((options.platform ?? process.platform) === "darwin") {
+    for (const bundle of ["/Applications/ChatGPT.app/Contents/Resources/codex", resolve(homedir(), "Applications/ChatGPT.app/Contents/Resources/codex")]) {
+      if (isExecutable(bundle)) return bundle;
+    }
+  }
+  throw new Error("Codex executable not found. Install Codex or set PYRY_CODEX_BIN to its absolute executable path before starting the dispatcher.");
 }
 
 export function buildCodexInvocation(opts: {

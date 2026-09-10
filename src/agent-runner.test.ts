@@ -1,6 +1,11 @@
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { buildCodexInvocation, CodexStreamAdapter, formatRunCost, resumeCommand, resolveAgentRunner } from "./agent-runner.js";
+import { buildCodexInvocation, CodexStreamAdapter, formatRunCost, resumeCommand, resolveAgentRunner, resolveCodexExecutable } from "./agent-runner.js";
 
 describe("runner selection", () => {
   test("Claude stays the default and unknown runners fail closed", () => {
@@ -97,4 +102,31 @@ test("blocked task stays blocked even when process shutdown times out", () => {
  const s=new CodexStreamAdapter();
  s.accept({type:"item.completed",item:{type:"agent_message",text:JSON.stringify({status:"blocked",summary:"Commit rejected"})}});
  const r=s.finish(null,true,1000);assert.equal(r.terminalReason,"codex_blocked");assert.equal(r.timedOut,true);
+});
+
+test("Codex executable is pinned from PATH before dispatch", () => {
+ assert.equal(resolveCodexExecutable({PATH:"/first:/second"}, {platform:"linux", isExecutable:p=>p==="/second/codex"}), "/second/codex");
+});
+test("macOS launch finds bundled Codex when the terminal PATH omits it", () => {
+ const bundle="/Applications/ChatGPT.app/Contents/Resources/codex";
+ assert.equal(resolveCodexExecutable({PATH:"/usr/bin:/bin"}, {platform:"darwin", isExecutable:p=>p===bundle}),bundle);
+});
+test("explicit Codex path wins and an invalid override fails without fallback", () => {
+ assert.equal(resolveCodexExecutable({PYRY_CODEX_BIN:"/custom/codex",PATH:"/bin"}, {isExecutable:p=>p==="/custom/codex"}),"/custom/codex");
+ assert.throws(()=>resolveCodexExecutable({PYRY_CODEX_BIN:"/missing/codex"}, {platform:"darwin",isExecutable:p=>p==="/Applications/ChatGPT.app/Contents/Resources/codex"}),/PYRY_CODEX_BIN/);
+});
+test("missing Codex fails preflight with an actionable error", () => {
+ assert.throws(()=>resolveCodexExecutable({PATH:"/bin"},{platform:"linux",isExecutable:()=>false}),/Install Codex.*PYRY_CODEX_BIN/);
+});
+
+test("missing configured binary stops real startup before role or board processing", () => {
+ const root=mkdtempSync(join(tmpdir(),"codex-preflight-"));
+ try {
+  const child=spawnSync(process.execPath,["--import","tsx",fileURLToPath(new URL("./dispatch-bin.ts",import.meta.url))],{
+   encoding:"utf8",timeout:10000,
+   env:{...process.env,AGENTS_REPO_PATH:root,TARGET_REPO_PATH:root,GITHUB_OWNER:"fixture",GITHUB_REPO:"fixture",PROJECT_NUMBER:"1",GITHUB_TOKEN:"fixture",PYRY_AGENT_RUNNER:"codex",PYRY_CODEX_BIN:join(root,"missing-codex")},
+  });
+  assert.equal(child.status,1);assert.match(child.stderr,/PYRY_CODEX_BIN/);
+  assert.doesNotMatch(child.stdout+child.stderr,/Missing per-agent|Dispatching|Polling/);
+ } finally {rmSync(root,{recursive:true,force:true});}
 });

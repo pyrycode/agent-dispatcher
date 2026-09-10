@@ -227,7 +227,10 @@ Claude authentication is not reused.
 Codex uses the operator's configured default model and effort. Optional
 `PYRY_CODEX_MODEL` and `PYRY_CODEX_EFFORT` select Codex-specific overrides;
 Claude stage model names and effort overrides are never passed to Codex.
-`PYRY_CODEX_BIN` can name an installed Codex executable when it is not on PATH.
+At startup the dispatcher pins the Codex executable from PATH. On macOS it also
+checks the ChatGPT app bundle when the terminal PATH does not expose its CLI.
+`PYRY_CODEX_BIN` overrides discovery. An invalid override or missing executable
+stops startup before ticket selection or labels are changed.
 The same stage set, ticket prompts, worktrees, deterministic gates and post-run
 checks apply. Product tests that exercise real Claude continue to exercise Claude.
 
