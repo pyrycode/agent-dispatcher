@@ -277,3 +277,22 @@ and a disposable real Codex run that added a failing regression test, fixed it,
 passed the tests and committed locally. It does not establish that every project
 role or an entire live-board ticket has been exercised. Selecting a runner does
 not provide a single-ticket mode; the normal launcher processes the board.
+
+
+### Live artifact handoff
+
+Codex's `completed` outcome completes the assigned role, not all later pipeline stages.
+Missing role-owned work and permission denials still stop as `blocked`.
+
+A capture ticket carries both `needs-real-claude` and `needs-live-artifacts` before
+its first review. The implementation role lists pending capture files and coupled
+reader changes in its PR. After review, the dispatcher runs the live gate. A pass
+or flaky pass with the artifact marker returns to implementation using the active
+stage set's rework label. It preserves both markers and posts the durable output
+path. Failure and unavailable-evidence routing remain unchanged.
+
+The implementation role commits the exact usable records and matching changes,
+checks and pushes them, then removes only `needs-live-artifacts`. Existing rework
+routing clears prior approvals. Review and the live gate run again before the
+ordinary documentation handoff. A green disposable checkout alone cannot complete
+a capture ticket. This workflow does not give agents Claude credentials.
