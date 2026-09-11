@@ -1,8 +1,11 @@
 import { type ChildProcess, execSync, spawn, spawnSync } from "node:child_process";
 import { readFileSync, existsSync, writeFileSync, mkdirSync, appendFileSync, readdirSync, createReadStream, createWriteStream, statSync, symlinkSync, unlinkSync } from "node:fs";
 import { resolve, dirname, basename } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { config } from "dotenv";
+
+import { buildCodexInvocation, codexChildEnv, CODEX_ROLE_GUIDANCE, CodexStreamAdapter, formatRunCost, resumeCommand, resolveAgentRunner, type AgentRunner } from "./agent-runner.js";
 
 import { GitHubProjectClient } from "./github.js";
 import { type AgentConfig, type ProjectItem } from "./types.js";
@@ -369,6 +372,9 @@ function writeLog(logFile: string, section: string, content: string): void {
 // so agent runs are observable during execution (not just post-mortem).
 
 export interface StreamResult {
+  runner?: AgentRunner;
+  /** False when the runner does not report monetary cost. */
+  costKnown?: boolean;
   output: string;
   sessionId: string;
   isError: boolean;
@@ -470,6 +476,7 @@ function logStreamMessage(logFile: string, msg: Record<string, unknown>): void {
 }
 
 interface RunClaudeOpts {
+  runner?: AgentRunner;
   promptFile: string;
   systemPromptFile: string;
   model: string;
@@ -625,6 +632,10 @@ function killAllChildPgrps(sig: NodeJS.Signals | number): void {
  */
 function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
   return new Promise((resolve, reject) => {
+    const isCodex = opts.runner === "codex";
+    if (isCodex && opts.resumeSessionId) { reject(new Error("Codex automatic continuation is not supported")); return; }
+    const codex = isCodex ? new CodexStreamAdapter() : null;
+    const startedAt = Date.now();
     // Phase C cutover (2026-05-14, pyrycode/pyrycode#329): default-spawn
     // `pyry agent-run` instead of `claude -p`. Both produce stream-json on
     // stdout consumed identically by the parser below. Pyry agent-run reads
@@ -646,7 +657,9 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
     const claudeReadsStdin = isResumeLeg || useLegacyClaude;
     let bin: string;
     let args: string[];
-    if (isResumeLeg) {
+    if (isCodex) {
+      ({ bin, args } = buildCodexInvocation({ cwd: opts.cwd, role: readFileSync(opts.systemPromptFile, "utf8") + CODEX_ROLE_GUIDANCE, model: opts.model, effort: opts.effort, bin: opts.env.PYRY_CODEX_BIN }));
+    } else if (isResumeLeg) {
       ({ bin, args } = buildResumeArgv({
         sessionId: opts.resumeSessionId!,
         model: opts.model,
@@ -706,7 +719,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
     // to the dispatcher's event loop. Surfaced 2026-05-22.
     const child = spawn(bin, args, {
       cwd: opts.cwd,
-      env: opts.env,
+      env: isCodex ? codexChildEnv(opts.env) : opts.env,
       stdio: ["pipe", "pipe", "pipe"],
       detached: true,
     });
@@ -717,6 +730,8 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
     if (child.pid !== undefined) liveChildPgrpPids.add(child.pid);
 
     let buffer = "";
+    const decoder = new StringDecoder("utf8");
+    let stderrTail = "";
     let resultMsg: Record<string, unknown> | null = null;
     // Session id from the FIRST stream event that carries one — the
     // system/init frame arrives within seconds of spawn. A run killed by
@@ -737,6 +752,9 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
       timedOut = true;
       appendFileSync(opts.logFile, `\n⏰ TIMEOUT — killing agent after ${opts.timeoutMs / 1000}s\n`);
       killChildPgrp(child, "SIGTERM");
+      if (isCodex && !forceExitTimer) {
+        forceExitTimer = setTimeout(() => killChildPgrp(child, "SIGKILL"), 2000);
+      }
     }, opts.timeoutMs);
 
     const handleWatchdogAction = (action: ReturnType<typeof advancePermissionDenialState>["action"]) => {
@@ -760,7 +778,11 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
       }
     };
 
-    if (claudeReadsStdin) {
+    child.stdin!.on("error", (err: NodeJS.ErrnoException) => {
+      // An early CLI rejection closes stdin. Its exit/result remains authoritative.
+      if (err.code !== "EPIPE") { killChildPgrp(child, "SIGTERM"); reject(err); }
+    });
+    if (isCodex || claudeReadsStdin) {
       // Pipe the prompt file content into claude's stdin, then close. Replaces
       // the prior `bash -c "cat ${file} | claude ..."` which made promptFile
       // pass through a shell quoting layer.
@@ -778,7 +800,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
     }
 
     child.stdout!.on("data", (chunk: Buffer) => {
-      buffer += chunk.toString();
+      buffer += decoder.write(chunk);
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
 
@@ -786,6 +808,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
         if (!line.trim()) continue;
         try {
           const msg = JSON.parse(line);
+          if (codex) { codex.accept(msg); logStreamMessage(opts.logFile, msg); continue; }
           initSessionId = captureSessionId(initSessionId, msg);
           logStreamMessage(opts.logFile, msg);
           if (msg.type === "result") resultMsg = msg;
@@ -802,6 +825,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
     });
 
     child.stderr!.on("data", (chunk: Buffer) => {
+      if (isCodex) stderrTail = (stderrTail + chunk.toString()).slice(-4000);
       process.stderr.write(chunk);
     });
 
@@ -823,9 +847,11 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
       untrackChildPgrpIfDrained(child);
 
       // Process remaining buffer
+      buffer += decoder.end();
       if (buffer.trim()) {
         try {
           const msg = JSON.parse(buffer);
+          if (codex) codex.accept(msg);
           initSessionId = captureSessionId(initSessionId, msg);
           logStreamMessage(opts.logFile, msg);
           if (msg.type === "result") resultMsg = msg;
@@ -840,6 +866,8 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
           }
         } catch { /* partial JSON, already logged via stream */ }
       }
+
+      if (codex) { resolve(codex.finish(code, timedOut, Date.now() - startedAt, stderrTail)); return; }
 
       if (resultMsg) {
         const r = resultMsg as any;
@@ -917,7 +945,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
  * which `handleDispatchError` maps to a distinct
  * `error:<agent>:resource_exhausted` label.
  */
-function runClaudeStreaming(opts: RunClaudeOpts): Promise<StreamResult> {
+export function runClaudeStreaming(opts: RunClaudeOpts): Promise<StreamResult> {
   return retrySpawnOnTransientError(
     () => runClaudeStreamingOnce(opts),
     {
@@ -1198,7 +1226,7 @@ async function attemptSaferSalvage(opts: {
     const prBody = [
       `## Auto-salvaged from ${budget.head}`,
       ``,
-      `The **${opts.agent.name}** agent ${budget.detail} (${opts.streamResult.numTurns} turns, $${opts.streamResult.totalCostUsd.toFixed(2)}) on #${opts.item.issueNumber} while work was in progress. The dispatcher auto-committed the uncommitted changes and opened this **draft** PR for human triage.`,
+      `The **${opts.agent.name}** agent ${budget.detail} (${opts.streamResult.numTurns} turns, ${formatRunCost(opts.streamResult)}) on #${opts.item.issueNumber} while work was in progress. The dispatcher auto-committed the uncommitted changes and opened this **draft** PR for human triage.`,
       ``,
       `**Build status at salvage:** clean (${salvageGates.length === 0 ? "no gates configured" : salvageGates.map((g) => `\`${g}\``).join(" + ") + " all passed"}). Tests were not run as a salvage gate — failing tests are often the signal the agent was chasing.`,
       ``,
@@ -1209,7 +1237,7 @@ async function attemptSaferSalvage(opts: {
       `\`\`\``,
       ``,
       `**To investigate:**`,
-      `- Resume the session: \`claude --resume ${opts.streamResult.sessionId}\``,
+      `- Resume the session: \`${resumeCommand(opts.streamResult)}\``,
       `- Branch: \`${opts.branchName}\``,
       `- Issue: ${opts.item.url}`,
       ``,
@@ -1263,12 +1291,12 @@ async function attemptSaferSalvage(opts: {
     try {
       await opts.client.addComment(
         opts.item.issueNumber,
-        `## ⚠️ Salvaged from ${budget.head}\n\nThe ${opts.agent.name} agent ${budget.detail} at ${opts.streamResult.numTurns} turns ($${opts.streamResult.totalCostUsd.toFixed(2)}) but had clean uncommitted work. The dispatcher auto-committed the changes and opened a draft PR for human triage.\n\nLabel \`error:max_turns_salvaged\` is set; the ticket does **not** auto-advance.\n\n**Reviewer:** check the draft PR — decide whether to fix-and-promote (mark ready), recover via JSONL replay, or close as wontfix.`,
+        `## ⚠️ Salvaged from ${budget.head}\n\nThe ${opts.agent.name} agent ${budget.detail} at ${opts.streamResult.numTurns} turns (${formatRunCost(opts.streamResult)}) but had clean uncommitted work. The dispatcher auto-committed the changes and opened a draft PR for human triage.\n\nLabel \`error:max_turns_salvaged\` is set; the ticket does **not** auto-advance.\n\n**Reviewer:** check the draft PR — decide whether to fix-and-promote (mark ready), recover via JSONL replay, or close as wontfix.`,
       );
     } catch (e) { console.warn(`   ⚠️  Failed to post salvage comment: ${e}`); }
 
     writeLog(opts.logFile, "SAFER_SALVAGE",
-      `Committed + pushed + draft PR opened for #${opts.item.issueNumber} (${opts.streamResult.numTurns} turns, $${opts.streamResult.totalCostUsd.toFixed(2)})`);
+      `Committed + pushed + draft PR opened for #${opts.item.issueNumber} (${opts.streamResult.numTurns} turns, ${formatRunCost(opts.streamResult)})`);
     console.log(`   💾 Safer salvage: draft PR opened for #${opts.item.issueNumber}, label error:max_turns_salvaged set`);
 
     await notifyDiscord(`💾 **${opts.agent.name}** salvaged on #${opts.item.issueNumber}: ${opts.item.title}\n${opts.item.url}\nDraft PR opened — needs human triage.`);
@@ -1735,7 +1763,13 @@ export async function dispatchToAgent(
     const postRun = await handlePostRun(streamResult, ctx, saferSalvaged);
     if (!postRun.ok) return;
   } catch (error: any) {
+    const preserveBlockedWork = streamResult?.runner === "codex"
+      && ["codex_blocked", "needs_refinement"].includes(streamResult.terminalReason) && ctx.useWorktree;
+    if (preserveBlockedWork) error.message += `\nWorktree preserved for recovery: ${ctx.worktreeDir}`;
     await handleDispatchError(error, ctx, streamResult);
+    // A rejected commit can leave useful edits. Never erase them or use
+    // automatic salvage to work around an approval rejection.
+    if (preserveBlockedWork) return;
   }
 
   await cleanupAfterDispatch(ctx);
@@ -1899,7 +1933,7 @@ export async function handleDispatchError(
   const { notifyDiscord } = ctx.deps;
   const sessionId = streamResult?.sessionId || "unknown";
   const sessionHint = sessionId !== "unknown"
-    ? `\nSession: ${sessionId} (resume with: claude --resume ${sessionId})`
+    ? `\nSession: ${sessionId} (resume with: ${resumeCommand({ runner: streamResult?.runner, sessionId })})`
     : "";
   writeLog(logFile, "ERROR", `${error.message}${sessionHint}`);
 
@@ -1907,7 +1941,7 @@ export async function handleDispatchError(
   const elapsedMin = Math.round((Date.now() - startTime) / 60_000);
   console.error(`   [${endTs}] ❌ ${agent.name} failed (${elapsedMin}min): ${error.message}`);
   if (sessionId !== "unknown") {
-    console.error(`   🔍 Resume session: claude --resume ${sessionId}`);
+    console.error(`   🔍 Resume session: ${resumeCommand({ runner: streamResult?.runner, sessionId })}`);
   }
   // Distinguish "couldn't even spawn" (ResourceExhaustedError, distinct
   // label so the operator can tell host-pressure incidents from agent
@@ -1937,9 +1971,9 @@ export async function handleDispatchError(
     // than on whichever wording the API happened to use. 15 of 79 such
     // failures parked a human on a wording the allowlist had never seen
     // (measured 2026-08-24 over 4103 logs) — see API_ERROR_TERMINAL_REASON.
-    const { transient, signature } = classifyAgentError(classifyText, {
-      terminalReason: streamResult?.terminalReason,
-    });
+    const { transient, signature } = ["codex_blocked", "needs_refinement"].includes(streamResult?.terminalReason ?? "")
+      ? { transient: false, signature: "" }
+      : classifyAgentError(classifyText, { terminalReason: streamResult?.terminalReason });
     if (transient) {
       const outcome = await scheduleTransientRetry({ agent, item, client, logFile, signature });
       if (outcome.kind === "retry") {
@@ -1976,7 +2010,7 @@ export async function handleDispatchError(
           `**Operator action:** investigate process pressure on the host ` +
           `(\`ps -ef | wc -l\`, \`ulimit -u\`, look for orphaned \`claude\` / \`pyry\` processes). ` +
           `The ticket will re-queue on the next pickup cycle once \`${errorLabel}\` is removed.`
-        : `## ⚠️ Agent Error: ${agent.name}\n\nThe ${agent.name} agent encountered an error:\n\n\`\`\`\n${error.message.slice(-2000)}\n\`\`\`${sessionId !== "unknown" ? `\n\n**Debug**: \`claude --resume ${sessionId}\`` : ""}${unrecordedRetry ? `\n\nThe error was a transient one the dispatcher would normally retry, but neither the retry counter nor the retry marker comment could be written — GitHub was refusing writes at the time. A retry nothing recorded would re-run every cycle with no backoff and no cap, so the ticket is parked instead. Strip \`${errorLabel}\` to re-queue it once GitHub is healthy.` : ""}\n\nManual intervention required.`;
+        : `## ⚠️ Agent Error: ${agent.name}\n\nThe ${agent.name} agent encountered an error:\n\n\`\`\`\n${error.message.slice(-2000)}\n\`\`\`${sessionId !== "unknown" ? `\n\n**Debug**: \`${resumeCommand({ runner: streamResult?.runner, sessionId })}\`` : ""}${unrecordedRetry ? `\n\nThe error was a transient one the dispatcher would normally retry, but neither the retry counter nor the retry marker comment could be written — GitHub was refusing writes at the time. A retry nothing recorded would re-run every cycle with no backoff and no cap, so the ticket is parked instead. Strip \`${errorLabel}\` to re-queue it once GitHub is healthy.` : ""}\n\nManual intervention required.`;
       await client.addComment(item.issueNumber, commentBody);
     } catch {}
   }
@@ -2294,6 +2328,8 @@ export async function prepareAgentSpawn(
   const { agent, item, client, agentCwd, useWorktree, worktreeDir, branchName, logFile } = ctx;
   const { execSync, readFileSync, writeFileSync, buildPromptForAgent } = ctx.deps;
 
+  const runner = resolveAgentRunner(process.env);
+
   // Build prompt AFTER worktree creation so specs are read from the feature branch
   const prompt = await buildPromptForAgent(agent, item, agentCwd);
 
@@ -2433,23 +2469,24 @@ export async function prepareAgentSpawn(
   const timeoutMs = timeoutFor(agent, item.labels);
   const timeoutLabel = `${timeoutMs / 60_000}min`;
 
-  writeLog(logFile, "DISPATCH", `Agent: ${agent.name}\nTicket: #${item.issueNumber} — ${item.title}\nBranch: ${branchName}\nWorktree: ${useWorktree ? worktreeDir : `none (PO on ${defaultBranch})`}\nMax turns: ${maxTurns}\nTimeout: ${timeoutLabel}\nAllowed tools: ${allowedTools}`);
+  writeLog(logFile, "DISPATCH", `Agent: ${agent.name}\nTicket: #${item.issueNumber} — ${item.title}\nBranch: ${branchName}\nWorktree: ${useWorktree ? worktreeDir : `none (PO on ${defaultBranch})`}\nRunner: ${runner}\nMax turns: ${runner === "codex" ? "not supported; wall-clock budget only" : maxTurns}\nTimeout: ${timeoutLabel}\nTool policy: ${runner === "codex" ? "Codex workspace sandbox and automatic review" : allowedTools}`);
   writeLog(logFile, "PROMPT", prompt);
   writeLog(logFile, "SYSTEM PROMPT", systemPrompt);
 
-  console.log(`   Running Claude Code as ${agent.name} (max ${maxTurns} turns)...`);
+  console.log(`   Running ${runner === "codex" ? "Codex" : "Claude Code"} as ${agent.name} (${runner === "codex" ? `${timeoutLabel} wall-clock budget` : `max ${maxTurns} turns`})...`);
   console.log(`   📝 Log: ${logFile}`);
 
   return {
     ok: true,
     config: {
+      runner,
       promptFile,
       systemPromptFile,
       // Per-agent override, else the pipeline default. QA and documentation
       // run on claude-sonnet-5 at high effort; every other stage inherits
       // opus/xhigh. See AGENTS in types.ts.
-      model: agent.model ?? "opus",
-      effort: agent.effort ?? "xhigh",
+      model: runner === "codex" ? process.env.PYRY_CODEX_MODEL ?? "" : agent.model ?? "opus",
+      effort: runner === "codex" ? process.env.PYRY_CODEX_EFFORT ?? "" : agent.effort ?? "xhigh",
       maxTurns,
       allowedTools,
       disallowedTools,
@@ -2504,6 +2541,7 @@ export async function maybeResumeExhaustedRun(
   config: SpawnConfig,
   ctx: DispatchContext,
 ): Promise<StreamResult> {
+  if (config.runner === "codex" || first.runner === "codex") return first;
   if (!first.isError) return first;
   const maxLegs = parseResumeLegs(process.env.PYRY_RESUME_LEGS);
   if (maxLegs === 0) return first;
@@ -2566,7 +2604,7 @@ export async function maybeResumeExhaustedRun(
       writeLog(
         ctx.logFile,
         "RESUME_EXHAUSTED",
-        `Still exhausted after ${legsUsed} resume leg(s) (last: ${current.terminalReason || (current.timedOut ? "timeout" : "error")}, ${current.numTurns} total turns, $${current.totalCostUsd.toFixed(2)} total). Falling through to salvage with the original first-leg result.`,
+        `Still exhausted after ${legsUsed} resume leg(s) (last: ${current.terminalReason || (current.timedOut ? "timeout" : "error")}, ${current.numTurns} total turns, ${formatRunCost(current)} total). Falling through to salvage with the original first-leg result.`,
       );
       console.log(`   ⚠️  Still exhausted after ${legsUsed} resume leg(s) — salvage runs on the original result`);
     }
@@ -2597,6 +2635,11 @@ export async function handleAgentResultErrors(
   ctx: DispatchContext,
 ): Promise<boolean> {
   if (!streamResult.isError) return false;
+  // A blocked task is never salvaged automatically, including a shutdown
+  // timeout after its final outcome. Salvage could repeat a rejected action.
+  if (streamResult.runner === "codex" && streamResult.terminalReason === "codex_blocked") {
+    throw new Error(`Codex task blocked: ${streamResult.output.slice(0, 2000)}`);
+  }
 
   const { agent, item, client, agentCwd, useWorktree, branchName, logFile } = ctx;
   const { execSync } = ctx.deps;
@@ -2734,16 +2777,32 @@ export async function handlePostRun(
   const { agent, item, client, agentCwd, useWorktree, branchName, logFile, startTime } = ctx;
   const { execSync, spawnSync, notifyDiscord } = ctx.deps;
 
+  // A builder planning handoff is neither completed implementation nor an
+  // approval escape hatch. Keep partial work local; the existing rework router
+  // owns the column move and done-label cleanup on its next pass.
+  if (streamResult.terminalReason === "needs_refinement") {
+    if (streamResult.runner !== "codex" || agent.name !== "builder" || item.issueNumber <= 0
+        || streamResult.isError || streamResult.hadPermissionDenial || saferSalvaged) {
+      throw new Error("Invalid refinement handoff; operator review required");
+    }
+    await client.addComment(item.issueNumber,
+      `## Builder requests refinement\n\n${streamResult.output}\n\nWorktree retained for recovery: ${agentCwd}`);
+    await client.addLabel(item.issueNumber, "needs-rework:refiner");
+    writeLog(logFile, "REFINEMENT HANDOFF", streamResult.output);
+    console.log(`   🔄 #${item.issueNumber} requests refinement; worktree retained`);
+    return { ok: false };
+  }
+
   const output = streamResult.output;
   const u = streamResult.usage;
   const usageSummary = [
-    `Turns: ${streamResult.numTurns}`,
+    `${streamResult.runner === "codex" ? "Codex completed turns" : "Turns"}: ${streamResult.numTurns}`,
     `Duration: ${Math.round(streamResult.durationMs / 1000)}s`,
     `Input tokens: ${(u as any).input_tokens ?? 0}`,
     `Output tokens: ${(u as any).output_tokens ?? 0}`,
     `Cache read: ${(u as any).cache_read_input_tokens ?? 0}`,
     `Cache creation: ${(u as any).cache_creation_input_tokens ?? 0}`,
-    `Cost: $${streamResult.totalCostUsd.toFixed(4)}`,
+    `Cost: ${formatRunCost(streamResult, 4)}`,
     `Session: ${streamResult.sessionId}`,
   ].join(" | ");
 

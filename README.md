@@ -207,3 +207,73 @@ in their project settings too.
 Role prompts should route new lessons through ticket comments and pull-request
 notes into the existing documentation stage. Do not move the private memory
 directory into the repository or inject the entire archive into each run.
+
+## Selectable agent runner
+
+Claude remains the default, including the existing `pyry agent-run` wrapper and
+`PYRY_USE_LEGACY_CLAUDE` rollback. Set the following in the consumer agents repo's
+`.env` to select Codex for all pipeline stages:
+
+```dotenv
+PYRY_AGENT_RUNNER=codex
+```
+
+Unset it or set `claude` to return to Claude. Unknown values fail startup before
+board processing. The installed Codex CLI must support `exec --json`,
+`--approve-for-me`, and `--output-schema`. The integration was verified with CLI
+0.153.4. Authenticate Codex on the dispatcher host before starting the queue.
+Claude authentication is not reused.
+
+Codex uses the operator's configured default model and effort. Optional
+`PYRY_CODEX_MODEL` and `PYRY_CODEX_EFFORT` select Codex-specific overrides;
+Claude stage model names and effort overrides are never passed to Codex.
+At startup the dispatcher pins the Codex executable from PATH. On macOS it also
+checks the ChatGPT app bundle when the terminal PATH does not expose its CLI.
+`PYRY_CODEX_BIN` overrides discovery. An invalid override or missing executable
+stops startup before ticket selection or labels are changed.
+The same stage set, ticket prompts, worktrees, deterministic gates and post-run
+checks apply. Product tests that exercise real Claude continue to exercise Claude.
+
+The runner adds the role instructions to Codex's built-in instructions and loads
+`CLAUDE.md` as a project-instruction fallback. Its task prompt travels on stdin.
+`--approve-for-me` selects workspace-write sandboxing and automatic approval
+review. It cannot be combined with `--sandbox`. No sandbox bypass or blanket
+network access is enabled. Claude tool allowlists are not translated into Codex
+permissions. Codex uses its own configured tools, sandbox and reviewer; role
+instructions still restrict the scope of the task. Missing search tools fall back
+to repository and command-line search. Claude credentials are stripped from the
+Codex child environment in addition to the existing dispatcher-secret scrub.
+
+A successful process must emit a completed turn and a valid final JSON outcome
+with `status: completed`. A `blocked` outcome, missing outcome, failed turn,
+nonzero exit or dispatcher timeout cannot advance a ticket. A blocked outcome
+parks the ticket without automatic retry and preserves its worktree for recovery.
+This avoids deleting edits after a required commit or external action is rejected.
+The operator must inspect that worktree before re-queueing the ticket.
+
+A builder may instead return `status: needs_refinement` for a planning problem.
+The dispatcher posts its explanation on the assigned issue and adds
+`needs-rework:refiner`. The existing rework router moves it back to refinement.
+No implementation-complete label, automatic commit or push occurs. Its worktree
+is retained. Other roles cannot use this outcome. A failed run or observed
+approval rejection cannot use this route. Permission denials still require
+operator review; the dispatcher does not retry the denied action.
+
+Codex has no Claude-style max-turn budget. The existing per-stage wall-clock
+budget applies, with process-group termination and a two-second forced-stop grace
+period. Codex does not enter the Claude continuation path. Timeout results retain
+the thread ID and use the existing partial-work salvage path. Recovery messages
+point to `codex resume`. Transient process-spawn retry remains bounded as before;
+other failures use the existing error classification without pretending all Codex
+failures are Claude API errors.
+
+Logs include native Codex progress, thread ID, token usage and completed Codex
+turns. Those turns are not comparable with Claude's model-turn count. Monetary
+cost is reported as unavailable because Codex JSON does not provide a measured
+USD cost.
+
+Verification includes subprocess fixtures for streaming, failures and teardown,
+and a disposable real Codex run that added a failing regression test, fixed it,
+passed the tests and committed locally. It does not establish that every project
+role or an entire live-board ticket has been exercised. Selecting a runner does
+not provide a single-ticket mode; the normal launcher processes the board.

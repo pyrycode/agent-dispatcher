@@ -23,6 +23,7 @@ import { fileURLToPath } from "node:url";
 
 import { dispatchInbox, installSignalHandlers, pollLoop } from "./dispatch.js";
 import { decideCodegraphHealth, findMissingAgentClaudeMds } from "./agent-runtime.js";
+import { resolveAgentRunner, resolveCodexExecutable } from "./agent-runner.js";
 import { activeStageSet, type StageSet } from "./stage-sets.js";
 import { resolveAgentsRepoRootWithEnv, resolveTargetRepoRoot } from "./worktree.js";
 
@@ -52,6 +53,10 @@ if (isNaN(parseInt(process.env.PROJECT_NUMBER!, 10))) {
 let stageSet: StageSet;
 try {
   stageSet = activeStageSet();
+  if (resolveAgentRunner(process.env) === "codex") {
+    process.env.PYRY_CODEX_BIN = resolveCodexExecutable(process.env);
+    console.log(`Codex executable: ${process.env.PYRY_CODEX_BIN}`);
+  }
 } catch (e) {
   console.error(e instanceof Error ? e.message : String(e));
   process.exit(1);

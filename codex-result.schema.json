@@ -1,0 +1,9 @@
+{
+  "type": "object",
+  "properties": {
+    "status": { "type": "string", "enum": ["completed", "blocked", "needs_refinement"] },
+    "summary": { "type": "string" }
+  },
+  "required": ["status", "summary"],
+  "additionalProperties": false
+}
