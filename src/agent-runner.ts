@@ -51,6 +51,8 @@ export function buildCodexInvocation(opts: {
       // Add role instructions without replacing Codex's built-in instructions.
       "-c", `developer_instructions=${JSON.stringify(opts.role)}`,
       "-c", 'project_doc_fallback_filenames=["CLAUDE.md"]',
+      // Meshy is for interactive art work; its launcher asks 1Password on every start.
+      "-c", "mcp_servers.meshy.enabled=false",
       ...(opts.model ? ["--model", opts.model] : []),
       ...(opts.effort ? ["-c", `model_reasoning_effort=${JSON.stringify(opts.effort)}`] : []),
       "-",
@@ -155,5 +157,6 @@ This dispatch uses Codex. Apply the role instructions above with these runtime a
 - Stay within this role's allowed files and assigned ticket. Git commits, pushes, and GitHub changes explicitly required by the assigned role are part of the task. Do not change unrelated tickets, host credentials, or sandbox policy.
 - Ordinary sandbox restrictions can be escalated through automatic approval review. If the reviewer rejects a necessary action, stop and report status blocked. Do not work around rejection.
 - Builder only: when planning finds a scope, sizing, overlap or missing-information problem requiring refinement, return status needs_refinement with a self-contained explanation and any split proposal or blocker issue numbers. Do not post the routing comment or apply needs-rework:refiner yourself. The dispatcher owns this handoff for the assigned issue. Do not use it for permission denials, failed tools, or documentation work owned by the later documentation stage. After a reviewer rejection, status blocked is mandatory.
-- Report status completed only after the assigned work and required checks are done. Missing access, incomplete work, or a rejected necessary action means status blocked. Return the required JSON outcome with a concise summary.
+- Report status completed when this role's assigned work and role-owned checks are done. Explicitly hand off work owned by later stages, including documentation and dispatcher-owned live tests. Pending later-stage work alone is not a blocker and must never be reported as already passed.
+- Missing access or incomplete work required by the current role, and every rejected necessary action, still mean status blocked. Never relabel a permission denial as a later-stage handoff. Return the required JSON outcome with a concise summary.
 `;
