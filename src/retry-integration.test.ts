@@ -16,6 +16,7 @@ import {
   type StreamResult,
 } from "./dispatch.js";
 import { ResourceExhaustedError } from "./agent-runtime.js";
+import { CodexStreamAdapter } from "./agent-runner.js";
 import { AGENTS, type ProjectItem } from "./types.js";
 
 const RETRY_MARKER = "<!-- pyry-auto-retry -->";
@@ -371,5 +372,67 @@ describe("holdBackoffWaiters — poll-loop backoff gate (agent-dispatcher#25)", 
     const byCol = new Map<string, ProjectItem[]>([["In QA", [item]]]);
     await holdBackoffWaiters(byCol, client, NOW);
     assert.deepEqual(byCol.get("In QA")!.map((i) => i.issueNumber), []);
+  });
+});
+
+
+describe("Codex temporary model-access failure, desktop #1351", () => {
+  const message = "stream disconnected before completion: Unable to verify model access right now. Please retry.";
+
+  function failedRun(options: { message?: string; blocked?: boolean; timedOut?: boolean } = {}) {
+    const adapter = new CodexStreamAdapter();
+    adapter.accept({ type: "thread.started", thread_id: "desktop-1351" });
+    adapter.accept({ type: "turn.started" });
+    adapter.accept({ type: "error", message: `Reconnecting... 5/5 (${message})` });
+    if (options.blocked) adapter.accept({ type: "item.completed", item: {
+      type: "command_execution", aggregated_output: "This action was rejected due to unacceptable risk",
+    } });
+    adapter.accept({ type: "turn.failed", error: { message: options.message ?? message } });
+    return adapter.finish(1, options.timedOut ?? false, 43000);
+  }
+
+  test("recorded terminal failure schedules a delayed ticket retry", async () => {
+    const result = failedRun();
+    const client = new FakeClient();
+    const discord: string[] = [];
+    await handleDispatchError(new Error(result.output), makeCtx(makeItem({ issueNumber: 1351 }), client, discord), result);
+    assert.equal(result.isError, true);
+    assert.equal(result.output, message);
+    assert.ok(client.labels().includes("error-retry-count:1"));
+    assert.ok(!client.labels().includes("error:developer"));
+    assert.ok(client.comments.some(c => c.body.includes(RETRY_MARKER)));
+    assert.ok(discord.some(m => m.includes("auto-retry 1/4")));
+  });
+
+  test("persistent model-access failure still parks at the existing retry cap", async () => {
+    const result = failedRun();
+    const client = new FakeClient();
+    await handleDispatchError(new Error(result.output), makeCtx(makeItem({ issueNumber: 1351, labels: ["error-retry-count:4"] }), client, []), result);
+    assert.ok(client.labels().includes("error:developer"));
+    assert.ok(client.comments.some(c => c.body.includes("Transient retries exhausted")));
+    assert.ok(!client.labels().some(l => l.startsWith("error-retry-count:")));
+  });
+
+  for (const [name, options] of [
+    ["approval rejection", { blocked: true }],
+    ["timeout", { timedOut: true }],
+    ["permanent model denial", { message: "stream disconnected before completion: You do not have access to this model." }],
+    ["unrecognised failure", { message: "Codex turn failed" }],
+  ] as const) {
+    test(`${name} stays parked despite earlier reconnect diagnostics`, async () => {
+      const result = failedRun(options);
+      const client = new FakeClient();
+      await handleDispatchError(new Error(result.output), makeCtx(makeItem({ issueNumber: 1351 }), client, []), result);
+      assert.ok(client.labels().includes("error:developer"));
+      assert.ok(!client.labels().some(l => l.startsWith("error-retry-count:")));
+    });
+  }
+
+  test("successful reconnect does not become a failed run", () => {
+    const adapter = new CodexStreamAdapter();
+    adapter.accept({ type: "error", message });
+    adapter.accept({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ status: "completed", summary: "Finished" }) } });
+    adapter.accept({ type: "turn.completed", usage: {} });
+    assert.equal(adapter.finish(0, false, 43000).isError, false);
   });
 });
