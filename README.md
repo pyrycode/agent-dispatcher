@@ -61,6 +61,22 @@ The agents repo provides:
 - `.env` with `GITHUB_TOKEN`, `GITHUB_OWNER`, `GITHUB_REPO`, `PROJECT_NUMBER`, `TARGET_REPO_PATH`, `AGENTS_REPO_PATH`
 - `bin/pyry-start` (or equivalent) to launch the dispatcher
 
+## Updating the shared dispatcher
+
+Make shared source changes in this repository. Test and publish the merged
+revision here before updating the consumer repositories. Local fixes found in a
+consumer's `dispatcher/` submodule must be reconciled here first.
+
+The five maintained consumers are `pyrycode-agents`, `pyrycode-desktop-agents`,
+`pyrycode-mobile-agents`, `pyrycode-relay-agents` and `tui-driver-agents` in the
+`pyrycode` GitHub organisation. The paused v2 consumer is excluded.
+
+For each consumer, inspect and preserve local changes, fetch the published
+revision, update the `dispatcher` submodule and commit that pointer in the
+consumer repository. Verify the published pointer matches the shared revision.
+Install dependencies if they changed. A running dispatcher loads source at
+startup, so report restart status separately from repository propagation.
+
 ## Required environment variables
 
 | Variable | Description |
