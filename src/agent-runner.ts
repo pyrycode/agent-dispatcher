@@ -51,6 +51,8 @@ export function buildCodexInvocation(opts: {
       // Add role instructions without replacing Codex's built-in instructions.
       "-c", `developer_instructions=${JSON.stringify(opts.role)}`,
       "-c", 'project_doc_fallback_filenames=["CLAUDE.md"]',
+      // Meshy is for interactive art work; its launcher asks 1Password on every start.
+      "-c", "mcp_servers.meshy.enabled=false",
       ...(opts.model ? ["--model", opts.model] : []),
       ...(opts.effort ? ["-c", `model_reasoning_effort=${JSON.stringify(opts.effort)}`] : []),
       "-",

@@ -96,6 +96,7 @@ test("Codex subprocess receives literal stdin, additive role, schema and reviewe
   assert.equal(args[0], "exec");
   assert.ok(args.includes("--json"));
   assert.ok(args.includes("--approve-for-me"));
+  assert.ok(args.some((arg, i) => arg === "-c" && args[i + 1] === "mcp_servers.meshy.enabled=false"), "dispatcher agents must not start Meshy and request 1Password access");
   // --approve-for-me selects workspace-write and conflicts with --sandbox.
   assert.ok(!args.includes("--sandbox"));
   assert.equal(args[args.indexOf("--cd") + 1], f.dir);
