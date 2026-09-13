@@ -267,6 +267,12 @@ point to `codex resume`. Transient process-spawn retry remains bounded as before
 other failures use the existing error classification without pretending all Codex
 failures are Claude API errors.
 
+A failed Codex turn reporting “Unable to verify model access right now. Please
+retry.” after a stream disconnect uses the existing delayed API retry schedule.
+This covers the temporary access-check outage observed on Desktop ticket 1351.
+The four-retry cap still applies. A disconnect by itself does not qualify.
+Permanent model denials, approval blocks and timeouts still require review.
+
 Logs include native Codex progress, thread ID, token usage and completed Codex
 turns. Those turns are not comparable with Claude's model-turn count. Monetary
 cost is reported as unavailable because Codex JSON does not provide a measured

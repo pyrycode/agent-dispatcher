@@ -120,7 +120,13 @@ export class CodexStreamAdapter {
     this.approvalRejected ||= /This action was rejected due to unacceptable risk/.test(stderr);
     const blocked = this.approvalRejected || outcome?.status === "blocked";
     const isError = timedOut || code !== 0 || this.failed || !this.completed || !outcome || blocked;
-    const terminalReason = blocked ? "codex_blocked" : timedOut ? "timeout" : isError ? "codex_error" : outcome?.status === "needs_refinement" ? "needs_refinement" : "stop";
+    // Codex reports this temporary access-check outage as a generic failed turn.
+    // Map the observed server failure to the existing capped API retry path.
+    // A disconnect alone can also mean permanent model denial, so keep it narrow.
+    const temporaryModelAccessFailure = this.failed && /^stream disconnected before completion: Unable to verify model access right now\.\s*Please retry\.?$/i.test(this.errorText.trim());
+    const terminalReason = blocked ? "codex_blocked" : timedOut ? "timeout"
+      : isError ? (temporaryModelAccessFailure ? "api_error" : "codex_error")
+      : outcome?.status === "needs_refinement" ? "needs_refinement" : "stop";
     const failure = blocked ? (this.approvalRejected ? "Automatic approval review rejected an action. Operator review required." : outcome!.summary) : this.errorText || stderr.trim() || `Codex exited with code ${code} without a successful completed task outcome`;
     return {
       runner: "codex", costKnown: false,
