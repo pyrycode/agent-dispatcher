@@ -796,3 +796,79 @@ describe("real-claude gate — builder stage set", () => {
     });
   });
 });
+
+
+describe("live artifact handoff", () => {
+  for (const flaky of [false, true]) {
+    test(`a ${flaky ? "flaky" : "clean"} pass returns pending artifacts for implementation and re-verification`, async () => {
+      await withStageSet("builder", async () => {
+        const item = builderParkedItem({ labels: ["done:builder", "done:verifier", "needs-real-claude", "needs-live-artifacts"] });
+        const client = new MockClient([item]);
+        const liveReport = flaky ? report({ exitCode: 1,
+          tally: tally({ executed: 176, passed: 175, failed: 1, failedNames: ["pkg.TestCapture"], packageFailed: true }),
+          rerunFailures: [],
+        }) : report();
+        await runRealClaudeGateExecution(client, async () => liveReport, 150, async () => {});
+        assert.equal(item.status, "In Development");
+        assert.ok(item.labels.includes("needs-rework:builder"));
+        assert.ok(item.labels.includes("needs-live-artifacts"));
+        assert.ok(item.labels.includes("needs-real-claude"));
+        assert.match(client.addCommentCalls.at(-1)?.body ?? "", /commit.*artifact/i);
+        await runReworkRouting(client);
+        assert.ok(!item.labels.includes("done:builder"));
+        assert.ok(!item.labels.includes("done:verifier"));
+        // Builder commits the evidence and clears only its pending marker.
+        item.labels = item.labels.filter(label => label !== "needs-live-artifacts");
+        item.labels.push("done:builder");
+        await runAutoAdvance(client, 1);
+        assert.equal(item.status, "In Code Review");
+        item.labels.push("done:verifier");
+        await runRealClaudeGate(client);
+        await runRealClaudeGateExecution(client, async () => report(), 150, async () => {});
+        assert.equal(item.status, "In Documentation");
+        assert.ok(!item.labels.includes("needs-real-claude"));
+      });
+    });
+  }
+  test("artifact handoff cannot continue if its evidence comment fails", async () => {
+    await withStageSet("builder", async () => {
+      const item = builderParkedItem({ labels: ["done:verifier", "needs-real-claude", "needs-live-artifacts"] });
+      const client = new MockClient([item]);
+      client.addComment = async () => { throw new Error("GitHub unavailable"); };
+      await runRealClaudeGateExecution(client, async () => report(), 150, async () => {});
+      assert.equal(item.status, "Inbox");
+      assert.equal(client.addLabelCalls.length, 0);
+      assert.equal(client.removeLabelCalls.length, 0);
+    });
+  });
+});
+
+
+test("artifact marker uses fresh labels and does not turn an unavailable gate into completion", async () => {
+  await withStageSet("builder", async () => {
+    const item = builderParkedItem();
+    const client = new MockClient([item]);
+    client.freshLabels.set(77, [...item.labels, "needs-live-artifacts"]);
+    await runRealClaudeGateExecution(client, async () => report(), 150, async () => {});
+    assert.equal(item.status, "In Development");
+    assert.ok(item.labels.includes("needs-real-claude"));
+    const unavailable = builderParkedItem({ labels: ["done:verifier", "needs-real-claude", "needs-live-artifacts"] });
+    const second = new MockClient([unavailable]);
+    await runRealClaudeGateExecution(second, async () => report({ runError: "login unavailable" }), 150, async () => {});
+    assert.equal(unavailable.status, "Inbox");
+    assert.ok(unavailable.labels.includes("error:real-claude-gate"));
+    assert.ok(!unavailable.labels.includes("needs-rework:builder"));
+    assert.equal(second.removeLabelCalls.length, 0);
+  });
+});
+
+test("failed artifact rework label write cannot move the ticket forward", async () => {
+  await withStageSet("builder", async () => {
+    const item = builderParkedItem({ labels: ["done:verifier", "needs-real-claude", "needs-live-artifacts"] });
+    const client = new MockClient([item]);
+    client.addLabel = async () => { throw new Error("GitHub unavailable"); };
+    await runRealClaudeGateExecution(client, async () => report(), 150, async () => {});
+    assert.equal(item.status, "Inbox");
+    assert.equal(client.removeLabelCalls.length, 0);
+  });
+});

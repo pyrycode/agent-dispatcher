@@ -501,9 +501,20 @@ export async function runRealClaudeGateExecution(
       baselineFailures: report.baselineFailures,
       rerunFailures: report.rerunFailures,
     });
-    const outcome = decideGateOutcome(verdict, realClaudeGate.failReworkLabel);
+    const artifactsPending = freshLabels.includes("needs-live-artifacts")
+      && (verdict === "pass" || verdict === "flaky-pass");
+    const outcome = artifactsPending
+      ? { toColumn: "In Development", addLabels: [realClaudeGate.failReworkLabel], removeLabels: [], notify: verdict === "flaky-pass" }
+      : decideGateOutcome(verdict, realClaudeGate.failReworkLabel);
 
-    const action = outcome.toColumn === null
+    const action = artifactsPending
+      ? `returned it to **In Development** with \`${realClaudeGate.failReworkLabel}\`. ` +
+        `Commit the exact usable live artifacts from this run's durable records and all matching reader/schema changes. ` +
+        `Use the output path below to find the records; do not invent evidence. ` +
+        `Then remove \`needs-live-artifacts\` after committing and pushing, and complete the implementation role. ` +
+        `The pending marker and \`needs-real-claude\` remain until that work is done; review and the live gate must run again. ` +
+        `This is an evidence handoff, not final acceptance.`
+      : outcome.toColumn === null
       ? `left it in ${REAL_CLAUDE_GATE_RUN_FROM_COLUMN} and added \`${outcome.addLabels.join("`, `")}\`. ` +
         (verdict === "inherited-failure"
           ? `This needs a human: the failures are real but this branch did not cause them, so there is nothing ` +
@@ -537,8 +548,18 @@ export async function runRealClaudeGateExecution(
       );
     } catch (e) {
       console.warn(`   ⚠️  Failed to post real-claude gate evidence on #${candidate.issueNumber}: ${e}`);
+      if (artifactsPending) return; // Recovery needs the durable evidence pointer.
     }
 
+    // Mark rework before moving so a failed write cannot forward stale approvals.
+    if (artifactsPending) {
+      try {
+        await client.addLabel(candidate.issueNumber, realClaudeGate.failReworkLabel);
+      } catch (e) {
+        console.warn(`   ⚠️  Failed to mark live artifact handoff for #${candidate.issueNumber}: ${e}`);
+        return;
+      }
+    }
     if (outcome.toColumn !== null) {
       try {
         await client.updateItemStatus(candidate.itemId, outcome.toColumn);
@@ -546,7 +567,7 @@ export async function runRealClaudeGateExecution(
         console.warn(`   ⚠️  Failed to move #${candidate.issueNumber} to ${outcome.toColumn}: ${e}`);
       }
     }
-    for (const label of outcome.addLabels) {
+    for (const label of artifactsPending ? [] : outcome.addLabels) {
       try { await client.addLabel(candidate.issueNumber, label); } catch (e) {
         console.warn(`   ⚠️  Failed to add ${label} to #${candidate.issueNumber}: ${e}`);
       }
