@@ -24,10 +24,12 @@
 // a detail.
 
 /** Artifact shapes the gate knows how to read. */
-export type GateOutputFormat = "go-json" | "playwright-json";
+import { XMLParser, XMLValidator } from "fast-xml-parser";
+
+export type GateOutputFormat = "go-json" | "playwright-json" | "junit-xml";
 
 /** Every format the parser accepts, for env validation at the caller. */
-export const GATE_OUTPUT_FORMATS: readonly GateOutputFormat[] = ["go-json", "playwright-json"];
+export const GATE_OUTPUT_FORMATS: readonly GateOutputFormat[] = ["go-json", "playwright-json", "junit-xml"];
 
 /**
  * Type guard for the env-configured format string. An unrecognised value
@@ -132,7 +134,82 @@ const GO_RUNNING_TEST_LINE = /^\s+((?:Test|Benchmark|Example|Fuzz)\S*) \(([^)]*)
  */
 export function parseGateOutput(raw: string, format: GateOutputFormat): GateTally {
   if (format === "playwright-json") return parsePlaywrightJson(raw);
+  if (format === "junit-xml") return parseJUnitXml(raw);
   return parseGoJson(raw);
+}
+
+// Android/Gradle emits JUnit XML. The consumer wrapper joins only fresh
+// reports under <testsuites> and writes build logs to stderr. Count leaf
+// cases, never the advertised suite total: skipped tests are not execution.
+function parseJUnitXml(raw: string): GateTally {
+  const tally = emptyTally();
+  if (/<!DOCTYPE|<!ENTITY/i.test(raw) || XMLValidator.validate(raw) !== true) return tally;
+  let doc: any;
+  try {
+    doc = new XMLParser({
+      ignoreAttributes: false,
+      attributeNamePrefix: "@_",
+      parseTagValue: false,
+      isArray: name => ["testsuite", "testcase", "failure", "error", "skipped"].includes(name),
+    }).parse(raw);
+  } catch { return tally; }
+  if (!doc || (!doc.testsuite && !doc.testsuites)) return tally;
+  tally.recognizedLines = 1;
+  type Result = { status: "passed" | "failed" | "skipped"; reason: string };
+  const cases = new Map<string, Result>();
+  const brokenSuite = (name: string) => {
+    tally.packageFailed = true;
+    if (!tally.packageFailures.includes(name)) tally.packageFailures.push(name);
+  };
+  const walk = (suite: any): { count: number; failed: number; skipped: number } => {
+    if (!suite || typeof suite !== "object") return { count: 0, failed: 0, skipped: 0 };
+    const suiteName = String(suite["@_name"] || "JUnit runner");
+    const leaves = Array.isArray(suite.testcase) ? suite.testcase : [];
+    let reportedFailures = 0;
+    let reportedSkips = 0;
+    for (const test of leaves) {
+      const method = test?.["@_name"];
+      if (typeof method !== "string" || !method.trim()) { brokenSuite(suiteName); continue; }
+      const name = `${test["@_classname"] || suiteName}#${method}`;
+      const failed = test.failure !== undefined || test.error !== undefined;
+      if (failed) reportedFailures++;
+      const status = failed ? "failed" : test.skipped !== undefined ? "skipped" : "passed";
+      if (status === "skipped") reportedSkips++;
+      const skip = test.skipped?.[0];
+      const reason = typeof skip === "string" ? skip : String(skip?.["@_message"] || skip?.["#text"] || "no reason recorded");
+      const previous = cases.get(name);
+      // Duplicate artifacts/retries must neither inflate the floor nor erase red.
+      if (!previous || status === "failed" || (previous.status === "skipped" && status === "passed")) {
+        cases.set(name, { status, reason });
+      }
+    }
+    let count = leaves.length;
+    for (const child of [...(suite.testsuite ?? []), ...(suite.testsuites ? [suite.testsuites] : [])]) {
+      const nested = walk(child);
+      count += nested.count; reportedFailures += nested.failed; reportedSkips += nested.skipped;
+    }
+    if (suite.error !== undefined || suite.failure !== undefined) brokenSuite(suiteName);
+    const declared = suite["@_tests"];
+    if (declared !== undefined && (!/^\d+$/.test(String(declared)) || Number(declared) !== count)) brokenSuite(suiteName);
+    // A runner error can appear only in the summary, with no failing testcase.
+    const failures = Number(suite["@_failures"] ?? 0) + Number(suite["@_errors"] ?? 0);
+    const skips = Number(suite["@_skipped"] ?? 0);
+    if (!Number.isFinite(failures) || failures > reportedFailures || !Number.isFinite(skips) || skips > reportedSkips) brokenSuite(suiteName);
+    return { count, failed: reportedFailures, skipped: reportedSkips };
+  };
+  if (doc.testsuites) walk(doc.testsuites);
+  for (const suite of doc.testsuite ?? []) walk(suite);
+  for (const [name, result] of cases) {
+    if (result.status === "skipped") {
+      tally.skipped++;
+      tally.skipReasons.push(`${name}: ${result.reason}`);
+    } else {
+      tally.executed++;
+      if (result.status === "failed") { tally.failed++; tally.failedNames.push(name); }
+      else { tally.passed++; tally.passedNames.push(name); }
+    }
+  }
+  return tally;
 }
 
 // --------- Go: `go test -json` ---------
