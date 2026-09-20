@@ -318,3 +318,12 @@ checks and pushes them, then removes only `needs-live-artifacts`. Existing rewor
 routing clears prior approvals. Review and the live gate run again before the
 ordinary documentation handoff. A green disposable checkout alone cannot complete
 a capture ticket. This workflow does not give agents Claude credentials.
+
+## Preserve local work during cleanup
+
+The dispatcher uses ordinary Git worktree removal. Dirty or locked worktrees stay
+at their existing paths. A retained worktree can block the next run of that branch;
+resolve and commit its work before retrying. Startup never force-removes it.
+Cleanup reports local changes in the main checkout without discarding tracked edits
+or deleting untracked files. This also applies to live-gate and baseline worktrees.
+A preserved path is evidence to inspect, not permission to force-delete it.

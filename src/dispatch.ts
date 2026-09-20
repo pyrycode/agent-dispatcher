@@ -2162,8 +2162,8 @@ export async function setupBranchAndWorktree(
         //     run looked like "unpushed work" but held none.)
         const diverged = branchAction === "abort-local-diverged";
         const msg = diverged
-          ? `Local \`${branchName}\` and origin/${branchName} have DIVERGED: each carries commits the other lacks. This usually means origin was advanced out-of-band (a manual triage or hot-fix push) while local still held commits from a prior run, often a leftover merge from a wedged dispatch. Do NOT blindly push local: it would revert the commits origin has that local lacks. Origin is the source of truth. Confirm origin holds the intended work, then discard the local commits with \`git branch -f ${branchName} origin/${branchName}\` and strip \`error:${agent.name}\` to retry. Only push local if you have verified it holds work origin genuinely lacks.`
-          : `Local \`${branchName}\` has commits not present on origin/${branchName}, and origin has none that local lacks: a prior dispatch committed work but failed to push. Push the missing commits with \`git push origin ${branchName}\`, or discard them if known-bad, then strip \`error:${agent.name}\` to retry.`;
+          ? `Local \`${branchName}\` and origin/${branchName} have DIVERGED: each carries commits the other lacks. This usually means origin was advanced out-of-band (a manual triage or hot-fix push) while local still held commits from a prior run, often a leftover merge from a wedged dispatch. Do NOT blindly push local: it would revert the commits origin has that local lacks. Origin is the source of truth. Confirm origin holds the intended work, then preserve the local branch and reconcile its commits without rewriting it. After resolving the divergence, strip \`error:${agent.name}\` to retry. Only push local if you have verified it holds work origin genuinely lacks.`
+          : `Local \`${branchName}\` has commits not present on origin/${branchName}, and origin has none that local lacks: a prior dispatch committed work but failed to push. Push the missing commits with \`git push origin ${branchName}\`, or preserve the branch for manual review, then strip \`error:${agent.name}\` to retry.`;
         console.error(`   ❌ ${msg}`);
 
         // Capture the relevant commits inline so the operator doesn't need
@@ -2221,7 +2221,7 @@ export async function setupBranchAndWorktree(
     // Clean up stale worktree at the SAME path (previous failed run with
     // matching agent prefix).
     try {
-      execSync(`git worktree remove --force "${worktreeDir}"`, { cwd: repoRoot, stdio: "pipe" });
+      execSync(`git worktree remove "${worktreeDir}"`, { cwd: repoRoot, stdio: "pipe" });
     } catch {}
 
     // Clean up orphan worktrees checked out at the SAME BRANCH under a
@@ -2231,8 +2231,8 @@ export async function setupBranchAndWorktree(
     // (permissions, lockfile contention) — the orphan blocks all future
     // dispatches on this branch with error:<agent> until a human steps in.
     // Prune first to drop dead refs (worktree dir was removed but git's
-    // metadata still references it), then force-remove anything still
-    // matching the branch.
+    // metadata still references it), then remove clean worktrees still
+    // matching the branch. Dirty worktrees remain and block reuse safely.
     try {
       execSync(`git worktree prune`, { cwd: repoRoot, stdio: "pipe" });
       const porcelain = execSync(`git worktree list --porcelain`, {
@@ -2241,7 +2241,7 @@ export async function setupBranchAndWorktree(
       for (const orphanPath of findWorktreesForBranch(porcelain, branchName)) {
         if (orphanPath === worktreeDir) continue; // already removed above
         try {
-          execSync(`git worktree remove --force "${orphanPath}"`, { cwd: repoRoot, stdio: "pipe" });
+          execSync(`git worktree remove "${orphanPath}"`, { cwd: repoRoot, stdio: "pipe" });
           console.log(`   🧹 Removed orphan worktree ${orphanPath} (branch ${branchName})`);
         } catch (e) {
           console.warn(`   ⚠️  Failed to remove orphan worktree ${orphanPath}: ${e}`);
@@ -2299,7 +2299,7 @@ export async function setupBranchAndWorktree(
     await client.addComment(item.issueNumber, `## ⚠️ Dispatch Error: ${agent.name}\n\nMerge conflict on branch \`${branchName}\` when merging \`${defaultBranch}\`. Manual resolution required.\n\n\`\`\`\n${e}\n\`\`\``);
     try { await client.addLabel(item.issueNumber, `error:${agent.name}`); } catch {}
     // Clean up the worktree since we're bailing
-    try { execSync(`git worktree remove --force "${worktreeDir}"`, { cwd: repoRoot, stdio: "pipe" }); } catch {}
+    try { execSync(`git worktree remove "${worktreeDir}"`, { cwd: repoRoot, stdio: "pipe" }); } catch {}
     return { ok: false };
   }
 
@@ -2366,7 +2366,7 @@ export async function prepareAgentSpawn(
       await client.addComment(item.issueNumber, `## ⚠️ Dispatch Error: ${agent.name}\n\nAgent CLAUDE.md not found at \`${agent.claudeMdPath}\`. Check types.ts configuration.`);
     }
     if (useWorktree) {
-      try { execSync(`git worktree remove --force "${worktreeDir}"`, { cwd: repoRoot, stdio: "pipe" }); } catch {}
+      try { execSync(`git worktree remove "${worktreeDir}"`, { cwd: repoRoot, stdio: "pipe" }); } catch {}
     }
     return { ok: false };
   }
@@ -2825,7 +2825,7 @@ export async function handlePostRun(
 
   // Safety net: commit any uncommitted changes BEFORE worktree cleanup
   // destroys them. Surfaced on #27 (architect's spec was Written but not
-  // committed; `git worktree remove --force` destroyed it silently). Each
+  // committed; `git worktree remove` destroyed it silently). Each
   // agent's CLAUDE.md should already commit its work, but this catches the
   // case where an agent forgets — which has happened, and the failure mode
   // is silent loss of the run's output. Run unconditionally inside the
@@ -3079,27 +3079,23 @@ export async function cleanupAfterDispatch(ctx: DispatchContext): Promise<void> 
   const { useWorktree, worktreeDir } = ctx;
   const { execSync } = ctx.deps;
 
-  // Clean up worktree (always, even on error)
+  // Git refuses to remove a dirty or locked worktree. Preserve it for recovery.
   if (useWorktree) {
     try {
-      execSync(`git worktree remove --force "${worktreeDir}"`, { cwd: repoRoot, stdio: "pipe" });
+      execSync(`git worktree remove "${worktreeDir}"`, { cwd: repoRoot, stdio: "pipe" });
       console.log(`   🧹 Removed worktree`);
     } catch (e) {
-      console.warn(`   ⚠️  Failed to remove worktree: ${e}`);
+      console.warn(`   ⚠️  Worktree retained at ${worktreeDir}: ${e}`);
     }
-    // Clean up any files leaked to the main repo by agent sub-processes
-    // (e.g., Claude Code's own worktree recovery writes to .claude/worktrees/ in the main repo)
+    // The main checkout belongs to the operator as well as the dispatcher.
+    // Report residue without discarding edits or deleting untracked files.
     try {
-      execSync(`git checkout -- .`, { cwd: repoRoot, stdio: "pipe" });
-      // Exclude the entire agents/ tree — it's gitignored from the target
-      // repo's perspective, and contains the submodule's node_modules,
-      // runtime logs, prompt files, and the per-agent CLAUDE.md files.
-      // Pre-split this enumerated `agents/dispatch/logs` and
-      // `agents/dispatch/node_modules`; the single `agents` exclude is
-      // both simpler and stays correct when the submodule layout changes.
-      execSync(`git clean -fd --exclude=.env --exclude=agents`, { cwd: repoRoot, stdio: "pipe" });
+      const status = execSync(`git status --porcelain --untracked-files=normal`, {
+        cwd: repoRoot, encoding: "utf-8", stdio: "pipe",
+      }).trim();
+      if (status) console.warn(`   ⚠️  Main checkout has local changes; preserved at ${repoRoot}`);
     } catch (e) {
-      console.warn(`   ⚠️  Failed to clean main repo: ${e}`);
+      console.warn(`   ⚠️  Could not inspect main checkout; left untouched: ${e}`);
     }
   }
 
@@ -3409,7 +3405,7 @@ export async function runDoneCleanup(client: DispatchClient): Promise<void> {
 // killed with SIGKILL (or a host that reboots under it) leaves `claude`
 // grandchildren still writing into the ticket's worktree. Stripping the
 // label under one of those lets a second run start and
-// `git worktree remove --force` the directory the first is working in.
+// `git worktree remove` the directory the first is working in.
 // So the sweep waits out the longest a legitimate run could still be
 // going, then strips. Recovery lands around two hours instead of seven,
 // and it needs no lock, no pidfile and no in-memory registry — this
@@ -3918,7 +3914,7 @@ export async function runRealClaudeGateSuite(opts: {
 
   // 4. Detached worktree at the head commit, then merge the base into it.
   const removeWorktree = () => {
-    try { deps.execSync(`git worktree remove --force "${worktreeDir}"`, { cwd: targetRepo, stdio: "pipe" }); } catch {}
+    try { deps.execSync(`git worktree remove "${worktreeDir}"`, { cwd: targetRepo, stdio: "pipe" }); } catch {}
     try { deps.execSync(`git worktree prune`, { cwd: targetRepo, stdio: "pipe" }); } catch {}
   };
 
@@ -4085,7 +4081,7 @@ async function runBaselineComparison(opts: {
   const stderrPath = resolve(opts.logsDir, `${opts.stamp}_real-claude-gate-base_#${opts.issueNumber}.stderr.log`);
 
   const removeWorktree = () => {
-    try { deps.execSync(`git worktree remove --force "${worktreeDir}"`, { cwd: targetRepo, stdio: "pipe" }); } catch {}
+    try { deps.execSync(`git worktree remove "${worktreeDir}"`, { cwd: targetRepo, stdio: "pipe" }); } catch {}
     try { deps.execSync(`git worktree prune`, { cwd: targetRepo, stdio: "pipe" }); } catch {}
   };
 
