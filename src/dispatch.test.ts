@@ -770,7 +770,8 @@ describe("setupBranchAndWorktree — failure modes", () => {
     // Divergence framing, not "unpushed work" framing.
     assert.match(body, /have DIVERGED/);
     assert.match(body, /would REVERT/);
-    assert.match(body, /git branch -f feature\/155 origin\/feature\/155/);
+    assert.match(body, /preserve the local branch and reconcile its commits without rewriting it/);
+    assert.doesNotMatch(body, /git branch -f/);
     // Must NOT advise pushing local — that's the trap this split fixes.
     assert.ok(!/Push the missing commits/.test(body), "diverged message must not advise pushing local");
     // Both directions' commits + SHAs surface so the operator sees what a
@@ -885,13 +886,13 @@ describe("setupBranchAndWorktree — failure modes", () => {
     // The merge-conflict path is special: it just successfully created
     // the worktree, so it cleans up its own worktree inline. Two markers:
     //   1. `git merge --abort` runs (drains the failed merge state)
-    //   2. `git worktree remove --force` runs AFTER `git worktree add`
+    //   2. `git worktree remove` runs AFTER `git worktree add`
     assert.ok(
       calls.exec.some(c => c.cmd.includes("git merge --abort")),
       "merge-conflict path must call `git merge --abort`",
     );
     const addIdx = calls.exec.findIndex(c => c.cmd.includes("git worktree add"));
-    const removeAfterAdd = calls.exec.slice(addIdx + 1).some(c => c.cmd.includes("git worktree remove --force"));
+    const removeAfterAdd = calls.exec.slice(addIdx + 1).some(c => c.cmd.includes("git worktree remove"));
     assert.ok(removeAfterAdd, "merge-conflict path must clean up its own worktree after creating it");
   });
 });
@@ -1021,7 +1022,7 @@ describe("setupBranchAndWorktree — coverage edges", () => {
     assert.deepEqual(result, { ok: true });
     // The orphan-removal call must precede the worktree-add call.
     const orphanRemoveIdx = calls.exec.findIndex(c =>
-      c.cmd.includes(`git worktree remove --force "${orphanPath}"`),
+      c.cmd.includes(`git worktree remove "${orphanPath}"`),
     );
     const addIdx = calls.exec.findIndex(c => c.cmd.includes("git worktree add"));
     assert.ok(orphanRemoveIdx >= 0, "orphan worktree removal must happen");
@@ -1141,7 +1142,7 @@ describe("prepareAgentSpawn", () => {
     // cleanup is skipped on early-return). Asserts the recovery
     // behaviour without depending on the orchestrator path.
     assert.ok(
-      calls.exec.some(c => c.cmd.includes("git worktree remove --force")),
+      calls.exec.some(c => c.cmd.includes("git worktree remove")),
       "must clean up worktree inline since orchestrator skips cleanup on early-return",
     );
   });
@@ -2464,26 +2465,13 @@ describe("handleDispatchError", () => {
 // to main only), worktree-remove failure tolerated.
 
 describe("cleanupAfterDispatch", () => {
-  test("useWorktree=true → git worktree remove --force + checkout -- . + clean -fd", async () => {
+  test("useWorktree=true removes only a clean worktree and inspects main without changing it", async () => {
     const { ctx, calls } = makeTestContext({ item: { issueNumber: 600 } });
-
     await cleanupAfterDispatch(ctx);
-
-    const cmds = calls.exec.map(c => c.cmd);
-    assert.ok(
-      cmds.some(c => c.includes("git worktree remove --force")),
-      "must remove the worktree",
-    );
-    assert.ok(
-      cmds.some(c => c === "git checkout -- ."),
-      "must reset main repo's working tree (catches Claude Code's leaked .claude/worktrees/)",
-    );
-    assert.ok(
-      cmds.some(c => c.startsWith("git clean -fd")),
-      "must clean untracked files in the main repo (with logs/node_modules excluded)",
-    );
-    // useWorktree=true → no `git checkout main` (which is the no-worktree path).
-    assert.ok(!cmds.includes("git checkout main"));
+    assert.deepEqual(calls.exec.map(c => c.cmd), [
+      `git worktree remove "${ctx.worktreeDir}"`,
+      "git status --porcelain --untracked-files=normal",
+    ]);
   });
 
   test("useWorktree=false (PO path) → git checkout main, no worktree ops", async () => {
@@ -2500,14 +2488,14 @@ describe("cleanupAfterDispatch", () => {
 
   test("git worktree remove fails → warning logged, function does not throw", async () => {
     // The worktree-remove try is wrapped in a `try {}` that swallows
-    // the error; cleanup proceeds to checkout/clean. The dispatcher
+    // the error; cleanup proceeds to read-only main inspection. The dispatcher
     // can't usefully recover from a stuck worktree mid-cleanup, so
     // it logs and moves on.
     const { ctx } = makeTestContext({
       item: { issueNumber: 602 },
       mockOptions: {
         execImpls: {
-          "git worktree remove --force": () => execError({ stderr: "fatal: '<path>' is locked" }),
+          "git worktree remove": () => execError({ stderr: "fatal: '<path>' is locked" }),
         },
       },
     });
@@ -2534,9 +2522,9 @@ describe("cleanupAfterDispatch", () => {
 // handleDispatchError runs AND cleanup runs (clean teardown after
 // labelling).
 
-/** Distinguishing marker: cleanup ran iff calls.exec contains `git checkout -- .` */
+/** Distinguishing marker: cleanup ran iff calls.exec contains `git status --porcelain --untracked-files=normal` */
 function cleanupRan(execCalls: { cmd: string }[]): boolean {
-  return execCalls.some(c => c.cmd === "git checkout -- .");
+  return execCalls.some(c => c.cmd === "git status --porcelain --untracked-files=normal");
 }
 
 /** Mock setup that lets dispatchToAgent walk the full happy path. */
@@ -2709,7 +2697,7 @@ describe("dispatchToAgent — orchestrator integration", () => {
     // cleanup. prepareAgentSpawn does its own inline `git worktree
     // remove --force` (since the orchestrator's outer cleanup is
     // skipped on its return path) — but the orchestrator-cleanup's
-    // distinguishing marker (`git checkout -- .`) does NOT fire.
+    // distinguishing marker (`git status --porcelain --untracked-files=normal`) does NOT fire.
     const client = new MockGitHubClient({
       status: { 704: "In Development" },
       labels: { 704: [] },
@@ -2728,9 +2716,9 @@ describe("dispatchToAgent — orchestrator integration", () => {
     // Stream was never invoked.
     assert.equal(calls.claudeStreams, 0);
     // Inline worktree removal DID happen (in prepareAgentSpawn's catch).
-    assert.ok(calls.exec.some(c => c.cmd.includes("git worktree remove --force")));
+    assert.ok(calls.exec.some(c => c.cmd.includes("git worktree remove")));
     // But the orchestrator's full cleanup did NOT run — its marker is
-    // `git checkout -- .` which lives only in cleanupAfterDispatch.
+    // `git status --porcelain --untracked-files=normal` which lives only in cleanupAfterDispatch.
     assert.ok(
       !cleanupRan(calls.exec),
       "prepareAgentSpawn early-return must skip cleanupAfterDispatch (inline cleanup is the path here)",
@@ -2857,10 +2845,10 @@ describe("dispatchToAgent — concurrent dispatches (pollLoop's Promise.allSettl
 
     // Cleanup-skip is per-dispatch: 803's worktree was cleaned up
     // (cleanup ran), 802's was preserved. The orchestrator's cleanup
-    // marker is `git checkout -- .` — it should appear at least once
+    // marker is `git status --porcelain --untracked-files=normal` — it should appear at least once
     // (for 803), not twice. (Each dispatchToAgent that runs cleanup
     // emits this exactly once.)
-    const cleanupMarkerCount = calls.exec.filter(c => c.cmd === "git checkout -- .").length;
+    const cleanupMarkerCount = calls.exec.filter(c => c.cmd === "git status --porcelain --untracked-files=normal").length;
     assert.equal(cleanupMarkerCount, 1, "cleanup must run for the success but not the failure (per-dispatch isolation)");
   });
 
@@ -2914,7 +2902,7 @@ describe("dispatchToAgent — concurrent dispatches (pollLoop's Promise.allSettl
     assert.ok(client.addLabelCalls.some(c => c.issueNumber === 805 && c.label === "error:developer"));
 
     // Cleanup ran for BOTH (thrown errors get clean teardown).
-    const cleanupMarkerCount = calls.exec.filter(c => c.cmd === "git checkout -- .").length;
+    const cleanupMarkerCount = calls.exec.filter(c => c.cmd === "git status --porcelain --untracked-files=normal").length;
     assert.equal(cleanupMarkerCount, 2, "thrown-error path runs cleanup; both dispatches must emit the marker");
 
     // Two error Discord notifies (one per failure).
@@ -6548,7 +6536,7 @@ test("Codex blocked work, including shutdown timeout, preserves edits without sa
   assert.ok(client.addLabelCalls.some(c=>c.label==="error:developer"));
   assert.ok(!client.addLabelCalls.some(c=>c.label==="done:developer"));
   assert.ok(!cleanupRan(calls.exec));
-  assert.ok(!calls.exec.slice(spawnIndex).some(c=>c.cmd.includes("git worktree remove --force") || c.cmd.includes("git add") || c.cmd.includes("git push")));
+  assert.ok(!calls.exec.slice(spawnIndex).some(c=>c.cmd.includes("git worktree remove") || c.cmd.includes("git add") || c.cmd.includes("git push")));
   assert.ok(client.comments.some(c=>c.body.includes("Worktree preserved")));
  }
 });
