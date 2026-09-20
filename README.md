@@ -102,7 +102,7 @@ Optional:
 | `PYRY_FAMILY_DISPATCH_LIMIT` | `24` | Family circuit breaker: dispatch budget per ticket family before the whole lineage is parked under `error:family-breaker` on its root. Per-family resume via a reset comment on the root; this knob is the global fallback. See above. |
 | `OWNER_TYPE` | `user` | `user` or `organization` for GitHub Project owner |
 | `PYRY_REAL_CLAUDE_GATE_CMD` | — | Shell command that runs the fork's live-claude suite. **Empty disables the gate entirely** and gated tickets park for an operator. See below. |
-| `PYRY_REAL_CLAUDE_GATE_FORMAT` | `go-json` | How to read what the command wrote: `go-json` or `playwright-json` |
+| `PYRY_REAL_CLAUDE_GATE_FORMAT` | `go-json` | How to read what the command wrote: `go-json`, `playwright-json` or `junit-xml` |
 | `PYRY_REAL_CLAUDE_GATE_TIMEOUT_MS` | `1800000` | Outer wall clock for one gate run. Must exceed the command's own inner timeout. |
 | `PYRY_REAL_CLAUDE_GATE_MIN_EXECUTED` | `1` | Floor for the executed-test guard. Set near the suite's real count. |
 | `PYRY_REAL_CLAUDE_GATE_BASELINE_CMD` | — | Base-commit re-run template with a `{{TESTS}}` placeholder. Runs only when the branch has named failures, so it costs seconds. Unset means failures are attributed to the branch. |
@@ -166,12 +166,16 @@ Do not quote `{{TESTS}}` yourself; the substituted filter brings its own quoting
 
 A failure keeps `needs-real-claude` so the ticket must pass the gate again after the fix; `runReworkRouting` strips the stale `done:*` trail and brings its three-strike breaker along. Environment failures park rather than routing to the developer agent, which could not fix a missing credential and would burn three spawns discovering that. The `error:` prefix already excludes a ticket from the WIP count and from gate re-selection, so the park is self-limiting.
 
-**The command must emit per-test JSON.** For Go that means:
+**The command must emit a per-test report.** For Go that means:
 
 ```sh
 PYRY_REAL_CLAUDE_GATE_CMD='go test -tags e2e_realclaude -timeout 20m -json ./internal/e2e/realclaude/...'
 PYRY_REAL_CLAUDE_GATE_MIN_EXECUTED=150
 ```
+
+Android consumers can emit JUnit XML with `PYRY_REAL_CLAUDE_GATE_FORMAT=junit-xml`. The command must write only XML to stdout and send build logs to stderr. Both `<testsuite>` and `<testsuites>` roots are accepted. The reader counts named test cases, excludes skips, preserves failures across duplicate reports, and rejects malformed reports or missing cases advertised by the suite. Mobile's wrapper additionally requires freshly generated device reports and forces the test task to execute.
+
+The baseline command currently uses Go test filters. Leave it unset for JUnit consumers until their command supports that filtering contract. Without it, failed tests route to rework without automatic retry or base comparison.
 
 A bare `make e2e-realclaude` target will **not** work. Without `-json` it prints nothing per-test on success, only a package summary, so executed tests cannot be counted — and the executed-test count is the whole guard. This is a contract, not a detail.
 
