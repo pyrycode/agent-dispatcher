@@ -30,9 +30,11 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  buildModeSection,
   cleanupAfterDispatch,
   countActiveWork,
   decideDrainNotification,
+  decideRefinementMode,
   decideSigint,
   dispatchToAgent,
   handleAgentResultErrors,
@@ -73,6 +75,7 @@ import {
 import { resetActiveStageSetForTests, resolveStageSet } from "./stage-sets.js";
 import type { AgentConfig, BlockerInfo, ProjectItem } from "./types.js";
 import {
+  decideReworkRoutes,
   FAMILY_BREAKER_COMMENT_MARKER,
   FAMILY_BREAKER_LABEL,
   FAMILY_DISPATCH_COMMENT_MARKER,
@@ -1408,6 +1411,129 @@ describe("prepareAgentSpawn", () => {
       }
     },
   );
+});
+
+// =====================================================================
+// decideRefinementMode / buildModeSection — the po/refiner `## Mode` line
+// =====================================================================
+//
+// Until 2026-09-21 every existing ticket (issueNumber > 0) was told it was
+// a "rework — existing ticket routed back". Seven of eleven refiner runs
+// on freshly split pyrycode-mobile children that day burned turns
+// explaining a rework nobody had asked for. The signal is `rework-count:N`:
+// `runReworkRouting` strips the `needs-rework:<agent>` trigger before the
+// target is ever dispatched, and bumps that counter in the same pass.
+
+describe("decideRefinementMode", () => {
+  test("no ticket → create-from-inbox, whatever the labels say", () => {
+    assert.equal(decideRefinementMode("po", { issueNumber: 0, labels: [] }), "create-from-inbox");
+    assert.equal(decideRefinementMode("refiner", { issueNumber: 0, labels: ["rework-count:2"] }), "create-from-inbox");
+  });
+
+  test("existing ticket with no rework trail → refine (the freshly split child)", () => {
+    // pyrycode-mobile #721's shape: size/priority tags, no comments, no
+    // rework label in its history.
+    assert.equal(decideRefinementMode("refiner", { issueNumber: 721, labels: [] }), "refine");
+    assert.equal(decideRefinementMode("po", { issueNumber: 721, labels: ["size:S", "priority:high"] }), "refine");
+  });
+
+  test("rework-count:N left by the router → rework", () => {
+    for (const agent of ["po", "refiner"]) {
+      assert.equal(decideRefinementMode(agent, { issueNumber: 50, labels: ["size:M", "rework-count:1"] }), "rework");
+      assert.equal(decideRefinementMode(agent, { issueNumber: 50, labels: ["rework-count:3"] }), "rework");
+    }
+  });
+
+  test("the labels a real route leaves behind read as rework", () => {
+    // What the target sees after `decideReworkRoutes` + the counter bump:
+    // trigger and done:/wip:/error: trail stripped, counter added.
+    const before = ["size:M", "done:refiner", "done:builder", "needs-rework:refiner"];
+    const [route] = decideReworkRoutes(
+      new Map([["refiner", "Backlog"], ["builder", "In Development"]]),
+      new Map([["In Development", [{ id: "PVTI_1", issueNumber: 60, labels: before }]]]),
+    );
+    const after = [...before.filter(l => !route.labelsToStrip.includes(l)), "rework-count:1"];
+    assert.deepEqual(after, ["size:M", "rework-count:1"]);
+    assert.equal(decideRefinementMode("refiner", { issueNumber: 60, labels: after }), "rework");
+  });
+
+  test("a still-attached needs-rework:<self> counts; one naming another agent does not", () => {
+    assert.equal(decideRefinementMode("refiner", { issueNumber: 61, labels: ["needs-rework:refiner"] }), "rework");
+    assert.equal(decideRefinementMode("po", { issueNumber: 61, labels: ["needs-rework:po"] }), "rework");
+    assert.equal(decideRefinementMode("refiner", { issueNumber: 61, labels: ["needs-rework:builder"] }), "refine");
+  });
+
+  test("malformed or zero counters are not a rework", () => {
+    for (const label of ["rework-count:0", "rework-count:", "rework-count:abc", "rework-count:-1"]) {
+      assert.equal(decideRefinementMode("refiner", { issueNumber: 62, labels: [label] }), "refine", label);
+    }
+  });
+
+  test("unrelated pipeline state does not imply a rework", () => {
+    // An error retry of a first refinement is still a first refinement.
+    const labels = ["error-retry-count:1", "family-dispatches:4", "merge-attempt:1"];
+    assert.equal(decideRefinementMode("refiner", { issueNumber: 63, labels }), "refine");
+  });
+});
+
+describe("buildModeSection", () => {
+  const refiner = { name: "refiner", column: "Backlog" };
+  const po = { name: "po", column: "Backlog" };
+
+  test("agents other than po/refiner get no mode section", () => {
+    for (const name of ["architect", "developer", "builder", "verifier", "code-review", "qa", "documentation"]) {
+      assert.equal(buildModeSection({ name, column: "In Development" }, { issueNumber: 70, labels: ["rework-count:1"] }, true), null, name);
+    }
+  });
+
+  test("create-from-inbox line is unchanged", () => {
+    const expected = "\n## Mode\ncreate-from-inbox — raw user request, draft a structured GitHub issue.";
+    assert.equal(buildModeSection(po, { issueNumber: 0, labels: [] }, false), expected);
+    assert.equal(buildModeSection(refiner, { issueNumber: 0, labels: [] }, false), expected);
+  });
+
+  test("first refinement never mentions being routed back as fact", () => {
+    for (const agent of [po, refiner]) {
+      for (const commentsIncluded of [false, true]) {
+        const section = buildModeSection(agent, { issueNumber: 721, labels: ["size:S"] }, commentsIncluded);
+        assert.ok(section, "po/refiner always get a mode section");
+        assert.match(section, /^\n## Mode\nrefine — existing Backlog ticket, not a rework\./);
+        assert.match(section, /No agent has routed it back/);
+        assert.match(section, /first refinement/);
+        assert.doesNotMatch(section, /\nrework —/);
+        assert.doesNotMatch(section, /previous agent comments/i);
+      }
+    }
+  });
+
+  test("first-refinement line names the agent's own column", () => {
+    const section = buildModeSection({ name: "refiner", column: "Refinement" }, { issueNumber: 722, labels: [] }, false);
+    assert.match(section!, /existing Refinement ticket/);
+  });
+
+  test("rework with comments points at them and cites the counter", () => {
+    const section = buildModeSection(refiner, { issueNumber: 80, labels: ["rework-count:2"] }, true);
+    assert.equal(
+      section,
+      "\n## Mode\nrework — existing ticket routed back (ticket carries `rework-count:2`). " +
+        "Read the previous agent comments above for the rework reason.",
+    );
+  });
+
+  test("rework without comments does not point at a section that is not there", () => {
+    const section = buildModeSection(po, { issueNumber: 81, labels: ["rework-count:1"] }, false);
+    assert.ok(section);
+    assert.match(section, /^\n## Mode\nrework — existing ticket routed back \(ticket carries `rework-count:1`\)\./);
+    assert.match(section, /No ticket comments are included above/);
+    assert.match(section, /gh issue view 81 --comments/);
+    assert.doesNotMatch(section, /Read the previous agent comments above/);
+  });
+
+  test("rework signalled only by a live needs-rework label cites no counter", () => {
+    const section = buildModeSection(refiner, { issueNumber: 82, labels: ["needs-rework:refiner"] }, true);
+    assert.match(section!, /^\n## Mode\nrework — existing ticket routed back\. Read the previous/);
+    assert.doesNotMatch(section!, /rework-count/);
+  });
 });
 
 // =====================================================================
