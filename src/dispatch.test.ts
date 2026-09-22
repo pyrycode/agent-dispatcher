@@ -23,7 +23,7 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 
 import { dirname, resolve } from "node:path";
@@ -116,6 +116,9 @@ export type CallLog = {
   claudeStreams: number;
   /** Every `deps.spawnGate` request (pre-verifier deterministic gates). */
   gates: GateSpawnRequest[];
+  /** `writeLog` sections captured through the deps seam. Nothing may land
+   *  on the real filesystem: see the log-write containment suite. */
+  logs: { logFile: string; section: string; content: string }[];
 };
 
 function emptyCallLog(): CallLog {
@@ -127,6 +130,7 @@ function emptyCallLog(): CallLog {
     discord: [],
     claudeStreams: 0,
     gates: [],
+    logs: [],
   };
 }
 
@@ -316,6 +320,9 @@ export function makeMockDeps(opts: MockDepsOptions = {}): { deps: DispatchDeps; 
     runClaudeStreaming: mockRunClaudeStreaming,
     notifyDiscord: mockNotifyDiscord,
     buildPromptForAgent: mockBuildPromptForAgent,
+    writeLog: (logFile, section, content) => {
+      calls.logs.push({ logFile: String(logFile), section, content: String(content) });
+    },
     curateMemoryIndex: async () => ({ ok: true }),
     spawnGate: mockSpawnGate,
   };
@@ -5554,6 +5561,11 @@ describe("runFamilyBreaker — per-family reset", () => {
 // ORIGINAL first-leg result, so salvage behaves byte-identically to a
 // world without the feature.
 
+/** The dispatch-log sections a test captured, rendered as one searchable text. */
+function loggedText(calls: CallLog): string {
+  return calls.logs.map((l) => `${l.section}\n${l.content}`).join("\n");
+}
+
 /** Build the SpawnConfig a resume test hands to maybeResumeExhaustedRun. */
 function makeSpawnConfig(
   logFile: string,
@@ -5687,7 +5699,7 @@ describe("maybeResumeExhaustedRun — same-dispatch continuation leg", () => {
 
   test("a RESUME section lands in the run log before the leg, naming leg number, session, and reason", async () => {
     await withResumeLegs(undefined, async () => {
-      const { ctx } = makeTestContext({
+      const { ctx, calls } = makeTestContext({
         item: { issueNumber: 951 },
         mockOptions: {
           streamResult: () => streamResult({ isError: false, sessionId: "sess-first" }),
@@ -5697,7 +5709,7 @@ describe("maybeResumeExhaustedRun — same-dispatch continuation leg", () => {
 
       await maybeResumeExhaustedRun(first, makeSpawnConfig(ctx.logFile), ctx);
 
-      const log = readFileSync(ctx.logFile, "utf-8");
+      const log = loggedText(calls);
       assert.match(log, /RESUME/);
       assert.match(log, /Leg: 1/);
       assert.match(log, /Session: sess-first/);
@@ -5724,7 +5736,7 @@ describe("maybeResumeExhaustedRun — same-dispatch continuation leg", () => {
       await maybeResumeExhaustedRun(first, makeSpawnConfig(ctx.logFile), ctx);
 
       assert.equal(calls.claudeStreams, 1);
-      const log = readFileSync(ctx.logFile, "utf-8");
+      const log = loggedText(calls);
       assert.match(log, /Reason: timeout/);
       const promptWrite = calls.fs.find(
         (f) => f.kind === "write" && f.path.includes(".prompt-resume-952"),
@@ -5772,7 +5784,7 @@ describe("maybeResumeExhaustedRun — same-dispatch continuation leg", () => {
 
       assert.equal(calls.claudeStreams, 1);
       assert.equal(result, first);
-      const log = readFileSync(ctx.logFile, "utf-8");
+      const log = loggedText(calls);
       assert.match(log, /RESUME_FAILED/);
       assert.match(log, /spawn claude ENOENT/);
     });
@@ -6348,7 +6360,7 @@ describe("pre-verifier gates — dispatchToAgent wiring", () => {
 
   test("maybeRunPreSpawnGates green: GATES section written to the dispatch log, prompt note returned", async () => {
     await withStageSet("builder", () => withVerifierGates("make check", async () => {
-      const { ctx } = makeTestContext({
+      const { ctx, calls } = makeTestContext({
         agent: builderAgent("verifier"),
         item: { issueNumber: 915 },
       });
@@ -6358,7 +6370,7 @@ describe("pre-verifier gates — dispatchToAgent wiring", () => {
       assert.match(result.promptNote, /## Deterministic gates/);
       assert.ok(!result.promptNote.includes("TRIAGE MODE"), "green note must not read as a failure");
       assert.match(result.promptNote, /make check/);
-      const log = readFileSync(ctx.logFile, "utf-8");
+      const log = loggedText(calls);
       assert.match(log, /GATES/);
       assert.match(log, /✓ make check \(exit 0\)/);
     }));
@@ -6366,7 +6378,7 @@ describe("pre-verifier gates — dispatchToAgent wiring", () => {
 
   test("maybeRunPreSpawnGates red: TRIAGE MODE note carries gate, verdict and output tail; no board mutation", async () => {
     await withStageSet("builder", () => withVerifierGates("make check", async () => {
-      const { ctx, client } = makeTestContext({
+      const { ctx, client, calls } = makeTestContext({
         agent: builderAgent("verifier"),
         item: { issueNumber: 916 },
         mockOptions: {
@@ -6381,7 +6393,7 @@ describe("pre-verifier gates — dispatchToAgent wiring", () => {
       assert.match(result.promptNote, /exit 3/);
       assert.equal(client.addLabelCalls.length, 0, "red gates mutate nothing — the verifier owns routing");
       assert.equal(client.comments.length, 0);
-      const log = readFileSync(ctx.logFile, "utf-8");
+      const log = loggedText(calls);
       assert.match(log, /✗ make check \(exit 3\)/);
     }));
   });
@@ -6694,5 +6706,86 @@ describe("Codex builder refinement handoff", () => {
     const {ctx, client} = makeTestContext({agent:{name:"verifier"}});
     await assert.rejects(handlePostRun(request(), ctx, false));
     assert.equal(client.addLabelCalls.length, 0);
+  });
+});
+
+// =====================================================================
+// Log-write containment: dispatch logs go through deps, never the real
+// filesystem (2026-09-01, ported 2026-09-22)
+// =====================================================================
+//
+// `writeLog` used to call the module-imported `appendFileSync` directly,
+// so mock deps could not intercept it and every phase function that logs
+// appended to the live logs dir of whatever AGENTS_REPO_PATH resolved to.
+// One `pnpm test` in the shared checkout wrote 86 fake-ticket logs to
+// `<parent>/logs/`; runs inside installed forks wrote into each fork's
+// live `logs/`, mixed in with real agent logs (920 found on 2026-09-22).
+//
+// Invariant: with mock deps, no phase function materializes `ctx.logFile`
+// on the real filesystem. `existsSync` here is the REAL node:fs one.
+// One test per deps-threading shape: ctx.deps destructured, the
+// scheduleTransientRetry deps param, and the salvage helpers' opts.deps.
+
+describe("log-write containment (deps.writeLog seam)", () => {
+  test("prepareAgentSpawn: DISPATCH/PROMPT/SYSTEM PROMPT go through deps, ctx.logFile never hits the real filesystem", async () => {
+    const claudeMd = claudeMdAbsPath("developer/CLAUDE.md");
+    const { ctx, calls } = makeTestContext({
+      item: { issueNumber: 998877, title: "Containment ticket" },
+      mockOptions: {
+        fsMap: { [claudeMd]: "Mock developer system prompt" },
+        buildPromptResult: "## Mock prompt #998877",
+      },
+    });
+
+    const result = await prepareAgentSpawn(ctx);
+
+    assert.ok(result.ok, "happy-path sanity: spawn config produced");
+    assert.equal(existsSync(ctx.logFile), false, `dispatch log escaped to the real filesystem: ${ctx.logFile}`);
+    assert.deepEqual(calls.logs.map((l) => l.section), ["DISPATCH", "PROMPT", "SYSTEM PROMPT"]);
+    assert.ok(calls.logs.every((l) => l.logFile === ctx.logFile));
+  });
+
+  test("handlePostRun: OUTPUT/USAGE go through deps, ctx.logFile never hits the real filesystem", async () => {
+    const { ctx, calls } = makeTestContext({
+      item: { issueNumber: 998878 },
+      mockOptions: {
+        execImpls: {
+          "git status --porcelain": () => "",
+          "git rev-list --count main..": () => "0\n",
+        },
+      },
+    });
+
+    const result = await handlePostRun(STREAM_OK(), ctx, /* saferSalvaged */ true);
+
+    assert.deepEqual(result, { ok: true });
+    assert.equal(existsSync(ctx.logFile), false, `dispatch log escaped to the real filesystem: ${ctx.logFile}`);
+    assert.ok(calls.logs.length > 0, "post-run sections captured through the deps seam instead");
+  });
+
+  test("handleDispatchError: ERROR and the transient-retry sections go through deps, ctx.logFile never hits the real filesystem", async () => {
+    const { ctx, calls } = makeTestContext({ item: { issueNumber: 998879 } });
+
+    await handleDispatchError(new Error("deliberate non-transient failure"), ctx, null);
+
+    assert.equal(existsSync(ctx.logFile), false, `dispatch log escaped to the real filesystem: ${ctx.logFile}`);
+    assert.ok(calls.logs.some((l) => l.section === "ERROR"));
+  });
+
+  test("safer salvage: SAFER_SALVAGE goes through opts.deps, ctx.logFile never hits the real filesystem", async () => {
+    const { ctx, calls } = makeTestContext({
+      item: { issueNumber: 998880 },
+      mockOptions: {
+        execImpls: {
+          "gh pr list --head": () => "[]",
+          "git status --porcelain": () => "M new.go\n",
+        },
+      },
+    });
+
+    await handleAgentResultErrors(streamResult({ isError: true, terminalReason: "max_turns" }), ctx);
+
+    assert.equal(existsSync(ctx.logFile), false, `dispatch log escaped to the real filesystem: ${ctx.logFile}`);
+    assert.ok(calls.logs.length > 0, "salvage sections captured through the deps seam instead");
   });
 });

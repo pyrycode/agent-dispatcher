@@ -1254,7 +1254,7 @@ async function attemptSaferSalvage(opts: {
       const gateSummary = salvageGates.length === 0
         ? "gates: none"
         : `gates: ${salvageGates.map((g, i) => `"${g}"=${gateExitCodes[i]}`).join(" ")}`;
-      writeLog(opts.logFile, "SAFER_SALVAGE_SKIPPED",
+      opts.deps.writeLog(opts.logFile, "SAFER_SALVAGE_SKIPPED",
         `${gateSummary} dirty=${dirty.trim().length > 0}`);
       return false;
     }
@@ -1368,7 +1368,7 @@ async function attemptSaferSalvage(opts: {
       );
     } catch (e) { console.warn(`   ⚠️  Failed to post salvage comment: ${e}`); }
 
-    writeLog(opts.logFile, "SAFER_SALVAGE",
+    opts.deps.writeLog(opts.logFile, "SAFER_SALVAGE",
       `Committed + pushed + draft PR opened for #${opts.item.issueNumber} (${opts.streamResult.numTurns} turns, ${formatRunCost(opts.streamResult)})`);
     console.log(`   💾 Safer salvage: draft PR opened for #${opts.item.issueNumber}, label error:max_turns_salvaged set`);
 
@@ -1376,7 +1376,7 @@ async function attemptSaferSalvage(opts: {
     return true;
   } catch (e) {
     console.warn(`   ⚠️  Safer salvage attempt failed: ${e}`);
-    writeLog(opts.logFile, "SAFER_SALVAGE_FAILED", String(e));
+    opts.deps.writeLog(opts.logFile, "SAFER_SALVAGE_FAILED", String(e));
     return false;
   }
 }
@@ -1479,7 +1479,7 @@ async function attemptPermissionDenialSalvage(opts: {
         );
       } catch (e) { console.warn(`   ⚠️  Failed to post permission-denial comment: ${e}`); }
 
-      writeLog(opts.logFile, "PERMISSION_DENIED_NO_SALVAGE",
+      opts.deps.writeLog(opts.logFile, "PERMISSION_DENIED_NO_SALVAGE",
         `Label set; no draft PR (dirty=${hasDirty}, gates=${gateExitCodes.join(",")})`);
       console.log(`   ⛔ Permission denied for #${opts.item.issueNumber} — label set, no salvage PR`);
 
@@ -1558,7 +1558,7 @@ async function attemptPermissionDenialSalvage(opts: {
       );
     } catch (e) { console.warn(`   ⚠️  Failed to post permission-denial salvage comment: ${e}`); }
 
-    writeLog(opts.logFile, "PERMISSION_DENIED_SALVAGE",
+    opts.deps.writeLog(opts.logFile, "PERMISSION_DENIED_SALVAGE",
       `Committed + pushed + draft PR opened for #${opts.item.issueNumber}; denied op=${deniedOp.slice(0, 100)}`);
     console.log(`   💾 Permission-denial salvage: draft PR opened for #${opts.item.issueNumber}, label ${label} set`);
 
@@ -1566,7 +1566,7 @@ async function attemptPermissionDenialSalvage(opts: {
     return true;
   } catch (e) {
     console.warn(`   ⚠️  Permission-denial salvage attempt failed: ${e}`);
-    writeLog(opts.logFile, "PERMISSION_DENIED_SALVAGE_FAILED", String(e));
+    opts.deps.writeLog(opts.logFile, "PERMISSION_DENIED_SALVAGE_FAILED", String(e));
     return false;
   }
 }
@@ -1635,7 +1635,7 @@ export interface DispatchClient {
 // semantic change vs. pre-DI; existing 234 tests pass unchanged.
 //
 // Boundary: the high-level helpers (`runClaudeStreaming`,
-// `notifyDiscord`, `buildPromptForAgent`) are in deps; the low-level
+// `notifyDiscord`, `buildPromptForAgent`, `writeLog`) are in deps; the low-level
 // fs/child_process primitives are also in deps so phase functions can
 // be tested at the granularity of "did we issue the right git command".
 // `attemptSaferSalvage` accepts deps as part of its opts (called from
@@ -1654,6 +1654,12 @@ export type DispatchDeps = {
   runClaudeStreaming: typeof runClaudeStreaming;
   notifyDiscord: (msg: string) => Promise<void>;
   buildPromptForAgent: typeof buildPromptForAgent;
+  // Section-append to the per-dispatch log file. In deps because it was
+  // the one phase-function write that bypassed the seam: every test run
+  // appended fake-ticket sections to the LIVE logs dir of whatever
+  // AGENTS_REPO_PATH resolved to (2026-09-01; 920 still found in the
+  // forks' logs dirs on 2026-09-22). Mock deps capture it instead.
+  writeLog: typeof writeLog;
   // Run the memory-index curation runner inline for this fork and await it.
   curateMemoryIndex: (opts: { agentsRepoRoot: string }) => Promise<{ ok: boolean }>;
   /** Pre-verifier deterministic gates (builder stage set). Same seam as
@@ -1695,6 +1701,7 @@ export const DEFAULT_DEPS: DispatchDeps = {
   runClaudeStreaming,
   notifyDiscord,
   buildPromptForAgent,
+  writeLog,
   curateMemoryIndex: runMemoryCuration,
   // Deferred through an arrow: `spawnGateCommand` is a `const` declared
   // further down the module, so a direct reference here would hit the
@@ -1900,6 +1907,7 @@ async function scheduleTransientRetry(opts: {
   client: DispatchClient;
   logFile: string;
   signature: string;
+  deps: Pick<DispatchDeps, "writeLog">;
 }): Promise<TransientRetryOutcome> {
   const { agent, item, client, logFile, signature } = opts;
 
@@ -1977,12 +1985,12 @@ async function scheduleTransientRetry(opts: {
   // is owed. Park instead — see this function's doc comment for why an
   // unrecorded retry is worse than a park.
   if (!counterPersisted && !markerPosted) {
-    writeLog(logFile, "AUTO_RETRY_UNRECORDED", `transient "${signature}" — neither the counter label nor the marker comment could be written; parking instead of retrying`);
+    opts.deps.writeLog(logFile, "AUTO_RETRY_UNRECORDED", `transient "${signature}" — neither the counter label nor the marker comment could be written; parking instead of retrying`);
     console.warn(`   ⚠️  #${item.issueNumber} transient "${signature}" — could not record the retry on the board (both writes failed); parking instead`);
     return { kind: "park", reason: "unrecorded" };
   }
 
-  writeLog(logFile, "AUTO_RETRY", `transient "${signature}" — attempt ${newAttempt}/${RETRY_MAX_ATTEMPTS}`);
+  opts.deps.writeLog(logFile, "AUTO_RETRY", `transient "${signature}" — attempt ${newAttempt}/${RETRY_MAX_ATTEMPTS}`);
   console.log(`   ♻️  #${item.issueNumber} transient "${signature}" — auto-retry ${newAttempt}/${RETRY_MAX_ATTEMPTS} scheduled`);
   return { kind: "retry", attempt: newAttempt };
 }
@@ -2008,7 +2016,7 @@ export async function handleDispatchError(
   const sessionHint = sessionId !== "unknown"
     ? `\nSession: ${sessionId} (resume with: ${resumeCommand({ runner: streamResult?.runner, sessionId })})`
     : "";
-  writeLog(logFile, "ERROR", `${error.message}${sessionHint}`);
+  ctx.deps.writeLog(logFile, "ERROR", `${error.message}${sessionHint}`);
 
   const endTs = new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
   const elapsedMin = Math.round((Date.now() - startTime) / 60_000);
@@ -2048,7 +2056,7 @@ export async function handleDispatchError(
       ? { transient: false, signature: "" }
       : classifyAgentError(classifyText, { terminalReason: streamResult?.terminalReason });
     if (transient) {
-      const outcome = await scheduleTransientRetry({ agent, item, client, logFile, signature });
+      const outcome = await scheduleTransientRetry({ agent, item, client, logFile, signature, deps: ctx.deps });
       if (outcome.kind === "retry") {
         await notifyDiscord(
           `♻️ **${agent.name}** transient error on #${item.issueNumber} ("${signature}") — ` +
@@ -2542,9 +2550,9 @@ export async function prepareAgentSpawn(
   const timeoutMs = timeoutFor(agent, item.labels);
   const timeoutLabel = `${timeoutMs / 60_000}min`;
 
-  writeLog(logFile, "DISPATCH", `Agent: ${agent.name}\nTicket: #${item.issueNumber} — ${item.title}\nBranch: ${branchName}\nWorktree: ${useWorktree ? worktreeDir : `none (PO on ${defaultBranch})`}\nRunner: ${runner}\nMax turns: ${runner === "codex" ? "not supported; wall-clock budget only" : maxTurns}\nTimeout: ${timeoutLabel}\nTool policy: ${runner === "codex" ? "Codex workspace sandbox and automatic review" : allowedTools}`);
-  writeLog(logFile, "PROMPT", prompt);
-  writeLog(logFile, "SYSTEM PROMPT", systemPrompt);
+  ctx.deps.writeLog(logFile, "DISPATCH", `Agent: ${agent.name}\nTicket: #${item.issueNumber} — ${item.title}\nBranch: ${branchName}\nWorktree: ${useWorktree ? worktreeDir : `none (PO on ${defaultBranch})`}\nRunner: ${runner}\nMax turns: ${runner === "codex" ? "not supported; wall-clock budget only" : maxTurns}\nTimeout: ${timeoutLabel}\nTool policy: ${runner === "codex" ? "Codex workspace sandbox and automatic review" : allowedTools}`);
+  ctx.deps.writeLog(logFile, "PROMPT", prompt);
+  ctx.deps.writeLog(logFile, "SYSTEM PROMPT", systemPrompt);
 
   console.log(`   Running ${runner === "codex" ? "Codex" : "Claude Code"} as ${agent.name} (${runner === "codex" ? `${timeoutLabel} wall-clock budget` : `max ${maxTurns} turns`})...`);
   console.log(`   📝 Log: ${logFile}`);
@@ -2636,7 +2644,7 @@ export async function maybeResumeExhaustedRun(
     const legNumber = legsUsed + 1;
     const reason: "max_turns" | "timeout" =
       current.terminalReason === "max_turns" ? "max_turns" : "timeout";
-    writeLog(
+    ctx.deps.writeLog(
       ctx.logFile,
       "RESUME",
       `Leg: ${legNumber}/${maxLegs}\nSession: ${current.sessionId}\nReason: ${reason}\nFresh budget: ${config.maxTurns} turns / ${config.timeoutMs / 60_000}min`,
@@ -2660,7 +2668,7 @@ export async function maybeResumeExhaustedRun(
       // A continuation leg that cannot even complete must not make the
       // dispatch worse than it would have been without the feature:
       // swallow, log, and hand the ORIGINAL result to the salvage paths.
-      writeLog(
+      ctx.deps.writeLog(
         ctx.logFile,
         "RESUME_FAILED",
         `Resume leg ${legNumber} failed: ${e?.message ?? e}\nFalling through to the original error path.`,
@@ -2674,7 +2682,7 @@ export async function maybeResumeExhaustedRun(
 
   if (current.isError) {
     if (legsUsed > 0) {
-      writeLog(
+      ctx.deps.writeLog(
         ctx.logFile,
         "RESUME_EXHAUSTED",
         `Still exhausted after ${legsUsed} resume leg(s) (last: ${current.terminalReason || (current.timedOut ? "timeout" : "error")}, ${current.numTurns} total turns, ${formatRunCost(current)} total). Falling through to salvage with the original first-leg result.`,
@@ -2763,13 +2771,13 @@ export async function handleAgentResultErrors(
       // why the PR-existence check couldn't run.
       const detail = e?.stderr?.toString?.() ?? e?.message ?? String(e);
       console.warn(`   ⚠️  gh pr list failed during max_turns salvage check (treating as no-PR): ${detail.slice(0, 300)}`);
-      writeLog(logFile, "SALVAGE_GH_FAILED", `gh pr list errored during salvage check; could not determine PR existence. Detail: ${detail}`);
+      ctx.deps.writeLog(logFile, "SALVAGE_GH_FAILED", `gh pr list errored during salvage check; could not determine PR existence. Detail: ${detail}`);
     }
     if (prListJson !== null) {
       const readyPr = findReadyPrNumber(prListJson);
       if (readyPr !== null) {
         console.log(`   ⚠️  Hit max_turns but PR #${readyPr} exists (non-draft) — treating as success`);
-        writeLog(logFile, "SALVAGED", `Agent hit max_turns (${streamResult.numTurns}) but ready PR #${readyPr} was already created. Treating as success.`);
+        ctx.deps.writeLog(logFile, "SALVAGED", `Agent hit max_turns (${streamResult.numTurns}) but ready PR #${readyPr} was already created. Treating as success.`);
         salvaged = true;
       }
     }
@@ -2861,7 +2869,7 @@ export async function handlePostRun(
     await client.addComment(item.issueNumber,
       `## Builder requests refinement\n\n${streamResult.output}\n\nWorktree retained for recovery: ${agentCwd}`);
     await client.addLabel(item.issueNumber, "needs-rework:refiner");
-    writeLog(logFile, "REFINEMENT HANDOFF", streamResult.output);
+    ctx.deps.writeLog(logFile, "REFINEMENT HANDOFF", streamResult.output);
     console.log(`   🔄 #${item.issueNumber} requests refinement; worktree retained`);
     return { ok: false };
   }
@@ -2879,8 +2887,8 @@ export async function handlePostRun(
     `Session: ${streamResult.sessionId}`,
   ].join(" | ");
 
-  writeLog(logFile, "OUTPUT (success)", output);
-  writeLog(logFile, "USAGE", usageSummary);
+  ctx.deps.writeLog(logFile, "OUTPUT (success)", output);
+  ctx.deps.writeLog(logFile, "USAGE", usageSummary);
   console.log(`   📊 ${usageSummary}`);
 
   const endTs = new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
@@ -3371,7 +3379,7 @@ export async function maybeRunPreSpawnGates(
     issueNumber: item.issueNumber,
     deps: ctx.deps,
   });
-  writeLog(logFile, "GATES", result.summary.join("\n"));
+  ctx.deps.writeLog(logFile, "GATES", result.summary.join("\n"));
 
   if (result.ok) {
     console.log(`   ✅ Pre-${agent.name} gates green`);
