@@ -26,7 +26,7 @@ import {
   decideRealClaudeGateRun,
   decideReworkRoutes,
 } from "./pipeline-decisions.js";
-import { AGENT_COLUMN_MAP } from "./dispatch-selection.js";
+import { AGENT_COLUMN_MAP, selectDispatches } from "./dispatch-selection.js";
 import { maxTurnsFor, parseVerifierGates, timeoutFor } from "./agent-runtime.js";
 
 // --------- Env wrap helper ---------
@@ -292,6 +292,42 @@ describe("builder stage set — collapsed four-role pipeline", () => {
     assert.equal(v.producesCommits, false, "verifier reviews + labels; it never commits (code-review contract)");
     assert.equal(maxTurnsFor(v), 150);
     assert.equal(timeoutFor(v), 2_400_000);
+    assert.equal(v.serial, true, "two verifiers gating at once contend for the host's emulators (2026-09-22)");
+  });
+
+  test("verifier is serial: two In Code Review items yield one verifier pick, and a builder still runs beside it", () => {
+    // The pre-spawn gates are host-level work (managed emulators, a relay
+    // and a daemon on fixed host resources), so a second verifier must
+    // wait for the first. The builder in the same cycle is unaffected:
+    // the cap buys builder-plus-verifier overlap, never verifier-plus-
+    // verifier.
+    const item = (n: number, labels: string[] = []) => ({ id: `i${n}`, issueNumber: n, labels });
+    const pollOrder = [...builder.agents].reverse();
+    const r = selectDispatches({
+      itemsByColumn: new Map([
+        ["In Code Review", [item(1), item(2)]],
+        ["In Development", [item(3)]],
+      ]),
+      pollOrder,
+      maxConcurrent: 3,
+    });
+    assert.deepStrictEqual(
+      r.map((c) => [c.agent.name, c.item.issueNumber]),
+      [["verifier", 1], ["builder", 3]],
+    );
+    const inFlight = selectDispatches({
+      itemsByColumn: new Map([
+        ["In Code Review", [item(1, ["wip:verifier"]), item(2)]],
+        ["In Development", [item(3)]],
+      ]),
+      pollOrder,
+      maxConcurrent: 3,
+    });
+    assert.deepStrictEqual(
+      inFlight.map((c) => [c.agent.name, c.item.issueNumber]),
+      [["builder", 3]],
+      "an in-flight verifier blocks the second pick but not the builder",
+    );
   });
 
   test("documentation is unchanged from classic (same config object)", () => {

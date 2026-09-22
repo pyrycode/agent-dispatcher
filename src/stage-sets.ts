@@ -169,6 +169,20 @@ const BUILDER_AGENTS: AgentConfig[] = [
     producesCommits: false, // PR comments + labels only
     maxTurns: 150,
     timeoutMs: 2_400_000, // 40min
+    // One verifier at a time, whatever PYRY_MAX_CONCURRENT says. The
+    // pre-spawn gates are host-level work that does not partition by
+    // worktree: on Mobile they boot Gradle-managed emulators (the UI
+    // suite alone runs two instances since 2026-09-22) and the scripted
+    // scenarios start a relay and a daemon on the host. Two verifiers
+    // gating at once contend for the same managed device under the
+    // Android plugin's cross-build device lock, and a gate queued behind
+    // another run's emulator work overruns VERIFIER_GATE_TIMEOUT_MS and
+    // spawns the verifier in triage mode on a red that is nobody's
+    // fault. A builder and a verifier still overlap, so the cap still
+    // pays; only verifier-with-verifier is serialised. Same mechanism as
+    // documentation's cap in selectDispatches. Decided with Juhana
+    // 2026-09-22 when Mobile moved to two tickets at once.
+    serial: true,
   },
   classicDocumentation,
 ];
