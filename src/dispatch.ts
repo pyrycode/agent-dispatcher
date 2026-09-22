@@ -3577,6 +3577,7 @@ export async function runStrandedWipSweep(
   notifyDiscord: DispatchDeps["notifyDiscord"],
   minAgeMs: number,
   now: number = Date.now(),
+  inFlight: ReadonlySet<string> = new Set(),
 ): Promise<void> {
   let items: ProjectItem[];
   try {
@@ -3586,7 +3587,9 @@ export async function runStrandedWipSweep(
     return;
   }
 
-  const candidates = selectStrandedWipCandidates(items);
+  // Runs this process has in flight are never stranded; see
+  // selectStrandedWipCandidates for the 2026-09-22 false alarm.
+  const candidates = selectStrandedWipCandidates(items, inFlight);
   if (candidates.length === 0) return;
 
   let stripped = false;
@@ -5645,7 +5648,7 @@ export async function pollLoop(): Promise<void> {
     // Once per cycle only. The age gate means a second pass at the end of
     // the cycle could never strip anything the opening pass didn't, and it
     // would cost a comments fetch per candidate to learn that.
-    await runStrandedWipSweep(client, notifyDiscord, STRANDED_WIP_MIN_AGE_MS);
+    await runStrandedWipSweep(client, notifyDiscord, STRANDED_WIP_MIN_AGE_MS, Date.now(), pool.keys());
     await runReworkRouting(client);
     await runRealClaudeGate(client);
     // Run the live gate for one parked ticket, here and only here.

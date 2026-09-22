@@ -1134,9 +1134,17 @@ export type StrandedWipAction =
  *
  * Split out from `decideStrandedWip` so the caller pays for one comments
  * fetch per CANDIDATE rather than one per board item. On a healthy board
- * this returns nothing at all, because a dispatch that is genuinely running
- * only exists inside `runConcurrentDispatches`, which the poll loop awaits
- * before it comes back around to the sweep.
+ * this returns nothing at all.
+ *
+ * `inFlight` is the set of runs this process has going, keyed
+ * `<agent>#<issue>` (dispatch-pool.ts). Until 2026-09-22 the sweep ran only
+ * between awaited batches, so any `wip:` on the board was by construction
+ * a label with no dispatch behind it. With the dispatch pool the sweep runs
+ * while agents work, and on Mobile's first pooled cycle it started its
+ * clock on both in-flight tickets, posting an observation comment on each.
+ * A stale observation can later authorise stripping a live run's label on
+ * the same ticket, so a ticket whose `wip:` belongs to a run in flight is
+ * never a candidate.
  *
  * Done is excluded because `decideDoneCleanup` already strips `wip:` there,
  * and closed-but-stranded tickets reach Done via the closed sweep first.
@@ -1145,6 +1153,7 @@ export type StrandedWipAction =
  */
 export function selectStrandedWipCandidates(
   items: readonly (DecisionItem & { status?: string })[],
+  inFlight: ReadonlySet<string> = new Set(),
 ): { issueNumber: number; wipLabels: string[] }[] {
   const out: { issueNumber: number; wipLabels: string[] }[] = [];
   for (const item of items) {
@@ -1152,6 +1161,8 @@ export function selectStrandedWipCandidates(
     if (item.status === "Done") continue;
     const wipLabels = item.labels.filter((l) => l.startsWith("wip:"));
     if (wipLabels.length === 0) continue;
+    const running = wipLabels.some((l) => inFlight.has(`${l.slice("wip:".length)}#${item.issueNumber}`));
+    if (running) continue;
     out.push({ issueNumber: item.issueNumber, wipLabels });
   }
   return out;
