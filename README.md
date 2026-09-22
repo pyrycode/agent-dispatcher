@@ -205,6 +205,7 @@ src/
 ├── lib.test.ts             # ~232 pure-logic tests
 ├── dispatch.test.ts        # ~70 phase-function integration tests (DI-mocked)
 └── reconcile.test.ts       # ~5 reconciler tests
+codex-helpers/               # GitHub publishing helpers Codex's rules approve; see its README
 ```
 
 307 tests; runs under Node 25 with TypeScript 6 + tsx.
@@ -326,6 +327,13 @@ checks and pushes them, then removes only `needs-live-artifacts`. Existing rewor
 routing clears prior approvals. Review and the live gate run again before the
 ordinary documentation handoff. A green disposable checkout alone cannot complete
 a capture ticket. This workflow does not give agents Claude credentials.
+
+## Codex pipeline helpers
+
+`codex-helpers/` holds the source of the fixed-destination GitHub helpers that
+agents use to publish, and that Codex's rules approve by their installed path.
+Edit them here and run `codex-helpers/install` on the dispatcher host; see
+[codex-helpers/README.md](codex-helpers/README.md).
 
 ## Preserve local work during cleanup
 

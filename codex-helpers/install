@@ -1,0 +1,61 @@
+#!/usr/bin/python3 -I
+"""Install the pipeline helpers as ~/.codex/bin/<pipeline>-pipeline-action.
+
+Codex's rules approve each helper by its installed path, so the copies live
+outside every agent's working folder, where agents cannot edit them. Each copy
+has its pipeline and home folder written in, so nothing is read from the
+environment at run time. The helper tests run first; a failure installs nothing.
+
+Usage: codex-helpers/install [pipeline ...]   (default: all three)
+"""
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+HERE = Path(__file__).resolve().parent
+SOURCE = HERE / 'pipeline-action'
+PIPELINES = ('pyrycode', 'pyrycode-desktop', 'pyrycode-mobile')
+MARKER = 'PIPELINE = None\nHOME = None\n'
+
+
+def render(pipeline, home):
+    if pipeline not in PIPELINES:
+        raise ValueError('Unknown pipeline: ' + pipeline)
+    text = SOURCE.read_text()
+    if text.count(MARKER) != 1:
+        raise ValueError('Install marker not found once in ' + str(SOURCE))
+    return text.replace(MARKER, f'PIPELINE = {pipeline!r}\nHOME = {str(home)!r}\n')
+
+
+def main(args):
+    targets = args or list(PIPELINES)
+    for pipeline in targets:
+        if pipeline not in PIPELINES:
+            sys.exit('Unknown pipeline: ' + pipeline + '. Known: ' + ', '.join(PIPELINES))
+    home = Path.home()
+    dest = home / '.codex' / 'bin'
+    if not dest.is_dir():
+        sys.exit(str(dest) + ' not found. Is Codex set up on this machine?')
+    tests = subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s', str(HERE),
+                            '-p', 'test_*.py'], cwd=HERE)
+    if tests.returncode != 0:
+        sys.exit('Helper tests failed; nothing installed.')
+    for pipeline in targets:
+        final = dest / (pipeline + '-pipeline-action')
+        fd, tmp = tempfile.mkstemp(dir=dest, prefix='.' + final.name + '.')
+        try:
+            with os.fdopen(fd, 'w') as out:
+                out.write(render(pipeline, home))
+            os.chmod(tmp, 0o755)
+            # Replace in one step so a running agent never reads a partial file.
+            os.replace(tmp, final)
+        except BaseException:
+            os.unlink(tmp)
+            raise
+        print('installed', final)
+
+
+if __name__ == '__main__':
+    main(sys.argv[1:])

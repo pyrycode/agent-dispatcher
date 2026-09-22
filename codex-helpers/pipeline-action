@@ -1,0 +1,249 @@
+#!/usr/bin/python3 -I
+"""Fixed-destination operations approved for one Pyrycode pipeline.
+
+This is the source of ~/.codex/bin/<pipeline>-pipeline-action. Edit it here and
+run codex-helpers/install; the installed copies are overwritten.
+"""
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import stat
+import sys
+
+# Set by codex-helpers/install, never read from the environment at run time.
+PIPELINE = None
+HOME = None
+
+# Pipeline, which is also its repository name: display name and board number.
+PIPELINES = {
+    'pyrycode': ('Pyrycode', 1),
+    'pyrycode-desktop': ('Pyrycode Desktop', 7),
+    'pyrycode-mobile': ('Pyrycode Mobile', 5),
+}
+if PIPELINE not in PIPELINES or not HOME:
+    sys.exit('This is the helper source. Run an installed copy; install with codex-helpers/install.')
+LABEL, BOARD = PIPELINES[PIPELINE]
+
+GH = '/opt/homebrew/bin/gh'
+GIT = '/usr/bin/git'
+REPO = 'github.com/pyrycode/' + PIPELINE
+URL = 'https://github.com/pyrycode/' + PIPELINE + '.git'
+COMMON = Path(HOME, 'Workspace/Projects', PIPELINE, '.git')
+REMOTES = {URL, 'git@github.com:pyrycode/' + PIPELINE + '.git',
+           'ssh://git@github.com/pyrycode/' + PIPELINE + '.git'}
+PUBLISH_DIR = Path(HOME, '.codex/publish', PIPELINE)
+COMMENT_ACTIONS = {kind + suffix for kind in ('issue', 'pr')
+                   for suffix in ('-comment', '-comment-edit-last', '-comment-delete-last')}
+ACTIONS = COMMENT_ACTIONS | {'label-edit', 'push', 'issue-create', 'issue-edit', 'pr-create', 'pr-edit',
+           'pr-review', 'board-add', 'board-status', 'board-after',
+           'relations', 'add-child', 'remove-child', 'add-blocker', 'remove-blocker'}
+
+
+def number(value):
+    if not re.fullmatch(r'[1-9][0-9]{0,9}', value):
+        raise ValueError('Expected one positive issue or PR number')
+    return value
+
+
+def run(argv, payload=None):
+    env = dict(os.environ)
+    env['GH_HOST'] = 'github.com'
+    env['GH_PROMPT_DISABLED'] = '1'
+    result = subprocess.run(argv, input=payload, text=True, capture_output=True,
+                            check=True, env=env)
+    return result.stdout.strip()
+
+
+def gh(*args):
+    return run([GH, *args])
+
+
+def graphql(query, variables):
+    result = json.loads(run([GH, 'api', '--hostname', 'github.com', 'graphql',
+                             '--input', '-'], json.dumps({'query': query, 'variables': variables})))
+    if result.get('errors'):
+        raise ValueError(json.dumps(result['errors']))
+    return result['data']
+
+
+def body(path):
+    p = Path(path)
+    if not p.is_absolute() or '..' in p.parts:
+        raise ValueError('Body must be an absolute path inside ' + str(PUBLISH_DIR))
+    try:
+        parts = p.relative_to(PUBLISH_DIR).parts
+    except ValueError:
+        raise ValueError('Body must be inside ' + str(PUBLISH_DIR)) from None
+    if not parts:
+        raise ValueError('Body must name a regular text file')
+    # Traverse using open directory handles. No symlink is followed, including
+    # during replacement races. Read the same file descriptor that was checked.
+    directory = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in PUBLISH_DIR.parts[1:] + parts[:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=directory)
+            os.close(directory)
+            directory = child
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                     dir_fd=directory)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise ValueError('Body must be a regular file with no hard links')
+            with os.fdopen(fd, 'r', encoding='utf-8', closefd=False) as stream:
+                return stream.read()
+        finally:
+            os.close(fd)
+    finally:
+        os.close(directory)
+
+
+def issue_id(n):
+    return json.loads(gh('issue', 'view', number(n), '--repo', REPO, '--json', 'id'))['id']
+
+
+def board():
+    # Board id and Status options in one query. The project view plus field
+    # listing it replaces cost about 100 GraphQL points; this costs 1.
+    data = graphql('''query($board:Int!){organization(login:"pyrycode"){projectV2(number:$board){
+      id field(name:"Status"){... on ProjectV2SingleSelectField{id options{id name}}}}}}''', {'board': BOARD})
+    found = data['organization']['projectV2']
+    if not found or not found.get('field'):
+        raise ValueError(f'Board {BOARD} or its Status field was not found')
+    return found
+
+
+def item(n, project_id):
+    # Paginate project memberships so another board cannot hide this pipeline's board.
+    cursor = None
+    while True:
+        data = graphql('''query($repo:String!,$n:Int!,$cursor:String){repository(owner:"pyrycode",name:$repo){
+          issue(number:$n){projectItems(first:100,after:$cursor){nodes{id project{id}}
+          pageInfo{hasNextPage endCursor}}}}}''', {'repo': PIPELINE, 'n': int(number(n)), 'cursor': cursor})
+        entries = data['repository']['issue']['projectItems']
+        for entry in entries['nodes']:
+            if entry['project']['id'] == project_id:
+                return entry['id']
+        if not entries['pageInfo']['hasNextPage']:
+            raise ValueError(f'Issue is not on {LABEL} board {BOARD}; use board-add first')
+        cursor = entries['pageInfo']['endCursor']
+
+
+def push(n):
+    n = number(n)
+    common = Path(run([GIT, 'rev-parse', '--path-format=absolute', '--git-common-dir'])).resolve()
+    if common != COMMON.resolve():
+        raise ValueError(f'Push requires the local {LABEL} repository or one of its worktrees')
+    branch = run([GIT, 'branch', '--show-current'])
+    if branch != 'feature/' + n:
+        raise ValueError('Current branch must match feature/ISSUE')
+    urls = run([GIT, 'remote', 'get-url', '--push', '--all', 'origin']).splitlines()
+    if len(urls) != 1 or urls[0] not in REMOTES:
+        raise ValueError(f'Origin push destination is not the approved {LABEL} repository')
+    # No force, delete, caller-supplied refspec, remote or extra Git arguments.
+    return run([GIT, 'push', '-u', 'origin', branch + ':refs/heads/' + branch])
+
+
+def perform(args):
+    if not args or args[0] not in ACTIONS:
+        raise ValueError('Supported actions: ' + ', '.join(sorted(ACTIONS)))
+    action, *values = args
+    counts = {'push':1,'issue-create':2,'issue-edit':3,'pr-create':3,'pr-edit':3,
+              'pr-review':3,'board-add':1,'board-status':2,'board-after':2,
+              'relations':1,'add-child':2,'remove-child':2,'add-blocker':2,'remove-blocker':2}
+    counts['label-edit'] = 4
+    counts.update({a: 1 if a.endswith('-delete-last') else 2 for a in COMMENT_ACTIONS})
+    if len(values) != counts[action]:
+        raise ValueError('Wrong argument count for ' + action)
+    if action in COMMENT_ACTIONS:
+        n = number(values[0])
+        kind = action.split('-')[0]
+        argv = [kind, 'comment', n, '--repo', REPO]
+        if action.endswith('-delete-last'):
+            return gh(*argv, '--delete-last', '--yes')
+        if action.endswith('-edit-last'):
+            argv += ['--edit-last']
+        return gh(*argv, '--body=' + body(values[1]))
+    if action == 'label-edit':
+        name, new_name, color, description = values
+        if any(not v.strip() or len(v) > 50 or any(ord(c) < 32 for c in v)
+               for v in (name, new_name)):
+            raise ValueError('Label names must contain 1 to 50 printable characters')
+        if not re.fullmatch(r'[0-9a-fA-F]{6}', color):
+            raise ValueError('Color must contain six hexadecimal digits')
+        return gh('label', 'edit', '--repo', REPO, '--name=' + new_name,
+                  '--color=' + color, '--description=' + description, '--', name)
+    if action == 'push':
+        return push(values[0])
+    if action in {'issue-create','issue-edit','pr-create','pr-edit'}:
+        title, path = values[-2:]
+        if not title.strip():
+            raise ValueError('Title must not be empty')
+        content = body(path)
+        kind, operation = action.split('-')
+        argv = [kind, 'create' if operation == 'create' else 'edit', '--repo', REPO]
+        if action == 'pr-create':
+            argv += ['--head=feature/' + number(values[0]), '--base=main']
+        elif operation == 'edit':
+            argv += [number(values[0])]
+        return gh(*argv, '--title=' + title, '--body=' + content)
+    if action == 'pr-review':
+        n, verdict, path = values
+        if verdict not in {'comment','approve','request-changes'}:
+            raise ValueError('Review must be comment, approve or request-changes')
+        return gh('pr','review',number(n),'--repo',REPO,'--'+verdict,'--body='+body(path))
+    if action == 'relations':
+        return graphql('''query($repo:String!,$n:Int!){repository(owner:"pyrycode",name:$repo){
+          issue(number:$n){number parent{number parent{number}}
+          blockedBy(first:100){nodes{number title state} pageInfo{hasNextPage}}
+          blocking(first:100){nodes{number title state} pageInfo{hasNextPage}}
+          subIssues(first:100){nodes{number title state} pageInfo{hasNextPage}}}}}''',
+          {'repo':PIPELINE,'n':int(number(values[0]))})
+    if action in {'add-child','remove-child','add-blocker','remove-blocker'}:
+        first, second = map(number, values)
+        if first == second:
+            raise ValueError('An issue cannot relate to itself')
+        names = {'add-child':('addSubIssue','AddSubIssueInput','subIssueId'),
+                 'remove-child':('removeSubIssue','RemoveSubIssueInput','subIssueId'),
+                 'add-blocker':('addBlockedBy','AddBlockedByInput','blockingIssueId'),
+                 'remove-blocker':('removeBlockedBy','RemoveBlockedByInput','blockingIssueId')}
+        mutation, input_type, field = names[action]
+        return graphql('mutation($input:'+input_type+'!){'+mutation+
+                       '(input:$input){clientMutationId}}',
+                       {'input':{'issueId':issue_id(first),field:issue_id(second)}})
+    n = number(values[0])
+    if action == 'board-add':
+        return gh('project','item-add',str(BOARD),'--owner','pyrycode','--url',
+                  'https://github.com/pyrycode/'+PIPELINE+'/issues/'+n,'--format','json')
+    found = board()
+    pid = found['id']
+    iid = item(n, pid)
+    if action == 'board-status':
+        status = found['field']
+        options = [o for o in status['options'] if o['name'] == values[1]]
+        if len(options) != 1:
+            raise ValueError('Unknown board status')
+        return gh('project','item-edit','--project-id',pid,'--id',iid,
+                  '--field-id',status['id'],'--single-select-option-id',options[0]['id'])
+    after = values[1]
+    if after == n:
+        raise ValueError('An issue cannot be positioned after itself')
+    inp = {'projectId':pid,'itemId':iid}
+    if after != 'top':
+        inp['afterId'] = item(number(after), pid)
+    return graphql('''mutation($input:UpdateProjectV2ItemPositionInput!){
+        updateProjectV2ItemPosition(input:$input){clientMutationId}}''', {'input':inp})
+
+
+if __name__ == '__main__':
+    try:
+        result = perform(sys.argv[1:])
+        print(result if isinstance(result,str) else json.dumps(result))
+    except (ValueError, OSError, KeyError, StopIteration, subprocess.CalledProcessError) as e:
+        print(str(e), file=sys.stderr)
+        if isinstance(e, subprocess.CalledProcessError) and e.stderr:
+            print(e.stderr, file=sys.stderr)
+        sys.exit(1)
