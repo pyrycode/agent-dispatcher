@@ -64,6 +64,8 @@ import {
   selectStrandedWipCandidates,
   decideMergeRetry,
   decidePostRunLabels,
+  decidePendingDoneFinalizations,
+  PENDING_DONE_PREFIX,
   decideReworkRoutes,
   decideFamilyBreaker,
   extractFamilyDispatchCount,
@@ -5788,5 +5790,60 @@ describe("selectDispatches — excludedRoots breaks the starvation loop", () => 
       excludedRoots: new Set([1906]),
     });
     assert.deepEqual(r.map(c => c.item.issueNumber), [1958]);
+  });
+});
+
+// =====================================================================
+// Pending-done: a deferred post-run decision (2026-09-22)
+// =====================================================================
+
+describe("decidePendingDoneFinalizations", () => {
+  const cols = new Map([["refiner", "Backlog"], ["builder", "In Development"], ["verifier", "In Code Review"]]);
+
+  test("still in the agent's column → ready: done:<agent> added, prior done:* stripped, own kept out of the strip", () => {
+    const [f, ...rest] = decidePendingDoneFinalizations(
+      [{ issueNumber: 803, status: "In Development", labels: ["enhancement", "done:refiner", "pending-done:builder"] }],
+      cols,
+    );
+    assert.equal(rest.length, 0);
+    assert.equal(f!.agentName, "builder");
+    assert.equal(f!.pendingLabel, "pending-done:builder");
+    assert.equal(f!.addReadyLabel, true);
+    assert.deepEqual(f!.priorReadyLabelsToStrip, ["done:refiner"]);
+    assert.equal(f!.logKind, "ready");
+  });
+
+  test("moved out of the agent's column → no done label, only the pending label goes", () => {
+    const [f] = decidePendingDoneFinalizations(
+      [{ issueNumber: 900, status: "Inbox", labels: ["pending-done:refiner", "done:po"] }],
+      cols,
+    );
+    assert.equal(f!.addReadyLabel, false);
+    assert.deepEqual(f!.priorReadyLabelsToStrip, []);
+    assert.equal(f!.logKind, "moved-out");
+  });
+
+  test("a rework label wins → no done label; routing is left to runReworkRouting", () => {
+    const [f] = decidePendingDoneFinalizations(
+      [{ issueNumber: 901, status: "In Development", labels: ["pending-done:builder", "needs-rework:refiner"] }],
+      cols,
+    );
+    assert.equal(f!.addReadyLabel, false);
+    assert.equal(f!.logKind, "rework");
+  });
+
+  test("no pending label, or one for an agent the stage set does not know → nothing to do", () => {
+    assert.deepEqual(decidePendingDoneFinalizations(
+      [
+        { issueNumber: 1, status: "In Development", labels: ["done:builder"] },
+        { issueNumber: 2, status: "In Development", labels: ["pending-done:architect"] },
+      ],
+      cols,
+    ), []);
+  });
+
+  test("the pending label blocks re-dispatch of that agent only", () => {
+    assert.equal(shouldSkipDispatch([`${PENDING_DONE_PREFIX}builder`], "builder"), true);
+    assert.equal(shouldSkipDispatch([`${PENDING_DONE_PREFIX}builder`], "verifier"), false);
   });
 });
