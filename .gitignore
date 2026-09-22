@@ -33,4 +33,6 @@ logs/
 # Eval harness cache of raw GitHub responses (src/eval/) — rebuildable,
 # potentially large, never source.
 /.eval-cache/
+
+# Python bytecode from the codex-helpers tests and install.
 __pycache__/
