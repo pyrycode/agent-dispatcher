@@ -161,15 +161,16 @@ export interface AutoAdvanceDecision {
   advances: AdvanceAction[];
   /** Items currently sitting at a human gate (logged as 🚦 awaiting review). */
   gatedAwaiting: { column: string; itemNumbers: number[] }[];
-  /** Items in Backlog held because the pipeline is at capacity
-   *  (`inFlightCount >= maxConcurrent`); logged as 🛑 held. */
+  /** Items in Backlog held because no seat is free
+   *  (`seatsTaken >= maxConcurrent`); logged as 🛑 held. */
   backlogHeld: number[];
 }
 
 /**
  * Pure decision function for `runAutoAdvance`. Given the rule table, gate
- * set, current items in each `from` column, the count of pipeline threads
- * currently in flight, and the concurrency cap, return the list of advances
+ * set, current items in each `from` column, the number of seats taken
+ * (runs in flight plus tickets past Backlog about to start, counted by
+ * `runAutoAdvance`), and the concurrency cap, return the list of advances
  * to perform plus the diagnostic info the caller needs to log gate/hold
  * heartbeats.
  *
@@ -177,7 +178,7 @@ export interface AutoAdvanceDecision {
  *   - **Gated columns** (in MANUAL_ADVANCE_GATES): no advance even when
  *     `done:<agent>` is set. Eligible items are reported in `gatedAwaiting`
  *     for heartbeat logging.
- *   - **Backlog**: capacity = `max(0, maxConcurrent - inFlightCount)`.
+ *   - **Backlog**: capacity = `max(0, maxConcurrent - seatsTaken)`.
  *     Advance the first `min(eligible.length, capacity)` items in input
  *     order; hold the rest in `backlogHeld`. When capacity is 0, all
  *     eligible Backlog items are held. The cap matches `selectDispatches`'s
@@ -199,7 +200,7 @@ export function decideAutoAdvance(
   rules: readonly AdvanceRule[],
   gates: ReadonlySet<string>,
   itemsByColumn: ReadonlyMap<string, readonly DecisionItem[]>,
-  inFlightCount: number,
+  seatsTaken: number,
   maxConcurrent: number,
 ): AutoAdvanceDecision {
   const advances: AdvanceAction[] = [];
@@ -246,7 +247,7 @@ export function decideAutoAdvance(
       // tickets that can't enter the pipeline (the bug shape: with WIP=N
       // dispatch but a hardcoded WIP=1 advance, refined backlog tickets
       // got stranded one-per-cycle while the pipeline ran serially).
-      const capacity = Math.max(0, maxConcurrent - inFlightCount);
+      const capacity = Math.max(0, maxConcurrent - seatsTaken);
       if (capacity === 0) {
         backlogHeld.push(...eligible.map(i => i.issueNumber));
         continue;

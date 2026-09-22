@@ -33,7 +33,6 @@ import {
   REAL_CLAUDE_GATE_LABEL,
   REAL_CLAUDE_GATE_RUN_FROM_COLUMN,
   REWORK_LOOP_THRESHOLD,
-  countPipelineInFlight,
   decideAutoAdvance,
   decideBaselineAdjustedVerdict,
   decideGateOutcome,
@@ -43,8 +42,10 @@ import {
   decideReworkRoutes,
   decideUnroutableRework,
   extractReworkCount,
+  isRetryWaiting,
   REWORK_TARGET_ERROR_LABEL,
 } from "./pipeline-decisions.js";
+import { selectDispatches } from "./dispatch-selection.js";
 import { formatGateEvidenceComment, type GateRunReport } from "./gate-output.js";
 
 /**
@@ -78,28 +79,50 @@ export interface ReconcileClient {
 // route backward (see runReworkRouting). The rule data + helpers live in
 // lib.ts so they can be unit-tested without spinning up the dispatcher.
 
-export async function runAutoAdvance(client: ReconcileClient, maxConcurrent: number): Promise<void> {
+export async function runAutoAdvance(
+  client: ReconcileClient,
+  maxConcurrent: number,
+  runsInFlight: number,
+): Promise<void> {
   // Rules + WIP-probe columns come from the stage set resolved at startup.
   // Classic wraps AUTO_ADVANCE_RULES / MID_PIPELINE_COLUMNS by reference,
   // so this is byte-identical to the pre-stage-set dispatcher there; the
   // builder set's chain skips In Architecture and In QA entirely.
-  const { advanceRules, midPipelineColumns } = activeStageSet();
+  const { advanceRules, midPipelineColumns, agents } = activeStageSet();
 
-  // Probe in-flight count: non-errored tickets in mid-pipeline columns.
-  // The Backlog promotion budget is `max(0, maxConcurrent - inFlightCount)`,
-  // so we need the count, not just a boolean.
-  let inFlightCount = 0;
+  // Seats taken: the pool's runs in flight, plus every ticket past Backlog
+  // that selection would start right now. The Backlog promotion budget is
+  // what is left, `max(0, maxConcurrent - seatsTaken)`.
+  //
+  // Before 2026-09-22 this counted every non-errored ticket past Backlog.
+  // A ticket queued behind a busy one-at-a-time agent (the verifier,
+  // documentation) holds no seat, but it held Backlog shut, and the free
+  // seat went to the only work left: refining the next Backlog ticket.
+  // Mobile refined its whole Backlog that way with three tickets past it
+  // and two runs going. Same shape as the blocked-ticket deadlock of
+  // 2026-05-16 (agent-dispatcher#10). Asking selection itself keeps
+  // blockers, error labels and the serial caps in one place.
+  let waitingForSeat = 0;
   try {
     const midItems = await Promise.all(
       midPipelineColumns.map(c => client.getItemsByStatus(c)),
     );
-    inFlightCount = countPipelineInFlight(midItems.flat());
+    // Retry-waiting tickets stay out, as they did in the old count: their
+    // backoff holds them out of selection too (holdBackoffWaiters).
+    const midByColumn = new Map(
+      midPipelineColumns.map((c, i) => [c, midItems[i].filter(it => !isRetryWaiting(it.labels))] as const),
+    );
+    waitingForSeat = selectDispatches({
+      itemsByColumn: midByColumn,
+      pollOrder: agents.filter(a => a.column !== "Backlog"),
+      maxConcurrent,
+    }).length;
   } catch (error: any) {
     // Fail-open: a transient GraphQL error shouldn't deadlock the pipeline.
-    // inFlightCount stays 0, so the cycle behaves as if the pipeline is
-    // empty (matches the pre-fix fail-open behaviour).
-    console.warn(`   ⚠️  In-flight probe failed; auto-advance proceeds without WIP gate: ${error.message}`);
+    // The budget then counts the runs in flight alone.
+    console.warn(`   ⚠️  Seat probe failed; Backlog promotion counts running agents only: ${error.message}`);
   }
+  const seatsTaken = runsInFlight + waitingForSeat;
 
   // Fetch items for each unique `from` column referenced by the rule table.
   // Building once and passing into the pure decision keeps I/O bounded and
@@ -121,7 +144,7 @@ export async function runAutoAdvance(client: ReconcileClient, maxConcurrent: num
     advanceRules,
     MANUAL_ADVANCE_GATES,
     itemsByColumn,
-    inFlightCount,
+    seatsTaken,
     maxConcurrent,
   );
 
@@ -150,7 +173,7 @@ export async function runAutoAdvance(client: ReconcileClient, maxConcurrent: num
   if (decision.backlogHeld.length > 0) {
     const numbers = decision.backlogHeld.map(n => `#${n}`).join(", ");
     console.log(
-      `   🛑 Backlog: ${numbers} held — pipeline at capacity (${inFlightCount}/${maxConcurrent} in flight)`,
+      `   🛑 Backlog: ${numbers} held — no free seat (${runsInFlight} running + ${waitingForSeat} waiting past Backlog, cap ${maxConcurrent})`,
     );
   }
 

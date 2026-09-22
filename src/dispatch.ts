@@ -5751,7 +5751,7 @@ export async function pollLoop(): Promise<void> {
       REAL_CLAUDE_GATE_MIN_EXECUTED,
       notifyDiscord,
     );
-    await runAutoAdvance(client, MAX_CONCURRENT);
+    await runAutoAdvance(client, MAX_CONCURRENT, pool.size);
     await runDoneCleanup(client);
 
     // Concurrency model: WIP=N (default 2 via PYRY_MAX_CONCURRENT env var).
@@ -5893,7 +5893,7 @@ export async function pollLoop(): Promise<void> {
     await runPendingDoneFinalize(client);
     await runReworkRouting(client);
     await runRealClaudeGate(client);
-    await runAutoAdvance(client, MAX_CONCURRENT);
+    await runAutoAdvance(client, MAX_CONCURRENT, pool.size);
     await runDoneCleanup(client);
 
     // Auto-merge PRs for tickets in the Done column. Extracted to
