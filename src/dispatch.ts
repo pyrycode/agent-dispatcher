@@ -5439,6 +5439,12 @@ export async function pollLoop(): Promise<void> {
     return Number.isFinite(n) && n > 0 ? n : 2;
   })();
   console.log(`   Concurrency cap: ${MAX_CONCURRENT} (PYRY_MAX_CONCURRENT)`);
+  {
+    const verifier = activeStageSet().agents.find((a) => a.name === "verifier");
+    if (verifier) {
+      console.log(`   Verifier: ${verifier.serial ? "one at a time" : "concurrent (PYRY_VERIFIER_SERIAL=0)"}`);
+    }
+  }
   console.log(`   Family breaker: ${FAMILY_DISPATCH_LIMIT} dispatches per ticket family (PYRY_FAMILY_DISPATCH_LIMIT)`);
 
   // Real-claude gate execution. Null when PYRY_REAL_CLAUDE_GATE_CMD is unset,
