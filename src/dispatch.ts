@@ -2567,9 +2567,9 @@ export async function prepareAgentSpawn(
       systemPromptFile,
       // Per-agent override, else the pipeline default. QA and documentation
       // run on claude-sonnet-5 at high effort; every other stage inherits
-      // opus/xhigh. See AGENTS in types.ts.
+      // opus/high (xhigh until 2026-09-22). See AGENTS in types.ts.
       model: runner === "codex" ? process.env.PYRY_CODEX_MODEL ?? "" : agent.model ?? "opus",
-      effort: runner === "codex" ? process.env.PYRY_CODEX_EFFORT ?? "" : agent.effort ?? "xhigh",
+      effort: runner === "codex" ? process.env.PYRY_CODEX_EFFORT ?? "" : agent.effort ?? "high",
       maxTurns,
       allowedTools,
       disallowedTools,

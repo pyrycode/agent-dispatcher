@@ -119,9 +119,9 @@ export interface AgentConfig {
   model?: string;
   /**
    * Per-agent `claude --effort` (thinking level) override. Omit to
-   * inherit the pipeline default (`xhigh`). One of pyry's accepted
+   * inherit the pipeline default (`high`). One of pyry's accepted
    * values: `low | medium | high | xhigh | max`. Resolved in
-   * `prepareAgentSpawn` as `agent.effort ?? "xhigh"`.
+   * `prepareAgentSpawn` as `agent.effort ?? "high"`.
    */
   effort?: string;
   /**

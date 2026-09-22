@@ -1115,7 +1115,7 @@ describe("AGENTS model/effort config", () => {
     for (const name of ["po", "architect", "developer", "code-review"]) {
       const agent = byName(name);
       assert.equal(agent.model, undefined, `${name} must not override model → inherits opus`);
-      assert.equal(agent.effort, undefined, `${name} must not override effort → inherits xhigh`);
+      assert.equal(agent.effort, undefined, `${name} must not override effort → inherits high`);
     }
   });
 });
@@ -1175,7 +1175,7 @@ describe("prepareAgentSpawn", () => {
     }
     const config = result.config;
     assert.equal(config.model, "opus");
-    assert.equal(config.effort, "xhigh");
+    assert.equal(config.effort, "high");
     assert.equal(config.maxTurns, 135, "developer base budget post-2026-06-06 is 135");
     assert.equal(config.cwd, ctx.agentCwd);
     assert.equal(config.timeoutMs, 1_500_000, "developer = 25min");
@@ -1234,10 +1234,10 @@ describe("prepareAgentSpawn", () => {
     assert.ok(writes.some(w => w.content === "Mock developer system prompt"));
   });
 
-  test("per-agent model/effort override flows into the spawn config (default opus/xhigh is covered by the happy-path test above)", async () => {
+  test("per-agent model/effort override flows into the spawn config (default opus/high is covered by the happy-path test above)", async () => {
     const claudeMd = claudeMdAbsPath("developer/CLAUDE.md");
     const { ctx } = makeTestContext({
-      agent: { model: "claude-sonnet-5", effort: "high" },
+      agent: { model: "claude-sonnet-5", effort: "medium" },
       item: { issueNumber: 205, title: "Override" },
       mockOptions: {
         fsMap: { [claudeMd]: "Mock system prompt" },
@@ -1251,7 +1251,7 @@ describe("prepareAgentSpawn", () => {
       assert.fail(`expected ok:true, got ok:false`);
     }
     assert.equal(result.config.model, "claude-sonnet-5", "agent.model must override the opus default");
-    assert.equal(result.config.effort, "high", "agent.effort must override the xhigh default");
+    assert.equal(result.config.effort, "medium", "agent.effort must override the high default");
   });
 
   test("QMD re-index fails → warning logged, dispatch continues", async () => {
@@ -6100,7 +6100,7 @@ describe("stage sets — prepareAgentSpawn grants + budgets", () => {
       assert.equal(result.config.maxTurns, 200);
       assert.equal(result.config.timeoutMs, 2_400_000);
       assert.equal(result.config.model, "opus");
-      assert.equal(result.config.effort, "xhigh");
+      assert.equal(result.config.effort, "high");
     });
   });
 
