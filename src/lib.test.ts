@@ -1720,15 +1720,31 @@ describe("selectStrandedWipCandidates", () => {
   type Item = { id: string; issueNumber: number; labels: string[]; status?: string };
 
   test("clean board → nothing to consider", () => {
-    // The normal case, and the one that has to stay free: a dispatch that
-    // is genuinely running only exists inside runConcurrentDispatches,
-    // which the poll loop awaits before it reaches the sweep. So a healthy
-    // board yields no candidates and the sweep costs zero comments fetches.
+    // The normal case, and the one that has to stay free: a healthy board
+    // yields no candidates and the sweep costs zero comments fetches. Runs
+    // this process has in flight are excluded through the second argument
+    // (the dispatch pool's keys); see the in-flight test below.
     const items: Item[] = [
       { id: "i1", issueNumber: 1, labels: ["done:builder"], status: "In Review" },
       { id: "i2", issueNumber: 2, labels: [], status: "Backlog" },
     ];
     assert.deepEqual(selectStrandedWipCandidates(items), []);
+  });
+
+  test("a wip: label that belongs to a run in flight is not a candidate (2026-09-22)", () => {
+    // With the dispatch pool the sweep runs while agents work. On Mobile's
+    // first pooled cycle it started its clock on both in-flight tickets and
+    // posted an observation comment on each; a stale observation can later
+    // authorise stripping a live run's label. In-flight keys are
+    // `<agent>#<issue>`, the same as dispatch-pool.ts.
+    const items: Item[] = [
+      { id: "i1", issueNumber: 782, labels: ["done:builder", "wip:verifier"], status: "In Code Review" },
+      { id: "i2", issueNumber: 590, labels: ["wip:verifier"], status: "In Code Review" },
+      { id: "i3", issueNumber: 601, labels: ["wip:builder"], status: "In Development" },
+    ];
+    const c = selectStrandedWipCandidates(items, new Set(["verifier#782", "verifier#590"]));
+    assert.deepEqual(c.map((x) => x.issueNumber), [601], "only the ticket with no run behind its label remains");
+    assert.equal(selectStrandedWipCandidates(items, new Set(["builder#782"])).length, 3, "a different agent's run on the same ticket does not cover this label");
   });
 
   test("wip: label outside Done → a candidate carrying its wip labels", () => {
