@@ -4,7 +4,7 @@ import { resolve, dirname, basename } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { config } from "dotenv";
-import { DispatchPool, candidateKey, excludeInFlight, freeSeats } from "./dispatch-pool.js";
+import { DispatchPool, candidateKey, excludeInFlight, freeSeats, resolvePollIntervalMs } from "./dispatch-pool.js";
 import { countVerdictsSince, parseVerdictArtifacts, pickVerdictPr, shouldFlagMissingVerdict } from "./verdict-guard.js";
 
 import { buildCodexInvocation, codexChildEnv, CODEX_ROLE_GUIDANCE, CodexStreamAdapter, formatRunCost, resumeCommand, resolveAgentRunner, type AgentRunner } from "./agent-runner.js";
@@ -5479,8 +5479,9 @@ export async function pollLoop(): Promise<void> {
   // ~12k points/hour, way over budget. 60s halves it; further reduction
   // comes from the per-cycle cache (next commit) and rate-limit backoff
   // (after that). Pickup latency for new tickets goes from ~30s to ~60s
-  // — fine for an agent pipeline (not a real-time system).
-  const POLL_INTERVAL = 60_000;
+  // — fine for an agent pipeline (not a real-time system). Per-fork
+  // override via PYRY_POLL_INTERVAL_MS since 2026-09-22 (dispatch-pool.ts).
+  const POLL_INTERVAL = resolvePollIntervalMs(process.env);
 
   // Runs in flight. Seats refill as runs settle instead of per batch; see
   // dispatch-pool.ts for the measurement that motivated it (2026-09-22).

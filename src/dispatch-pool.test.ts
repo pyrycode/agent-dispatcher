@@ -1,7 +1,7 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 
-import { DispatchPool, candidateKey, excludeInFlight, freeSeats } from "./dispatch-pool.js";
+import { DEFAULT_POLL_INTERVAL_MS, DispatchPool, candidateKey, excludeInFlight, freeSeats, resolvePollIntervalMs } from "./dispatch-pool.js";
 
 function deferred<T = void>() {
   let resolve!: (v: T) => void;
@@ -18,6 +18,18 @@ describe("dispatch pool — seats refill as runs settle (2026-09-22)", () => {
     assert.equal(freeSeats(2, 1), 1);
     assert.equal(freeSeats(2, 2), 0);
     assert.equal(freeSeats(1, 3), 0);
+  });
+
+  test("PYRY_POLL_INTERVAL_MS sets the poll interval when it is a whole number at or above the floor", () => {
+    assert.equal(resolvePollIntervalMs({ PYRY_POLL_INTERVAL_MS: "120000" }), 120_000);
+    assert.equal(resolvePollIntervalMs({ PYRY_POLL_INTERVAL_MS: "10000" }), 10_000);
+  });
+
+  test("PYRY_POLL_INTERVAL_MS keeps the 60s default when unset, empty, not plain digits or below the floor", () => {
+    assert.equal(DEFAULT_POLL_INTERVAL_MS, 60_000);
+    for (const value of [undefined, "", "  ", "abc", "60.5", "0", "-5", "9999", "1e4", "+120000"]) {
+      assert.equal(resolvePollIntervalMs({ PYRY_POLL_INTERVAL_MS: value }), 60_000, `value ${JSON.stringify(value)}`);
+    }
   });
 
   test("candidateKey names the run by agent and ticket", () => {
