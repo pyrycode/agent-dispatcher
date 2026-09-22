@@ -49,6 +49,7 @@ import {
   runConcurrentDispatches,
   runDoneCleanup,
   runStrandedWipSweep,
+  runPendingDoneFinalize,
   strandedWipMinAgeMs,
   runFamilyBreaker,
   selectPastParkedFamilies,
@@ -2434,6 +2435,30 @@ describe("handlePostRun — decidePostRunLabels integration", () => {
 
     assert.deepEqual(result, { ok: true }, "post-run must not throw on getItemStatus failure");
     // Cautious default: skip done:<agent> when we can't confirm the column.
+    assert.ok(!client.addLabelCalls.some(c => c.label === "done:developer"));
+    // ...but defer the decision instead of dropping it, so the next cycle
+    // does not re-dispatch the developer on finished work.
+    assert.ok(client.addLabelCalls.some(c => c.issueNumber === 413 && c.label === "pending-done:developer"));
+  });
+
+  test("status-unknown and the pending label cannot be written either → still no throw, no done label", async () => {
+    const client = new MockGitHubClient({ labels: { 414: [] }, defaultStatus: null });
+    client.failures.getItemStatus = new Error("graphql rate limit");
+    client.failures.addLabel = new Error("REST 502");
+    const { ctx } = makeTestContext({
+      item: { issueNumber: 414 },
+      client,
+      mockOptions: {
+        execImpls: {
+          "git status --porcelain": () => "",
+          "git rev-list --count main..": () => "1\n",
+        },
+      },
+    });
+
+    const result = await handlePostRun(STREAM_OK(), ctx, false);
+
+    assert.deepEqual(result, { ok: true });
     assert.ok(!client.addLabelCalls.some(c => c.label === "done:developer"));
   });
 });
@@ -6791,4 +6816,65 @@ describe("log-write containment (deps.writeLog seam)", () => {
     assert.equal(existsSync(ctx.logFile), false, `dispatch log escaped to the real filesystem: ${ctx.logFile}`);
     assert.ok(calls.logs.length > 0, "salvage sections captured through the deps seam instead");
   });
+});
+
+// =====================================================================
+// runPendingDoneFinalize: the next board read finishes a deferred
+// post-run decision (2026-09-22)
+// =====================================================================
+
+describe("runPendingDoneFinalize", () => {
+  // Pinned to the classic set: the fixtures use the classic developer
+  // column, and a builder fork's .env would otherwise resolve the builder set.
+  test("ticket still in its agent's column → prior done:* stripped, done:<agent> added, pending label removed, cache cleared", () => withStageSet("classic", async () => {
+    const client = new MockGitHubClient({
+      items: [
+        { issueNumber: 7001, status: "In Development", labels: ["done:architect", "pending-done:developer"], state: "OPEN" },
+      ],
+    });
+
+    await runPendingDoneFinalize(client);
+
+    assert.deepEqual(client.removeLabelCalls.map(c => `${c.issueNumber} ${c.label}`), [
+      "7001 done:architect",
+      "7001 pending-done:developer",
+    ]);
+    assert.deepEqual(client.addLabelCalls.map(c => `${c.issueNumber} ${c.label}`), ["7001 done:developer"]);
+    assert.equal(client.clearItemsCacheCalls, 1);
+  }));
+
+  test("ticket moved out of the agent's column → only the pending label goes, no done label", () => withStageSet("classic", async () => {
+    const client = new MockGitHubClient({
+      items: [{ issueNumber: 7002, status: "Inbox", labels: ["pending-done:developer"], state: "OPEN" }],
+    });
+
+    await runPendingDoneFinalize(client);
+
+    assert.deepEqual(client.removeLabelCalls.map(c => c.label), ["pending-done:developer"]);
+    assert.equal(client.addLabelCalls.length, 0);
+  }));
+
+  test("done label cannot be written → the pending label stays for the next cycle", () => withStageSet("classic", async () => {
+    const client = new MockGitHubClient({
+      items: [{ issueNumber: 7003, status: "In Development", labels: ["pending-done:developer"], state: "OPEN" }],
+    });
+    client.failures.addLabel = new Error("REST 502");
+
+    await runPendingDoneFinalize(client);
+
+    assert.equal(client.removeLabelCalls.length, 0, "pending label kept so the decision is not lost");
+  }));
+
+  test("board read fails → nothing changes", () => withStageSet("classic", async () => {
+    const client = new MockGitHubClient({
+      items: [{ issueNumber: 7004, status: "In Development", labels: ["pending-done:developer"], state: "OPEN" }],
+    });
+    client.failures.getAllProjectItems = new Error("graphql rate limit");
+
+    await runPendingDoneFinalize(client);
+
+    assert.equal(client.addLabelCalls.length, 0);
+    assert.equal(client.removeLabelCalls.length, 0);
+    assert.equal(client.clearItemsCacheCalls, 0);
+  }));
 });

@@ -1337,6 +1337,65 @@ export function decidePostRunLabels(opts: {
   };
 }
 
+/** One deferred post-run decision, finished against a known column. */
+export interface PendingDoneFinalization {
+  issueNumber: number;
+  agentName: string;
+  /** The `pending-done:<agent>` label to remove in every outcome. */
+  pendingLabel: string;
+  /** True when the ticket is still in the agent's column with no rework
+   *  label: add `done:<agent>` exactly as a normal post-run would. */
+  addReadyLabel: boolean;
+  priorReadyLabelsToStrip: string[];
+  logKind: PostRunLabelDecision["logKind"];
+}
+
+/**
+ * Finish the post-run decisions that `handlePostRun` had to defer.
+ *
+ * A successful run whose post-run column read failed gets
+ * `pending-done:<agent>` instead of `done:<agent>` (2026-09-22: a GraphQL
+ * rate limit left #796, #803 and #807 with neither label, so the next
+ * cycle would have re-run a builder on each finished branch). The pending
+ * label blocks re-dispatch through `shouldSkipDispatch`, and this decision
+ * runs on the next board read, where every item's column is known.
+ *
+ * It is `decidePostRunLabels` with that column filled in: still in the
+ * agent's column and no rework label → ready; moved out → drop the pending
+ * label only; a rework label → drop it and leave routing to
+ * `runReworkRouting`. Labels for agents the stage set does not know are
+ * ignored. Pure; the caller applies the side effects.
+ */
+export function decidePendingDoneFinalizations(
+  items: ReadonlyArray<{ issueNumber: number; status: string | null; labels: readonly string[] }>,
+  columnByAgent: ReadonlyMap<string, string>,
+): PendingDoneFinalization[] {
+  const out: PendingDoneFinalization[] = [];
+  for (const item of items) {
+    for (const label of item.labels) {
+      if (!label.startsWith(PENDING_DONE_PREFIX)) continue;
+      const agentName = label.slice(PENDING_DONE_PREFIX.length);
+      const agentColumn = columnByAgent.get(agentName);
+      if (agentColumn === undefined) continue;
+      const decision = decidePostRunLabels({
+        postLabels: item.labels.filter((l) => l !== label),
+        agentName,
+        agentColumn,
+        currentColumn: item.status,
+      });
+      out.push({
+        issueNumber: item.issueNumber,
+        agentName,
+        pendingLabel: label,
+        addReadyLabel: decision.addReadyLabel,
+        priorReadyLabelsToStrip: decision.priorReadyLabelsToStrip,
+        logKind: decision.logKind,
+      });
+    }
+  }
+  return out;
+}
+
 /**
  * Decide whether to add `done:<agent>` after a successful agent run.
  *
@@ -1661,17 +1720,23 @@ export function decideFamilyBreaker(opts: {
 
 // --------- Label predicates ---------
 
-// The four label prefixes the dispatcher uses for per-agent state.
-//   done:<agent>        — agent completed successfully
+// The label prefixes the dispatcher uses for per-agent state.
+//   done:<agent>         — agent completed successfully
 //   needs-rework:<agent> — agent (or another) flagged the ticket back here
 //   wip:<agent>          — agent currently running
 //   error:<agent>        — agent crashed
+//   pending-done:<agent> — agent succeeded but the post-run column read
+//                          failed; the next board read finishes the
+//                          decision (see decidePendingDoneFinalizations)
 export const PIPELINE_LABEL_PREFIXES = [
   "done:",
   "needs-rework:",
   "wip:",
   "error:",
+  "pending-done:",
 ] as const;
+
+export const PENDING_DONE_PREFIX = "pending-done:";
 
 /**
  * True if the given label is one of the dispatcher's pipeline-state labels.

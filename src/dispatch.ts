@@ -50,6 +50,8 @@ import {
   isMergeConflictError,
   isPipelineLabel,
   isPipelineLabelForAgent,
+  decidePendingDoneFinalizations,
+  PENDING_DONE_PREFIX,
   shouldAddReadyLabel,
   shouldSkipDispatch,
   classifyAgentError,
@@ -3181,9 +3183,24 @@ export async function handlePostRun(
         case "moved-out":
           console.log(`   📋 Agent moved #${item.issueNumber} ${agent.column} → ${currentColumn} — skipping done:${agent.name}`);
           break;
-        case "status-unknown":
-          console.log(`   ⚠️  Skipping done:${agent.name} for #${item.issueNumber} (status fetch failed; will retry next cycle)`);
+        case "status-unknown": {
+          // The run succeeded but its column is unknown, so done:<agent>
+          // cannot be decided yet. Mark the decision as pending rather than
+          // leaving no label at all: with neither label, the next cycle
+          // would re-dispatch this agent on finished work (2026-09-22, a
+          // GraphQL rate limit did that to #796, #803 and #807). Labels are
+          // REST writes, which kept working through that limit.
+          // `runPendingDoneFinalize` finishes the decision on the next
+          // board read.
+          const pendingLabel = `${PENDING_DONE_PREFIX}${agent.name}`;
+          try {
+            await client.addLabel(item.issueNumber, pendingLabel);
+            console.log(`   ⏸️  Column unknown for #${item.issueNumber} (status fetch failed); added ${pendingLabel}, the next board read finishes done:${agent.name}`);
+          } catch (e) {
+            console.warn(`   ⚠️  Column unknown for #${item.issueNumber} and ${pendingLabel} could not be added (${e}); the next cycle will dispatch ${agent.name} again`);
+          }
           break;
+        }
       }
     }
 
@@ -3692,6 +3709,60 @@ export async function runStrandedWipSweep(
   // without this the swept ticket stays invisible until the next poll.
   // Same idiom as `runReworkRouting` and `runAutoAdvance`.
   if (stripped) client.clearItemsCache();
+}
+
+/**
+ * Finish the post-run decisions `handlePostRun` deferred with
+ * `pending-done:<agent>` because the run's column could not be read.
+ *
+ * Reads the same cached whole-board snapshot the stranded-wip sweep uses,
+ * so it costs no extra GitHub call. For each pending label: a ticket still
+ * in its agent's column gets exactly what a normal post-run gives it, prior
+ * `done:*` stripped and `done:<agent>` added; a ticket that moved out or
+ * carries a rework label only loses the pending label. The pending label
+ * is removed last, so a failed ready write leaves it in place for the next
+ * cycle instead of dropping the decision. If the board read itself fails,
+ * nothing changes and the next cycle tries again. Decision:
+ * `decidePendingDoneFinalizations`.
+ */
+export async function runPendingDoneFinalize(client: DispatchClient): Promise<void> {
+  let items: ProjectItem[];
+  try {
+    items = await client.getAllProjectItems();
+  } catch (error: any) {
+    console.error(`Error fetching board for pending-done finalize: ${error.message}`);
+    return;
+  }
+
+  const finalizations = decidePendingDoneFinalizations(items, activeStageSet().columnByAgent);
+  let mutated = false;
+  for (const f of finalizations) {
+    if (f.addReadyLabel) {
+      try {
+        for (const prior of f.priorReadyLabelsToStrip) {
+          await client.removeLabel(f.issueNumber, prior);
+        }
+        await client.addLabel(f.issueNumber, `done:${f.agentName}`);
+        mutated = true;
+      } catch (e) {
+        console.warn(`   ⚠️  Pending-done: could not add done:${f.agentName} to #${f.issueNumber} (${e}); keeping ${f.pendingLabel} for the next cycle`);
+        continue;
+      }
+    }
+    try {
+      await client.removeLabel(f.issueNumber, f.pendingLabel);
+      mutated = true;
+      console.log(f.addReadyLabel
+        ? `   🏷️  Pending-done: added done:${f.agentName} to #${f.issueNumber}, its run's deferred post-run decision`
+        : `   🧹 Pending-done: dropped ${f.pendingLabel} from #${f.issueNumber} (${f.logKind}), no done label`);
+    } catch (e) {
+      console.warn(`   ⚠️  Pending-done: failed to remove ${f.pendingLabel} from #${f.issueNumber}: ${e}`);
+    }
+  }
+
+  // Same idiom as the stranded-wip sweep: later sub-steps read the cached
+  // snapshot, so auto-advance would not see the new done label otherwise.
+  if (mutated) client.clearItemsCache();
 }
 
 // =====================================================================
@@ -5658,6 +5729,7 @@ export async function pollLoop(): Promise<void> {
     // the cycle could never strip anything the opening pass didn't, and it
     // would cost a comments fetch per candidate to learn that.
     await runStrandedWipSweep(client, notifyDiscord, STRANDED_WIP_MIN_AGE_MS, Date.now(), pool.keys());
+    await runPendingDoneFinalize(client);
     await runReworkRouting(client);
     await runRealClaudeGate(client);
     // Run the live gate for one parked ticket, here and only here.
@@ -5818,6 +5890,7 @@ export async function pollLoop(): Promise<void> {
     // dispatched (catches tickets advanced/closed by humans or label
     // changes between cycles).
     await runClosedSweep(client);
+    await runPendingDoneFinalize(client);
     await runReworkRouting(client);
     await runRealClaudeGate(client);
     await runAutoAdvance(client, MAX_CONCURRENT);
