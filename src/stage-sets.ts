@@ -185,6 +185,8 @@ const BUILDER_AGENTS: AgentConfig[] = [
     // wants to try concurrent verifiers sets PYRY_VERIFIER_SERIAL=0 and
     // gets the variant built below; see resolveStageSet.
     serial: true,
+    // A clean exit must have ruled: see verdict-guard.ts (Mobile #782).
+    requiresVerdict: true,
   },
   classicDocumentation,
 ];
