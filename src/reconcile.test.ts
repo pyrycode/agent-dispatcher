@@ -127,7 +127,7 @@ describe("runAutoAdvance — cache invalidation", () => {
     });
     const client = new MockClient([item]);
 
-    await runAutoAdvance(client, 1);
+    await runAutoAdvance(client, 1, 0);
 
     // Sanity: the advance happened.
     assert.equal(client.updateItemStatusCalls.length, 1, "expected one updateItemStatus call");
@@ -147,7 +147,7 @@ describe("runAutoAdvance — cache invalidation", () => {
     // Empty pipeline → nothing to advance → no cache churn.
     const client = new MockClient([]);
 
-    await runAutoAdvance(client, 1);
+    await runAutoAdvance(client, 1, 0);
 
     assert.equal(client.updateItemStatusCalls.length, 0);
     assert.equal(
@@ -168,7 +168,7 @@ describe("runAutoAdvance — cache invalidation", () => {
     });
     const client = new MockClient([item]);
 
-    await runAutoAdvance(client, 1);
+    await runAutoAdvance(client, 1, 0);
 
     assert.equal(client.updateItemStatusCalls.length, 1);
     assert.equal(client.updateItemStatusCalls[0]?.newStatus, "In Architecture");
@@ -200,7 +200,7 @@ describe("runAutoAdvance — cache invalidation", () => {
     });
     const client = new MockClient([blocked, blockingBacklog]);
 
-    await runAutoAdvance(client, 1);
+    await runAutoAdvance(client, 1, 0);
 
     // #409 advances into the pipeline. #383 stays parked (its `blockedBy`
     // hasn't cleared yet; only #409 closing would clear it).
@@ -237,7 +237,7 @@ describe("runAutoAdvance — cache invalidation", () => {
     });
     const client = new MockClient([midActive, backlog]);
 
-    await runAutoAdvance(client, 1);
+    await runAutoAdvance(client, 1, 0);
 
     // #100 counts as in-flight (its blocker is closed → it's progressing).
     // Capacity = max(0, 1 - 1) = 0 → #101 stays in Backlog.
@@ -245,6 +245,56 @@ describe("runAutoAdvance — cache invalidation", () => {
       client.updateItemStatusCalls.length, 0,
       "active mid-pipeline ticket (no OPEN blockers) consumes capacity — Backlog stays held",
     );
+  });
+});
+
+describe("runAutoAdvance — the Backlog budget counts free seats", () => {
+  test("a ticket queued behind the busy verifier holds no seat (Mobile, 2026-09-22)", async () => {
+    // The board that refined Mobile's whole Backlog: cap 3, the verifier on
+    // #802, documentation on #807, and #803 waiting its turn for the
+    // one-at-a-time verifier. Three tickets past Backlog, two runs. The old
+    // count read three and held Backlog shut while the free seat went to
+    // the refiner.
+    await withStageSet("builder", async () => {
+      const client = new MockClient([
+        makeItem({ id: "item-802", issueNumber: 802, status: "In Code Review", labels: ["done:builder", "wip:verifier"] }),
+        makeItem({ id: "item-803", issueNumber: 803, status: "In Code Review", labels: ["done:builder"] }),
+        makeItem({ id: "item-807", issueNumber: 807, status: "In Documentation", labels: ["done:verifier", "wip:documentation"] }),
+        makeItem({ id: "item-798", issueNumber: 798, status: "Backlog", labels: ["done:refiner"] }),
+        makeItem({ id: "item-804", issueNumber: 804, status: "Backlog", labels: ["done:refiner"] }),
+      ]);
+
+      await runAutoAdvance(client, 3, 2);
+
+      assert.deepEqual(client.updateItemStatusCalls, [{ itemId: "item-798", newStatus: "In Development" }]);
+    });
+  });
+
+  test("a ticket past Backlog that would start now takes the free seat", async () => {
+    await withStageSet("builder", async () => {
+      const client = new MockClient([
+        makeItem({ id: "item-900", issueNumber: 900, status: "In Development", labels: [] }),
+        makeItem({ id: "item-901", issueNumber: 901, status: "Backlog", labels: ["done:refiner"] }),
+      ]);
+
+      await runAutoAdvance(client, 3, 2);
+
+      assert.equal(client.updateItemStatusCalls.length, 0);
+    });
+  });
+
+  test("refiner runs hold seats like any other run", async () => {
+    await withStageSet("builder", async () => {
+      const client = new MockClient([
+        makeItem({ id: "item-901", issueNumber: 901, status: "Backlog", labels: ["done:refiner"] }),
+      ]);
+
+      await runAutoAdvance(client, 3, 3);
+      assert.equal(client.updateItemStatusCalls.length, 0);
+
+      await runAutoAdvance(client, 3, 2);
+      assert.deepEqual(client.updateItemStatusCalls, [{ itemId: "item-901", newStatus: "In Development" }]);
+    });
   });
 });
 
@@ -820,7 +870,7 @@ describe("live artifact handoff", () => {
         // Builder commits the evidence and clears only its pending marker.
         item.labels = item.labels.filter(label => label !== "needs-live-artifacts");
         item.labels.push("done:builder");
-        await runAutoAdvance(client, 1);
+        await runAutoAdvance(client, 1, 0);
         assert.equal(item.status, "In Code Review");
         item.labels.push("done:verifier");
         await runRealClaudeGate(client);
