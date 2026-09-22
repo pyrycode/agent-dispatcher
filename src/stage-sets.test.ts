@@ -330,6 +330,38 @@ describe("builder stage set — collapsed four-role pipeline", () => {
     );
   });
 
+  test("PYRY_VERIFIER_SERIAL=0 hands back the builder set with concurrent verifiers, nothing else changed", () => {
+    // A fork opts out of the verifier cap per process, not per code
+    // change. Only the verifier's config differs; documentation keeps its
+    // cap by reference and the rest of the set is the same objects.
+    const concurrent = resolveStageSet("builder", { PYRY_VERIFIER_SERIAL: "0" });
+    const v = concurrent.agents.find((a) => a.name === "verifier")!;
+    assert.equal(v.serial, false);
+    assert.equal(v.column, "In Code Review");
+    assert.equal(maxTurnsFor(v), 150);
+    for (const name of ["refiner", "builder", "documentation"]) {
+      assert.equal(concurrent.agents.find((a) => a.name === name), byName.get(name), `${name} is the same object`);
+    }
+    assert.equal(concurrent.agents.find((a) => a.name === "documentation")!.serial, true);
+    assert.deepStrictEqual(concurrent.preSpawnGate, builder.preSpawnGate);
+    const item = (n: number, labels: string[] = []) => ({ id: `i${n}`, issueNumber: n, labels });
+    const r = selectDispatches({
+      itemsByColumn: new Map([["In Code Review", [item(1), item(2)]]]),
+      pollOrder: [...concurrent.agents].reverse(),
+      maxConcurrent: 3,
+    });
+    assert.deepStrictEqual(r.map((c) => c.item.issueNumber), [1, 2], "two verifiers may run at once");
+  });
+
+  test("PYRY_VERIFIER_SERIAL keeps the cap for every value but the exact string 0", () => {
+    for (const value of [undefined, "", "1", "false", "no", " 0"]) {
+      const set = resolveStageSet("builder", { PYRY_VERIFIER_SERIAL: value });
+      assert.equal(set, builder, `value ${JSON.stringify(value)} resolves to the default set`);
+      assert.equal(set.agents.find((a) => a.name === "verifier")!.serial, true);
+    }
+    assert.equal(resolveStageSet("classic", { PYRY_VERIFIER_SERIAL: "0" }).name, "classic", "the switch has no effect on classic");
+  });
+
   test("documentation is unchanged from classic (same config object)", () => {
     const docs = byName.get("documentation")!;
     const classicDocs = AGENTS.find((a) => a.name === "documentation")!;

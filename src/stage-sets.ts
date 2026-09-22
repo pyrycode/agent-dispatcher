@@ -181,11 +181,21 @@ const BUILDER_AGENTS: AgentConfig[] = [
     // fault. A builder and a verifier still overlap, so the cap still
     // pays; only verifier-with-verifier is serialised. Same mechanism as
     // documentation's cap in selectDispatches. Decided with Juhana
-    // 2026-09-22 when Mobile moved to two tickets at once.
+    // 2026-09-22 when Mobile moved to two tickets at once. A fork that
+    // wants to try concurrent verifiers sets PYRY_VERIFIER_SERIAL=0 and
+    // gets the variant built below; see resolveStageSet.
     serial: true,
   },
   classicDocumentation,
 ];
+
+// The same set with concurrent verifiers, for a fork that opts out of the
+// cap with PYRY_VERIFIER_SERIAL=0 (Mobile's experiment, 2026-09-22). Only
+// the verifier's config differs; every other agent is the same object, so
+// documentation keeps its cap and its model by reference.
+const BUILDER_AGENTS_CONCURRENT_VERIFIERS: AgentConfig[] = BUILDER_AGENTS.map((a) =>
+  a.name === "verifier" ? { ...a, serial: false } : a,
+);
 
 // The collapsed chain. In Architecture and In QA are simply absent —
 // never polled, never advanced into.
@@ -205,6 +215,15 @@ const BUILDER_STAGE_SET: StageSet = deriveStageSet({
   preSpawnGate: { agentNames: new Set(["verifier"]) },
 });
 
+const BUILDER_STAGE_SET_CONCURRENT_VERIFIERS: StageSet = deriveStageSet({
+  name: "builder",
+  agents: BUILDER_AGENTS_CONCURRENT_VERIFIERS,
+  advanceRules: BUILDER_ADVANCE_RULES,
+  agentToolNames: new Set(["builder", "verifier"]),
+  webSearchToolNames: new Set(["builder"]),
+  preSpawnGate: { agentNames: new Set(["verifier"]) },
+});
+
 // --------- resolution ---------
 
 /**
@@ -217,12 +236,20 @@ const BUILDER_STAGE_SET: StageSet = deriveStageSet({
  *   startup (dispatch-bin.ts) surface the message and exit 1 — a typo'd
  *   stage set must never silently run the wrong pipeline.
  *
- * Pure over its input; `activeStageSet` below owns the env read.
+ * Pure over its inputs; `activeStageSet` below owns the env read. `env`
+ * carries the per-fork switches a set reads: today only
+ * PYRY_VERIFIER_SERIAL, where the exact string "0" hands the builder set
+ * back with concurrent verifiers and anything else keeps the default cap.
  */
-export function resolveStageSet(raw: string | undefined): StageSet {
+export function resolveStageSet(
+  raw: string | undefined,
+  env: Pick<NodeJS.ProcessEnv, "PYRY_VERIFIER_SERIAL"> = process.env,
+): StageSet {
   const name = (raw ?? "").trim();
   if (name === "" || name === "classic") return CLASSIC_STAGE_SET;
-  if (name === "builder") return BUILDER_STAGE_SET;
+  if (name === "builder") {
+    return env.PYRY_VERIFIER_SERIAL === "0" ? BUILDER_STAGE_SET_CONCURRENT_VERIFIERS : BUILDER_STAGE_SET;
+  }
   throw new Error(
     `Unknown PYRY_STAGE_SET "${raw}". Valid stage sets: ${STAGE_SET_NAMES.join(", ")}. ` +
       `Unset the variable (or set "classic") for the default six-agent pipeline.`,
@@ -241,7 +268,7 @@ let active: StageSet | null = null;
  */
 export function activeStageSet(): StageSet {
   if (active === null) {
-    active = resolveStageSet(process.env.PYRY_STAGE_SET);
+    active = resolveStageSet(process.env.PYRY_STAGE_SET, process.env);
   }
   return active;
 }
