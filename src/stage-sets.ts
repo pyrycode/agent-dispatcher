@@ -243,7 +243,7 @@ const BUILDER_STAGE_SET_CONCURRENT_VERIFIERS: StageSet = deriveStageSet({
  */
 export function resolveStageSet(
   raw: string | undefined,
-  env: Pick<NodeJS.ProcessEnv, "PYRY_VERIFIER_SERIAL"> = process.env,
+  env: { PYRY_VERIFIER_SERIAL?: string } = process.env,
 ): StageSet {
   const name = (raw ?? "").trim();
   if (name === "" || name === "classic") return CLASSIC_STAGE_SET;
