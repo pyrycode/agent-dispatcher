@@ -22,6 +22,31 @@ export function candidateKey(agentName: string, issueNumber: number): string {
   return `${agentName}#${issueNumber}`;
 }
 
+/** The loop's wait between board reads when nothing settles first. */
+export const DEFAULT_POLL_INTERVAL_MS = 60_000;
+
+/**
+ * Floor for `PYRY_POLL_INTERVAL_MS`. 30s polling overran GitHub's hourly
+ * GraphQL budget on 2026-05-03; anything under 10s is a typo, not a choice.
+ */
+export const MIN_POLL_INTERVAL_MS = 10_000;
+
+/**
+ * Read the poll interval from the environment. `PYRY_POLL_INTERVAL_MS` as a
+ * whole number of milliseconds at or above the floor is used as given; unset,
+ * empty, non-numeric, fractional or too small keeps the default. Mobile set
+ * 120000 on 2026-09-22 to ease the account-wide API limit, which the
+ * dispatchers share with interactive sessions and the board-status cron.
+ * Only idle pickup latency changes: a pass that dispatches or a run that
+ * settles wakes the loop without waiting out the interval.
+ */
+export function resolvePollIntervalMs(env: Record<string, string | undefined>): number {
+  const raw = (env.PYRY_POLL_INTERVAL_MS ?? "").trim();
+  if (!/^\d+$/.test(raw)) return DEFAULT_POLL_INTERVAL_MS;
+  const n = Number(raw);
+  return n < MIN_POLL_INTERVAL_MS ? DEFAULT_POLL_INTERVAL_MS : n;
+}
+
 /** Seats left under the cap for this cycle's selection. Never negative. */
 export function freeSeats(maxConcurrent: number, inFlight: number): number {
   return Math.max(0, maxConcurrent - inFlight);
