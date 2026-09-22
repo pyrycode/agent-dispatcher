@@ -1295,7 +1295,10 @@ describe("prepareAgentSpawn", () => {
     assert.equal(qmdCalls.length, 0, "PO must never invoke qmd (no isolated tree)");
   });
 
-  test("agent-specific tools / turns / timeout", async () => {
+  test("agent-specific tools / turns / timeout", () => withStageSet("classic", async () => {
+    // Pinned to the classic set: a builder fork's .env sets PYRY_STAGE_SET=builder,
+    // which dispatch.ts loads at import, and the builder set has no architect,
+    // so an unpinned run inside Mobile, Pyrycode or Desktop failed this row.
     // Parametric across agents. Asserts:
     //   - architect + code-review get the `,Agent` tool suffix
     //   - code-review = 150 turns + 40min, developer/docs = 135 turns + 25min,
@@ -1331,7 +1334,7 @@ describe("prepareAgentSpawn", () => {
       const hasWebSearch = cfg.allowedTools.split(",").includes("WebSearch");
       assert.equal(hasWebSearch, c.hasWebSearch, `${c.name} WebSearch tool presence — research is architect-scoped`);
     }
-  });
+  }));
 
   test("security-sensitive architect gets the 40min budget (item.labels threaded to timeoutFor)", async () => {
     // pyrycode-mobile#304 (2026-05-31): a security-sensitive architect run
