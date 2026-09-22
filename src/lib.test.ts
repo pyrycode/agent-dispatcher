@@ -1433,9 +1433,32 @@ describe("decideReworkRoutes", () => {
     assert.deepEqual(r[0].labelsToStrip, ["needs-rework:po"]);
   });
 
-  test("rework label strips done:/error:/wip: along with itself", () => {
+  test("rework label strips done:/error: along with itself", () => {
     // The dispatcher cleans up stale state-prefix labels on rework so the
     // ticket arrives in the target column with a clean slate. Lock that.
+    const r = decideReworkRoutes(
+      AGENT_COLUMN_MAP,
+      items(["In Architecture", [{
+        id: "i1",
+        issueNumber: 27,
+        labels: ["done:architect", "error:architect", "needs-rework:po", "size:m"],
+      }]]),
+    );
+    assert.equal(r.length, 1);
+    const stripped = new Set(r[0].labelsToStrip);
+    assert.ok(stripped.has("needs-rework:po"));
+    assert.ok(stripped.has("done:architect"));
+    assert.ok(stripped.has("error:architect"));
+    // Non-state labels survive
+    assert.ok(!stripped.has("size:m"));
+  });
+
+  test("a ticket still carrying wip:<agent> is not routed this pass (2026-09-22)", () => {
+    // Until 2026-09-22 routing only ran between awaited batches, so a wip
+    // label here was always stale and got stripped with the rest. With the
+    // dispatch pool routing runs while agents work, and a live wip means
+    // the agent still owns the ticket. Routing waits for the next pass; a
+    // dead run's stale wip is the stranded-wip sweep's job.
     const r = decideReworkRoutes(
       AGENT_COLUMN_MAP,
       items(["In Architecture", [{
@@ -1444,14 +1467,7 @@ describe("decideReworkRoutes", () => {
         labels: ["done:architect", "wip:architect", "error:architect", "needs-rework:po", "size:m"],
       }]]),
     );
-    assert.equal(r.length, 1);
-    const stripped = new Set(r[0].labelsToStrip);
-    assert.ok(stripped.has("needs-rework:po"));
-    assert.ok(stripped.has("done:architect"));
-    assert.ok(stripped.has("wip:architect"));
-    assert.ok(stripped.has("error:architect"));
-    // Non-state labels survive
-    assert.ok(!stripped.has("size:m"));
+    assert.equal(r.length, 0);
   });
 
   test("malformed needs-rework: (no target) → no route", () => {

@@ -4,6 +4,8 @@ import { resolve, dirname, basename } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { config } from "dotenv";
+import { DispatchPool, candidateKey, excludeInFlight, freeSeats } from "./dispatch-pool.js";
+import { countVerdictsSince, parseVerdictArtifacts, pickVerdictPr, shouldFlagMissingVerdict } from "./verdict-guard.js";
 
 import { buildCodexInvocation, codexChildEnv, CODEX_ROLE_GUIDANCE, CodexStreamAdapter, formatRunCost, resumeCommand, resolveAgentRunner, type AgentRunner } from "./agent-runner.js";
 
@@ -3043,6 +3045,57 @@ export async function handlePostRun(
     }
   }
 
+  // Verdict guard: an agent that exists to rule on a pull request must have
+  // ruled. Same fabric as the empty-branch guard above; the incident and the
+  // reasoning are in verdict-guard.ts. A lookup failure keeps the guard
+  // quiet (count stays -1), a missing PR means there is nothing to check.
+  if (item.issueNumber > 0 && !saferSalvaged && agent.requiresVerdict) {
+    let verdicts = -1;
+    try {
+      const prJson = execSync(
+        `gh pr list --head ${branchName} --state open --json number,isDraft`,
+        { cwd: agentCwd, stdio: "pipe" },
+      ).toString().trim();
+      const pr = pickVerdictPr(prJson);
+      if (pr === null) {
+        console.warn(`   ⚠️  Verdict guard: no open PR on ${branchName}; nothing to check.`);
+      } else {
+        const viewJson = execSync(
+          `gh pr view ${pr} --json reviews,comments`,
+          { cwd: agentCwd, stdio: "pipe" },
+        ).toString();
+        verdicts = countVerdictsSince(parseVerdictArtifacts(viewJson), startTime);
+      }
+    } catch (e: any) {
+      const detail = e?.stderr?.toString?.() ?? e?.message ?? String(e);
+      console.warn(`   ⚠️  Verdict guard skipped (could not read the PR): ${detail.slice(0, 300)}`);
+    }
+    if (shouldFlagMissingVerdict(agent, postLabels, verdicts)) {
+      console.error(`   ❌ ${agent.name} ended without a verdict — nothing posted on the PR since the run started and no rework label. Treating as error:${agent.name}.`);
+      try {
+        await client.addLabel(item.issueNumber, `error:${agent.name}`);
+      } catch (e) {
+        console.warn(`   ⚠️  Failed to add error:${agent.name} label: ${e}`);
+      }
+      try {
+        await client.addComment(
+          item.issueNumber,
+          `## ⚠️ Dispatch Error: ${agent.name} ended without a verdict\n\n` +
+          `The run exited cleanly but posted no review or comment on the pull request after it started, and added no \`needs-rework:*\` label. ` +
+          `A clean exit with no verdict would otherwise count as a pass, so the ticket is parked instead.\n\n` +
+          `Likely causes:\n` +
+          `- The agent started a long command in the background and ended its turn waiting for it\n` +
+          `- The agent wrote its verdict to a scratch file and never posted it\n` +
+          `- The \`gh pr review\` or \`gh pr comment\` call failed and the agent did not notice\n\n` +
+          `Treating as \`error:${agent.name}\`. To unblock: read the run log, then strip the \`error:${agent.name}\` label to re-dispatch.`,
+        );
+      } catch (e) {
+        console.warn(`   ⚠️  Failed to post missing-verdict comment: ${e}`);
+      }
+      return { ok: false };
+    }
+  }
+
   // Post-success labeling
   // Convention: agents add needs-rework:{target} directly (target = who should fix it).
   // The dispatch detects any needs-rework:* label and treats it as a rework signal.
@@ -5426,6 +5479,10 @@ export async function pollLoop(): Promise<void> {
   // — fine for an agent pipeline (not a real-time system).
   const POLL_INTERVAL = 60_000;
 
+  // Runs in flight. Seats refill as runs settle instead of per batch; see
+  // dispatch-pool.ts for the measurement that motivated it (2026-09-22).
+  const pool = new DispatchPool();
+
   // Per-cycle dispatch concurrency cap. Default 2 (modest parallelism without
   // burning Anthropic rate-limit budget too fast). Set PYRY_MAX_CONCURRENT=1
   // for legacy WIP=1 finish-first behaviour, or higher when queue depth grows
@@ -5475,6 +5532,10 @@ export async function pollLoop(): Promise<void> {
     // mid-execution (including a running dispatchToAgent) finishes first —
     // wip:<agent> labels get stripped naturally by the agent completion path.
     if (drainMode) {
+      if (pool.size > 0) {
+        console.log(`🚦 Drain: waiting for ${pool.size} in-flight run(s) to finish: ${[...pool.keys()].join(", ")}`);
+        await pool.drain();
+      }
       console.log("✅ Drain complete. Exiting cleanly.");
       break;
     }
@@ -5678,13 +5739,15 @@ export async function pollLoop(): Promise<void> {
 
     // Family circuit breaker: between selection and prep, before any
     // wip:<agent> write or worktree creation. See selectPastParkedFamilies.
-    const { candidates, tallies: familyTallies } = await selectPastParkedFamilies({
+    const seats = freeSeats(MAX_CONCURRENT, pool.size);
+    const { candidates: selected, tallies: familyTallies } = await selectPastParkedFamilies({
       itemsByColumn,
       pollOrder,
-      maxConcurrent: MAX_CONCURRENT,
+      maxConcurrent: seats,
       rootLabelsByIssue,
       client,
     });
+    const candidates = excludeInFlight(selected, pool.keys());
     dispatched = candidates.length > 0;
 
     // Edge-triggered "board drained" ping: fire once when the board goes from
@@ -5697,14 +5760,19 @@ export async function pollLoop(): Promise<void> {
     }
 
     if (candidates.length > 0) {
-      console.log(`   🚦 Dispatching ${candidates.length} agent(s) this cycle (cap ${MAX_CONCURRENT}): ${candidates.map(c => `${c.agent.name}#${c.item.issueNumber}`).join(", ")}`);
+      console.log(`   🚦 Dispatching ${candidates.length} agent(s) this cycle (${pool.size} in flight, cap ${MAX_CONCURRENT}): ${candidates.map(c => `${c.agent.name}#${c.item.issueNumber}`).join(", ")}`);
     }
 
     // Pre-dispatch mutations + concurrent dispatch — both extracted to
     // testable helpers below pollLoop. See `runPreDispatchPrep` and
     // `runConcurrentDispatches` for invariants.
     await runPreDispatchPrep(candidates, client, { tallies: familyTallies, rootLabelsByIssue });
-    await runConcurrentDispatches(candidates, client);
+    // Launch without awaiting: each run is its own pool entry and frees its
+    // seat the moment it settles. The driver keeps its per-run isolation and
+    // wip cleanup; the pool only watches for the end.
+    for (const c of candidates) {
+      pool.launch(candidateKey(c.agent.name, c.item.issueNumber), () => runConcurrentDispatches([c], client));
+    }
 
     // Drop the snapshot the agents just invalidated.
     //
@@ -5747,14 +5815,21 @@ export async function pollLoop(): Promise<void> {
     // `runAutoMerge` below for testability.
     await runAutoMerge(client);
 
-    if (dispatched) {
-      // Something was dispatched — restart cycle immediately so each in-flight
-      // ticket can advance to its next stage without waiting a poll interval.
-      continue;
+    // Wait for a seat to free or for the poll interval, whichever comes
+    // first. A run settling wakes the loop at once, so the finished ticket's
+    // next stage and a replacement candidate are picked in the same pass
+    // rather than after the longest run of a batch. Before 2026-09-22 this
+    // was an unconditional restart after an awaited batch.
+    let tick: ReturnType<typeof setTimeout> | undefined;
+    const interval = new Promise<void>((r) => { tick = setTimeout(r, POLL_INTERVAL); });
+    if (pool.size > 0) {
+      console.log(`⏰ Waiting up to ${POLL_INTERVAL / 1000}s or for a freed seat (${pool.size} in flight)...`);
+      await Promise.race([interval, pool.anySettled()]);
+    } else {
+      console.log(`⏰ Sleeping ${POLL_INTERVAL / 1000}s...`);
+      await interval;
     }
-
-    console.log(`⏰ Sleeping ${POLL_INTERVAL / 1000}s...`);
-    await new Promise((r) => setTimeout(r, POLL_INTERVAL));
+    if (tick !== undefined) clearTimeout(tick);
   }
 }
 

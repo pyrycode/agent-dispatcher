@@ -333,6 +333,13 @@ export function decideReworkRoutes(
     for (const item of items) {
       if (item.issueNumber <= 0) continue;
 
+      // An in-flight agent owns its ticket until it exits. Since 2026-09-22
+      // routing runs while agents are still working (dispatch-pool.ts), so
+      // a ticket carrying wip:<agent> waits for the next pass: the rework
+      // label is still there then, and a dead run's stale wip is cleared
+      // by the stranded-wip sweep after its age gate.
+      if (item.labels.some((l) => l.startsWith("wip:"))) continue;
+
       // First valid rework label wins. Iterate in array order for
       // determinism — same order GitHub returns from the labels query.
       for (const label of item.labels) {

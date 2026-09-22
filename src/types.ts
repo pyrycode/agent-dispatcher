@@ -99,6 +99,17 @@ export interface AgentConfig {
    */
   serial?: boolean;
   /**
+   * True if a clean run of this agent must leave a verdict on the ticket's
+   * pull request: a review or a comment posted after the run started, or
+   * a `needs-rework:*` label. A clean exit with neither is treated as
+   * `error:<agent>` rather than as a pass. Set on the builder set's
+   * verifier after Mobile #782 on 2026-09-22, when a verifier that had
+   * found a regression ended its turn waiting on a background baseline
+   * run and the dispatcher advanced the ticket. Guard and rationale in
+   * verdict-guard.ts; the check runs in `handlePostRun`.
+   */
+  requiresVerdict?: boolean;
+  /**
    * Per-agent `claude --model` override. Omit to inherit the pipeline
    * default (`opus`). Set on stages that don't need the top model —
    * e.g. QA runs mechanical gates and documentation synthesizes prose,
