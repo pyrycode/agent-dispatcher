@@ -1597,6 +1597,8 @@ export interface DispatchClient {
   getClosedItemsNotInDone(): Promise<ProjectItem[]>;
   /** Used by `runClosedSweep` to move closed-but-stranded items to Done. */
   updateItemStatus(itemId: string, newStatus: string): Promise<void>;
+  /** Close an issue as completed. Used by `runParentClose`. */
+  closeIssue(issueNumber: number): Promise<void>;
   /** Used by the transient-retry backoff (agent-dispatcher#25): the
    *  createdAt of the most recent auto-retry comment on an issue, which is
    *  the durable "last failure time" the poll loop uses to compute backoff
@@ -5081,16 +5083,14 @@ async function handleConflictWithRetry(
  * Apply the conflict-block path: `error:merge-conflict` label + triage
  * comment + Discord notify + Status rollback to In Code Review.
  *
- * Invoked from two seams in `runAutoMerge`:
- *   1. Pre-merge `gh pr update-branch --rebase` surfacing a conflict
- *      (catches retroactive sibling conflicts at the earliest seam).
- *   2. The merge step itself returning `isMergeConflictError`.
+ * Invoked from `runAutoMerge`'s merge step when it returns
+ * `isMergeConflictError`, once retries are exhausted. (A conflict at the
+ * pre-merge rebase used to come here too; since 2026-09-23 it falls
+ * through to the plain merge instead, which may still be clean.)
  *
- * Both seams need the same operator-visible side-effects (label is the
- * load-bearing global-block signal; Status rollback maintains the
- * column-as-truth invariant; comment + Discord surface the manual
- * recovery recipe). Extracted here so the new pre-merge step rides the
- * same path without duplicating ~50 lines.
+ * Label is the load-bearing global-block signal; Status rollback
+ * maintains the column-as-truth invariant; comment + Discord surface the
+ * manual recovery recipe.
  *
  * Errors are caught internally — the conflict-block label is the only
  * load-bearing post-condition. Discord/comment/Status failures log a
@@ -5160,11 +5160,10 @@ async function handleMergeConflict(
  *   - `gh pr list --head feature/<n>` to find the PR. Transient
  *     failure (network/rate-limit) → skip, retry next cycle.
  *   - `gh pr update-branch <n> --rebase` to fast-forward the PR branch
- *     onto current main. Catches retroactive sibling conflicts that
- *     architect-time `git branch -r` overlap couldn't see (sibling PRs
- *     landing AFTER architect ran). Conflict here → `handleMergeConflict`,
- *     skip the merge attempt this cycle. Transient failure → silent
- *     skip, retry next cycle (same posture as PR-list transient).
+ *     onto current main. Conflict here → fall through to the plain
+ *     merge, which may still be clean (2026-09-23, #823). Transient
+ *     failure → logged skip, retry next cycle (same posture as PR-list
+ *     transient).
  *   - `gh pr merge <n> --merge --delete-branch`. On success: pull
  *     merged changes to local main (non-fatal failure), strip pipeline
  *     labels from the issue, Discord notify. On conflict (detected
@@ -5224,14 +5223,18 @@ export async function runAutoMerge(
       // `gh pr update-branch --rebase` is server-side; the dispatcher's
       // repoRoot stays untouched).
       //
-      // Conflict path: `handleMergeConflict` (same label/comment/rollback
-      // as the merge step below); skip the merge attempt this cycle so
-      // the conflict-block label takes effect immediately. Transient
-      // failure (gh rate limit, network): silent skip, retry next cycle —
-      // same posture as the PR-list transient-failure path above. We do
-      // NOT fall through to the merge step on transient: next cycle's
-      // rebase is the correctness path; falling through risks merging
-      // against a stale base that the rebase intended to refresh.
+      // Conflict path: fall through to the plain merge below. A rebase
+      // can conflict where a merge does not: a branch that settled an
+      // earlier conflict by merging main has the fix in that merge
+      // commit, and a rebase replays the branch's own commits without
+      // it. Mobile PR 834 (#823) sat unmerged in Done for 4.5 hours that
+      // way on 2026-09-23. The merge step still catches a real conflict
+      // and routes it to `handleConflictWithRetry`.
+      //
+      // Transient failure (gh rate limit, network): skip, retry next
+      // cycle — same posture as the PR-list transient-failure path
+      // above — but log the error so a failure that never clears is
+      // visible instead of silent.
       try {
         execSync(
           `gh pr update-branch ${prNumber} --rebase`,
@@ -5240,11 +5243,11 @@ export async function runAutoMerge(
       } catch (e: any) {
         const errOut = `${e.stderr ?? ""}\n${e.message ?? ""}`;
         if (isMergeConflictError(errOut)) {
-          await handleConflictWithRetry(client, item, prNumber, notifyDiscord);
+          console.warn(`   ↪️  PR #${prNumber} for #${item.issueNumber}: rebase refused over a conflict — trying a plain merge`);
+        } else {
+          console.warn(`   ⚠️  PR #${prNumber} for #${item.issueNumber}: rebase failed, retrying next cycle: ${errOut.trim().split("\n")[0]}`);
           continue;
         }
-        // Non-conflict failure: silent, retry next cycle.
-        continue;
       }
 
       // Step 2: Try the actual merge. Conflict path is the special case.
@@ -5317,11 +5320,70 @@ export async function runAutoMerge(
           await handleConflictWithRetry(client, item, prNumber, notifyDiscord);
           continue;
         }
-        // Non-conflict failure (transient network, auth, etc.): silently retry next cycle.
+        // Non-conflict failure (transient network, auth, etc.): retry next cycle.
+        console.warn(`   ⚠️  PR #${prNumber} for #${item.issueNumber}: merge failed, retrying next cycle: ${errOut.trim().split("\n")[0]}`);
       }
     }
   } catch (error: any) {
     console.error(`Error polling Done column: ${error.message}`);
+  }
+}
+
+/**
+ * Close parent tickets whose work is finished.
+ *
+ * A parent's work lands through its sub-issues' PRs, so no PR ever closes
+ * the parent. `runAutoAdvance` moves it to Done, and before 2026-09-23 it
+ * stayed open there: Mobile #652 and Desktop #1558, #1497, #1488 and
+ * #1251 were found open in Done with every sub-issue closed.
+ *
+ * Closes a Done ticket only when it has at least one sub-issue and every
+ * one is closed. A ticket with no sub-issues is never touched: an open
+ * ticket in Done without children can be deliberate (tui-driver #185 was
+ * reopened after its fix merged). Also skipped: `error:merge-conflict`
+ * (a human is triaging) and a parent with its own open PR, which is the
+ * auto-merge's to land — closing first would hide it from the auto-merge,
+ * which reads open tickets only. A failed PR lookup skips the ticket for
+ * the cycle. Runs before `runAutoMerge` for the same reason: this
+ * cycle's snapshot still shows a parent whose PR the auto-merge is about
+ * to merge as open, and the open-PR check keeps it out.
+ */
+export async function runParentClose(
+  client: DispatchClient,
+  deps: DispatchDeps = DEFAULT_DEPS,
+): Promise<void> {
+  const { execSync } = deps;
+  let doneItems: ProjectItem[];
+  try {
+    doneItems = await client.getItemsByStatus("Done");
+  } catch (error: any) {
+    console.error(`Error fetching Done items for parent close: ${error.message}`);
+    return;
+  }
+  for (const item of doneItems) {
+    const subs = item.subIssues;
+    if (!subs || subs.total === 0 || subs.completed < subs.total) continue;
+    if (item.labels.includes("error:merge-conflict")) continue;
+    try {
+      const openPr = execSync(
+        `gh pr list --head "feature/${item.issueNumber}" --state open --json number --jq '.[0].number'`,
+        { cwd: repoRoot, encoding: "utf-8", timeout: 15_000 }
+      ).toString().trim();
+      if (openPr) continue;
+    } catch {
+      continue;
+    }
+    try {
+      await client.addComment(
+        item.issueNumber,
+        `Closing: all ${subs.completed} of ${subs.total} sub-issues are closed and this ticket is in Done. ` +
+        `Reopen it if work remains.\n\n*Closed automatically by the dispatcher.*`,
+      );
+      await client.closeIssue(item.issueNumber);
+      console.log(`   ✓ Parent close: closed #${item.issueNumber} (${subs.completed}/${subs.total} sub-issues closed)`);
+    } catch (e: any) {
+      console.warn(`   ⚠️  Failed to close parent #${item.issueNumber}: ${e?.message ?? e}`);
+    }
   }
 }
 
@@ -5992,6 +6054,10 @@ export async function pollLoop(): Promise<void> {
     await runRealClaudeGate(client);
     await runAutoAdvance(client, MAX_CONCURRENT, pool.size);
     await runDoneCleanup(client);
+
+    // Close Done parents whose sub-issues are all closed. Before the
+    // auto-merge; see `runParentClose`.
+    await runParentClose(client);
 
     // Auto-merge PRs for tickets in the Done column. Extracted to
     // `runAutoMerge` below for testability.

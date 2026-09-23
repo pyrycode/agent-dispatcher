@@ -45,6 +45,7 @@ import {
   maybeResumeExhaustedRun,
   prepareAgentSpawn,
   runAutoMerge,
+  runParentClose,
   runClosedSweep,
   runConcurrentDispatches,
   runDoneCleanup,
@@ -396,6 +397,7 @@ export class MockGitHubClient implements DispatchClient {
   getItemsByStatusCalls: string[] = [];
   getClosedItemsNotInDoneCalls = 0;
   updateItemStatusCalls: { itemId: string; newStatus: string }[] = [];
+  closeIssueCalls: number[] = [];
   getLatestRetryAtCalls: number[] = [];
   retryAtByIssue: Map<number, Date | null> = new Map();
   /** Pre-seeded family tallies for `getFamilyDispatchState` — markers
@@ -428,6 +430,7 @@ export class MockGitHubClient implements DispatchClient {
     getFamilyDispatchState?: Error;
     getAllProjectItems?: Error;
     getStrandedWipMarkers?: Error | ((issueNumber: number) => Error | null);
+    closeIssue?: Error | ((issueNumber: number) => Error | null);
   } = {};
 
   constructor(opts: {
@@ -538,6 +541,18 @@ export class MockGitHubClient implements DispatchClient {
     }
   }
 
+  async closeIssue(issueNumber: number): Promise<void> {
+    this.closeIssueCalls.push(issueNumber);
+    if (typeof this.failures.closeIssue === "function") {
+      const e = this.failures.closeIssue(issueNumber);
+      if (e) throw e;
+    } else if (this.failures.closeIssue) {
+      throw this.failures.closeIssue;
+    }
+    const item = this.itemsByIssueNumber.get(issueNumber);
+    if (item) item.state = "CLOSED";
+  }
+
   async getLatestRetryAt(issueNumber: number): Promise<Date | null> {
     this.getLatestRetryAtCalls.push(issueNumber);
     if (this.failures.getLatestRetryAt) throw this.failures.getLatestRetryAt;
@@ -627,6 +642,7 @@ export function makeProjectItem(overrides: Partial<ProjectItem> = {}): ProjectIt
     blockedBy,
     parentNumber: overrides.parentNumber ?? null,
     grandparentNumber: overrides.grandparentNumber ?? null,
+    ...(overrides.subIssues ? { subIssues: overrides.subIssues } : {}),
   };
 }
 
@@ -4065,10 +4081,10 @@ describe("runAutoMerge", () => {
     assert.equal(calls.discord.length, 0);
   });
 
-  test("rebase-time conflict on first attempt → bumps merge-attempt:1, never invokes gh pr merge", async () => {
-    // Pre-merge rebase failure on the first attempt: counter bumps,
-    // merge step skipped (correct — same posture as the give-up rebase
-    // test, just at the retry seam).
+  test("rebase-time conflict, merge conflicts too, first attempt → plain merge tried, then bumps merge-attempt:1", async () => {
+    // A rebase conflict falls back to the plain merge. When the merge
+    // conflicts as well, the conflict is real and the usual retry
+    // counter applies.
     const client = new MockGitHubClient({
       items: [
         { id: "PVTI_1410", issueNumber: 1410, status: "Done", labels: ["done:documentation"], state: "OPEN" },
@@ -4078,15 +4094,50 @@ describe("runAutoMerge", () => {
       execImpls: {
         "gh pr list --head \"feature/1410\"": () => "910\n",
         "gh pr update-branch 910 --rebase": () => execError({ stderr: "is not mergeable" }),
+        "gh pr merge 910 --merge --delete-branch": () => execError({ stderr: "is not mergeable" }),
       },
     });
 
     await runAutoMerge(client, deps);
 
+    assert.ok(calls.exec.some(c => c.cmd === "gh pr merge 910 --merge --delete-branch"),
+      "a rebase conflict must fall back to the plain merge");
     assert.ok(client.addLabelCalls.some(c => c.issueNumber === 1410 && c.label === "merge-attempt:1"));
-    assert.ok(!calls.exec.some(c => c.cmd.includes("gh pr merge")),
-      "rebase conflict must short-circuit before merge attempt, even on retry");
     assert.ok(!client.addLabelCalls.some(c => c.label === "error:merge-conflict"));
+  });
+
+  test("rebase refused over a conflict the plain merge does not have → merges with a merge commit (#823 / PR 834)", async () => {
+    // The branch had settled an earlier conflict by merging main. A
+    // rebase replays the branch's own commits and ignores that merge, so
+    // GitHub refuses it — with an error none of the conflict phrases
+    // matched, which made the dispatcher skip the ticket silently every
+    // cycle. The plain merge is clean. Error text captured verbatim from
+    // a throwaway repo on 2026-09-23.
+    const client = new MockGitHubClient({
+      items: [
+        { id: "PVTI_1411", issueNumber: 1411, status: "Done", labels: ["done:documentation"], state: "OPEN" },
+      ],
+    });
+    const { deps, calls } = makeMockDeps({
+      execImpls: {
+        "gh pr list --head \"feature/1411\"": () => "911\n",
+        "gh pr update-branch 911 --rebase": () => execError({
+          stderr: "GraphQL: rebase conflict between base and head (updatePullRequestBranch)",
+          message: "Command failed: gh pr update-branch 911 --rebase",
+        }),
+        "gh pr merge 911 --merge --delete-branch": () => "",
+        "git checkout main && git pull": () => "",
+      },
+    });
+
+    await runAutoMerge(client, deps);
+
+    assert.ok(calls.exec.some(c => c.cmd === "gh pr merge 911 --merge --delete-branch"),
+      "must fall back to the plain merge");
+    assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1411 && c.label === "done:documentation"),
+      "a successful fallback merge cleans labels like any merge");
+    assert.ok(!client.addLabelCalls.some(c => c.label.startsWith("merge-attempt:") || c.label.startsWith("error:")));
+    assert.equal(client.updateItemStatusCalls.length, 0);
   });
 
   test("skip cases — merged label, error:merge-conflict label, issueNumber=0 → no gh pr list invoked", async () => {
@@ -4296,16 +4347,14 @@ describe("runAutoMerge", () => {
     assert.ok(!client.addLabelCalls.some(c => c.label === "error:merge-conflict"));
   });
 
-  test("pre-merge rebase conflict → label + comment + Status rollback applied, gh pr merge NEVER invoked", async () => {
-    // When the rebase itself surfaces a conflict, the dispatcher must
-    // short-circuit BEFORE the merge call — same load-bearing conflict
-    // path as a merge-time conflict (label + triage comment + Discord +
-    // Status rollback to In Code Review). The whole point of the rebase
-    // step is to catch the conflict at this earlier seam; falling
-    // through to attempt the merge would defeat it.
+  test("pre-merge rebase conflict, merge conflicts too, retries exhausted → label + comment + Status rollback", async () => {
+    // A rebase conflict falls back to the plain merge (2026-09-23: a
+    // rebase can conflict where the merge is clean). When the merge
+    // conflicts as well, the same load-bearing conflict path applies:
+    // label + triage comment + Discord + Status rollback.
     //
     // Pre-seeded `merge-attempt:2` so this is the 3rd (final) attempt —
-    // retries exhausted, dispatcher gives up at the rebase step.
+    // retries exhausted, dispatcher gives up.
     const client = new MockGitHubClient({
       items: [
         { id: "PVTI_1401", issueNumber: 1401, status: "Done", labels: ["done:documentation", "merge-attempt:2"], state: "OPEN" },
@@ -4321,14 +4370,18 @@ describe("runAutoMerge", () => {
           stderr: "X Pull request #901 is not mergeable: the merge commit cannot be cleanly created.",
           message: "Command failed: gh pr update-branch 901 --rebase",
         }),
+        "gh pr merge 901 --merge --delete-branch": () => execError({
+          stderr: "X Pull request #901 is not mergeable: the merge commit cannot be cleanly created.",
+          message: "Command failed: gh pr merge 901",
+        }),
       },
     });
 
     await runAutoMerge(client, deps);
 
-    // The merge call MUST NOT have been attempted.
-    assert.ok(!calls.exec.some(c => c.cmd.includes("gh pr merge")),
-      "rebase-time conflict must short-circuit before merge attempt");
+    // The plain merge was tried after the rebase conflict.
+    assert.ok(calls.exec.some(c => c.cmd === "gh pr merge 901 --merge --delete-branch"),
+      "a rebase conflict must fall back to the plain merge");
     // Conflict-block label applied (stops retry loop).
     assert.ok(client.addLabelCalls.some(c => c.issueNumber === 1401 && c.label === "error:merge-conflict"));
     // Triage comment posted.
@@ -4380,6 +4433,150 @@ describe("runAutoMerge", () => {
     assert.equal(calls.discord.length, 0);
     // Status NOT rolled back — the ticket may yet succeed next cycle.
     assert.equal(client.updateItemStatusCalls.length, 0);
+  });
+});
+
+// =====================================================================
+// runParentClose
+// =====================================================================
+//
+// A parent ticket's work lands through its sub-issues' PRs, so no PR ever
+// closes the parent itself. Before 2026-09-23 nothing closed it: five
+// parents (Mobile #652, Desktop #1558/#1497/#1488/#1251) sat open in Done
+// with every sub-issue closed. A ticket with no sub-issues is never
+// touched — tui-driver #185 sits open in Done on purpose.
+
+describe("runParentClose", () => {
+  test("Done parent with every sub-issue closed and no open PR → comment + close", async () => {
+    const client = new MockGitHubClient({
+      items: [
+        { issueNumber: 1500, status: "Done", labels: [], state: "OPEN", subIssues: { total: 2, completed: 2 } },
+      ],
+    });
+    const { deps, calls } = makeMockDeps({
+      execImpls: { "gh pr list --head \"feature/1500\"": () => "" },
+    });
+
+    await runParentClose(client, deps);
+
+    assert.deepEqual(client.closeIssueCalls, [1500]);
+    assert.equal(client.comments.length, 1);
+    assert.equal(client.comments[0]!.issueNumber, 1500);
+    assert.match(client.comments[0]!.body, /2 of 2 sub-issues/);
+    // Comment first, so the reason is on the ticket before it closes.
+    assert.ok(calls.exec.some(c => c.cmd.includes("feature/1500")), "must check for the parent's own open PR");
+  });
+
+  test("a sub-issue still open → left open", async () => {
+    const client = new MockGitHubClient({
+      items: [
+        { issueNumber: 1501, status: "Done", labels: [], state: "OPEN", subIssues: { total: 3, completed: 2 } },
+      ],
+    });
+    const { deps, calls } = makeMockDeps();
+
+    await runParentClose(client, deps);
+
+    assert.equal(client.closeIssueCalls.length, 0);
+    assert.equal(client.comments.length, 0);
+    assert.equal(calls.exec.length, 0, "no PR lookup for a ticket that is not a candidate");
+  });
+
+  test("no sub-issues (unknown or zero) → never touched, even open in Done (tui-driver #185)", async () => {
+    const client = new MockGitHubClient({
+      items: [
+        { issueNumber: 1502, status: "Done", labels: [], state: "OPEN" },
+        { issueNumber: 1503, status: "Done", labels: [], state: "OPEN", subIssues: { total: 0, completed: 0 } },
+      ],
+    });
+    const { deps, calls } = makeMockDeps();
+
+    await runParentClose(client, deps);
+
+    assert.equal(client.closeIssueCalls.length, 0);
+    assert.equal(client.comments.length, 0);
+    assert.equal(calls.exec.length, 0);
+  });
+
+  test("not in Done → left open, even with every sub-issue closed", async () => {
+    const client = new MockGitHubClient({
+      items: [
+        { issueNumber: 1504, status: "In Development", labels: [], state: "OPEN", subIssues: { total: 1, completed: 1 } },
+      ],
+    });
+    const { deps } = makeMockDeps();
+
+    await runParentClose(client, deps);
+
+    assert.equal(client.closeIssueCalls.length, 0);
+  });
+
+  test("the parent has its own open PR → left open for the auto-merge", async () => {
+    const client = new MockGitHubClient({
+      items: [
+        { issueNumber: 1505, status: "Done", labels: [], state: "OPEN", subIssues: { total: 1, completed: 1 } },
+      ],
+    });
+    const { deps } = makeMockDeps({
+      execImpls: { "gh pr list --head \"feature/1505\"": () => "950\n" },
+    });
+
+    await runParentClose(client, deps);
+
+    assert.equal(client.closeIssueCalls.length, 0);
+    assert.equal(client.comments.length, 0);
+  });
+
+  test("the PR lookup fails → left open this cycle (fail closed)", async () => {
+    const client = new MockGitHubClient({
+      items: [
+        { issueNumber: 1506, status: "Done", labels: [], state: "OPEN", subIssues: { total: 1, completed: 1 } },
+      ],
+    });
+    const { deps } = makeMockDeps({
+      execImpls: {
+        "gh pr list --head \"feature/1506\"": () => execError({ stderr: "GraphQL error: rate limit exceeded" }),
+      },
+    });
+
+    await runParentClose(client, deps);
+
+    assert.equal(client.closeIssueCalls.length, 0);
+  });
+
+  test("error:merge-conflict on the parent → left open for the human", async () => {
+    const client = new MockGitHubClient({
+      items: [
+        { issueNumber: 1507, status: "Done", labels: ["error:merge-conflict"], state: "OPEN", subIssues: { total: 1, completed: 1 } },
+      ],
+    });
+    const { deps, calls } = makeMockDeps();
+
+    await runParentClose(client, deps);
+
+    assert.equal(client.closeIssueCalls.length, 0);
+    assert.equal(calls.exec.length, 0);
+  });
+
+  test("a close failure is non-fatal — the next parent still closes", async () => {
+    const client = new MockGitHubClient({
+      items: [
+        { issueNumber: 1508, status: "Done", labels: [], state: "OPEN", subIssues: { total: 1, completed: 1 } },
+        { issueNumber: 1509, status: "Done", labels: [], state: "OPEN", subIssues: { total: 4, completed: 4 } },
+      ],
+    });
+    client.failures.closeIssue = (n) => (n === 1508 ? new Error("403 forbidden") : null);
+    const { deps } = makeMockDeps({
+      execImpls: {
+        "gh pr list --head \"feature/1508\"": () => "",
+        "gh pr list --head \"feature/1509\"": () => "",
+      },
+    });
+
+    await runParentClose(client, deps);
+
+    assert.deepEqual(client.closeIssueCalls, [1508, 1509]);
+    assert.equal(client.itemsByIssueNumber.get(1509)!.state, "CLOSED");
   });
 });
 

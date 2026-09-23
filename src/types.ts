@@ -35,6 +35,11 @@ export interface ProjectItem {
    *  ticket's root: `grandparentNumber ?? parentNumber ?? issueNumber`
    *  (see `resolveFamilyRoot` in pipeline-decisions.ts). */
   grandparentNumber: number | null;
+  /** GitHub's sub-issue tally for this issue (`subIssuesSummary`):
+   *  how many sub-issues it has and how many are closed. Absent when the
+   *  fetch did not carry it. Read by `runParentClose` to close a Done
+   *  parent once every sub-issue is closed. */
+  subIssues?: { total: number; completed: number };
 }
 
 export interface AgentConfig {
