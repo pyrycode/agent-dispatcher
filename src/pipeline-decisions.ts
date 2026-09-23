@@ -297,6 +297,10 @@ export interface ReworkRoute {
    *  clean ticket, ready for re-dispatch). Non-state labels (size:,
    *  priority:, custom tags) are preserved. */
   labelsToStrip: string[];
+  /** Set when the route is a wait on open blockers rather than a rework:
+   *  the ticket stays in `fromColumn` and no rework is counted. Holds the
+   *  open blocker numbers. See `decideReworkRoutes`. */
+  waitingOn?: number[];
 }
 
 /**
@@ -320,6 +324,16 @@ export interface ReworkRoute {
  * is a no-op for same-column updates, but the label-strip and
  * rework-count bump still happen, which unblocks dispatch. Surfaced as
  * Pyrycode #59's broader bug 2026-05-02.
+ *
+ * A refinement bail from past Backlog on a ticket with an OPEN blocker is a
+ * wait, not a rework. Dispatch never picks a blocked ticket, so the blocker
+ * was added by the run that bailed: the file-overlap check found another
+ * open branch editing the same files. Sending it to Backlog bought a
+ * refinement run on a sound ticket and a rework count that walked it toward
+ * the loop breaker (pyrycode-mobile #808, parked behind #803 and then #804
+ * on 2026-09-22 and 2026-09-23). The route keeps the ticket in its column
+ * and strips only the trigger. It holds no seat while blocked, and the same
+ * agent picks it up when the blocker closes.
  *
  * Pure function over already-collected items; the caller does the I/O
  * (status updates and label removals).
@@ -348,6 +362,22 @@ export function decideReworkRoutes(
         if (target === null) continue;
         const targetColumn = agentColumnMap.get(target);
         if (!targetColumn) continue;
+
+        const openBlockers = (item.blockedBy ?? [])
+          .filter(b => b.state === "OPEN")
+          .map(b => b.number);
+        if (targetColumn === "Backlog" && fromColumn !== "Backlog" && openBlockers.length > 0) {
+          routes.push({
+            itemId: item.id,
+            issueNumber: item.issueNumber,
+            fromColumn,
+            toColumn: fromColumn,
+            triggerLabel: label,
+            labelsToStrip: [label],
+            waitingOn: openBlockers,
+          });
+          break;
+        }
 
         const labelsToStrip = [
           label,

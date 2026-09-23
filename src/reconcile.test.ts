@@ -389,6 +389,34 @@ describe("runReworkRouting — cache invalidation", () => {
     assert.equal(client.addLabelCalls.length, 1);
     assert.equal(client.addCommentCalls.length, 1);
   });
+
+  test("a refinement bail on a blocked ticket waits in place, uncounted, even at the loop threshold", async () => {
+    // pyrycode-mobile #808, 2026-09-23: two file-overlap bails had already
+    // walked it to rework-count:2. At the threshold a real rework would halt.
+    await withStageSet("builder", async () => {
+      const item = makeItem({
+        id: "item-808",
+        issueNumber: 808,
+        status: "In Development",
+        labels: ["needs-rework:refiner", "done:refiner", "rework-count:3"],
+        blockedBy: [{ number: 804, state: "OPEN" }],
+      });
+      const client = new MockClient([item]);
+
+      await runReworkRouting(client);
+
+      assert.deepEqual(client.updateItemStatusCalls, [], "stays in In Development");
+      assert.deepEqual(client.removeLabelCalls, [{ issueNumber: 808, label: "needs-rework:refiner" }]);
+      assert.deepEqual(client.addLabelCalls, [], "no counter bump, no error:rework-loop");
+      assert.match(client.addCommentCalls[0]?.body ?? "", /Waiting on #804/);
+      assert.deepEqual(item.labels, ["done:refiner", "rework-count:3"]);
+      assert.equal(client.clearItemsCacheCalls, 1);
+
+      // Next cycle: the trigger is gone, so nothing more is written.
+      await runReworkRouting(client);
+      assert.equal(client.addCommentCalls.length, 1);
+    });
+  });
 });
 
 describe("runRealClaudeGate — parks gated tickets in Inbox", () => {

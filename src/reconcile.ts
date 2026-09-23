@@ -218,6 +218,33 @@ export async function runReworkRouting(client: ReconcileClient): Promise<void> {
   // at the end if any state-changing operation happened.
   let mutated = false;
   for (const route of routes) {
+    // A wait on open blockers: drop the trigger, leave the column and the
+    // counter alone, and skip the loop breaker since nothing was reworked.
+    // A failed strip posts nothing; the label is still there next pass.
+    if (route.waitingOn?.length) {
+      const blockers = route.waitingOn.map(n => `#${n}`).join(", ");
+      try {
+        await client.removeLabel(route.issueNumber, route.triggerLabel);
+      } catch (e) {
+        console.warn(`   ⚠️  Failed to strip ${route.triggerLabel} from #${route.issueNumber}: ${e}`);
+        continue;
+      }
+      mutated = true;
+      try {
+        await client.addComment(
+          route.issueNumber,
+          `## ⏸️ Waiting on ${blockers}\n\n` +
+          `\`${route.triggerLabel}\` arrived with an open blocker, so this is a wait, not a rework. ` +
+          `The ticket stays in ${route.fromColumn} and is picked up again once ${blockers} ` +
+          `${route.waitingOn.length > 1 ? "close" : "closes"}. No refinement run, and the rework count is unchanged.`,
+        );
+      } catch (e) {
+        console.warn(`   ⚠️  Failed to post wait comment on #${route.issueNumber}: ${e}`);
+      }
+      console.log(`   ⏸️  Wait: #${route.issueNumber} stays in ${route.fromColumn} until ${blockers} closes (${route.triggerLabel} dropped, no rework counted)`);
+      continue;
+    }
+
     // Find the source item to read its current rework count.
     const srcItems = itemsByColumn.get(route.fromColumn) ?? [];
     const srcItem = srcItems.find(it => it.id === route.itemId);
