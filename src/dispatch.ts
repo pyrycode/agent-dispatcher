@@ -20,6 +20,7 @@ import {
   initPermissionDenialState,
   maxTurnsFor,
   mergeLegResults,
+  parseBudgetScale,
   parseResumeLegs,
   pickFinalSessionId,
   shouldAttemptResume,
@@ -5557,6 +5558,7 @@ export async function pollLoop(): Promise<void> {
 
   console.log("🔄 Starting dispatch loop...");
   console.log(`   Stage set: ${stageSet.name} (PYRY_STAGE_SET)`);
+  console.log(`   Budget scale: ${parseBudgetScale(process.env.PYRY_BUDGET_SCALE)}× turns and time (PYRY_BUDGET_SCALE)`);
   console.log(`   Watching columns (finish-first): ${pollOrder.map((a) => a.column).join(", ")}`);
 
   // How long a `wip:<agent>` must sit with no dispatch behind it before the

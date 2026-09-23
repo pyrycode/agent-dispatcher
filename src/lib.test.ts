@@ -32,6 +32,7 @@ import {
   maxTurnsFor,
   timeoutFor,
   mergeLegResults,
+  parseBudgetScale,
   parseResumeLegs,
   parseSalvageGates,
   pickFinalSessionId,
@@ -5464,6 +5465,73 @@ describe("pickFinalSessionId — result frame wins over init capture", () => {
 
   test("empty on both sides stays empty", () => {
     assert.equal(pickFinalSessionId("", ""), "");
+  });
+});
+
+describe("parseBudgetScale — the PYRY_BUDGET_SCALE knob", () => {
+  test("unset or empty keeps every budget as it is", () => {
+    assert.equal(parseBudgetScale(undefined), 1);
+    assert.equal(parseBudgetScale(""), 1);
+  });
+
+  test("a positive number is the multiplier", () => {
+    assert.equal(parseBudgetScale("1.5"), 1.5);
+    assert.equal(parseBudgetScale("2"), 2);
+    assert.equal(parseBudgetScale("0.5"), 0.5);
+  });
+
+  test("garbage, zero and negatives fall back to 1", () => {
+    assert.equal(parseBudgetScale("banana"), 1);
+    assert.equal(parseBudgetScale("1.5x"), 1);
+    assert.equal(parseBudgetScale("0"), 1);
+    assert.equal(parseBudgetScale("-2"), 1);
+  });
+});
+
+describe("PYRY_BUDGET_SCALE applied through maxTurnsFor / timeoutFor", () => {
+  const dev = AGENTS.find(a => a.name === "developer")!;
+  const inline = { ...dev, name: "builder", maxTurns: 200, timeoutMs: 2_400_000 };
+
+  function withScale(value: string | undefined, fn: () => void): void {
+    const prior = process.env.PYRY_BUDGET_SCALE;
+    if (value === undefined) delete process.env.PYRY_BUDGET_SCALE;
+    else process.env.PYRY_BUDGET_SCALE = value;
+    try {
+      fn();
+    } finally {
+      if (prior === undefined) delete process.env.PYRY_BUDGET_SCALE;
+      else process.env.PYRY_BUDGET_SCALE = prior;
+    }
+  }
+
+  test("unset leaves name-keyed and inline budgets unchanged", () => {
+    withScale(undefined, () => {
+      assert.equal(maxTurnsFor(dev), 135);
+      assert.equal(timeoutFor(dev), 1_500_000);
+      assert.equal(maxTurnsFor(inline), 200);
+      assert.equal(timeoutFor(inline), 2_400_000);
+    });
+  });
+
+  test("1.5 scales inline stage-set budgets (builder 200 turns / 40min → 300 / 60min)", () => {
+    withScale("1.5", () => {
+      assert.equal(maxTurnsFor(inline), 300);
+      assert.equal(timeoutFor(inline), 3_600_000);
+    });
+  });
+
+  test("1.5 scales name-keyed budgets and rounds timeouts to whole minutes", () => {
+    withScale("1.5", () => {
+      assert.equal(maxTurnsFor(dev), 203); // 202.5 rounds up
+      assert.equal(timeoutFor(dev), 2_280_000); // 37.5min rounds to 38min
+    });
+  });
+
+  test("a tiny scale never yields zero turns or a zero timeout", () => {
+    withScale("0.001", () => {
+      assert.equal(maxTurnsFor(dev), 1);
+      assert.equal(timeoutFor(dev), 60_000);
+    });
   });
 });
 
