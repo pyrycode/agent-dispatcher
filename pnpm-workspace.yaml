@@ -1,0 +1,5 @@
+# Supply-chain cooldown: refuse any package version published less than
+# 2 days ago (value in minutes). Malicious releases are usually caught and
+# pulled within hours. For an urgent fix, list the package under
+# minimumReleaseAgeExclude.
+minimumReleaseAge: 2880
