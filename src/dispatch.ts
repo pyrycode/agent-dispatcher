@@ -7,6 +7,7 @@ import { config } from "dotenv";
 import { DispatchPool, candidateKey, excludeInFlight, freeSeats, resolvePollIntervalMs } from "./dispatch-pool.js";
 import { countVerdictsSince, parseVerdictArtifacts, pickVerdictPr, shouldFlagMissingVerdict } from "./verdict-guard.js";
 import { resolveImportOnlyMerge } from "./merge-resolve.js";
+import { MERGE_HANDOFF_LABEL, checkMergeResolution, decideConflictRoute, mergeHandoffNote, readPendingMerge, type PendingMerge } from "./merge-handoff.js";
 
 import { buildCodexInvocation, codexChildEnv, CODEX_ROLE_GUIDANCE, CodexStreamAdapter, formatRunCost, resumeCommand, resolveAgentRunner, type AgentRunner } from "./agent-runner.js";
 
@@ -43,6 +44,7 @@ import {
 import { selectDispatches } from "./dispatch-selection.js";
 import { activeStageSet } from "./stage-sets.js";
 import {
+  REAL_CLAUDE_GATE_FAIL_COLUMN,
   decideDoneCleanup,
   decideMergeRetry,
   decidePostRunLabels,
@@ -1769,6 +1771,11 @@ export type DispatchContext = {
   startTime: number;
   startTs: string;
   deps: DispatchDeps;
+  /** Set by `setupBranchAndWorktree` when it left a conflicted merge of the
+   *  default branch for this (code-owning) agent to finish. The prompt tells
+   *  the agent, and `handlePostRun` checks the result before pushing. See
+   *  merge-handoff.ts. */
+  pendingMerge?: PendingMerge;
 };
 
 export function makeDispatchContext(
@@ -1829,7 +1836,8 @@ export async function dispatchToAgent(
   // empty note without reading any env.
   const gates = await maybeRunPreSpawnGates(ctx);
 
-  const spawn = await prepareAgentSpawn(ctx, gates.promptNote);
+  const mergeNote = ctx.pendingMerge ? mergeHandoffNote(defaultBranch, ctx.pendingMerge.paths) : "";
+  const spawn = await prepareAgentSpawn(ctx, gates.promptNote + mergeNote);
   if (!spawn.ok) return;
 
   // streamResult is declared outside the try so handleDispatchError
@@ -2396,7 +2404,46 @@ export async function setupBranchAndWorktree(
       } catch {}
       return { ok: true };
     }
+
+    // Anything else goes to the agent owning the ticket's code, or parks
+    // when that would skip a stage (see merge-handoff.ts).
+    const route = decideConflictRoute(activeStageSet().agents, agent.name, REAL_CLAUDE_GATE_FAIL_COLUMN);
+    const pending = readPendingMerge(worktreeDir, ctx.deps);
+    const fileList = (pending?.paths ?? []).map(p => `- \`${p}\``).join("\n");
+    if (route.kind === "resolve" && pending !== null) {
+      ctx.pendingMerge = pending;
+      console.log(`   🔀 Merge of ${defaultBranch} into ${branchName} conflicted in ${pending.paths.length} file(s); left for ${agent.name} to finish`);
+      try {
+        await client.addComment(
+          item.issueNumber,
+          `## 🔀 Merge conflict left for ${agent.name}\n\n` +
+          `Merging \`${defaultBranch}\` into \`${branchName}\` conflicted in:\n\n${fileList}\n\n` +
+          `The ${agent.name} run finishes the merge first. When it ends, the dispatcher checks that the merge is committed, ` +
+          `no conflict markers remain and every line \`${defaultBranch}\` added to those files survived, before anything is pushed.`,
+        );
+      } catch {}
+      return { ok: true };
+    }
     try { execSync(`git merge --abort`, { cwd: worktreeDir, stdio: "pipe" }); } catch {}
+    if (route.kind === "route" && pending !== null) {
+      console.log(`   🔀 Merge of ${defaultBranch} into ${branchName} conflicted; sending #${item.issueNumber} to ${route.owner} (not a rework)`);
+      try {
+        await client.addComment(
+          item.issueNumber,
+          `## 🔀 Merge conflict sent to ${route.owner}\n\n` +
+          `Merging \`${defaultBranch}\` into \`${branchName}\` before the ${agent.name} run conflicted in:\n\n${fileList}\n\n` +
+          `This ticket goes back to ${route.owner} only for this merge. It does not count as a rework. ` +
+          `After ${route.owner} finishes it, the ticket passes the review stages again.`,
+        );
+        await client.addLabel(item.issueNumber, MERGE_HANDOFF_LABEL);
+        await client.addLabel(item.issueNumber, `needs-rework:${route.owner}`);
+      } catch (labelErr) {
+        console.warn(`   ⚠️  Failed to route the merge conflict on #${item.issueNumber}: ${labelErr}`);
+        try { await client.addLabel(item.issueNumber, `error:${agent.name}`); } catch {}
+      }
+      try { execSync(`git worktree remove "${worktreeDir}"`, { cwd: repoRoot, stdio: "pipe" }); } catch {}
+      return { ok: false };
+    }
     console.error(`   ❌ Merge conflict merging ${defaultBranch} into ${branchName}: ${e}`);
     await client.addComment(item.issueNumber, `## ⚠️ Dispatch Error: ${agent.name}\n\nMerge conflict on branch \`${branchName}\` when merging \`${defaultBranch}\`. Manual resolution required.\n\n\`\`\`\n${e}\n\`\`\``);
     try { await client.addLabel(item.issueNumber, `error:${agent.name}`); } catch {}
@@ -2743,6 +2790,13 @@ export async function handleAgentResultErrors(
     throw new Error(`Codex task blocked: ${streamResult.output.slice(0, 2000)}`);
   }
 
+  // Salvage commits and pushes whatever the run left. A run that was
+  // finishing a merge may have left conflict markers, so it is never
+  // salvaged: the error path parks it for a human instead.
+  if (ctx.pendingMerge) {
+    throw new Error(`${ctx.agent.name} ended in error while finishing a merge of ${defaultBranch}; not salvaged, so a half-finished merge is never pushed. Worktree: ${ctx.agentCwd}`);
+  }
+
   const { agent, item, client, agentCwd, useWorktree, branchName, logFile } = ctx;
   const { execSync } = ctx.deps;
   let salvaged = false;
@@ -2893,6 +2947,29 @@ export async function handlePostRun(
     ctx.deps.writeLog(logFile, "REFINEMENT HANDOFF", streamResult.output);
     console.log(`   🔄 #${item.issueNumber} requests refinement; worktree retained`);
     return { ok: false };
+  }
+
+  // A merge left for this run must be finished, and must keep main's side,
+  // before the safety-net commit or the push can touch it. On failure the
+  // worktree stays as it is for a human, and nothing reaches origin.
+  if (ctx.pendingMerge && useWorktree && item.issueNumber > 0) {
+    const problems = checkMergeResolution(agentCwd, ctx.pendingMerge, ctx.deps);
+    if (problems.length > 0) {
+      console.error(`   ❌ ${agent.name} did not finish the merge of ${defaultBranch} cleanly on #${item.issueNumber}`);
+      ctx.deps.writeLog(logFile, "MERGE CHECK FAILED", problems.join("\n"));
+      try { await client.addLabel(item.issueNumber, `error:${agent.name}`); } catch {}
+      try {
+        await client.addComment(
+          item.issueNumber,
+          `## ⚠️ Dispatch Error: ${agent.name}\n\n` +
+          `The run was asked to finish a merge of \`${defaultBranch}\` into \`${branchName}\`, and the check on its result failed:\n\n` +
+          problems.map(p => `- ${p}`).join("\n") +
+          `\n\nNothing was pushed. The worktree is kept at \`${agentCwd}\`. Finish the merge by hand, push it, then strip \`error:${agent.name}\`.`,
+        );
+      } catch {}
+      return { ok: false };
+    }
+    console.log(`   🔀 Merge of ${defaultBranch} finished; main's side is intact in ${ctx.pendingMerge.paths.length} file(s)`);
   }
 
   const output = streamResult.output;

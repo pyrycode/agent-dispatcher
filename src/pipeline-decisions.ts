@@ -8,6 +8,7 @@
 // (the only cross-file dependency in this file).
 
 import { hasOpenBlockers } from "./blockers.js";
+import { MERGE_HANDOFF_LABEL } from "./merge-handoff.js";
 
 // --------- Auto-advance rules ---------
 
@@ -301,6 +302,11 @@ export interface ReworkRoute {
    *  the ticket stays in `fromColumn` and no rework is counted. Holds the
    *  open blocker numbers. See `decideReworkRoutes`. */
   waitingOn?: number[];
+  /** Set when the route only sends the ticket to its code owner to finish a
+   *  merge of the default branch (the ticket carries MERGE_HANDOFF_LABEL).
+   *  The ticket moves as usual, but no rework is counted and the loop
+   *  breaker is not consulted. See merge-handoff.ts. */
+  mergeHandoff?: true;
 }
 
 /**
@@ -334,6 +340,13 @@ export interface ReworkRoute {
  * on 2026-09-22 and 2026-09-23). The route keeps the ticket in its column
  * and strips only the trigger. It holds no seat while blocked, and the same
  * agent picks it up when the blocker closes.
+ *
+ * A route on a ticket carrying MERGE_HANDOFF_LABEL is a merge handoff: the
+ * dispatcher's merge before a later stage conflicted and sent the ticket to
+ * its code owner. It moves like any rework and the marker is stripped with
+ * it, but it is flagged so the caller counts nothing. Nothing was wrong with
+ * the ticket, and main has to move again for the next conflict, so it cannot
+ * loop on its own.
  *
  * Pure function over already-collected items; the caller does the I/O
  * (status updates and label removals).
@@ -379,11 +392,12 @@ export function decideReworkRoutes(
           break;
         }
 
+        const mergeHandoff = item.labels.includes(MERGE_HANDOFF_LABEL);
         const labelsToStrip = [
           label,
           ...item.labels.filter(l =>
             l !== label &&
-            (l.startsWith("done:") || l.startsWith("wip:") || l.startsWith("error:")),
+            (l.startsWith("done:") || l.startsWith("wip:") || l.startsWith("error:") || l === MERGE_HANDOFF_LABEL),
           ),
         ];
 
@@ -394,6 +408,7 @@ export function decideReworkRoutes(
           toColumn: targetColumn,
           triggerLabel: label,
           labelsToStrip,
+          ...(mergeHandoff ? { mergeHandoff: true as const } : {}),
         });
         break; // first valid rework label wins
       }
