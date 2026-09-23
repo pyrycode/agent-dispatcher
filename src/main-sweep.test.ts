@@ -1,0 +1,300 @@
+import { describe, test } from "node:test";
+import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
+
+import {
+  DEFAULT_MAIN_SWEEP_EVERY,
+  DEFAULT_MAIN_SWEEP_TIMEOUT_MS,
+  buildMainSweepIssue,
+  decideMainSweep,
+  parseMainSweepState,
+  resolveMainSweepConfig,
+  tailLines,
+  type MainSweepConfig,
+  type MainSweepOutcome,
+} from "./main-sweep.js";
+import {
+  runMainSweep,
+  runMainSweepCycle,
+  type GateRunnerDeps,
+  type GateSpawnRequest,
+  type MainSweepClient,
+} from "./dispatch.js";
+
+const A = "a".repeat(40);
+const B = "b".repeat(40);
+const C = "c".repeat(40);
+
+function outcome(over: Partial<MainSweepOutcome> = {}): MainSweepOutcome {
+  return {
+    passed: false, exitCode: 1, timedOut: false, runError: null, failedNames: [],
+    stdoutPath: "/logs/out.log", stderrPath: "/logs/err.log", stderrTail: "", durationMs: 349_000, ...over,
+  };
+}
+
+describe("main sweep config", () => {
+  test("off unless a command is set", () => {
+    assert.equal(resolveMainSweepConfig({}), null);
+    assert.equal(resolveMainSweepConfig({ PYRY_MAIN_SWEEP_CMD: "   " }), null);
+  });
+
+  test("defaults and overrides", () => {
+    assert.deepEqual(resolveMainSweepConfig({ PYRY_MAIN_SWEEP_CMD: " make deep " }), {
+      command: "make deep", every: DEFAULT_MAIN_SWEEP_EVERY, timeoutMs: DEFAULT_MAIN_SWEEP_TIMEOUT_MS, format: null,
+    });
+    assert.deepEqual(resolveMainSweepConfig({
+      PYRY_MAIN_SWEEP_CMD: "x", PYRY_MAIN_SWEEP_EVERY: "3", PYRY_MAIN_SWEEP_TIMEOUT_MS: "900000",
+      PYRY_MAIN_SWEEP_FORMAT: "junit-xml",
+    }), { command: "x", every: 3, timeoutMs: 900_000, format: "junit-xml" });
+  });
+
+  test("bad numbers and formats fall back instead of disabling the sweep", () => {
+    assert.deepEqual(resolveMainSweepConfig({
+      PYRY_MAIN_SWEEP_CMD: "x", PYRY_MAIN_SWEEP_EVERY: "0", PYRY_MAIN_SWEEP_TIMEOUT_MS: "soon",
+      PYRY_MAIN_SWEEP_FORMAT: "tap",
+    }), { command: "x", every: DEFAULT_MAIN_SWEEP_EVERY, timeoutMs: DEFAULT_MAIN_SWEEP_TIMEOUT_MS, format: null });
+  });
+});
+
+describe("main sweep state file", () => {
+  test("missing or damaged reads as empty", () => {
+    const empty = { lastSha: null, lastGoodSha: null, openIssue: null };
+    assert.deepEqual(parseMainSweepState(null), empty);
+    assert.deepEqual(parseMainSweepState("{not json"), empty);
+    assert.deepEqual(parseMainSweepState(JSON.stringify({ lastSha: "; rm -rf /", openIssue: -3 })), empty);
+  });
+
+  test("round-trips valid fields", () => {
+    const state = { lastSha: A, lastGoodSha: B, openIssue: 944 };
+    assert.deepEqual(parseMainSweepState(JSON.stringify(state)), state);
+  });
+});
+
+describe("main sweep decision", () => {
+  const base = { head: B, lastSha: A, mergesSince: 1, every: 5, idle: false, verifierBusy: false };
+
+  test("never beside a verifier, never twice on the same commit", () => {
+    assert.equal(decideMainSweep({ ...base, idle: true, verifierBusy: true }).run, false);
+    assert.equal(decideMainSweep({ ...base, idle: true, head: A }).run, false);
+    assert.equal(decideMainSweep({ ...base, idle: true, head: null }).run, false);
+  });
+
+  test("idle runs as soon as main has moved, even after one merge", () => {
+    assert.equal(decideMainSweep({ ...base, idle: true }).run, true);
+  });
+
+  test("a busy board waits for the merge count", () => {
+    assert.equal(decideMainSweep({ ...base, mergesSince: 4 }).run, false);
+    assert.equal(decideMainSweep({ ...base, mergesSince: 5 }).run, true);
+    assert.equal(decideMainSweep({ ...base, mergesSince: null }).run, true);
+  });
+
+  test("the first sweep waits for an idle cycle", () => {
+    assert.equal(decideMainSweep({ ...base, lastSha: null, mergesSince: null }).run, false);
+    assert.equal(decideMainSweep({ ...base, lastSha: null, mergesSince: null, idle: true }).run, true);
+  });
+});
+
+describe("main sweep ticket", () => {
+  test("names the failing tests and the merge range", () => {
+    const { title, body } = buildMainSweepIssue({
+      repo: "pyrycode/pyrycode-mobile",
+      head: C,
+      lastGoodSha: A,
+      mergeSubjects: ["Merge pull request #939 from pyrycode/x", "Merge pull request #940 from pyrycode/y"],
+      command: "UI_DEVICE_ALL=1 python3 scripts/android-test-gate.py ui",
+      outcome: outcome({ failedNames: ["de.pyryco.mobile.ui.FooTest.bar"], stderrTail: "FAILED\n" }),
+    });
+    assert.equal(title, "In-depth test run failed on main at ccccccc");
+    assert.match(body, /`de\.pyryco\.mobile\.ui\.FooTest\.bar`/);
+    assert.match(body, /Merge pull request #939/);
+    assert.match(body, new RegExp(`compare/${A}\\.\\.\\.${C}`));
+    assert.match(body, /```\nFAILED\n```/);
+  });
+
+  test("says so when it could not run or has no good commit", () => {
+    const { title, body } = buildMainSweepIssue({
+      repo: "o/r", head: C, lastGoodSha: null, mergeSubjects: [], command: "x",
+      outcome: outcome({ exitCode: null, runError: "could not create the sweep worktree: boom" }),
+    });
+    assert.equal(title, "In-depth test run could not run on main at ccccccc");
+    assert.match(body, /No earlier sweep passed/);
+    assert.match(body, /Run error: could not create the sweep worktree: boom/);
+  });
+
+  test("tailLines keeps the end", () => {
+    assert.equal(tailLines("1\n2\n3\n4", 2), "3\n4");
+    assert.equal(tailLines("abcdef", 40, 3), "def");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Process half, through injected deps: no shell, no worktree, no suite.
+// ---------------------------------------------------------------------------
+
+function runnerDeps(over: {
+  gitFail?: (cmd: string) => boolean;
+  files?: Record<string, string>;
+  spawn?: { exitCode: number | null; timedOut?: boolean; spawnError?: string | null };
+} = {}) {
+  const calls: string[] = [];
+  const requests: GateSpawnRequest[] = [];
+  const deps: Partial<GateRunnerDeps> = {
+    execSync: ((cmd: string) => {
+      calls.push(cmd);
+      if (over.gitFail?.(cmd)) throw new Error(`boom: ${cmd}`);
+      return Buffer.from("");
+    }) as any,
+    mkdirSync: (() => undefined) as any,
+    readFileSync: ((path: string) => {
+      const hit = Object.entries(over.files ?? {}).find(([suffix]) => path.endsWith(suffix));
+      if (!hit) throw new Error("ENOENT");
+      return hit[1];
+    }) as any,
+    now: () => 0,
+    spawnGate: async (req: GateSpawnRequest) => {
+      requests.push(req);
+      return { exitCode: 0, timedOut: false, spawnError: null, ...over.spawn };
+    },
+  };
+  return { deps, calls, requests };
+}
+
+const sweep = (h: ReturnType<typeof runnerDeps>, format: "junit-xml" | null = null) => runMainSweep({
+  sha: C, command: "deep", format, timeoutMs: 60_000, repoRoot: "/tmp/repo", logsDir: "/tmp/logs", deps: h.deps,
+});
+
+describe("runMainSweep", () => {
+  test("runs the command in a detached worktree of the commit and removes it after", async () => {
+    const h = runnerDeps({ files: { ".stderr.log": "tail\n" } });
+    const result = await sweep(h);
+    assert.equal(result.passed, true);
+    assert.equal(result.stderrTail, "tail\n");
+    assert.ok(h.calls.some((c) => c.startsWith("git worktree add --detach") && c.endsWith(C)));
+    assert.equal(h.requests.length, 1);
+    assert.equal(h.requests[0].command, "deep");
+    assert.match(h.requests[0].cwd, /\.pyrycode-worktrees\/main-sweep$/);
+    assert.ok(h.calls.at(-2)?.startsWith("git worktree remove "));
+  });
+
+  test("a non-zero exit, a timeout or a spawn error is a failure", async () => {
+    assert.equal((await sweep(runnerDeps({ spawn: { exitCode: 1 } }))).passed, false);
+    assert.equal((await sweep(runnerDeps({ spawn: { exitCode: null, timedOut: true } }))).passed, false);
+    const spawnFailed = await sweep(runnerDeps({ spawn: { exitCode: null, spawnError: "ENOENT bash" } }));
+    assert.equal(spawnFailed.passed, false);
+    assert.equal(spawnFailed.runError, "ENOENT bash");
+  });
+
+  test("names failing tests when a format is configured", async () => {
+    const xml = '<testsuite tests="2"><testcase classname="a.B" name="ok"/>' +
+      '<testcase classname="a.B" name="bad"><failure/></testcase></testsuite>';
+    const result = await sweep(runnerDeps({ spawn: { exitCode: 1 }, files: { "_main-sweep_ccccccc.log": xml } }), "junit-xml");
+    assert.equal(result.failedNames.length, 1);
+    assert.match(result.failedNames[0], /bad/);
+  });
+
+  test("a worktree that cannot be created is a run error, and nothing is spawned", async () => {
+    const h = runnerDeps({ gitFail: (c) => c.startsWith("git worktree add") });
+    const result = await sweep(h);
+    assert.equal(result.passed, false);
+    assert.match(result.runError ?? "", /could not create the sweep worktree/);
+    assert.equal(h.requests.length, 0);
+  });
+});
+
+describe("runMainSweepCycle", () => {
+  const config: MainSweepConfig = { command: "deep", every: 5, timeoutMs: 60_000, format: null };
+
+  function harness(opts: {
+    state?: object | null;
+    head?: string;
+    merges?: string;
+    issueState?: string;
+    result?: MainSweepOutcome;
+    createFails?: boolean;
+  } = {}) {
+    const written: string[] = [];
+    const runs: string[] = [];
+    const board: string[] = [];
+    const client: MainSweepClient = {
+      createIssue: async (title) => {
+        if (opts.createFails) throw new Error("403");
+        board.push(`create ${title}`);
+        return { number: 950, nodeId: "N", url: "u" };
+      },
+      addItemToProject: async () => { board.push("add"); return "ITEM"; },
+      updateItemStatus: async (_id, status) => { board.push(`status ${status}`); },
+    };
+    const execSync = ((cmd: string) => {
+      if (cmd === "git rev-parse origin/main") return Buffer.from(opts.head ?? C);
+      if (cmd.startsWith("git rev-list --count --merges")) return Buffer.from(opts.merges ?? "1");
+      if (cmd.startsWith("gh issue view")) return Buffer.from(opts.issueState ?? "OPEN");
+      if (cmd.startsWith("git log --merges")) return Buffer.from("Merge pull request #939 from x\n");
+      throw new Error(`unexpected ${cmd}`);
+    }) as any;
+    const cycle = (idle: boolean, verifierBusy = false) => runMainSweepCycle({
+      config, client, idle, verifierBusy, repo: "o/r", repoRoot: "/tmp/repo", defaultBranch: "main",
+      deps: {
+        execSync,
+        readState: () => (opts.state === null || opts.state === undefined ? null : JSON.stringify(opts.state)),
+        writeState: (json) => { written.push(json); },
+        run: async (sha) => { runs.push(sha); return opts.result ?? outcome({ passed: true, exitCode: 0 }); },
+      },
+    });
+    const lastState = () => JSON.parse(written.at(-1) ?? "null");
+    return { cycle, runs, board, written, lastState };
+  }
+
+  test("off when not configured", async () => {
+    const d = await runMainSweepCycle({ config: null, client: {} as any, idle: true, verifierBusy: false, repo: "o/r" });
+    assert.deepEqual(d, { run: false, reason: "not configured" });
+  });
+
+  test("a pass records main as the last good commit and clears the open ticket", async () => {
+    const h = harness({ state: { lastSha: A, lastGoodSha: A, openIssue: 944 } });
+    const d = await h.cycle(true);
+    assert.equal(d.run, true);
+    assert.deepEqual(h.runs, [C]);
+    assert.deepEqual(h.lastState(), { lastSha: C, lastGoodSha: C, openIssue: null });
+    assert.deepEqual(h.board, []);
+  });
+
+  test("a busy board with too few merges does nothing", async () => {
+    const h = harness({ state: { lastSha: A, lastGoodSha: A, openIssue: null }, merges: "4" });
+    assert.equal((await h.cycle(false)).run, false);
+    assert.deepEqual(h.runs, []);
+    assert.deepEqual(h.written, []);
+  });
+
+  test("a running verifier holds the sweep back even when idle-looking", async () => {
+    const h = harness({ state: { lastSha: A, lastGoodSha: A, openIssue: null }, merges: "9" });
+    assert.equal((await h.cycle(true, true)).run, false);
+    assert.deepEqual(h.runs, []);
+  });
+
+  test("a failure files one Backlog ticket and remembers it", async () => {
+    const h = harness({ state: { lastSha: A, lastGoodSha: A, openIssue: null }, result: outcome() });
+    await h.cycle(true);
+    assert.deepEqual(h.board, ["create In-depth test run failed on main at ccccccc", "add", "status Backlog"]);
+    assert.deepEqual(h.lastState(), { lastSha: C, lastGoodSha: A, openIssue: 950 });
+  });
+
+  test("a repeat failure files nothing while the earlier ticket is open", async () => {
+    const h = harness({ state: { lastSha: A, lastGoodSha: A, openIssue: 950 }, result: outcome(), issueState: "OPEN" });
+    await h.cycle(true);
+    assert.deepEqual(h.board, []);
+    assert.deepEqual(h.lastState(), { lastSha: C, lastGoodSha: A, openIssue: 950 });
+  });
+
+  test("a failure after the earlier ticket closed files a new one", async () => {
+    const h = harness({ state: { lastSha: A, lastGoodSha: A, openIssue: 950 }, result: outcome(), issueState: "CLOSED" });
+    await h.cycle(true);
+    assert.equal(h.board[0], "create In-depth test run failed on main at ccccccc");
+  });
+
+  test("a board write that fails still records the sweep, so it does not rerun every cycle", async () => {
+    const h = harness({ state: { lastSha: A, lastGoodSha: A, openIssue: null }, result: outcome(), createFails: true });
+    await h.cycle(true);
+    assert.deepEqual(h.lastState(), { lastSha: C, lastGoodSha: A, openIssue: null });
+  });
+});

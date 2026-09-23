@@ -42,6 +42,17 @@ import {
   shouldProduceCommits,
 } from "./blockers.js";
 import { selectDispatches } from "./dispatch-selection.js";
+import {
+  buildMainSweepIssue,
+  decideMainSweep,
+  parseMainSweepState,
+  resolveMainSweepConfig,
+  tailLines,
+  type MainSweepConfig,
+  type MainSweepDecision,
+  type MainSweepOutcome,
+  type MainSweepState,
+} from "./main-sweep.js";
 import { activeStageSet } from "./stage-sets.js";
 import {
   REAL_CLAUDE_GATE_FAIL_COLUMN,
@@ -4559,6 +4570,215 @@ export function makeRealClaudeGateRunner(): RealClaudeGateRunner | null {
   });
 }
 
+/**
+ * Run the fork's in-depth command against `sha` on main and report what
+ * happened. Never throws; a run that cannot start comes back with `runError`.
+ *
+ * Same shape as `runRealClaudeGateSuite`: a DETACHED worktree, so it holds no
+ * branch and cannot collide with a dispatch worktree; judged by the files read
+ * back off disk; the worktree removed in a `finally`. No merge step, since it
+ * tests main itself.
+ */
+export async function runMainSweep(opts: {
+  sha: string;
+  command: string;
+  format: GateOutputFormat | null;
+  timeoutMs: number;
+  repoRoot?: string;
+  logsDir?: string;
+  deps?: Partial<GateRunnerDeps>;
+}): Promise<MainSweepOutcome> {
+  const deps: GateRunnerDeps = { ...DEFAULT_GATE_RUNNER_DEPS, ...opts.deps };
+  const targetRepo = opts.repoRoot ?? repoRoot;
+  const logsDir = opts.logsDir ?? LOGS_DIR;
+  // Prefixed so it can never collide with a dispatch worktree (`<agent>-<issue>`).
+  const worktreeDir = resolve(targetRepo, `../.pyrycode-worktrees/main-sweep`);
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const stdoutPath = resolve(logsDir, `${stamp}_main-sweep_${opts.sha.slice(0, 7)}.log`);
+  const stderrPath = resolve(logsDir, `${stamp}_main-sweep_${opts.sha.slice(0, 7)}.stderr.log`);
+  const started = deps.now();
+  const outcome: MainSweepOutcome = {
+    passed: false, exitCode: null, timedOut: false, runError: null, failedNames: [],
+    stdoutPath, stderrPath, stderrTail: "", durationMs: 0,
+  };
+  const finish = (runError?: string): MainSweepOutcome => {
+    if (runError !== undefined) outcome.runError = runError;
+    outcome.passed = outcome.runError === null && !outcome.timedOut && outcome.exitCode === 0;
+    outcome.durationMs = deps.now() - started;
+    return outcome;
+  };
+  const removeWorktree = () => {
+    try { deps.execSync(`git worktree remove "${worktreeDir}"`, { cwd: targetRepo, stdio: "pipe" }); } catch {}
+    try { deps.execSync(`git worktree prune`, { cwd: targetRepo, stdio: "pipe" }); } catch {}
+  };
+
+  removeWorktree(); // clear anything a crashed earlier run left behind
+  try {
+    deps.mkdirSync(resolve(targetRepo, `../.pyrycode-worktrees`), { recursive: true });
+    deps.execSync(`git worktree add --detach "${worktreeDir}" ${opts.sha}`, {
+      cwd: targetRepo, encoding: "utf-8", timeout: 120_000, stdio: "pipe",
+    });
+  } catch (e: any) {
+    removeWorktree();
+    return finish(`could not create the sweep worktree: ${e?.message ?? e}`);
+  }
+
+  try {
+    deps.mkdirSync(logsDir, { recursive: true });
+    const spawned = await deps.spawnGate({
+      command: opts.command,
+      cwd: worktreeDir,
+      env: buildGateSpawnEnv(process.env),
+      timeoutMs: opts.timeoutMs,
+      stdoutPath,
+      stderrPath,
+    });
+    outcome.exitCode = spawned.exitCode;
+    outcome.timedOut = spawned.timedOut;
+    if (spawned.spawnError !== null) outcome.runError = spawned.spawnError;
+    try {
+      outcome.stderrTail = tailLines(deps.readFileSync(stderrPath, "utf-8").toString());
+    } catch {}
+    if (opts.format !== null) {
+      try {
+        outcome.failedNames = parseGateOutput(deps.readFileSync(stdoutPath, "utf-8").toString(), opts.format).failedNames;
+      } catch {}
+    }
+    return finish();
+  } catch (e: any) {
+    return finish(`sweep run failed unexpectedly: ${e?.message ?? e}`);
+  } finally {
+    removeWorktree();
+  }
+}
+
+/** Narrow client for the sweep's board writes; `GitHubProjectClient` satisfies it. */
+export interface MainSweepClient {
+  createIssue(title: string, body: string, labels?: string[]): Promise<{ number: number; nodeId: string; url: string }>;
+  addItemToProject(issueNodeId: string): Promise<string>;
+  updateItemStatus(itemId: string, newStatus: string): Promise<void>;
+}
+
+export interface MainSweepCycleDeps {
+  execSync: typeof execSync;
+  readState: () => string | null;
+  writeState: (json: string) => void;
+  run: (sha: string) => Promise<MainSweepOutcome>;
+}
+
+const MAIN_SWEEP_STATE_FILE = "main-sweep-state.json";
+
+const DEFAULT_MAIN_SWEEP_CYCLE_DEPS = (config: MainSweepConfig): MainSweepCycleDeps => ({
+  execSync,
+  readState: () => {
+    try { return readFileSync(resolve(LOGS_DIR, MAIN_SWEEP_STATE_FILE), "utf-8"); } catch { return null; }
+  },
+  writeState: (json) => {
+    mkdirSync(LOGS_DIR, { recursive: true });
+    writeFileSync(resolve(LOGS_DIR, MAIN_SWEEP_STATE_FILE), json);
+  },
+  run: (sha) => runMainSweep({ sha, command: config.command, format: config.format, timeoutMs: config.timeoutMs }),
+});
+
+/**
+ * One cycle's main sweep step: decide, run inline, record, and file a Backlog
+ * ticket on failure. Returns the decision for logging and tests.
+ *
+ * Runs inline in the poll loop on purpose. While it runs no new verifier can
+ * launch, and it only starts when none is in flight, so the in-depth run never
+ * shares the emulators with a verifier's gates. Builders already in the pool
+ * keep running. The cost is a dispatch pause of one sweep, about six minutes
+ * for Mobile, at most once per `every` merges or when there is nothing to do.
+ */
+export async function runMainSweepCycle(opts: {
+  config: MainSweepConfig | null;
+  client: MainSweepClient;
+  idle: boolean;
+  verifierBusy: boolean;
+  repo: string;
+  repoRoot?: string;
+  defaultBranch?: string;
+  deps?: Partial<MainSweepCycleDeps>;
+}): Promise<MainSweepDecision> {
+  if (opts.config === null) return { run: false, reason: "not configured" };
+  const config = opts.config;
+  const deps: MainSweepCycleDeps = { ...DEFAULT_MAIN_SWEEP_CYCLE_DEPS(config), ...opts.deps };
+  const targetRepo = opts.repoRoot ?? repoRoot;
+  const base = opts.defaultBranch ?? defaultBranch;
+  const git = (args: string): string =>
+    deps.execSync(`git ${args}`, { cwd: targetRepo, encoding: "utf-8", timeout: 60_000, stdio: "pipe" }).toString().trim();
+
+  const state = parseMainSweepState(deps.readState());
+  // The local ref, no fetch: runAutoMerge pulls after every merge, and the
+  // sweep itself only needs to notice main moving within a cycle or two.
+  let head: string | null = null;
+  try { head = git(`rev-parse origin/${base}`); } catch {}
+  let mergesSince: number | null = null;
+  if (head !== null && state.lastSha !== null && head !== state.lastSha) {
+    try {
+      const n = parseInt(git(`rev-list --count --merges ${state.lastSha}..${head}`), 10);
+      mergesSince = Number.isFinite(n) ? n : null;
+    } catch {}
+  }
+  const decision = decideMainSweep({
+    head, lastSha: state.lastSha, mergesSince, every: config.every, idle: opts.idle, verifierBusy: opts.verifierBusy,
+  });
+  if (!decision.run || head === null) return decision;
+
+  console.log(`   🔬 Main sweep on ${head.slice(0, 7)}: ${decision.reason}`);
+  const outcome = await deps.run(head);
+  const next: MainSweepState = { ...state, lastSha: head };
+
+  if (outcome.passed) {
+    console.log(`   ✅ Main sweep passed on ${head.slice(0, 7)} in ${Math.round(outcome.durationMs / 1000)}s`);
+    next.lastGoodSha = head;
+    next.openIssue = null;
+    deps.writeState(JSON.stringify(next, null, 2) + "\n");
+    return decision;
+  }
+
+  console.warn(
+    `   ❌ Main sweep failed on ${head.slice(0, 7)}` +
+    (outcome.runError ? `: ${outcome.runError}` : ` (exit ${outcome.exitCode}${outcome.timedOut ? ", timed out" : ""})`),
+  );
+  let stillOpen = false;
+  if (state.openIssue !== null) {
+    try {
+      stillOpen = deps.execSync(`gh issue view ${state.openIssue} --json state --jq .state`, {
+        cwd: targetRepo, encoding: "utf-8", timeout: 60_000, stdio: "pipe",
+      }).toString().trim() === "OPEN";
+    } catch {
+      stillOpen = true; // unknown: prefer no duplicate over a second ticket
+    }
+  }
+  if (stillOpen) {
+    console.warn(`   ↪️  Ticket #${state.openIssue} for the earlier sweep failure is still open; not filing another`);
+  } else {
+    let mergeSubjects: string[] = [];
+    if (state.lastGoodSha !== null) {
+      try {
+        mergeSubjects = git(`log --merges --format=%s ${state.lastGoodSha}..${head}`).split("\n").filter(Boolean);
+      } catch {}
+    }
+    const { title, body } = buildMainSweepIssue({
+      repo: opts.repo, head, lastGoodSha: state.lastGoodSha, mergeSubjects, command: config.command, outcome,
+    });
+    try {
+      const issue = await opts.client.createIssue(title, body);
+      const itemId = await opts.client.addItemToProject(issue.nodeId);
+      await opts.client.updateItemStatus(itemId, "Backlog");
+      next.openIssue = issue.number;
+      console.warn(`   🎫 Filed #${issue.number} in Backlog for the sweep failure`);
+    } catch (e: any) {
+      // Recorded as swept anyway: retrying a six-minute run every cycle to
+      // re-attempt a board write would stall the whole loop.
+      console.error(`   ❌ Could not file the sweep failure ticket: ${e?.message ?? e}`);
+    }
+  }
+  deps.writeState(JSON.stringify(next, null, 2) + "\n");
+  return decision;
+}
+
 export async function holdBackoffWaiters(
   itemsByColumn: Map<string, ProjectItem[]>,
   client: DispatchClient,
@@ -5761,6 +5981,16 @@ export async function pollLoop(): Promise<void> {
         `${Math.round(REAL_CLAUDE_GATE_TIMEOUT_MS / 60_000)}min wall clock, format ${REAL_CLAUDE_GATE_FORMAT}`,
   );
 
+  // Main sweep: the fork's in-depth command against main, when idle or every N
+  // merges. Null when PYRY_MAIN_SWEEP_CMD is unset. See runMainSweepCycle.
+  const mainSweep = resolveMainSweepConfig(process.env);
+  console.log(
+    mainSweep === null
+      ? `   Main sweep: off (PYRY_MAIN_SWEEP_CMD)`
+      : `   Main sweep: when idle or every ${mainSweep.every} merges, ` +
+        `${Math.round(mainSweep.timeoutMs / 60_000)}min wall clock: ${mainSweep.command}`,
+  );
+
   // Edge-trigger state for the "board drained" ping: flips true once a cycle
   // sees work, so the ping fires on the busy → quiet transition and never on a
   // board that's been idle since startup. See decideDrainNotification.
@@ -6065,6 +6295,20 @@ export async function pollLoop(): Promise<void> {
     // Auto-merge PRs for tickets in the Done column. Extracted to
     // `runAutoMerge` below for testability.
     await runAutoMerge(client);
+
+    // In-depth run against main, inline, never beside a verifier's gates.
+    // After the merge so this cycle's merge counts. See runMainSweepCycle.
+    if (mainSweep !== null) {
+      const verifierBusy = [...pool.keys()].some((k) => k.startsWith("verifier#")) ||
+        [...itemsByColumn.values()].some((items) => items.some((i) => i.labels.includes("wip:verifier")));
+      await runMainSweepCycle({
+        config: mainSweep,
+        client,
+        idle: !dispatched && activeWork === 0 && pool.size === 0,
+        verifierBusy,
+        repo: `${process.env.GITHUB_OWNER}/${process.env.GITHUB_REPO}`,
+      });
+    }
 
     // Wait for a seat to free or for the poll interval, whichever comes
     // first. A run settling wakes the loop at once, so the finished ticket's

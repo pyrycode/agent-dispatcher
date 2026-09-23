@@ -109,6 +109,10 @@ Optional:
 | `PYRY_REAL_CLAUDE_GATE_TIMEOUT_MS` | `1800000` | Outer wall clock for one gate run. Must exceed the command's own inner timeout. |
 | `PYRY_REAL_CLAUDE_GATE_MIN_EXECUTED` | `1` | Floor for the executed-test guard. Set near the suite's real count. |
 | `PYRY_REAL_CLAUDE_GATE_BASELINE_CMD` | — | Base-commit re-run template with a `{{TESTS}}` placeholder. Runs only when the branch has named failures, so it costs seconds. Unset means failures are attributed to the branch. |
+| `PYRY_MAIN_SWEEP_CMD` | — | Main sweep: an in-depth command, too slow for every verifier pass, run against main when the board is idle or every `PYRY_MAIN_SWEEP_EVERY` merges. Runs inline, never beside a verifier. A failure files one Backlog ticket. **Empty disables it.** State in `logs/main-sweep-state.json`. |
+| `PYRY_MAIN_SWEEP_EVERY` | `5` | Merges since the last sweep that force one while the board is busy. |
+| `PYRY_MAIN_SWEEP_TIMEOUT_MS` | `1800000` | Outer wall clock for one sweep. |
+| `PYRY_MAIN_SWEEP_FORMAT` | — | Optional `go-json`, `playwright-json` or `junit-xml`, to name the failing tests in the ticket. Without it the exit code alone judges the run. |
 
 > **Load order.** `dotenv` now loads the fork's `.env` before any module-top constant reads `process.env`, so every variable in this table works from the file. Before 2026-08-07 the load sat below several of those reads, and `TARGET_REPO_PATH`, `TARGET_DEFAULT_BRANCH`, `SALVAGE_GATES` and `PYRY_AUTOCURATE_MEMORY` were silently file-blind — each fork's launcher pre-exported `TARGET_REPO_PATH` to work around it. Values a launcher exports, or that `op run --env-file` injects, still take precedence over the file.
 
