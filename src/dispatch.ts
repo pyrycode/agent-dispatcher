@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { config } from "dotenv";
 import { DispatchPool, candidateKey, excludeInFlight, freeSeats, resolvePollIntervalMs } from "./dispatch-pool.js";
 import { countVerdictsSince, parseVerdictArtifacts, pickVerdictPr, shouldFlagMissingVerdict } from "./verdict-guard.js";
+import { resolveImportOnlyMerge } from "./merge-resolve.js";
 
 import { buildCodexInvocation, codexChildEnv, CODEX_ROLE_GUIDANCE, CodexStreamAdapter, formatRunCost, resumeCommand, resolveAgentRunner, type AgentRunner } from "./agent-runner.js";
 
@@ -2372,11 +2373,28 @@ export async function setupBranchAndWorktree(
     return { ok: false };
   }
 
-  // Merge default branch into the feature branch INSIDE the worktree (not in the main repo)
+  // Merge default branch into the feature branch INSIDE the worktree (not in the main repo).
+  // diff3 markers carry the common ancestor, which is how an import-only
+  // conflict is told apart from one that needs a human (see merge-resolve.ts).
   try {
-    execSync(`git merge ${defaultBranch} --no-edit`, { cwd: worktreeDir, stdio: "pipe" });
+    execSync(`git -c merge.conflictStyle=diff3 merge ${defaultBranch} --no-edit`, { cwd: worktreeDir, stdio: "pipe" });
     console.log(`   🔀 Merged ${defaultBranch} into ${branchName} (in worktree)`);
   } catch (e) {
+    const resolvedPaths = resolveImportOnlyMerge(worktreeDir, ctx.deps);
+    if (resolvedPaths !== null) {
+      console.log(`   🔀 Merged ${defaultBranch} into ${branchName} (in worktree), keeping both sides' imports in ${resolvedPaths.length} file(s)`);
+      try {
+        await client.addComment(
+          item.issueNumber,
+          `## 🔀 Import-only merge conflict resolved\n\n` +
+          `Merging \`${defaultBranch}\` into \`${branchName}\` before the ${agent.name} run conflicted only where both sides added import lines at the same spot. ` +
+          `The dispatcher kept both sets, in sorted order, and committed the merge:\n\n` +
+          resolvedPaths.map(p => `- \`${p}\``).join("\n") +
+          `\n\nAny other conflict still stops here for a human.`,
+        );
+      } catch {}
+      return { ok: true };
+    }
     try { execSync(`git merge --abort`, { cwd: worktreeDir, stdio: "pipe" }); } catch {}
     console.error(`   ❌ Merge conflict merging ${defaultBranch} into ${branchName}: ${e}`);
     await client.addComment(item.issueNumber, `## ⚠️ Dispatch Error: ${agent.name}\n\nMerge conflict on branch \`${branchName}\` when merging \`${defaultBranch}\`. Manual resolution required.\n\n\`\`\`\n${e}\n\`\`\``);
