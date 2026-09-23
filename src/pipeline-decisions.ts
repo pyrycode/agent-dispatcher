@@ -1899,7 +1899,10 @@ export function isMergeConflictError(stderr: string | null | undefined): boolean
     s.includes("merge commit cannot be cleanly created") ||
     s.includes("merge conflict") ||
     // `gh pr update-branch --rebase`, the Step 1.5 path.
-    s.includes("due to conflicts")
+    s.includes("due to conflicts") ||
+    // Verbatim from `gh pr update-branch --rebase` (2026-09-23):
+    // "GraphQL: rebase conflict between base and head (updatePullRequestBranch)".
+    s.includes("rebase conflict")
   );
 }
 

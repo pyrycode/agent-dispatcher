@@ -433,6 +433,13 @@ describe("isMergeConflictError", () => {
     );
   });
 
+  test("matches gh pr update-branch --rebase's refusal verbatim (2026-09-23)", () => {
+    assert.equal(
+      isMergeConflictError("GraphQL: rebase conflict between base and head (updatePullRequestBranch)"),
+      true,
+    );
+  });
+
   test("matches the lowercase 'merge conflict' phrase (older gh / alt tooling)", () => {
     assert.equal(isMergeConflictError("error: merge conflict in foo.go"), true);
   });

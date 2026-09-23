@@ -280,6 +280,7 @@ export class GitHubProjectClient {
                         number
                         parent { number }
                       }
+                      subIssuesSummary { total completed }
                     }
                   }
                 }
@@ -324,6 +325,9 @@ export class GitHubProjectClient {
             state: b.state,
           })),
           ...mapParentChain(node.content),
+          ...(node.content.subIssuesSummary
+            ? { subIssues: { total: node.content.subIssuesSummary.total, completed: node.content.subIssuesSummary.completed } }
+            : {}),
         });
       }
 
@@ -462,6 +466,25 @@ export class GitHubProjectClient {
 
     if (!response.ok) {
       throw new Error(`Failed to add comment: ${response.statusText}`);
+    }
+  }
+
+  /** Close an issue as completed. Used by `runParentClose`. */
+  async closeIssue(issueNumber: number): Promise<void> {
+    const response = await fetchWithRetry(
+      `https://api.github.com/repos/${this.config.owner}/${this.config.repo}/issues/${issueNumber}`,
+      {
+        method: "PATCH",
+        headers: {
+          Authorization: `token ${this.config.token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ state: "closed", state_reason: "completed" }),
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error(`Failed to close issue: ${response.statusText}`);
     }
   }
 

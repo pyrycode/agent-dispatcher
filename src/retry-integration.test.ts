@@ -54,6 +54,7 @@ class FakeClient implements DispatchClient {
   async getStrandedWipMarkers() { return { observedAt: null, sweptAt: null }; }
   clearItemsCache() { /* no-op */ }
   async updateItemStatus() { /* no-op */ }
+  async closeIssue() { /* no-op */ }
   async getLatestRetryAt(issueNumber: number) {
     this.getLatestRetryAtCalls.push(issueNumber);
     if (this.failRetryAt) throw this.failRetryAt;
