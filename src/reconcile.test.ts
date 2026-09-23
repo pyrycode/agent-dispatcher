@@ -417,6 +417,43 @@ describe("runReworkRouting — cache invalidation", () => {
       assert.equal(client.addCommentCalls.length, 1);
     });
   });
+
+  test("a merge handoff moves the ticket to the owner without counting, even at the loop threshold", async () => {
+    // pyrycode-mobile #808, 2026-09-23: documentation's merge of main hit
+    // #805's line and sent the ticket back to the builder (merge-handoff.ts).
+    await withStageSet("builder", async () => {
+      const item = makeItem({
+        id: "item-808",
+        issueNumber: 808,
+        status: "In Documentation",
+        labels: ["done:verifier", "rework-count:3", "merge-handoff", "needs-rework:builder"],
+      });
+      const client = new MockClient([item]);
+
+      await runReworkRouting(client);
+
+      assert.deepEqual(client.updateItemStatusCalls.map(c => c.newStatus), ["In Development"]);
+      assert.deepEqual(client.addLabelCalls, [], "no counter bump, no error:rework-loop");
+      assert.deepEqual(item.labels, ["rework-count:3"], "trigger, marker and done:verifier stripped; counter untouched");
+      assert.equal(client.clearItemsCacheCalls, 1);
+    });
+  });
+
+  test("the same rework without the marker still counts", async () => {
+    await withStageSet("builder", async () => {
+      const item = makeItem({
+        id: "item-809",
+        issueNumber: 809,
+        status: "In Code Review",
+        labels: ["done:verifier", "rework-count:1", "needs-rework:builder"],
+      });
+      const client = new MockClient([item]);
+
+      await runReworkRouting(client);
+
+      assert.deepEqual(client.addLabelCalls, [{ issueNumber: 809, label: "rework-count:2" }]);
+    });
+  });
 });
 
 describe("runRealClaudeGate — parks gated tickets in Inbox", () => {

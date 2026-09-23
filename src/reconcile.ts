@@ -255,7 +255,7 @@ export async function runReworkRouting(client: ReconcileClient): Promise<void> {
     // attention. Catches the recursive-rework class of failure
     // (Pyrycode #41 hit 6 dev↔architect rounds before the dev agent
     // self-halted by intelligence — this makes the halt structural).
-    if (currentCount >= REWORK_LOOP_THRESHOLD) {
+    if (!route.mergeHandoff && currentCount >= REWORK_LOOP_THRESHOLD) {
       // The rework-loop comment + label only need to fire ONCE — once
       // `error:rework-loop` is on the ticket, the dispatcher's own
       // GLOBAL_BLOCK_LABELS gates further dispatch. But the trigger
@@ -297,6 +297,16 @@ export async function runReworkRouting(client: ReconcileClient): Promise<void> {
       // chain could leave duplicates (rework-count:1 + rework-count:2).
       // Stripping only the max would leave stragglers. Idempotent strip
       // of every rework-count:* label keeps the state clean. (review #19)
+      mutated = true;
+      const transition = route.fromColumn === route.toColumn
+        ? `cleared at ${route.toColumn}`
+        : `moved ${route.fromColumn} → ${route.toColumn}`;
+      // A merge handoff is not a rework (see decideReworkRoutes): the
+      // counter stays where it is.
+      if (route.mergeHandoff) {
+        console.log(`   🔀 Merge handoff: #${route.issueNumber} ${transition} (${route.triggerLabel}, no rework counted)`);
+        continue;
+      }
       const srcLabels = srcItem?.labels ?? [];
       for (const label of srcLabels) {
         if (label.startsWith("rework-count:")) {
@@ -304,10 +314,6 @@ export async function runReworkRouting(client: ReconcileClient): Promise<void> {
         }
       }
       try { await client.addLabel(route.issueNumber, `rework-count:${currentCount + 1}`); } catch {}
-      mutated = true;
-      const transition = route.fromColumn === route.toColumn
-        ? `cleared at ${route.toColumn}`
-        : `moved ${route.fromColumn} → ${route.toColumn}`;
       console.log(`   ↩️  Rework: #${route.issueNumber} ${transition} (${route.triggerLabel}, count ${currentCount + 1}/${REWORK_LOOP_THRESHOLD})`);
     } catch (e) {
       console.warn(`   ⚠️  Failed to route rework for #${route.issueNumber}: ${e}`);

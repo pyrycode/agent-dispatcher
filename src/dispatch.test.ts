@@ -959,25 +959,99 @@ describe("setupBranchAndWorktree — failure modes", () => {
     assert.ok(!calls.exec.slice(addIdx + 1).some(c => c.cmd.includes("git worktree remove")), "a resolved merge keeps its worktree");
   });
 
-  test("code conflict → nothing written, merge aborted, label + comment + {ok:false} as before", async () => {
-    const { ctx, client, calls, path } = conflictContext(105, [
-      "<<<<<<< HEAD",
-      "val x = 1",
-      "||||||| base",
-      "val x = 0",
-      "=======",
-      "val x = 2",
-      ">>>>>>> main",
-      "",
-    ].join("\n"));
+  // Anything past import-only goes to the code owner (merge-handoff.ts).
+  // The stopped merge is readable: two conflicted-file lines are enough.
+  const CODE_CONFLICT = [
+    "<<<<<<< HEAD",
+    "val x = 1",
+    "||||||| base",
+    "val x = 0",
+    "=======",
+    "val x = 2",
+    ">>>>>>> main",
+    "",
+  ].join("\n");
+  function codeConflictContext(issueNumber: number, agent: Partial<AgentConfig>) {
+    const probe = makeTestContext({ item: { issueNumber }, agent });
+    const path = resolve(probe.ctx.worktreeDir, "Thread.kt");
+    const made = makeTestContext({
+      item: { issueNumber },
+      agent,
+      mockOptions: {
+        execImpls: {
+          ...happyExecBaseline(),
+          [`git rev-parse --verify feature/${issueNumber}`]: () => execError({ stderr: "fatal" }),
+          [`git rev-parse --verify origin/feature/${issueNumber}`]: () => execError({ stderr: "fatal" }),
+          "merge main --no-edit": () => execError({ stderr: "CONFLICT (content): Merge conflict in Thread.kt" }),
+          "git diff --name-only --diff-filter=U -z": () => "Thread.kt\0",
+          "git rev-parse MERGE_HEAD": () => "mainsha\n",
+          "git merge-base HEAD MERGE_HEAD": () => "basesha\n",
+        },
+        fsMap: { [path]: CODE_CONFLICT },
+      },
+    });
+    return { ...made, path };
+  }
+
+  test("code conflict before the code owner's run → merge left in the worktree for it, comment, {ok:true}", async () => {
+    const { ctx, client, calls, path } = codeConflictContext(105, {});
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: true });
+    assert.deepEqual(client.addLabelCalls, []);
+    assert.match(client.comments[0]!.body, /Merge conflict left for developer/);
+    assert.match(client.comments[0]!.body, /`Thread\.kt`/);
+    assert.deepEqual(ctx.pendingMerge, { paths: ["Thread.kt"], mainSha: "mainsha", baseSha: "basesha" });
+    assert.ok(!calls.fs.some(f => f.kind === "write" && f.path === path), "the dispatcher resolves nothing itself");
+    assert.ok(!calls.exec.some(c => c.cmd.includes("git merge --abort")), "the merge stays for the agent");
+    assert.ok(!calls.exec.some(c => c.cmd.includes("git commit")));
+  });
+
+  test("code conflict before a later stage → aborted, sent to the owner as an uncounted handoff, {ok:false}", async () => {
+    // pyrycode-mobile #808, 2026-09-23: documentation's merge hit #805's line.
+    const { ctx, client, calls } = codeConflictContext(106, {
+      name: "documentation", column: "In Documentation", claudeMdPath: "documentation/CLAUDE.md",
+    });
 
     const result = await setupBranchAndWorktree(ctx);
 
     assert.deepEqual(result, { ok: false });
-    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 105, label: "error:developer" }]);
+    assert.deepEqual(client.addLabelCalls, [
+      { issueNumber: 106, label: "merge-handoff" },
+      { issueNumber: 106, label: "needs-rework:developer" },
+    ]);
+    assert.match(client.comments[0]!.body, /Merge conflict sent to developer/);
+    assert.match(client.comments[0]!.body, /does not count as a rework/);
+    assert.equal(ctx.pendingMerge, undefined);
+    assert.ok(calls.exec.some(c => c.cmd.includes("git merge --abort")));
+    const addIdx = calls.exec.findIndex(c => c.cmd.includes("git worktree add"));
+    assert.ok(calls.exec.slice(addIdx + 1).some(c => c.cmd.includes("git worktree remove")), "the routed stage cleans up its worktree");
+  });
+
+  test("code conflict before an earlier stage → parks for a human as before", async () => {
+    const { ctx, client, calls, path } = codeConflictContext(107, {
+      name: "architect", column: "In Architecture", claudeMdPath: "architect/CLAUDE.md",
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: false });
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 107, label: "error:architect" }]);
     assert.match(client.comments[0]!.body, /Merge conflict on branch/);
     assert.ok(!calls.fs.some(f => f.kind === "write" && f.path === path), "nothing may be written for an unresolvable conflict");
     assert.ok(!calls.exec.some(c => c.cmd.includes("git commit")));
+    assert.ok(calls.exec.some(c => c.cmd.includes("git merge --abort")));
+  });
+
+  test("the owner's stopped merge cannot be read → parks rather than hand over blind", async () => {
+    const { ctx, client, calls } = conflictContext(108, CODE_CONFLICT);
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: false });
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 108, label: "error:developer" }]);
+    assert.equal(ctx.pendingMerge, undefined);
     assert.ok(calls.exec.some(c => c.cmd.includes("git merge --abort")));
   });
 });
@@ -6951,4 +7025,87 @@ describe("runPendingDoneFinalize", () => {
     assert.equal(client.removeLabelCalls.length, 0);
     assert.equal(client.clearItemsCacheCalls, 0);
   }));
+});
+
+// =====================================================================
+// Merge handoff: the code owner's run finishes a merge of main
+// =====================================================================
+//
+// setupBranchAndWorktree leaves a conflicted merge for the code owner and
+// records it on the context (merge-handoff.ts). What the run does with it is
+// checked before the safety-net commit and the push; a run that errors is
+// never salvaged, since salvage would push whatever markers it left.
+describe("merge handoff — the owner's run", () => {
+  const pendingMerge = { paths: ["Thread.kt"], mainSha: "mainsha", baseSha: "basesha" };
+
+  test("merge still in progress → error:<agent>, comment, no commit, no push, {ok:false}", async () => {
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 808 },
+      mockOptions: { execImpls: { "git rev-parse -q --verify MERGE_HEAD": () => "mainsha\n" } },
+    });
+    ctx.pendingMerge = pendingMerge;
+
+    const result = await handlePostRun(STREAM_OK(), ctx, false);
+
+    assert.deepEqual(result, { ok: false });
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 808, label: "error:developer" }]);
+    assert.match(client.comments[0]!.body, /never committed/);
+    assert.match(client.comments[0]!.body, /Nothing was pushed/);
+    assert.ok(!calls.exec.some(c => c.cmd.includes("git add -A")), "the safety-net commit must not seal a half-finished merge");
+    assert.ok(!calls.exec.some(c => c.cmd.includes("git push")));
+  });
+
+  test("main's added line dropped → names it, no push, {ok:false}", async () => {
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 808 },
+      mockOptions: {
+        execImpls: {
+          "git rev-parse -q --verify MERGE_HEAD": () => execError({ status: 1 }),
+          "git show HEAD:": () => "Overlay {\n  Status(usage = usage)\n}\n",
+          "git diff -U0 basesha mainsha": () => "+++ b/Thread.kt\n+    turnOutcome = turnOutcome,\n",
+        },
+      },
+    });
+    ctx.pendingMerge = pendingMerge;
+
+    const result = await handlePostRun(STREAM_OK(), ctx, false);
+
+    assert.deepEqual(result, { ok: false });
+    assert.match(client.comments[0]!.body, /lost 1 line\(s\) main added: `turnOutcome = turnOutcome,`/);
+    assert.ok(!calls.exec.some(c => c.cmd.includes("git push")));
+  });
+
+  test("clean resolution → passes the check and pushes as usual", async () => {
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 808 },
+      mockOptions: {
+        execImpls: {
+          "git rev-parse -q --verify MERGE_HEAD": () => execError({ status: 1 }),
+          "git show HEAD:": () => "Overlay {\n  Status(\n      turnOutcome = turnOutcome,\n  )\n}\n",
+          "git diff -U0 basesha mainsha": () => "+++ b/Thread.kt\n+    turnOutcome = turnOutcome,\n",
+          "git status --porcelain": () => "",
+          "git rev-list --count main..": () => "3\n",
+        },
+      },
+    });
+    ctx.pendingMerge = pendingMerge;
+
+    const result = await handlePostRun(STREAM_OK(), ctx, false);
+
+    assert.deepEqual(result, { ok: true });
+    assert.ok(!client.addLabelCalls.some(c => c.label.startsWith("error:")));
+    assert.ok(calls.exec.some(c => c.cmd.includes("git push -u origin feature/808")));
+  });
+
+  test("a run that errors mid-merge is never salvaged", async () => {
+    const { ctx, client, calls } = makeTestContext({ item: { issueNumber: 808 } });
+    ctx.pendingMerge = pendingMerge;
+
+    await assert.rejects(
+      handleAgentResultErrors(streamResult({ isError: true, terminalReason: "max_turns" }), ctx),
+      /not salvaged/,
+    );
+    assert.ok(!calls.exec.some(c => c.cmd.includes("git add -A") || c.cmd.includes("git push")));
+    assert.ok(!client.addLabelCalls.some(c => c.label === "error:max_turns_salvaged"));
+  });
 });
