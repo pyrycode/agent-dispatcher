@@ -89,6 +89,15 @@ import { AGENTS } from "./types.js";
 import { ResourceExhaustedError, timeoutFor } from "./agent-runtime.js";
 import { resolveAgentsRepoRoot, resolveTargetRepoRoot } from "./worktree.js";
 
+// Importing dispatch.ts loads the fork's .env, so a fork running this suite
+// from its installed copy (bin/pyry-test) handed the tests its own stage set
+// and budget scale. Mobile's builder set and 1.5 scale failed nine tests on
+// 2026-09-23. The suite runs on the defaults; tests that care pin their own
+// with withStageSet or by setting the variable.
+delete process.env.PYRY_STAGE_SET;
+delete process.env.PYRY_BUDGET_SCALE;
+resetActiveStageSetForTests();
+
 // Recompute agentsRepoRoot the same way dispatch.ts does so test
 // fsMaps can use the absolute paths the production code resolves.
 const TEST_AGENTS_REPO_ROOT = resolveAgentsRepoRoot(dirname(fileURLToPath(import.meta.url)));
