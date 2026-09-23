@@ -696,7 +696,7 @@ describe("dispatch test harness", () => {
 //
 // 12 tests: 5 failure modes + 6 decisions from `decideBranchSetup` +
 // orphan-worktree cleanup + codegraph soft-fails + the no-worktree
-// (PO/issue-0) path. Mock granularity is per-execSync-substring so a
+// (PO/issue-0) path. Plus the import-only merge-conflict pair. Mock granularity is per-execSync-substring so a
 // test can flip "fast-forward" to "abort" by adjusting one handler.
 //
 // **Invariant under test (the load-bearing one):** every failure path
@@ -883,7 +883,7 @@ describe("setupBranchAndWorktree — failure modes", () => {
           "git rev-parse --verify feature/103": () => execError({ stderr: "fatal" }),
           "git rev-parse --verify origin/feature/103": () => execError({ stderr: "fatal" }),
           // worktree creation succeeds, but the post-create merge fails.
-          "git merge main --no-edit": () => execError({ stderr: "CONFLICT (content): Merge conflict in foo.go" }),
+          "merge main --no-edit": () => execError({ stderr: "CONFLICT (content): Merge conflict in foo.go" }),
         },
       },
     });
@@ -905,6 +905,80 @@ describe("setupBranchAndWorktree — failure modes", () => {
     const addIdx = calls.exec.findIndex(c => c.cmd.includes("git worktree add"));
     const removeAfterAdd = calls.exec.slice(addIdx + 1).some(c => c.cmd.includes("git worktree remove"));
     assert.ok(removeAfterAdd, "merge-conflict path must clean up its own worktree after creating it");
+  });
+
+  // Mobile #803 / #823 (2026-09-22) parked on conflicts where both sides
+  // had only added an import at the same slot. merge-resolve.ts settles
+  // that shape; everything else keeps the park-for-a-human path above.
+  function conflictContext(issueNumber: number, conflicted: string) {
+    const probe = makeTestContext({ item: { issueNumber } });
+    const path = resolve(probe.ctx.worktreeDir, "Thread.kt");
+    const made = makeTestContext({
+      item: { issueNumber },
+      mockOptions: {
+        execImpls: {
+          ...happyExecBaseline(),
+          [`git rev-parse --verify feature/${issueNumber}`]: () => execError({ stderr: "fatal" }),
+          [`git rev-parse --verify origin/feature/${issueNumber}`]: () => execError({ stderr: "fatal" }),
+          "merge main --no-edit": () => execError({ stderr: "CONFLICT (content): Merge conflict in Thread.kt" }),
+          "git diff --name-only --diff-filter=U -z": () => "Thread.kt\0",
+        },
+        fsMap: { [path]: conflicted },
+      },
+    });
+    return { ...made, path };
+  }
+
+  test("import-only merge conflict → resolved and committed in the worktree, comment, no error label, {ok:true}", async () => {
+    const { ctx, client, calls, path } = conflictContext(104, [
+      "import a.A",
+      "<<<<<<< HEAD",
+      "import a.Feature",
+      "||||||| base",
+      "=======",
+      "import a.Main",
+      ">>>>>>> main",
+      "",
+    ].join("\n"));
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: true });
+    assert.deepEqual(client.addLabelCalls, []);
+    assert.match(client.comments[0]!.body, /Import-only merge conflict resolved/);
+    assert.match(client.comments[0]!.body, /`Thread\.kt`/);
+    assert.deepEqual(
+      calls.fs.filter(f => f.kind === "write" && f.path === path).map(f => f.content),
+      ["import a.A\nimport a.Feature\nimport a.Main\n"],
+    );
+    assert.ok(calls.exec.some(c => c.cmd.includes("merge.conflictStyle=diff3")), "merge must write diff3 markers");
+    assert.ok(calls.exec.some(c => c.cmd === "git add -- 'Thread.kt'"));
+    assert.ok(calls.exec.some(c => c.cmd === "git commit --no-edit"));
+    assert.ok(!calls.exec.some(c => c.cmd.includes("git merge --abort")), "a resolved merge must not be aborted");
+    const addIdx = calls.exec.findIndex(c => c.cmd.includes("git worktree add"));
+    assert.ok(!calls.exec.slice(addIdx + 1).some(c => c.cmd.includes("git worktree remove")), "a resolved merge keeps its worktree");
+  });
+
+  test("code conflict → nothing written, merge aborted, label + comment + {ok:false} as before", async () => {
+    const { ctx, client, calls, path } = conflictContext(105, [
+      "<<<<<<< HEAD",
+      "val x = 1",
+      "||||||| base",
+      "val x = 0",
+      "=======",
+      "val x = 2",
+      ">>>>>>> main",
+      "",
+    ].join("\n"));
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: false });
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 105, label: "error:developer" }]);
+    assert.match(client.comments[0]!.body, /Merge conflict on branch/);
+    assert.ok(!calls.fs.some(f => f.kind === "write" && f.path === path), "nothing may be written for an unresolvable conflict");
+    assert.ok(!calls.exec.some(c => c.cmd.includes("git commit")));
+    assert.ok(calls.exec.some(c => c.cmd.includes("git merge --abort")));
   });
 });
 
