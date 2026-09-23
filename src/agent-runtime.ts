@@ -78,8 +78,34 @@ export function shouldUseWorktree(agent: AgentConfig): boolean {
  * 85-90, the cap is still binding and per-size differentiation finally
  * earns its keep. If runs land at 50-75, the bump was right and the
  * 2026-05-19 doc/PR-body trim accounts for the rest of the headroom.
+ *
+ * Every tier is multiplied by `PYRY_BUDGET_SCALE` (see `parseBudgetScale`).
  */
 export function maxTurnsFor(agent: AgentConfig): number {
+  const scaled = baseMaxTurns(agent) * parseBudgetScale(process.env.PYRY_BUDGET_SCALE);
+  return Math.max(1, Math.round(scaled));
+}
+
+/**
+ * Per-fork multiplier on every agent's turn and wall-clock budget, from
+ * `PYRY_BUDGET_SCALE`. Unset, empty, non-numeric, zero or negative → 1, so
+ * a fork that does not set it keeps the budgets in `maxTurnsFor` and
+ * `timeoutFor` byte-for-byte.
+ *
+ * Added 2026-09-23 for pyrycode-mobile, which runs Opus 5.5 and raised its
+ * ticket ceiling from 800 to 1600 lines. The first 50 Opus 5.5 builder runs
+ * there peaked at a third of the builder's turns and time, so the budgets
+ * were not binding; the scale keeps the same headroom ratio as tickets grow.
+ * A multiplier rather than per-agent values keeps the relative ratios
+ * between roles, the same reasoning as the flat +50% of 2026-06-06.
+ */
+export function parseBudgetScale(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return 1;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : 1;
+}
+
+function baseMaxTurns(agent: AgentConfig): number {
   // Config-carried override first: stage-set agents (stage-sets.ts) whose
   // budgets don't map onto the classic names declare them inline (the
   // builder set's builder=200 / verifier=150). No classic agent sets the
@@ -119,8 +145,16 @@ export function maxTurnsFor(agent: AgentConfig): number {
  *
  * `labels` is the ticket's current label set; callers without labels in
  * scope can omit it (defaults to none → base tiers only).
+ *
+ * Every tier is multiplied by `PYRY_BUDGET_SCALE` and rounded to whole
+ * minutes, so the "Timeout: Nmin" label stays whole.
  */
 export function timeoutFor(agent: AgentConfig, labels: string[] = []): number {
+  const scaled = baseTimeout(agent, labels) * parseBudgetScale(process.env.PYRY_BUDGET_SCALE);
+  return Math.max(60_000, Math.round(scaled / 60_000) * 60_000);
+}
+
+function baseTimeout(agent: AgentConfig, labels: string[]): number {
   // Config-carried override first (flat — the label-conditional bump below
   // applies only to the name-keyed path). Used by the builder stage set's
   // builder + verifier (both 40min); no classic agent sets the field.
