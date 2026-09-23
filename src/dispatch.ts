@@ -5683,6 +5683,9 @@ export async function pollLoop(): Promise<void> {
     token: process.env.GITHUB_TOKEN!,
     ownerType: "organization",
   });
+  // GitHub's board listing can lag its issues (2026-09-23 incident); the
+  // client then reads columns from the issues and says so here, once.
+  client.setListingGapHandler((message) => { void notifyDiscord(message); });
 
   await client.initialize();
 

@@ -118,6 +118,131 @@ export function mapParentChain(
   return { parentNumber, grandparentNumber };
 }
 
+// The issue fields every board read selects. Shared by the board listing and
+// the open-issue read below so the two produce identical items.
+const ISSUE_FIELDS = `
+                      id
+                      number
+                      title
+                      body
+                      url
+                      state
+                      labels(first: 10) {
+                        nodes { name }
+                      }
+                      blockedBy(first: 10) {
+                        nodes { number state }
+                      }
+                      parent {
+                        number
+                        parent { number }
+                      }
+                      subIssuesSummary { total completed }`;
+
+/** Map one board item's id, Status name and Issue content onto a cache item. */
+function toRawItem(itemId: string, status: string | null | undefined, content: any): RawItem {
+  return {
+    id: itemId,
+    issueId: content.id,
+    issueNumber: content.number,
+    title: content.title,
+    body: content.body ?? "",
+    status: status ?? "no-status",
+    state: content.state ?? null,
+    labels: content.labels.nodes.map((l: any) => l.name),
+    url: content.url,
+    blockedBy: (content.blockedBy?.nodes ?? []).map((b: any) => ({
+      number: b.number,
+      state: b.state,
+    })),
+    ...mapParentChain(content),
+    ...(content.subIssuesSummary
+      ? { subIssues: { total: content.subIssuesSummary.total, completed: content.subIssuesSummary.completed } }
+      : {}),
+  };
+}
+
+/** Where the board listing and the open-issue read disagreed in one fetch. */
+export interface ListingGaps {
+  /** Open issues on the board that the listing did not return at all. */
+  missing: number[];
+  /** Open issues the listing placed in a different column than the issue itself reports. */
+  moved: { issueNumber: number; listed: string; actual: string }[];
+}
+
+/**
+ * Combine the board listing with the open-issue read.
+ *
+ * The board listing (`ProjectV2.items`) is the only source of column
+ * ORDER, which is the operator's priority signal, but GitHub serves it
+ * from a search index that can lag. During GitHub's 2026-09-23 incident
+ * ("stale Project search results") it left out every card added for
+ * hours, so the dispatcher could not see new tickets at all. The
+ * open-issue read (`Repository.issues` with each issue's own board item)
+ * is current.
+ *
+ * So: every open issue the read returns replaces its listing entry in
+ * place, keeping the listing's position but taking the read's column,
+ * labels and blockers. Open issues the listing lacks go after every
+ * listed item, lowest number first, which puts each at the bottom of its
+ * column. Listing items the read does not cover (closed issues, other
+ * repositories' issues) pass through unchanged. When the listing is
+ * healthy the result is the listing, and both gap lists are empty.
+ */
+export function mergeListingWithOpenIssues<T extends { issueNumber: number; status: string }>(
+  listing: readonly T[],
+  openIssues: readonly T[],
+): { items: T[]; gaps: ListingGaps } {
+  const fresh = new Map(openIssues.map((i) => [i.issueNumber, i] as const));
+  const listed = new Set<number>();
+  const moved: ListingGaps["moved"] = [];
+  const items = listing.map((item) => {
+    const current = fresh.get(item.issueNumber);
+    if (!current) return item;
+    listed.add(item.issueNumber);
+    if (current.status !== item.status) {
+      moved.push({ issueNumber: item.issueNumber, listed: item.status, actual: current.status });
+    }
+    return current;
+  });
+  const unlisted = openIssues
+    .filter((i) => !listed.has(i.issueNumber))
+    .sort((a, b) => a.issueNumber - b.issueNumber);
+  return {
+    items: [...items, ...unlisted],
+    gaps: { missing: unlisted.map((i) => i.issueNumber), moved },
+  };
+}
+
+/**
+ * Edge-triggered report of a stale board listing: one warning and one
+ * notification when gaps first appear, a short line each cycle while they
+ * last, and one line when the listing catches up. Pure; the caller holds
+ * `active` between fetches.
+ */
+export function decideListingGapReport(
+  active: boolean,
+  gaps: ListingGaps,
+  repo: string,
+): { active: boolean; notify?: string; log?: string } {
+  const count = gaps.missing.length + gaps.moved.length;
+  if (count === 0) {
+    return active ? { active: false, log: "   ✅ Board listing caught up with the issues." } : { active: false };
+  }
+  if (active) {
+    return { active: true, log: `   ℹ️  Board listing still stale: ${gaps.missing.length} missing, ${gaps.moved.length} in another column. Using the issues.` };
+  }
+  const list = (nums: number[]) =>
+    nums.slice(0, 10).map((n) => `#${n}`).join(", ") + (nums.length > 10 ? ` and ${nums.length - 10} more` : "");
+  const parts: string[] = [];
+  if (gaps.missing.length > 0) parts.push(`${gaps.missing.length} open ticket(s) missing from it (${list(gaps.missing)})`);
+  if (gaps.moved.length > 0) parts.push(`${gaps.moved.length} shown in the wrong column (${list(gaps.moved.map((m) => m.issueNumber))})`);
+  return {
+    active: true,
+    notify: `⚠️ **${repo}**: GitHub's board listing is stale: ${parts.join("; ")}. The dispatcher is reading columns from the issues instead; new tickets go to the bottom of their column until the listing catches up.`,
+  };
+}
+
 export class GitHubProjectClient {
   private gql: typeof graphql;
   private config: ProjectConfig;
@@ -161,6 +286,10 @@ export class GitHubProjectClient {
    * `remaining` gets dangerously low. Null until the first fetch.
    */
   private lastRateLimit: { remaining: number; resetAt: string; cost: number } | null = null;
+  /** Whether the last fetch found the board listing stale; see `decideListingGapReport`. */
+  private listingGapActive = false;
+  /** Called once when the board listing goes stale, with a message for the operator. */
+  private listingGapHandler: ((message: string) => void) | null = null;
 
   constructor(config: ProjectConfig) {
     this.config = config;
@@ -177,6 +306,11 @@ export class GitHubProjectClient {
    */
   clearItemsCache(): void {
     this.allItemsCache = null;
+  }
+
+  /** Receive a one-off message when the board listing and the issues start to disagree. */
+  setListingGapHandler(handler: (message: string) => void): void {
+    this.listingGapHandler = handler;
   }
 
   /** Latest GraphQL rate-limit state, or null if no successful fetch yet. */
@@ -263,24 +397,7 @@ export class GitHubProjectClient {
                     }
                   }
                   content {
-                    ... on Issue {
-                      id
-                      number
-                      title
-                      body
-                      url
-                      state
-                      labels(first: 10) {
-                        nodes { name }
-                      }
-                      blockedBy(first: 10) {
-                        nodes { number state }
-                      }
-                      parent {
-                        number
-                        parent { number }
-                      }
-                      subIssuesSummary { total completed }
+                    ... on Issue {${ISSUE_FIELDS}
                     }
                   }
                 }
@@ -310,31 +427,87 @@ export class GitHubProjectClient {
         // silently misbehave.
         if (typeof node.content.number !== "number") continue;
 
-        items.push({
-          id: node.id,
-          issueId: node.content.id,
-          issueNumber: node.content.number,
-          title: node.content.title,
-          body: node.content.body ?? "",
-          status: itemStatus ?? "no-status",
-          state: node.content.state ?? null,
-          labels: node.content.labels.nodes.map((l: any) => l.name),
-          url: node.content.url,
-          blockedBy: (node.content.blockedBy?.nodes ?? []).map((b: any) => ({
-            number: b.number,
-            state: b.state,
-          })),
-          ...mapParentChain(node.content),
-          ...(node.content.subIssuesSummary
-            ? { subIssues: { total: node.content.subIssuesSummary.total, completed: node.content.subIssuesSummary.completed } }
-            : {}),
-        });
+        items.push(toRawItem(node.id, itemStatus, node.content));
       }
 
       const pageInfo = result.node.items.pageInfo;
       cursor = pageInfo?.hasNextPage ? pageInfo.endCursor : null;
     } while (cursor !== null);
 
+    const openIssues = await this.fetchOpenIssueItems();
+    if (!openIssues) return items;
+    const { items: merged, gaps } = mergeListingWithOpenIssues(items, openIssues);
+    const report = decideListingGapReport(this.listingGapActive, gaps, this.config.repo);
+    this.listingGapActive = report.active;
+    if (report.log) console.log(report.log);
+    if (report.notify) {
+      console.warn(`   ${report.notify}`);
+      this.listingGapHandler?.(report.notify);
+    }
+    return merged;
+  }
+
+  /**
+   * Every OPEN issue in the configured repository that has an item on
+   * this board, with that item's id and column. Read from the issues
+   * rather than the board listing, so it is current even while GitHub's
+   * project index lags; see `mergeListingWithOpenIssues`. About 2 GraphQL
+   * points a page of 100 open issues. Returns null on any failure, and the
+   * caller falls back to the listing alone, which is the behaviour before
+   * this read existed.
+   */
+  private async fetchOpenIssueItems(): Promise<RawItem[] | null> {
+    const items: RawItem[] = [];
+    let cursor: string | null = null;
+    let pages = 0;
+    try {
+      do {
+        if (pages >= GitHubProjectClient.MAX_PAGES) {
+          throw new Error(`more than ${GitHubProjectClient.MAX_PAGES} pages of open issues`);
+        }
+        const result: any = await this.gql(`
+          query($owner: String!, $repo: String!, $cursor: String) {
+            rateLimit { remaining resetAt cost }
+            repository(owner: $owner, name: $repo) {
+              issues(states: OPEN, first: 100, after: $cursor) {
+                pageInfo { hasNextPage endCursor }
+                nodes {${ISSUE_FIELDS}
+                  projectItems(first: 10) {
+                    nodes {
+                      id
+                      project { id }
+                      fieldValueByName(name: "Status") {
+                        ... on ProjectV2ItemFieldSingleSelectValue {
+                          name
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        `, { owner: this.config.owner, repo: this.config.repo, cursor });
+        pages++;
+        if (result.rateLimit && this.lastRateLimit) {
+          this.lastRateLimit = {
+            remaining: result.rateLimit.remaining,
+            resetAt: result.rateLimit.resetAt,
+            cost: this.lastRateLimit.cost + (result.rateLimit.cost ?? 0),
+          };
+        }
+        for (const issue of result.repository.issues.nodes) {
+          const onBoard = (issue.projectItems?.nodes ?? []).find((pi: any) => pi?.project?.id === this.projectId);
+          if (!onBoard) continue;
+          items.push(toRawItem(onBoard.id, onBoard.fieldValueByName?.name, issue));
+        }
+        const pageInfo = result.repository.issues.pageInfo;
+        cursor = pageInfo?.hasNextPage ? pageInfo.endCursor : null;
+      } while (cursor !== null);
+    } catch (e: any) {
+      console.warn(`   ⚠️  Open-issue read failed, using the board listing alone this cycle: ${e?.message ?? e}`);
+      return null;
+    }
     return items;
   }
 
