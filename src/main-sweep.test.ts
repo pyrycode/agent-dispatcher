@@ -7,6 +7,7 @@ import {
   DEFAULT_MAIN_SWEEP_TIMEOUT_MS,
   buildMainSweepIssue,
   decideMainSweep,
+  holdVerifiersDuringSweep,
   parseMainSweepState,
   resolveMainSweepConfig,
   tailLines,
@@ -16,6 +17,7 @@ import {
 import {
   runMainSweep,
   runMainSweepCycle,
+  startMainSweepCycle,
   type GateRunnerDeps,
   type GateSpawnRequest,
   type MainSweepClient,
@@ -242,7 +244,18 @@ describe("runMainSweepCycle", () => {
       },
     });
     const lastState = () => JSON.parse(written.at(-1) ?? "null");
-    return { cycle, runs, board, written, lastState };
+    // Starts a cycle whose run stays open until `release` is called.
+    let release: (o: MainSweepOutcome) => void = () => {};
+    const start = (idle: boolean) => startMainSweepCycle({
+      config, client, idle, verifierBusy: false, repo: "o/r", repoRoot: "/tmp/repo", defaultBranch: "main",
+      deps: {
+        execSync,
+        readState: () => (opts.state === null || opts.state === undefined ? null : JSON.stringify(opts.state)),
+        writeState: (json) => { written.push(json); },
+        run: (sha) => { runs.push(sha); return new Promise((r) => { release = r; }); },
+      },
+    });
+    return { cycle, start, release: (o: MainSweepOutcome) => release(o), runs, board, written, lastState };
   }
 
   test("off when not configured", async () => {
@@ -296,5 +309,54 @@ describe("runMainSweepCycle", () => {
     const h = harness({ state: { lastSha: A, lastGoodSha: A, openIssue: null }, result: outcome(), createFails: true });
     await h.cycle(true);
     assert.deepEqual(h.lastState(), { lastSha: C, lastGoodSha: A, openIssue: null });
+  });
+
+  test("start returns while the sweep is still running, and records it when it ends", async () => {
+    const h = harness({ state: { lastSha: A, lastGoodSha: A, openIssue: null } });
+    const { decision, finished } = await h.start(true);
+    assert.equal(decision.run, true);
+    assert.notEqual(finished, null);
+    assert.deepEqual(h.runs, [C]);
+    assert.deepEqual(h.written, []);
+    h.release(outcome({ passed: true, exitCode: 0 }));
+    await finished;
+    assert.deepEqual(h.lastState(), { lastSha: C, lastGoodSha: C, openIssue: null });
+  });
+
+  test("start hands back no run when the decision is not to sweep", async () => {
+    const h = harness({ state: { lastSha: A, lastGoodSha: A, openIssue: null }, merges: "4" });
+    const { decision, finished } = await h.start(false);
+    assert.equal(decision.run, false);
+    assert.equal(finished, null);
+    assert.deepEqual(h.runs, []);
+  });
+
+  test("a run that throws still settles the sweep", async () => {
+    const { finished } = await startMainSweepCycle({
+      config, client: {} as any, idle: true, verifierBusy: false, repo: "o/r", repoRoot: "/tmp/repo", defaultBranch: "main",
+      deps: {
+        execSync: ((cmd: string) => cmd === "git rev-parse origin/main" ? Buffer.from(C) : Buffer.from("1")) as any,
+        readState: () => JSON.stringify({ lastSha: A, lastGoodSha: A, openIssue: null }),
+        writeState: () => {},
+        run: async () => { throw new Error("boom"); },
+      },
+    });
+    assert.notEqual(finished, null);
+    await finished; // resolves, never rejects
+  });
+});
+
+describe("holdVerifiersDuringSweep", () => {
+  const c = (name: string) => ({ agent: { name }, item: { issueNumber: 1 } });
+
+  test("drops verifiers while a sweep runs and keeps the other stages", () => {
+    assert.deepEqual(
+      holdVerifiersDuringSweep([c("builder"), c("verifier"), c("documentation")], true).map((x) => x.agent.name),
+      ["builder", "documentation"],
+    );
+  });
+
+  test("keeps everything when no sweep runs", () => {
+    assert.equal(holdVerifiersDuringSweep([c("verifier")], false).length, 1);
   });
 });

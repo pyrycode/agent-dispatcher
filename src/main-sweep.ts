@@ -107,6 +107,17 @@ export function decideMainSweep(input: {
   return { run: false, reason: `${input.mergesSince} of ${input.every} merges since the last sweep` };
 }
 
+/**
+ * While a main sweep runs, no verifier starts: its gates would share the
+ * emulators with the sweep. Every other stage dispatches as usual.
+ */
+export function holdVerifiersDuringSweep<T extends { agent: { name: string } }>(
+  candidates: readonly T[],
+  sweepRunning: boolean,
+): T[] {
+  return sweepRunning ? candidates.filter((c) => c.agent.name !== "verifier") : [...candidates];
+}
+
 export interface MainSweepOutcome {
   passed: boolean;
   exitCode: number | null;

@@ -45,6 +45,7 @@ import { selectDispatches } from "./dispatch-selection.js";
 import {
   buildMainSweepIssue,
   decideMainSweep,
+  holdVerifiersDuringSweep,
   parseMainSweepState,
   resolveMainSweepConfig,
   tailLines,
@@ -4741,26 +4742,24 @@ const DEFAULT_MAIN_SWEEP_CYCLE_DEPS = (config: MainSweepConfig): MainSweepCycleD
 });
 
 /**
- * One cycle's main sweep step: decide, run inline, record, and file a Backlog
- * ticket on failure. Returns the decision for logging and tests.
+ * One cycle's main sweep step: decide, and when the decision is to run, start
+ * the run and hand back a promise for its end. The caller does not await it,
+ * so the poll loop keeps merging Done tickets and dispatching while the suite
+ * runs. `finished` records the result and files a Backlog ticket on failure;
+ * it never rejects. Null when nothing was started.
  *
- * Runs inline in the poll loop on purpose. While it runs no new verifier can
- * launch, and it only starts when none is in flight, so the in-depth run never
- * shares the emulators with a verifier's gates. Builders already in the pool
- * keep running. The cost is a dispatch pause of one sweep, about six minutes
- * for Mobile, at most once per `every` merges or when there is nothing to do.
+ * The emulators stay exclusive through the caller, not through blocking. The
+ * sweep starts only when no verifier is in flight, and while it runs the loop
+ * starts no verifier and holds the live gate (see `pollLoop`). Builders keep
+ * running, as they did when the sweep blocked the loop. Until 2026-09-24 the
+ * sweep ran inline and every merge waited behind it; a mobile sweep beside a
+ * compiling builder took 23 minutes on 2026-09-24 and froze the board.
  */
-export async function runMainSweepCycle(opts: {
-  config: MainSweepConfig | null;
-  client: MainSweepClient;
-  idle: boolean;
-  verifierBusy: boolean;
-  repo: string;
-  repoRoot?: string;
-  defaultBranch?: string;
-  deps?: Partial<MainSweepCycleDeps>;
-}): Promise<MainSweepDecision> {
-  if (opts.config === null) return { run: false, reason: "not configured" };
+export async function startMainSweepCycle(opts: MainSweepCycleOpts): Promise<{
+  decision: MainSweepDecision;
+  finished: Promise<void> | null;
+}> {
+  if (opts.config === null) return { decision: { run: false, reason: "not configured" }, finished: null };
   const config = opts.config;
   const deps: MainSweepCycleDeps = { ...DEFAULT_MAIN_SWEEP_CYCLE_DEPS(config), ...opts.deps };
   const targetRepo = opts.repoRoot ?? repoRoot;
@@ -4783,10 +4782,50 @@ export async function runMainSweepCycle(opts: {
   const decision = decideMainSweep({
     head, lastSha: state.lastSha, mergesSince, every: config.every, idle: opts.idle, verifierBusy: opts.verifierBusy,
   });
-  if (!decision.run || head === null) return decision;
+  if (!decision.run || head === null) return { decision, finished: null };
 
   console.log(`   🔬 Main sweep on ${head.slice(0, 7)}: ${decision.reason}`);
-  const outcome = await deps.run(head);
+  const sha = head;
+  const finished = (async () => {
+    try {
+      await recordMainSweep({ opts, config, deps, git, targetRepo, state, head: sha, outcome: await deps.run(sha) });
+    } catch (e: any) {
+      console.error(`   ❌ Main sweep on ${sha.slice(0, 7)} ended unexpectedly: ${e?.message ?? e}`);
+    }
+  })();
+  return { decision, finished };
+}
+
+interface MainSweepCycleOpts {
+  config: MainSweepConfig | null;
+  client: MainSweepClient;
+  idle: boolean;
+  verifierBusy: boolean;
+  repo: string;
+  repoRoot?: string;
+  defaultBranch?: string;
+  deps?: Partial<MainSweepCycleDeps>;
+}
+
+/** `startMainSweepCycle` awaited to the end. Returns the decision. */
+export async function runMainSweepCycle(opts: MainSweepCycleOpts): Promise<MainSweepDecision> {
+  const { decision, finished } = await startMainSweepCycle(opts);
+  await finished;
+  return decision;
+}
+
+/** Record a finished sweep, and file a Backlog ticket when it failed. */
+async function recordMainSweep(r: {
+  opts: MainSweepCycleOpts;
+  config: MainSweepConfig;
+  deps: MainSweepCycleDeps;
+  git: (args: string) => string;
+  targetRepo: string;
+  state: MainSweepState;
+  head: string;
+  outcome: MainSweepOutcome;
+}): Promise<void> {
+  const { opts, config, deps, git, targetRepo, state, head, outcome } = r;
   const next: MainSweepState = { ...state, lastSha: head };
 
   if (outcome.passed) {
@@ -4794,7 +4833,7 @@ export async function runMainSweepCycle(opts: {
     next.lastGoodSha = head;
     next.openIssue = null;
     deps.writeState(JSON.stringify(next, null, 2) + "\n");
-    return decision;
+    return;
   }
 
   console.warn(
@@ -4830,13 +4869,12 @@ export async function runMainSweepCycle(opts: {
       next.openIssue = issue.number;
       console.warn(`   🎫 Filed #${issue.number} in Backlog for the sweep failure`);
     } catch (e: any) {
-      // Recorded as swept anyway: retrying a six-minute run every cycle to
-      // re-attempt a board write would stall the whole loop.
+      // Recorded as swept anyway: rerunning the whole suite every cycle to
+      // re-attempt a board write would keep the emulators from verifiers.
       console.error(`   ❌ Could not file the sweep failure ticket: ${e?.message ?? e}`);
     }
   }
   deps.writeState(JSON.stringify(next, null, 2) + "\n");
-  return decision;
 }
 
 export async function holdBackoffWaiters(
@@ -6061,6 +6099,10 @@ export async function pollLoop(): Promise<void> {
   // allows an immediate first attempt, which is fine.
   let lastCurationAttemptMs = 0;
 
+  // The main sweep in flight, if any. It runs beside the loop rather than
+  // inside it; see `startMainSweepCycle` for what it holds back meanwhile.
+  let sweepRun: Promise<void> | null = null;
+
   while (true) {
     // Drain check: exit cleanly before starting the next cycle if SIGTERM
     // was received. Placement at top of loop means a cycle that's already
@@ -6070,6 +6112,10 @@ export async function pollLoop(): Promise<void> {
       if (pool.size > 0) {
         console.log(`🚦 Drain: waiting for ${pool.size} in-flight run(s) to finish: ${[...pool.keys()].join(", ")}`);
         await pool.drain();
+      }
+      if (sweepRun !== null) {
+        console.log(`🚦 Drain: waiting for the main sweep to finish`);
+        await sweepRun;
       }
       console.log("✅ Drain complete. Exiting cleanly.");
       break;
@@ -6205,7 +6251,8 @@ export async function pollLoop(): Promise<void> {
       realClaudeGateRunner,
       REAL_CLAUDE_GATE_MIN_EXECUTED,
       notifyDiscord,
-      pool.size,
+      // A running main sweep holds the emulators the same way a run does.
+      pool.size + (sweepRun !== null ? 1 : 0),
       (flaky, ctx) => recordFlakyTests(client, flaky, ctx),
     );
     await runAutoAdvance(client, MAX_CONCURRENT, pool.size);
@@ -6288,7 +6335,7 @@ export async function pollLoop(): Promise<void> {
       rootLabelsByIssue,
       client,
     });
-    const candidates = gateHeld ? [] : excludeInFlight(selected, pool.keys());
+    const candidates = gateHeld ? [] : holdVerifiersDuringSweep(excludeInFlight(selected, pool.keys()), sweepRun !== null);
     dispatched = candidates.length > 0;
 
     // Edge-triggered "board drained" ping: fire once when the board goes from
@@ -6361,18 +6408,23 @@ export async function pollLoop(): Promise<void> {
     // `runAutoMerge` below for testability.
     await runAutoMerge(client);
 
-    // In-depth run against main, inline, never beside a verifier's gates.
-    // After the merge so this cycle's merge counts. See runMainSweepCycle.
-    if (mainSweep !== null) {
+    // In-depth run against main, in the background, never beside a
+    // verifier's gates. After the merge so this cycle's merge counts. See
+    // startMainSweepCycle.
+    if (mainSweep !== null && sweepRun === null) {
       const verifierBusy = [...pool.keys()].some((k) => k.startsWith("verifier#")) ||
         [...itemsByColumn.values()].some((items) => items.some((i) => i.labels.includes("wip:verifier")));
-      await runMainSweepCycle({
+      const { finished } = await startMainSweepCycle({
         config: mainSweep,
         client,
         idle: !dispatched && activeWork === 0 && pool.size === 0,
         verifierBusy,
         repo: `${process.env.GITHUB_OWNER}/${process.env.GITHUB_REPO}`,
       });
+      if (finished !== null) {
+        const run: Promise<void> = finished.finally(() => { if (sweepRun === run) sweepRun = null; });
+        sweepRun = run;
+      }
     }
 
     // Wait for a seat to free or for the poll interval, whichever comes
@@ -6382,9 +6434,15 @@ export async function pollLoop(): Promise<void> {
     // was an unconditional restart after an awaited batch.
     let tick: ReturnType<typeof setTimeout> | undefined;
     const interval = new Promise<void>((r) => { tick = setTimeout(r, POLL_INTERVAL); });
+    // The sweep ending wakes the loop too, so a held verifier or live gate
+    // starts at once.
+    const sweepEnd = sweepRun ?? new Promise<void>(() => {});
     if (pool.size > 0) {
       console.log(`⏰ Waiting up to ${POLL_INTERVAL / 1000}s or for a freed seat (${pool.size} in flight)...`);
-      await Promise.race([interval, pool.anySettled()]);
+      await Promise.race([interval, pool.anySettled(), sweepEnd]);
+    } else if (sweepRun !== null) {
+      console.log(`⏰ Waiting up to ${POLL_INTERVAL / 1000}s or for the main sweep to finish...`);
+      await Promise.race([interval, sweepEnd]);
     } else {
       console.log(`⏰ Sleeping ${POLL_INTERVAL / 1000}s...`);
       await interval;
