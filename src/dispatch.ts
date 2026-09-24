@@ -6137,11 +6137,15 @@ export async function pollLoop(): Promise<void> {
     // minutes of blocking wall clock (308s measured on pyrycode); running it
     // twice per cycle would roughly double cycle time for no gain, because
     // the gate step already selects at most one ticket per call.
-    await runRealClaudeGateExecution(
+    //
+    // HELD while runs are in flight: nothing new is dispatched below, the
+    // pool empties, and the gate runs alone. See the hold in reconcile.ts.
+    const gateHeld = await runRealClaudeGateExecution(
       client,
       realClaudeGateRunner,
       REAL_CLAUDE_GATE_MIN_EXECUTED,
       notifyDiscord,
+      pool.size,
     );
     await runAutoAdvance(client, MAX_CONCURRENT, pool.size);
     await runDoneCleanup(client);
@@ -6223,13 +6227,13 @@ export async function pollLoop(): Promise<void> {
       rootLabelsByIssue,
       client,
     });
-    const candidates = excludeInFlight(selected, pool.keys());
+    const candidates = gateHeld ? [] : excludeInFlight(selected, pool.keys());
     dispatched = candidates.length > 0;
 
     // Edge-triggered "board drained" ping: fire once when the board goes from
     // busy to nothing-left-to-dispatch, so the operator knows the agents are
-    // done or stuck and it's time to look.
-    const drain = decideDrainNotification({ hasCandidates: dispatched, activeWork, armed: sawActiveWork });
+    // done or stuck and it's time to look. A held gate is not a drained board.
+    const drain = decideDrainNotification({ hasCandidates: dispatched || gateHeld, activeWork, armed: sawActiveWork });
     sawActiveWork = drain.armed;
     if (drain.notify) {
       await notifyDiscord(`📭 **${process.env.GITHUB_REPO}**: no tickets left to dispatch. Everything is done, blocked, or parked for review.`);

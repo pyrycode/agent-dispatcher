@@ -444,16 +444,22 @@ export async function runRealClaudeGate(client: ReconcileClient): Promise<void> 
  */
 export type RealClaudeGateRunner = (opts: { issueNumber: number }) => Promise<GateRunReport>;
 
+/**
+ * Returns true when a confirmed candidate is held because agent runs are
+ * still in flight. The caller then dispatches nothing new, so the pool
+ * empties and the gate runs on the first cycle with nothing in flight.
+ */
 export async function runRealClaudeGateExecution(
   client: ReconcileClient,
   runner: RealClaudeGateRunner | null,
   minExecuted: number,
   notifyDiscord: (message: string) => Promise<void>,
-): Promise<void> {
+  inFlight = 0,
+): Promise<boolean> {
   // Off switch. No command configured means this step never touches the
   // board, so the whole feature can land on a live dispatcher before any
   // fork opts in.
-  if (runner === null) return;
+  if (runner === null) return false;
 
   // Same stage-set keys as the park step above.
   const { realClaudeGate } = activeStageSet();
@@ -463,11 +469,11 @@ export async function runRealClaudeGateExecution(
     parked = await client.getItemsByStatus(REAL_CLAUDE_GATE_RUN_FROM_COLUMN);
   } catch (error: any) {
     console.error(`Error scanning ${REAL_CLAUDE_GATE_RUN_FROM_COLUMN} for real-claude gate runs: ${error.message}`);
-    return;
+    return false;
   }
 
   const candidate = decideRealClaudeGateRun(parked, realClaudeGate.reviewDoneLabel);
-  if (candidate === null) return;
+  if (candidate === null) return false;
 
   const snapshot = parked.find(item => item.id === candidate.itemId);
 
@@ -486,7 +492,7 @@ export async function runRealClaudeGateExecution(
     console.warn(
       `   ⚠️  Real-claude gate: could not re-read labels for #${candidate.issueNumber}, skipping this cycle: ${error.message}`,
     );
-    return;
+    return false;
   }
 
   const confirmed = decideRealClaudeGateRun([
@@ -501,7 +507,19 @@ export async function runRealClaudeGateExecution(
     console.log(
       `   🧪 Real-claude gate: #${candidate.issueNumber} no longer eligible on a fresh label read — skipping`,
     );
-    return;
+    return false;
+  }
+
+  // Never beside an agent run. The gate's suite shares the host's CPU and
+  // emulator with whatever is in flight, and a builder running device tests
+  // on the same managed device stretched a mobile gate from 2m50s to 28
+  // minutes on 2026-09-24. Its pairing codes expired mid-run, 23 of 24
+  // methods failed, and the failure was blamed on the branch (mobile #993).
+  if (inFlight > 0) {
+    console.log(
+      `   🧪 Real-claude gate: #${candidate.issueNumber} waits for ${inFlight} in-flight run(s); holding new dispatches`,
+    );
+    return true;
   }
 
   console.log(
@@ -604,7 +622,7 @@ export async function runRealClaudeGateExecution(
       );
     } catch (e) {
       console.warn(`   ⚠️  Failed to post real-claude gate evidence on #${candidate.issueNumber}: ${e}`);
-      if (artifactsPending) return; // Recovery needs the durable evidence pointer.
+      if (artifactsPending) return false; // Recovery needs the durable evidence pointer.
     }
 
     // Mark rework before moving so a failed write cannot forward stale approvals.
@@ -613,7 +631,7 @@ export async function runRealClaudeGateExecution(
         await client.addLabel(candidate.issueNumber, realClaudeGate.failReworkLabel);
       } catch (e) {
         console.warn(`   ⚠️  Failed to mark live artifact handoff for #${candidate.issueNumber}: ${e}`);
-        return;
+        return false;
       }
     }
     if (outcome.toColumn !== null) {
@@ -655,4 +673,5 @@ export async function runRealClaudeGateExecution(
     // nothing has invalidated the cache by outliving it.
     client.clearItemsCache();
   }
+  return false;
 }
