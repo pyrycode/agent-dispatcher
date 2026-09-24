@@ -627,6 +627,52 @@ describe("runRealClaudeGateExecution — selection", () => {
   });
 });
 
+describe("runRealClaudeGateExecution — never beside an agent run", () => {
+  test("holds a confirmed candidate while runs are in flight", async () => {
+    // mobile #993: a builder's device tests on the same managed device
+    // stretched the gate past its pairing-code window and failed the branch.
+    const client = new MockClient([parkedItem()]);
+    let ranCount = 0;
+
+    const held = await runRealClaudeGateExecution(
+      client, async () => { ranCount++; return report(); }, 150, async () => {}, 1,
+    );
+
+    assert.equal(held, true);
+    assert.equal(ranCount, 0, "the suite must not start beside an in-flight run");
+    assert.equal(client.updateItemStatusCalls.length, 0);
+    assert.equal(client.addCommentCalls.length, 0);
+  });
+
+  test("runs once nothing is in flight", async () => {
+    const client = new MockClient([parkedItem()]);
+    let ranCount = 0;
+
+    const held = await runRealClaudeGateExecution(
+      client, async () => { ranCount++; return report(); }, 150, async () => {}, 0,
+    );
+
+    assert.equal(held, false);
+    assert.equal(ranCount, 1);
+  });
+
+  test("does not hold dispatch for a candidate the fresh read disqualifies", async () => {
+    const item = parkedItem();
+    const client = new MockClient([item]);
+    client.freshLabels.set(1382, [...item.labels, "error:developer"]);
+
+    const held = await runRealClaudeGateExecution(client, async () => report(), 150, async () => {}, 2);
+
+    assert.equal(held, false);
+  });
+
+  test("does not hold with no candidate", async () => {
+    const client = new MockClient([]);
+
+    assert.equal(await runRealClaudeGateExecution(client, async () => report(), 150, async () => {}, 2), false);
+  });
+});
+
 describe("runRealClaudeGateExecution — outcomes", () => {
   test("pass advances the ticket and clears the gate label", async () => {
     const item = parkedItem();
