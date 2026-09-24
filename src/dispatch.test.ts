@@ -31,6 +31,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   buildModeSection,
+  selectUnansweredGateFailure,
   cleanupAfterDispatch,
   countActiveWork,
   decideDrainNotification,
@@ -74,6 +75,7 @@ import {
   type GateSpawnRequest,
   type StreamResult,
 } from "./dispatch.js";
+import { formatGateEvidenceComment } from "./gate-output.js";
 import { resetActiveStageSetForTests, resolveStageSet } from "./stage-sets.js";
 import type { AgentConfig, BlockerInfo, ProjectItem } from "./types.js";
 import {
@@ -1718,6 +1720,71 @@ describe("buildModeSection", () => {
     const section = buildModeSection(refiner, { issueNumber: 82, labels: ["needs-rework:refiner"] }, true);
     assert.match(section!, /^\n## Mode\nrework — existing ticket routed back\. Read the previous/);
     assert.doesNotMatch(section!, /rework-count/);
+  });
+});
+
+// =====================================================================
+// selectUnansweredGateFailure — the implementer's `## Live Gate Failure`
+// =====================================================================
+//
+// On pyrycode-mobile #996 (2026-09-24) the real-claude gate failed and
+// routed the ticket to the builder, but the gate's comment never reached
+// the builder's prompt. It redid the verifier's older, already-fixed
+// finding and changed no code, so the same suite ran on the same tree.
+
+describe("selectUnansweredGateFailure", () => {
+  const report = {
+    runError: null, timedOut: false, exitCode: 1,
+    tally: {
+      executed: 27, passed: 24, failed: 3, skipped: 0,
+      failedNames: ["e2e.T#stopRunningTurn"], passedNames: [], timedOutTests: [], skipReasons: [],
+      packageFailed: false, packageFailures: [], recognizedLines: 27,
+    },
+    command: "python3 scripts/android-test-gate.py live",
+    branchName: "feature/996", baseRef: "origin/main",
+    baseSha: "b".repeat(40), headSha: "h".repeat(40), commitsBehind: 0,
+    durationMs: 416_800, outputPath: "/logs/gate.log", outputBytes: 3_800,
+    baselineFailures: null, baselineSkipReason: "no baseline command configured for this fork", baselineOutputPath: null,
+    rerunFailures: null, rerunSkipReason: "no baseline command configured for this fork", rerunOutputPath: null,
+  };
+  const gateFail = formatGateEvidenceComment({
+    verdict: "fail", reason: "3 test(s) failed", report, minExecuted: 8,
+    action: "moved it to **In Development**, added `needs-rework:builder`. `needs-real-claude` stays on, so this ticket must pass the gate again after the fix.",
+  });
+  const gateUnusable = formatGateEvidenceComment({
+    verdict: "unusable", reason: "no report", report, minExecuted: 8,
+    action: "left it in Inbox and added `error:real-claude-gate`. This needs a human.",
+  });
+  const parked = "## 🧪 Real-claude gate — parked for the live run\n\n3. **Fail** → add `needs-rework:builder` and move it to **In Development**.";
+  const builderDone = "## 🤖 Builder — designs and implements\n\nbuilder agent has completed work on this ticket.\n\n<details>…</details>";
+  const verifierFlagged = "## 🤖 Verifier — reviews PRs\n\nverifier agent flagged issues on this ticket → rework by **builder**.";
+  const verifierPassed = "## 🤖 Verifier — reviews PRs\n\nverifier agent has completed work on this ticket.";
+  const marker = "<!-- family-dispatch-marker -->\n🧮 Family dispatch 6: **builder** on #996";
+
+  test("#996: a gate FAIL after the last builder report is returned", () => {
+    const comments = [builderDone, verifierFlagged, builderDone, verifierPassed, parked, gateFail, marker];
+    assert.equal(selectUnansweredGateFailure(comments, "builder"), gateFail);
+  });
+
+  test("a builder report after the gate FAIL means it was answered", () => {
+    assert.equal(selectUnansweredGateFailure([builderDone, gateFail, marker, builderDone, verifierFlagged], "builder"), null);
+  });
+
+  test("the parked notice alone is not a gate failure", () => {
+    assert.equal(selectUnansweredGateFailure([builderDone, verifierPassed, parked], "builder"), null);
+  });
+
+  test("a gate verdict that parks for a human is not a rework reason", () => {
+    assert.equal(selectUnansweredGateFailure([builderDone, gateUnusable], "builder"), null);
+  });
+
+  test("another agent's completion does not count as the implementer's answer", () => {
+    assert.equal(selectUnansweredGateFailure([gateFail, verifierPassed], "builder"), gateFail);
+    assert.equal(selectUnansweredGateFailure([gateFail, builderDone], "developer"), gateFail);
+  });
+
+  test("no comments → null", () => {
+    assert.equal(selectUnansweredGateFailure([], "builder"), null);
   });
 });
 
