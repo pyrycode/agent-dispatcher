@@ -171,3 +171,137 @@ describe("checkMergeResolution — real git, the #808 shape", () => {
     }
   });
 });
+
+// pyrycode-mobile#932 on 2026-09-24. Both sides changed the same line: main
+// added one argument to a call and the ticket added another. The right
+// resolution is one line carrying both, so neither side's line survives
+// verbatim.
+describe("checkMergeResolution — real git, both sides edit one line", () => {
+  const deps = { execSync, readFileSync };
+  const git = (cwd: string, cmd: string) =>
+    execSync(`git -c user.name=t -c user.email=t@t ${cmd}`, { cwd, stdio: "pipe", encoding: "utf-8" });
+
+  const file = (call: string) => ["fun module() {", `  val t = ${call}`, "  t.open()", "}", ""].join("\n");
+  const BASE = file("thread(handle)");
+  const MAIN = file("thread(handle, viewing)");
+  const BRANCH = file("thread(handle, reader)");
+
+  function conflictedRepo() {
+    const dir = mkdtempSync(join(tmpdir(), "merge-handoff-"));
+    git(dir, "init -q -b main");
+    writeFileSync(join(dir, "Module.kt"), BASE);
+    git(dir, "add -A");
+    git(dir, "commit -q -m base");
+    git(dir, "checkout -q -b feature/932");
+    writeFileSync(join(dir, "Module.kt"), BRANCH);
+    git(dir, "commit -q -am reader");
+    git(dir, "checkout -q main");
+    writeFileSync(join(dir, "Module.kt"), MAIN);
+    git(dir, "commit -q -am viewing");
+    git(dir, "checkout -q feature/932");
+    assert.throws(() => git(dir, "merge main --no-edit"), "the fixture must conflict");
+    const pending = readPendingMerge(dir, deps);
+    assert.ok(pending, "a stopped merge must be readable");
+    return { dir, pending };
+  }
+
+  test("one line carrying both sides' changes passes", () => {
+    const { dir, pending } = conflictedRepo();
+    try {
+      writeFileSync(join(dir, "Module.kt"), file("thread(handle, viewing, reader)"));
+      git(dir, "commit -q -am merge --no-edit");
+      assert.deepEqual(checkMergeResolution(dir, pending, deps), []);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("keeping only the branch's version of the line is still caught", () => {
+    const { dir, pending } = conflictedRepo();
+    try {
+      writeFileSync(join(dir, "Module.kt"), BRANCH);
+      git(dir, "commit -q -am merge --no-edit");
+      const problems = checkMergeResolution(dir, pending, deps);
+      assert.equal(problems.length, 1);
+      assert.match(problems[0]!, /lost 1 line\(s\) main added: `val t = thread\(handle, viewing\)`/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// pyrycode-mobile#883 on 2026-09-24. Main moved a test file and the ticket
+// deleted it, because the ticket removes the screen it tests. Keeping the
+// file deleted is the ticket's own reviewed change, not a lost side.
+describe("checkMergeResolution — real git, the branch deleted a file main changed", () => {
+  const deps = { execSync, readFileSync };
+  const git = (cwd: string, cmd: string) =>
+    execSync(`git -c user.name=t -c user.email=t@t ${cmd}`, { cwd, stdio: "pipe", encoding: "utf-8" });
+
+  const OLD = ["class LiteralScreenTest {", "  fun shows() = check()", "}", ""].join("\n");
+
+  function conflictedRepo(mainChange: (dir: string) => void) {
+    const dir = mkdtempSync(join(tmpdir(), "merge-handoff-"));
+    git(dir, "init -q -b main");
+    writeFileSync(join(dir, "Keep.kt"), "keep\n");
+    execSync("mkdir -p device shared", { cwd: dir });
+    writeFileSync(join(dir, "device/LiteralScreenTest.kt"), OLD);
+    git(dir, "add -A");
+    git(dir, "commit -q -m base");
+    git(dir, "checkout -q -b feature/883");
+    git(dir, "rm -q device/LiteralScreenTest.kt");
+    git(dir, "commit -q -m retire");
+    git(dir, "checkout -q main");
+    mainChange(dir);
+    git(dir, "add -A");
+    git(dir, "commit -q -m change");
+    git(dir, "checkout -q feature/883");
+    assert.throws(() => git(dir, "merge main --no-edit"), "the fixture must conflict");
+    const pending = readPendingMerge(dir, deps);
+    assert.ok(pending, "a stopped merge must be readable");
+    return { dir, pending };
+  }
+
+  const move = (dir: string) => git(dir, "mv device/LiteralScreenTest.kt shared/LiteralScreenTest.kt");
+  const edit = (dir: string) => writeFileSync(join(dir, "device/LiteralScreenTest.kt"), OLD.replace("check()", "check(robolectric = true)"));
+
+  for (const [name, change] of [["moved", move], ["edited", edit]] as const) {
+    test(`keeping the file deleted when main ${name} it passes`, () => {
+      const { dir, pending } = conflictedRepo(change);
+      try {
+        git(dir, "rm -q --ignore-unmatch device/LiteralScreenTest.kt shared/LiteralScreenTest.kt");
+        git(dir, "commit -q --no-edit");
+        assert.deepEqual(checkMergeResolution(dir, pending, deps), []);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  test("deleting a file the branch still had is caught", () => {
+    const dir = mkdtempSync(join(tmpdir(), "merge-handoff-"));
+    try {
+      git(dir, "init -q -b main");
+      writeFileSync(join(dir, "A.kt"), "val a = 1\n");
+      git(dir, "add -A");
+      git(dir, "commit -q -m base");
+      git(dir, "checkout -q -b feature/1");
+      writeFileSync(join(dir, "A.kt"), "val a = 2\n");
+      git(dir, "commit -q -am branch");
+      git(dir, "checkout -q main");
+      writeFileSync(join(dir, "A.kt"), "val a = 3\n");
+      git(dir, "commit -q -am main");
+      git(dir, "checkout -q feature/1");
+      assert.throws(() => git(dir, "merge main --no-edit"), "the fixture must conflict");
+      const pending = readPendingMerge(dir, deps);
+      assert.ok(pending);
+      git(dir, "rm -q A.kt");
+      git(dir, "commit -q --no-edit");
+      const problems = checkMergeResolution(dir, pending, deps);
+      assert.equal(problems.length, 1);
+      assert.match(problems[0]!, /`A\.kt` lost 1 line\(s\) main added: `val a = 3`/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

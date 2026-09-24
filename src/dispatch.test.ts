@@ -1011,6 +1011,7 @@ describe("setupBranchAndWorktree — failure modes", () => {
           "git diff --name-only --diff-filter=U -z": () => "Thread.kt\0",
           "git rev-parse MERGE_HEAD": () => "mainsha\n",
           "git merge-base HEAD MERGE_HEAD": () => "basesha\n",
+          "git rev-parse HEAD": () => "headsha\n",
         },
         fsMap: { [path]: CODE_CONFLICT },
       },
@@ -1027,7 +1028,7 @@ describe("setupBranchAndWorktree — failure modes", () => {
     assert.deepEqual(client.addLabelCalls, []);
     assert.match(client.comments[0]!.body, /Merge conflict left for developer/);
     assert.match(client.comments[0]!.body, /`Thread\.kt`/);
-    assert.deepEqual(ctx.pendingMerge, { paths: ["Thread.kt"], mainSha: "mainsha", baseSha: "basesha" });
+    assert.deepEqual(ctx.pendingMerge, { paths: ["Thread.kt"], mainSha: "mainsha", baseSha: "basesha", headSha: "headsha" });
     assert.ok(!calls.fs.some(f => f.kind === "write" && f.path === path), "the dispatcher resolves nothing itself");
     assert.ok(!calls.exec.some(c => c.cmd.includes("git merge --abort")), "the merge stays for the agent");
     assert.ok(!calls.exec.some(c => c.cmd.includes("git commit")));
@@ -7242,7 +7243,7 @@ describe("runPendingDoneFinalize", () => {
 // checked before the safety-net commit and the push; a run that errors is
 // never salvaged, since salvage would push whatever markers it left.
 describe("merge handoff — the owner's run", () => {
-  const pendingMerge = { paths: ["Thread.kt"], mainSha: "mainsha", baseSha: "basesha" };
+  const pendingMerge = { paths: ["Thread.kt"], mainSha: "mainsha", baseSha: "basesha", headSha: "headsha" };
 
   test("merge still in progress → error:<agent>, comment, no commit, no push, {ok:false}", async () => {
     const { ctx, client, calls } = makeTestContext({

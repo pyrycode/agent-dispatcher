@@ -32,6 +32,17 @@
 // resolution may re-indent main's lines under new code (#808 wrapped the
 // block #805 had just edited). Failing any of these parks the ticket with
 // nothing pushed and the worktree kept.
+//
+// Two resolutions drop main's lines correctly, and the check lets them pass.
+// Both key on what the branch had already done before the merge, so a
+// resolver cannot invent either one.
+//   - The branch had deleted the file, and the result keeps it deleted.
+//     Mobile #883 retired a screen and its tests while main moved those
+//     tests to a new folder.
+//   - Both sides edited the same line, and one result line holds both
+//     edits: main's line and a vanished branch line appear in it, token by
+//     token, in order. Mobile #932 added an argument to the same call main
+//     had just added one to.
 
 import type { execSync as ExecSync } from "node:child_process";
 import type { readFileSync as ReadFileSync } from "node:fs";
@@ -75,6 +86,8 @@ export type PendingMerge = {
   mainSha: string;
   /** The merge base, so the check knows what main added. */
   baseSha: string;
+  /** The branch tip the merge started from, so the check knows what the ticket changed. */
+  headSha: string;
 };
 
 export type MergeHandoffDeps = {
@@ -96,8 +109,9 @@ export function readPendingMerge(cwd: string, deps: MergeHandoffDeps): PendingMe
     const paths = run(deps, `git diff --name-only --diff-filter=U -z`, cwd).split("\0").filter(Boolean);
     const mainSha = run(deps, `git rev-parse MERGE_HEAD`, cwd);
     const baseSha = run(deps, `git merge-base HEAD MERGE_HEAD`, cwd);
-    if (paths.length === 0 || !mainSha || !baseSha) return null;
-    return { paths, mainSha, baseSha };
+    const headSha = run(deps, `git rev-parse HEAD`, cwd);
+    if (paths.length === 0 || !mainSha || !baseSha || !headSha) return null;
+    return { paths, mainSha, baseSha, headSha };
   } catch (e) {
     console.warn(`   ⚠️  Could not read the stopped merge, leaving it to a human: ${e}`);
     return null;
@@ -124,6 +138,38 @@ export function missingLines(required: readonly string[], text: string): string[
   return [...new Set(required)].filter((l) => !present.has(l));
 }
 
+const tokens = (line: string) => line.match(/\w+|[^\s\w]/g) ?? [];
+
+/** Whether every token of `part` appears in `whole`, in order. */
+function tokensWithin(part: readonly string[], whole: readonly string[]): boolean {
+  let i = 0;
+  for (const t of whole) if (i < part.length && t === part[i]) i++;
+  return i === part.length;
+}
+
+/**
+ * The lines of `missing` that no line of `text` holds in combination with a
+ * vanished branch line: one of `branchAdded` that `text` no longer holds
+ * either. What remains was lost, not merged.
+ */
+export function uncombinedLines(missing: readonly string[], branchAdded: readonly string[], text: string): string[] {
+  const lines = text.split("\n").map((l) => l.trim());
+  const present = new Set(lines);
+  const vanished = branchAdded.filter((l) => !present.has(l)).map(tokens);
+  if (vanished.length === 0) return [...missing];
+  const merged = lines.map(tokens).filter((r) => vanished.some((v) => tokensWithin(v, r)));
+  return missing.filter((m) => !merged.some((r) => tokensWithin(tokens(m), r)));
+}
+
+/** A file's content at `rev`, or null when the file does not exist there. */
+function fileAt(deps: MergeHandoffDeps, cwd: string, rev: string, path: string): string | null {
+  try {
+    return run(deps, `git show ${rev}:${shellQuote(path)}`, cwd);
+  } catch {
+    return null;
+  }
+}
+
 const MAX_LINES_SHOWN = 5;
 
 /**
@@ -147,12 +193,10 @@ export function checkMergeResolution(cwd: string, pending: PendingMerge, deps: M
   }
 
   for (const path of pending.paths) {
-    let text: string;
-    try {
-      text = run(deps, `git show HEAD:${shellQuote(path)}`, cwd);
-    } catch {
-      text = "";
-    }
+    const result = fileAt(deps, cwd, "HEAD", path);
+    // The branch had deleted this file before the merge, and it stays deleted.
+    if (result === null && fileAt(deps, cwd, pending.headSha, path) === null) continue;
+    const text = result ?? "";
     if (hasConflictMarkers(text)) {
       problems.push(`\`${path}\` still has conflict markers.`);
       continue;
@@ -164,7 +208,13 @@ export function checkMergeResolution(cwd: string, pending: PendingMerge, deps: M
       problems.push(`Could not read what main changed in \`${path}\`: ${e}`);
       continue;
     }
-    const missing = missingLines(addedLines(diff), text);
+    let missing = missingLines(addedLines(diff), text);
+    if (missing.length > 0) {
+      try {
+        const branchDiff = run(deps, `git diff -U0 ${pending.baseSha} ${pending.headSha} -- ${shellQuote(path)}`, cwd);
+        missing = uncombinedLines(missing, addedLines(branchDiff), text);
+      } catch {}
+    }
     if (missing.length > 0) {
       const shown = missing.slice(0, MAX_LINES_SHOWN).map((l) => `\`${l}\``).join(", ");
       const more = missing.length > MAX_LINES_SHOWN ? `, and ${missing.length - MAX_LINES_SHOWN} more` : "";
@@ -187,7 +237,7 @@ export function mergeHandoffNote(defaultBranch: string, paths: readonly string[]
     "",
     "The merge is still in progress in your working tree. Settle it before anything else:",
     "",
-    `1. Resolve every conflict so both sides' changes survive. \`${defaultBranch}\`'s side is already reviewed and merged, so keep every line it added and fit this ticket's code around them. Re-indenting one of its lines is fine; dropping or rewriting one is not.`,
+    `1. Resolve every conflict so both sides' changes survive. \`${defaultBranch}\`'s side is already reviewed and merged, so keep every line it added and fit this ticket's code around them. Re-indenting one of its lines is fine, and so is one line carrying both sides' edits when both changed the same line. Dropping or rewriting one of its lines is not. A file this ticket had already deleted may stay deleted.`,
     "2. Build, and run the tests that cover the conflicted files.",
     "3. Commit with `git commit --no-edit`.",
     "",
