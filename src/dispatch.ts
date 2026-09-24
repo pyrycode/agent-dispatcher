@@ -4438,7 +4438,7 @@ async function runBaselineComparison(opts: {
 }): Promise<void> {
   const { report, deps, targetRepo } = opts;
 
-  const filter = buildBaselineFilter(opts.failedNames);
+  const filter = buildBaselineFilter(opts.failedNames, opts.format);
   if (filter === null) {
     report.baselineSkipReason =
       "could not build a safe test filter from the failing names, so no comparison was attempted";
@@ -4548,7 +4548,7 @@ async function runBranchRerun(opts: {
 }): Promise<void> {
   const { report, deps } = opts;
 
-  const filter = buildBaselineFilter(opts.failedNames);
+  const filter = buildBaselineFilter(opts.failedNames, opts.format);
   if (filter === null) {
     report.rerunSkipReason =
       "could not build a safe test filter from the failing names, so no re-run was attempted";

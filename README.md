@@ -184,6 +184,8 @@ PYRY_REAL_CLAUDE_GATE_MIN_EXECUTED=150
 
 Android consumers can emit JUnit XML with `PYRY_REAL_CLAUDE_GATE_FORMAT=junit-xml`. The command must write only XML to stdout and send build logs to stderr. Both `<testsuite>` and `<testsuites>` roots are accepted. The reader counts named test cases, excludes skips, preserves failures across duplicate reports, and rejects malformed reports or missing cases advertised by the suite. Mobile's wrapper additionally requires freshly generated device reports and forces the test task to execute.
 
+For `junit-xml` the `{{TESTS}}` filter is not a regex. It is a single-quoted, comma-separated `pkg.Class#method` list, the shape Android's instrumentation `class` argument takes, so the baseline command must hand it to a runner that selects tests by that list. A name that is not a plain class and method, such as a parameterised `method[0]`, refuses the whole filter.
+
 The baseline command currently uses Go test filters. Leave it unset for JUnit consumers until their command supports that filtering contract. Without it, failed tests route to rework without automatic retry or base comparison.
 
 A bare `make e2e-realclaude` target will **not** work. Without `-json` it prints nothing per-test on success, only a package summary, so executed tests cannot be counted — and the executed-test count is the whole guard. This is a contract, not a detail.

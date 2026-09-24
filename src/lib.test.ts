@@ -4857,6 +4857,35 @@ describe("buildBaselineFilter", () => {
     // turning a seconds-long check into a second five-minute run.
     assert.equal(buildBaselineFilter([]), null);
   });
+
+  test("junit-xml builds a comma-separated Class#method list, not a regex", () => {
+    // Android instrumentation selects by this list. The Go regex matched
+    // nothing there, so every live failure stayed the branch's and
+    // pyrycode-mobile #1016 was sent back three times for flakes.
+    const f = buildBaselineFilter(
+      ["de.pyryco.mobile.e2e.InteractiveStreamE2ETest#interactiveTurn_a", "de.pyryco.mobile.e2e.InteractiveStreamE2ETest#interactiveTurn_b"],
+      "junit-xml",
+    );
+    assert.equal(f, "'de.pyryco.mobile.e2e.InteractiveStreamE2ETest#interactiveTurn_a,de.pyryco.mobile.e2e.InteractiveStreamE2ETest#interactiveTurn_b'");
+  });
+
+  test("junit-xml deduplicates and keeps a nested class", () => {
+    assert.equal(buildBaselineFilter(["p.A$Inner#m", "p.A$Inner#m"], "junit-xml"), "'p.A$Inner#m'");
+  });
+
+  test("junit-xml REFUSES the whole list when one name is not a plain Class#method", () => {
+    assert.equal(buildBaselineFilter(["p.A#ok", "p.A#param[0]"], "junit-xml"), null);
+    assert.equal(buildBaselineFilter(["p.A#with space"], "junit-xml"), null);
+    assert.equal(buildBaselineFilter(["p.A#m'; rm -rf /"], "junit-xml"), null);
+    assert.equal(buildBaselineFilter(["p.A"], "junit-xml"), null);
+    assert.equal(buildBaselineFilter(["p.A#m,p.B#n"], "junit-xml"), null);
+    assert.equal(buildBaselineFilter([], "junit-xml"), null);
+  });
+
+  test("junit-xml filter survives command substitution intact", () => {
+    const cmd = buildBaselineCommand("python3 gate.py live --tests {{TESTS}}", buildBaselineFilter(["p.A$B#m"], "junit-xml")!);
+    assert.equal(cmd, "python3 gate.py live --tests 'p.A$B#m'");
+  });
 });
 
 describe("decideBaselineAdjustedVerdict", () => {
