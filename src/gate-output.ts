@@ -537,8 +537,19 @@ export function stripPackageQualifier(qualifiedName: string): string {
  * `sub|TestB)$`, two broken regexps, and the run refuses to start. Running
  * the whole parent re-runs sibling subtests too, which costs a little and
  * changes nothing: results are still compared by full leaf name.
+ *
+ * JUnit XML names are `pkg.Class#method`, which is not a regex filter at
+ * all. Android instrumentation selects tests with a comma-separated
+ * `Class#method` list, so that format gets one, built by
+ * `buildJUnitBaselineFilter`. A Go-style regex handed to it would match
+ * nothing, the re-run would execute nothing, and every failure would stay
+ * the branch's: the loop that sent pyrycode-mobile #1016 back three times.
  */
-export function buildBaselineFilter(qualifiedFailedNames: readonly string[]): string | null {
+export function buildBaselineFilter(
+  qualifiedFailedNames: readonly string[],
+  format: GateOutputFormat = "go-json",
+): string | null {
+  if (format === "junit-xml") return buildJUnitBaselineFilter(qualifiedFailedNames);
   const safe = /^[A-Za-z0-9_/#.\-]+$/;
   const bare: string[] = [];
   for (const qualified of qualifiedFailedNames) {
@@ -554,6 +565,26 @@ export function buildBaselineFilter(qualifiedFailedNames: readonly string[]): st
   // Single-quoted so the shell passes it through untouched. The safe set
   // excludes a single quote, so this cannot be broken out of.
   return `'^(${escaped.join("|")})$'`;
+}
+
+/**
+ * The JUnit side of `buildBaselineFilter`: a single-quoted, comma-separated
+ * `pkg.Class#method` list, the shape Android's instrumentation `class`
+ * argument takes. Same refusal rule as the Go filter: one name outside a
+ * plain class and method shape refuses the whole list, so a parameterised
+ * `method[0]` or a backticked Kotlin name with spaces never yields a partial
+ * comparison.
+ */
+function buildJUnitBaselineFilter(qualifiedFailedNames: readonly string[]): string | null {
+  const shape = /^[A-Za-z_][A-Za-z0-9_$]*(\.[A-Za-z_][A-Za-z0-9_$]*)*#[A-Za-z_][A-Za-z0-9_]*$/;
+  const names: string[] = [];
+  for (const name of qualifiedFailedNames) {
+    // `$` is legal in a class name and inert inside single quotes.
+    if (!shape.test(name)) return null;
+    if (!names.includes(name)) names.push(name);
+  }
+  if (names.length === 0) return null;
+  return `'${names.join(",")}'`;
 }
 
 /** Placeholder a baseline command template must carry. */
