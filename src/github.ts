@@ -715,6 +715,38 @@ export class GitHubProjectClient {
   }
 
   /**
+   * Every open issue carrying `label`, with its body, across all pages.
+   * Pull requests share the issues endpoint and are dropped.
+   */
+  async listOpenIssuesWithLabel(label: string): Promise<{ number: number; body: string }[]> {
+    const found: { number: number; body: string }[] = [];
+    for (let page = 1; ; page++) {
+      const response = await fetchWithRetry(
+        `https://api.github.com/repos/${this.config.owner}/${this.config.repo}/issues` +
+          `?state=open&labels=${encodeURIComponent(label)}&per_page=100&page=${page}`,
+        {
+          headers: {
+            Authorization: `token ${this.config.token}`,
+            Accept: "application/vnd.github+json",
+          },
+        },
+        3,
+        1000,
+        true, // a read is idempotent — retry transient GitHub 5xx/429
+      );
+      if (!response.ok) {
+        throw new Error(`Failed to list issues labelled ${label}: ${response.status} ${response.statusText}`);
+      }
+      const batch: any[] = (await response.json()) as any[];
+      for (const issue of batch) {
+        if (issue.pull_request) continue;
+        found.push({ number: issue.number, body: issue.body ?? "" });
+      }
+      if (batch.length < 100) return found;
+    }
+  }
+
+  /**
    * Add an existing issue (by GraphQL node ID) to the project. Returns the
    * project item ID so the caller can immediately set its status.
    *

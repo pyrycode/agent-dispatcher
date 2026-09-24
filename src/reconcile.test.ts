@@ -728,6 +728,50 @@ describe("runRealClaudeGateExecution — outcomes", () => {
     assert.match(client.addCommentCalls[0]?.body ?? "", /passed when re-run on the same merged tree/);
   });
 
+  test("hands the flaky tests to the filer after the ticket's own writes, and names the ticket in the ping", async () => {
+    // pyrycode-mobile, 2026-09-24: with the re-run letting tickets through,
+    // nothing filed the flakes, and the silent second-client bug went a day
+    // untracked. The filer runs last so it can never hold up the verdict.
+    const item = parkedItem();
+    const client = new MockClient([item]);
+    const notifications: string[] = [];
+    const calls: { flaky: readonly string[]; gatedIssue: number; movedFirst: boolean }[] = [];
+    const flaky = report({
+      exitCode: 1,
+      tally: tally({ executed: 176, passed: 175, failed: 1, failedNames: ["pkg.TestLiveness"], packageFailed: true }),
+      rerunFailures: [],
+      rerunSkipReason: null,
+      rerunOutputPath: "/logs/rerun.log",
+    });
+
+    await runRealClaudeGateExecution(
+      client,
+      async () => flaky,
+      150,
+      async (m) => { notifications.push(m); },
+      0,
+      async (names, ctx) => {
+        calls.push({ flaky: names, gatedIssue: ctx.gatedIssue, movedFirst: client.updateItemStatusCalls.length === 1 });
+        return { filed: [{ name: names[0], issue: 2600 }], commented: [], untracked: [] };
+      },
+    );
+
+    assert.deepEqual(calls, [{ flaky: ["pkg.TestLiveness"], gatedIssue: 1382, movedFirst: true }]);
+    assert.match(notifications[0], /Tracked on #2600/);
+  });
+
+  test("does not call the filer when nothing was flaky", async () => {
+    const client = new MockClient([parkedItem()]);
+    let called = 0;
+
+    await runRealClaudeGateExecution(client, async () => report(), 150, async () => {}, 0, async () => {
+      called++;
+      return { filed: [], commented: [], untracked: [] };
+    });
+
+    assert.equal(called, 0);
+  });
+
   test("an all-skip suite with exit 0 parks loudly instead of advancing", async () => {
     // The 2026-07-22 shape, end to end: every test skipped, exit 0. This is
     // the single most important assertion in the file. If it ever goes

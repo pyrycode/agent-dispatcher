@@ -47,6 +47,7 @@ import {
 } from "./pipeline-decisions.js";
 import { selectDispatches } from "./dispatch-selection.js";
 import { formatGateEvidenceComment, type GateRunReport } from "./gate-output.js";
+import type { FlakyRunContext, FlakyTicketResult } from "./flaky-tickets.js";
 
 /**
  * Subset of `GitHubProjectClient` that reconciliation actually uses.
@@ -455,6 +456,7 @@ export async function runRealClaudeGateExecution(
   minExecuted: number,
   notifyDiscord: (message: string) => Promise<void>,
   inFlight = 0,
+  recordFlaky: (flaky: readonly string[], ctx: FlakyRunContext) => Promise<FlakyTicketResult> = noFlakyTickets,
 ): Promise<boolean> {
   // Off switch. No command configured means this step never touches the
   // board, so the whole feature can land on a live dispatcher before any
@@ -655,12 +657,30 @@ export async function runRealClaudeGateExecution(
     const icon = verdict === "pass" ? "✅" : verdict === "flaky-pass" ? "⚠️" : verdict === "fail" ? "❌" : "🚨";
     console.log(`   ${icon} Real-claude gate #${candidate.issueNumber}: ${verdict} — ${reason}`);
 
+    // After the gated ticket's own writes, so a slow or failing board write
+    // here can never hold up or undo its verdict. Any verdict can carry
+    // flakes: a fail whose other failures reproduced still names them.
+    let flakyTickets: FlakyTicketResult | null = null;
+    if (flaky.length > 0) {
+      flakyTickets = await recordFlaky(flaky, {
+        gatedIssue: candidate.issueNumber,
+        report,
+        at: new Date().toISOString(),
+      });
+      for (const { name, issue } of flakyTickets.filed) console.log(`   🎫 Filed #${issue} in Backlog for flaky ${name}`);
+      for (const { name, issue } of flakyTickets.commented) console.log(`   💬 Flaky ${name} recorded on #${issue}`);
+      if (flakyTickets.untracked.length > 0) {
+        console.warn(`   ⚠️  Flaky test(s) with no ticket this run: ${flakyTickets.untracked.join(", ")}`);
+      }
+    }
+
     if (outcome.notify) {
       await notifyDiscord(
         verdict === "flaky-pass"
           ? `⚠️ **Real-claude gate passed #${candidate.issueNumber} only on re-run.** ` +
             `${flaky.map(name => `\`${name}\``).join(", ")} failed once and passed the second time on the same ` +
-            `merged tree. The ticket advanced; the flake is the suite's to fix — see the evidence comment.`
+            `merged tree. The ticket advanced; the flake is the suite's to fix — see the evidence comment.` +
+            flakyTicketNote(flakyTickets)
           : `🚨 **Real-claude gate could not judge #${candidate.issueNumber}** (${verdict}): ${reason}\n` +
             `Parked in ${REAL_CLAUDE_GATE_RUN_FROM_COLUMN} with \`${outcome.addLabels.join("`, `")}\`. ` +
             `Needs a human — see the evidence comment.`,
@@ -674,4 +694,16 @@ export async function runRealClaudeGateExecution(
     client.clearItemsCache();
   }
   return false;
+}
+
+/** Default for `runRealClaudeGateExecution`'s flake filing: file nothing. */
+async function noFlakyTickets(flaky: readonly string[]): Promise<FlakyTicketResult> {
+  return { filed: [], commented: [], untracked: [...flaky] };
+}
+
+/** One sentence for the Discord ping naming where the flakes are tracked. */
+function flakyTicketNote(result: FlakyTicketResult | null): string {
+  if (result === null) return "";
+  const tracked = [...result.filed, ...result.commented].map(t => `#${t.issue}`);
+  return tracked.length > 0 ? ` Tracked on ${tracked.join(", ")}.` : "";
 }

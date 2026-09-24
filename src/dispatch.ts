@@ -53,6 +53,7 @@ import {
   type MainSweepOutcome,
   type MainSweepState,
 } from "./main-sweep.js";
+import { recordFlakyTests } from "./flaky-tickets.js";
 import { activeStageSet } from "./stage-sets.js";
 import {
   REAL_CLAUDE_GATE_FAIL_COLUMN,
@@ -6205,6 +6206,7 @@ export async function pollLoop(): Promise<void> {
       REAL_CLAUDE_GATE_MIN_EXECUTED,
       notifyDiscord,
       pool.size,
+      (flaky, ctx) => recordFlakyTests(client, flaky, ctx),
     );
     await runAutoAdvance(client, MAX_CONCURRENT, pool.size);
     await runDoneCleanup(client);
