@@ -3434,8 +3434,13 @@ export async function cleanupAfterDispatch(ctx: DispatchContext): Promise<void> 
 
 // --------- Pre-verifier deterministic gates (builder stage set) ---------
 
-/** Wall-clock cap per pre-verifier gate command. */
-export const VERIFIER_GATE_TIMEOUT_MS = 600_000; // 10min
+/** Wall-clock cap per pre-verifier gate command. 10 min default; a fork
+ *  whose slowest gate runs longer raises it with
+ *  `PYRY_VERIFIER_GATE_TIMEOUT_MS`. Desktop's serial Playwright tier
+ *  measured 14.8 min on 2026-09-24 (pyrycode-desktop #1634), so every
+ *  pass timed out at the default. */
+export const VERIFIER_GATE_TIMEOUT_MS =
+  Number(process.env.PYRY_VERIFIER_GATE_TIMEOUT_MS) || 600_000;
 
 /** Cap on the failing gate's output tail injected into the verifier's
  *  triage-mode prompt note. */
