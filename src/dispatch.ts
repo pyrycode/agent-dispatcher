@@ -4169,6 +4169,45 @@ export const spawnGateCommand: GateSpawner = async (req) => {
 };
 
 /** Injectable I/O for `runRealClaudeGateSuite`. */
+/**
+ * Clear a gate-owned worktree path before a run creates it.
+ *
+ * Ordinary removal first. Git refuses a worktree with untracked files, and a
+ * live run that is killed partway through always leaves some: its captures
+ * land under testdata/ before the suite finishes. Such a leftover is moved
+ * aside to a `stale-<name>-<stamp>` sibling instead, so its evidence is kept
+ * and the new run can still create its worktree. Without this the retry
+ * fails on "already exists" and parks for a human; pyrycode #2525 on
+ * 2026-09-22 and #2658 on 2026-09-25 were both cleared by hand this way
+ * (agent-dispatcher#79). Nothing is ever force-removed.
+ *
+ * Only for the pre-run clear. The post-run removal stays ordinary, so a
+ * finished run's captures remain at their path for the implementation role.
+ * Returns the path it moved the leftover to, or null when it moved nothing.
+ */
+export function clearGateWorktreePath(
+  exec: typeof execSync,
+  targetRepo: string,
+  worktreeDir: string,
+  stamp: string,
+): string | null {
+  let movedTo: string | null = null;
+  try {
+    exec(`git worktree remove "${worktreeDir}"`, { cwd: targetRepo, stdio: "pipe" });
+  } catch {
+    // Also throws when there is nothing at the path, the usual case; the move
+    // then fails the same way and the run proceeds.
+    const aside = resolve(dirname(worktreeDir), `stale-${basename(worktreeDir)}-${stamp}`);
+    try {
+      exec(`git worktree move "${worktreeDir}" "${aside}"`, { cwd: targetRepo, stdio: "pipe" });
+      movedTo = aside;
+      console.warn(`   ⚠️  Leftover worktree with local files kept: moved ${worktreeDir} aside to ${aside}`);
+    } catch {}
+  }
+  try { exec(`git worktree prune`, { cwd: targetRepo, stdio: "pipe" }); } catch {}
+  return movedTo;
+}
+
 export interface GateRunnerDeps {
   execSync: typeof execSync;
   spawnSync: typeof spawnSync;
@@ -4351,7 +4390,7 @@ export async function runRealClaudeGateSuite(opts: {
     try { deps.execSync(`git worktree prune`, { cwd: targetRepo, stdio: "pipe" }); } catch {}
   };
 
-  removeWorktree(); // clear anything a crashed earlier run left behind
+  clearGateWorktreePath(deps.execSync, targetRepo, worktreeDir, stamp); // clear anything a crashed earlier run left behind
   try {
     deps.mkdirSync(resolve(targetRepo, `../.pyrycode-worktrees`), { recursive: true });
     git(`worktree add --detach "${worktreeDir}" ${report.headSha}`);
@@ -4518,7 +4557,7 @@ async function runBaselineComparison(opts: {
     try { deps.execSync(`git worktree prune`, { cwd: targetRepo, stdio: "pipe" }); } catch {}
   };
 
-  removeWorktree();
+  clearGateWorktreePath(deps.execSync, targetRepo, worktreeDir, opts.stamp);
   try {
     deps.execSync(`git worktree add --detach "${worktreeDir}" ${opts.baseSha}`, {
       cwd: targetRepo, stdio: "pipe", timeout: 120_000,
@@ -4730,7 +4769,7 @@ export async function runMainSweep(opts: {
     try { deps.execSync(`git worktree prune`, { cwd: targetRepo, stdio: "pipe" }); } catch {}
   };
 
-  removeWorktree(); // clear anything a crashed earlier run left behind
+  clearGateWorktreePath(deps.execSync, targetRepo, worktreeDir, stamp); // clear anything a crashed earlier run left behind
   try {
     deps.mkdirSync(resolve(targetRepo, `../.pyrycode-worktrees`), { recursive: true });
     deps.execSync(`git worktree add --detach "${worktreeDir}" ${opts.sha}`, {

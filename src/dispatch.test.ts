@@ -65,6 +65,7 @@ import {
   type SigintState,
   buildGateSpawnEnv,
   runRealClaudeGateSuite,
+  clearGateWorktreePath,
   spawnGateCommand,
   maybeRunPreSpawnGates,
   runVerifierGates,
@@ -5456,6 +5457,41 @@ describe("runRealClaudeGateSuite — worktree safety", () => {
     assert.ok(calls.some(c => c.includes("worktree remove")));
   });
 
+  test("moves a leftover worktree that removal refuses aside before creating its own (agent-dispatcher#79)", async () => {
+    // A killed run leaves untracked captures, so plain `git worktree remove`
+    // refuses the path. The retry must keep that evidence AND still start.
+    let removes = 0;
+    const { run, calls } = gateRun({
+      gitFail: (c) => c.includes("worktree remove") && removes++ === 0,
+    });
+    const report = await run();
+
+    assert.equal(report.runError, null);
+    const moveIdx = calls.findIndex(c => c.includes("git worktree move"));
+    const addIdx = calls.findIndex(c => c.includes("git worktree add"));
+    assert.ok(moveIdx >= 0, "expected the leftover to be moved aside");
+    assert.ok(moveIdx < addIdx, "the move must precede `git worktree add`");
+    assert.match(calls[moveIdx], /real-claude-gate-1382" ".*\/stale-real-claude-gate-1382-\S+"$/);
+    assert.ok(!calls.some(c => c.includes("--force")), "nothing may be force-removed");
+  });
+
+  test("moves nothing when the path clears normally", async () => {
+    const { run, calls } = gateRun();
+    await run();
+    assert.ok(!calls.some(c => c.includes("git worktree move")));
+  });
+
+  test("keeps a finished run's worktree at its path when post-run removal refuses it", async () => {
+    // Pre-run clear succeeds; the post-run removal is refused because the run
+    // wrote captures. Those stay put for the implementation role.
+    let removes = 0;
+    const { run, calls } = gateRun({
+      gitFail: (c) => c.includes("worktree remove") && removes++ > 0,
+    });
+    await run();
+    assert.ok(!calls.some(c => c.includes("git worktree move")));
+  });
+
   test("uses a worktree path that cannot collide with a dispatch worktree", async () => {
     // Dispatch worktrees are `<agent>-<issue>`; no agent is called
     // `real-claude-gate`.
@@ -7532,5 +7568,37 @@ describe("merge handoff — the owner's run", () => {
     );
     assert.ok(!calls.exec.some(c => c.cmd.includes("git add -A") || c.cmd.includes("git push")));
     assert.ok(!client.addLabelCalls.some(c => c.label === "error:max_turns_salvaged"));
+  });
+});
+
+describe("clearGateWorktreePath", () => {
+  const exec = (fail: (c: string) => boolean) => {
+    const calls: string[] = [];
+    const fn = ((cmd: string) => {
+      calls.push(cmd);
+      if (fail(cmd)) throw new Error(`boom: ${cmd}`);
+      return Buffer.from("");
+    }) as any;
+    return { fn, calls };
+  };
+  const dir = "/tmp/.pyrycode-worktrees/real-claude-gate-7";
+
+  test("returns the stale path it moved a refused leftover to", () => {
+    const { fn, calls } = exec(c => c.includes("worktree remove"));
+    const moved = clearGateWorktreePath(fn, "/tmp/repo", dir, "2026-09-25T14-35-53-625Z");
+    assert.equal(moved, "/tmp/.pyrycode-worktrees/stale-real-claude-gate-7-2026-09-25T14-35-53-625Z");
+    assert.ok(calls.some(c => c === "git worktree prune"));
+  });
+
+  test("returns null when nothing is at the path (remove and move both fail)", () => {
+    const { fn, calls } = exec(c => c.includes("worktree remove") || c.includes("worktree move"));
+    assert.equal(clearGateWorktreePath(fn, "/tmp/repo", dir, "s"), null);
+    assert.ok(calls.some(c => c === "git worktree prune"), "prune still runs");
+  });
+
+  test("returns null and moves nothing when removal succeeds", () => {
+    const { fn, calls } = exec(() => false);
+    assert.equal(clearGateWorktreePath(fn, "/tmp/repo", dir, "s"), null);
+    assert.ok(!calls.some(c => c.includes("worktree move")));
   });
 });
