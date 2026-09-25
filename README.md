@@ -353,3 +353,10 @@ resolve and commit its work before retrying. Startup never force-removes it.
 Cleanup reports local changes in the main checkout without discarding tracked edits
 or deleting untracked files. This also applies to live-gate and baseline worktrees.
 A preserved path is evidence to inspect, not permission to force-delete it.
+
+Live-gate, baseline and main-sweep worktrees have one exception to blocking.
+A killed run leaves untracked captures, so its worktree survives removal.
+Before the next run, the dispatcher moves such a leftover aside to a
+`stale-<name>-<stamp>` sibling with `git worktree move`, keeping every file,
+and then creates a fresh worktree. After a run, removal stays ordinary, so a
+finished run's captures remain at their path for the implementation role.
