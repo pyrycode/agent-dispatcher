@@ -1094,6 +1094,13 @@ export interface DoneCleanup {
  *   - the `merged` label specifically — its semantic is "PR was merged,"
  *     set only by the auto-merge path; reaching Done some other way
  *     shouldn't grant it
+ *   - any `merge-attempt:N` counter. It counts auto-merge conflicts
+ *     across cycles while the ticket sits in Done, and this pass runs
+ *     before the auto-merge in every cycle. Stripping it here reset the
+ *     count to zero each cycle, so the retry never reached its give-up
+ *     threshold: mobile #878 retried a conflicting PR every two minutes
+ *     for over 30 hours (2026-09-23 to 09-25). The auto-merge path
+ *     clears the counter itself, on merge and on give-up.
  *
  * Skips items with `issueNumber <= 0` (epics, virtual items) — same as
  * `decideReworkRoutes`. Idempotent: a clean ticket produces no entry.
@@ -1113,7 +1120,6 @@ export function decideDoneCleanup(
       l => l !== FAMILY_BREAKER_LABEL
         && (isPipelineLabel(l)
           || l.startsWith("rework-count:")
-          || l.startsWith("merge-attempt:")
           || l.startsWith(ERROR_RETRY_COUNT_PREFIX)
           || l.startsWith(FAMILY_DISPATCH_COUNT_PREFIX)),
     );

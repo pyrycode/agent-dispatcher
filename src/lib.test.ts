@@ -2020,15 +2020,14 @@ describe("decideMergeRetry", () => {
   });
 });
 
-describe("decideDoneCleanup — merge-attempt cleanup", () => {
-  // Behavior added 2026-05-10 evening alongside merge-retry: a Done
-  // ticket that carried a merge-attempt:N counter (because retries
-  // happened before success) must have it stripped, same as
-  // rework-count:N. Without this, a re-opened ticket would carry stale
-  // merge-attempt:* labels that bias future retries toward early
-  // exhaustion.
+describe("decideDoneCleanup — merge-attempt counter", () => {
+  // The counter counts auto-merge conflicts while the ticket sits open
+  // in Done. Done cleanup runs before the auto-merge every cycle, so it
+  // must leave the counter alone or the retry never reaches give-up
+  // (mobile #878, 2026-09-23 to 09-25). The auto-merge path clears it
+  // on merge and on give-up.
 
-  test("strips merge-attempt:N alongside pipeline labels and rework-count:N", () => {
+  test("strips pipeline labels and rework-count:N but keeps merge-attempt:N", () => {
     const cleanups = decideDoneCleanup([
       {
         id: "x",
@@ -2040,7 +2039,7 @@ describe("decideDoneCleanup — merge-attempt cleanup", () => {
     const stripped = new Set(cleanups[0]!.labelsToStrip);
     assert.ok(stripped.has("done:documentation"));
     assert.ok(stripped.has("rework-count:1"));
-    assert.ok(stripped.has("merge-attempt:2"));
+    assert.ok(!stripped.has("merge-attempt:2"));
     // Non-pipeline labels are left alone.
     assert.ok(!stripped.has("size:s"));
     assert.ok(!stripped.has("priority:high"));

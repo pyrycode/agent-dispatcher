@@ -5348,9 +5348,10 @@ const MERGE_RETRY_MAX_ATTEMPTS = 3;
  *   - Falls through to the existing `handleMergeConflict` flow when
  *     retries are exhausted.
  *
- * On success at any retry, `decideDoneCleanup` strips the
- * `merge-attempt:*` counter alongside the rest of the pipeline labels
- * (the same way `rework-count:*` gets stripped).
+ * The counter is cleared here in the auto-merge path, on merge and on
+ * give-up, never by `decideDoneCleanup`. That pass runs before the
+ * auto-merge every cycle, so stripping it there reset the count each
+ * cycle and the retry never gave up (mobile #878, 2026-09-23 to 09-25).
  *
  * Counter cleanup is best-effort: if removing the previous counter
  * fails, the next cycle's `extractMergeAttemptCount` reads max-of-found
@@ -5423,6 +5424,13 @@ async function handleMergeConflict(
   console.warn(`   🛑 PR #${prNumber} for #${item.issueNumber} has merge conflicts — labelling for triage`);
   try {
     await client.addLabel(item.issueNumber, "error:merge-conflict");
+    // The retries are spent. Clear the counter so a ticket that comes
+    // back to Done after the conflict is resolved gets a fresh set.
+    for (const label of item.labels) {
+      if (label.startsWith("merge-attempt:")) {
+        try { await client.removeLabel(item.issueNumber, label); } catch {}
+      }
+    }
     await client.addComment(
       item.issueNumber,
       `## 🛑 Auto-merge blocked by merge conflict\n\n` +
@@ -5619,7 +5627,7 @@ export async function runAutoMerge(
 
         // Clean up pipeline labels — they're noise on completed tickets.
         for (const label of item.labels) {
-          if (isPipelineLabel(label)) {
+          if (isPipelineLabel(label) || label.startsWith("merge-attempt:")) {
             try { await client.removeLabel(item.issueNumber, label); } catch {}
           }
         }
