@@ -4040,8 +4040,13 @@ describe("runAutoMerge", () => {
     assert.equal(calls.discord.length, 1);
     assert.match(calls.discord[0]!, /^🛑 Merge conflict on PR #790/);
     // Pipeline labels NOT stripped (the merge failed, so the ticket
-    // isn't really done; labels stay until human resolves).
-    assert.ok(!client.removeLabelCalls.some(c => c.issueNumber === 1201));
+    // isn't really done; labels stay until human resolves). Only the
+    // spent retry counter is cleared, so a later return to Done retries
+    // afresh.
+    assert.deepEqual(
+      client.removeLabelCalls.filter(c => c.issueNumber === 1201).map(c => c.label),
+      ["merge-attempt:2"],
+    );
     // Status rolled back from Done → In Code Review (the column-as-truth
     // fix shipped 2026-05-09 evening). Without this the ticket sits at
     // Status=Done with a still-open conflicting PR — exact bug #218 hit
@@ -4123,6 +4128,53 @@ describe("runAutoMerge", () => {
     assert.equal(calls.discord.length, 0);
     // No previous-counter to strip on first attempt (currentCount=0).
     assert.ok(!client.removeLabelCalls.some(c => c.label.startsWith("merge-attempt:")));
+  });
+
+  test("conflict every cycle with Done cleanup in between → gives up on the third cycle (mobile #878 regression)", async () => {
+    // The real poll loop runs runDoneCleanup before runAutoMerge in
+    // every cycle. Cleanup used to strip merge-attempt:N from the open
+    // Done ticket, so the count read zero each cycle and the retry
+    // looped forever instead of handing the conflict back.
+    const client = new MockGitHubClient({
+      items: [
+        { id: "PVTI_1220", issueNumber: 1220, status: "Done", labels: ["done:documentation"], state: "OPEN" },
+      ],
+    });
+    const { deps, calls } = makeMockDeps({
+      execImpls: {
+        "gh pr list --head \"feature/1220\"": () => "930\n",
+        "gh pr merge 930 --merge --delete-branch": () => execError({ stderr: "X Pull request #930 is not mergeable" }),
+      },
+    });
+
+    for (let cycle = 0; cycle < 3; cycle++) {
+      await runDoneCleanup(client);
+      await runAutoMerge(client, deps);
+    }
+
+    assert.ok(client.addLabelCalls.some(c => c.issueNumber === 1220 && c.label === "error:merge-conflict"));
+    assert.equal(client.itemsByIssueNumber.get(1220)!.status, "In Code Review");
+    assert.equal(calls.discord.length, 1);
+    // The spent counter is cleared on give-up.
+    assert.ok(!client.itemsByIssueNumber.get(1220)!.labels.some(l => l.startsWith("merge-attempt:")));
+  });
+
+  test("merge succeeds after a retry → merge-attempt counter cleared with the pipeline labels", async () => {
+    const client = new MockGitHubClient({
+      items: [
+        { id: "PVTI_1221", issueNumber: 1221, status: "Done", labels: ["done:documentation", "merge-attempt:1"], state: "OPEN" },
+      ],
+    });
+    const { deps } = makeMockDeps({
+      execImpls: {
+        "gh pr list --head \"feature/1221\"": () => "931\n",
+      },
+    });
+
+    await runAutoMerge(client, deps);
+
+    assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1221 && c.label === "merge-attempt:1"));
+    assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1221 && c.label === "done:documentation"));
   });
 
   test("merge conflict on second attempt (merge-attempt:1) → bumps to merge-attempt:2, strips merge-attempt:1, no give-up", async () => {
