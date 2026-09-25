@@ -4144,6 +4144,7 @@ describe("advancePermissionDenialState — watchdog state machine", () => {
     assert.deepEqual(s, {
       hadPermissionDenial: false,
       watchdogPending: false,
+      stoppedAtDenial: false,
       deniedContent: null,
       lastAssistantText: null,
     });
@@ -4226,6 +4227,41 @@ describe("advancePermissionDenialState — watchdog state machine", () => {
     const advanced = advancePermissionDenialState(s, sysMsg);
     assert.equal(advanced.action, "none");
     assert.equal(advanced.state.watchdogPending, true, "watchdog must NOT clear on non-assistant events");
+  });
+
+  // stoppedAtDenial: did the run end on a denial, or carry on past it?
+  // A clean exit only routes as permission_denied when it stopped there
+  // (pyrycode#2586: the verifier obeyed Layer 1, exited cleanly, and the
+  // ticket got the generic missing-verdict error instead).
+  test("denial → stoppedAtDenial set", () => {
+    const { state } = advancePermissionDenialState(initPermissionDenialState(), denialMsg);
+    assert.equal(state.stoppedAtDenial, true);
+  });
+
+  test("denial then text-only exit → stoppedAtDenial stays true", () => {
+    let s = initPermissionDenialState();
+    ({ state: s } = advancePermissionDenialState(s, denialMsg));
+    ({ state: s } = advancePermissionDenialState(s, textMsg("Denied, so I am stopping.")));
+    assert.equal(s.stoppedAtDenial, true);
+  });
+
+  test("denial, text, then a later tool_use → stoppedAtDenial clears (agent carried on)", () => {
+    let s = initPermissionDenialState();
+    ({ state: s } = advancePermissionDenialState(s, denialMsg));
+    ({ state: s } = advancePermissionDenialState(s, textMsg("That was denied; reading the file instead.")));
+    ({ state: s } = advancePermissionDenialState(s, toolUseMsg("Read")));
+    assert.equal(s.stoppedAtDenial, false);
+    assert.equal(s.hadPermissionDenial, true, "the history flag still records the denial");
+  });
+
+  test("recovered, then denied again and stopped → stoppedAtDenial set again", () => {
+    let s = initPermissionDenialState();
+    ({ state: s } = advancePermissionDenialState(s, denialMsg));
+    ({ state: s } = advancePermissionDenialState(s, textMsg("Trying another way.")));
+    ({ state: s } = advancePermissionDenialState(s, toolUseMsg("Read")));
+    ({ state: s } = advancePermissionDenialState(s, denialMsg));
+    ({ state: s } = advancePermissionDenialState(s, textMsg("Denied again, stopping.")));
+    assert.equal(s.stoppedAtDenial, true);
   });
 
   test("empty / whitespace text doesn't overwrite lastAssistantText (preserves real intent)", () => {

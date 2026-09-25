@@ -291,6 +291,7 @@ export function makeMockDeps(opts: MockDepsOptions = {}): { deps: DispatchDeps; 
     terminalReason: "stop",
     rawResult: {},
     hadPermissionDenial: false,
+    stoppedAtDenial: false,
     deniedOpContent: null,
     lastAssistantText: null,
     timedOut: false,
@@ -1811,6 +1812,7 @@ function streamResult(overrides: Partial<StreamResult> = {}): StreamResult {
     terminalReason: "stop",
     rawResult: {},
     hadPermissionDenial: false,
+    stoppedAtDenial: false,
     deniedOpContent: null,
     lastAssistantText: null,
     timedOut: false,
@@ -2125,6 +2127,53 @@ describe("handleAgentResultErrors", () => {
     // Discord notify fires with the no-salvage variant.
     assert.equal(calls.discord.length, 1);
     assert.match(calls.discord[0]!, /⛔.*permission-denied/);
+  });
+
+  // pyrycode#2586: the verifier hit a denial, obeyed Layer 1 and exited
+  // cleanly (is_error=false). The isError early-return skipped the denial
+  // salvage, and the ticket got the generic missing-verdict error.
+  test("clean exit that stopped at a denial → error:<agent>:permission_denied, not the success path", async () => {
+    const { ctx, client } = makeTestContext({
+      item: { issueNumber: 312 },
+      mockOptions: { execImpls: { "git status --porcelain": () => "" } },
+    });
+
+    const saferSalvaged = await handleAgentResultErrors(
+      streamResult({
+        isError: false,
+        terminalReason: "completed",
+        hadPermissionDenial: true,
+        stoppedAtDenial: true,
+        deniedOpContent: "Permission to use Bash with command `codex app-server generate-json-schema` has been denied.",
+        lastAssistantText: "I stopped the review before posting anything, because a command was denied.",
+      }),
+      ctx,
+    );
+
+    assert.equal(saferSalvaged, true, "must suppress the success path");
+    assert.ok(client.addLabelCalls.some((c) => c.label === "error:developer:permission_denied"));
+    assert.equal(client.comments.length, 1);
+    assert.match(client.comments[0]!.body, /Permission Denied — agent halted/);
+    assert.match(client.comments[0]!.body, /generate-json-schema/);
+  });
+
+  test("clean exit that carried on past a denial → success path, no labels", async () => {
+    const { ctx, client } = makeTestContext({ item: { issueNumber: 313 } });
+
+    const saferSalvaged = await handleAgentResultErrors(
+      streamResult({
+        isError: false,
+        terminalReason: "completed",
+        hadPermissionDenial: true,
+        stoppedAtDenial: false,
+        deniedOpContent: "Permission to use Bash with command `rm -rf /tmp/x` has been denied.",
+      }),
+      ctx,
+    );
+
+    assert.equal(saferSalvaged, false);
+    assert.equal(client.addLabelCalls.length, 0);
+    assert.equal(client.comments.length, 0);
   });
 
   test("hadPermissionDenial=true runs salvage BEFORE max_turns paths (permission_denied wins routing)", async () => {
