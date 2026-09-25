@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { config } from "dotenv";
 import { DispatchPool, candidateKey, excludeInFlight, freeSeats, resolvePollIntervalMs } from "./dispatch-pool.js";
 import { countVerdictsSince, parseVerdictArtifacts, pickVerdictPr, shouldFlagMissingVerdict } from "./verdict-guard.js";
+import { countOpenPrs, shouldFlagMissingPr } from "./pr-guard.js";
 import { resolveImportOnlyMerge } from "./merge-resolve.js";
 import { MERGE_HANDOFF_LABEL, checkMergeResolution, decideConflictRoute, mergeHandoffNote, readPendingMerge, type PendingMerge } from "./merge-handoff.js";
 
@@ -3230,6 +3231,47 @@ export async function handlePostRun(
         );
       } catch (e) {
         console.warn(`   ⚠️  Failed to post empty-branch error comment: ${e}`);
+      }
+      return { ok: false };
+    }
+  }
+
+  // PR guard: an agent whose job ends in a pull request must have opened
+  // one. Same fabric as the empty-branch guard above; the incident and the
+  // reasoning are in pr-guard.ts. A lookup failure keeps the guard quiet
+  // (count stays -1).
+  if (item.issueNumber > 0 && !saferSalvaged && agent.opensPr) {
+    let openPrs = -1;
+    try {
+      const prJson = execSync(
+        `gh pr list --head ${branchName} --state open --json number`,
+        { cwd: agentCwd, stdio: "pipe" },
+      ).toString().trim();
+      openPrs = countOpenPrs(prJson);
+    } catch (e: any) {
+      const detail = e?.stderr?.toString?.() ?? e?.message ?? String(e);
+      console.warn(`   ⚠️  PR guard skipped (could not list PRs): ${detail.slice(0, 300)}`);
+    }
+    if (shouldFlagMissingPr(agent, postLabels, openPrs)) {
+      console.error(`   ❌ ${agent.name} ended without an open PR on ${branchName} and no rework label. Treating as error:${agent.name}.`);
+      try {
+        await client.addLabel(item.issueNumber, `error:${agent.name}`);
+      } catch (e) {
+        console.warn(`   ⚠️  Failed to add error:${agent.name} label: ${e}`);
+      }
+      try {
+        await client.addComment(
+          item.issueNumber,
+          `## ⚠️ Dispatch Error: ${agent.name} ended without opening a PR\n\n` +
+          `The run exited cleanly, but \`${branchName}\` has no open pull request and the run added no \`needs-rework:*\` label. ` +
+          `A clean exit would otherwise count as a pass and carry the ticket to Done with nothing to merge, so the ticket is parked instead.\n\n` +
+          `Likely causes:\n` +
+          `- The agent started a long command in the background and ended its turn waiting for it\n` +
+          `- The \`gh pr create\` call failed and the agent did not notice\n\n` +
+          `The branch was pushed and the worktree is kept at \`${agentCwd}\`. Check that the work is finished, then either open the PR by hand and move the ticket on, or strip the \`error:${agent.name}\` label to re-dispatch.`,
+        );
+      } catch (e) {
+        console.warn(`   ⚠️  Failed to post missing-PR comment: ${e}`);
       }
       return { ok: false };
     }

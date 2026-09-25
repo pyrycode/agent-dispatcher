@@ -156,6 +156,8 @@ const BUILDER_AGENTS: AgentConfig[] = [
     producesCommits: true,
     maxTurns: 200,
     timeoutMs: 2_400_000, // 40min
+    // A clean exit must have opened the PR: see pr-guard.ts (pyrycode #2569).
+    opensPr: true,
   },
   {
     // Absorbs qa + code-review: the dispatcher runs the mechanical gates

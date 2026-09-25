@@ -2360,6 +2360,56 @@ describe("handlePostRun — failure modes", () => {
     // postLabels has needs-rework:po — that's tested in lib.test.ts.)
   });
 
+  // pyrycode#2569 (2026-09-24): the builder ended its turn before opening
+  // the PR, the run exited cleanly, and the ticket rode done:builder all the
+  // way to Done with nothing for auto-merge to merge.
+  const BUILDER = { name: "builder", column: "In Development", claudeMdPath: "builder/CLAUDE.md", usesWorktree: true, producesCommits: true, opensPr: true };
+
+  test("builder exits cleanly with no open PR → error:builder + comment + {ok:false}", async () => {
+    const client = new MockGitHubClient({ status: { 2569: "In Development" }, labels: { 2569: [] } });
+    const { ctx } = makeTestContext({
+      agent: BUILDER,
+      item: { issueNumber: 2569 },
+      client,
+      mockOptions: {
+        execImpls: {
+          "git status --porcelain": () => "",
+          "git rev-list --count main..": () => "2\n",
+          "gh pr list --head": () => "[]",
+        },
+      },
+    });
+
+    const result = await handlePostRun(STREAM_OK(), ctx, false);
+
+    assert.deepEqual(result, { ok: false });
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 2569, label: "error:builder" }]);
+    assert.match(client.comments[0]!.body, /ended without opening a PR/);
+    assert.ok(!client.addLabelCalls.some(c => c.label === "done:builder"));
+  });
+
+  test("builder exits cleanly with an open PR → done:builder as before", async () => {
+    const client = new MockGitHubClient({ status: { 2570: "In Development" }, labels: { 2570: [] } });
+    const { ctx } = makeTestContext({
+      agent: BUILDER,
+      item: { issueNumber: 2570 },
+      client,
+      mockOptions: {
+        execImpls: {
+          "git status --porcelain": () => "",
+          "git rev-list --count main..": () => "2\n",
+          "gh pr list --head": () => JSON.stringify([{ number: 2630 }]),
+        },
+      },
+    });
+
+    const result = await handlePostRun(STREAM_OK(), ctx, false);
+
+    assert.deepEqual(result, { ok: true });
+    assert.ok(client.addLabelCalls.some(c => c.label === "done:builder"));
+    assert.ok(!client.addLabelCalls.some(c => c.label === "error:builder"));
+  });
+
   test("empty branch + architect added needs-human:sizing → error:architect (a stop is now a deviation)", async () => {
     // The end-to-end mirror of the unit test in lib.test.ts. When the
     // split-depth gate meant "stop and wait for a person", an empty
