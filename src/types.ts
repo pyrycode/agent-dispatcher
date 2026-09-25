@@ -115,6 +115,16 @@ export interface AgentConfig {
    */
   requiresVerdict?: boolean;
   /**
+   * True if a clean run of this agent must leave an open pull request on
+   * `feature/<n>`, or a `needs-rework:*` label. A clean exit with neither
+   * is treated as `error:<agent>` rather than as a pass. Set on the
+   * builder set's builder after pyrycode #2569 on 2026-09-24, when a
+   * builder ended its turn before opening the PR and the ticket still
+   * reached Done. Guard and rationale in pr-guard.ts; the check runs in
+   * `handlePostRun`.
+   */
+  opensPr?: boolean;
+  /**
    * Per-agent `claude --model` override. Omit to inherit the pipeline
    * default (`opus`). Set on stages that don't need the top model —
    * e.g. QA runs mechanical gates and documentation synthesizes prose,
