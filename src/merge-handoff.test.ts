@@ -68,6 +68,15 @@ describe("merge check helpers", () => {
     assert.deepEqual(missingLines(["x = 1,", "y = 2,"], "        x = 1,\n"), ["y = 2,"]);
   });
 
+  test("a line a formatter realigned still counts (pyrycode #2586)", () => {
+    // gofmt widens a struct literal's alignment when the branch adds a
+    // longer field name; main's lines survive with only their spacing changed.
+    const diff = "+++ b/codex_runner.go\n+\t\t\tBinary:   bin,\n+\t\t\tHome:     h.home,\n";
+    const merged = "\t\t\tBinary:         bin,\n\t\t\tHome:           h.home,\n\t\t\tPermissionMode: cfg.PermissionMode,\n";
+    assert.deepEqual(missingLines(addedLines(diff), merged), []);
+    assert.deepEqual(missingLines(addedLines(diff), "\t\t\tBinary:         bin,\n"), ["Home: h.home,"]);
+  });
+
   test("the prompt note names every conflicted file and the commit step", () => {
     const note = mergeHandoffNote("main", ["a/Thread.kt", "res/strings.xml"]);
     assert.match(note, /Finish the merge of `main` first/);

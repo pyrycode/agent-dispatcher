@@ -118,12 +118,20 @@ export function readPendingMerge(cwd: string, deps: MergeHandoffDeps): PendingMe
   }
 }
 
-/** The non-blank lines a unified diff adds, trimmed. */
+/**
+ * A line as the merge check compares it: trimmed, with every run of inner
+ * whitespace collapsed to one space. A formatter that realigns a block
+ * (gofmt widening a struct literal for a longer field name) changes only
+ * spacing, and must not read as lost lines (pyrycode #2586).
+ */
+export const normalizeLine = (line: string) => line.trim().replace(/\s+/g, " ");
+
+/** The non-blank lines a unified diff adds, normalized. */
 export function addedLines(diff: string): string[] {
   return diff
     .split("\n")
     .filter((l) => l.startsWith("+") && !l.startsWith("+++"))
-    .map((l) => l.slice(1).trim())
+    .map((l) => normalizeLine(l.slice(1)))
     .filter((l) => l !== "");
 }
 
@@ -132,9 +140,9 @@ export function hasConflictMarkers(text: string): boolean {
   return text.split("\n").some((l) => /^(<{7}|>{7})(?: |\r?$)/.test(l));
 }
 
-/** The lines of `required` that `text` no longer holds, compared trimmed. */
+/** The lines of `required` that `text` no longer holds, compared normalized. */
 export function missingLines(required: readonly string[], text: string): string[] {
-  const present = new Set(text.split("\n").map((l) => l.trim()));
+  const present = new Set(text.split("\n").map(normalizeLine));
   return [...new Set(required)].filter((l) => !present.has(l));
 }
 
@@ -153,7 +161,7 @@ function tokensWithin(part: readonly string[], whole: readonly string[]): boolea
  * either. What remains was lost, not merged.
  */
 export function uncombinedLines(missing: readonly string[], branchAdded: readonly string[], text: string): string[] {
-  const lines = text.split("\n").map((l) => l.trim());
+  const lines = text.split("\n").map(normalizeLine);
   const present = new Set(lines);
   const vanished = branchAdded.filter((l) => !present.has(l)).map(tokens);
   if (vanished.length === 0) return [...missing];
