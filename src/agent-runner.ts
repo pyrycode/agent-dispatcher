@@ -136,7 +136,7 @@ export class CodexStreamAdapter {
       // all human-facing cost reports say unavailable, not a measured zero.
       totalCostUsd: 0, durationMs, usage: this.usage, terminalReason,
       rawResult: { is_error: isError, subtype: isError ? terminalReason : "success", result: isError ? failure : outcome!.summary },
-      hadPermissionDenial: this.approvalRejected, deniedOpContent: null,
+      hadPermissionDenial: this.approvalRejected, stoppedAtDenial: false, deniedOpContent: null,
       lastAssistantText: this.lastText || null, timedOut,
     };
   }

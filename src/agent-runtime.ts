@@ -969,6 +969,10 @@ export function detectPermissionDenial(msg: unknown): { content: string } | null
  *   driver SIGTERMs the child — Layer 1 missed; Layer 2 enforces the
  *   stop. If it's text-only (clean Layer 1 exit), the watchdog clears
  *   silently and the stream winds down on its own.
+ * - `stoppedAtDenial` is true while no `tool_use` has followed the most
+ *   recent denial. At stream end it says whether the agent stopped at a
+ *   denial or carried on past it. A clean exit only routes as
+ *   permission-denied when it stopped there (pyrycode#2586).
  * - `deniedContent` captures the first denial's `tool_result.content`
  *   so the post-run comment can quote the denied op back to the operator.
  * - `lastAssistantText` is the most recent assistant text block (the
@@ -978,6 +982,7 @@ export function detectPermissionDenial(msg: unknown): { content: string } | null
 export interface PermissionDenialState {
   hadPermissionDenial: boolean;
   watchdogPending: boolean;
+  stoppedAtDenial: boolean;
   deniedContent: string | null;
   lastAssistantText: string | null;
 }
@@ -986,6 +991,7 @@ export function initPermissionDenialState(): PermissionDenialState {
   return {
     hadPermissionDenial: false,
     watchdogPending: false,
+    stoppedAtDenial: false,
     deniedContent: null,
     lastAssistantText: null,
   };
@@ -1035,6 +1041,7 @@ export function advancePermissionDenialState(
         // force-exit lands.
         deniedContent: state.deniedContent ?? denial.content,
         watchdogPending: true,
+        stoppedAtDenial: true,
       },
       action: "logDenial",
     };
@@ -1061,7 +1068,7 @@ export function advancePermissionDenialState(
   if (state.watchdogPending && sawToolUse) {
     // Workaround attempt — Layer 1 missed. Force-exit.
     return {
-      state: { ...state, lastAssistantText: lastText, watchdogPending: false },
+      state: { ...state, lastAssistantText: lastText, watchdogPending: false, stoppedAtDenial: false },
       action: "forceExit",
     };
   }
@@ -1074,7 +1081,7 @@ export function advancePermissionDenialState(
     };
   }
   return {
-    state: { ...state, lastAssistantText: lastText },
+    state: { ...state, lastAssistantText: lastText, stoppedAtDenial: state.stoppedAtDenial && !sawToolUse },
     action: "none",
   };
 }

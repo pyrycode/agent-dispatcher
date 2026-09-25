@@ -121,6 +121,7 @@ function makeStreamResult(terminalReason: string): StreamResult {
     terminalReason,
     rawResult: {},
     hadPermissionDenial: false,
+    stoppedAtDenial: false,
     deniedOpContent: null,
     lastAssistantText: null,
     timedOut: false,

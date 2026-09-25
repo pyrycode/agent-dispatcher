@@ -414,6 +414,10 @@ export interface StreamResult {
    * `error:<agent>:permission_denied` label + tailored salvage comment.
    */
   hadPermissionDenial: boolean;
+  /** True when the run ended with no tool use after its most recent
+   *  denial: the agent stopped there rather than carrying on. A clean
+   *  exit with this set routes to the permission-denied path. */
+  stoppedAtDenial: boolean;
   /** The `tool_result.content` of the first permission denial — typically
    *  `"Permission to use Bash with command <cmd> has been denied."`.
    *  Null when no denial fired. Used to quote the denied op in the
@@ -905,6 +909,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
           terminalReason: r.terminal_reason || "",
           rawResult: r,
           hadPermissionDenial: denialState.hadPermissionDenial,
+          stoppedAtDenial: denialState.stoppedAtDenial,
           deniedOpContent: denialState.deniedContent,
           lastAssistantText: denialState.lastAssistantText,
           timedOut,
@@ -928,6 +933,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
           terminalReason: "permission_denied",
           rawResult: {},
           hadPermissionDenial: true,
+          stoppedAtDenial: denialState.stoppedAtDenial,
           deniedOpContent: denialState.deniedContent,
           lastAssistantText: denialState.lastAssistantText,
           timedOut,
@@ -2850,6 +2856,10 @@ export async function maybeResumeExhaustedRun(
 //      orchestrator suppresses done:<agent>, success-comment wording,
 //      and the success Discord notify.
 //
+// A clean exit (isError=false) comes through too when the agent stopped
+// at a permission denial, so it reaches the permission-denial salvage
+// instead of the success path (pyrycode#2586).
+//
 // If neither path applies, throws to the outer catch handler. Path
 // order matters: the PR-already-exists check has to run first because
 // the safer-salvage path explicitly skips drafts.
@@ -2857,7 +2867,7 @@ export async function handleAgentResultErrors(
   streamResult: StreamResult,
   ctx: DispatchContext,
 ): Promise<boolean> {
-  if (!streamResult.isError) return false;
+  if (!streamResult.isError && !streamResult.stoppedAtDenial) return false;
   // A blocked task is never salvaged automatically, including a shutdown
   // timeout after its final outcome. Salvage could repeat a rejected action.
   if (streamResult.runner === "codex" && streamResult.terminalReason === "codex_blocked") {
