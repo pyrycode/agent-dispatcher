@@ -1854,6 +1854,9 @@ export function isPipelineLabelForAgent(label: string, agentName: string): boole
 export const GLOBAL_BLOCK_LABELS: ReadonlySet<string> = new Set([
   "error:max_turns_salvaged",
   "error:merge-conflict",
+  // Rework routing leaves the ticket in its current column at the threshold.
+  // Block that column's agent too, or it reviews the same branch every cycle.
+  "error:rework-loop",
   // The family circuit breaker's park switch, applied to the family ROOT.
   // Membership here blocks the root itself; descendants are vetoed through
   // the parent chain by shouldSkipDispatch's rootLabels arm. See the

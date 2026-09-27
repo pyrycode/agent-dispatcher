@@ -374,6 +374,19 @@ describe("shouldSkipDispatch", () => {
     }
   });
 
+  test("error:rework-loop blocks all agents while the ticket awaits human triage", () => {
+    for (const agent of AGENTS) {
+      assert.equal(shouldSkipDispatch(["error:rework-loop"], agent.name), true);
+    }
+    assert.equal(
+      shouldSkipDispatch(
+        ["done:builder", "needs-rework:builder", "rework-count:3", "error:rework-loop"],
+        "verifier",
+      ),
+      true,
+    );
+  });
+
   test("needs-human:sizing does NOT block dispatch — it is a marker, not a gate", () => {
     // Design change, same day it was introduced. The label was briefly a
     // global block, on the reading that an agent hitting the split-depth
@@ -2704,6 +2717,19 @@ describe("selectDispatches", () => {
     });
     assert.equal(r.length, 1);
     assert.equal(r[0].item.issueNumber, 4);
+  });
+
+  test("a rework-loop halt prevents another review dispatch on the same ticket", () => {
+    const r = selectDispatches({
+      itemsByColumn: new Map([
+        ["In Code Review", [
+          item(2671, ["done:builder", "needs-rework:builder", "rework-count:3", "error:rework-loop"]),
+        ]],
+      ]),
+      pollOrder: POLL_ORDER,
+      maxConcurrent: 2,
+    });
+    assert.deepEqual(r, []);
   });
 
   test("OPEN blocker → skipped for ALL agents including PO (post-2026-05-08 flip)", () => {
