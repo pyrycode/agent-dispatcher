@@ -158,7 +158,7 @@ export function codexChildEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 
 export const CODEX_ROLE_GUIDANCE = `
 This dispatch uses Codex. Apply the role instructions above with these runtime adaptations:
-- The selected Codex model and effort come from Codex configuration. Claude model names and max-turn counts do not apply. The dispatcher enforces a wall-clock budget. There is no automatic continuation for Codex.
+- The Codex model defaults to GPT-6 Sol, with optional dispatcher model and effort overrides. Effort otherwise comes from Codex configuration. Claude model names and max-turn counts do not apply. The dispatcher enforces a wall-clock budget. There is no automatic continuation for Codex.
 - Use available Codex tools. Claude MCP names and tool allowlists do not configure Codex. If a named search tool is unavailable, use repository files and command-line search.
 - Stay within this role's allowed files and assigned ticket. Git commits, pushes, and GitHub changes explicitly required by the assigned role are part of the task. Do not change unrelated tickets, host credentials, or sandbox policy.
 - Ordinary sandbox restrictions can be escalated through automatic approval review. If the reviewer rejects a necessary action, stop and report status blocked. Do not work around rejection.
