@@ -7275,7 +7275,7 @@ test("Codex spawn selection does not inherit Claude model overrides", async () =
     const result = await prepareAgentSpawn(ctx);
     assert.ok(result.ok);
     assert.equal(result.config.runner, "codex");
-    assert.equal(result.config.model, "");
+    assert.equal(result.config.model, "gpt-6-sol");
     assert.equal(result.config.effort, "");
     process.env.PYRY_CODEX_MODEL = "selected-codex-model";
     process.env.PYRY_CODEX_EFFORT = "medium";
