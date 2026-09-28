@@ -160,7 +160,7 @@ While that suite is running, the ticket carries `wip:real-claude-gate`. The disp
 | pass | → In Documentation | removes `needs-real-claude` | no |
 | flaky: every failure passed on a same-tree re-run | → In Documentation | removes `needs-real-claude` | yes, naming the flaky tests |
 | fail | → In Development | adds the set's fail rework label (`needs-rework:developer` classic, `needs-rework:builder` builder), **keeps** `needs-real-claude` | no |
-| failures the branch inherited | stays in Inbox | adds `error:real-claude-gate` | yes |
+| failures the branch inherited | → In Development | adds the set's fail rework label, **keeps** `needs-real-claude` | yes, naming the main-branch failures |
 | nothing executed | stays in Inbox | adds `error:real-claude-gate` | yes |
 | no usable result | stays in Inbox | adds `error:real-claude-gate` | yes |
 
@@ -168,9 +168,9 @@ While that suite is running, the ticket carries `wip:real-claude-gate`. The disp
 
 **Every flaky test gets a ticket.** Letting a flake through is right for the ticket and leaves the suite's problem untracked: nobody is blamed, so nobody files anything. On pyrycode-mobile, 2026-09-24, a second-client bug behind several flakes went a whole day with no ticket that way. So after the gated ticket's own writes, each flaky test gets one open `flaky-test` ticket in Backlog, labelled `bug`. A hidden marker line in its body, `<!-- flaky-test: <full test name> -->`, lets later runs find it, and each later flake adds a comment instead of filing again, so the comments count the occurrences. Closing the ticket means the next flake files a fresh one. A run files at most five new tickets, since more flakes than that points at the environment; the rest are logged. To route an existing hand-filed ticket's flakes to it, add the label and the marker line to its body.
 
-**The base comparison, and why it exists.** On the gate's first live run, 2026-08-07, a ticket came back with 519 passed and 2 failed and was routed to the developer agent. Both failures reproduced identically on clean `main` and neither touched the ticket's subject. Without a baseline the gate cannot tell "this branch broke it" from "it was already broken", so it hands an agent work it did not cause and cannot fix, burning rework attempts until the breaker halts it.
+**The base comparison, and why it exists.** On the gate's first live run, 2026-08-07, a ticket came back with 519 passed and 2 failed. Both failures reproduced identically on clean `main` and neither touched the ticket's subject. The comparison records whether the ticket introduced a failure so rework does not misattribute it. Since 2026-09-28, a trustworthy red test run still routes to rework even when main is also red; `error:real-claude-gate` is reserved for a run the gate could not judge.
 
-So when a run fails with named tests, the gate re-runs **only those tests** against the base commit alone, unmerged, in a second detached worktree. Tests red on both sides are reported as inherited and the ticket parks for a human; only tests green on the base and red on the branch route as rework. Set it up as:
+So when a run fails with named tests, the gate re-runs **only those tests** against the base commit alone, unmerged, in a second detached worktree. Tests red on both sides are reported as inherited in the evidence and Discord warning. The ticket goes to rework either way. Set it up as:
 
 ```sh
 PYRY_REAL_CLAUDE_GATE_BASELINE_CMD='go test -tags e2e_realclaude -timeout 20m -json -run {{TESTS}} ./internal/e2e/realclaude/...'
@@ -178,7 +178,7 @@ PYRY_REAL_CLAUDE_GATE_BASELINE_CMD='go test -tags e2e_realclaude -timeout 20m -j
 
 Do not quote `{{TESTS}}` yourself; the substituted filter brings its own quoting. Two refusals are deliberate. A name containing anything outside a conservative character set refuses the whole filter rather than dropping that name, because a partial filter compares different test sets on the two sides. And a base run that executes nothing, the same false green the gate exists to reject, is discarded rather than treated as exoneration. In both cases `baselineFailures` stays null and the failures remain the branch's, since **a missing baseline is not an exoneration**.
 
-A failure keeps `needs-real-claude` so the ticket must pass the gate again after the fix; `runReworkRouting` strips the stale `done:*` trail and brings its three-strike breaker along. Environment failures park rather than routing to the developer agent, which could not fix a missing credential and would burn three spawns discovering that. The `error:` prefix already excludes a ticket from the WIP count and from gate re-selection, so the park is self-limiting.
+A failure keeps `needs-real-claude` so the ticket must pass the gate again after the fix; `runReworkRouting` strips the stale `done:*` trail and brings its three-strike breaker along. Failures reproduced on main also route to rework, with the baseline result recorded so the agent knows the ticket branch did not introduce them. An environment failure or unusable report parks instead of routing to the developer agent, which could not fix a missing credential and would burn three spawns discovering that. The `error:` prefix excludes a parked ticket from the WIP count and from gate re-selection.
 
 **The command must emit a per-test report.** For Go that means:
 
