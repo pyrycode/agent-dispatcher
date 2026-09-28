@@ -149,6 +149,8 @@ In the classic set this feature is entirely inert (locked by test): no gate runs
 
 Some tickets can only be accepted by running against real claude rather than the pipeline's fakes. The PO marks them `needs-real-claude` during refinement. After code review such a ticket is parked in Inbox, and if this fork sets `PYRY_REAL_CLAUDE_GATE_CMD` the dispatcher then runs the suite itself, once per cycle, before it picks any other ticket.
 
+While that suite is running, the ticket carries `wip:real-claude-gate`. The dispatcher removes it when the run finishes, whether the result passes, fails, or needs human attention. A ticket with any `wip:` label is not selected for another gate run. The existing stranded-running-label sweep clears a marker left by an interrupted process after its safety delay.
+
 **What it does per run.** Fetches, resolves the branch from `origin` only, records how many commits behind the base branch it is, probes for conflicts with `git merge-tree --write-tree` before touching the disk, creates a **detached** worktree at the head commit, merges the base branch into it, runs the command, then judges by reading the output file back off disk. The worktree is removed either way. Both log files end in `.log`, so the existing rotation sweeps them.
 
 **Outcomes.**

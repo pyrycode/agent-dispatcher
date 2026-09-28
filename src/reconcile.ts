@@ -31,6 +31,7 @@ import {
   MANUAL_ADVANCE_GATES,
   REAL_CLAUDE_GATE_FROM_COLUMN,
   REAL_CLAUDE_GATE_LABEL,
+  REAL_CLAUDE_GATE_RUNNING_LABEL,
   REAL_CLAUDE_GATE_RUN_FROM_COLUMN,
   REWORK_LOOP_THRESHOLD,
   decideAutoAdvance,
@@ -528,38 +529,45 @@ export async function runRealClaudeGateExecution(
     `   🧪 Real-claude gate: running the live suite for #${candidate.issueNumber} (this blocks the cycle)…`,
   );
 
-  let report: GateRunReport;
   try {
-    report = await runner({ issueNumber: candidate.issueNumber });
-  } catch (error: any) {
-    // A runner that throws must still park the ticket. Letting the
-    // exception escape would leave the card sitting in Inbox with no
-    // error label, so the next cycle would pick it up and throw again —
-    // an invisible loop that burns a full suite's wall clock each time.
-    report = {
-      runError: `gate runner threw: ${error?.message ?? error}`,
-      timedOut: false,
-      exitCode: null,
-      tally: null,
-      command: "(runner threw before reporting the command)",
-      branchName: `feature/${candidate.issueNumber}`,
-      baseRef: "unknown",
-      baseSha: "",
-      headSha: "",
-      commitsBehind: null,
-      durationMs: 0,
-      outputPath: "(none)",
-      outputBytes: 0,
-      baselineFailures: null,
-      baselineSkipReason: "the runner threw before any comparison could run",
-      baselineOutputPath: null,
-      rerunFailures: null,
-      rerunSkipReason: "the runner threw before any re-run could happen",
-      rerunOutputPath: null,
-    };
+    await client.addLabel(candidate.issueNumber, REAL_CLAUDE_GATE_RUNNING_LABEL);
+  } catch (error) {
+    console.warn(`   ⚠️  Real-claude gate: could not mark #${candidate.issueNumber} as running, skipping this cycle: ${error}`);
+    return false;
   }
 
   try {
+    let report: GateRunReport;
+    try {
+      report = await runner({ issueNumber: candidate.issueNumber });
+    } catch (error: any) {
+      // A runner that throws must still park the ticket. Letting the
+      // exception escape would leave the card sitting in Inbox with no
+      // error label, so the next cycle would pick it up and throw again —
+      // an invisible loop that burns a full suite's wall clock each time.
+      report = {
+        runError: `gate runner threw: ${error?.message ?? error}`,
+        timedOut: false,
+        exitCode: null,
+        tally: null,
+        command: "(runner threw before reporting the command)",
+        branchName: `feature/${candidate.issueNumber}`,
+        baseRef: "unknown",
+        baseSha: "",
+        headSha: "",
+        commitsBehind: null,
+        durationMs: 0,
+        outputPath: "(none)",
+        outputBytes: 0,
+        baselineFailures: null,
+        baselineSkipReason: "the runner threw before any comparison could run",
+        baselineOutputPath: null,
+        rerunFailures: null,
+        rerunSkipReason: "the runner threw before any re-run could happen",
+        rerunOutputPath: null,
+      };
+    }
+
     const raw = decideGateVerdict({
       runError: report.runError,
       timedOut: report.timedOut,
@@ -687,6 +695,11 @@ export async function runRealClaudeGateExecution(
       );
     }
   } finally {
+    try {
+      await client.removeLabel(candidate.issueNumber, REAL_CLAUDE_GATE_RUNNING_LABEL);
+    } catch (error) {
+      console.warn(`   ⚠️  Real-claude gate: could not clear the running label on #${candidate.issueNumber}: ${error}`);
+    }
     // Unconditionally, not just on mutation. The board snapshot this cycle
     // started with is now minutes old — a full suite is 300s-plus — and
     // ticket selection still runs after this step. Even a run that changed

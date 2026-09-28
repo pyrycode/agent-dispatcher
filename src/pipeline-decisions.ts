@@ -515,6 +515,8 @@ export function decideUnroutableRework(
  * and the park-for-operator behaviour is exactly what it was.
  */
 export const REAL_CLAUDE_GATE_LABEL = "needs-real-claude";
+/** Visible only while the dispatcher is executing the live suite. */
+export const REAL_CLAUDE_GATE_RUNNING_LABEL = "wip:real-claude-gate";
 
 /**
  * The column the gate fires from: the last stage before Done that the
@@ -632,9 +634,9 @@ export interface RealClaudeGateRunCandidate {
  * Eligibility mirrors the rest of the pipeline: review finished (the stage
  * set's review done label — classic default `done:code-review`), the gate
  * is wanted (`needs-real-claude`), nothing is
- * already wrong (`error:*`), no rework is pending (`needs-rework:*`), and no
- * blocker is open. Excluding `error:*` is what stops a ticket the gate
- * already parked from being re-selected forever.
+ * already wrong (`error:*`), no rework is pending (`needs-rework:*`), no run
+ * is marked active (`wip:*`), and no blocker is open. Excluding `error:*`
+ * stops a ticket the gate already parked from being re-selected forever.
  *
  * Input order is the board's own ordering (`POSITION` ascending), which is
  * the user's prioritisation signal. First eligible wins; don't re-sort.
@@ -647,7 +649,7 @@ export function decideRealClaudeGateRun(
     if (item.issueNumber <= 0) continue;
     if (!item.labels.includes(reviewDoneLabel)) continue;
     if (!item.labels.includes(REAL_CLAUDE_GATE_LABEL)) continue;
-    if (item.labels.some(l => l.startsWith("error:") || l.startsWith("needs-rework:"))) continue;
+    if (item.labels.some(l => l.startsWith("error:") || l.startsWith("needs-rework:") || l.startsWith("wip:"))) continue;
     if (hasOpenBlockers(item.blockedBy ?? [])) continue;
     return { itemId: item.id, issueNumber: item.issueNumber };
   }

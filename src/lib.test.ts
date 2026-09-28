@@ -4749,6 +4749,12 @@ describe("decideRealClaudeGateRun", () => {
     ]), null);
   });
 
+  test("skips a ticket marked as running", () => {
+    assert.equal(decideRealClaudeGateRun([
+      item({ labels: ["done:code-review", "needs-real-claude", "wip:real-claude-gate"] }),
+    ]), null);
+  });
+
   test("skips a ticket with an open blocker", () => {
     assert.equal(decideRealClaudeGateRun([
       item({ blockedBy: [{ number: 99, state: "OPEN" }] }),
