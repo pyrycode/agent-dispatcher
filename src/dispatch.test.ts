@@ -100,6 +100,7 @@ import { resolveAgentsRepoRoot, resolveTargetRepoRoot } from "./worktree.js";
 // with withStageSet or by setting the variable.
 delete process.env.PYRY_STAGE_SET;
 delete process.env.PYRY_BUDGET_SCALE;
+delete process.env.PYRY_EFFORT_POLICY;
 resetActiveStageSetForTests();
 
 // Recompute agentsRepoRoot the same way dispatch.ts does so test
@@ -7284,6 +7285,42 @@ test("Codex spawn selection does not inherit Claude model overrides", async () =
     assert.ok(selected.ok);
     assert.equal(selected.config.model, "selected-codex-model");
     assert.equal(selected.config.effort, "medium");
+  } finally {
+    for (const k of keys) {
+      if (previous[k] === undefined) delete process.env[k]; else process.env[k] = previous[k];
+    }
+  }
+});
+
+test("effort trial reaches both runners and records the actual selection without changing models", async () => {
+  const keys = ["PYRY_EFFORT_POLICY", "PYRY_AGENT_RUNNER", "PYRY_CODEX_MODEL", "PYRY_CODEX_EFFORT"] as const;
+  const previous = Object.fromEntries(keys.map(k => [k, process.env[k]]));
+  try {
+    process.env.PYRY_EFFORT_POLICY = "role-risk-v1";
+    delete process.env.PYRY_CODEX_MODEL;
+    delete process.env.PYRY_CODEX_EFFORT;
+    await withStageSet("builder", async () => {
+      for (const runner of ["claude", "codex"]) {
+        process.env.PYRY_AGENT_RUNNER = runner;
+        for (const [name, expected] of [["refiner", "medium"], ["builder", "medium"], ["verifier", "high"], ["documentation", "low"]]) {
+          const agent = builderAgent(name);
+          const { ctx, calls } = makeTestContext({
+            agent,
+            item: { body: "## Effort assessment\nRisk: routine\nReason: Clear local change.\n", labels: [] },
+            mockOptions: { fsMap: { [claudeMdAbsPath(agent.claudeMdPath)]: "role" } },
+          });
+          const result = await prepareAgentSpawn(ctx);
+          assert.ok(result.ok);
+          assert.equal(result.config.effort, expected);
+          assert.equal(result.config.model, runner === "codex" ? "gpt-6-sol" : agent.model ?? "opus");
+          const log = calls.logs.find(l => l.section === "DISPATCH")!;
+          assert.match(log.content, /Effort policy: role-risk-v1/);
+          assert.ok(log.content.includes(`Effort: ${expected}\n`));
+          assert.match(log.content, /Effort reason:/);
+          assert.equal(calls.claudeStreams, 0, "spawn preparation must not run an agent");
+        }
+      }
+    });
   } finally {
     for (const k of keys) {
       if (previous[k] === undefined) delete process.env[k]; else process.env[k] = previous[k];

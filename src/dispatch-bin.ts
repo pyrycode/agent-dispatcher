@@ -25,6 +25,7 @@ import { dispatchInbox, installSignalHandlers, pollLoop } from "./dispatch.js";
 import { decideCodegraphHealth, findMissingAgentClaudeMds } from "./agent-runtime.js";
 import { resolveAgentRunner, resolveCodexExecutable } from "./agent-runner.js";
 import { activeStageSet, type StageSet } from "./stage-sets.js";
+import { validateEffortPolicy } from "./effort-policy.js";
 import { resolveAgentsRepoRootWithEnv, resolveTargetRepoRoot } from "./worktree.js";
 
 // Validate required environment variables. dispatch.ts loads .env at
@@ -53,6 +54,7 @@ if (isNaN(parseInt(process.env.PROJECT_NUMBER!, 10))) {
 let stageSet: StageSet;
 try {
   stageSet = activeStageSet();
+  validateEffortPolicy(process.env.PYRY_EFFORT_POLICY, stageSet.name);
   if (resolveAgentRunner(process.env) === "codex") {
     process.env.PYRY_CODEX_BIN = resolveCodexExecutable(process.env);
     console.log(`Codex executable: ${process.env.PYRY_CODEX_BIN}`);
