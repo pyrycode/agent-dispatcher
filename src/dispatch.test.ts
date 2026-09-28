@@ -5539,10 +5539,11 @@ describe("runRealClaudeGateSuite — evidence gathering", () => {
 
   test("names both log files with a .log suffix so rotation sweeps them", async () => {
     const { run, spawnRequests } = gateRun();
-    await run();
+    const report = await run();
     assert.match(spawnRequests[0].stdoutPath, /\.log$/);
     assert.match(spawnRequests[0].stderrPath, /\.log$/);
     assert.notEqual(spawnRequests[0].stdoutPath, spawnRequests[0].stderrPath);
+    assert.equal(report.stderrPath, spawnRequests[0].stderrPath);
   });
 });
 
