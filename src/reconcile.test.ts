@@ -24,6 +24,7 @@ import {
 import type { GateRunReport, GateTally } from "./gate-output.js";
 import type { ProjectItem } from "./types.js";
 import { resetActiveStageSetForTests } from "./stage-sets.js";
+import { REAL_CLAUDE_GATE_RUNNING_LABEL } from "./pipeline-decisions.js";
 
 /**
  * Minimal in-memory ReconcileClient. Records every call to
@@ -580,6 +581,33 @@ describe("runRealClaudeGateExecution — selection", () => {
     assert.deepEqual(ran, [1382], "expected exactly one gate run, on the first ticket in board order");
   });
 
+  test("shows the running label only while the live suite is executing", async () => {
+    const item = parkedItem();
+    const client = new MockClient([item]);
+    await runRealClaudeGateExecution(client, async () => {
+      assert.ok(item.labels.includes(REAL_CLAUDE_GATE_RUNNING_LABEL));
+      assert.equal(item.status, "Inbox");
+      return report();
+    }, 150, async () => {});
+    assert.ok(!item.labels.includes(REAL_CLAUDE_GATE_RUNNING_LABEL));
+  });
+
+  test("does not start the suite when its running label cannot be written", async () => {
+    const client = new MockClient([parkedItem()]);
+    client.addLabel = async () => { throw new Error("GitHub unavailable"); };
+    let ran = false;
+    await runRealClaudeGateExecution(client, async () => { ran = true; return report(); }, 150, async () => {});
+    assert.equal(ran, false);
+    assert.equal(client.addCommentCalls.length, 0);
+  });
+
+  test("waits for stale running labels to be cleared before retrying", async () => {
+    const client = new MockClient([parkedItem({ labels: ["done:code-review", "needs-real-claude", REAL_CLAUDE_GATE_RUNNING_LABEL] })]);
+    let ran = false;
+    await runRealClaudeGateExecution(client, async () => { ran = true; return report(); }, 150, async () => {});
+    assert.equal(ran, false);
+  });
+
   test("skips a ticket the FRESH label read disqualifies", async () => {
     // The board snapshot asks GitHub for `labels(first: 10)`, and a ticket
     // this far down the pipeline can carry ten already — so the snapshot can
@@ -681,8 +709,8 @@ describe("runRealClaudeGateExecution — outcomes", () => {
     await runRealClaudeGateExecution(client, async () => report(), 150, async () => {});
 
     assert.deepEqual(client.updateItemStatusCalls, [{ itemId: "item-1382", newStatus: "In Documentation" }]);
-    assert.deepEqual(client.removeLabelCalls, [{ issueNumber: 1382, label: "needs-real-claude" }]);
-    assert.equal(client.addLabelCalls.length, 0);
+    assert.deepEqual(client.removeLabelCalls, [{ issueNumber: 1382, label: "needs-real-claude" }, { issueNumber: 1382, label: REAL_CLAUDE_GATE_RUNNING_LABEL }]);
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1382, label: REAL_CLAUDE_GATE_RUNNING_LABEL }]);
     assert.equal(item.status, "In Documentation");
   });
 
@@ -699,8 +727,8 @@ describe("runRealClaudeGateExecution — outcomes", () => {
     await runRealClaudeGateExecution(client, async () => failing, 150, async () => {});
 
     assert.deepEqual(client.updateItemStatusCalls, [{ itemId: "item-1382", newStatus: "In Development" }]);
-    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1382, label: "needs-rework:developer" }]);
-    assert.equal(client.removeLabelCalls.length, 0, "needs-real-claude must survive a failure");
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1382, label: REAL_CLAUDE_GATE_RUNNING_LABEL }, { issueNumber: 1382, label: "needs-rework:developer" }]);
+    assert.deepEqual(client.removeLabelCalls, [{ issueNumber: 1382, label: REAL_CLAUDE_GATE_RUNNING_LABEL }]);
     assert.ok(item.labels.includes("needs-real-claude"));
   });
 
@@ -721,8 +749,8 @@ describe("runRealClaudeGateExecution — outcomes", () => {
     await runRealClaudeGateExecution(client, async () => flaky, 150, async (m) => { notifications.push(m); });
 
     assert.deepEqual(client.updateItemStatusCalls, [{ itemId: "item-1382", newStatus: "In Documentation" }]);
-    assert.deepEqual(client.removeLabelCalls, [{ issueNumber: 1382, label: "needs-real-claude" }]);
-    assert.equal(client.addLabelCalls.length, 0, "no rework label, no error label");
+    assert.deepEqual(client.removeLabelCalls, [{ issueNumber: 1382, label: "needs-real-claude" }, { issueNumber: 1382, label: REAL_CLAUDE_GATE_RUNNING_LABEL }]);
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1382, label: REAL_CLAUDE_GATE_RUNNING_LABEL }], "no rework label, no error label");
     assert.equal(notifications.length, 1, "the flake gets a human's attention");
     assert.match(notifications[0], /TestLiveness/);
     assert.match(client.addCommentCalls[0]?.body ?? "", /passed when re-run on the same merged tree/);
@@ -788,8 +816,8 @@ describe("runRealClaudeGateExecution — outcomes", () => {
 
     assert.equal(client.updateItemStatusCalls.length, 0, "must not move the ticket anywhere");
     assert.equal(item.status, "Inbox");
-    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1382, label: "error:real-claude-gate" }]);
-    assert.equal(client.removeLabelCalls.length, 0);
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1382, label: REAL_CLAUDE_GATE_RUNNING_LABEL }, { issueNumber: 1382, label: "error:real-claude-gate" }]);
+    assert.deepEqual(client.removeLabelCalls, [{ issueNumber: 1382, label: REAL_CLAUDE_GATE_RUNNING_LABEL }]);
     assert.equal(notifications.length, 1, "a gate that cannot judge must ping a human");
   });
 
@@ -805,7 +833,7 @@ describe("runRealClaudeGateExecution — outcomes", () => {
     );
 
     assert.equal(client.updateItemStatusCalls.length, 0);
-    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1382, label: "error:real-claude-gate" }]);
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1382, label: REAL_CLAUDE_GATE_RUNNING_LABEL }, { issueNumber: 1382, label: "error:real-claude-gate" }]);
     assert.equal(notifications.length, 1);
   });
 
@@ -823,7 +851,7 @@ describe("runRealClaudeGateExecution — outcomes", () => {
       async (m) => { notifications.push(m); },
     );
 
-    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1382, label: "error:real-claude-gate" }]);
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1382, label: REAL_CLAUDE_GATE_RUNNING_LABEL }, { issueNumber: 1382, label: "error:real-claude-gate" }]);
     assert.equal(notifications.length, 1);
     assert.match(client.addCommentCalls[0]?.body ?? "", /worktree exploded/);
   });
@@ -964,8 +992,8 @@ describe("real-claude gate — builder stage set", () => {
       await runRealClaudeGateExecution(client, async () => report(), 150, async () => {});
 
       assert.deepEqual(client.updateItemStatusCalls, [{ itemId: "item-77", newStatus: "In Documentation" }]);
-      assert.deepEqual(client.removeLabelCalls, [{ issueNumber: 77, label: "needs-real-claude" }]);
-      assert.equal(client.addLabelCalls.length, 0);
+      assert.deepEqual(client.removeLabelCalls, [{ issueNumber: 77, label: "needs-real-claude" }, { issueNumber: 77, label: REAL_CLAUDE_GATE_RUNNING_LABEL }]);
+      assert.deepEqual(client.addLabelCalls, [{ issueNumber: 77, label: REAL_CLAUDE_GATE_RUNNING_LABEL }]);
       assert.equal(item.status, "In Documentation");
     });
   });
@@ -982,8 +1010,8 @@ describe("real-claude gate — builder stage set", () => {
       await runRealClaudeGateExecution(client, async () => failing, 150, async () => {});
 
       assert.deepEqual(client.updateItemStatusCalls, [{ itemId: "item-77", newStatus: "In Development" }]);
-      assert.deepEqual(client.addLabelCalls, [{ issueNumber: 77, label: "needs-rework:builder" }]);
-      assert.equal(client.removeLabelCalls.length, 0, "needs-real-claude must survive a failure");
+      assert.deepEqual(client.addLabelCalls, [{ issueNumber: 77, label: REAL_CLAUDE_GATE_RUNNING_LABEL }, { issueNumber: 77, label: "needs-rework:builder" }]);
+      assert.deepEqual(client.removeLabelCalls, [{ issueNumber: 77, label: REAL_CLAUDE_GATE_RUNNING_LABEL }]);
       assert.ok(item.labels.includes("needs-real-claude"));
     });
   });
@@ -1042,8 +1070,8 @@ describe("live artifact handoff", () => {
       client.addComment = async () => { throw new Error("GitHub unavailable"); };
       await runRealClaudeGateExecution(client, async () => report(), 150, async () => {});
       assert.equal(item.status, "Inbox");
-      assert.equal(client.addLabelCalls.length, 0);
-      assert.equal(client.removeLabelCalls.length, 0);
+      assert.deepEqual(client.addLabelCalls, [{ issueNumber: 77, label: REAL_CLAUDE_GATE_RUNNING_LABEL }]);
+      assert.deepEqual(client.removeLabelCalls, [{ issueNumber: 77, label: REAL_CLAUDE_GATE_RUNNING_LABEL }]);
     });
   });
 });
@@ -1063,7 +1091,7 @@ test("artifact marker uses fresh labels and does not turn an unavailable gate in
     assert.equal(unavailable.status, "Inbox");
     assert.ok(unavailable.labels.includes("error:real-claude-gate"));
     assert.ok(!unavailable.labels.includes("needs-rework:builder"));
-    assert.equal(second.removeLabelCalls.length, 0);
+    assert.deepEqual(second.removeLabelCalls, [{ issueNumber: 77, label: REAL_CLAUDE_GATE_RUNNING_LABEL }]);
   });
 });
 
@@ -1071,9 +1099,13 @@ test("failed artifact rework label write cannot move the ticket forward", async 
   await withStageSet("builder", async () => {
     const item = builderParkedItem({ labels: ["done:verifier", "needs-real-claude", "needs-live-artifacts"] });
     const client = new MockClient([item]);
-    client.addLabel = async () => { throw new Error("GitHub unavailable"); };
+    const addLabel = client.addLabel.bind(client);
+    client.addLabel = async (issueNumber, label) => {
+      if (label === "needs-rework:builder") throw new Error("GitHub unavailable");
+      await addLabel(issueNumber, label);
+    };
     await runRealClaudeGateExecution(client, async () => report(), 150, async () => {});
     assert.equal(item.status, "Inbox");
-    assert.equal(client.removeLabelCalls.length, 0);
+    assert.deepEqual(client.removeLabelCalls, [{ issueNumber: 77, label: REAL_CLAUDE_GATE_RUNNING_LABEL }]);
   });
 });
