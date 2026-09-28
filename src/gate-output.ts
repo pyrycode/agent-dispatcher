@@ -653,6 +653,8 @@ export interface GateRunReport {
   /** Where the judged bytes live on the dispatcher host. */
   outputPath: string;
   outputBytes: number;
+  /** Build and device diagnostics, kept separately from the machine-readable report. */
+  stderrPath?: string;
   /**
    * Which of the branch's failing tests also fail on the base commit.
    *
@@ -870,9 +872,8 @@ export function formatGateEvidenceComment(opts: {
 
   lines.push(`**What the dispatcher did:** ${opts.action}`);
   lines.push("");
-  lines.push(
-    `Full output: \`${report.outputPath}\` (${formatBytes(report.outputBytes)}) on the dispatcher host.`,
-  );
+  lines.push(`Test report: \`${report.outputPath}\` (${formatBytes(report.outputBytes)}) on the dispatcher host.`);
+  if (report.stderrPath) lines.push(`Diagnostic log: \`${report.stderrPath}\` on the dispatcher host.`);
 
   return lines.join("\n");
 }

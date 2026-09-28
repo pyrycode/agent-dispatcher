@@ -4318,6 +4318,7 @@ export async function runRealClaudeGateSuite(opts: {
     durationMs: 0,
     outputPath: stdoutPath,
     outputBytes: 0,
+    stderrPath,
     baselineFailures: null,
     baselineSkipReason: opts.baselineCommand ? null : "no baseline command configured for this fork",
     baselineOutputPath: null,

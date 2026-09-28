@@ -4854,9 +4854,11 @@ describe("formatGateEvidenceComment", () => {
   test("says plainly that nothing was judged when there is no artifact", () => {
     const body = formatGateEvidenceComment({
       verdict: "unusable", reason: "no readable test events",
-      report: { ...baseReport, tally: null }, minExecuted: 150, action: "parked",
+      report: { ...baseReport, tally: null, stderrPath: "/logs/gate.stderr.log" }, minExecuted: 150, action: "parked",
     });
     assert.match(body, /not the same as nothing failing/);
+    assert.match(body, /Diagnostic log: `\/logs\/gate\.stderr\.log`/);
+    assert.match(body, /Test report: `\/logs\/gate\.log`/);
   });
 
   test("reports an uncomputable commits-behind rather than omitting it", () => {
