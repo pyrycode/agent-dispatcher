@@ -732,6 +732,28 @@ describe("runRealClaudeGateExecution — outcomes", () => {
     assert.ok(item.labels.includes("needs-real-claude"));
   });
 
+  test("failures reproduced on main still route to rework, not a gate error", async () => {
+    const item = parkedItem();
+    const client = new MockClient([item]);
+    const notifications: string[] = [];
+    const inherited = report({
+      exitCode: 1,
+      tally: tally({ executed: 176, passed: 175, failed: 1, failedNames: ["pkg.TestThing"], packageFailed: true }),
+      baselineFailures: ["pkg.TestThing"],
+    });
+
+    await runRealClaudeGateExecution(client, async () => inherited, 150, async message => { notifications.push(message); });
+
+    assert.equal(item.status, "In Development");
+    assert.ok(item.labels.includes("needs-rework:developer"));
+    assert.ok(item.labels.includes("needs-real-claude"));
+    assert.ok(!item.labels.includes("error:real-claude-gate"));
+    assert.ok(!item.labels.includes("wip:real-claude-gate"));
+    assert.match(client.addCommentCalls[0]?.body ?? "", /Already failing on `origin\/main`/);
+    assert.match(client.addCommentCalls[0]?.body ?? "", /moved it to \*\*In Development\*\*/);
+    assert.match(notifications[0] ?? "", /failures on main/);
+  });
+
   test("a failure that passed on the same-tree re-run advances like a pass and pings a human", async () => {
     // pyrycode #2089, 2026-09-06: one flaky liveness test, green on re-run,
     // must not cost the ticket a rework lap. The ping is about the suite.

@@ -978,6 +978,7 @@ export interface GateOutcome {
  *   pass          → In Documentation, clear `needs-real-claude`
  *   flaky-pass    → the same, plus a Discord ping naming the flaky tests
  *   fail          → In Development, add the set's fail rework label (classic: `needs-rework:developer`)
+ *   inherited-failure → In Development with the same rework label, plus a baseline warning
  *   zero-executed → stays in Inbox, add `error:real-claude-gate`, notify
  *   unusable      → stays in Inbox, add `error:real-claude-gate`, notify
  *
@@ -1026,14 +1027,18 @@ export function decideGateOutcome(
         removeLabels: [],
         notify: false,
       };
+    case "inherited-failure":
+      // The report is usable and the tests are red. Keep the baseline
+      // distinction in the evidence, but send a real test failure through
+      // rework rather than labelling it as a gate execution error.
+      return {
+        toColumn: REAL_CLAUDE_GATE_FAIL_COLUMN,
+        addLabels: [failReworkLabel],
+        removeLabels: [],
+        notify: true,
+      };
     case "zero-executed":
     case "unusable":
-    case "inherited-failure":
-      // `inherited-failure` parks for the same reason the other two do: no
-      // agent can fix it. A developer handed a failure the branch did not
-      // cause has nothing to act on, and would spend all three rework
-      // attempts finding that out. It needs a human to decide whether to
-      // fix the base, file the failure, or let the ticket through.
       return {
         toColumn: null,
         addLabels: [REAL_CLAUDE_GATE_ERROR_LABEL],

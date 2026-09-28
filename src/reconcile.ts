@@ -600,16 +600,16 @@ export async function runRealClaudeGateExecution(
         `This is an evidence handoff, not final acceptance.`
       : outcome.toColumn === null
       ? `left it in ${REAL_CLAUDE_GATE_RUN_FROM_COLUMN} and added \`${outcome.addLabels.join("`, `")}\`. ` +
-        (verdict === "inherited-failure"
-          ? `This needs a human: the failures are real but this branch did not cause them, so there is nothing ` +
-            `for the developer agent to fix. Repair the base, file the failures, or let the ticket through.`
-          : `This needs a human: the gate could not produce a trustworthy answer, and no agent can fix that by ` +
-            `rewriting code.`)
+        `This needs a human: the gate could not produce a trustworthy answer, and no agent can fix that by ` +
+        `rewriting code.`
       : `moved it to **${outcome.toColumn}**` +
         (outcome.addLabels.length > 0 ? `, added \`${outcome.addLabels.join("`, `")}\`` : "") +
         (outcome.removeLabels.length > 0 ? `, removed \`${outcome.removeLabels.join("`, `")}\`` : "") +
         (verdict === "fail"
           ? `. \`${REAL_CLAUDE_GATE_LABEL}\` stays on, so this ticket must pass the gate again after the fix.`
+          : verdict === "inherited-failure"
+            ? `. These failures also occur on the base commit. Rework must repair or isolate the shared failures; ` +
+              `\`${REAL_CLAUDE_GATE_LABEL}\` stays on until a later live run passes.`
           : verdict === "flaky-pass"
             ? `. The suite is green on re-run and the ticket did nothing wrong. The flaky test(s) named above ` +
               `are the suite's problem, not this branch's, and a human has been pinged about them.`
@@ -662,7 +662,7 @@ export async function runRealClaudeGateExecution(
       }
     }
 
-    const icon = verdict === "pass" ? "✅" : verdict === "flaky-pass" ? "⚠️" : verdict === "fail" ? "❌" : "🚨";
+    const icon = verdict === "pass" ? "✅" : verdict === "flaky-pass" || verdict === "inherited-failure" ? "⚠️" : verdict === "fail" ? "❌" : "🚨";
     console.log(`   ${icon} Real-claude gate #${candidate.issueNumber}: ${verdict} — ${reason}`);
 
     // After the gated ticket's own writes, so a slow or failing board write
@@ -689,6 +689,10 @@ export async function runRealClaudeGateExecution(
             `${flaky.map(name => `\`${name}\``).join(", ")} failed once and passed the second time on the same ` +
             `merged tree. The ticket advanced; the flake is the suite's to fix — see the evidence comment.` +
             flakyTicketNote(flakyTickets)
+          : verdict === "inherited-failure"
+            ? `⚠️ **Real-claude gate found failures on main for #${candidate.issueNumber}.** ${reason}. ` +
+              `Sent to ${outcome.toColumn} with \`${realClaudeGate.failReworkLabel}\` for rework. ` +
+              `The ticket branch did not introduce the named failures — see the evidence comment.`
           : `🚨 **Real-claude gate could not judge #${candidate.issueNumber}** (${verdict}): ${reason}\n` +
             `Parked in ${REAL_CLAUDE_GATE_RUN_FROM_COLUMN} with \`${outcome.addLabels.join("`, `")}\`. ` +
             `Needs a human — see the evidence comment.`,
