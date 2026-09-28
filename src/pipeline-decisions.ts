@@ -849,12 +849,11 @@ export interface BaselineAdjustedVerdict {
  * Re-judge a failing run against what the base commit already fails.
  *
  * **Why this exists.** On the gate's first live run, 2026-08-07, pyrycode
- * #1382 came back with 519 passed and 2 failed and was routed to the
- * developer agent. Both failures reproduced identically on clean `main`,
- * and neither touched the ticket's subject. Without a baseline the gate
- * cannot tell "this branch broke it" from "it was already broken", so it
- * hands a developer agent work it did not cause and cannot fix, and burns
- * rework attempts until the three-strike breaker halts it.
+ * #1382 came back with 519 passed and 2 failed. Both failures reproduced
+ * identically on clean `main`, and neither touched the ticket's subject.
+ * The baseline makes that attribution visible even when the red test run
+ * routes to rework. It prevents the issue evidence from blaming the branch
+ * for failures it inherited.
  *
  * Kept separate from `decideGateVerdict` rather than folded into it, so
  * that function stays a judgement about one run and its ordering invariant
