@@ -124,7 +124,7 @@ test("missing configured binary stops real startup before role or board processi
  try {
   const child=spawnSync(process.execPath,["--import","tsx",fileURLToPath(new URL("./dispatch-bin.ts",import.meta.url))],{
    encoding:"utf8",timeout:10000,
-   env:{...process.env,AGENTS_REPO_PATH:root,TARGET_REPO_PATH:root,GITHUB_OWNER:"fixture",GITHUB_REPO:"fixture",PROJECT_NUMBER:"1",GITHUB_TOKEN:"fixture",PYRY_AGENT_RUNNER:"codex",PYRY_CODEX_BIN:join(root,"missing-codex")},
+   env:{...process.env,AGENTS_REPO_PATH:root,TARGET_REPO_PATH:root,GITHUB_OWNER:"fixture",GITHUB_REPO:"fixture",PROJECT_NUMBER:"1",GITHUB_TOKEN:"fixture",PYRY_AGENT_RUNNER:"codex",PYRY_EFFORT_POLICY:"off",PYRY_CODEX_BIN:join(root,"missing-codex")},
   });
   assert.equal(child.status,1);assert.match(child.stderr,/PYRY_CODEX_BIN/);
   assert.doesNotMatch(child.stdout+child.stderr,/Missing per-agent|Dispatching|Polling/);

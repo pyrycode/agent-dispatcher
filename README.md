@@ -264,12 +264,58 @@ Claude authentication is not reused.
 Codex uses `gpt-6-sol` by default and inherits the operator's configured effort.
 Optional `PYRY_CODEX_MODEL` and `PYRY_CODEX_EFFORT` select Codex-specific overrides;
 Claude stage model names and effort overrides are never passed to Codex.
+The optional role-risk policy below selects effort for both runners instead.
 At startup the dispatcher pins the Codex executable from PATH. On macOS it also
 checks the ChatGPT app bundle when the terminal PATH does not expose its CLI.
 `PYRY_CODEX_BIN` overrides discovery. An invalid override or missing executable
 stops startup before ticket selection or labels are changed.
 The same stage set, ticket prompts, worktrees, deterministic gates and post-run
 checks apply. Product tests that exercise real Claude continue to exercise Claude.
+
+### Optional role and risk effort trial
+
+Set `PYRY_EFFORT_POLICY=role-risk-v1` in one consumer's `.env` to opt its
+four-role builder pipeline into task-dependent effort. It works with Claude and
+Codex. Other consumers retain their settings. Model choices, turn limits,
+timeouts and acceptance gates do not change. An explicit `PYRY_CODEX_EFFORT`
+still overrides the trial for Codex. Leave that override unset to measure the policy.
+
+| Role | Routine ticket | Elevated risk | No valid assessment |
+| --- | --- | --- | --- |
+| Refiner | medium | high | medium |
+| Builder | medium | high | high |
+| Verifier | high | high | high |
+| Documentation | low | medium | medium |
+
+The consumer's refiner must add exactly one section to the issue body:
+
+```markdown
+## Effort assessment
+Risk: routine
+Reason: Explicit requirements and a local change with straightforward checks.
+```
+
+Use `Risk: elevated` for security, concurrency, persistence or migrations,
+cross-component contracts, unclear behaviour and difficult bug investigations.
+Choose from the actual work, not the line count or size label. An existing
+`security-sensitive` label always overrides a routine assessment. Missing,
+malformed or duplicate assessments are unknown. Code-fenced examples are ignored.
+Assess split children separately before marking them refined. A ticket that skips
+refinement keeps conservative effort until someone assesses it. No extra model
+call, automatic ticket rewrite or label is needed to select effort.
+
+The policy is chosen before each role starts. A running role's effort stays fixed,
+including any continuation. A rework label alone does not raise effort: use the
+failure evidence to update the assessment if the work proves harder than expected.
+An environment problem still needs an environment fix.
+
+Each DISPATCH log records runner, model, policy, selected effort and selection
+reason alongside the existing token, duration and outcome records. Compare total
+tokens across all attempts of completed tickets, plus rework and escaped defects.
+Compare Claude and Codex separately with models held constant. This trial does not
+claim a measured saving. Set `PYRY_EFFORT_POLICY=off` or remove it and restart to
+restore previous effort selection. Unknown policy names or use with the classic
+stage set fail startup before board processing.
 
 The runner adds the role instructions to Codex's built-in instructions and loads
 `CLAUDE.md` as a project-instruction fallback. Its task prompt travels on stdin.

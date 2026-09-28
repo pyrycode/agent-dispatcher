@@ -57,6 +57,7 @@ import {
 } from "./main-sweep.js";
 import { recordFlakyTests } from "./flaky-tickets.js";
 import { activeStageSet } from "./stage-sets.js";
+import { resolveEffort } from "./effort-policy.js";
 import {
   REAL_CLAUDE_GATE_FAIL_COLUMN,
   decideDoneCleanup,
@@ -2699,7 +2700,10 @@ export async function prepareAgentSpawn(
   const timeoutMs = timeoutFor(agent, item.labels);
   const timeoutLabel = `${timeoutMs / 60_000}min`;
 
-  ctx.deps.writeLog(logFile, "DISPATCH", `Agent: ${agent.name}\nTicket: #${item.issueNumber} — ${item.title}\nBranch: ${branchName}\nWorktree: ${useWorktree ? worktreeDir : `none (PO on ${defaultBranch})`}\nRunner: ${runner}\nMax turns: ${runner === "codex" ? "not supported; wall-clock budget only" : maxTurns}\nTimeout: ${timeoutLabel}\nTool policy: ${runner === "codex" ? "Codex workspace sandbox and automatic review" : allowedTools}`);
+  const model = runner === "codex" ? process.env.PYRY_CODEX_MODEL ?? "gpt-6-sol" : agent.model ?? "opus";
+  const effort = resolveEffort({ agent, item, runner, env: process.env, stageSet: stageSet.name });
+
+  ctx.deps.writeLog(logFile, "DISPATCH", `Agent: ${agent.name}\nTicket: #${item.issueNumber} — ${item.title}\nBranch: ${branchName}\nWorktree: ${useWorktree ? worktreeDir : `none (PO on ${defaultBranch})`}\nRunner: ${runner}\nModel: ${model}\nEffort policy: ${effort.policy}\nEffort: ${effort.effort || "inherited"}\nEffort reason: ${effort.reason}\nMax turns: ${runner === "codex" ? "not supported; wall-clock budget only" : maxTurns}\nTimeout: ${timeoutLabel}\nTool policy: ${runner === "codex" ? "Codex workspace sandbox and automatic review" : allowedTools}`);
   ctx.deps.writeLog(logFile, "PROMPT", prompt);
   ctx.deps.writeLog(logFile, "SYSTEM PROMPT", systemPrompt);
 
@@ -2712,11 +2716,8 @@ export async function prepareAgentSpawn(
       runner,
       promptFile,
       systemPromptFile,
-      // Per-agent override, else the pipeline default. QA and documentation
-      // run on claude-sonnet-5 at high effort; every other stage inherits
-      // opus/high (xhigh until 2026-09-22). See AGENTS in types.ts.
-      model: runner === "codex" ? process.env.PYRY_CODEX_MODEL ?? "gpt-6-sol" : agent.model ?? "opus",
-      effort: runner === "codex" ? process.env.PYRY_CODEX_EFFORT ?? "" : agent.effort ?? "high",
+      model,
+      effort: effort.effort,
       maxTurns,
       allowedTools,
       disallowedTools,
