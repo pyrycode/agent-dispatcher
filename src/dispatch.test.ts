@@ -399,6 +399,7 @@ export class MockGitHubClient implements DispatchClient {
   labelOps: Array<{ op: "add" | "remove"; issueNumber: number; label: string }> = [];
   getItemStatusCalls: { issueNumber: number; forceRefresh: boolean | undefined }[] = [];
   getIssueLabelsCalls: number[] = [];
+  getOpenBlockersCalls: number[] = [];
   getItemsByStatusCalls: string[] = [];
   getClosedItemsNotInDoneCalls = 0;
   updateItemStatusCalls: { itemId: string; newStatus: string }[] = [];
@@ -427,6 +428,7 @@ export class MockGitHubClient implements DispatchClient {
     removeLabel?: Error | ((issueNumber: number, label: string) => Error | null);
     addComment?: Error;
     getIssueLabels?: Error;
+    getOpenBlockers?: Error;
     getItemStatus?: Error;
     getItemsByStatus?: Error;
     getClosedItemsNotInDone?: Error;
@@ -506,6 +508,13 @@ export class MockGitHubClient implements DispatchClient {
     this.getIssueLabelsCalls.push(issueNumber);
     if (this.failures.getIssueLabels) throw this.failures.getIssueLabels;
     return [...(this.labelsByIssue.get(issueNumber) ?? [])];
+  }
+
+  async getOpenBlockers(issueNumber: number): Promise<number[]> {
+    this.getOpenBlockersCalls.push(issueNumber);
+    if (this.failures.getOpenBlockers) throw this.failures.getOpenBlockers;
+    return (this.itemsByIssueNumber.get(issueNumber)?.blockedBy ?? [])
+      .filter(b => b.state === "OPEN").map(b => b.number);
   }
 
   async getItemStatus(issueNumber: number, options?: { forceRefresh?: boolean }): Promise<string | null> {
@@ -7436,6 +7445,34 @@ describe("Codex builder refinement handoff", () => {
     const {ctx, client} = makeTestContext({agent:{name:"verifier"}});
     await assert.rejects(handlePostRun(request(), ctx, false));
     assert.equal(client.addLabelCalls.length, 0);
+  });
+});
+
+describe("Codex builder blocker wait", () => {
+  const request = () => streamResult({runner:"codex", isError:false, terminalReason:"waiting_on_blocker", output:"Baseline format fix is #1280"});
+  test("a fresh open dependency routes to the existing wait path", async () => {
+    const {ctx, client, calls} = makeTestContext({agent:{name:"builder"}});
+    client.itemsByIssueNumber.set(100, {...ctx.item, state:"OPEN", blockedBy:[{number:1280,state:"OPEN"}]});
+    assert.deepEqual(await handlePostRun(request(), ctx, false), {ok:false});
+    assert.deepEqual(client.getOpenBlockersCalls, [100]);
+    assert.deepEqual(client.addLabelCalls, [{issueNumber:100,label:"needs-rework:refiner"}]);
+    assert.match(client.comments[0].body, /Waiting on #1280/);
+    assert.equal(calls.exec.length, 0);
+  });
+  test("no open dependency cannot masquerade as a wait", async () => {
+    const {ctx, client} = makeTestContext({agent:{name:"builder"}});
+    await assert.rejects(handlePostRun(request(), ctx, false), /without an open GitHub blocker/);
+    assert.equal(client.addLabelCalls.length, 0);
+  });
+  test("denied, failed, or non-builder outcomes cannot wait", async () => {
+    for (const patch of [{hadPermissionDenial:true}, {isError:true}, {runner:"claude" as const}]) {
+      const {ctx, client} = makeTestContext({agent:{name:"builder"}});
+      await assert.rejects(handlePostRun({...request(),...patch}, ctx, false), /Invalid blocker wait/);
+      assert.equal(client.getOpenBlockersCalls.length, 0);
+    }
+    const {ctx, client} = makeTestContext({agent:{name:"verifier"}});
+    await assert.rejects(handlePostRun(request(), ctx, false), /Invalid blocker wait/);
+    assert.equal(client.getOpenBlockersCalls.length, 0);
   });
 });
 

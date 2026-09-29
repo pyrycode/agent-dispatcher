@@ -1,7 +1,7 @@
 {
   "type": "object",
   "properties": {
-    "status": { "type": "string", "enum": ["completed", "blocked", "needs_refinement"] },
+    "status": { "type": "string", "enum": ["completed", "blocked", "needs_refinement", "waiting_on_blocker"] },
     "summary": { "type": "string" }
   },
   "required": ["status", "summary"],

@@ -150,6 +150,13 @@ function baseMaxTurns(agent: AgentConfig): number {
  * minutes, so the "Timeout: Nmin" label stays whole.
  */
 export function timeoutFor(agent: AgentConfig, labels: string[] = []): number {
+  if (agent.name === "builder" && process.env.PYRY_BUILDER_TIMEOUT_MINUTES !== undefined) {
+    const raw = process.env.PYRY_BUILDER_TIMEOUT_MINUTES;
+    if (!/^[1-9][0-9]*$/.test(raw) || Number(raw) > 240) {
+      throw new Error("PYRY_BUILDER_TIMEOUT_MINUTES must be a whole number from 1 to 240");
+    }
+    return Number(raw) * 60_000;
+  }
   const scaled = baseTimeout(agent, labels) * parseBudgetScale(process.env.PYRY_BUDGET_SCALE);
   return Math.max(60_000, Math.round(scaled / 60_000) * 60_000);
 }

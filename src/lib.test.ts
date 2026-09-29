@@ -5610,19 +5610,48 @@ describe("PYRY_BUDGET_SCALE applied through maxTurnsFor / timeoutFor", () => {
   }
 
   test("unset leaves name-keyed and inline budgets unchanged", () => {
-    withScale(undefined, () => {
-      assert.equal(maxTurnsFor(dev), 135);
-      assert.equal(timeoutFor(dev), 1_500_000);
-      assert.equal(maxTurnsFor(inline), 200);
-      assert.equal(timeoutFor(inline), 2_400_000);
-    });
+    const previous = process.env.PYRY_BUILDER_TIMEOUT_MINUTES;
+    delete process.env.PYRY_BUILDER_TIMEOUT_MINUTES;
+    try {
+      withScale(undefined, () => {
+        assert.equal(maxTurnsFor(dev), 135);
+        assert.equal(timeoutFor(dev), 1_500_000);
+        assert.equal(maxTurnsFor(inline), 200);
+        assert.equal(timeoutFor(inline), 2_400_000);
+      });
+    } finally {
+      if (previous !== undefined) process.env.PYRY_BUILDER_TIMEOUT_MINUTES = previous;
+    }
   });
 
   test("1.5 scales inline stage-set budgets (builder 200 turns / 40min → 300 / 60min)", () => {
-    withScale("1.5", () => {
-      assert.equal(maxTurnsFor(inline), 300);
-      assert.equal(timeoutFor(inline), 3_600_000);
-    });
+    const previous = process.env.PYRY_BUILDER_TIMEOUT_MINUTES;
+    delete process.env.PYRY_BUILDER_TIMEOUT_MINUTES;
+    try {
+      withScale("1.5", () => {
+        assert.equal(maxTurnsFor(inline), 300);
+        assert.equal(timeoutFor(inline), 3_600_000);
+      });
+    } finally {
+      if (previous !== undefined) process.env.PYRY_BUILDER_TIMEOUT_MINUTES = previous;
+    }
+  });
+
+  test("a builder-only timeout overrides the scaled wall clock without changing turn or verifier budgets", () => {
+    const previous = process.env.PYRY_BUILDER_TIMEOUT_MINUTES;
+    try {
+      process.env.PYRY_BUILDER_TIMEOUT_MINUTES = "70";
+      withScale("1.5", () => {
+        assert.equal(maxTurnsFor(inline), 300);
+        assert.equal(timeoutFor(inline), 4_200_000);
+        assert.equal(timeoutFor(dev), 2_280_000);
+      });
+      process.env.PYRY_BUILDER_TIMEOUT_MINUTES = "70x";
+      assert.throws(() => timeoutFor(inline), /PYRY_BUILDER_TIMEOUT_MINUTES/);
+    } finally {
+      if (previous === undefined) delete process.env.PYRY_BUILDER_TIMEOUT_MINUTES;
+      else process.env.PYRY_BUILDER_TIMEOUT_MINUTES = previous;
+    }
   });
 
   test("1.5 scales name-keyed budgets and rounds timeouts to whole minutes", () => {

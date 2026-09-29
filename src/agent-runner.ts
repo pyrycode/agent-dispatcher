@@ -112,10 +112,10 @@ export class CodexStreamAdapter {
   }
 
   finish(code: number | null, timedOut: boolean, durationMs: number, stderr = ""): StreamResult {
-    let outcome: { status: "completed" | "blocked" | "needs_refinement"; summary: string } | undefined;
+    let outcome: { status: "completed" | "blocked" | "needs_refinement" | "waiting_on_blocker"; summary: string } | undefined;
     try {
       const parsed = JSON.parse(this.lastText);
-      if ((parsed.status === "completed" || parsed.status === "blocked" || parsed.status === "needs_refinement") && typeof parsed.summary === "string" && parsed.summary.trim()) outcome = parsed;
+      if ((parsed.status === "completed" || parsed.status === "blocked" || parsed.status === "needs_refinement" || parsed.status === "waiting_on_blocker") && typeof parsed.summary === "string" && parsed.summary.trim()) outcome = parsed;
     } catch { /* Missing or malformed task outcome fails closed. */ }
     this.approvalRejected ||= /This action was rejected due to unacceptable risk/.test(stderr);
     const blocked = this.approvalRejected || outcome?.status === "blocked";
@@ -126,7 +126,8 @@ export class CodexStreamAdapter {
     const temporaryModelAccessFailure = this.failed && /^stream disconnected before completion: Unable to verify model access right now\.\s*Please retry\.?$/i.test(this.errorText.trim());
     const terminalReason = blocked ? "codex_blocked" : timedOut ? "timeout"
       : isError ? (temporaryModelAccessFailure ? "api_error" : "codex_error")
-      : outcome?.status === "needs_refinement" ? "needs_refinement" : "stop";
+      : outcome?.status === "needs_refinement" ? "needs_refinement"
+      : outcome?.status === "waiting_on_blocker" ? "waiting_on_blocker" : "stop";
     const failure = blocked ? (this.approvalRejected ? "Automatic approval review rejected an action. Operator review required." : outcome!.summary) : this.errorText || stderr.trim() || `Codex exited with code ${code} without a successful completed task outcome`;
     return {
       runner: "codex", costKnown: false,
@@ -163,6 +164,7 @@ This dispatch uses Codex. Apply the role instructions above with these runtime a
 - Stay within this role's allowed files and assigned ticket. Git commits, pushes, and GitHub changes explicitly required by the assigned role are part of the task. Do not change unrelated tickets, host credentials, or sandbox policy.
 - Ordinary sandbox restrictions can be escalated through automatic approval review. If the reviewer rejects a necessary action, stop and report status blocked. Do not work around rejection.
 - Builder only: when planning finds a scope, sizing, overlap or missing-information problem requiring refinement, return status needs_refinement with a self-contained explanation and any split proposal or blocker issue numbers. Do not post the routing comment or apply needs-rework:refiner yourself. The dispatcher owns this handoff for the assigned issue. Do not use it for permission denials, failed tools, or documentation work owned by the later documentation stage. After a reviewer rejection, status blocked is mandatory.
+- Builder only: when an open GitHub blocked-by dependency prevents work, including rework on a PR whose gate is red on main, link the blocking issue and return status waiting_on_blocker. The dispatcher verifies the open dependency and parks the ticket without an error or rework count. Do not use this outcome for permission denials, missing access, or a failure that this ticket caused.
 - Report status completed when this role's assigned work and role-owned checks are done. Explicitly hand off work owned by later stages, including documentation and dispatcher-owned live tests. Pending later-stage work alone is not a blocker and must never be reported as already passed. A builder awaiting live artifacts must follow the role's needs-live-artifacts handoff, identify the exact remaining files/checks in its PR and summary, and finish its implementation stage. On the return from the live gate, committing those artifacts is the builder's own work and cannot be deferred again.
 - Missing access or incomplete work required by the current role, and every rejected necessary action, still mean status blocked. Never relabel a permission denial as a later-stage handoff. Return the required JSON outcome with a concise summary.
 `;

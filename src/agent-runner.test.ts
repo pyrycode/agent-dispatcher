@@ -143,6 +143,18 @@ test("refinement is a distinct successful handoff, never implementation completi
   assert.equal(adapter.finish(null, true, 1).isError, true);
 });
 
+test("an open-blocker wait is a distinct handoff, while approval rejection remains an error", () => {
+  const adapter = new CodexStreamAdapter();
+  adapter.accept({type:"item.completed", item:{type:"agent_message", text:JSON.stringify({status:"waiting_on_blocker", summary:"Waiting on #1280"})}});
+  adapter.accept({type:"turn.completed", usage:{}});
+  assert.equal(adapter.finish(0, false, 1).terminalReason, "waiting_on_blocker");
+  assert.equal(adapter.finish(0, false, 1).isError, false);
+  adapter.accept({type:"item.completed", item:{type:"command_execution", aggregated_output:"This action was rejected due to unacceptable risk."}});
+  const rejected = adapter.finish(0, false, 1);
+  assert.equal(rejected.terminalReason, "codex_blocked");
+  assert.equal(rejected.isError, true);
+});
+
 test("an approval rejection cannot be converted into a refinement request", () => {
   const adapter = new CodexStreamAdapter();
   adapter.accept({type:"item.completed", item:{type:"command_execution", aggregated_output:'CreateProcess Rejected("This action was rejected due to unacceptable risk.")'}});
