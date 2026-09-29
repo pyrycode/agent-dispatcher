@@ -3049,7 +3049,7 @@ export async function handlePostRun(
     if (blockers.length === 0) throw new Error("Builder requested a wait without an open GitHub blocker");
     await client.addComment(item.issueNumber,
       `## ⏸️ Waiting on ${blockers.map(n => `#${n}`).join(", ")}\n\n${streamResult.output}\n\nWorktree retained for recovery: ${agentCwd}`);
-    await client.addLabel(item.issueNumber, "needs-rework:refiner");
+    await client.addLabel(item.issueNumber, "needs-rework:builder");
     ctx.deps.writeLog(logFile, "BLOCKER WAIT", streamResult.output);
     console.log(`   ⏸️  #${item.issueNumber} waits on ${blockers.map(n => `#${n}`).join(", ")}; worktree retained`);
     return { ok: false };

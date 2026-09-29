@@ -54,4 +54,17 @@ describe("a refinement bail on a blocked ticket is a wait (2026-09-23)", () => {
     assert.equal(routes[0].toColumn, "In Development");
     assert.equal(routes[0].waitingOn, undefined);
   });
+
+  test("a builder waiting on a fix returns to builder rework in Development", () => {
+    const routes = decideReworkRoutes(columns, new Map([
+      ["In Development", [{
+        id: "a",
+        issueNumber: 1277,
+        labels: ["needs-rework:builder", "done:builder"],
+        blockedBy: [{ number: 1280, state: "OPEN" as const }],
+      }]],
+    ]));
+    assert.equal(routes[0].toColumn, "In Development");
+    assert.deepStrictEqual(routes[0].labelsToStrip, ["needs-rework:builder", "done:builder"]);
+  });
 });

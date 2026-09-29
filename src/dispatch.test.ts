@@ -7455,7 +7455,7 @@ describe("Codex builder blocker wait", () => {
     client.itemsByIssueNumber.set(100, {...ctx.item, state:"OPEN", blockedBy:[{number:1280,state:"OPEN"}]});
     assert.deepEqual(await handlePostRun(request(), ctx, false), {ok:false});
     assert.deepEqual(client.getOpenBlockersCalls, [100]);
-    assert.deepEqual(client.addLabelCalls, [{issueNumber:100,label:"needs-rework:refiner"}]);
+    assert.deepEqual(client.addLabelCalls, [{issueNumber:100,label:"needs-rework:builder"}]);
     assert.match(client.comments[0].body, /Waiting on #1280/);
     assert.equal(calls.exec.length, 0);
   });
