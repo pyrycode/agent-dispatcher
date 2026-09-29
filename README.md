@@ -38,7 +38,7 @@ Before any salvage, a run that exhausted its budget — the `max_turns` turn cap
 When an agent exhausts its budget mid-dispatch (and any resume-in-place legs are spent), the dispatcher tries two recovery paths before flagging the run as errored:
 
 1. **PR-already-exists** — if the agent opened a non-draft PR before timing out, treat the run as success.
-2. **Safer-salvage** — if the worktree has uncommitted changes that pass `go vet` + `go build` (or the consumer's configured salvage gates), open a draft PR with `error:max_turns_salvaged` and let the next dispatch continue from there.
+2. **Safer-salvage** — if the worktree has uncommitted changes or committed branch changes relative to the default branch, run `go vet` + `go build` (or the consumer's configured salvage gates). When they pass, commit only outstanding edits, push and open a draft PR with `error:max_turns_salvaged`. A clean branch with no content change is not recoverable. The ticket stays blocked until human triage; recovery never marks the agent complete.
 
 ### Family circuit breaker
 
@@ -93,7 +93,7 @@ Optional:
 | Variable | Default | Description |
 |---|---|---|
 | `TARGET_DEFAULT_BRANCH` | `main` | Default branch of the target repo. Set to `master` or your trunk-based branch name as needed. Threaded through `git checkout`, `git rev-list --count`, merge targets, and the empty-branch guard. |
-| `SALVAGE_GATES` | `go vet ./...; go build ./...` | `;`-delimited shell commands that gate the safer-salvage path on `max_turns`. Each runs in the agent's worktree; all must exit 0 for the dispatcher to commit + push uncommitted work as a draft PR. Set to `""` to skip gating entirely. Override per ecosystem (e.g. `cargo check --all-targets; cargo test --no-run` for Rust). |
+| `SALVAGE_GATES` | `go vet ./...; go build ./...` | `;`-delimited shell commands that gate the safer-salvage path on `max_turns`. Each runs in the agent's worktree; all must exit 0 for the dispatcher to preserve committed or uncommitted branch work as a draft PR. Set to `""` to skip gating entirely. Override per ecosystem (e.g. `cargo check --all-targets; cargo test --no-run` for Rust). |
 | `PYRY_STAGE_SET` | `classic` | Which agent pipeline this fork runs: `classic` (the six-agent relay, byte-identical default) or `builder` (collapsed four-role pipeline, piloted on one fork). Unknown values fail fast at startup. See below. |
 | `PYRY_VERIFIER_SERIAL` | `1` | Builder set only. The verifier runs one at a time by default, because its pre-spawn gates are host-level work (emulators, a relay and a daemon on one machine) that two verifiers would contend for. The exact string `0` lets verifiers run concurrently for a fork that wants to try it. Printed in the startup banner. |
 | `PYRY_POLL_INTERVAL_MS` | `60000` | How long the loop waits between board reads when no run settles first. Whole milliseconds, floor `10000`; anything else keeps the default. Only idle pickup latency changes: a dispatch or a settled run wakes the loop at once. Mobile runs `120000` since 2026-09-22 to ease the account-wide GitHub API limit. |

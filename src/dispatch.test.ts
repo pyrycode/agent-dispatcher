@@ -1823,6 +1823,61 @@ function streamResult(overrides: Partial<StreamResult> = {}): StreamResult {
 }
 
 describe("handleAgentResultErrors", () => {
+  test("timeout after commit and push recovers a clean branch as a blocked draft", async () => {
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 1270 },
+      mockOptions: {
+        execImpls: { "gh pr list --head": () => "[]", "git status --porcelain": () => "" },
+        spawnImpls: { "git diff --quiet": () => 1 },
+      },
+    });
+    const recovered = await handleAgentResultErrors(
+      streamResult({ isError: true, terminalReason: "", timedOut: true }), ctx,
+    );
+    assert.equal(recovered, true);
+    assert.ok(!calls.exec.some(c => c.cmd.startsWith("git add")));
+    assert.ok(!calls.spawn.some(c => c.cmd === "git" && c.args[0] === "commit"));
+    assert.ok(calls.spawn.some(c => c.cmd === "git" && c.args[0] === "push"));
+    const pr = calls.spawn.find(c => c.cmd === "gh" && c.args.includes("create"));
+    assert.ok(pr?.args.includes("--draft"));
+    assert.match(String(pr?.opts?.input), /already committed/);
+    assert.ok(client.addLabelCalls.some(c => c.label === "error:max_turns_salvaged"));
+    assert.ok(!client.addLabelCalls.some(c => c.label.startsWith("done:")));
+  });
+
+  for (const diffStatus of [0, 128]) {
+    test(`clean branch with diff status ${diffStatus} cannot be recovered`, async () => {
+      const { ctx, calls } = makeTestContext({
+        mockOptions: {
+          execImpls: { "gh pr list --head": () => "[]", "git status --porcelain": () => "" },
+          spawnImpls: { "git diff --quiet": () => diffStatus },
+        },
+      });
+      await assert.rejects(handleAgentResultErrors(
+        streamResult({ isError: true, terminalReason: "", timedOut: true }), ctx,
+      ), /Agent error/);
+      assert.ok(calls.spawn.some(c => c.cmd === "git" && c.args[0] === "diff"));
+      assert.ok(!calls.spawn.some(c => c.args[0] === "push" || c.cmd === "gh"));
+    });
+  }
+
+  test("committed timeout work with a failing build cannot open a draft", async () => {
+    const { ctx, calls } = makeTestContext({
+      mockOptions: {
+        execImpls: {
+          "gh pr list --head": () => "[]",
+          "git status --porcelain": () => "",
+          "go build": () => execError({ stderr: "build failed" }),
+        },
+        spawnImpls: { "git diff --quiet": () => 1 },
+      },
+    });
+    await assert.rejects(handleAgentResultErrors(
+      streamResult({ isError: true, terminalReason: "", timedOut: true }), ctx,
+    ), /Agent error/);
+    assert.ok(!calls.spawn.some(c => c.args[0] === "push" || c.cmd === "gh"));
+  });
+
   test("isError=false → returns false (no salvage, success path runs)", async () => {
     const { ctx, client, calls } = makeTestContext({ item: { issueNumber: 300 } });
 

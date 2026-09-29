@@ -1277,8 +1277,8 @@ async function buildPromptForAgent(
 
 /**
  * Run the safer-salvage path on a max_turns failure: gate on clean
- * vet/build + uncommitted changes (via `shouldAttemptSafeSalvage`),
- * then commit the work, push, open a DRAFT PR, label the ticket
+ * vet/build + uncommitted or committed branch changes (via `shouldAttemptSafeSalvage`),
+ * then commit any uncommitted work, push, open a DRAFT PR, label the ticket
  * `error:max_turns_salvaged`, and post a triage comment.
  *
  * Returns true if salvage was performed (caller should skip the
@@ -1314,6 +1314,19 @@ async function attemptSaferSalvage(opts: {
     const dirty = execSync(`git status --porcelain`, {
       cwd: opts.agentCwd, encoding: "utf-8", timeout: 15_000,
     }).toString();
+    const hasUncommittedChanges = dirty.trim().length > 0;
+    let hasCommittedChanges = false;
+    if (!hasUncommittedChanges) {
+      // A clean worktree can still hold the entire implementation, as
+      // Mobile #1270 did when it timed out after push but before PR creation.
+      const diff = spawnSync("git", ["diff", "--quiet", `origin/${defaultBranch}...HEAD`, "--"], {
+        cwd: opts.agentCwd, stdio: "pipe", timeout: 15_000,
+      });
+      if (diff.status !== 0 && diff.status !== 1) {
+        throw new Error(`Cannot inspect committed salvage work: ${diff.stderr?.toString() || "git diff failed"}`);
+      }
+      hasCommittedChanges = diff.status === 1;
+    }
 
     // Run each configured gate in order; collect exit codes. Each gate
     // gets a 120s timeout — same envelope as the Go build default,
@@ -1335,33 +1348,36 @@ async function attemptSaferSalvage(opts: {
       timedOut: opts.streamResult.timedOut === true,
       prAlreadyExists: false,
       gitStatusOutput: dirty,
+      hasCommittedChanges,
       gateExitCodes,
     })) {
       const gateSummary = salvageGates.length === 0
         ? "gates: none"
         : `gates: ${salvageGates.map((g, i) => `"${g}"=${gateExitCodes[i]}`).join(" ")}`;
       opts.deps.writeLog(opts.logFile, "SAFER_SALVAGE_SKIPPED",
-        `${gateSummary} dirty=${dirty.trim().length > 0}`);
+        `${gateSummary} dirty=${hasUncommittedChanges} committedChanges=${hasCommittedChanges}`);
       return false;
     }
 
-    execSync(`git add -A`, { cwd: opts.agentCwd, stdio: "pipe", timeout: 15_000 });
-    // spawnSync with argv (no shell) so commit messages and branch
-    // names containing shell metacharacters can't break the call.
-    // The same pattern is used for `gh pr create` below where the
-    // ticket title (user-influenced text) flows in.
-    const commitResult = spawnSync(
-      "git",
-      [
-        "commit",
-        "-m", `WIP: max_turns salvage for #${opts.item.issueNumber}`,
-        "-m", `Auto-committed by dispatcher when ${opts.agent.name} hit max_turns. Build was clean (vet + build); work preserved as draft PR for human triage.`,
-        "-m", `Session: ${opts.streamResult.sessionId}`,
-      ],
-      { cwd: opts.agentCwd, stdio: "pipe", timeout: 15_000 },
-    );
-    if (commitResult.status !== 0) {
-      throw new Error(`git commit failed: ${commitResult.stderr?.toString() || "unknown"}`);
+    if (hasUncommittedChanges) {
+      execSync(`git add -A`, { cwd: opts.agentCwd, stdio: "pipe", timeout: 15_000 });
+      // spawnSync with argv (no shell) so commit messages and branch
+      // names containing shell metacharacters can't break the call.
+      // The same pattern is used for `gh pr create` below where the
+      // ticket title (user-influenced text) flows in.
+      const commitResult = spawnSync(
+        "git",
+        [
+          "commit",
+          "-m", `WIP: max_turns salvage for #${opts.item.issueNumber}`,
+          "-m", `Auto-committed by dispatcher when ${opts.agent.name} hit max_turns. Build was clean (vet + build); work preserved as draft PR for human triage.`,
+          "-m", `Session: ${opts.streamResult.sessionId}`,
+        ],
+        { cwd: opts.agentCwd, stdio: "pipe", timeout: 15_000 },
+      );
+      if (commitResult.status !== 0) {
+        throw new Error(`git commit failed: ${commitResult.stderr?.toString() || "unknown"}`);
+      }
     }
 
     const pushResult = spawnSync(
@@ -1382,10 +1398,13 @@ async function attemptSaferSalvage(opts: {
     const budget = opts.streamResult.timedOut === true && opts.streamResult.terminalReason !== "max_turns"
       ? { head: "wall-clock timeout", detail: "ran out of wall-clock time" }
       : { head: "`max_turns`", detail: "hit `max_turns`" };
+    const preservation = hasUncommittedChanges
+      ? "auto-committed the uncommitted changes"
+      : "preserved the work already committed on the branch";
     const prBody = [
       `## Auto-salvaged from ${budget.head}`,
       ``,
-      `The **${opts.agent.name}** agent ${budget.detail} (${opts.streamResult.numTurns} turns, ${formatRunCost(opts.streamResult)}) on #${opts.item.issueNumber} while work was in progress. The dispatcher auto-committed the uncommitted changes and opened this **draft** PR for human triage.`,
+      `The **${opts.agent.name}** agent ${budget.detail} (${opts.streamResult.numTurns} turns, ${formatRunCost(opts.streamResult)}) on #${opts.item.issueNumber} while work was in progress. The dispatcher ${preservation} and opened this **draft** PR for human triage.`,
       ``,
       `**Build status at salvage:** clean (${salvageGates.length === 0 ? "no gates configured" : salvageGates.map((g) => `\`${g}\``).join(" + ") + " all passed"}). Tests were not run as a salvage gate — failing tests are often the signal the agent was chasing.`,
       ``,
@@ -1450,12 +1469,12 @@ async function attemptSaferSalvage(opts: {
     try {
       await opts.client.addComment(
         opts.item.issueNumber,
-        `## ⚠️ Salvaged from ${budget.head}\n\nThe ${opts.agent.name} agent ${budget.detail} at ${opts.streamResult.numTurns} turns (${formatRunCost(opts.streamResult)}) but had clean uncommitted work. The dispatcher auto-committed the changes and opened a draft PR for human triage.\n\nLabel \`error:max_turns_salvaged\` is set; the ticket does **not** auto-advance.\n\n**Reviewer:** check the draft PR — decide whether to fix-and-promote (mark ready), recover via JSONL replay, or close as wontfix.`,
+        `## ⚠️ Salvaged from ${budget.head}\n\nThe ${opts.agent.name} agent ${budget.detail} at ${opts.streamResult.numTurns} turns (${formatRunCost(opts.streamResult)}). The dispatcher ${preservation} and opened a draft PR for human triage.\n\nLabel \`error:max_turns_salvaged\` is set; the ticket does **not** auto-advance.\n\n**Reviewer:** check the draft PR — decide whether to fix-and-promote (mark ready), recover via JSONL replay, or close as wontfix.`,
       );
     } catch (e) { console.warn(`   ⚠️  Failed to post salvage comment: ${e}`); }
 
     opts.deps.writeLog(opts.logFile, "SAFER_SALVAGE",
-      `Committed + pushed + draft PR opened for #${opts.item.issueNumber} (${opts.streamResult.numTurns} turns, ${formatRunCost(opts.streamResult)})`);
+      `${preservation}; pushed + draft PR opened for #${opts.item.issueNumber} (${opts.streamResult.numTurns} turns, ${formatRunCost(opts.streamResult)})`);
     console.log(`   💾 Safer salvage: draft PR opened for #${opts.item.issueNumber}, label error:max_turns_salvaged set`);
 
     await notifyDiscord(`💾 **${opts.agent.name}** salvaged on #${opts.item.issueNumber}: ${opts.item.title}\n${opts.item.url}\nDraft PR opened — needs human triage.`);
