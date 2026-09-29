@@ -207,8 +207,9 @@ function baseTimeout(agent: AgentConfig, labels: string[]): number {
  *    different salvage fired, the work was pushed, and the next run
  *    finished it from that branch.
  * 2. No PR already exists — the existing salvage path handles that case.
- * 3. Working tree has changes — nothing to salvage if the worktree is
- *    clean (the agent did no productive work).
+ * 3. Working tree has changes, or the committed branch differs from
+ *    the default branch. An agent can commit and push before timing
+ *    out on PR creation; a clean worktree does not imply no work.
  * 4. All configured salvage gates exit 0 — don't ship broken code as a
  *    draft PR. Default gates are Go-specific (`go vet ./...` and
  *    `go build ./...`); consumers in other ecosystems override via the
@@ -254,6 +255,8 @@ export function shouldAttemptSafeSalvage(opts: {
   timedOut: boolean;
   prAlreadyExists: boolean;
   gitStatusOutput: string;
+  /** Committed branch content differs from its merge base with the default branch. */
+  hasCommittedChanges?: boolean;
   /**
    * Exit codes from each configured salvage gate, in execution order.
    * All must be 0 for salvage to proceed. Empty array = no gating
@@ -263,7 +266,7 @@ export function shouldAttemptSafeSalvage(opts: {
 }): boolean {
   if (opts.terminalReason !== "max_turns" && !opts.timedOut) return false;
   if (opts.prAlreadyExists) return false;
-  if (opts.gitStatusOutput.trim().length === 0) return false;
+  if (opts.gitStatusOutput.trim().length === 0 && !opts.hasCommittedChanges) return false;
   if (opts.gateExitCodes.some((code) => code !== 0)) return false;
   return true;
 }
