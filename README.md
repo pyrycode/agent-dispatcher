@@ -95,6 +95,7 @@ Optional:
 | `TARGET_DEFAULT_BRANCH` | `main` | Default branch of the target repo. Set to `master` or your trunk-based branch name as needed. Threaded through `git checkout`, `git rev-list --count`, merge targets, and the empty-branch guard. |
 | `SALVAGE_GATES` | `go vet ./...; go build ./...` | `;`-delimited shell commands that gate the safer-salvage path on `max_turns`. Each runs in the agent's worktree; all must exit 0 for the dispatcher to preserve committed or uncommitted branch work as a draft PR. Set to `""` to skip gating entirely. Override per ecosystem (e.g. `cargo check --all-targets; cargo test --no-run` for Rust). |
 | `PYRY_STAGE_SET` | `classic` | Which agent pipeline this fork runs: `classic` (the six-agent relay, byte-identical default) or `builder` (collapsed four-role pipeline, piloted on one fork). Unknown values fail fast at startup. See below. |
+| `PYRY_BUILDER_TIMEOUT_MINUTES` | unset | Absolute wall-clock limit for the builder only, after the general budget scale. Whole minutes from 1 to 240. Other roles and turn budgets are unchanged. Mobile sets 70 in its launcher. |
 | `PYRY_VERIFIER_SERIAL` | `1` | Builder set only. The verifier runs one at a time by default, because its pre-spawn gates are host-level work (emulators, a relay and a daemon on one machine) that two verifiers would contend for. The exact string `0` lets verifiers run concurrently for a fork that wants to try it. Printed in the startup banner. |
 | `PYRY_POLL_INTERVAL_MS` | `60000` | How long the loop waits between board reads when no run settles first. Whole milliseconds, floor `10000`; anything else keeps the default. Only idle pickup latency changes: a dispatch or a settled run wakes the loop at once. Mobile runs `120000` since 2026-09-22 to ease the account-wide GitHub API limit. |
 | `PYRY_VERIFIER_GATES` | `go vet ./...; go build ./...` | Builder stage set only: `;`-delimited deterministic gate commands the dispatcher itself runs in the ticket's worktree before spawning the verifier. Same parsing as `SALVAGE_GATES`; set to `""` to skip the pre-verifier gate step. A fork's `.env` sets the full list, e.g. `make check;make build`. Inert in the classic set. |
@@ -341,6 +342,12 @@ No implementation-complete label, automatic commit or push occurs. Its worktree
 is retained. Other roles cannot use this outcome. A failed run or observed
 approval rejection cannot use this route. Permission denials still require
 operator review; the dispatcher does not retry the denied action.
+
+A Codex builder may return `status: waiting_on_blocker` after linking an open
+GitHub dependency. The dispatcher reads blockers afresh, posts the wait and
+routes through `needs-rework:refiner`. The existing router leaves the ticket
+in development without adding a rework count. A missing or closed blocker,
+failed run, or approval rejection still becomes an agent error.
 
 Codex has no Claude-style max-turn budget. The existing per-stage wall-clock
 budget applies, with process-group termination and a two-second forced-stop grace
