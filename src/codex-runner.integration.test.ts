@@ -108,7 +108,7 @@ test("Codex subprocess receives literal stdin, additive role, schema and reviewe
   assert.ok(args.includes('model_reasoning_effort="high"'));
   assert.ok(args.includes('project_doc_fallback_filenames=["CLAUDE.md"]'));
   const schema = JSON.parse(readFileSync(args[args.indexOf("--output-schema") + 1], "utf8"));
-  assert.deepEqual(schema.properties.status.enum, ["completed", "blocked", "needs_refinement"]);
+  assert.deepEqual(schema.properties.status.enum, ["completed", "blocked", "needs_refinement", "waiting_on_blocker"]);
   for (const forbidden of ["--max-turns", "--allowedTools", "--disallowedTools", "--dangerously-bypass-approvals-and-sandbox"]) assert.ok(!args.includes(forbidden));
 });
 

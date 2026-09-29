@@ -47,6 +47,7 @@ class FakeClient implements DispatchClient {
     this.comments.push({ issueNumber, body });
   }
   async getIssueLabels() { return []; }
+  async getOpenBlockers() { return []; }
   async getItemStatus() { return null; }
   async getItemsByStatus() { return []; }
   async getClosedItemsNotInDone() { return []; }

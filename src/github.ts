@@ -679,6 +679,24 @@ export class GitHubProjectClient {
     return labels.map((l) => l.name);
   }
 
+  async getOpenBlockers(issueNumber: number): Promise<number[]> {
+    const result: any = await this.gql(`
+      query($owner: String!, $repo: String!, $number: Int!) {
+        repository(owner: $owner, name: $repo) {
+          issue(number: $number) {
+            blockedBy(first: 100) { nodes { number state } pageInfo { hasNextPage } }
+          }
+        }
+      }
+    `, { owner: this.config.owner, repo: this.config.repo, number: issueNumber });
+    const blockers = result.repository?.issue?.blockedBy;
+    if (!blockers || blockers.pageInfo?.hasNextPage) {
+      throw new Error(`Could not read every blocker for #${issueNumber}`);
+    }
+    return blockers.nodes.filter((b: { state: string }) => b.state === "OPEN")
+      .map((b: { number: number }) => b.number);
+  }
+
   /**
    * Create a new issue in the configured repo via the REST API.
    * Returns both the issue number (for human-facing links) and the

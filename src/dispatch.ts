@@ -1686,6 +1686,8 @@ export interface DispatchClient {
   removeLabel(issueNumber: number, label: string): Promise<void>;
   addComment(issueNumber: number, body: string): Promise<void>;
   getIssueLabels(issueNumber: number): Promise<string[]>;
+  /** Fresh GitHub read, including blockers added during this agent run. */
+  getOpenBlockers(issueNumber: number): Promise<number[]>;
   getItemStatus(issueNumber: number, options?: { forceRefresh?: boolean }): Promise<string | null>;
   /** Used by `runAutoMerge` and `runDoneCleanup` to find Done-column
    *  items. The real `GitHubProjectClient` reads from the per-cycle
@@ -3037,6 +3039,21 @@ export async function handlePostRun(
 ): Promise<{ ok: true } | { ok: false }> {
   const { agent, item, client, agentCwd, useWorktree, branchName, logFile, startTime } = ctx;
   const { execSync, spawnSync, notifyDiscord } = ctx.deps;
+
+  if (streamResult.terminalReason === "waiting_on_blocker") {
+    if (streamResult.runner !== "codex" || agent.name !== "builder" || item.issueNumber <= 0
+        || streamResult.isError || streamResult.hadPermissionDenial || saferSalvaged) {
+      throw new Error("Invalid blocker wait; operator review required");
+    }
+    const blockers = await client.getOpenBlockers(item.issueNumber);
+    if (blockers.length === 0) throw new Error("Builder requested a wait without an open GitHub blocker");
+    await client.addComment(item.issueNumber,
+      `## ⏸️ Waiting on ${blockers.map(n => `#${n}`).join(", ")}\n\n${streamResult.output}\n\nWorktree retained for recovery: ${agentCwd}`);
+    await client.addLabel(item.issueNumber, "needs-rework:refiner");
+    ctx.deps.writeLog(logFile, "BLOCKER WAIT", streamResult.output);
+    console.log(`   ⏸️  #${item.issueNumber} waits on ${blockers.map(n => `#${n}`).join(", ")}; worktree retained`);
+    return { ok: false };
+  }
 
   // A builder planning handoff is neither completed implementation nor an
   // approval escape hatch. Keep partial work local; the existing rework router
