@@ -11,7 +11,7 @@ import { countOpenPrs, shouldFlagMissingPr } from "./pr-guard.js";
 import { resolveImportOnlyMerge } from "./merge-resolve.js";
 import { MERGE_HANDOFF_LABEL, checkMergeResolution, decideConflictRoute, mergeHandoffNote, readPendingMerge, type PendingMerge } from "./merge-handoff.js";
 
-import { buildCodexInvocation, codexChildEnv, CODEX_ROLE_GUIDANCE, CodexStreamAdapter, formatRunCost, resumeCommand, resolveAgentRunner, type AgentRunner } from "./agent-runner.js";
+import { buildClaudeSourceReviewInvocation, buildCodexInvocation, codexChildEnv, CODEX_ROLE_GUIDANCE, CodexStreamAdapter, formatRunCost, resumeCommand, resolveAgentRunner, type AgentRunner } from "./agent-runner.js";
 
 import { GitHubProjectClient } from "./github.js";
 import { type AgentConfig, type ProjectItem } from "./types.js";
@@ -509,6 +509,8 @@ interface RunClaudeOpts {
   runner?: AgentRunner;
   /** Restricted preliminary source review, never a publishing/verdict run. */
   sourceReview?: boolean;
+  /** The sole allowed source directory for the Claude preliminary reader. */
+  sourceReviewRoot?: string;
   promptFile: string;
   systemPromptFile: string;
   model: string;
@@ -686,11 +688,14 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
     // branch into the default spawn once the wrapper grows a --resume
     // flag (README "Resume-in-place" carries the caveat).
     const isResumeLeg = Boolean(opts.resumeSessionId);
-    const claudeReadsStdin = isResumeLeg || useLegacyClaude;
+    const claudeReadsStdin = isResumeLeg || useLegacyClaude || opts.sourceReview;
     let bin: string;
     let args: string[];
     if (isCodex) {
       ({ bin, args } = buildCodexInvocation({ cwd: opts.cwd, role: readFileSync(opts.systemPromptFile, "utf8") + (opts.sourceReview ? "" : CODEX_ROLE_GUIDANCE), model: opts.model, effort: opts.effort, bin: opts.env.PYRY_CODEX_BIN, agentsRepoPath: opts.env.AGENTS_REPO_PATH, sourceReview: opts.sourceReview }));
+    } else if (opts.sourceReview) {
+      if (!opts.sourceReviewRoot) throw new Error("Claude source review requires an explicit source root");
+      ({ bin, args } = buildClaudeSourceReviewInvocation({ root: opts.sourceReviewRoot, model: opts.model, effort: opts.effort, maxTurns: opts.maxTurns, systemPromptFile: opts.systemPromptFile }));
     } else if (isResumeLeg) {
       ({ bin, args } = buildResumeArgv({
         sessionId: opts.resumeSessionId!,
@@ -903,15 +908,21 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
 
       if (resultMsg) {
         const r = resultMsg as any;
+        // Direct Claude CLI emits subtype/structured_output, unlike pyry's
+        // normalized result. Fail closed for incomplete or late source reports.
+        const report = opts.sourceReview ? r.structured_output : null;
+        const sourceComplete = !opts.sourceReview || (code === 0 && !timedOut && !denialState.hadPermissionDenial
+          && !r.is_error && r.subtype === "success" && report?.status === "completed"
+          && typeof report.summary === "string" && report.summary.trim().length > 0);
         resolve({
-          output: r.result || "",
+          output: opts.sourceReview ? report?.summary || r.result || "" : r.result || "",
           sessionId: pickFinalSessionId(r.session_id, initSessionId),
-          isError: r.is_error || false,
+          isError: r.is_error || !sourceComplete,
           numTurns: r.num_turns || 0,
           totalCostUsd: r.total_cost_usd || 0,
           durationMs: r.duration_ms || 0,
           usage: r.usage || {},
-          terminalReason: r.terminal_reason || "",
+          terminalReason: opts.sourceReview ? (sourceComplete ? "stop" : "source_review_incomplete") : r.terminal_reason || "",
           rawResult: r,
           hadPermissionDenial: denialState.hadPermissionDenial,
           stoppedAtDenial: denialState.stoppedAtDenial,
@@ -1948,7 +1959,6 @@ export async function dispatchToAgent(
   // inherited from main). In the classic set this is a no-op returning an
   // empty note without reading any env.
   const parallelReview = process.env.PYRY_VERIFIER_PARALLEL_REVIEW === "1"
-    && resolveAgentRunner(process.env) === "codex"
     && activeStageSet().preSpawnGate?.agentNames.has(agent.name) === true
     && parseVerifierGates(process.env.PYRY_VERIFIER_GATES).length > 0;
   const gates = parallelReview ? { promptNote: "" } : await maybeRunPreSpawnGates(ctx);
@@ -1969,7 +1979,9 @@ export async function dispatchToAgent(
     // (PYRY_RESUME_LEGS, default 1) before any salvage. A success comes
     // back merged and walks the normal success path below; anything
     // else comes back as the original result and salvages as today.
-    streamResult = await maybeResumeExhaustedRun(streamResult, spawn.config, ctx);
+    // The two model phases already share one budget. Do not grant another
+    // full budget through the normal single-phase continuation path.
+    if (!parallelReview) streamResult = await maybeResumeExhaustedRun(streamResult, spawn.config, ctx);
     saferSalvaged = await handleAgentResultErrors(streamResult, ctx);
     const postRun = await handlePostRun(streamResult, ctx, saferSalvaged);
     if (!postRun.ok) return;
@@ -2592,7 +2604,7 @@ export async function prepareAgentSpawn(
    *  Empty for every other dispatch, which keeps the written prompt
    *  byte-identical to the pre-stage-set dispatcher. */
   promptNote = "",
-): Promise<{ ok: true; config: SpawnConfig; promptText: string } | { ok: false }> {
+): Promise<{ ok: true; config: SpawnConfig; promptText: string; systemPrompt: string } | { ok: false }> {
   const { agent, item, client, agentCwd, useWorktree, worktreeDir, branchName, logFile } = ctx;
   const { execSync, readFileSync, writeFileSync, buildPromptForAgent } = ctx.deps;
 
@@ -2750,7 +2762,7 @@ export async function prepareAgentSpawn(
 
   return {
     ok: true,
-    promptText,
+    promptText, systemPrompt,
     config: {
       runner,
       promptFile,
@@ -2777,32 +2789,44 @@ export async function prepareAgentSpawn(
  * preliminary run goes straight to dispatch error handling, never salvage. */
 async function runParallelVerifierReview(
   ctx: DispatchContext,
-  spawn: { config: SpawnConfig; promptText: string },
+  spawn: { config: SpawnConfig; promptText: string; systemPrompt: string },
 ): Promise<StreamResult> {
   const { config, promptText } = spawn;
   const deadline = Date.now() + config.timeoutMs;
   const sourcePromptFile = config.promptFile + ".source.txt";
   const sourceSystemFile = config.promptFile + ".source-system.txt";
   const sourceLogFile = config.logFile.replace(/\.log$/, ".source.log");
+  const isClaude = config.runner !== "codex";
+  let sourcePrompt = promptText;
+  if (isClaude) {
+    // The reader has no command tool. Supply the complete merge-base diff
+    // ourselves and let its read tools inspect the full files and local plan.
+    const diff = ctx.deps.spawnSync("git", ["diff", "--no-ext-diff", `${defaultBranch}...HEAD`, "--"], {
+      cwd: ctx.agentCwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024,
+    });
+    if (diff.error || diff.status !== 0) throw new Error("Cannot prepare complete source diff for Claude review");
+    sourcePrompt += "\n\n## Complete source diff\n\n" + diff.stdout.toString();
+  }
   const sourceInstructions = [
     "You are the preliminary source reviewer for this ticket. Automated checks are running concurrently.",
     "Read the full current diff, all affected files and the local plan. Review the entire diff on rework too.",
-    `The source worktree is ${JSON.stringify(ctx.agentCwd)}. Use git -C with this absolute path; your working directory is isolated.`,
-    `Compare against ${JSON.stringify(defaultBranch)} using the merge base. Read the repository instructions and the verifier checklist at ${JSON.stringify(config.systemPromptFile)} as review criteria only.`,
+    `The source worktree is ${JSON.stringify(ctx.agentCwd)}. Your working directory is isolated. ` + (isClaude ? "The complete merge-base diff is supplied in the prompt. Use Read, Glob and Grep to inspect full files and repository instructions." : `Use git -C with this absolute path. Compare against ${JSON.stringify(defaultBranch)} using the merge base. Read the repository instructions.`),
     "Review correctness, lifecycle, concurrency, security, accessibility, test coverage, plan compliance and same-pattern occurrences.",
-    "This phase has read-only local shell access. No network, plugins, connectors or permission escalation is available. Do not delegate to other agents.",
+    isClaude ? "This phase has only Read, Glob and Grep file tools. No shell, writes, network, plugins, connectors, permission escalation or delegation tools are available." : "This phase has read-only local shell access. No network, plugins, connectors or permission escalation is available. Do not delegate to other agents.",
     "Do not run builds, tests, emulators, baselines or other gates. Do not edit files, post reviews/comments, change labels or issue a PASS/FAIL verdict.",
-    "Defer Figma, live evidence and red-gate triage to the final verifier. Do not report those intentionally deferred checks as infrastructure failures.",
+    "Defer Figma, live evidence, remote PR queries, codegraph/QMD tools, external checklists and red-gate triage to the final verifier. Document remaining checks. Do not report those intentionally deferred checks as infrastructure failures.",
     "Return status completed with a self-contained summary: every finding with file/line, concrete trigger, impact and severity; reviewed coverage; remaining checks. If the source review cannot complete, return blocked.",
     "The final verifier will receive your complete findings and the gate results after BOTH finish.",
+    "\n## Verifier checklist, review criteria only\n",
+    spawn.systemPrompt,
   ].join("\n");
-  ctx.deps.writeFileSync(sourcePromptFile, promptText);
+  ctx.deps.writeFileSync(sourcePromptFile, sourcePrompt);
   ctx.deps.writeFileSync(sourceSystemFile, sourceInstructions);
-  ctx.deps.writeLog(sourceLogFile, "SOURCE REVIEW", sourceInstructions + "\n\n" + promptText);
+  ctx.deps.writeLog(sourceLogFile, "SOURCE REVIEW", sourceInstructions + "\n\n" + sourcePrompt);
   console.log("   🔎 Source review running alongside verifier gates; verdict waits for both");
   const results = await Promise.allSettled([
     maybeRunPreSpawnGates(ctx),
-    ctx.deps.runClaudeStreaming({ ...config, sourceReview: true, promptFile: sourcePromptFile, systemPromptFile: sourceSystemFile, logFile: sourceLogFile }),
+    ctx.deps.runClaudeStreaming({ ...config, sourceReview: true, sourceReviewRoot: ctx.agentCwd, promptFile: sourcePromptFile, systemPromptFile: sourceSystemFile, logFile: sourceLogFile }),
   ]);
   const [gates, review] = results;
   if (gates.status === "rejected") throw gates.reason;
@@ -2823,7 +2847,9 @@ async function runParallelVerifierReview(
   ctx.deps.writeLog(ctx.logFile, "FINAL REVIEW INPUT", finalNote);
   const remainingMs = deadline - Date.now();
   if (remainingMs <= 0) throw new Error("Verifier budget exhausted before final review. No verdict published.");
-  const final = await ctx.deps.runClaudeStreaming({ ...config, timeoutMs: remainingMs });
+  const remainingTurns = isClaude ? config.maxTurns - source.numTurns : config.maxTurns;
+  if (remainingTurns <= 0) throw new Error("Verifier turn budget exhausted before final review. No verdict published.");
+  const final = await ctx.deps.runClaudeStreaming({ ...config, timeoutMs: remainingMs, maxTurns: remainingTurns });
   return mergeLegResults(source, final);
 }
 

@@ -6,6 +6,24 @@ import type { StreamResult } from "./dispatch.js";
 
 export type AgentRunner = "claude" | "codex";
 
+/** A separate reader, with no shell, write, network or delegation tools. */
+export function buildClaudeSourceReviewInvocation(opts: {
+  root: string; model: string; effort: string; maxTurns: number; systemPromptFile: string;
+}): { bin: string; args: string[] } {
+  return { bin: "claude", args: [
+    "-p", "--verbose", "--output-format", "stream-json",
+    "--restricted", "--safe-mode", "--no-chrome", "--disable-slash-commands",
+    "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+    "--tools", "Read,Glob,Grep", "--allowedTools", "Read,Glob,Grep",
+    "--permission-mode", "dontAsk", "--add-dir", opts.root,
+    "--model", opts.model, "--effort", opts.effort, "--max-turns", String(opts.maxTurns),
+    "--append-system-prompt-file", opts.systemPromptFile,
+    "--json-schema", JSON.stringify({ type: "object", properties: {
+      status: { type: "string", enum: ["completed", "blocked"] }, summary: { type: "string" },
+    }, required: ["status", "summary"], additionalProperties: false }),
+  ] };
+}
+
 /** A typo must fail before the dispatcher starts changing the board. */
 export function resolveAgentRunner(env: NodeJS.ProcessEnv): AgentRunner {
   const value = env.PYRY_AGENT_RUNNER ?? "claude";
