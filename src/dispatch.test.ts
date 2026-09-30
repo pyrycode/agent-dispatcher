@@ -7341,7 +7341,7 @@ test("Codex spawn selection does not inherit Claude model overrides", async () =
     const result = await prepareAgentSpawn(ctx);
     assert.ok(result.ok);
     assert.equal(result.config.runner, "codex");
-    assert.equal(result.config.model, "gpt-6-sol");
+    assert.equal(result.config.model, "gpt-6.1-sol");
     assert.equal(result.config.effort, "");
     process.env.PYRY_CODEX_MODEL = "selected-codex-model";
     process.env.PYRY_CODEX_EFFORT = "medium";
@@ -7376,7 +7376,7 @@ test("effort trial reaches both runners and records the actual selection without
           const result = await prepareAgentSpawn(ctx);
           assert.ok(result.ok);
           assert.equal(result.config.effort, expected);
-          assert.equal(result.config.model, runner === "codex" ? "gpt-6-sol" : agent.model ?? "opus");
+          assert.equal(result.config.model, runner === "codex" ? "gpt-6.1-sol" : agent.model ?? "opus");
           const log = calls.logs.find(l => l.section === "DISPATCH")!;
           assert.match(log.content, /Effort policy: role-risk-v1/);
           assert.ok(log.content.includes(`Effort: ${expected}\n`));

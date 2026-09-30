@@ -2721,7 +2721,7 @@ export async function prepareAgentSpawn(
   const timeoutMs = timeoutFor(agent, item.labels);
   const timeoutLabel = `${timeoutMs / 60_000}min`;
 
-  const model = runner === "codex" ? process.env.PYRY_CODEX_MODEL ?? "gpt-6-sol" : agent.model ?? "opus";
+  const model = runner === "codex" ? process.env.PYRY_CODEX_MODEL ?? "gpt-6.1-sol" : agent.model ?? "opus";
   const effort = resolveEffort({ agent, item, runner, env: process.env, stageSet: stageSet.name });
 
   ctx.deps.writeLog(logFile, "DISPATCH", `Agent: ${agent.name}\nTicket: #${item.issueNumber} — ${item.title}\nBranch: ${branchName}\nWorktree: ${useWorktree ? worktreeDir : `none (PO on ${defaultBranch})`}\nRunner: ${runner}\nModel: ${model}\nEffort policy: ${effort.policy}\nEffort: ${effort.effort || "inherited"}\nEffort reason: ${effort.reason}\nMax turns: ${runner === "codex" ? "not supported; wall-clock budget only" : maxTurns}\nTimeout: ${timeoutLabel}\nTool policy: ${runner === "codex" ? "Codex workspace sandbox and automatic review" : allowedTools}`);

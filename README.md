@@ -262,7 +262,7 @@ board processing. The installed Codex CLI must support `exec --json`,
 0.153.4. Authenticate Codex on the dispatcher host before starting the queue.
 Claude authentication is not reused.
 
-Codex uses `gpt-6-sol` by default and inherits the operator's configured effort.
+Codex uses `gpt-6.1-sol` by default and inherits the operator's configured effort.
 Optional `PYRY_CODEX_MODEL` and `PYRY_CODEX_EFFORT` select Codex-specific overrides;
 Claude stage model names and effort overrides are never passed to Codex.
 The optional role-risk policy below selects effort for both runners instead.
