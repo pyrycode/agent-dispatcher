@@ -15,6 +15,17 @@ describe("runner selection", () => {
   });
 });
 describe("Codex invocation", () => {
+  test("source review cannot publish or request writable access", () => {
+    const spec = buildCodexInvocation({ cwd: "/tmp/isolated-review", role: "Read sources", model: "chosen-model", effort: "high", sourceReview: true });
+    assert.ok(!spec.args.includes("--approve-for-me"));
+    assert.equal(spec.args[spec.args.indexOf("--sandbox") + 1], "read-only");
+    assert.ok(spec.args.includes('approval_policy="never"'));
+    assert.ok(spec.args.includes("--ignore-user-config"));
+    assert.ok(spec.args.includes("features.apps=false"));
+    assert.ok(spec.args.includes("features.plugins=false"));
+    assert.ok(spec.args.includes("features.multi_agent=false"));
+    assert.ok(spec.args.includes("--skip-git-repo-check"));
+  });
   test("keeps role instructions additive, prompts on stdin and permissions reviewed", () => {
     const role = 'Review "quoted" paths\nDo not modify code.';
     const spec = buildCodexInvocation({ cwd: "/tmp/a b", role, model: "", effort: "" });
