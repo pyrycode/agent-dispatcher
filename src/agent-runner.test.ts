@@ -26,6 +26,7 @@ describe("Codex invocation", () => {
     assert.equal(spec.args.at(-1), "-");
     assert.ok(spec.args.includes(`developer_instructions=${JSON.stringify(role)}`));
     assert.ok(spec.args.includes('project_doc_fallback_filenames=["CLAUDE.md"]'));
+    assert.ok(!spec.args.some(arg => arg.startsWith("shell_environment_policy.set.AGENTS_REPO_PATH=")), "an absent path must not overwrite user configuration");
     for (const forbidden of ["--model", "--max-turns", "--allowedTools", "--dangerously-bypass-approvals-and-sandbox", "--full-auto"]) assert.ok(!spec.args.includes(forbidden));
   });
   test("uses only explicitly selected Codex model and effort", () => {
