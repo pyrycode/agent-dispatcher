@@ -99,6 +99,7 @@ Optional:
 | `PYRY_VERIFIER_SERIAL` | `1` | Builder set only. The verifier runs one at a time by default, because its pre-spawn gates are host-level work (emulators, a relay and a daemon on one machine) that two verifiers would contend for. The exact string `0` lets verifiers run concurrently for a fork that wants to try it. Printed in the startup banner. |
 | `PYRY_POLL_INTERVAL_MS` | `60000` | How long the loop waits between board reads when no run settles first. Whole milliseconds, floor `10000`; anything else keeps the default. Only idle pickup latency changes: a dispatch or a settled run wakes the loop at once. Mobile runs `120000` since 2026-09-22 to ease the account-wide GitHub API limit. |
 | `PYRY_VERIFIER_GATES` | `go vet ./...; go build ./...` | Builder stage set only: `;`-delimited deterministic gate commands the dispatcher itself runs in the ticket's worktree before spawning the verifier. Same parsing as `SALVAGE_GATES`; set to `""` to skip the pre-verifier gate step. A fork's `.env` sets the full list, e.g. `make check;make build`. Inert in the classic set. |
+| `PYRY_VERIFIER_PARALLEL_REVIEW` | `0` | Exact `1` opts a Codex verifier into preliminary source review alongside its deterministic gates. Both must finish before the final verifier can triage and publish. Other runners, roles, classic and empty gate lists keep sequential behaviour. See below. |
 | `PYRY_VERIFIER_GATE_TIMEOUT_MS` | `600000` | Builder stage set only: wall clock for each `PYRY_VERIFIER_GATES` command. A gate that runs past it reads as red and the verifier spawns in triage mode. Raise it for a fork whose slowest gate needs longer; Desktop runs `1800000` since 2026-09-25 because its serial Playwright tier takes about 15 minutes. |
 | `DISCORD_WEBHOOK_URL` | — | Notify on dispatch start/end |
 | `PYRY_LOG_RETENTION_DAYS` | `30` | Rotate logs older than N days; `0` disables |
@@ -143,6 +144,27 @@ The advance chain is Backlog → In Development → In Code Review → In Docume
 - **Any red** → the verifier's prompt gets the failure context in **TRIAGE MODE**: the failing gate, its verdict (exit code / timeout / spawn error) and the tail of its output (capped at 4000 chars). The verifier then owns the baseline partition and the bounce-vs-advance call, exactly as QA does today — failures that already exist on the merge base get filed and advanced rather than bounced, and only regressions this ticket caused go back to the builder. The dispatcher deliberately applies no rework label on red: a deterministic bounce would loop forever on a pre-existing failure.
 
 In the classic set this feature is entirely inert (locked by test): no gate runs, no env is read.
+
+**Parallel source review.** With `PYRY_VERIFIER_PARALLEL_REVIEW=1`, a Codex
+verifier starts its complete source review while the configured gates run. This
+preliminary phase uses an empty temporary working directory, ignores user
+configuration, and has read-only local shell access with no approvals, network,
+plugins, apps or browser access. Agent delegation is prohibited. It reads the ticket's worktree by
+absolute path. It cannot publish reviews, mutate labels or run builds and devices.
+Standard Codex authentication still comes from `CODEX_HOME`.
+
+After both phases settle, a normal verifier receives the complete source findings
+and green or red gate evidence. It validates findings, finishes deferred Figma and
+live-evidence checks, performs any red-gate triage, then publishes the verdict.
+A failed or incomplete preliminary review parks the dispatch as an error; an
+existing PR cannot salvage it into a pass. Both model phases share the original
+verifier wall-clock budget, and their usage is combined. Source-review output has
+its own `.source.log`; the main log records the report and final input.
+
+The verifier serial switch still covers the entire dispatch, so this option does
+not overlap two emulator suites. A separate concurrency cap of two permits a
+builder or refiner beside the verifier. Other consumers remain sequential unless
+they explicitly enable this option.
 
 **Real-claude gate under stage sets.** The gate's trigger and rework labels derive from the active set: it fires on the set's final pre-documentation review signal (`done:code-review` in classic, `done:verifier` in builder) and routes genuine failures back with the set's own rework label (`needs-rework:developer` / `needs-rework:builder`). A `needs-real-claude` ticket on the builder fork therefore parks and executes through the gate exactly as it does under classic.
 

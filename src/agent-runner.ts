@@ -40,19 +40,30 @@ export function resolveCodexExecutable(env: NodeJS.ProcessEnv, options: {
 }
 
 export function buildCodexInvocation(opts: {
-  cwd: string; role: string; model: string; effort: string; bin?: string; agentsRepoPath?: string;
+  cwd: string; role: string; model: string; effort: string; bin?: string; agentsRepoPath?: string; sourceReview?: boolean;
 }): { bin: string; args: string[] } {
   return {
     bin: opts.bin || "codex",
     args: [
-      "exec", "--json", "--approve-for-me",
+      "exec", "--json",
+      // Preliminary review runs from an empty temporary directory, so no
+      // project config can restore MCP access. Auth still uses CODEX_HOME.
+      // Read-only shell + no network/approval + no connector/plugin tools
+      // makes publishing a verdict impossible until the final phase.
+      ...(opts.sourceReview ? [
+        "--ignore-user-config", "--sandbox", "read-only", "--skip-git-repo-check",
+        "-c", 'approval_policy="never"',
+        "-c", "features.apps=false", "-c", "features.plugins=false",
+        "-c", "features.multi_agent=false", "-c", "features.browser_use=false",
+        "-c", "features.browser_use_external=false", "-c", 'web_search="disabled"',
+      ] : ["--approve-for-me"]),
       "--output-schema", fileURLToPath(new URL("../codex-result.schema.json", import.meta.url)),
       "--cd", opts.cwd,
       // Add role instructions without replacing Codex's built-in instructions.
       "-c", `developer_instructions=${JSON.stringify(opts.role)}`,
       "-c", 'project_doc_fallback_filenames=["CLAUDE.md"]',
       // Meshy is for interactive art work; its launcher asks 1Password on every start.
-      "-c", "mcp_servers.meshy.enabled=false",
+      ...(!opts.sourceReview ? ["-c", "mcp_servers.meshy.enabled=false"] : []),
       // Core shell inheritance drops custom variables. Supply only this
       // non-secret path so role checklists remain readable from tool commands.
       ...(opts.agentsRepoPath ? ["-c", `shell_environment_policy.set.AGENTS_REPO_PATH=${JSON.stringify(opts.agentsRepoPath)}`] : []),
