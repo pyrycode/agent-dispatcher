@@ -3106,9 +3106,9 @@ function fullHappyExecImpls(branch: string): Record<string, ExecHandler> {
 }
 
 describe("parallel verifier source review", () => {
-  async function withParallelReview(fn: () => Promise<void>) {
+  async function withParallelReview(fn: () => Promise<void>, runner = "codex") {
     const prior = { runner: process.env.PYRY_AGENT_RUNNER, parallel: process.env.PYRY_VERIFIER_PARALLEL_REVIEW };
-    process.env.PYRY_AGENT_RUNNER = "codex";
+    process.env.PYRY_AGENT_RUNNER = runner;
     process.env.PYRY_VERIFIER_PARALLEL_REVIEW = "1";
     try { await withStageSet("builder", () => withVerifierGates("make check", fn)); }
     finally {
@@ -3129,8 +3129,9 @@ describe("parallel verifier source review", () => {
     const promise = new Promise<T>(r => { resolve = r; });
     return { promise, resolve };
   }
+  for (const runner of ["codex", "claude"] as const) {
   for (const first of ["source", "gates"] as const) {
-    test(`source and gates start together; ${first} finishing first cannot publish a verdict`, async () => {
+    test(`${runner}: source and gates start together; ${first} finishing first cannot publish a verdict`, async () => {
       await withParallelReview(async () => {
         const f = fixture();
         const gate = deferred<GateSpawnOutcome>();
@@ -3141,14 +3142,14 @@ describe("parallel verifier source review", () => {
         f.deps.runClaudeStreaming = async opts => {
           if (opts.sourceReview) { sourceStarted = true; if (gateStarted) started.resolve(); return source.promise; }
           finalized = true;
-          return streamResult({ runner: "codex", output: "Published verdict", usage: { input_tokens: 7 } });
+          return streamResult({ runner: runner as "claude" | "codex", output: "Published verdict", usage: { input_tokens: 7 } });
         };
         const run = f.run();
         // Await only a bounded event loop turn: serial dispatch must fail this test, not hang.
         await Promise.race([started.promise, new Promise<void>(r => setTimeout(r, 25))]);
         const bothStarted = gateStarted && sourceStarted;
         const green = { exitCode: 0, timedOut: false, spawnError: null };
-        const findings = streamResult({ runner: "codex", output: "Inspect window ownership at Screen.kt:45", usage: { input_tokens: 11 } });
+        const findings = streamResult({ runner: runner as "claude" | "codex", output: "Inspect window ownership at Screen.kt:45", usage: { input_tokens: 11 } });
         if (first === "source") source.resolve(findings); else gate.resolve(green);
         await new Promise<void>(r => setImmediate(r));
         const earlyFinal = finalized;
@@ -3162,27 +3163,27 @@ describe("parallel verifier source review", () => {
         assert.match(prompt, /Screen.kt:45/);
         assert.match(loggedText(f.calls), /Input tokens: 18/);
         assert.ok(f.client.addLabelCalls.some(x => x.label === "done:verifier"));
-      });
+      }, runner);
     });
   }
-  test("red gates reach final triage alongside source findings; rework never gets done", async () => {
+  test(`${runner}: red gates reach final triage alongside source findings; rework never gets done`, async () => {
     await withParallelReview(async () => {
       const f = fixture();
       f.deps.spawnGate = async () => ({ exitCode: 1, timedOut: false, spawnError: null });
       f.deps.runClaudeStreaming = async opts => {
-        if (opts.sourceReview) return streamResult({ runner: "codex", output: "Complete source findings" });
+        if (opts.sourceReview) return streamResult({ runner: runner as "claude" | "codex", output: "Complete source findings" });
         await f.client.addLabel(1330, "needs-rework:builder");
-        return streamResult({ runner: "codex", output: "Regression needs rework" });
+        return streamResult({ runner: runner as "claude" | "codex", output: "Regression needs rework" });
       };
       await f.run();
       const prompt = f.calls.fs.filter(x => x.kind === "write" && x.path.endsWith(".prompt-1330.txt")).at(-1)!.content!;
       assert.match(prompt, /TRIAGE MODE/);
       assert.match(prompt, /Complete source findings/);
       assert.ok(!f.client.addLabelCalls.some(x => x.label === "done:verifier"));
-    });
+    }, runner);
   });
   for (const failure of ["source error", "source timeout", "source exception", "empty report", "gate exception"] as const) {
-    test(`${failure} waits for its sibling and cannot advance or salvage`, async () => {
+    test(`${runner}: ${failure} waits for its sibling and cannot advance or salvage`, async () => {
       await withParallelReview(async () => {
         const f = fixture();
         let finalized = false, siblingSettled = false;
@@ -3196,9 +3197,9 @@ describe("parallel verifier source review", () => {
           if (failure === "source exception") throw new Error("Source reader failed");
           if (failure === "gate exception") {
             await new Promise<void>(r => setTimeout(r, 5)); siblingSettled = true;
-            return streamResult({ runner: "codex", output: "Findings" });
+            return streamResult({ runner: runner as "claude" | "codex", output: "Findings" });
           }
-          return streamResult({ runner: "codex", isError: failure !== "empty report", terminalReason: failure === "source timeout" ? "timeout" : failure === "empty report" ? "stop" : "codex_error", output: failure === "empty report" ? "" : "Source review failed" });
+          return streamResult({ runner: runner as "claude" | "codex", isError: failure !== "empty report", terminalReason: failure === "source timeout" ? "timeout" : failure === "empty report" ? "stop" : "codex_error", output: failure === "empty report" ? "" : "Source review failed" });
         };
         await f.run();
         assert.equal(siblingSettled, true);
@@ -3206,10 +3207,56 @@ describe("parallel verifier source review", () => {
         assert.ok(f.client.addLabelCalls.some(x => x.label === "error:verifier"));
         assert.ok(!f.client.addLabelCalls.some(x => x.label === "done:verifier"));
         assert.ok(!f.calls.exec.some(x => x.cmd.includes("gh pr list --head")), "preliminary failure must not use PR-already-exists salvage");
-      });
+      }, runner);
     });
   }
-  for (const mode of ["classic", "claude", "empty gates", "opted out"] as const) {
+  }
+  test("Claude receives the complete diff and shares turns with the final phase", async () => {
+    await withParallelReview(async () => {
+      const f = fixture();
+      const originalSpawn = f.deps.spawnSync;
+      f.deps.spawnSync = ((bin, args, opts) => {
+        if (bin === "git" && args?.includes("--no-ext-diff")) return { status: 0, stdout: "complete fixture diff", stderr: "" };
+        return originalSpawn(bin, args, opts);
+      }) as typeof f.deps.spawnSync;
+      let initialTurns = 0;
+      f.deps.runClaudeStreaming = async opts => {
+        if (opts.sourceReview) {
+          initialTurns = opts.maxTurns;
+          assert.ok(opts.sourceReviewRoot);
+          return streamResult({ output: "Complete report", numTurns: 8 });
+        }
+        assert.equal(opts.maxTurns, initialTurns - 8);
+        return streamResult({ output: "Final verdict", numTurns: 4 });
+      };
+      await f.run();
+      assert.ok(f.calls.fs.some(x => x.kind === "write" && x.path.endsWith(".source.txt") && x.content?.includes("complete fixture diff")));
+      assert.match(loggedText(f.calls), /Turns: 12/);
+      assert.ok(f.client.addLabelCalls.some(x => x.label === "done:verifier"));
+    }, "claude");
+  });
+  for (const failure of ["diff unavailable", "turn budget exhausted", "final budget exhausted"] as const) {
+    test(`Claude ${failure} cannot get a fresh continuation budget`, async () => {
+      await withParallelReview(async () => {
+        const f = fixture();
+        if (failure === "diff unavailable") f.deps.spawnSync = (() => ({ status: 1, stdout: "", stderr: "failed" })) as any;
+        let sourceRuns = 0, finalRuns = 0;
+        f.deps.runClaudeStreaming = async opts => {
+          if (opts.sourceReview) {
+            sourceRuns++;
+            return streamResult({ output: "Source findings", numTurns: failure === "turn budget exhausted" ? opts.maxTurns : 3 });
+          }
+          finalRuns++;
+          return streamResult({ isError: true, terminalReason: "max_turns", numTurns: opts.maxTurns, sessionId: "existing-session" });
+        };
+        await f.run();
+        assert.equal(sourceRuns, failure === "diff unavailable" ? 0 : 1);
+        assert.equal(finalRuns, failure === "final budget exhausted" ? 1 : 0);
+        assert.ok(!f.client.addLabelCalls.some(x => x.label === "done:verifier"));
+      }, "claude");
+    });
+  }
+  for (const mode of ["classic", "empty gates", "opted out"] as const) {
     test(`${mode} retains the single publishing run`, async () => {
       await withParallelReview(async () => {
         const f = fixture();
@@ -3221,8 +3268,7 @@ describe("parallel verifier source review", () => {
         if (mode === "classic") await withStageSet(undefined, f.run);
         else if (mode === "empty gates") await withVerifierGates("", f.run);
         else {
-          if (mode === "claude") process.env.PYRY_AGENT_RUNNER = "claude";
-          else process.env.PYRY_VERIFIER_PARALLEL_REVIEW = "0";
+          process.env.PYRY_VERIFIER_PARALLEL_REVIEW = "0";
           await f.run();
         }
         assert.equal(sourceRuns, 0);
