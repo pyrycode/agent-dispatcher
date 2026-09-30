@@ -687,7 +687,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
     let bin: string;
     let args: string[];
     if (isCodex) {
-      ({ bin, args } = buildCodexInvocation({ cwd: opts.cwd, role: readFileSync(opts.systemPromptFile, "utf8") + CODEX_ROLE_GUIDANCE, model: opts.model, effort: opts.effort, bin: opts.env.PYRY_CODEX_BIN }));
+      ({ bin, args } = buildCodexInvocation({ cwd: opts.cwd, role: readFileSync(opts.systemPromptFile, "utf8") + CODEX_ROLE_GUIDANCE, model: opts.model, effort: opts.effort, bin: opts.env.PYRY_CODEX_BIN, agentsRepoPath: opts.env.AGENTS_REPO_PATH }));
     } else if (isResumeLeg) {
       ({ bin, args } = buildResumeArgv({
         sessionId: opts.resumeSessionId!,

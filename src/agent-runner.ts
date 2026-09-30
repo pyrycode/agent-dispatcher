@@ -40,7 +40,7 @@ export function resolveCodexExecutable(env: NodeJS.ProcessEnv, options: {
 }
 
 export function buildCodexInvocation(opts: {
-  cwd: string; role: string; model: string; effort: string; bin?: string;
+  cwd: string; role: string; model: string; effort: string; bin?: string; agentsRepoPath?: string;
 }): { bin: string; args: string[] } {
   return {
     bin: opts.bin || "codex",
@@ -53,6 +53,9 @@ export function buildCodexInvocation(opts: {
       "-c", 'project_doc_fallback_filenames=["CLAUDE.md"]',
       // Meshy is for interactive art work; its launcher asks 1Password on every start.
       "-c", "mcp_servers.meshy.enabled=false",
+      // Core shell inheritance drops custom variables. Supply only this
+      // non-secret path so role checklists remain readable from tool commands.
+      ...(opts.agentsRepoPath ? ["-c", `shell_environment_policy.set.AGENTS_REPO_PATH=${JSON.stringify(opts.agentsRepoPath)}`] : []),
       ...(opts.model ? ["--model", opts.model] : []),
       ...(opts.effort ? ["-c", `model_reasoning_effort=${JSON.stringify(opts.effort)}`] : []),
       "-",

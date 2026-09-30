@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runClaudeStreaming } from "./dispatch.js";
@@ -18,6 +18,21 @@ process.stdin.on('end', async () => {
     credentialKeys: Object.keys(process.env).filter(key => /^(ANTHROPIC_|CLAUDE_CODE_)/.test(key) || key === 'CLAUDE_CONFIG_DIR'),
     ordinary: process.env.TEST_ORDINARY
   }));
+  if (process.env.TEST_MODE === 'agents-path') {
+    // Model the CLI's core shell environment: custom inherited values disappear
+    // unless the runner explicitly supplies them through the config set table.
+    const shellEnv = {};
+    for (const arg of process.argv.slice(2)) {
+      const match = /^shell_environment_policy\\.set\\.AGENTS_REPO_PATH=(.*)$/.exec(arg);
+      if (match) shellEnv.AGENTS_REPO_PATH = JSON.parse(match[1]);
+    }
+    const path = shellEnv.AGENTS_REPO_PATH;
+    if (!path || fs.readFileSync(require('node:path').join(path, 'builder/security-review.md'), 'utf8') !== 'fixture security checklist') {
+      process.stderr.write('Security review path unavailable in core shell environment');
+      process.exitCode = 1;
+      return;
+    }
+  }
   const events = [
     {type:'thread.started', thread_id:'fixture-thread'},
     {type:'turn.started'},
@@ -110,6 +125,22 @@ test("Codex subprocess receives literal stdin, additive role, schema and reviewe
   const schema = JSON.parse(readFileSync(args[args.indexOf("--output-schema") + 1], "utf8"));
   assert.deepEqual(schema.properties.status.enum, ["completed", "blocked", "needs_refinement", "waiting_on_blocker"]);
   for (const forbidden of ["--max-turns", "--allowedTools", "--disallowedTools", "--dangerously-bypass-approvals-and-sandbox"]) assert.ok(!args.includes(forbidden));
+});
+
+test("security review remains readable with a core shell environment", async t => {
+  const f = fixture(t, "agents-path");
+  const agents = join(f.dir, 'agents with "quotes" and $literal');
+  mkdirSync(join(agents, "builder"), { recursive: true });
+  writeFileSync(join(agents, "builder/security-review.md"), "fixture security checklist");
+  const result = await runClaudeStreaming({
+    ...f.options,
+    env: { ...f.options.env, AGENTS_REPO_PATH: agents },
+  });
+  assert.equal(result.isError, false, result.output);
+  const observed = JSON.parse(readFileSync(join(f.dir, "observed.json"), "utf8"));
+  assert.ok(observed.argv.includes(`shell_environment_policy.set.AGENTS_REPO_PATH=${JSON.stringify(agents)}`));
+  assert.deepEqual(observed.credentialKeys, []);
+  assert.ok(!observed.argv.some((arg: string) => arg.startsWith("shell_environment_policy.inherit=")));
 });
 
 test("Codex JSON split across chunks and terminal event without newline is consumed", async t => {

@@ -328,6 +328,11 @@ instructions still restrict the scope of the task. Missing search tools fall bac
 to repository and command-line search. Claude credentials are stripped from the
 Codex child environment in addition to the existing dispatcher-secret scrub.
 
+Each Codex launch explicitly sets `AGENTS_REPO_PATH` in its shell environment
+configuration when the dispatcher supplies that path. This keeps role checklists
+readable when the user's shell policy inherits only core variables. The override
+carries only this non-secret path and leaves the user's inheritance policy intact.
+
 A successful process must emit a completed turn and a valid final JSON outcome
 with `status: completed`. A `blocked` outcome, missing outcome, failed turn,
 nonzero exit or dispatcher timeout cannot advance a ticket. A blocked outcome
