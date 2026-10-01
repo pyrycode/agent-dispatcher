@@ -447,9 +447,21 @@ export async function runRealClaudeGate(client: ReconcileClient): Promise<void> 
 export type RealClaudeGateRunner = (opts: { issueNumber: number }) => Promise<GateRunReport>;
 
 /**
- * Returns true when a confirmed candidate is held because agent runs are
- * still in flight. The caller then dispatches nothing new, so the pool
- * empties and the gate runs on the first cycle with nothing in flight.
+ * Hands a started run to the caller instead of awaiting it. The caller keeps
+ * the poll loop going while `work` runs and must not start another gate run
+ * until it settles. `work` never rejects.
+ */
+export type RealClaudeGateBackground = (issueNumber: number, work: () => Promise<void>) => void;
+
+/**
+ * Returns true when a confirmed candidate is held because conflicting runs
+ * are in flight, or when its run was handed to `background`.
+ *
+ * Without `background` the run is awaited here and `inFlight` counts every
+ * agent run: the caller dispatches nothing new while held, so the pool
+ * empties and the gate runs alone. With `background` the caller counts only
+ * the runs that share the emulator with the gate's suite and holds those
+ * back while the run is going; every other agent keeps working beside it.
  */
 export async function runRealClaudeGateExecution(
   client: ReconcileClient,
@@ -458,6 +470,7 @@ export async function runRealClaudeGateExecution(
   notifyDiscord: (message: string) => Promise<void>,
   inFlight = 0,
   recordFlaky: (flaky: readonly string[], ctx: FlakyRunContext) => Promise<FlakyTicketResult> = noFlakyTickets,
+  background?: RealClaudeGateBackground,
 ): Promise<boolean> {
   // Off switch. No command configured means this step never touches the
   // board, so the whole feature can land on a live dispatcher before any
@@ -513,20 +526,26 @@ export async function runRealClaudeGateExecution(
     return false;
   }
 
-  // Never beside an agent run. The gate's suite shares the host's CPU and
-  // emulator with whatever is in flight, and a builder running device tests
-  // on the same managed device stretched a mobile gate from 2m50s to 28
-  // minutes on 2026-09-24. Its pairing codes expired mid-run, 23 of 24
-  // methods failed, and the failure was blamed on the branch (mobile #993).
+  // Never beside a conflicting run. A builder running device tests on the
+  // same managed device stretched a mobile gate from 2m50s to 28 minutes on
+  // 2026-09-24. Its pairing codes expired mid-run, 23 of 24 methods failed,
+  // and the failure was blamed on the branch (mobile #993). Pairing codes are
+  // now minted after the build and mobile's test script holds the device
+  // host-wide, so a background caller counts only verifiers and the main
+  // sweep, whose long device runs would time out queued behind the suite.
   if (inFlight > 0) {
     console.log(
-      `   🧪 Real-claude gate: #${candidate.issueNumber} waits for ${inFlight} in-flight run(s); holding new dispatches`,
+      background
+        ? `   🧪 Real-claude gate: #${candidate.issueNumber} waits for ${inFlight} run(s) that share the emulator`
+        : `   🧪 Real-claude gate: #${candidate.issueNumber} waits for ${inFlight} in-flight run(s); holding new dispatches`,
     );
     return true;
   }
 
   console.log(
-    `   🧪 Real-claude gate: running the live suite for #${candidate.issueNumber} (this blocks the cycle)…`,
+    background
+      ? `   🧪 Real-claude gate: running the live suite for #${candidate.issueNumber} in the background…`
+      : `   🧪 Real-claude gate: running the live suite for #${candidate.issueNumber} (this blocks the cycle)…`,
   );
 
   try {
@@ -536,180 +555,190 @@ export async function runRealClaudeGateExecution(
     return false;
   }
 
-  try {
-    let report: GateRunReport;
+  const work = async (): Promise<void> => {
     try {
-      report = await runner({ issueNumber: candidate.issueNumber });
-    } catch (error: any) {
-      // A runner that throws must still park the ticket. Letting the
-      // exception escape would leave the card sitting in Inbox with no
-      // error label, so the next cycle would pick it up and throw again —
-      // an invisible loop that burns a full suite's wall clock each time.
-      report = {
-        runError: `gate runner threw: ${error?.message ?? error}`,
-        timedOut: false,
-        exitCode: null,
-        tally: null,
-        command: "(runner threw before reporting the command)",
-        branchName: `feature/${candidate.issueNumber}`,
-        baseRef: "unknown",
-        baseSha: "",
-        headSha: "",
-        commitsBehind: null,
-        durationMs: 0,
-        outputPath: "(none)",
-        outputBytes: 0,
-        baselineFailures: null,
-        baselineSkipReason: "the runner threw before any comparison could run",
-        baselineOutputPath: null,
-        rerunFailures: null,
-        rerunSkipReason: "the runner threw before any re-run could happen",
-        rerunOutputPath: null,
-      };
-    }
-
-    const raw = decideGateVerdict({
-      runError: report.runError,
-      timedOut: report.timedOut,
-      tally: report.tally,
-      exitCode: report.exitCode,
-      minExecuted: gateRunFloor(report, minExecuted),
-    });
-    // Re-judge a failure against what the base commit already fails, so a
-    // branch is not blamed for breakage it inherited. No-op for every other
-    // verdict, and a no-op when no baseline ran.
-    const { verdict, reason, introduced, preExisting, flaky } = decideBaselineAdjustedVerdict({
-      verdict: raw.verdict,
-      reason: raw.reason,
-      branchFailures: report.tally?.failedNames ?? [],
-      baselineFailures: report.baselineFailures,
-      rerunFailures: report.rerunFailures,
-    });
-    const artifactsPending = freshLabels.includes("needs-live-artifacts")
-      && (verdict === "pass" || verdict === "flaky-pass");
-    const outcome = artifactsPending
-      ? { toColumn: "In Development", addLabels: [realClaudeGate.failReworkLabel], removeLabels: [], notify: verdict === "flaky-pass" }
-      : decideGateOutcome(verdict, realClaudeGate.failReworkLabel);
-
-    const action = artifactsPending
-      ? `returned it to **In Development** with \`${realClaudeGate.failReworkLabel}\`. ` +
-        `Commit the exact usable live artifacts from this run's durable records and all matching reader/schema changes. ` +
-        `Use the output path below to find the records; do not invent evidence. ` +
-        `Then remove \`needs-live-artifacts\` after committing and pushing, and complete the implementation role. ` +
-        `The pending marker and \`needs-real-claude\` remain until that work is done; review and the live gate must run again. ` +
-        `This is an evidence handoff, not final acceptance.`
-      : outcome.toColumn === null
-      ? `left it in ${REAL_CLAUDE_GATE_RUN_FROM_COLUMN} and added \`${outcome.addLabels.join("`, `")}\`. ` +
-        `This needs a human: the gate could not produce a trustworthy answer, and no agent can fix that by ` +
-        `rewriting code.`
-      : `moved it to **${outcome.toColumn}**` +
-        (outcome.addLabels.length > 0 ? `, added \`${outcome.addLabels.join("`, `")}\`` : "") +
-        (outcome.removeLabels.length > 0 ? `, removed \`${outcome.removeLabels.join("`, `")}\`` : "") +
-        (verdict === "fail"
-          ? `. \`${REAL_CLAUDE_GATE_LABEL}\` stays on, so this ticket must pass the gate again after the fix.`
-          : verdict === "inherited-failure"
-            ? `. These failures also occur on the base commit. Rework must repair or isolate the shared failures; ` +
-              `\`${REAL_CLAUDE_GATE_LABEL}\` stays on until a later live run passes.`
-          : verdict === "flaky-pass"
-            ? `. The suite is green on re-run and the ticket did nothing wrong. The flaky test(s) named above ` +
-              `are the suite's problem, not this branch's, and a human has been pinged about them.`
-            : ".");
-
-    // Comment first, mutate second. If a label write fails, the evidence
-    // is already on the ticket and an operator can finish by hand; the
-    // reverse order can move a card with no record of why.
-    //
-    // Then column BEFORE labels, which matters on a pass. If the move
-    // fails after `needs-real-claude` was already stripped, the ticket sits
-    // in Inbox with nothing marking it as gated: it would never re-gate and
-    // never advance, stuck silently. This order fails the other way — the
-    // label survives, the ticket re-gates next cycle, and the worst cost is
-    // one repeated suite run.
-    try {
-      await client.addComment(
-        candidate.issueNumber,
-        formatGateEvidenceComment({ verdict, reason, report, minExecuted, action, introduced, preExisting, flaky }),
-      );
-    } catch (e) {
-      console.warn(`   ⚠️  Failed to post real-claude gate evidence on #${candidate.issueNumber}: ${e}`);
-      if (artifactsPending) return false; // Recovery needs the durable evidence pointer.
-    }
-
-    // Mark rework before moving so a failed write cannot forward stale approvals.
-    if (artifactsPending) {
+      let report: GateRunReport;
       try {
-        await client.addLabel(candidate.issueNumber, realClaudeGate.failReworkLabel);
-      } catch (e) {
-        console.warn(`   ⚠️  Failed to mark live artifact handoff for #${candidate.issueNumber}: ${e}`);
-        return false;
+        report = await runner({ issueNumber: candidate.issueNumber });
+      } catch (error: any) {
+        // A runner that throws must still park the ticket. Letting the
+        // exception escape would leave the card sitting in Inbox with no
+        // error label, so the next cycle would pick it up and throw again —
+        // an invisible loop that burns a full suite's wall clock each time.
+        report = {
+          runError: `gate runner threw: ${error?.message ?? error}`,
+          timedOut: false,
+          exitCode: null,
+          tally: null,
+          command: "(runner threw before reporting the command)",
+          branchName: `feature/${candidate.issueNumber}`,
+          baseRef: "unknown",
+          baseSha: "",
+          headSha: "",
+          commitsBehind: null,
+          durationMs: 0,
+          outputPath: "(none)",
+          outputBytes: 0,
+          baselineFailures: null,
+          baselineSkipReason: "the runner threw before any comparison could run",
+          baselineOutputPath: null,
+          rerunFailures: null,
+          rerunSkipReason: "the runner threw before any re-run could happen",
+          rerunOutputPath: null,
+        };
       }
-    }
-    if (outcome.toColumn !== null) {
-      try {
-        await client.updateItemStatus(candidate.itemId, outcome.toColumn);
-      } catch (e) {
-        console.warn(`   ⚠️  Failed to move #${candidate.issueNumber} to ${outcome.toColumn}: ${e}`);
-      }
-    }
-    for (const label of artifactsPending ? [] : outcome.addLabels) {
-      try { await client.addLabel(candidate.issueNumber, label); } catch (e) {
-        console.warn(`   ⚠️  Failed to add ${label} to #${candidate.issueNumber}: ${e}`);
-      }
-    }
-    for (const label of outcome.removeLabels) {
-      try { await client.removeLabel(candidate.issueNumber, label); } catch (e) {
-        console.warn(`   ⚠️  Failed to remove ${label} from #${candidate.issueNumber}: ${e}`);
-      }
-    }
 
-    const icon = verdict === "pass" ? "✅" : verdict === "flaky-pass" || verdict === "inherited-failure" ? "⚠️" : verdict === "fail" ? "❌" : "🚨";
-    console.log(`   ${icon} Real-claude gate #${candidate.issueNumber}: ${verdict} — ${reason}`);
-
-    // After the gated ticket's own writes, so a slow or failing board write
-    // here can never hold up or undo its verdict. Any verdict can carry
-    // flakes: a fail whose other failures reproduced still names them.
-    let flakyTickets: FlakyTicketResult | null = null;
-    if (flaky.length > 0) {
-      flakyTickets = await recordFlaky(flaky, {
-        gatedIssue: candidate.issueNumber,
-        report,
-        at: new Date().toISOString(),
+      const raw = decideGateVerdict({
+        runError: report.runError,
+        timedOut: report.timedOut,
+        tally: report.tally,
+        exitCode: report.exitCode,
+        minExecuted: gateRunFloor(report, minExecuted),
       });
-      for (const { name, issue } of flakyTickets.filed) console.log(`   🎫 Filed #${issue} in Backlog for flaky ${name}`);
-      for (const { name, issue } of flakyTickets.commented) console.log(`   💬 Flaky ${name} recorded on #${issue}`);
-      if (flakyTickets.untracked.length > 0) {
-        console.warn(`   ⚠️  Flaky test(s) with no ticket this run: ${flakyTickets.untracked.join(", ")}`);
-      }
-    }
+      // Re-judge a failure against what the base commit already fails, so a
+      // branch is not blamed for breakage it inherited. No-op for every other
+      // verdict, and a no-op when no baseline ran.
+      const { verdict, reason, introduced, preExisting, flaky } = decideBaselineAdjustedVerdict({
+        verdict: raw.verdict,
+        reason: raw.reason,
+        branchFailures: report.tally?.failedNames ?? [],
+        baselineFailures: report.baselineFailures,
+        rerunFailures: report.rerunFailures,
+      });
+      const artifactsPending = freshLabels.includes("needs-live-artifacts")
+        && (verdict === "pass" || verdict === "flaky-pass");
+      const outcome = artifactsPending
+        ? { toColumn: "In Development", addLabels: [realClaudeGate.failReworkLabel], removeLabels: [], notify: verdict === "flaky-pass" }
+        : decideGateOutcome(verdict, realClaudeGate.failReworkLabel);
 
-    if (outcome.notify) {
-      await notifyDiscord(
-        verdict === "flaky-pass"
-          ? `⚠️ **Real-claude gate passed #${candidate.issueNumber} only on re-run.** ` +
-            `${flaky.map(name => `\`${name}\``).join(", ")} failed once and passed the second time on the same ` +
-            `merged tree. The ticket advanced; the flake is the suite's to fix — see the evidence comment.` +
-            flakyTicketNote(flakyTickets)
-          : verdict === "inherited-failure"
-            ? `⚠️ **Real-claude gate found failures on main for #${candidate.issueNumber}.** ${reason}. ` +
-              `Sent to ${outcome.toColumn} with \`${realClaudeGate.failReworkLabel}\` for rework. ` +
-              `The ticket branch did not introduce the named failures — see the evidence comment.`
-          : `🚨 **Real-claude gate could not judge #${candidate.issueNumber}** (${verdict}): ${reason}\n` +
-            `Parked in ${REAL_CLAUDE_GATE_RUN_FROM_COLUMN} with \`${outcome.addLabels.join("`, `")}\`. ` +
-            `Needs a human — see the evidence comment.`,
-      );
+      const action = artifactsPending
+        ? `returned it to **In Development** with \`${realClaudeGate.failReworkLabel}\`. ` +
+          `Commit the exact usable live artifacts from this run's durable records and all matching reader/schema changes. ` +
+          `Use the output path below to find the records; do not invent evidence. ` +
+          `Then remove \`needs-live-artifacts\` after committing and pushing, and complete the implementation role. ` +
+          `The pending marker and \`needs-real-claude\` remain until that work is done; review and the live gate must run again. ` +
+          `This is an evidence handoff, not final acceptance.`
+        : outcome.toColumn === null
+        ? `left it in ${REAL_CLAUDE_GATE_RUN_FROM_COLUMN} and added \`${outcome.addLabels.join("`, `")}\`. ` +
+          `This needs a human: the gate could not produce a trustworthy answer, and no agent can fix that by ` +
+          `rewriting code.`
+        : `moved it to **${outcome.toColumn}**` +
+          (outcome.addLabels.length > 0 ? `, added \`${outcome.addLabels.join("`, `")}\`` : "") +
+          (outcome.removeLabels.length > 0 ? `, removed \`${outcome.removeLabels.join("`, `")}\`` : "") +
+          (verdict === "fail"
+            ? `. \`${REAL_CLAUDE_GATE_LABEL}\` stays on, so this ticket must pass the gate again after the fix.`
+            : verdict === "inherited-failure"
+              ? `. These failures also occur on the base commit. Rework must repair or isolate the shared failures; ` +
+                `\`${REAL_CLAUDE_GATE_LABEL}\` stays on until a later live run passes.`
+            : verdict === "flaky-pass"
+              ? `. The suite is green on re-run and the ticket did nothing wrong. The flaky test(s) named above ` +
+                `are the suite's problem, not this branch's, and a human has been pinged about them.`
+              : ".");
+
+      // Comment first, mutate second. If a label write fails, the evidence
+      // is already on the ticket and an operator can finish by hand; the
+      // reverse order can move a card with no record of why.
+      //
+      // Then column BEFORE labels, which matters on a pass. If the move
+      // fails after `needs-real-claude` was already stripped, the ticket sits
+      // in Inbox with nothing marking it as gated: it would never re-gate and
+      // never advance, stuck silently. This order fails the other way — the
+      // label survives, the ticket re-gates next cycle, and the worst cost is
+      // one repeated suite run.
+      try {
+        await client.addComment(
+          candidate.issueNumber,
+          formatGateEvidenceComment({ verdict, reason, report, minExecuted, action, introduced, preExisting, flaky }),
+        );
+      } catch (e) {
+        console.warn(`   ⚠️  Failed to post real-claude gate evidence on #${candidate.issueNumber}: ${e}`);
+        if (artifactsPending) return; // Recovery needs the durable evidence pointer.
+      }
+
+      // Mark rework before moving so a failed write cannot forward stale approvals.
+      if (artifactsPending) {
+        try {
+          await client.addLabel(candidate.issueNumber, realClaudeGate.failReworkLabel);
+        } catch (e) {
+          console.warn(`   ⚠️  Failed to mark live artifact handoff for #${candidate.issueNumber}: ${e}`);
+          return;
+        }
+      }
+      if (outcome.toColumn !== null) {
+        try {
+          await client.updateItemStatus(candidate.itemId, outcome.toColumn);
+        } catch (e) {
+          console.warn(`   ⚠️  Failed to move #${candidate.issueNumber} to ${outcome.toColumn}: ${e}`);
+        }
+      }
+      for (const label of artifactsPending ? [] : outcome.addLabels) {
+        try { await client.addLabel(candidate.issueNumber, label); } catch (e) {
+          console.warn(`   ⚠️  Failed to add ${label} to #${candidate.issueNumber}: ${e}`);
+        }
+      }
+      for (const label of outcome.removeLabels) {
+        try { await client.removeLabel(candidate.issueNumber, label); } catch (e) {
+          console.warn(`   ⚠️  Failed to remove ${label} from #${candidate.issueNumber}: ${e}`);
+        }
+      }
+
+      const icon = verdict === "pass" ? "✅" : verdict === "flaky-pass" || verdict === "inherited-failure" ? "⚠️" : verdict === "fail" ? "❌" : "🚨";
+      console.log(`   ${icon} Real-claude gate #${candidate.issueNumber}: ${verdict} — ${reason}`);
+
+      // After the gated ticket's own writes, so a slow or failing board write
+      // here can never hold up or undo its verdict. Any verdict can carry
+      // flakes: a fail whose other failures reproduced still names them.
+      let flakyTickets: FlakyTicketResult | null = null;
+      if (flaky.length > 0) {
+        flakyTickets = await recordFlaky(flaky, {
+          gatedIssue: candidate.issueNumber,
+          report,
+          at: new Date().toISOString(),
+        });
+        for (const { name, issue } of flakyTickets.filed) console.log(`   🎫 Filed #${issue} in Backlog for flaky ${name}`);
+        for (const { name, issue } of flakyTickets.commented) console.log(`   💬 Flaky ${name} recorded on #${issue}`);
+        if (flakyTickets.untracked.length > 0) {
+          console.warn(`   ⚠️  Flaky test(s) with no ticket this run: ${flakyTickets.untracked.join(", ")}`);
+        }
+      }
+
+      if (outcome.notify) {
+        await notifyDiscord(
+          verdict === "flaky-pass"
+            ? `⚠️ **Real-claude gate passed #${candidate.issueNumber} only on re-run.** ` +
+              `${flaky.map(name => `\`${name}\``).join(", ")} failed once and passed the second time on the same ` +
+              `merged tree. The ticket advanced; the flake is the suite's to fix — see the evidence comment.` +
+              flakyTicketNote(flakyTickets)
+            : verdict === "inherited-failure"
+              ? `⚠️ **Real-claude gate found failures on main for #${candidate.issueNumber}.** ${reason}. ` +
+                `Sent to ${outcome.toColumn} with \`${realClaudeGate.failReworkLabel}\` for rework. ` +
+                `The ticket branch did not introduce the named failures — see the evidence comment.`
+            : `🚨 **Real-claude gate could not judge #${candidate.issueNumber}** (${verdict}): ${reason}\n` +
+              `Parked in ${REAL_CLAUDE_GATE_RUN_FROM_COLUMN} with \`${outcome.addLabels.join("`, `")}\`. ` +
+              `Needs a human — see the evidence comment.`,
+        );
+      }
+    } finally {
+      try {
+        await client.removeLabel(candidate.issueNumber, REAL_CLAUDE_GATE_RUNNING_LABEL);
+      } catch (error) {
+        console.warn(`   ⚠️  Real-claude gate: could not clear the running label on #${candidate.issueNumber}: ${error}`);
+      }
+      // Unconditionally, not just on mutation. The board snapshot this cycle
+      // started with is now minutes old — a full suite is 300s-plus — and
+      // ticket selection still runs after this step. Even a run that changed
+      // nothing has invalidated the cache by outliving it.
+      client.clearItemsCache();
     }
-  } finally {
-    try {
-      await client.removeLabel(candidate.issueNumber, REAL_CLAUDE_GATE_RUNNING_LABEL);
-    } catch (error) {
-      console.warn(`   ⚠️  Real-claude gate: could not clear the running label on #${candidate.issueNumber}: ${error}`);
-    }
-    // Unconditionally, not just on mutation. The board snapshot this cycle
-    // started with is now minutes old — a full suite is 300s-plus — and
-    // ticket selection still runs after this step. Even a run that changed
-    // nothing has invalidated the cache by outliving it.
-    client.clearItemsCache();
+  };
+
+  if (background) {
+    background(candidate.issueNumber, () => work().catch((error: any) => {
+      console.error(`   ❌ Real-claude gate #${candidate.issueNumber} ended unexpectedly: ${error?.message ?? error}`);
+    }));
+    return true;
   }
+  await work();
   return false;
 }
 

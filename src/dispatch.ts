@@ -286,6 +286,14 @@ const REAL_CLAUDE_GATE_MIN_EXECUTED =
 const REAL_CLAUDE_GATE_BASELINE_CMD =
   (process.env.PYRY_REAL_CLAUDE_GATE_BASELINE_CMD ?? "").trim();
 
+// Background gate: run the live suite beside the poll loop instead of inside
+// it. Off unless PYRY_REAL_CLAUDE_GATE_BACKGROUND=1. Only verifiers and the
+// main sweep wait for it, because their device runs share the emulator and
+// would time out queued behind the suite; builders, refiners and
+// documentation keep working. A fork should turn this on only when its suite
+// tolerates other work on the host, as mobile's device hold makes it do.
+const REAL_CLAUDE_GATE_BACKGROUND = (process.env.PYRY_REAL_CLAUDE_GATE_BACKGROUND ?? "").trim() === "1";
+
 // Per-ticket selection: run the live tests the pull request names instead of
 // the whole suite. Off unless PYRY_REAL_CLAUDE_GATE_SELECT=1. The selected
 // command is built from the baseline template, so selection needs one; without
@@ -6439,7 +6447,8 @@ export async function pollLoop(): Promise<void> {
         (REAL_CLAUDE_GATE_SELECTION === null
           ? ", full suite every run"
           : `, per-ticket selection with ${REAL_CLAUDE_GATE_SELECTION.alwaysTests.length} always-run test(s), ` +
-            `full suite every ${REAL_CLAUDE_GATE_SELECTION.fullEvery} merges`),
+            `full suite every ${REAL_CLAUDE_GATE_SELECTION.fullEvery} merges`) +
+        (REAL_CLAUDE_GATE_BACKGROUND ? ", runs in the background holding only verifiers" : ", runs alone"),
   );
 
   // Main sweep: the fork's in-depth command against main, when idle or every N
@@ -6466,6 +6475,11 @@ export async function pollLoop(): Promise<void> {
   // inside it; see `startMainSweepCycle` for what it holds back meanwhile.
   let sweepRun: Promise<void> | null = null;
 
+  // The live gate run in flight, when the fork runs it in the background.
+  // Typed by assertion: it is only ever assigned inside a callback, so a
+  // plain `= null` would narrow every later read to null.
+  let gateRun = null as { issue: number; done: Promise<void> } | null;
+
   while (true) {
     // Drain check: exit cleanly before starting the next cycle if SIGTERM
     // was received. Placement at top of loop means a cycle that's already
@@ -6479,6 +6493,10 @@ export async function pollLoop(): Promise<void> {
       if (sweepRun !== null) {
         console.log(`🚦 Drain: waiting for the main sweep to finish`);
         await sweepRun;
+      }
+      if (gateRun !== null) {
+        console.log(`🚦 Drain: waiting for the real-claude gate on #${gateRun.issue} to finish`);
+        await gateRun.done;
       }
       console.log("✅ Drain complete. Exiting cleanly.");
       break;
@@ -6589,7 +6607,12 @@ export async function pollLoop(): Promise<void> {
     // Once per cycle only. The age gate means a second pass at the end of
     // the cycle could never strip anything the opening pass didn't, and it
     // would cost a comments fetch per candidate to learn that.
-    await runStrandedWipSweep(client, notifyDiscord, STRANDED_WIP_MIN_AGE_MS, Date.now(), pool.keys());
+    // A background gate run holds `wip:real-claude-gate` on its ticket, so it
+    // counts as in flight here exactly as a pool entry does.
+    await runStrandedWipSweep(
+      client, notifyDiscord, STRANDED_WIP_MIN_AGE_MS, Date.now(),
+      gateRun === null ? pool.keys() : new Set([...pool.keys(), `real-claude-gate#${gateRun.issue}`]),
+    );
     await runPendingDoneFinalize(client);
     await runReworkRouting(client);
     await runRealClaudeGate(client);
@@ -6609,15 +6632,37 @@ export async function pollLoop(): Promise<void> {
     //
     // HELD while runs are in flight: nothing new is dispatched below, the
     // pool empties, and the gate runs alone. See the hold in reconcile.ts.
-    const gateHeld = await runRealClaudeGateExecution(
-      client,
-      realClaudeGateRunner,
-      REAL_CLAUDE_GATE_MIN_EXECUTED,
-      notifyDiscord,
-      // A running main sweep holds the emulators the same way a run does.
-      pool.size + (sweepRun !== null ? 1 : 0),
-      (flaky, ctx) => recordFlakyTests(client, flaky, ctx),
-    );
+    //
+    // In the background mode it waits only for verifiers and the main sweep,
+    // and while it waits or runs, only verifiers are held back. The run goes
+    // on beside the loop; the next gate run starts after it settles.
+    let gateHeld = false;
+    if (!REAL_CLAUDE_GATE_BACKGROUND) {
+      gateHeld = await runRealClaudeGateExecution(
+        client,
+        realClaudeGateRunner,
+        REAL_CLAUDE_GATE_MIN_EXECUTED,
+        notifyDiscord,
+        // A running main sweep holds the emulators the same way a run does.
+        pool.size + (sweepRun !== null ? 1 : 0),
+        (flaky, ctx) => recordFlakyTests(client, flaky, ctx),
+      );
+    } else if (gateRun === null) {
+      const verifiersInFlight = [...pool.keys()].filter((k) => k.startsWith("verifier#")).length;
+      gateHeld = await runRealClaudeGateExecution(
+        client,
+        realClaudeGateRunner,
+        REAL_CLAUDE_GATE_MIN_EXECUTED,
+        notifyDiscord,
+        verifiersInFlight + (sweepRun !== null ? 1 : 0),
+        (flaky, ctx) => recordFlakyTests(client, flaky, ctx),
+        (issue, work) => {
+          const done: Promise<void> = work().finally(() => { if (gateRun?.done === done) gateRun = null; });
+          gateRun = { issue, done };
+        },
+      );
+    }
+    const gateHoldsVerifiers = REAL_CLAUDE_GATE_BACKGROUND && (gateHeld || gateRun !== null);
     await runAutoAdvance(client, MAX_CONCURRENT, pool.size);
     await runDoneCleanup(client);
 
@@ -6698,13 +6743,15 @@ export async function pollLoop(): Promise<void> {
       rootLabelsByIssue,
       client,
     });
-    const candidates = gateHeld ? [] : holdVerifiersDuringSweep(excludeInFlight(selected, pool.keys()), sweepRun !== null);
+    const candidates = gateHeld && !REAL_CLAUDE_GATE_BACKGROUND
+      ? []
+      : holdVerifiersDuringSweep(excludeInFlight(selected, pool.keys()), sweepRun !== null || gateHoldsVerifiers);
     dispatched = candidates.length > 0;
 
     // Edge-triggered "board drained" ping: fire once when the board goes from
     // busy to nothing-left-to-dispatch, so the operator knows the agents are
     // done or stuck and it's time to look. A held gate is not a drained board.
-    const drain = decideDrainNotification({ hasCandidates: dispatched || gateHeld, activeWork, armed: sawActiveWork });
+    const drain = decideDrainNotification({ hasCandidates: dispatched || gateHeld || gateRun !== null, activeWork, armed: sawActiveWork });
     sawActiveWork = drain.armed;
     if (drain.notify) {
       await notifyDiscord(`📭 **${process.env.GITHUB_REPO}**: no tickets left to dispatch. Everything is done, blocked, or parked for review.`);
@@ -6774,7 +6821,7 @@ export async function pollLoop(): Promise<void> {
     // In-depth run against main, in the background, never beside a
     // verifier's gates. After the merge so this cycle's merge counts. See
     // startMainSweepCycle.
-    if (mainSweep !== null && sweepRun === null) {
+    if (mainSweep !== null && sweepRun === null && !gateHoldsVerifiers) {
       const verifierBusy = [...pool.keys()].some((k) => k.startsWith("verifier#")) ||
         [...itemsByColumn.values()].some((items) => items.some((i) => i.labels.includes("wip:verifier")));
       const { finished } = await startMainSweepCycle({
@@ -6800,12 +6847,15 @@ export async function pollLoop(): Promise<void> {
     // The sweep ending wakes the loop too, so a held verifier or live gate
     // starts at once.
     const sweepEnd = sweepRun ?? new Promise<void>(() => {});
+    // A background gate ending wakes it the same way, so held verifiers and
+    // the gated ticket's next stage start at once.
+    const gateEnd = gateRun?.done ?? new Promise<void>(() => {});
     if (pool.size > 0) {
       console.log(`⏰ Waiting up to ${POLL_INTERVAL / 1000}s or for a freed seat (${pool.size} in flight)...`);
-      await Promise.race([interval, pool.anySettled(), sweepEnd]);
-    } else if (sweepRun !== null) {
-      console.log(`⏰ Waiting up to ${POLL_INTERVAL / 1000}s or for the main sweep to finish...`);
-      await Promise.race([interval, sweepEnd]);
+      await Promise.race([interval, pool.anySettled(), sweepEnd, gateEnd]);
+    } else if (sweepRun !== null || gateRun !== null) {
+      console.log(`⏰ Waiting up to ${POLL_INTERVAL / 1000}s or for the main sweep or live gate to finish...`);
+      await Promise.race([interval, sweepEnd, gateEnd]);
     } else {
       console.log(`⏰ Sleeping ${POLL_INTERVAL / 1000}s...`);
       await interval;
