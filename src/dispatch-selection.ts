@@ -100,8 +100,10 @@ export function selectDispatches<T extends DecisionItem>(opts: {
     // pipeline. Count in-flight `wip:<agent>` from every column in the
     // snapshot, plus any items already picked this cycle for this agent.
     // Once one slot is taken, this agent is done for the cycle.
+    // `maxInFlight` is the same cap with a number other than one.
+    const cap = agent.serial ? 1 : agent.maxInFlight;
     let serialBudget = Number.POSITIVE_INFINITY;
-    if (agent.serial) {
+    if (cap !== undefined) {
       const wipLabel = `wip:${agent.name}`;
       let inFlight = 0;
       for (const cols of itemsByColumn.values()) {
@@ -109,7 +111,7 @@ export function selectDispatches<T extends DecisionItem>(opts: {
           if (it.labels.includes(wipLabel)) inFlight++;
         }
       }
-      serialBudget = Math.max(0, 1 - inFlight);
+      serialBudget = Math.max(0, cap - inFlight);
     }
 
     for (const item of items) {
@@ -120,7 +122,7 @@ export function selectDispatches<T extends DecisionItem>(opts: {
       if (shouldSkipDispatch(item.labels, agent.name, rootLabelsByIssue?.get(familyRoot))) continue;
       if (item.issueNumber > 0 && hasOpenBlockers(item.blockedBy ?? [])) continue;
       out.push({ agent, item });
-      if (agent.serial) serialBudget--;
+      if (cap !== undefined) serialBudget--;
     }
   }
   return out;

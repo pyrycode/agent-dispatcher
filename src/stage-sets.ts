@@ -228,6 +228,26 @@ const BUILDER_STAGE_SET_CONCURRENT_VERIFIERS: StageSet = deriveStageSet({
   preSpawnGate: { agentNames: new Set(["verifier"]) },
 });
 
+// Concurrent verifiers with a number cap, for a fork that also sets
+// PYRY_VERIFIER_MAX (Mobile, 2026-10-01: two). One set per cap, so a
+// resolution stays a stable instance.
+const cappedVerifierSets = new Map<number, StageSet>();
+function cappedVerifierSet(max: number): StageSet {
+  let set = cappedVerifierSets.get(max);
+  if (set === undefined) {
+    set = deriveStageSet({
+      name: "builder",
+      agents: BUILDER_AGENTS.map((a) => (a.name === "verifier" ? { ...a, serial: false, maxInFlight: max } : a)),
+      advanceRules: BUILDER_ADVANCE_RULES,
+      agentToolNames: new Set(["builder", "verifier"]),
+      webSearchToolNames: new Set(["builder"]),
+      preSpawnGate: { agentNames: new Set(["verifier"]) },
+    });
+    cappedVerifierSets.set(max, set);
+  }
+  return set;
+}
+
 // --------- resolution ---------
 
 /**
@@ -247,12 +267,14 @@ const BUILDER_STAGE_SET_CONCURRENT_VERIFIERS: StageSet = deriveStageSet({
  */
 export function resolveStageSet(
   raw: string | undefined,
-  env: { PYRY_VERIFIER_SERIAL?: string } = process.env,
+  env: { PYRY_VERIFIER_SERIAL?: string; PYRY_VERIFIER_MAX?: string } = process.env,
 ): StageSet {
   const name = (raw ?? "").trim();
   if (name === "" || name === "classic") return CLASSIC_STAGE_SET;
   if (name === "builder") {
-    return env.PYRY_VERIFIER_SERIAL === "0" ? BUILDER_STAGE_SET_CONCURRENT_VERIFIERS : BUILDER_STAGE_SET;
+    if (env.PYRY_VERIFIER_SERIAL !== "0") return BUILDER_STAGE_SET;
+    const max = Number(env.PYRY_VERIFIER_MAX);
+    return Number.isInteger(max) && max >= 2 ? cappedVerifierSet(max) : BUILDER_STAGE_SET_CONCURRENT_VERIFIERS;
   }
   throw new Error(
     `Unknown PYRY_STAGE_SET "${raw}". Valid stage sets: ${STAGE_SET_NAMES.join(", ")}. ` +
