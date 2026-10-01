@@ -25,6 +25,7 @@
 
 /** Artifact shapes the gate knows how to read. */
 import { XMLParser, XMLValidator } from "fast-xml-parser";
+import type { GateSelection } from "./gate-selection.js";
 
 export type GateOutputFormat = "go-json" | "playwright-json" | "junit-xml";
 
@@ -688,6 +689,19 @@ export interface GateRunReport {
   rerunSkipReason: string | null;
   /** Where the re-run's own bytes live, when it ran. */
   rerunOutputPath: string | null;
+  /**
+   * Whether this run was the full suite or the tests the pull request named,
+   * and why. Absent when the fork has selection off, so every run is full.
+   */
+  selection?: GateSelection;
+}
+
+/**
+ * The executed-test floor for one run. A selected run must execute every
+ * test it asked for; anything fewer means a named test never ran.
+ */
+export function gateRunFloor(report: GateRunReport, forkFloor: number): number {
+  return report.selection?.mode === "selected" ? report.selection.tests.length : forkFloor;
 }
 
 /**
@@ -735,6 +749,14 @@ export function formatGateEvidenceComment(opts: {
   lines.push(report.command);
   lines.push("```");
   lines.push("");
+  if (report.selection) {
+    lines.push(
+      report.selection.mode === "selected"
+        ? `Selected run: ${report.selection.reason}.`
+        : `Full suite: ${report.selection.reason}.`,
+    );
+    lines.push("");
+  }
 
   lines.push("**What it ran against**");
   lines.push(`- Branch \`${report.branchName}\` at \`${shortSha(report.headSha)}\``);
@@ -769,7 +791,9 @@ export function formatGateEvidenceComment(opts: {
     lines.push("");
     lines.push(
       `Executed counts leaf tests that ran a body: passed plus failed, skips excluded. ` +
-      `The floor for this fork is ${Math.max(1, opts.minExecuted)}.`,
+      (report.selection?.mode === "selected"
+        ? `The floor for this selected run is ${report.selection.tests.length}, one per named test.`
+        : `The floor for this fork is ${Math.max(1, opts.minExecuted)}.`),
     );
     lines.push("");
 

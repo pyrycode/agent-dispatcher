@@ -112,6 +112,10 @@ Optional:
 | `PYRY_REAL_CLAUDE_GATE_TIMEOUT_MS` | `1800000` | Outer wall clock for one gate run. Must exceed the command's own inner timeout. |
 | `PYRY_REAL_CLAUDE_GATE_MIN_EXECUTED` | `1` | Floor for the executed-test guard. Set near the suite's real count. |
 | `PYRY_REAL_CLAUDE_GATE_BASELINE_CMD` | — | Base-commit re-run template with a `{{TESTS}}` placeholder. Runs only when the branch has named failures, so it costs seconds. Unset means failures are attributed to the branch. |
+| `PYRY_REAL_CLAUDE_GATE_SELECT` | — | `1` runs only the live tests the pull request names, plus the always-run set, instead of the whole suite. Needs the baseline template. See "Per-ticket selection" below. |
+| `PYRY_REAL_CLAUDE_GATE_ALWAYS_TESTS` | — | Comma-separated qualified test names every selected run includes. |
+| `PYRY_REAL_CLAUDE_GATE_FULL_PATHS` | — | Comma-separated path prefixes. A branch changing any of them runs the whole suite. |
+| `PYRY_REAL_CLAUDE_GATE_FULL_EVERY` | `10` | Merges on the base since the last clean full run that force the whole suite again. State in `logs/real-claude-gate-full-state.json`. |
 | `PYRY_MAIN_SWEEP_CMD` | — | Main sweep: an in-depth command, too slow for every verifier pass, run against main when the board is idle or every `PYRY_MAIN_SWEEP_EVERY` merges. Runs inline, never beside a verifier. A failure files one Backlog ticket. **Empty disables it.** State in `logs/main-sweep-state.json`. |
 | `PYRY_MAIN_SWEEP_EVERY` | `5` | Merges since the last sweep that force one while the board is busy. |
 | `PYRY_MAIN_SWEEP_TIMEOUT_MS` | `1800000` | Outer wall clock for one sweep. |
@@ -220,6 +224,10 @@ PYRY_REAL_CLAUDE_GATE_BASELINE_CMD='go test -tags e2e_realclaude -timeout 20m -j
 Do not quote `{{TESTS}}` yourself; the substituted filter brings its own quoting. Two refusals are deliberate. A name containing anything outside a conservative character set refuses the whole filter rather than dropping that name, because a partial filter compares different test sets on the two sides. And a base run that executes nothing, the same false green the gate exists to reject, is discarded rather than treated as exoneration. In both cases `baselineFailures` stays null and the failures remain the branch's, since **a missing baseline is not an exoneration**.
 
 A failure keeps `needs-real-claude` so the ticket must pass the gate again after the fix; `runReworkRouting` strips the stale `done:*` trail and brings its three-strike breaker along. Failures reproduced on main also route to rework, with the baseline result recorded so the agent knows the ticket branch did not introduce them. An environment failure or unusable report parks instead of routing to the developer agent, which could not fix a missing credential and would burn three spawns discovering that. The `error:` prefix excludes a parked ticket from the WIP count and from gate re-selection.
+
+**Per-ticket selection.** Off by default; `PYRY_REAL_CLAUDE_GATE_SELECT=1` turns it on. The gate then runs the live tests the ticket's open pull request lists under a `## Live tests` heading, one qualified name per line, plus the fork's always-run set. The selected command is the baseline template with that list in place of `{{TESTS}}`, and the run must execute every test it named, so a misspelt name cannot pass by running nothing. Mobile's whole live suite took about eight and a half minutes per ticket, most of it on flows the ticket never touched.
+
+Every doubt resolves to the whole suite: the branch changes a `PYRY_REAL_CLAUDE_GATE_FULL_PATHS` prefix, its changed files cannot be listed, the pull request has no list or asks for `all`, or a name cannot go into a safe filter. A backstop covers the tickets that break a flow they did not name: once `PYRY_REAL_CLAUDE_GATE_FULL_EVERY` merges have landed on the base since the last clean full run, or none is on record, the next gated ticket runs the whole suite. Only a clean full run resets the count, so while main is red every gated ticket keeps running the whole suite. The evidence comment says which kind of run it was and why.
 
 **The command must emit a per-test report.** For Go that means:
 
