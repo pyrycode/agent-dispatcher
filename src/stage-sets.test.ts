@@ -353,6 +353,32 @@ describe("builder stage set — collapsed four-role pipeline", () => {
     assert.deepStrictEqual(r.map((c) => c.item.issueNumber), [1, 2], "two verifiers may run at once");
   });
 
+  test("PYRY_VERIFIER_MAX caps concurrent verifiers: two In Code Review picks of three, a builder still beside them", () => {
+    const capped = resolveStageSet("builder", { PYRY_VERIFIER_SERIAL: "0", PYRY_VERIFIER_MAX: "2" });
+    assert.equal(capped, resolveStageSet("builder", { PYRY_VERIFIER_SERIAL: "0", PYRY_VERIFIER_MAX: "2" }), "a stable instance");
+    assert.equal(capped.agents.find((a) => a.name === "verifier")!.maxInFlight, 2);
+    const item = (n: number, labels: string[] = []) => ({ id: `i${n}`, issueNumber: n, labels });
+    const pick = (review: ReturnType<typeof item>[]) => selectDispatches({
+      itemsByColumn: new Map([["In Code Review", review], ["In Development", [item(9)]]]),
+      pollOrder: [...capped.agents].reverse(),
+      maxConcurrent: 4,
+    }).map((c) => [c.agent.name, c.item.issueNumber]);
+    assert.deepStrictEqual(pick([item(1), item(2), item(3)]), [["verifier", 1], ["verifier", 2], ["builder", 9]]);
+    assert.deepStrictEqual(
+      pick([item(1, ["wip:verifier"]), item(2), item(3)]),
+      [["verifier", 2], ["builder", 9]],
+      "an in-flight verifier takes one of the two",
+    );
+  });
+
+  test("PYRY_VERIFIER_MAX is ignored without PYRY_VERIFIER_SERIAL=0, and below two", () => {
+    assert.equal(resolveStageSet("builder", { PYRY_VERIFIER_MAX: "2" }), builder);
+    for (const value of [undefined, "", "1", "0", "two", "2.5"]) {
+      const v = resolveStageSet("builder", { PYRY_VERIFIER_SERIAL: "0", PYRY_VERIFIER_MAX: value }).agents.find((a) => a.name === "verifier")!;
+      assert.equal(v.maxInFlight, undefined, `value ${JSON.stringify(value)} leaves verifiers uncapped`);
+    }
+  });
+
   test("PYRY_VERIFIER_SERIAL keeps the cap for every value but the exact string 0", () => {
     for (const value of [undefined, "", "1", "false", "no", " 0"]) {
       const set = resolveStageSet("builder", { PYRY_VERIFIER_SERIAL: value });

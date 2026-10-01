@@ -6445,7 +6445,13 @@ export async function pollLoop(): Promise<void> {
   {
     const verifier = activeStageSet().agents.find((a) => a.name === "verifier");
     if (verifier) {
-      console.log(`   Verifier: ${verifier.serial ? "one at a time" : "concurrent (PYRY_VERIFIER_SERIAL=0)"}`);
+      console.log(`   Verifier: ${
+        verifier.serial
+          ? "one at a time"
+          : verifier.maxInFlight !== undefined
+            ? `up to ${verifier.maxInFlight} at a time (PYRY_VERIFIER_MAX)`
+            : "concurrent (PYRY_VERIFIER_SERIAL=0)"
+      }`);
     }
   }
   console.log(`   Family breaker: ${FAMILY_DISPATCH_LIMIT} dispatches per ticket family (PYRY_FAMILY_DISPATCH_LIMIT)`);

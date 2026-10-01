@@ -104,6 +104,13 @@ export interface AgentConfig {
    */
   serial?: boolean;
   /**
+   * At most this many instances running at once across the pipeline,
+   * counted the same way as `serial`. `serial: true` wins and means one.
+   * Mobile caps concurrent verifiers at two (2026-10-01): their emulator
+   * work queues on a host-wide hold, so a third only waits.
+   */
+  maxInFlight?: number;
+  /**
    * True if a clean run of this agent must leave a verdict on the ticket's
    * pull request: a review or a comment posted after the run started, or
    * a `needs-rework:*` label. A clean exit with neither is treated as
