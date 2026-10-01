@@ -113,6 +113,12 @@ describe("decideGateSelection", () => {
     assert.equal(decide({ section: { kind: "all" } }).mode, "full");
   });
 
+  test("an always-run name cut at its # blames the fork's setting, not the pull request", () => {
+    const selection = decide({ config: { ...config, alwaysTests: [LIVE] } });
+    assert.equal(selection.mode, "full");
+    assert.match(selection.reason, /PYRY_REAL_CLAUDE_GATE_ALWAYS_TESTS/);
+  });
+
   test("a name the filter cannot carry runs everything rather than a partial list", () => {
     const selection = decide({ section: { kind: "list", names: [`${LIVE}#ok`, "rename the chat"] } });
     assert.equal(selection.mode, "full");

@@ -124,6 +124,14 @@ export function decideGateSelection(input: {
     return { mode: "full", reason: `the pull request's \`## ${LIVE_TESTS_HEADING}\` list asks for all of them` };
   }
 
+  if (config.alwaysTests.length > 0 && buildBaselineFilter(config.alwaysTests, input.format) === null) {
+    return {
+      mode: "full",
+      reason: "a name in the fork's PYRY_REAL_CLAUDE_GATE_ALWAYS_TESTS is not a plain qualified test name. " +
+        "An env-file loader may have cut the value at a `#`; quote it",
+    };
+  }
+
   const tests = [...config.alwaysTests];
   for (const name of section.names) if (!tests.includes(name)) tests.push(name);
   const filter = buildBaselineFilter(tests, input.format);

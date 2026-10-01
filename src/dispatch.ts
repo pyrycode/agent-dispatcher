@@ -314,6 +314,15 @@ const REAL_CLAUDE_GATE_SELECTION: GateSelectionConfig | null = (() => {
     );
     return null;
   }
+  // A `#` starts a comment for some env-file loaders, which leaves a bare
+  // class name. Selection then runs every test, so say why at startup.
+  const cut = config?.alwaysTests.filter(name => !name.includes("#")) ?? [];
+  if (cut.length > 0) {
+    console.warn(
+      `   ⚠️  PYRY_REAL_CLAUDE_GATE_ALWAYS_TESTS holds a name with no #method (${cut.join(", ")}). ` +
+      `An env-file loader may have cut the value at a #; quote it. Until then every gate run uses the full suite.`,
+    );
+  }
   return config;
 })();
 
