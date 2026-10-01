@@ -46,7 +46,7 @@ export interface CodegraphSymlinkDecision {
  * into a freshly created worktree.
  *
  * **Why a symlink at all:** the dispatcher creates a worktree per
- * dispatched ticket (`pyrycode/.pyrycode-worktrees/<agent>-<n>/`).
+ * dispatched ticket (`.pyrycode-worktrees/<repo>/<agent>-<n>/`).
  * Each worktree is a fresh checkout — `git worktree add` does not
  * carry untracked files into the new tree, and `.codegraph/` is
  * gitignored. An agent spawned in the worktree with codegraph in its

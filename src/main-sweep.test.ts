@@ -175,7 +175,7 @@ describe("runMainSweep", () => {
     assert.ok(h.calls.some((c) => c.startsWith("git worktree add --detach") && c.endsWith(C)));
     assert.equal(h.requests.length, 1);
     assert.equal(h.requests[0].command, "deep");
-    assert.match(h.requests[0].cwd, /\.pyrycode-worktrees\/main-sweep$/);
+    assert.match(h.requests[0].cwd, /\.pyrycode-worktrees\/[^/]+\/main-sweep$/);
     assert.ok(h.calls.at(-2)?.startsWith("git worktree remove "));
   });
 
