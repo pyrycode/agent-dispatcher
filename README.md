@@ -157,14 +157,22 @@ Claude runs the CLI directly with restricted and safe modes. Its only source
 tools are Read, Glob and Grep. StructuredOutput returns the report. Shell, write,
 network, MCP, Chrome and delegation tools are absent. Only the source worktree
 is added as a readable directory. The dispatcher supplies the complete merge-base
-diff and verifier checklist. OAuth and normal Claude authentication remain
+diff and the review criteria. OAuth and normal Claude authentication remain
 available. The installed Claude CLI must support these flags; an unsupported
 CLI fails the review rather than falling back to an unrestricted process.
+
+Both runners get the same brief. It defines the review as done when every changed
+section has been judged with enough surrounding code, and treats a file it could
+not read completely as a remaining check for the final verifier rather than a
+reason to stop. The criteria come from `verifier/review-criteria.md` in the agents
+repo when the fork provides one. Otherwise the whole verifier role file is
+appended, which also carries triage and publishing duties this phase cannot
+perform.
 
 After both phases settle, a normal verifier receives the complete source findings
 and green or red gate evidence. It validates findings, finishes deferred Figma and
 live-evidence checks, performs any red-gate triage, then publishes the verdict.
-A failed or incomplete preliminary review parks the dispatch as an error; an
+A failed or blocked preliminary review parks the dispatch as an error; an
 existing PR cannot salvage it into a pass. Both model phases share the original
 verifier wall-clock budget. Claude also shares its turn limit across both phases.
 Parallel review does not grant the single-phase automatic continuation budget.
