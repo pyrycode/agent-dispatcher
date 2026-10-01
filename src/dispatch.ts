@@ -294,6 +294,13 @@ const REAL_CLAUDE_GATE_BASELINE_CMD =
 // tolerates other work on the host, as mobile's device hold makes it do.
 const REAL_CLAUDE_GATE_BACKGROUND = (process.env.PYRY_REAL_CLAUDE_GATE_BACKGROUND ?? "").trim() === "1";
 
+// A background gate also runs beside verifiers unless this is `1`, the
+// default. Turn it off only when the fork's device runs queue on a host-wide
+// hold long enough to wait out the other side, and the verifier's per-gate
+// timeout covers that wait. A verifier spends most of its run reviewing with
+// the emulator idle, which a held gate otherwise waits out in full.
+const REAL_CLAUDE_GATE_HOLD_VERIFIERS = (process.env.PYRY_REAL_CLAUDE_GATE_HOLD_VERIFIERS ?? "1").trim() !== "0";
+
 // Per-ticket selection: run the live tests the pull request names instead of
 // the whole suite. Off unless PYRY_REAL_CLAUDE_GATE_SELECT=1. The selected
 // command is built from the baseline template, so selection needs one; without
@@ -6448,7 +6455,11 @@ export async function pollLoop(): Promise<void> {
           ? ", full suite every run"
           : `, per-ticket selection with ${REAL_CLAUDE_GATE_SELECTION.alwaysTests.length} always-run test(s), ` +
             `full suite every ${REAL_CLAUDE_GATE_SELECTION.fullEvery} merges`) +
-        (REAL_CLAUDE_GATE_BACKGROUND ? ", runs in the background holding only verifiers" : ", runs alone"),
+        (!REAL_CLAUDE_GATE_BACKGROUND
+          ? ", runs alone"
+          : REAL_CLAUDE_GATE_HOLD_VERIFIERS
+            ? ", runs in the background holding only verifiers"
+            : ", runs in the background beside every agent"),
   );
 
   // Main sweep: the fork's in-depth command against main, when idle or every N
@@ -6648,7 +6659,9 @@ export async function pollLoop(): Promise<void> {
         (flaky, ctx) => recordFlakyTests(client, flaky, ctx),
       );
     } else if (gateRun === null) {
-      const verifiersInFlight = [...pool.keys()].filter((k) => k.startsWith("verifier#")).length;
+      const verifiersInFlight = REAL_CLAUDE_GATE_HOLD_VERIFIERS
+        ? [...pool.keys()].filter((k) => k.startsWith("verifier#")).length
+        : 0;
       gateHeld = await runRealClaudeGateExecution(
         client,
         realClaudeGateRunner,
@@ -6662,7 +6675,10 @@ export async function pollLoop(): Promise<void> {
         },
       );
     }
-    const gateHoldsVerifiers = REAL_CLAUDE_GATE_BACKGROUND && (gateHeld || gateRun !== null);
+    // A waiting or running background gate keeps the main sweep off the
+    // emulator, and verifiers too unless the fork lets them share it.
+    const gateActive = REAL_CLAUDE_GATE_BACKGROUND && (gateHeld || gateRun !== null);
+    const gateHoldsVerifiers = gateActive && REAL_CLAUDE_GATE_HOLD_VERIFIERS;
     await runAutoAdvance(client, MAX_CONCURRENT, pool.size);
     await runDoneCleanup(client);
 
@@ -6821,7 +6837,7 @@ export async function pollLoop(): Promise<void> {
     // In-depth run against main, in the background, never beside a
     // verifier's gates. After the merge so this cycle's merge counts. See
     // startMainSweepCycle.
-    if (mainSweep !== null && sweepRun === null && !gateHoldsVerifiers) {
+    if (mainSweep !== null && sweepRun === null && !gateActive) {
       const verifierBusy = [...pool.keys()].some((k) => k.startsWith("verifier#")) ||
         [...itemsByColumn.values()].some((items) => items.some((i) => i.labels.includes("wip:verifier")));
       const { finished } = await startMainSweepCycle({
