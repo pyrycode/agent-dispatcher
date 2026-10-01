@@ -3212,6 +3212,26 @@ describe("parallel verifier source review", () => {
     });
   }
   }
+  for (const withCriteria of [true, false]) {
+    test(`source brief ${withCriteria ? "uses the fork's review criteria file" : "falls back to the verifier role file"}`, async () => {
+      await withParallelReview(async () => {
+        const client = new MockGitHubClient({ status: { 1330: "In Code Review" }, labels: { 1330: [] } });
+        const fsMap: Record<string, string> = { [claudeMdAbsPath("verifier/CLAUDE.md")]: "Role file with triage scripts" };
+        if (withCriteria) fsMap[claudeMdAbsPath("verifier/review-criteria.md")] = "Criteria: wire types match";
+        const { deps, calls } = makeMockDeps({ execImpls: fullHappyExecImpls("feature/1330"), fsMap });
+        deps.runClaudeStreaming = async opts => streamResult({ output: opts.sourceReview ? "Complete report" : "Final verdict" });
+        await dispatchToAgent(builderAgent("verifier"), makeProjectItem({ issueNumber: 1330 }), client, deps);
+        const brief = calls.fs.filter(x => x.kind === "write" && x.path.endsWith(".source-system.txt")).at(-1)!.content!;
+        assert.match(brief, /An unread file is a remaining check, not a reason to stop/);
+        if (withCriteria) {
+          assert.match(brief, /## Review criteria\n\nCriteria: wire types match/);
+          assert.doesNotMatch(brief, /triage scripts/);
+        } else {
+          assert.match(brief, /Role file with triage scripts/);
+        }
+      });
+    });
+  }
   test("Claude receives the complete diff and shares turns with the final phase", async () => {
     await withParallelReview(async () => {
       const f = fixture();

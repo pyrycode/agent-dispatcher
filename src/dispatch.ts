@@ -2818,18 +2818,24 @@ async function runParallelVerifierReview(
     if (diff.error || diff.status !== 0) throw new Error("Cannot prepare complete source diff for Claude review");
     sourcePrompt += "\n\n## Complete source diff\n\n" + diff.stdout.toString();
   }
+  // A fork can give this phase its own criteria file next to the verifier's
+  // role file. The full role file also carries triage scripts, label and
+  // publishing duties this read-only phase cannot perform; handing it those
+  // made reviewers report themselves blocked. Older forks fall back to it.
+  const criteriaPath = resolve(agentsRepoRoot, dirname(ctx.agent.claudeMdPath), "review-criteria.md");
+  const criteria = ctx.deps.existsSync(criteriaPath) ? ctx.deps.readFileSync(criteriaPath, "utf-8") : null;
   const sourceInstructions = [
-    "You are the preliminary source reviewer for this ticket. Automated checks are running concurrently.",
-    "Read the full current diff, all affected files and the local plan. Review the entire diff on rework too.",
-    `The source worktree is ${JSON.stringify(ctx.agentCwd)}. Your working directory is isolated. ` + (isClaude ? "The complete merge-base diff is supplied in the prompt. Use Read, Glob and Grep to inspect full files and repository instructions." : `Use git -C with this absolute path. Compare against ${JSON.stringify(defaultBranch)} using the merge base. Read the repository instructions.`),
-    "Review correctness, lifecycle, concurrency, security, accessibility, test coverage, plan compliance and same-pattern occurrences.",
-    isClaude ? "This phase has only Read, Glob and Grep file tools. No shell, writes, network, plugins, connectors, permission escalation or delegation tools are available." : "This phase has read-only local shell access. No network, plugins, connectors or permission escalation is available. Do not delegate to other agents.",
-    "Do not run builds, tests, emulators, baselines or other gates. Do not edit files, post reviews/comments, change labels or issue a PASS/FAIL verdict.",
-    "Defer Figma, live evidence, remote PR queries, codegraph/QMD tools, external checklists and red-gate triage to the final verifier. Document remaining checks. Do not report those intentionally deferred checks as infrastructure failures.",
-    "Return status completed with a self-contained summary: every finding with file/line, concrete trigger, impact and severity; reviewed coverage; remaining checks. If the source review cannot complete, return blocked.",
-    "The final verifier will receive your complete findings and the gate results after BOTH finish.",
-    "\n## Verifier checklist, review criteria only\n",
-    spawn.systemPrompt,
+    "You are the first of two reviewers on this pull request. Automated checks are running at the same time. Your job is to find the problems in this change so the final verifier can confirm them and publish one verdict.",
+    "You are done when every changed section has been judged with enough of the surrounding code to know whether it is correct. Read as much context as each change needs. You do not need to read every affected file from end to end. Review the entire diff on rework too, together with the local plan and the repository instructions.",
+    `The source worktree is ${JSON.stringify(ctx.agentCwd)}. Your working directory is isolated. ` + (isClaude
+      ? "The complete merge-base diff is supplied in the prompt. Use Read, Glob and Grep to inspect files. Read large files in ranges with an offset and limit."
+      : `Use git -C with this absolute path and compare against ${JSON.stringify(defaultBranch)} using the merge base. Command output longer than about 10000 tokens is cut in the middle, so read large files one range at a time, for example with sed -n, and reread any range that came back cut.`),
+    isClaude ? "This phase has only the Read, Glob and Grep file tools. No shell, writes, network, plugins, connectors, permission escalation or delegation are available." : "This phase has read-only local shell access. No network, plugins, connectors or permission escalation is available. Do not delegate to other agents.",
+    "Do not run builds, tests, emulators or other gates, edit files, post comments, change labels or give a PASS or FAIL verdict. The final verifier handles Figma, live evidence, GitHub queries, codegraph and QMD, external checklists and any red-gate triage. Leave those to it without reporting them as failures.",
+    "Return status completed with a self-contained report: every finding with file and symbol, the concrete trigger, its impact and severity; what you covered; and what remains for the final verifier, including any file you could not read completely. An unread file is a remaining check, not a reason to stop. Return blocked only when you could not review the change at all, for example when the diff or the worktree is unreadable.",
+    "The final verifier receives your complete report and the check results after both finish.",
+    criteria ? "\n## Review criteria\n" : "\n## Verifier role file, for its review criteria only\n",
+    criteria ?? spawn.systemPrompt,
   ].join("\n");
   ctx.deps.writeFileSync(sourcePromptFile, sourcePrompt);
   ctx.deps.writeFileSync(sourceSystemFile, sourceInstructions);
