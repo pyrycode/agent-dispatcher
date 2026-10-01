@@ -137,3 +137,17 @@ describe("native fix-ticket blockers", () => {
     await assert.rejects(c.addBlocker(1397, 1500), /Could not verify/);
   });
 });
+
+
+test("Backlog priority uses native project position and verifies the returned first item", async () => {
+  const client = new GitHubProjectClient({ owner: "o", repo: "r", token: "test" } as any);
+  (client as any).projectId = "PROJECT";
+  (client as any).gql = async (query: string, vars: any) => {
+    assert.match(query, /afterId: null/);
+    assert.deepEqual(vars, { project: "PROJECT", item: "FIX" });
+    return { updateProjectV2ItemPosition: { items: { nodes: [{ id: "FIX" }] } } };
+  };
+  await client.moveItemToTop("FIX");
+  (client as any).gql = async () => ({ updateProjectV2ItemPosition: { items: { nodes: [{ id: "OTHER" }] } } });
+  await assert.rejects(client.moveItemToTop("FIX"), /Could not verify top position/);
+});

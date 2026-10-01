@@ -13,6 +13,7 @@ class Client implements InheritedTicketClient {
   created: { number: number; nodeId: string; body: string; title: string }[] = [];
   statuses = new Map<number, string>();
   linked: number[] = [];
+  positions: string[] = [];
   fail: "list" | "board" | "link" | null = null;
   async listOpenIssuesWithLabel(label: string) {
     assert.equal(label, "bug");
@@ -32,6 +33,7 @@ class Client implements InheritedTicketClient {
   async getItemStatus(number: number) { return this.statuses.get(number) ?? null; }
   async updateItemStatus(item: string, status: string) { this.statuses.set(Number(item.slice(5)), status); }
   async addComment() {}
+  async moveItemToTop(item: string) { this.positions.push(item); }
   async addBlocker(parent: number, blocker: number) {
     assert.equal(parent, 1397);
     if (this.fail === "link") throw Error("link failed");
@@ -117,4 +119,16 @@ test("multiple existing trackers reuse the oldest canonical ticket", async () =>
     { number: 1480, nodeId: "node-1480", body: inheritedMarker(name) });
   assert.deepEqual((await recordInheritedTests(client, [name], ctx)).blockers, [{ name, issue: 1480 }]);
   assert.equal(client.created.length, 0);
+});
+
+test("shared fix tickets in Backlog are promoted to its top; active fixes keep their position", async () => {
+  const client = new Client();
+  await recordInheritedTests(client, [name], ctx);
+  assert.deepEqual(client.positions, ["node-1500"]);
+  client.positions = [];
+  await recordInheritedTests(client, [name], ctx);
+  assert.deepEqual(client.positions, ["node-1500"], "an existing Backlog fix is promoted too");
+  client.statuses.set(1500, "In Development"); client.positions = [];
+  await recordInheritedTests(client, [name], ctx);
+  assert.deepEqual(client.positions, []);
 });
