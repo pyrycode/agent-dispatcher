@@ -66,6 +66,7 @@ import {
   buildGateSpawnEnv,
   runRealClaudeGateSuite,
   clearGateWorktreePath,
+  worktreePath,
   spawnGateCommand,
   maybeRunPreSpawnGates,
   runVerifierGates,
@@ -7872,6 +7873,19 @@ describe("merge handoff — the owner's run", () => {
     );
     assert.ok(!calls.exec.some(c => c.cmd.includes("git add -A") || c.cmd.includes("git push")));
     assert.ok(!client.addLabelCalls.some(c => c.label === "error:max_turns_salvaged"));
+  });
+});
+
+describe("worktreePath", () => {
+  test("gives each repository its own folder, so equal ticket numbers cannot collide", () => {
+    const mobile = worktreePath("/w/pyrycode-mobile", "builder-1348");
+    const desktop = worktreePath("/w/pyrycode-desktop", "builder-1348");
+    assert.equal(mobile, "/w/.pyrycode-worktrees/pyrycode-mobile/builder-1348");
+    assert.equal(desktop, "/w/.pyrycode-worktrees/pyrycode-desktop/builder-1348");
+  });
+
+  test("ignores a trailing slash on the repository path", () => {
+    assert.equal(worktreePath("/w/pyrycode/", "main-sweep"), "/w/.pyrycode-worktrees/pyrycode/main-sweep");
   });
 });
 

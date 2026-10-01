@@ -1902,6 +1902,17 @@ export type DispatchContext = {
   pendingMerge?: PendingMerge;
 };
 
+/**
+ * Path of a dispatcher-owned worktree. Every board's dispatcher shares the
+ * `.pyrycode-worktrees` folder beside its repository, and ticket numbers
+ * repeat across repositories, so each repository gets its own subfolder.
+ * Without it mobile #1348's builder failed on 2026-10-01 because desktop's
+ * builder-1348 from 2026-09-12 still held the path.
+ */
+export function worktreePath(targetRepo: string, name: string): string {
+  return resolve(targetRepo, `../.pyrycode-worktrees/${basename(resolve(targetRepo))}/${name}`);
+}
+
 export function makeDispatchContext(
   agent: AgentConfig,
   item: ProjectItem,
@@ -1912,7 +1923,7 @@ export function makeDispatchContext(
   // Main repo NEVER checks out the feature branch — avoids orphaned untracked
   // files when switching back to main. All feature branch work happens in the
   // worktree. PO never needs a worktree — it uses gh CLI, no code changes.
-  const worktreeDir = resolve(repoRoot, `../.pyrycode-worktrees/${agent.name}-${item.issueNumber}`);
+  const worktreeDir = worktreePath(repoRoot, `${agent.name}-${item.issueNumber}`);
   const useWorktree = item.issueNumber > 0 && shouldUseWorktree(agent);
   const agentCwd = useWorktree ? worktreeDir : repoRoot;
   return {
@@ -2475,7 +2486,7 @@ export async function setupBranchAndWorktree(
       console.warn(`   ⚠️  Failed to inspect worktrees for ${branchName}: ${e}`);
     }
 
-    mkdirSync(resolve(repoRoot, `../.pyrycode-worktrees`), { recursive: true });
+    mkdirSync(dirname(worktreeDir), { recursive: true });
     execSync(`git worktree add "${worktreeDir}" ${branchName}`, { cwd: repoRoot, stdio: "pipe" });
     console.log(`   🌳 Created worktree at ${worktreeDir}`);
 
@@ -4431,7 +4442,7 @@ export async function runRealClaudeGateSuite(opts: {
   const baseRef = `origin/${base}`;
   // Prefixed so it can never collide with a dispatch worktree, which is
   // named `<agent>-<issue>` and no agent is called `real-claude-gate`.
-  const worktreeDir = resolve(targetRepo, `../.pyrycode-worktrees/real-claude-gate-${opts.issueNumber}`);
+  const worktreeDir = worktreePath(targetRepo, `real-claude-gate-${opts.issueNumber}`);
 
   // `.log` suffix on both files so the existing rotation sweep picks them
   // up with no code change (see `rotateOldLogs`).
@@ -4529,7 +4540,7 @@ export async function runRealClaudeGateSuite(opts: {
 
   clearGateWorktreePath(deps.execSync, targetRepo, worktreeDir, stamp); // clear anything a crashed earlier run left behind
   try {
-    deps.mkdirSync(resolve(targetRepo, `../.pyrycode-worktrees`), { recursive: true });
+    deps.mkdirSync(dirname(worktreeDir), { recursive: true });
     git(`worktree add --detach "${worktreeDir}" ${report.headSha}`);
   } catch (e: any) {
     removeWorktree();
@@ -4685,7 +4696,7 @@ async function runBaselineComparison(opts: {
       `the baseline command has no ${BASELINE_TESTS_PLACEHOLDER} placeholder, so it would have re-run the whole suite`;
     return;
   }
-  const worktreeDir = resolve(targetRepo, `../.pyrycode-worktrees/real-claude-gate-base-${opts.issueNumber}`);
+  const worktreeDir = worktreePath(targetRepo, `real-claude-gate-base-${opts.issueNumber}`);
   const stdoutPath = resolve(opts.logsDir, `${opts.stamp}_real-claude-gate-base_#${opts.issueNumber}.log`);
   const stderrPath = resolve(opts.logsDir, `${opts.stamp}_real-claude-gate-base_#${opts.issueNumber}.stderr.log`);
 
@@ -4886,7 +4897,7 @@ export async function runMainSweep(opts: {
   const targetRepo = opts.repoRoot ?? repoRoot;
   const logsDir = opts.logsDir ?? LOGS_DIR;
   // Prefixed so it can never collide with a dispatch worktree (`<agent>-<issue>`).
-  const worktreeDir = resolve(targetRepo, `../.pyrycode-worktrees/main-sweep`);
+  const worktreeDir = worktreePath(targetRepo, "main-sweep");
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const stdoutPath = resolve(logsDir, `${stamp}_main-sweep_${opts.sha.slice(0, 7)}.log`);
   const stderrPath = resolve(logsDir, `${stamp}_main-sweep_${opts.sha.slice(0, 7)}.stderr.log`);
@@ -4908,7 +4919,7 @@ export async function runMainSweep(opts: {
 
   clearGateWorktreePath(deps.execSync, targetRepo, worktreeDir, stamp); // clear anything a crashed earlier run left behind
   try {
-    deps.mkdirSync(resolve(targetRepo, `../.pyrycode-worktrees`), { recursive: true });
+    deps.mkdirSync(dirname(worktreeDir), { recursive: true });
     deps.execSync(`git worktree add --detach "${worktreeDir}" ${opts.sha}`, {
       cwd: targetRepo, encoding: "utf-8", timeout: 120_000, stdio: "pipe",
     });
