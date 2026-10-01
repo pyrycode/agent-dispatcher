@@ -124,6 +124,14 @@ import {
   type GateRunReport,
 } from "./gate-output.js";
 import {
+  decideGateSelection,
+  parseGateFullState,
+  parseLiveTestsSection,
+  readGateSelectionConfig,
+  type GateSelectionConfig,
+  type LiveTestsSection,
+} from "./gate-selection.js";
+import {
   trimMemoryIndexFile,
   MEMORY_INDEX_CAP_BYTES,
   MEMORY_INDEX_LESSON_WATERMARK_BYTES,
@@ -277,6 +285,22 @@ const REAL_CLAUDE_GATE_MIN_EXECUTED =
 //   go test -tags e2e_realclaude -timeout 20m -json -run {{TESTS}} ./internal/e2e/realclaude/...
 const REAL_CLAUDE_GATE_BASELINE_CMD =
   (process.env.PYRY_REAL_CLAUDE_GATE_BASELINE_CMD ?? "").trim();
+
+// Per-ticket selection: run the live tests the pull request names instead of
+// the whole suite. Off unless PYRY_REAL_CLAUDE_GATE_SELECT=1. The selected
+// command is built from the baseline template, so selection needs one; without
+// it every run stays full. See gate-selection.ts for the rules.
+const REAL_CLAUDE_GATE_SELECTION: GateSelectionConfig | null = (() => {
+  const config = readGateSelectionConfig(process.env);
+  if (config !== null && REAL_CLAUDE_GATE_BASELINE_CMD === "") {
+    console.warn(
+      `   ⚠️  PYRY_REAL_CLAUDE_GATE_SELECT=1 needs PYRY_REAL_CLAUDE_GATE_BASELINE_CMD to build the selected command. ` +
+      `Selection is OFF; every gate run uses the full suite.`,
+    );
+    return null;
+  }
+  return config;
+})();
 
 // Env-var validation moved to dispatch-bin.ts (the entry-point module).
 // Library callers don't need the dispatcher's env vars at import time —
@@ -4369,7 +4393,12 @@ export interface GateRunnerDeps {
   statSync: typeof statSync;
   spawnGate: GateSpawner;
   now: () => number;
+  /** The selection backstop's record of the last passing full run. */
+  readGateFullState: () => string | null;
+  writeGateFullState: (json: string) => void;
 }
+
+const GATE_FULL_STATE_FILE = "real-claude-gate-full-state.json";
 
 export const DEFAULT_GATE_RUNNER_DEPS: GateRunnerDeps = {
   execSync,
@@ -4379,6 +4408,13 @@ export const DEFAULT_GATE_RUNNER_DEPS: GateRunnerDeps = {
   statSync,
   spawnGate: spawnGateCommand,
   now: Date.now,
+  readGateFullState: () => {
+    try { return readFileSync(resolve(LOGS_DIR, GATE_FULL_STATE_FILE), "utf-8"); } catch { return null; }
+  },
+  writeGateFullState: (json) => {
+    mkdirSync(LOGS_DIR, { recursive: true });
+    writeFileSync(resolve(LOGS_DIR, GATE_FULL_STATE_FILE), json);
+  },
 };
 
 /**
@@ -4433,6 +4469,10 @@ export async function runRealClaudeGateSuite(opts: {
   baselineCommand?: string;
   format: GateOutputFormat;
   timeoutMs: number;
+  /** Per-ticket selection. Absent or null runs the full command every time. */
+  selection?: GateSelectionConfig | null;
+  /** The fork's floor, which a full run must clear to count as the backstop's pass. */
+  minExecuted?: number;
   /** Overridable for tests; defaults to the module-level target repo. */
   repoRoot?: string;
   defaultBranch?: string;
@@ -4518,6 +4558,49 @@ export async function runRealClaudeGateSuite(opts: {
     report.commitsBehind = null; // evidence-only; never worth failing the run
   }
 
+  // 2b. The whole suite, or the tests the pull request names. Decided before
+  // any worktree exists; every input that cannot be read resolves to full.
+  let command = opts.command;
+  if (opts.selection) {
+    let changedPaths: string[] | null = null;
+    try {
+      changedPaths = git(`diff --name-only ${report.baseSha}...${report.headSha}`).split("\n").filter(p => p !== "");
+    } catch {}
+    let mergesSinceFull: number | null = null;
+    const lastFull = parseGateFullState(deps.readGateFullState()).lastFullPassSha;
+    if (lastFull !== null) {
+      try {
+        const n = parseInt(git(`rev-list --count --merges ${lastFull}..${report.baseSha}`), 10);
+        mergesSinceFull = Number.isFinite(n) ? n : null;
+      } catch {}
+    }
+    let section: LiveTestsSection = { kind: "missing" };
+    try {
+      section = parseLiveTestsSection(deps.execSync(
+        `gh pr list --head ${branchName} --state open --json body --jq '.[0].body // ""'`,
+        { cwd: targetRepo, encoding: "utf-8", timeout: 60_000, stdio: "pipe" },
+      ).toString());
+    } catch {}
+    let selection = decideGateSelection({
+      config: opts.selection, section, changedPaths, mergesSinceFull, format: opts.format,
+    });
+    if (selection.mode === "selected") {
+      const selected = opts.baselineCommand ? buildBaselineCommand(opts.baselineCommand, selection.filter) : null;
+      if (selected === null) {
+        selection = { mode: "full", reason: `the baseline command has no ${BASELINE_TESTS_PLACEHOLDER} placeholder to carry the test list` };
+      } else {
+        command = selected;
+      }
+    }
+    report.selection = selection;
+    report.command = command;
+    console.log(
+      selection.mode === "selected"
+        ? `   🎯 Real-claude gate: ${selection.tests.length} selected test(s) for #${opts.issueNumber}: ${selection.reason}`
+        : `   🎯 Real-claude gate: full suite for #${opts.issueNumber}: ${selection.reason}`,
+    );
+  }
+
   // 3. Conflict probe, in the object database, before any working tree.
   const probe = deps.spawnSync(
     "git",
@@ -4565,7 +4648,7 @@ export async function runRealClaudeGateSuite(opts: {
   try {
     deps.mkdirSync(logsDir, { recursive: true });
     const outcome = await deps.spawnGate({
-      command: opts.command,
+      command,
       cwd: worktreeDir,
       env: buildGateSpawnEnv(process.env),
       timeoutMs: opts.timeoutMs,
@@ -4586,6 +4669,22 @@ export async function runRealClaudeGateSuite(opts: {
       console.warn(`   ⚠️  Real-claude gate: could not read ${stdoutPath} back: ${e?.message ?? e}`);
     }
     if (raw !== null) report.tally = parseGateOutput(raw, opts.format);
+
+    // A clean full run resets the selection backstop's merge count. Only a
+    // clean one: a red full run leaves the count where it was, so the next
+    // gated ticket runs the full suite again until main is green.
+    const tally = report.tally;
+    if (
+      report.selection?.mode === "full" && report.runError === null && !report.timedOut &&
+      report.exitCode === 0 && tally !== null && tally.failed === 0 &&
+      tally.executed >= Math.max(1, opts.minExecuted ?? 1)
+    ) {
+      try {
+        deps.writeGateFullState(JSON.stringify({ lastFullPassSha: report.baseSha }));
+      } catch (e: any) {
+        console.warn(`   ⚠️  Real-claude gate: could not record the full run: ${e?.message ?? e}`);
+      }
+    }
 
     // Same-tree re-run, only when the branch failed named tests. Answers
     // the question a single run cannot: does this fail every time, or did
@@ -4878,6 +4977,8 @@ export function makeRealClaudeGateRunner(): RealClaudeGateRunner | null {
     baselineCommand: REAL_CLAUDE_GATE_BASELINE_CMD,
     format,
     timeoutMs: REAL_CLAUDE_GATE_TIMEOUT_MS,
+    selection: REAL_CLAUDE_GATE_SELECTION,
+    minExecuted: REAL_CLAUDE_GATE_MIN_EXECUTED,
   });
 }
 
@@ -6334,7 +6435,11 @@ export async function pollLoop(): Promise<void> {
     realClaudeGateRunner === null
       ? `   Real-claude gate: not configured — gated tickets park in Inbox for an operator (PYRY_REAL_CLAUDE_GATE_CMD)`
       : `   Real-claude gate: enabled, floor ${REAL_CLAUDE_GATE_MIN_EXECUTED} executed test(s), ` +
-        `${Math.round(REAL_CLAUDE_GATE_TIMEOUT_MS / 60_000)}min wall clock, format ${REAL_CLAUDE_GATE_FORMAT}`,
+        `${Math.round(REAL_CLAUDE_GATE_TIMEOUT_MS / 60_000)}min wall clock, format ${REAL_CLAUDE_GATE_FORMAT}` +
+        (REAL_CLAUDE_GATE_SELECTION === null
+          ? ", full suite every run"
+          : `, per-ticket selection with ${REAL_CLAUDE_GATE_SELECTION.alwaysTests.length} always-run test(s), ` +
+            `full suite every ${REAL_CLAUDE_GATE_SELECTION.fullEvery} merges`),
   );
 
   // Main sweep: the fork's in-depth command against main, when idle or every N

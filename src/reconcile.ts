@@ -47,7 +47,7 @@ import {
   REWORK_TARGET_ERROR_LABEL,
 } from "./pipeline-decisions.js";
 import { selectDispatches } from "./dispatch-selection.js";
-import { formatGateEvidenceComment, type GateRunReport } from "./gate-output.js";
+import { formatGateEvidenceComment, gateRunFloor, type GateRunReport } from "./gate-output.js";
 import type { FlakyRunContext, FlakyTicketResult } from "./flaky-tickets.js";
 
 /**
@@ -573,7 +573,7 @@ export async function runRealClaudeGateExecution(
       timedOut: report.timedOut,
       tally: report.tally,
       exitCode: report.exitCode,
-      minExecuted,
+      minExecuted: gateRunFloor(report, minExecuted),
     });
     // Re-judge a failure against what the base commit already fails, so a
     // branch is not blamed for breakage it inherited. No-op for every other

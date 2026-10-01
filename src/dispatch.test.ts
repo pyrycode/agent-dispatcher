@@ -5807,6 +5807,101 @@ describe("runRealClaudeGateSuite — evidence gathering", () => {
   });
 });
 
+describe("runRealClaudeGateSuite — per-ticket selection", () => {
+  const LAST_FULL = "f".repeat(40);
+  const body = "## Summary\nx\n\n## Live tests\n- p.TestRename\n";
+
+  function selectionRun(over: {
+    prBody?: string;
+    changed?: string;
+    lastFull?: string | null;
+    merges?: string;
+    fileContents?: string;
+    selection?: Parameters<typeof runRealClaudeGateSuite>[0]["selection"];
+  } = {}) {
+    const writes: string[] = [];
+    const out: Record<string, string> = {
+      ...GATE_SHAS,
+      [`git diff --name-only ${GATE_BASE_SHA}...${GATE_HEAD_SHA}`]: over.changed ?? "ui/Settings.kt\n",
+      [`git rev-list --count --merges ${LAST_FULL}..${GATE_BASE_SHA}`]: over.merges ?? "2",
+    };
+    const harness = makeGateDeps({
+      gitOut: (cmd: string) => cmd.startsWith("gh pr list") ? (over.prBody ?? body) : (out[cmd] ?? ""),
+      fileContents: over.fileContents,
+      readGateFullState: () => over.lastFull === null ? null : JSON.stringify({ lastFullPassSha: over.lastFull ?? LAST_FULL }),
+      writeGateFullState: (json: string) => { writes.push(json); },
+    } as any);
+    return {
+      ...harness,
+      writes,
+      run: () => runRealClaudeGateSuite({
+        issueNumber: 1382,
+        command: "go test -json ./...",
+        baselineCommand: "go test -json -run {{TESTS}} ./...",
+        format: "go-json",
+        timeoutMs: 60_000,
+        selection: over.selection === undefined
+          ? { alwaysTests: ["p.TestPing"], fullPaths: ["net/"], fullEvery: 10 }
+          : over.selection,
+        minExecuted: 1,
+        repoRoot: "/tmp/fake-repo",
+        defaultBranch: "main",
+        logsDir: "/tmp/fake-logs",
+        deps: harness.deps,
+      }),
+    };
+  }
+
+  test("runs the named tests and the always-run set through the baseline template", async () => {
+    const { run, spawnRequests, writes } = selectionRun();
+    const report = await run();
+
+    assert.equal(report.selection?.mode, "selected");
+    assert.match(spawnRequests[0].command, /-run '\^\(TestPing\|TestRename\)\$'/);
+    assert.equal(report.command, spawnRequests[0].command, "the evidence shows the command that actually ran");
+    assert.deepEqual(writes, [], "a selected run never resets the backstop");
+  });
+
+  test("a branch touching a full path runs the full command", async () => {
+    const { run, spawnRequests } = selectionRun({ changed: "net/Relay.kt\n" });
+    const report = await run();
+    assert.equal(report.selection?.mode, "full");
+    assert.equal(spawnRequests[0].command, "go test -json ./...");
+  });
+
+  test("with no full pass on record, runs the full command and records it when it is clean", async () => {
+    const { run, spawnRequests, writes } = selectionRun({ lastFull: null });
+    await run();
+    assert.equal(spawnRequests[0].command, "go test -json ./...");
+    assert.deepEqual(writes, [JSON.stringify({ lastFullPassSha: GATE_BASE_SHA })]);
+  });
+
+  test("a red full run leaves the backstop where it was", async () => {
+    const { run, writes } = selectionRun({
+      lastFull: null,
+      fileContents: '{"Action":"fail","Package":"p","Test":"TestA"}',
+    });
+    await run();
+    assert.deepEqual(writes, []);
+  });
+
+  test("a pull request with no list runs the full command", async () => {
+    const { run, spawnRequests } = selectionRun({ prBody: "## Summary\nx" });
+    const report = await run();
+    assert.equal(report.selection?.mode, "full");
+    assert.match(report.selection?.reason ?? "", /no `## Live tests` list/);
+    assert.equal(spawnRequests[0].command, "go test -json ./...");
+  });
+
+  test("selection off reads no pull request and records nothing", async () => {
+    const { run, calls, writes } = selectionRun({ selection: null, lastFull: null });
+    const report = await run();
+    assert.equal(report.selection, undefined);
+    assert.ok(!calls.some(c => c.startsWith("gh pr list")));
+    assert.deepEqual(writes, []);
+  });
+});
+
 describe("runRealClaudeGateSuite — same-tree re-run before the base comparison", () => {
   // pyrycode #2089, 2026-09-06: a flaky liveness test failed once on the
   // branch and passed on the base, so the base comparison called it a
