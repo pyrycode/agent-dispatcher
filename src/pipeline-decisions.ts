@@ -982,7 +982,7 @@ export interface GateOutcome {
  *   pass          → In Documentation, clear `needs-real-claude`
  *   flaky-pass    → the same, plus a Discord ping naming the flaky tests
  *   fail          → In Development, add the set's fail rework label (classic: `needs-rework:developer`)
- *   inherited-failure → In Development with the same rework label, plus a baseline warning
+ *   inherited-failure → stays at the live gate behind separate fix-ticket blockers
  *   zero-executed → stays in Inbox, add `error:real-claude-gate`, notify
  *   unusable      → stays in Inbox, add `error:real-claude-gate`, notify
  *
@@ -1032,15 +1032,9 @@ export function decideGateOutcome(
         notify: false,
       };
     case "inherited-failure":
-      // The report is usable and the tests are red. Keep the baseline
-      // distinction in the evidence, but send a real test failure through
-      // rework rather than labelling it as a gate execution error.
-      return {
-        toColumn: REAL_CLAUDE_GATE_FAIL_COLUMN,
-        addLabels: [failReworkLabel],
-        removeLabels: [],
-        notify: true,
-      };
+      // Reconciliation creates and confirms the fix-ticket blockers first.
+      // The next live run waits for them to close, without a rework route.
+      return { toColumn: null, addLabels: [], removeLabels: [], notify: true };
     case "zero-executed":
     case "unusable":
       return {

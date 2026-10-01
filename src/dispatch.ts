@@ -57,6 +57,7 @@ import {
   type MainSweepState,
 } from "./main-sweep.js";
 import { recordFlakyTests } from "./flaky-tickets.js";
+import { recordInheritedTests } from "./inherited-tickets.js";
 import { activeStageSet } from "./stage-sets.js";
 import { resolveEffort } from "./effort-policy.js";
 import {
@@ -6672,6 +6673,8 @@ export async function pollLoop(): Promise<void> {
         // A running main sweep holds the emulators the same way a run does.
         pool.size + (sweepRun !== null ? 1 : 0),
         (flaky, ctx) => recordFlakyTests(client, flaky, ctx),
+        undefined,
+        (failures, ctx) => recordInheritedTests(client, failures, ctx),
       );
     } else if (gateRun === null) {
       const verifiersInFlight = REAL_CLAUDE_GATE_HOLD_VERIFIERS
@@ -6688,6 +6691,7 @@ export async function pollLoop(): Promise<void> {
           const done: Promise<void> = work().finally(() => { if (gateRun?.done === done) gateRun = null; });
           gateRun = { issue, done };
         },
+        (failures, ctx) => recordInheritedTests(client, failures, ctx),
       );
     }
     // A waiting or running background gate keeps the main sweep off the

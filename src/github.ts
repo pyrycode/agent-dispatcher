@@ -697,6 +697,34 @@ export class GitHubProjectClient {
       .map((b: { number: number }) => b.number);
   }
 
+  /** Resolve both endpoints as issues, link them, and verify the open blocker. */
+  async addBlocker(issueNumber: number, blockerNumber: number): Promise<void> {
+    if (issueNumber === blockerNumber) throw new Error("An issue cannot block itself");
+    const result: any = await this.gql(`
+      query($owner: String!, $repo: String!, $parent: Int!, $blocker: Int!) {
+        repository(owner: $owner, name: $repo) {
+          parent: issue(number: $parent) { id state }
+          blocker: issue(number: $blocker) { id state }
+        }
+      }
+    `, { owner: this.config.owner, repo: this.config.repo, parent: issueNumber, blocker: blockerNumber });
+    const { parent, blocker } = result.repository ?? {};
+    if (!parent?.id || !blocker?.id || parent.state !== "OPEN" || blocker.state !== "OPEN") {
+      throw new Error("Blocker endpoints must both be open issues");
+    }
+    if (!(await this.getOpenBlockers(issueNumber)).includes(blockerNumber)) {
+      await this.gql(`
+        mutation($issue: ID!, $blocker: ID!) {
+          addBlockedBy(input: { issueId: $issue, blockingIssueId: $blocker }) { issue { id } }
+        }
+      `, { issue: parent.id, blocker: blocker.id });
+    }
+    if (!(await this.getOpenBlockers(issueNumber)).includes(blockerNumber)) {
+      throw new Error(`Could not verify #${issueNumber} is blocked by #${blockerNumber}`);
+    }
+    this.clearItemsCache();
+  }
+
   /**
    * Create a new issue in the configured repo via the REST API.
    * Returns both the issue number (for human-facing links) and the
@@ -736,8 +764,8 @@ export class GitHubProjectClient {
    * Every open issue carrying `label`, with its body, across all pages.
    * Pull requests share the issues endpoint and are dropped.
    */
-  async listOpenIssuesWithLabel(label: string): Promise<{ number: number; body: string }[]> {
-    const found: { number: number; body: string }[] = [];
+  async listOpenIssuesWithLabel(label: string): Promise<{ number: number; nodeId: string; title: string; body: string }[]> {
+    const found: { number: number; nodeId: string; title: string; body: string }[] = [];
     for (let page = 1; ; page++) {
       const response = await fetchWithRetry(
         `https://api.github.com/repos/${this.config.owner}/${this.config.repo}/issues` +
@@ -758,7 +786,7 @@ export class GitHubProjectClient {
       const batch: any[] = (await response.json()) as any[];
       for (const issue of batch) {
         if (issue.pull_request) continue;
-        found.push({ number: issue.number, body: issue.body ?? "" });
+        found.push({ number: issue.number, nodeId: issue.node_id, title: issue.title, body: issue.body ?? "" });
       }
       if (batch.length < 100) return found;
     }

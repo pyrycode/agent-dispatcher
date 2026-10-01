@@ -47,6 +47,10 @@ class MockClient implements ReconcileClient {
     this.items = items;
   }
 
+  async getOpenBlockers(issueNumber: number): Promise<number[]> {
+    return (this.items.find(i => i.issueNumber === issueNumber)?.blockedBy ?? []).filter(b => b.state === "OPEN").map(b => b.number);
+  }
+
   async getItemsByStatus(status: string): Promise<ProjectItem[]> {
     return this.items.filter(i => i.status === status);
   }
@@ -782,26 +786,91 @@ describe("runRealClaudeGateExecution — outcomes", () => {
     assert.ok(item.labels.includes("needs-real-claude"));
   });
 
-  test("failures reproduced on main still route to rework, not a gate error", async () => {
-    const item = parkedItem();
-    const client = new MockClient([item]);
-    const notifications: string[] = [];
-    const inherited = report({
-      exitCode: 1,
-      tally: tally({ executed: 176, passed: 175, failed: 1, failedNames: ["pkg.TestThing"], packageFailed: true }),
-      baselineFailures: ["pkg.TestThing"],
+  test("inherited live failure waits at the retry limit, then re-gates after its fix closes", async () => {
+    await withStageSet("builder", async () => {
+      const item = parkedItem({ issueNumber: 1397, labels: ["done:verifier", "needs-real-claude", "rework-count:3"] });
+      const client = new MockClient([item]);
+      const inherited = report({ exitCode: 1,
+        tally: tally({ executed: 176, passed: 175, failed: 1, failedNames: ["pkg.TestThing"] }),
+        baselineFailures: ["pkg.TestThing"], baselineOutputPath: "/logs/base.log" });
+      let filed = 0;
+      await runRealClaudeGateExecution(client, async () => inherited, 150, async () => {}, 0, undefined, undefined,
+        async (names, ctx) => {
+          assert.deepEqual(names, ["pkg.TestThing"]);
+          assert.equal(ctx.gatedIssue, 1397);
+          assert.equal(ctx.report.baselineOutputPath, "/logs/base.log");
+          filed++;
+          item.blockedBy = [{ number: 1500, state: "OPEN" }];
+          return { blockers: [{ name: "pkg.TestThing", issue: 1500 }], untracked: [] };
+        });
+      await runReworkRouting(client);
+      assert.equal(filed, 1);
+      assert.equal(item.status, "Inbox");
+      assert.deepEqual(item.labels.sort(), ["done:verifier", "needs-real-claude", "rework-count:3"].sort());
+      assert.match(client.addCommentCalls[0].body, /#1500/);
+      let ran = false;
+      await runRealClaudeGateExecution(client, async () => { ran = true; return report(); }, 150, async () => {});
+      assert.equal(ran, false, "open fix blocks another expensive run");
+      item.blockedBy[0].state = "CLOSED";
+      await runRealClaudeGateExecution(client, async () => { ran = true; return report(); }, 150, async () => {});
+      assert.equal(ran, true);
+      assert.equal(item.status, "In Documentation");
+      assert.ok(!item.labels.includes("needs-real-claude"));
+      assert.ok(item.labels.includes("rework-count:3"));
     });
+  });
 
-    await runRealClaudeGateExecution(client, async () => inherited, 150, async message => { notifications.push(message); });
+  test("failed shared-ticket filing parks for recovery without spending rework", async () => {
+    const item = parkedItem({ labels: ["done:code-review", "needs-real-claude", "rework-count:3"] });
+    const client = new MockClient([item]);
+    const inherited = report({ exitCode: 1,
+      tally: tally({ executed: 176, passed: 175, failed: 1, failedNames: ["pkg.TestThing"] }),
+      baselineFailures: ["pkg.TestThing"] });
+    await runRealClaudeGateExecution(client, async () => inherited, 150, async () => {}, 0, undefined, undefined,
+      async () => { throw new Error("GitHub unavailable"); });
+    await runReworkRouting(client);
+    assert.equal(item.status, "Inbox");
+    assert.ok(item.labels.includes("error:real-claude-gate"));
+    assert.ok(item.labels.includes("rework-count:3"));
+    assert.ok(!item.labels.some(l => l.startsWith("needs-rework:")));
+    assert.match(client.addCommentCalls[0].body, /could not.*blocker/i);
+  });
 
+  test("mixed failures get separate shared tickets while the branch regression still routes to its builder", async () => {
+    const item = parkedItem(); const client = new MockClient([item]);
+    const mixed = report({ exitCode: 1,
+      tally: tally({ executed: 176, passed: 174, failed: 2, failedNames: ["pkg.Shared", "pkg.Regression"] }),
+      baselineFailures: ["pkg.Shared"] });
+    let tracked: readonly string[] = [];
+    await runRealClaudeGateExecution(client, async () => mixed, 150, async () => {}, 0, undefined, undefined,
+      async names => { tracked = names; return { blockers: [{ name: "pkg.Shared", issue: 1500 }], untracked: [] }; });
+    assert.deepEqual(tracked, ["pkg.Shared"]);
     assert.equal(item.status, "In Development");
     assert.ok(item.labels.includes("needs-rework:developer"));
-    assert.ok(item.labels.includes("needs-real-claude"));
-    assert.ok(!item.labels.includes("error:real-claude-gate"));
-    assert.ok(!item.labels.includes("wip:real-claude-gate"));
-    assert.match(client.addCommentCalls[0]?.body ?? "", /Already failing on `origin\/main`/);
-    assert.match(client.addCommentCalls[0]?.body ?? "", /moved it to \*\*In Development\*\*/);
-    assert.match(notifications[0] ?? "", /failures on main/);
+    assert.match(client.addCommentCalls[0].body, /#1500/);
+  });
+
+  test("a fix ticket that still fails its own named test returns to its builder", async () => {
+    const item = parkedItem(); const client = new MockClient([item]);
+    const inherited = report({ exitCode: 1,
+      tally: tally({ executed: 176, passed: 175, failed: 1, failedNames: ["pkg.Shared"] }),
+      baselineFailures: ["pkg.Shared"] });
+    await runRealClaudeGateExecution(client, async () => inherited, 150, async () => {}, 0, undefined, undefined,
+      async () => ({ blockers: [], untracked: [], owned: ["pkg.Shared"] }));
+    assert.equal(item.status, "In Development");
+    assert.ok(item.labels.includes("needs-rework:developer"));
+    assert.match(client.addCommentCalls[0].body, /already owns the fix/);
+  });
+
+  test("fresh blockers added after the board snapshot prevent another live run", async () => {
+    const client = new MockClient([parkedItem()]);
+    client.getOpenBlockers = async () => [1500];
+    let ran = false;
+    await runRealClaudeGateExecution(client, async () => { ran = true; return report(); }, 150, async () => {});
+    assert.equal(ran, false);
+    client.getOpenBlockers = async () => { throw Error("GitHub unavailable"); };
+    await runRealClaudeGateExecution(client, async () => { ran = true; return report(); }, 150, async () => {});
+    assert.equal(ran, false);
   });
 
   test("a failure that passed on the same-tree re-run advances like a pass and pings a human", async () => {

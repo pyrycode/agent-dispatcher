@@ -4,7 +4,7 @@
 
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { decideListingGapReport, mergeListingWithOpenIssues, type ListingGaps } from "./github.js";
+import { decideListingGapReport, mergeListingWithOpenIssues, type ListingGaps, GitHubProjectClient } from "./github.js";
 
 type Item = { issueNumber: number; status: string; labels: string[] };
 const item = (issueNumber: number, status: string, labels: string[] = []): Item => ({ issueNumber, status, labels });
@@ -100,5 +100,40 @@ describe("decideListingGapReport", () => {
     const r = decideListingGapReport(false, many, "pyrycode-mobile");
     assert.match(r.notify ?? "", /#909 and 4 more/);
     assert.doesNotMatch(r.notify ?? "", /#910/);
+  });
+});
+
+
+describe("native fix-ticket blockers", () => {
+  function client(parent: unknown = { id: "P", state: "OPEN" }, blocker: unknown = { id: "B", state: "OPEN" }) {
+    const c = new GitHubProjectClient({ owner: "o", repo: "r", token: "test" } as any);
+    let linked = false;
+    const calls: string[] = [];
+    (c as any).gql = async (query: string, vars: any) => {
+      calls.push(query);
+      if (query.includes("addBlockedBy")) { assert.equal(vars.issue, "P"); assert.equal(vars.blocker, "B"); linked = true; return {}; }
+      if (query.includes("parent: issue")) return { repository: { parent, blocker } };
+      return { repository: { issue: { blockedBy: { nodes: linked ? [{ number: 1500, state: "OPEN" }] : [], pageInfo: { hasNextPage: false } } } } };
+    };
+    return { c, calls };
+  }
+  test("validates issue endpoints, links and reads back the dependency; repeated linking is idempotent", async () => {
+    const { c, calls } = client();
+    await c.addBlocker(1397, 1500);
+    await c.addBlocker(1397, 1500);
+    assert.equal(calls.filter(q => q.includes("addBlockedBy")).length, 1);
+    assert.equal(calls.filter(q => q.includes("blockedBy(first:")).length, 4);
+  });
+  test("a PR number or closed fix is rejected before any link write", async () => {
+    for (const blocker of [null, { id: "B", state: "CLOSED" }]) {
+      const { c, calls } = client(undefined, blocker);
+      await assert.rejects(c.addBlocker(1397, 1500), /open issues/);
+      assert.equal(calls.filter(q => q.includes("addBlockedBy")).length, 0);
+    }
+  });
+  test("a relationship missing on readback is not reported as linked", async () => {
+    const { c } = client();
+    c.getOpenBlockers = async () => [];
+    await assert.rejects(c.addBlocker(1397, 1500), /Could not verify/);
   });
 });
