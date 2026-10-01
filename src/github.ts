@@ -841,6 +841,22 @@ export class GitHubProjectClient {
     }
   }
 
+  /** Project order drives column priority. Verify the item is now first. */
+  async moveItemToTop(itemId: string): Promise<void> {
+    if (!this.projectId) throw new Error("Not initialized");
+    const result: any = await this.gql(`
+      mutation($project: ID!, $item: ID!) {
+        updateProjectV2ItemPosition(input: { projectId: $project, itemId: $item, afterId: null }) {
+          items(first: 1) { nodes { id } }
+        }
+      }
+    `, { project: this.projectId, item: itemId });
+    if (result.updateProjectV2ItemPosition?.items?.nodes?.[0]?.id !== itemId) {
+      throw new Error(`Could not verify top position for ${itemId}`);
+    }
+    this.clearItemsCache();
+  }
+
   async removeLabel(issueNumber: number, label: string): Promise<void> {
     const response = await fetchWithRetry(
       `https://api.github.com/repos/${this.config.owner}/${this.config.repo}/issues/${issueNumber}/labels/${encodeURIComponent(label)}`,

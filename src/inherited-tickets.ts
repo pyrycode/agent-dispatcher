@@ -5,6 +5,7 @@ import { shortTestName, type FlakyRunContext, type FlakyTicketClient } from "./f
 export interface InheritedTicketClient extends FlakyTicketClient {
   listOpenIssuesWithLabel(label: string): Promise<{ number: number; nodeId: string; title?: string; body: string }[]>;
   getItemStatus(issueNumber: number): Promise<string | null>;
+  moveItemToTop(itemId: string): Promise<void>;
   /** Links two issues and reads the relationship back before resolving. */
   addBlocker(issueNumber: number, blockerNumber: number): Promise<void>;
 }
@@ -79,9 +80,9 @@ export async function recordInheritedTests(
       }
       const status = await client.getItemStatus(issue.number);
       const itemId = await client.addItemToProject(issue.nodeId);
-      if (status === null || status === "Inbox" || status === "Done") {
-        await client.updateItemStatus(itemId, "Backlog");
-      }
+      const entersBacklog = status === null || status === "Inbox" || status === "Done";
+      if (entersBacklog) await client.updateItemStatus(itemId, "Backlog");
+      if (entersBacklog || status === "Backlog") await client.moveItemToTop(itemId);
       await client.addBlocker(ctx.gatedIssue, issue.number);
       result.blockers.push({ name, issue: issue.number });
     } catch (error) {
