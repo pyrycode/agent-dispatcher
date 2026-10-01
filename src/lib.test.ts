@@ -4981,7 +4981,7 @@ describe("decideBaselineAdjustedVerdict", () => {
     // The pyrycode#1382 case, 2026-08-07: 519 passed, 2 failed, and both
     // failures reproduce identically on clean main with nothing to do with
     // the ticket. Keep that attribution in the evidence even though a
-    // trustworthy red run now routes to rework.
+    // trustworthy red run now waits on separate fix-ticket blockers.
     const d = decideBaselineAdjustedVerdict({ ...base, baselineFailures: ["p.TestA", "p.TestB"] });
     assert.equal(d.verdict, "inherited-failure");
     assert.deepEqual(d.introduced, []);
@@ -5078,10 +5078,10 @@ describe("decideBaselineAdjustedVerdict", () => {
     assert.equal(o.notify, true);
   });
 
-  test("inherited test failures route to rework with the baseline evidence intact", () => {
+  test("inherited test failures wait in Inbox without requesting rework", () => {
     const o = decideGateOutcome("inherited-failure");
-    assert.equal(o.toColumn, "In Development");
-    assert.deepEqual(o.addLabels, ["needs-rework:developer"]);
+    assert.equal(o.toColumn, null);
+    assert.deepEqual(o.addLabels, []);
     assert.deepEqual(o.removeLabels, [], "the gate label must survive");
     assert.equal(o.notify, true);
   });
