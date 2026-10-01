@@ -225,6 +225,11 @@ export function decideAutoAdvance(
     // This is the structural guarantee — it does not depend on the gate step
     // running, so removing or breaking that step cannot un-gate a ticket.
     !(rule.from === REAL_CLAUDE_GATE_FROM_COLUMN && item.labels.includes(REAL_CLAUDE_GATE_LABEL)) &&
+    // A background gate run is still writing its verdict. A failure moves the
+    // ticket to its rework column before adding the rework label, so for a
+    // moment it reads as a finished stage with no rework pending. The running
+    // label comes off last, after every verdict write.
+    !item.labels.includes(REAL_CLAUDE_GATE_RUNNING_LABEL) &&
     !hasOpenBlockers(item.blockedBy ?? []);
 
   for (const rule of rules) {

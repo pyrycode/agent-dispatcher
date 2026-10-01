@@ -701,6 +701,56 @@ describe("runRealClaudeGateExecution — never beside an agent run", () => {
   });
 });
 
+describe("runRealClaudeGateExecution — in the background", () => {
+  test("marks the ticket, hands the run over, and returns before the suite runs", async () => {
+    const client = new MockClient([parkedItem()]);
+    let ranCount = 0;
+    let handed: { issue: number; work: () => Promise<void> } | null = null;
+
+    const started = await runRealClaudeGateExecution(
+      client, async () => { ranCount++; return report(); }, 150, async () => {}, 0, undefined,
+      (issue, work) => { handed = { issue, work }; },
+    );
+
+    assert.equal(started, true, "a started background run holds verifiers like a wait does");
+    assert.equal(ranCount, 0, "the suite runs only when the caller starts the handed work");
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1382, label: REAL_CLAUDE_GATE_RUNNING_LABEL }]);
+    assert.equal(handed!.issue, 1382);
+
+    await handed!.work();
+    assert.equal(ranCount, 1);
+    assert.deepEqual(client.updateItemStatusCalls, [{ itemId: "item-1382", newStatus: "In Documentation" }]);
+    assert.ok(client.removeLabelCalls.some(c => c.label === REAL_CLAUDE_GATE_RUNNING_LABEL));
+  });
+
+  test("waits for conflicting runs without handing anything over", async () => {
+    const client = new MockClient([parkedItem()]);
+    let handedCount = 0;
+
+    const held = await runRealClaudeGateExecution(
+      client, async () => report(), 150, async () => {}, 1, undefined, () => { handedCount++; },
+    );
+
+    assert.equal(held, true);
+    assert.equal(handedCount, 0);
+    assert.equal(client.addLabelCalls.length, 0, "a waiting gate does not mark the ticket as running");
+  });
+
+  test("handed work never rejects, even when the runner throws", async () => {
+    const client = new MockClient([parkedItem()]);
+    let handed: (() => Promise<void>) | null = null;
+
+    await runRealClaudeGateExecution(
+      client, async () => { throw new Error("boom"); }, 150, async () => {}, 0, undefined,
+      (_issue, work) => { handed = work; },
+    );
+
+    await handed!();
+    assert.ok(client.addLabelCalls.some(c => c.label === "error:real-claude-gate"), "a thrown runner still parks");
+    assert.ok(client.removeLabelCalls.some(c => c.label === REAL_CLAUDE_GATE_RUNNING_LABEL));
+  });
+});
+
 describe("runRealClaudeGateExecution — outcomes", () => {
   test("pass advances the ticket and clears the gate label", async () => {
     const item = parkedItem();

@@ -97,6 +97,7 @@ import {
   REWORK_TARGET_ERROR_LABEL,
   decideRealClaudeGateRun,
   REAL_CLAUDE_GATE_LABEL,
+  REAL_CLAUDE_GATE_RUNNING_LABEL,
   shouldAddReadyLabel,
   shouldSkipDispatch,
 } from "./pipeline-decisions.js";
@@ -792,6 +793,22 @@ describe("decideAutoAdvance", () => {
     assert.deepEqual(d.advances, []);
     assert.deepEqual(d.backlogHeld, []);
     assert.deepEqual(d.gatedAwaiting, []);
+  });
+
+  test("a ticket a background gate is still writing to never advances", () => {
+    // A failing verdict moves the ticket back before adding its rework label.
+    // In between it reads as finished developer work, until the running label
+    // comes off last.
+    const d = decideAutoAdvance(
+      AUTO_ADVANCE_RULES,
+      MANUAL_ADVANCE_GATES,
+      items(["In Development", [
+        { id: "i1", issueNumber: 1382, labels: ["done:developer", REAL_CLAUDE_GATE_LABEL, REAL_CLAUDE_GATE_RUNNING_LABEL] },
+      ]]),
+      0,
+      3,
+    );
+    assert.deepEqual(d.advances, []);
   });
 
   test("single done:po in Backlog, pipeline empty → advance to In Architecture", () => {

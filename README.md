@@ -112,6 +112,7 @@ Optional:
 | `PYRY_REAL_CLAUDE_GATE_TIMEOUT_MS` | `1800000` | Outer wall clock for one gate run. Must exceed the command's own inner timeout. |
 | `PYRY_REAL_CLAUDE_GATE_MIN_EXECUTED` | `1` | Floor for the executed-test guard. Set near the suite's real count. |
 | `PYRY_REAL_CLAUDE_GATE_BASELINE_CMD` | — | Base-commit re-run template with a `{{TESTS}}` placeholder. Runs only when the branch has named failures, so it costs seconds. Unset means failures are attributed to the branch. |
+| `PYRY_REAL_CLAUDE_GATE_BACKGROUND` | — | `1` runs the gate beside the poll loop. Only verifiers and the main sweep wait for it; builders, refiners and documentation keep working. Unset keeps the gate running alone. See below. |
 | `PYRY_REAL_CLAUDE_GATE_SELECT` | — | `1` runs only the live tests the pull request names, plus the always-run set, instead of the whole suite. Needs the baseline template. See "Per-ticket selection" below. |
 | `PYRY_REAL_CLAUDE_GATE_ALWAYS_TESTS` | — | Comma-separated qualified test names every selected run includes. |
 | `PYRY_REAL_CLAUDE_GATE_FULL_PATHS` | — | Comma-separated path prefixes. A branch changing any of them runs the whole suite. |
@@ -193,6 +194,8 @@ they explicitly enable this option.
 ### Real-claude gate
 
 Some tickets can only be accepted by running against real claude rather than the pipeline's fakes. The PO marks them `needs-real-claude` during refinement. After code review such a ticket is parked in Inbox, and if this fork sets `PYRY_REAL_CLAUDE_GATE_CMD` the dispatcher then runs the suite itself, once per cycle, before it picks any other ticket.
+
+**Running alone, or in the background.** By default the gate runs alone: once a ticket is waiting, nothing new is dispatched until every agent run has finished, and the loop then waits for the suite. On mobile that cost up to 81 minutes of drain before one gate and about nine minutes of a stalled board during each. With `PYRY_REAL_CLAUDE_GATE_BACKGROUND=1` the gate waits only for running verifiers and the main sweep, then runs beside the loop. While it waits or runs, new verifiers and the main sweep are held back, because their device runs share the emulator and would hit their own time limits queued behind the suite. Everything else keeps dispatching, merging and advancing. Turn it on only where the suite tolerates other work on the host. Mobile can, because its test script holds the emulator host-wide, so a builder's device run queues instead of colliding.
 
 While that suite is running, the ticket carries `wip:real-claude-gate`. The dispatcher removes it when the run finishes, whether the result passes, fails, or needs human attention. A ticket with any `wip:` label is not selected for another gate run. The existing stranded-running-label sweep clears a marker left by an interrupted process after its safety delay.
 
