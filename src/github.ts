@@ -898,9 +898,9 @@ export class GitHubProjectClient {
   }
 
   /**
-   * One page of an issue's comments. Shared by the three marker readers
-   * below (auto-retry time, auto-retry count, stranded-`wip:` markers) so
-   * they can't drift apart. THROWS on fetch failure (fetchWithRetry
+   * One page of an issue's comments. Shared by the marker readers below
+   * (auto-retry time, auto-retry count, stranded-`wip:` markers, any marker
+   * count) so they can't drift apart. THROWS on fetch failure (fetchWithRetry
    * exhausted); each caller decides what a failed read means for it.
    *
    * One page (100) is far more than any ticket accrues in practice.
@@ -956,6 +956,16 @@ export class GitHubProjectClient {
       if (typeof c?.body === "string" && c.body.includes(AUTO_RETRY_COMMENT_MARKER)) count++;
     }
     return count;
+  }
+
+  /**
+   * How many of an issue's comments carry `marker`. The final-merge loop
+   * guard counts its routing comments this way (merge-handoff.ts). THROWS on
+   * fetch failure; the caller leaves the ticket for the next cycle.
+   */
+  async countMarkerComments(issueNumber: number, marker: string): Promise<number> {
+    const comments = await this.fetchIssueComments(issueNumber);
+    return comments.filter((c) => typeof c?.body === "string" && c.body.includes(marker)).length;
   }
 
   /**

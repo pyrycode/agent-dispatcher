@@ -78,6 +78,8 @@ import {
   type StreamResult,
 } from "./dispatch.js";
 import { formatGateEvidenceComment } from "./gate-output.js";
+import { FINAL_MERGE_HANDOFF_MARKER } from "./merge-handoff.js";
+import { runReworkRouting } from "./reconcile.js";
 import { resetActiveStageSetForTests, resolveStageSet } from "./stage-sets.js";
 import type { AgentConfig, BlockerInfo, ProjectItem } from "./types.js";
 import {
@@ -422,6 +424,11 @@ export class MockGitHubClient implements DispatchClient {
   getStrandedWipMarkersCalls: number[] = [];
   getAllProjectItemsCalls = 0;
   clearItemsCacheCalls = 0;
+  /** Comment bodies already on a ticket before this test's writes, for
+   *  `countMarkerComments`. Comments posted through THIS client count on
+   *  top (same durable-comment semantics as the family tally). */
+  priorCommentsByIssue: Map<number, string[]> = new Map();
+  countMarkerCommentsCalls: { issueNumber: number; marker: string }[] = [];
   /** Clock stamped onto comments posted through this client. Overridable so
    *  a test can post a marker and then have it read back as old. */
   commentClock: () => Date = () => new Date();
@@ -440,6 +447,7 @@ export class MockGitHubClient implements DispatchClient {
     getAllProjectItems?: Error;
     getStrandedWipMarkers?: Error | ((issueNumber: number) => Error | null);
     closeIssue?: Error | ((issueNumber: number) => Error | null);
+    countMarkerComments?: Error;
   } = {};
 
   constructor(opts: {
@@ -577,6 +585,16 @@ export class MockGitHubClient implements DispatchClient {
 
   async countRetryMarkers(_issueNumber: number): Promise<number> {
     return 0;
+  }
+
+  async countMarkerComments(issueNumber: number, marker: string): Promise<number> {
+    this.countMarkerCommentsCalls.push({ issueNumber, marker });
+    if (this.failures.countMarkerComments) throw this.failures.countMarkerComments;
+    const bodies = [
+      ...(this.priorCommentsByIssue.get(issueNumber) ?? []),
+      ...this.comments.filter(c => c.issueNumber === issueNumber).map(c => c.body),
+    ];
+    return bodies.filter(b => b.includes(marker)).length;
   }
 
   async getAllProjectItems(): Promise<ProjectItem[]> {
@@ -1012,12 +1030,13 @@ describe("setupBranchAndWorktree — failure modes", () => {
     ">>>>>>> main",
     "",
   ].join("\n");
-  function codeConflictContext(issueNumber: number, agent: Partial<AgentConfig>) {
+  function codeConflictContext(issueNumber: number, agent: Partial<AgentConfig>, client?: MockGitHubClient) {
     const probe = makeTestContext({ item: { issueNumber }, agent });
     const path = resolve(probe.ctx.worktreeDir, "Thread.kt");
     const made = makeTestContext({
       item: { issueNumber },
       agent,
+      client,
       mockOptions: {
         execImpls: {
           ...happyExecBaseline(),
@@ -1069,6 +1088,47 @@ describe("setupBranchAndWorktree — failure modes", () => {
     assert.ok(calls.exec.some(c => c.cmd.includes("git merge --abort")));
     const addIdx = calls.exec.findIndex(c => c.cmd.includes("git worktree add"));
     assert.ok(calls.exec.slice(addIdx + 1).some(c => c.cmd.includes("git worktree remove")), "the routed stage cleans up its worktree");
+  });
+
+  test("final merge out of retries → owner, router (uncounted, labels cleaned), then this path in the owner's run", async () => {
+    // pyrycode-mobile #1430, 2026-10-02: the PR conflicted with main after
+    // documentation and parked for a human. The final merge now takes the
+    // route above. The stale done:* labels stand in for any the Done
+    // cleanup has not stripped yet.
+    const client = new MockGitHubClient({
+      items: [{
+        id: "PVTI_1430", issueNumber: 1430, status: "Done",
+        labels: ["done:code-review", "done:documentation", "merge-attempt:2", "size:s"], state: "OPEN",
+      }],
+    });
+    const { deps: mergeDeps } = makeMockDeps({
+      execImpls: {
+        "gh pr list --head \"feature/1430\"": () => "1431\n",
+        "gh pr merge 1431 --merge --delete-branch": () => execError({ stderr: "X Pull request #1431 is not mergeable" }),
+      },
+    });
+    const ticket = () => client.itemsByIssueNumber.get(1430)!;
+
+    // 1. The spent final merge routes the ticket to the owner.
+    await runAutoMerge(client, mergeDeps);
+    assert.equal(ticket().status, "In Documentation");
+    assert.deepEqual(ticket().labels, ["done:code-review", "done:documentation", "size:s", "merge-handoff", "needs-rework:developer"]);
+
+    // 2. The rework router moves it without counting a rework, and strips
+    // the marker, the trigger and the stale done:* labels, exactly as for
+    // a pre-run handoff.
+    const labelsAddedBefore = client.addLabelCalls.length;
+    await runReworkRouting(client);
+    assert.equal(ticket().status, "In Development");
+    assert.deepEqual(ticket().labels, ["size:s"]);
+    assert.deepEqual(client.addLabelCalls.slice(labelsAddedBefore), [], "no rework-count, no error:rework-loop");
+
+    // 3. The owner's pre-run merge hits the conflict and keeps it for its run.
+    const { ctx } = codeConflictContext(1430, {}, client);
+    const result = await setupBranchAndWorktree(ctx);
+    assert.deepEqual(result, { ok: true });
+    assert.match(client.comments.at(-1)!.body, /Merge conflict left for developer/);
+    assert.deepEqual(ctx.pendingMerge?.paths, ["Thread.kt"]);
   });
 
   test("code conflict before an earlier stage → parks for a human as before", async () => {
@@ -4366,10 +4426,12 @@ describe("runAutoMerge", () => {
     assert.ok(!client.addLabelCalls.some(c => c.label === "error:merge-conflict"));
   });
 
-  test("merge conflict on retries-exhausted attempt → error:merge-conflict label + triage comment + Discord notify + Status rolled back to In Code Review", async () => {
+  test("merge conflict on retries-exhausted attempt → sent to the code owner: marker comment, merge-handoff + needs-rework:developer, Status to In Documentation, Discord notify", async () => {
     // Pre-seeded `merge-attempt:2` simulates the 3rd attempt — that's
-    // when retries are exhausted and the dispatcher gives up. Earlier
-    // attempts bump the counter and skip; see the retry tests below.
+    // when retries are exhausted. Earlier attempts bump the counter and
+    // skip; see the retry tests below. Since 2026-10-02 the spent retries
+    // send the ticket to its code owner instead of parking it (pyrycode-
+    // mobile #1017, #1346 and #1430 parked for a human that week).
     const client = new MockGitHubClient({
       items: [
         { id: "PVTI_1201", issueNumber: 1201, status: "Done", labels: ["done:documentation", "merge-attempt:2"], state: "OPEN" },
@@ -4389,35 +4451,191 @@ describe("runAutoMerge", () => {
 
     await runAutoMerge(client, deps);
 
-    // The conflict-block label was applied (stops retry loop on next cycle).
-    assert.ok(client.addLabelCalls.some(c => c.issueNumber === 1201 && c.label === "error:merge-conflict"));
-    // Triage comment posted with manual-resolution recipe.
+    // The route the pre-run merge uses: marker first, then the owner's rework label.
+    assert.deepEqual(client.addLabelCalls, [
+      { issueNumber: 1201, label: "merge-handoff" },
+      { issueNumber: 1201, label: "needs-rework:developer" },
+    ]);
+    // One routing comment, opening with the loop guard's marker.
     assert.equal(client.comments.length, 1);
-    assert.match(client.comments[0]!.body, /Auto-merge blocked by merge conflict/);
-    assert.match(client.comments[0]!.body, /gh pr checkout 790/);
-    assert.match(client.comments[0]!.body, /git fetch origin main/);
-    // Discord notify (one 🛑 message).
-    assert.equal(calls.discord.length, 1);
-    assert.match(calls.discord[0]!, /^🛑 Merge conflict on PR #790/);
-    // Pipeline labels NOT stripped (the merge failed, so the ticket
-    // isn't really done; labels stay until human resolves). Only the
-    // spent retry counter is cleared, so a later return to Done retries
-    // afresh.
+    const body = client.comments[0]!.body;
+    assert.ok(body.startsWith(FINAL_MERGE_HANDOFF_MARKER), "the marker opens the comment the guard counts");
+    assert.match(body, /Final merge sent to developer/);
+    assert.match(body, /PR #790 conflicts with `main`/);
+    assert.match(body, /only to finish this merge\. It does not count as a rework/);
+    assert.match(body, /merge handoff 1 of 2/);
+    assert.deepEqual(client.countMarkerCommentsCalls, [{ issueNumber: 1201, marker: FINAL_MERGE_HANDOFF_MARKER }]);
+    // Only the spent retry counter is cleared, so the ticket's next time
+    // in Done retries afresh. The router strips the rest when it moves it.
     assert.deepEqual(
       client.removeLabelCalls.filter(c => c.issueNumber === 1201).map(c => c.label),
       ["merge-attempt:2"],
     );
-    // Status rolled back from Done → In Code Review (the column-as-truth
-    // fix shipped 2026-05-09 evening). Without this the ticket sits at
-    // Status=Done with a still-open conflicting PR — exact bug #218 hit
-    // this morning.
-    assert.deepEqual(
-      client.updateItemStatusCalls,
-      [{ itemId: "PVTI_1201", newStatus: "In Code Review" }],
-      "merge-conflict path must roll Status back from Done → In Code Review",
-    );
-    // Items map reflects the rollback (state actually changed, not just recorded).
-    assert.equal(client.itemsByIssueNumber.get(1201)!.status, "In Code Review");
+    // Done is not a column the rework router scans: the ticket waits in
+    // the last stage's column, as after a pre-run route from documentation.
+    assert.deepEqual(client.updateItemStatusCalls, [{ itemId: "PVTI_1201", newStatus: "In Documentation" }]);
+    assert.equal(client.itemsByIssueNumber.get(1201)!.status, "In Documentation");
+    // Discord still hears about it.
+    assert.equal(calls.discord.length, 1);
+    assert.match(calls.discord[0]!, /^🔀 Merge conflict on PR #790 \(#1201\) — sent back to developer/);
+  });
+
+  test("retries-exhausted conflict in the builder set → sent to the builder", async () => {
+    await withStageSet("builder", async () => {
+      const client = new MockGitHubClient({
+        items: [
+          { id: "PVTI_1430", issueNumber: 1430, status: "Done", labels: ["merge-attempt:2"], state: "OPEN" },
+        ],
+      });
+      const { deps } = makeMockDeps({
+        execImpls: {
+          "gh pr list --head \"feature/1430\"": () => "1431\n",
+          "gh pr merge 1431 --merge --delete-branch": () => execError({ stderr: "X Pull request #1431 is not mergeable" }),
+        },
+      });
+
+      await runAutoMerge(client, deps);
+
+      assert.deepEqual(client.addLabelCalls.map(c => c.label), ["merge-handoff", "needs-rework:builder"]);
+      assert.match(client.comments[0]!.body, /Final merge sent to builder/);
+      assert.equal(client.itemsByIssueNumber.get(1430)!.status, "In Documentation");
+    });
+  });
+
+  test("two earlier final-merge handoffs → parks for a human as before, saying why", async () => {
+    // The loop guard: main overtook the ticket twice already.
+    const client = new MockGitHubClient({
+      items: [
+        { id: "PVTI_1202", issueNumber: 1202, status: "Done", labels: ["merge-attempt:2"], state: "OPEN" },
+      ],
+    });
+    client.priorCommentsByIssue.set(1202, [
+      `${FINAL_MERGE_HANDOFF_MARKER}\n## 🔀 Final merge sent to developer`,
+      "## ✅ some agent comment",
+      `${FINAL_MERGE_HANDOFF_MARKER}\n## 🔀 Final merge sent to developer`,
+    ]);
+    const { deps, calls } = makeMockDeps({
+      execImpls: {
+        "gh pr list --head \"feature/1202\"": () => "795\n",
+        "gh pr merge 795 --merge --delete-branch": () => execError({ stderr: "X Pull request #795 is not mergeable" }),
+      },
+    });
+
+    await runAutoMerge(client, deps);
+
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1202, label: "error:merge-conflict" }]);
+    assert.equal(client.comments.length, 1);
+    assert.match(client.comments[0]!.body, /Auto-merge blocked by merge conflict/);
+    assert.match(client.comments[0]!.body, /already gone back to developer 2 times/);
+    assert.match(client.comments[0]!.body, /gh pr checkout 795/);
+    assert.ok(!client.comments[0]!.body.includes(FINAL_MERGE_HANDOFF_MARKER), "a park is not a handoff");
+    assert.deepEqual(client.updateItemStatusCalls, [{ itemId: "PVTI_1202", newStatus: "In Code Review" }]);
+    assert.equal(calls.discord.length, 1);
+    assert.match(calls.discord[0]!, /^🛑 Merge conflict on PR #795/);
+  });
+
+  test("the route's labels fail → parks for a human as before, saying why", async () => {
+    const client = new MockGitHubClient({
+      items: [
+        { id: "PVTI_1203", issueNumber: 1203, status: "Done", labels: ["merge-attempt:2"], state: "OPEN" },
+      ],
+    });
+    client.failures.addLabel = (_n, label) => label.startsWith("needs-rework:") ? new Error("REST 502") : null;
+    const { deps, calls } = makeMockDeps({
+      execImpls: {
+        "gh pr list --head \"feature/1203\"": () => "796\n",
+        "gh pr merge 796 --merge --delete-branch": () => execError({ stderr: "X Pull request #796 is not mergeable" }),
+      },
+    });
+
+    await runAutoMerge(client, deps);
+
+    assert.ok(client.addLabelCalls.some(c => c.label === "error:merge-conflict"));
+    // The routing comment went out first, so the attempt still counts
+    // toward the guard; the park comment follows it.
+    assert.equal(client.comments.length, 2);
+    assert.match(client.comments[1]!.body, /Sending it back to developer to finish the merge failed: REST 502/);
+    assert.deepEqual(client.updateItemStatusCalls, [{ itemId: "PVTI_1203", newStatus: "In Code Review" }]);
+    assert.match(calls.discord[0]!, /^🛑 Merge conflict on PR #796/);
+  });
+
+  test("earlier handoffs cannot be counted → nothing changes; the spent counter brings it back next cycle", async () => {
+    const client = new MockGitHubClient({
+      items: [
+        { id: "PVTI_1204", issueNumber: 1204, status: "Done", labels: ["merge-attempt:2"], state: "OPEN" },
+      ],
+    });
+    client.failures.countMarkerComments = new Error("Failed to fetch comments: Bad Gateway");
+    const { deps, calls } = makeMockDeps({
+      execImpls: {
+        "gh pr list --head \"feature/1204\"": () => "797\n",
+        "gh pr merge 797 --merge --delete-branch": () => execError({ stderr: "X Pull request #797 is not mergeable" }),
+      },
+    });
+
+    await runAutoMerge(client, deps);
+
+    assert.deepEqual(client.addLabelCalls, []);
+    assert.deepEqual(client.removeLabelCalls, []);
+    assert.equal(client.comments.length, 0);
+    assert.equal(client.updateItemStatusCalls.length, 0);
+    assert.equal(calls.discord.length, 0);
+    assert.deepEqual(client.itemsByIssueNumber.get(1204)!.labels, ["merge-attempt:2"]);
+  });
+
+  test("the route's Status move fails → labels stay, non-fatal", async () => {
+    const client = new MockGitHubClient({
+      items: [
+        { id: "PVTI_1209", issueNumber: 1209, status: "Done", labels: ["merge-attempt:2"], state: "OPEN" },
+      ],
+    });
+    client.failures.updateItemStatus = new Error("project field permission denied");
+    const { deps, calls } = makeMockDeps({
+      execImpls: {
+        "gh pr list --head \"feature/1209\"": () => "798\n",
+        "gh pr merge 798 --merge --delete-branch": () => execError({ stderr: "X Pull request #798 is not mergeable" }),
+      },
+    });
+
+    await runAutoMerge(client, deps);
+
+    assert.deepEqual(client.addLabelCalls.map(c => c.label), ["merge-handoff", "needs-rework:developer"]);
+    assert.ok(!client.addLabelCalls.some(c => c.label === "error:merge-conflict"));
+    assert.equal(client.itemsByIssueNumber.get(1209)!.status, "Done");
+    assert.equal(calls.discord.length, 1);
+  });
+
+  test("a ticket main keeps overtaking goes to the owner twice, then parks", async () => {
+    // Each route's own comment is what the next round counts.
+    const client = new MockGitHubClient({
+      items: [
+        { id: "PVTI_1212", issueNumber: 1212, status: "Done", labels: ["merge-attempt:2"], state: "OPEN" },
+      ],
+    });
+    const { deps } = makeMockDeps({
+      execImpls: {
+        "gh pr list --head \"feature/1212\"": () => "799\n",
+        "gh pr merge 799 --merge --delete-branch": () => execError({ stderr: "X Pull request #799 is not mergeable" }),
+      },
+    });
+    const backInDoneWithRetriesSpent = () => {
+      const item = client.itemsByIssueNumber.get(1212)!;
+      item.status = "Done";
+      item.labels = ["merge-attempt:2"];
+    };
+
+    await runAutoMerge(client, deps);
+    assert.equal(client.itemsByIssueNumber.get(1212)!.status, "In Documentation");
+    backInDoneWithRetriesSpent();
+    await runAutoMerge(client, deps);
+    assert.equal(client.itemsByIssueNumber.get(1212)!.status, "In Documentation");
+    assert.match(client.comments[1]!.body, /merge handoff 2 of 2/);
+    backInDoneWithRetriesSpent();
+    await runAutoMerge(client, deps);
+
+    assert.equal(client.itemsByIssueNumber.get(1212)!.status, "In Code Review");
+    assert.ok(client.itemsByIssueNumber.get(1212)!.labels.includes("error:merge-conflict"));
+    assert.equal(client.addLabelCalls.filter(c => c.label === "needs-rework:developer").length, 2);
   });
 
   test("merge conflict — Status rollback failure is non-fatal (label still applied, sibling items still process)", async () => {
@@ -4428,13 +4646,15 @@ describe("runAutoMerge", () => {
     // Status is cosmetic correctness.
     //
     // Pre-seeded `merge-attempt:2` on both items so the next conflict
-    // triggers the give-up path (retries exhausted), not a counter bump.
+    // triggers the give-up path (retries exhausted), not a counter bump,
+    // and two earlier handoffs each so the give-up parks for a human.
     const client = new MockGitHubClient({
       items: [
         { id: "PVTI_1207", issueNumber: 1207, status: "Done", labels: ["done:documentation", "merge-attempt:2"], state: "OPEN" },
         { id: "PVTI_1208", issueNumber: 1208, status: "Done", labels: ["done:documentation", "merge-attempt:2"], state: "OPEN" },
       ],
     });
+    for (const n of [1207, 1208]) client.priorCommentsByIssue.set(n, [FINAL_MERGE_HANDOFF_MARKER, FINAL_MERGE_HANDOFF_MARKER]);
     // Rollback fails for 1207 only; 1208 should still process normally.
     client.failures.updateItemStatus = (itemId) =>
       itemId === "PVTI_1207" ? new Error("project field permission denied") : null;
@@ -4490,7 +4710,7 @@ describe("runAutoMerge", () => {
     assert.ok(!client.removeLabelCalls.some(c => c.label.startsWith("merge-attempt:")));
   });
 
-  test("conflict every cycle with Done cleanup in between → gives up on the third cycle (mobile #878 regression)", async () => {
+  test("conflict every cycle with Done cleanup in between → hands off on the third cycle (mobile #878 regression)", async () => {
     // The real poll loop runs runDoneCleanup before runAutoMerge in
     // every cycle. Cleanup used to strip merge-attempt:N from the open
     // Done ticket, so the count read zero each cycle and the retry
@@ -4512,8 +4732,9 @@ describe("runAutoMerge", () => {
       await runAutoMerge(client, deps);
     }
 
-    assert.ok(client.addLabelCalls.some(c => c.issueNumber === 1220 && c.label === "error:merge-conflict"));
-    assert.equal(client.itemsByIssueNumber.get(1220)!.status, "In Code Review");
+    assert.ok(client.addLabelCalls.some(c => c.issueNumber === 1220 && c.label === "needs-rework:developer"));
+    assert.ok(!client.addLabelCalls.some(c => c.label === "error:merge-conflict"));
+    assert.equal(client.itemsByIssueNumber.get(1220)!.status, "In Documentation");
     assert.equal(calls.discord.length, 1);
     // The spent counter is cleared on give-up.
     assert.ok(!client.itemsByIssueNumber.get(1220)!.labels.some(l => l.startsWith("merge-attempt:")));
@@ -4827,19 +5048,21 @@ describe("runAutoMerge", () => {
     assert.ok(!client.addLabelCalls.some(c => c.label === "error:merge-conflict"));
   });
 
-  test("pre-merge rebase conflict, merge conflicts too, retries exhausted → label + comment + Status rollback", async () => {
+  test("pre-merge rebase conflict, merge conflicts too, retries and handoffs exhausted → label + comment + Status rollback", async () => {
     // A rebase conflict falls back to the plain merge (2026-09-23: a
     // rebase can conflict where the merge is clean). When the merge
     // conflicts as well, the same load-bearing conflict path applies:
     // label + triage comment + Discord + Status rollback.
     //
     // Pre-seeded `merge-attempt:2` so this is the 3rd (final) attempt —
-    // retries exhausted, dispatcher gives up.
+    // retries exhausted, dispatcher gives up — and two earlier handoffs,
+    // so the give-up parks for a human.
     const client = new MockGitHubClient({
       items: [
         { id: "PVTI_1401", issueNumber: 1401, status: "Done", labels: ["done:documentation", "merge-attempt:2"], state: "OPEN" },
       ],
     });
+    client.priorCommentsByIssue.set(1401, [FINAL_MERGE_HANDOFF_MARKER, FINAL_MERGE_HANDOFF_MARKER]);
     const { deps, calls } = makeMockDeps({
       execImpls: {
         "gh pr list --head \"feature/1401\"": () => "901\n",

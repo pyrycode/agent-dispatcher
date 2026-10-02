@@ -68,6 +68,7 @@ class FakeClient implements DispatchClient {
   async getFamilyDispatchState(_issueNumber: number) {
     return { markerCount: 0, breakerCommented: false };
   }
+  async countMarkerComments(_issueNumber: number, _marker: string) { return 0; }
   labels() { return this.addLabelCalls.map((c) => c.label); }
 }
 

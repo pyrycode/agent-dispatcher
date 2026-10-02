@@ -9,6 +9,8 @@ import {
   addedLines,
   checkMergeResolution,
   decideConflictRoute,
+  decideFinalMergeRoute,
+  FINAL_MERGE_HANDOFF_MAX,
   hasConflictMarkers,
   mergeHandoffNote,
   missingLines,
@@ -41,6 +43,33 @@ describe("decideConflictRoute — who settles a conflict", () => {
     assert.deepEqual(route(classic, "architect"), { kind: "park" });
     assert.deepEqual(route(builder, "refiner"), { kind: "park" });
     assert.deepEqual(route(builder, "developer"), { kind: "park" });
+  });
+});
+
+describe("decideFinalMergeRoute — a Done ticket's conflict after the retries", () => {
+  const classic = resolveStageSet("classic").agents;
+  const builder = resolveStageSet("builder").agents;
+  const final = (agents: typeof classic, prior: number) =>
+    decideFinalMergeRoute(agents, REAL_CLAUDE_GATE_FAIL_COLUMN, prior);
+
+  test("goes to the owner from the last stage's column, as if documentation had asked", () => {
+    assert.deepEqual(final(classic, 0), { kind: "route", owner: "developer", column: "In Documentation" });
+    assert.deepEqual(final(builder, 1), { kind: "route", owner: "builder", column: "In Documentation" });
+  });
+
+  test("parks once the ticket has gone back FINAL_MERGE_HANDOFF_MAX times", () => {
+    const parked = final(builder, FINAL_MERGE_HANDOFF_MAX);
+    assert.equal(parked.kind, "park");
+    assert.match(parked.kind === "park" ? parked.reason : "", /already gone back to builder 2 times/);
+  });
+
+  test("parks when the set has nobody to send it to", () => {
+    const noOwner = builder.filter((a) => a.column !== REAL_CLAUDE_GATE_FAIL_COLUMN);
+    assert.equal(final(noOwner, 0).kind, "park");
+    assert.equal(final([], 0).kind, "park");
+    // The owner as the last stage has no later stage to send it back from.
+    const ownerLast = builder.slice(0, 2);
+    assert.equal(final(ownerLast, 0).kind, "park");
   });
 });
 
