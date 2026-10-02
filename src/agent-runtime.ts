@@ -1238,3 +1238,113 @@ export function shouldFireIdleWatchdog(
 export function idleWatchdogTickMs(idleMs: number): number {
   return Math.min(30_000, Math.max(1_000, Math.round(idleMs / 10)));
 }
+
+// --------- Partial-work salvage for runs that already have a PR ---------
+
+/** How a run was stopped by the dispatcher rather than finishing. */
+export type RunStopKind = "timeout" | "idle_stall";
+
+/**
+ * The runner's rejection when the dispatcher itself stopped the run and no
+ * result frame came back: the wall clock, or the idle watchdog. Typed so
+ * the orchestrator can tell these from every other failure without
+ * matching message text. The message is unchanged from the plain `Error`
+ * it replaces, so retry classification and comments read the same.
+ *
+ * This is the door most timeouts arrive through: a SIGTERMed `pyry
+ * agent-run` writes no result frame, so pyrycode-mobile #1430 (2026-10-02)
+ * and #1332 (2026-10-01) both failed with "Agent timed out after 2280s"
+ * here, never reaching `handleAgentResultErrors` at all.
+ */
+export class AgentRunStoppedError extends Error {
+  constructor(message: string, readonly kind: RunStopKind) {
+    super(message);
+    this.name = "AgentRunStoppedError";
+  }
+}
+
+/**
+ * Which stop, if any, ended this run. Both doors count: the runner's
+ * rejection (`AgentRunStoppedError`) and a result frame the dispatcher
+ * marked (`timedOut`, or terminal reason `idle_stall` from either the
+ * dispatcher's watchdog or pyry's). A result that is not an error is not
+ * a stop. Neither is a permission denial or a Codex blocked or refinement
+ * outcome: those are policy stops with their own handling, and saving
+ * their work automatically could repeat the action that was refused.
+ */
+export function runStopKind(
+  error: unknown,
+  streamResult: {
+    isError: boolean;
+    timedOut: boolean;
+    terminalReason: string;
+    hadPermissionDenial: boolean;
+  } | null,
+): RunStopKind | null {
+  if (error instanceof AgentRunStoppedError) return error.kind;
+  if (!streamResult || !streamResult.isError || streamResult.hadPermissionDenial) return null;
+  if (["codex_blocked", "needs_refinement", "waiting_on_blocker"].includes(streamResult.terminalReason)) return null;
+  if (streamResult.terminalReason === IDLE_STALL_REASON) return "idle_stall";
+  if (streamResult.timedOut) return "timeout";
+  return null;
+}
+
+/**
+ * True when this run's stage may have its partial work committed and
+ * pushed for it. Only stages that own commits on the branch qualify:
+ * `producesCommits` is already that list (architect, developer, builder,
+ * documentation). Reviewer stages (verifier, code-review, qa) and the
+ * refiner/PO carry `false`, so their worktree is never pushed for them.
+ */
+export function canSalvagePartialWork(opts: {
+  stopKind: RunStopKind | null;
+  agent: Pick<AgentConfig, "producesCommits">;
+  useWorktree: boolean;
+  issueNumber: number;
+}): boolean {
+  return opts.stopKind !== null && opts.agent.producesCommits && opts.useWorktree && opts.issueNumber > 0;
+}
+
+/**
+ * Whether to commit and push a stopped run's leftovers to its branch.
+ *
+ * Why. The draft-PR salvage (`shouldAttemptSafeSalvage`) only covers a
+ * branch with no pull request yet, because it opens one. Every rework,
+ * documentation and later run already has a PR, so a timeout there left
+ * its edits in the worktree: pyrycode-mobile #1430 (2026-10-02) and #1332
+ * (2026-10-01) both timed out in documentation with finished edits
+ * uncommitted. A dirty worktree also blocks the next run from recreating
+ * it, and unpushed local commits make the next setup abort as "local
+ * ahead of origin". Pushing to the existing branch fixes both; the PR
+ * already exists, so nothing new is opened and nothing auto-advances.
+ *
+ * Gates, all required:
+ * - an open PR on the branch (`openPrCount > 0`; -1 means the lookup
+ *   failed, which skips);
+ * - no merge in progress (`MERGE_HEAD`), and a merge handed to this run
+ *   passed `checkMergeResolution`, so conflict markers are never pushed;
+ * - something to save: uncommitted changes, or local commits origin lacks.
+ *
+ * Pure; the caller (`salvagePartialWork` in dispatch.ts) does the I/O.
+ */
+export function decidePartialWorkSalvage(opts: {
+  openPrCount: number;
+  gitStatusOutput: string;
+  /** `git rev-list --count origin/<branch>..HEAD`; -1 when unknown. */
+  commitsAheadOfOrigin: number;
+  mergeInProgress: boolean;
+  /** `checkMergeResolution` problems for a merge handed to this run; empty otherwise. */
+  mergeCheckProblems: readonly string[];
+}): { salvage: true } | { salvage: false; reason: string } {
+  if (opts.openPrCount < 0) return { salvage: false, reason: "could not look up the branch's pull request" };
+  if (opts.openPrCount === 0) return { salvage: false, reason: "no open pull request on the branch" };
+  if (opts.mergeInProgress) return { salvage: false, reason: "a merge is still in progress (MERGE_HEAD)" };
+  if (opts.mergeCheckProblems.length > 0) {
+    return { salvage: false, reason: `the merge handed to this run failed its check: ${opts.mergeCheckProblems.join(" ")}` };
+  }
+  const dirty = opts.gitStatusOutput.trim().length > 0;
+  if (!dirty && opts.commitsAheadOfOrigin <= 0) {
+    return { salvage: false, reason: "nothing to save: worktree clean and in sync with origin" };
+  }
+  return { salvage: true };
+}

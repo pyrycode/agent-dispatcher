@@ -17,6 +17,10 @@ import assert from "node:assert/strict";
 
 import { AGENTS } from "./types.js";
 import {
+  AgentRunStoppedError,
+  canSalvagePartialWork,
+  decidePartialWorkSalvage,
+  runStopKind,
   advanceIdleWatchdogState,
   advancePermissionDenialState,
   buildResumeArgv,
@@ -6176,5 +6180,61 @@ describe("idle-stream watchdog — claude runner (pyrycode-mobile #1430, 2026-10
     assert.equal(r.signature, "idle stream stall");
     // The result-frame door: handleAgentResultErrors names the reason.
     assert.equal(classifyAgentError("Agent error (idle_stall): subtype=error_during_execution. Ran 15m 2s (timeout 25min).", { terminalReason: "idle_stall" }).transient, true);
+  });
+});
+
+describe("partial-work salvage decisions (mobile #1430, #1332)", () => {
+  const result = (over: Partial<{ isError: boolean; timedOut: boolean; terminalReason: string; hadPermissionDenial: boolean }> = {}) => ({
+    isError: true, timedOut: false, terminalReason: "", hadPermissionDenial: false, ...over,
+  });
+
+  test("runStopKind reads both doors: the runner's rejection and a marked result frame", () => {
+    assert.equal(runStopKind(new AgentRunStoppedError("Agent timed out after 2280s", "timeout"), null), "timeout");
+    assert.equal(runStopKind(new AgentRunStoppedError("Agent idle_stall: ...", "idle_stall"), null), "idle_stall");
+    assert.equal(runStopKind(new Error("Agent error ()"), result({ timedOut: true })), "timeout");
+    assert.equal(runStopKind(new Error("Agent error (idle_stall)"), result({ terminalReason: "idle_stall" })), "idle_stall");
+  });
+
+  test("runStopKind: anything else is not a stop", () => {
+    assert.equal(runStopKind(new Error("Claude CLI exited with code 1, no result message received"), null), null);
+    assert.equal(runStopKind(new Error("x"), result({ terminalReason: "max_turns" })), null);
+    assert.equal(runStopKind(new Error("x"), result({ isError: false, timedOut: true })), null, "a success that landed after the kill");
+    assert.equal(runStopKind(new Error("x"), result({ timedOut: true, hadPermissionDenial: true })), null, "a denial is a policy stop");
+    assert.equal(runStopKind(new Error("x"), result({ timedOut: true, terminalReason: "codex_blocked" })), null, "never work around a rejected action");
+  });
+
+  test("canSalvagePartialWork: only stages that own commits, in a worktree, on a real ticket", () => {
+    const base = { stopKind: "timeout" as const, useWorktree: true, issueNumber: 1430 };
+    for (const name of ["architect", "developer", "documentation"]) {
+      assert.equal(canSalvagePartialWork({ ...base, agent: AGENTS.find(a => a.name === name)! }), true, name);
+    }
+    for (const name of ["po", "qa", "code-review"]) {
+      assert.equal(canSalvagePartialWork({ ...base, agent: AGENTS.find(a => a.name === name)! }), false, name);
+    }
+    const dev = AGENTS.find(a => a.name === "developer")!;
+    assert.equal(canSalvagePartialWork({ ...base, stopKind: null, agent: dev }), false);
+    assert.equal(canSalvagePartialWork({ ...base, useWorktree: false, agent: dev }), false);
+    assert.equal(canSalvagePartialWork({ ...base, issueNumber: 0, agent: dev }), false);
+  });
+
+  const ok = { openPrCount: 1, gitStatusOutput: " M a.md\n", commitsAheadOfOrigin: 0, mergeInProgress: false, mergeCheckProblems: [] as string[] };
+
+  test("decidePartialWorkSalvage: PR + dirty tree, or PR + local commits → salvage", () => {
+    assert.deepEqual(decidePartialWorkSalvage(ok), { salvage: true });
+    assert.deepEqual(decidePartialWorkSalvage({ ...ok, gitStatusOutput: "", commitsAheadOfOrigin: 2 }), { salvage: true });
+  });
+
+  test("decidePartialWorkSalvage: each gate refuses on its own", () => {
+    const refused = (over: Partial<typeof ok>, why: RegExp) => {
+      const d = decidePartialWorkSalvage({ ...ok, ...over });
+      assert.equal(d.salvage, false);
+      assert.match((d as { reason: string }).reason, why);
+    };
+    refused({ openPrCount: 0 }, /no open pull request/);
+    refused({ openPrCount: -1 }, /could not look up/);
+    refused({ mergeInProgress: true }, /MERGE_HEAD/);
+    refused({ mergeCheckProblems: ["`a.kt` still has conflict markers."] }, /conflict markers/);
+    refused({ gitStatusOutput: "", commitsAheadOfOrigin: 0 }, /nothing to save/);
+    refused({ gitStatusOutput: "  \n", commitsAheadOfOrigin: -1 }, /nothing to save/);
   });
 });

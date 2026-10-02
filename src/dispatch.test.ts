@@ -52,6 +52,7 @@ import {
   runDoneCleanup,
   runStrandedWipSweep,
   runPendingDoneFinalize,
+  salvagePartialWork,
   strandedWipMinAgeMs,
   runFamilyBreaker,
   selectPastParkedFamilies,
@@ -91,7 +92,7 @@ import {
   tallyFamilyComments,
 } from "./pipeline-decisions.js";
 import { AGENTS } from "./types.js";
-import { ResourceExhaustedError, timeoutFor } from "./agent-runtime.js";
+import { AgentRunStoppedError, idleStallMessage, ResourceExhaustedError, timeoutFor } from "./agent-runtime.js";
 import { resolveAgentsRepoRoot, resolveTargetRepoRoot } from "./worktree.js";
 
 // Importing dispatch.ts loads the fork's .env, so a fork running this suite
@@ -8033,5 +8034,231 @@ describe("clearGateWorktreePath", () => {
     const { fn, calls } = exec(() => false);
     assert.equal(clearGateWorktreePath(fn, "/tmp/repo", dir, "s"), null);
     assert.ok(!calls.some(c => c.includes("worktree move")));
+  });
+});
+
+// =====================================================================
+// Partial-work salvage — a stopped run on a branch that already has a PR
+// =====================================================================
+//
+// pyrycode-mobile #1430 (2026-10-02) and #1332 (2026-10-01) both timed out
+// in documentation with finished edits uncommitted. Their tickets already
+// had a PR, so the draft-PR salvage never applied, and both timeouts came
+// through the runner's REJECT door ("Agent timed out after 2280s", no
+// result frame). These tests drive dispatchToAgent through both doors.
+
+describe("partial-work salvage — stopped run with an existing PR (mobile #1430, #1332)", () => {
+  const DOC_AGENT: Partial<AgentConfig> = {
+    name: "documentation", column: "In Documentation", claudeMdPath: "documentation/CLAUDE.md", producesCommits: true,
+  };
+  const PR_JSON = `[{"number": 1431}]`;
+  const NO_MERGE = { "git rev-parse -q --verify MERGE_HEAD": () => execError({ status: 1 }) };
+
+  function stoppedRun(opts: {
+    issue: number;
+    agent?: Partial<AgentConfig>;
+    stop: { reject: Error } | { result: StreamResult };
+    exec?: Record<string, ExecHandler>;
+    spawn?: Record<string, SpawnHandler>;
+  }) {
+    const agent = makeAgentConfig(opts.agent ?? DOC_AGENT);
+    const client = new MockGitHubClient({ status: { [opts.issue]: agent.column }, labels: { [opts.issue]: [] } });
+    const item = makeProjectItem({ issueNumber: opts.issue, status: agent.column });
+    const { deps, calls } = makeMockDeps({
+      execImpls: { ...fullHappyExecImpls(`feature/${opts.issue}`), ...NO_MERGE, ...opts.exec },
+      spawnImpls: opts.spawn,
+      fsMap: { [claudeMdAbsPath(agent.claudeMdPath)]: "role prompt" },
+      ...("result" in opts.stop ? { streamResult: opts.stop.result } : {}),
+    });
+    if ("reject" in opts.stop) {
+      const err = opts.stop.reject;
+      deps.runClaudeStreaming = (async () => { calls.claudeStreams += 1; throw err; }) as DispatchDeps["runClaudeStreaming"];
+    }
+    return { agent, item, client, deps, calls };
+  }
+  const commitOf = (calls: CallLog) => calls.spawn.find(c => c.cmd === "git" && c.args[0] === "commit");
+  const pushOf = (calls: CallLog) => calls.spawn.find(c => c.cmd === "git" && c.args[0] === "push");
+
+  test("timeout through the reject door, PR + dirty tree → commit, push, comment, then park as before", async () => {
+    const { agent, item, client, deps, calls } = stoppedRun({
+      issue: 1430,
+      stop: { reject: new AgentRunStoppedError("Agent timed out after 2280s", "timeout") },
+      exec: { "gh pr list --head": () => PR_JSON, "git status --porcelain": () => " M docs/knowledge/features/development-verification.md\n" },
+    });
+
+    await dispatchToAgent(agent, item, client, deps);
+
+    const commit = commitOf(calls);
+    assert.ok(commit, "the dirty tree is committed");
+    assert.equal(commit!.args[2], "wip(documentation): partial work from a timed-out run (#1430)");
+    assert.ok(calls.exec.some(c => c.cmd === "git add -A"));
+    assert.deepEqual(pushOf(calls)?.args, ["push", "-u", "origin", "feature/1430"]);
+    const saved = client.comments.findIndex(c => /Partial work saved/.test(c.body));
+    const parked = client.comments.findIndex(c => /Agent Error: documentation/.test(c.body));
+    assert.ok(saved >= 0, "the ticket says the work was pushed");
+    assert.match(client.comments[saved]!.body, /PR #1431/);
+    assert.match(client.comments[saved]!.body, /next documentation run on this ticket continues from it/);
+    assert.ok(parked > saved, "the original error still parks, after the salvage comment");
+    assert.ok(client.addLabelCalls.some(c => c.label === "error:documentation"), "a timeout still parks under error:<agent>");
+    assert.ok(!client.addLabelCalls.some(c => c.label === "error:max_turns_salvaged"));
+    assert.ok(cleanupRan(calls.exec), "teardown runs after a successful push");
+  });
+
+  for (const door of ["reject", "result"] as const) {
+    test(`idle stall through the ${door} door → salvage, then the transient retry still runs`, async () => {
+      const stop = door === "reject"
+        ? { reject: new AgentRunStoppedError(idleStallMessage(600_000), "idle_stall") }
+        : { result: streamResult({ isError: true, terminalReason: "idle_stall", output: "Now update the catalog." }) };
+      const { agent, item, client, deps, calls } = stoppedRun({
+        issue: 1431,
+        stop,
+        exec: { "gh pr list --head": () => PR_JSON, "git status --porcelain": () => "?? docs/new-child.md\n" },
+      });
+
+      await dispatchToAgent(agent, item, client, deps);
+
+      assert.equal(commitOf(calls)?.args[2], "wip(documentation): partial work from a stalled run (#1431)");
+      assert.ok(pushOf(calls), "pushed to the existing branch");
+      assert.ok(client.comments.some(c => /Partial work saved/.test(c.body) && /stalled/.test(c.body)));
+      assert.ok(client.comments.some(c => /Auto-retry scheduled/.test(c.body)), "the stall is still retried as transient");
+      assert.ok(!client.addLabelCalls.some(c => c.label === "error:documentation"), "no park on a transient stall");
+    });
+  }
+
+  test("timeout through the result door with a PR → the draft-PR salvage stands aside, the partial salvage pushes", async () => {
+    const { agent, item, client, deps, calls } = stoppedRun({
+      issue: 1332,
+      agent: { name: "developer" },
+      stop: { result: streamResult({ isError: true, terminalReason: "", timedOut: true, sessionId: "" }) },
+      exec: { "gh pr list --head": () => PR_JSON, "git status --porcelain": () => " M src/a.go\n" },
+    });
+
+    await dispatchToAgent(agent, item, client, deps);
+
+    assert.ok(!calls.spawn.some(c => c.cmd === "gh" && c.args.includes("create")), "no second PR is attempted");
+    assert.ok(!client.addLabelCalls.some(c => c.label === "error:max_turns_salvaged"));
+    assert.equal(commitOf(calls)?.args[2], "wip(developer): partial work from a timed-out run (#1332)");
+    assert.ok(pushOf(calls));
+    assert.ok(client.addLabelCalls.some(c => c.label === "error:developer"));
+  });
+
+  test("clean tree with local commits origin lacks → pushes without a new commit", async () => {
+    const { agent, item, client, deps, calls } = stoppedRun({
+      issue: 1433,
+      stop: { reject: new AgentRunStoppedError("Agent timed out after 2280s", "timeout") },
+      exec: { "gh pr list --head": () => PR_JSON, "git status --porcelain": () => "", "git rev-list --count origin/feature/1433..HEAD": () => "2\n" },
+    });
+
+    await dispatchToAgent(agent, item, client, deps);
+
+    assert.equal(commitOf(calls), undefined);
+    assert.ok(pushOf(calls));
+    assert.ok(client.comments.some(c => /found local commits origin did not have/.test(c.body)));
+  });
+
+  for (const reviewer of ["verifier", "code-review", "qa"]) {
+    test(`skipped for a reviewer stage (${reviewer})`, async () => {
+      const { agent, item, client, deps, calls } = stoppedRun({
+        issue: 1434,
+        agent: { name: reviewer, column: "In Code Review", claudeMdPath: `${reviewer}/CLAUDE.md`, producesCommits: false },
+        stop: { reject: new AgentRunStoppedError("Agent timed out after 2400s", "timeout") },
+        exec: { "gh pr list --head": () => PR_JSON, "git status --porcelain": () => " M src/a.go\n" },
+      });
+
+      await dispatchToAgent(agent, item, client, deps);
+
+      assert.equal(commitOf(calls), undefined);
+      assert.equal(pushOf(calls), undefined);
+      assert.ok(!calls.exec.some(c => c.cmd.includes("gh pr list")), "a reviewer stage is not even probed");
+      assert.ok(!client.comments.some(c => /Partial work/.test(c.body)));
+      assert.ok(client.addLabelCalls.some(c => c.label === `error:${reviewer}`));
+    });
+  }
+
+  test("skipped with MERGE_HEAD present: a half-finished merge is never pushed", async () => {
+    const { agent, item, client, deps, calls } = stoppedRun({
+      issue: 1435,
+      agent: { name: "developer" },
+      stop: { reject: new AgentRunStoppedError("Agent timed out after 1500s", "timeout") },
+      exec: { "gh pr list --head": () => PR_JSON, "git status --porcelain": () => "UU src/a.go\n", "git rev-parse -q --verify MERGE_HEAD": () => "mainsha\n" },
+    });
+
+    await dispatchToAgent(agent, item, client, deps);
+
+    assert.ok(!calls.exec.some(c => c.cmd === "git add -A"));
+    assert.equal(commitOf(calls), undefined);
+    assert.equal(pushOf(calls), undefined);
+    assert.ok(calls.logs.some(l => l.section === "PARTIAL_SALVAGE_SKIPPED" && /MERGE_HEAD/.test(l.content)));
+  });
+
+  test("a merge handed to the run must pass the merge check", async () => {
+    // Committed merge (no MERGE_HEAD), but the file still has markers.
+    const { ctx, client, calls } = makeTestContext({
+      agent: { name: "developer" },
+      item: { issueNumber: 1436 },
+      mockOptions: {
+        execImpls: {
+          ...NO_MERGE,
+          "gh pr list --head": () => PR_JSON,
+          "git status --porcelain": () => " M src/Thread.kt\n",
+          "git show HEAD:": () => "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> main\n",
+        },
+      },
+    });
+    ctx.pendingMerge = { paths: ["src/Thread.kt"], mainSha: "mainsha", baseSha: "basesha", headSha: "headsha" };
+
+    const res = await salvagePartialWork(ctx, "timeout");
+
+    assert.deepEqual(res, { keepWorktree: false });
+    assert.equal(commitOf(calls), undefined);
+    assert.equal(pushOf(calls), undefined);
+    assert.equal(client.comments.length, 0);
+    assert.ok(calls.logs.some(l => l.section === "PARTIAL_SALVAGE_SKIPPED" && /conflict markers/.test(l.content)));
+  });
+
+  test("skipped when the worktree is clean and in sync with origin", async () => {
+    const { agent, item, client, deps, calls } = stoppedRun({
+      issue: 1437,
+      stop: { reject: new AgentRunStoppedError("Agent timed out after 2280s", "timeout") },
+      exec: { "gh pr list --head": () => PR_JSON, "git status --porcelain": () => "", "git rev-list --count origin/feature/1437..HEAD": () => "0\n" },
+    });
+
+    await dispatchToAgent(agent, item, client, deps);
+
+    assert.equal(pushOf(calls), undefined);
+    assert.ok(!client.comments.some(c => /Partial work/.test(c.body)));
+    assert.ok(calls.logs.some(l => l.section === "PARTIAL_SALVAGE_SKIPPED" && /nothing to save/.test(l.content)));
+  });
+
+  test("skipped when the branch has no PR (the draft-PR salvage owns that case)", async () => {
+    const { agent, item, client, deps, calls } = stoppedRun({
+      issue: 1438,
+      stop: { reject: new AgentRunStoppedError("Agent timed out after 2280s", "timeout") },
+      exec: { "gh pr list --head": () => "[]", "git status --porcelain": () => " M a.md\n" },
+    });
+
+    await dispatchToAgent(agent, item, client, deps);
+
+    assert.equal(pushOf(calls), undefined);
+    assert.ok(calls.logs.some(l => l.section === "PARTIAL_SALVAGE_SKIPPED" && /no open pull request/.test(l.content)));
+  });
+
+  test("push failure → comment names the kept worktree, and the teardown is skipped", async () => {
+    const { agent, item, client, deps, calls } = stoppedRun({
+      issue: 1439,
+      stop: { reject: new AgentRunStoppedError("Agent timed out after 2280s", "timeout") },
+      exec: { "gh pr list --head": () => PR_JSON, "git status --porcelain": () => " M a.md\n" },
+      spawn: { "git push": () => ({ status: 1, stderr: "! [rejected] non-fast-forward" }) },
+    });
+
+    await dispatchToAgent(agent, item, client, deps);
+
+    assert.ok(commitOf(calls), "committed locally first");
+    const note = client.comments.find(c => /Partial work not pushed/.test(c.body));
+    assert.ok(note, "the ticket says the push failed");
+    assert.match(note!.body, /kept worktree at `[^`]*documentation-1439`/);
+    assert.ok(calls.logs.some(l => l.section === "PARTIAL_SALVAGE_PUSH_FAILED" && /non-fast-forward/.test(l.content)));
+    assert.ok(client.addLabelCalls.some(c => c.label === "error:documentation"), "the error path still runs");
+    assert.ok(!cleanupRan(calls.exec), "the worktree holding the only copy is not torn down");
   });
 });

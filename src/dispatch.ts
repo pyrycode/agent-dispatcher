@@ -28,6 +28,11 @@ import {
   parseIdleTimeoutMs,
   shouldFireIdleWatchdog,
   IDLE_STALL_REASON,
+  AgentRunStoppedError,
+  canSalvagePartialWork,
+  decidePartialWorkSalvage,
+  runStopKind,
+  type RunStopKind,
   maxTurnsFor,
   mergeLegResults,
   parseBudgetScale,
@@ -1052,9 +1057,9 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
       } else if (idleStalled) {
         // Checked before the wall clock: the stall is the cause even when
         // the backstop also fired while the kill was landing.
-        reject(new Error(idleStallMessage(idleMs)));
+        reject(new AgentRunStoppedError(idleStallMessage(idleMs), "idle_stall"));
       } else if (timedOut) {
-        reject(new Error(`Agent timed out after ${opts.timeoutMs / 1000}s`));
+        reject(new AgentRunStoppedError(`Agent timed out after ${opts.timeoutMs / 1000}s`, "timeout"));
       } else {
         reject(new Error(`Claude CLI exited with code ${code}, no result message received`));
       }
@@ -2100,10 +2105,18 @@ export async function dispatchToAgent(
     const preserveBlockedWork = streamResult?.runner === "codex"
       && ["codex_blocked", "needs_refinement"].includes(streamResult.terminalReason) && ctx.useWorktree;
     if (preserveBlockedWork) error.message += `\nWorktree preserved for recovery: ${ctx.worktreeDir}`;
+    // A run the dispatcher stopped (wall clock or idle stall) on a branch
+    // that already has a PR: push its leftovers BEFORE the error path and
+    // the worktree teardown, then let the error continue as before. See
+    // `decidePartialWorkSalvage` for the incidents (mobile #1430, #1332).
+    const stopKind = saferSalvaged || preserveBlockedWork ? null : runStopKind(error, streamResult);
+    const partial = stopKind ? await salvagePartialWork(ctx, stopKind) : { keepWorktree: false };
     await handleDispatchError(error, ctx, streamResult);
     // A rejected commit can leave useful edits. Never erase them or use
     // automatic salvage to work around an approval rejection.
     if (preserveBlockedWork) return;
+    // Committed but not pushed: the kept worktree is now the only copy.
+    if (partial.keepWorktree) return;
   }
 
   await cleanupAfterDispatch(ctx);
@@ -3117,7 +3130,7 @@ export async function handleAgentResultErrors(
   // finishing a merge may have left conflict markers, so it is never
   // salvaged: the error path parks it for a human instead.
   if (ctx.pendingMerge) {
-    throw new Error(`${ctx.agent.name} ended in error while finishing a merge of ${defaultBranch}; not salvaged, so a half-finished merge is never pushed. Worktree: ${ctx.agentCwd}`);
+    throw new Error(`${ctx.agent.name} ended in error while finishing a merge of ${defaultBranch}; not salvaged unless the merge check passes, so a half-finished merge is never pushed. Worktree: ${ctx.agentCwd}`);
   }
 
   const { agent, item, client, agentCwd, useWorktree, branchName, logFile } = ctx;
@@ -3195,10 +3208,17 @@ export async function handleAgentResultErrors(
   // widened here: the PR-already-exists path above still requires
   // `max_turns`, because that path AUTO-ADVANCES the ticket as a success
   // and no observed failure justifies loosening an auto-advance.
+  //
+  // A wall-clock kill on a branch that ALREADY has an open PR is not this
+  // path's case: it would commit, push and set the block label, then fail
+  // on `gh pr create` because the branch has its PR. Those runs throw on
+  // to the outer catch, where `salvagePartialWork` pushes the work to the
+  // existing PR instead (2026-10-02). A failed lookup keeps the old path.
   if (!salvaged
       && (streamResult.terminalReason === "max_turns" || streamResult.timedOut === true)
       && useWorktree
-      && item.issueNumber > 0) {
+      && item.issueNumber > 0
+      && !(streamResult.terminalReason !== "max_turns" && (openPrNumbersFor(ctx)?.length ?? 0) > 0)) {
     const ok = await attemptSaferSalvage({
       agentCwd, branchName, agent, item,
       streamResult, client, logFile,
@@ -3237,6 +3257,148 @@ export async function handleAgentResultErrors(
   }
 
   return saferSalvaged;
+}
+
+/** Numbers of the open pull requests on the ticket's branch, drafts
+ *  included; null when the lookup failed. */
+function openPrNumbersFor(ctx: DispatchContext): number[] | null {
+  try {
+    const json = String(ctx.deps.execSync(
+      `gh pr list --head "${ctx.branchName}" --state open --json number`,
+      { cwd: ctx.agentCwd, encoding: "utf-8", timeout: 15_000 },
+    ));
+    const prs = JSON.parse(json || "[]") as unknown;
+    if (!Array.isArray(prs)) return [];
+    return prs.map((p: any) => p?.number).filter((n: unknown): n is number => typeof n === "number");
+  } catch (e: any) {
+    const detail = e?.stderr?.toString?.() || e?.message || String(e);
+    ctx.deps.writeLog(ctx.logFile, "PR_LOOKUP_FAILED", `gh pr list for ${ctx.branchName} failed: ${detail}`);
+    return null;
+  }
+}
+
+/**
+ * Commit and push what a stopped run left in its worktree to the branch's
+ * existing pull request, and say so on the ticket. Runs from
+ * `dispatchToAgent`'s catch, BEFORE `handleDispatchError` and the
+ * worktree teardown, for a run that ended by wall-clock timeout or idle
+ * stall. Decision in `decidePartialWorkSalvage` (agent-runtime.ts), which
+ * also carries the incidents.
+ *
+ * It never changes how the failure itself is handled: an idle stall still
+ * goes to the transient retry, a timeout still parks under
+ * `error:<agent>`. The difference is that the work is on GitHub, and the
+ * next run's worktree starts from it.
+ *
+ * Returns `keepWorktree: true` only when a commit was made and the push
+ * failed. The worktree is then clean, so the teardown would remove it and
+ * leave the work as an unpushed local commit; the caller skips the
+ * teardown instead and the comment points at the path.
+ */
+export async function salvagePartialWork(
+  ctx: DispatchContext,
+  stopKind: RunStopKind,
+): Promise<{ keepWorktree: boolean }> {
+  const { agent, item, client, agentCwd, branchName, logFile, useWorktree } = ctx;
+  const { execSync, spawnSync } = ctx.deps;
+  if (!canSalvagePartialWork({ stopKind, agent, useWorktree, issueNumber: item.issueNumber })) {
+    return { keepWorktree: false };
+  }
+  const stopped = stopKind === "timeout"
+    ? "hit its wall-clock limit"
+    : "stalled (its stream went silent with no tool running)";
+  try {
+    const prLookup = openPrNumbersFor(ctx);
+    const prNumbers = prLookup ?? [];
+    const openPrCount = prLookup === null ? -1 : prLookup.length;
+    const gitStatusOutput = String(execSync(`git status --porcelain`, { cwd: agentCwd, encoding: "utf-8", timeout: 15_000 }));
+    // `-q --verify` prints MERGE_HEAD's sha when a merge is in progress
+    // and exits 1 with no output when none is.
+    let mergeInProgress = false;
+    try {
+      mergeInProgress = String(execSync(
+        `git rev-parse -q --verify MERGE_HEAD`,
+        { cwd: agentCwd, encoding: "utf-8", stdio: "pipe", timeout: 15_000 },
+      )).trim().length > 0;
+    } catch { /* exit 1: no merge in progress */ }
+    let commitsAheadOfOrigin = -1;
+    try {
+      commitsAheadOfOrigin = parseCommitsAhead(String(execSync(
+        `git rev-list --count origin/${branchName}..HEAD`,
+        { cwd: agentCwd, encoding: "utf-8", timeout: 15_000 },
+      )));
+    } catch { /* unknown: the dirty check alone decides */ }
+    const mergeCheckProblems = ctx.pendingMerge && !mergeInProgress
+      ? checkMergeResolution(agentCwd, ctx.pendingMerge, ctx.deps)
+      : [];
+
+    const decision = decidePartialWorkSalvage({
+      openPrCount, gitStatusOutput, commitsAheadOfOrigin, mergeInProgress, mergeCheckProblems,
+    });
+    if (!decision.salvage) {
+      ctx.deps.writeLog(logFile, "PARTIAL_SALVAGE_SKIPPED", `${stopKind}: ${decision.reason}`);
+      console.log(`   💾 Partial-work salvage skipped for #${item.issueNumber}: ${decision.reason}`);
+      return { keepWorktree: false };
+    }
+
+    const dirty = gitStatusOutput.trim().length > 0;
+    if (dirty) {
+      execSync(`git add -A`, { cwd: agentCwd, stdio: "pipe", timeout: 15_000 });
+      const runShape = stopKind === "timeout" ? "a timed-out run" : "a stalled run";
+      const commit = spawnSync(
+        "git",
+        [
+          "commit",
+          "-m", `wip(${agent.name}): partial work from ${runShape} (#${item.issueNumber})`,
+          "-m", `Auto-committed by the dispatcher when the ${agent.name} run ${stopped}. Unfinished; the next run continues from here.`,
+        ],
+        { cwd: agentCwd, stdio: "pipe", timeout: 15_000 },
+      );
+      if (commit.status !== 0) {
+        throw new Error(`git commit failed: ${commit.stderr?.toString() || commit.stdout?.toString() || "unknown"}`);
+      }
+    }
+    let sha = "";
+    try {
+      sha = String(execSync(`git rev-parse --short HEAD`, { cwd: agentCwd, encoding: "utf-8", timeout: 15_000 })).trim();
+    } catch { /* cosmetic */ }
+    const what = dirty ? `committed its uncommitted changes${sha ? ` as \`${sha}\`` : ""}` : "found local commits origin did not have";
+    const pr = prNumbers.length > 0 ? ` (PR ${prNumbers.map((n) => `#${n}`).join(", ")})` : "";
+
+    const push = spawnSync("git", ["push", "-u", "origin", branchName], { cwd: agentCwd, stdio: "pipe", timeout: 30_000 });
+    if (push.status !== 0) {
+      const detail = push.stderr?.toString() || push.stdout?.toString() || "unknown";
+      ctx.deps.writeLog(logFile, "PARTIAL_SALVAGE_PUSH_FAILED", detail);
+      console.warn(`   ⚠️  Partial-work push failed for #${item.issueNumber}; worktree kept at ${agentCwd}`);
+      try {
+        await client.addComment(
+          item.issueNumber,
+          `## ⚠️ Partial work not pushed\n\n` +
+          `The ${agent.name} run ${stopped}. The dispatcher ${what} on \`${branchName}\`, but \`git push\` failed, ` +
+          `so the work is only in the kept worktree at \`${agentCwd}\`. Push it from there before the next run, ` +
+          `or the next run's setup stops on a local branch that is ahead of origin. Details are in the dispatcher log.`,
+        );
+      } catch {}
+      return { keepWorktree: true };
+    }
+
+    ctx.deps.writeLog(logFile, "PARTIAL_SALVAGE", `${stopKind}: ${what}; pushed ${branchName}${pr}`);
+    console.log(`   💾 Partial work from the stopped ${agent.name} run pushed to ${branchName}${pr}`);
+    try {
+      await client.addComment(
+        item.issueNumber,
+        `## 💾 Partial work saved\n\n` +
+        `The ${agent.name} run ${stopped}. The dispatcher ${what} and pushed them to \`${branchName}\`${pr}, ` +
+        `so nothing is lost when the worktree is removed. The work is unfinished. ` +
+        `The next ${agent.name} run on this ticket continues from it.`,
+      );
+    } catch (e) { console.warn(`   ⚠️  Failed to post partial-work comment: ${e}`); }
+    return { keepWorktree: false };
+  } catch (e) {
+    console.warn(`   ⚠️  Partial-work salvage failed for #${item.issueNumber}: ${e}`);
+    ctx.deps.writeLog(logFile, "PARTIAL_SALVAGE_FAILED", String(e));
+    return { keepWorktree: false };
+  }
 }
 
 // Post-run side-effect chain after a successful (or successfully-salvaged)
