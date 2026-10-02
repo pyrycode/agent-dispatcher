@@ -869,6 +869,9 @@ describe("setupBranchAndWorktree — failure modes", () => {
     assert.ok(!/have DIVERGED/.test(body), "strictly-ahead must not use divergence framing");
     assert.ok(!/would REVERT/.test(body));
     assert.ok(!calls.exec.some(c => c.cmd.includes("git worktree add")));
+    // The stale-worktree cleanup now runs before the branch setup, but an
+    // integrity abort still leaves every worktree in place for triage.
+    assert.ok(!calls.exec.some(c => c.cmd.includes("git worktree remove") || c.cmd.includes("git worktree prune")));
   });
 
   test("git branch creation throws → caught, label + comment + {ok:false}", async () => {
@@ -1230,6 +1233,77 @@ describe("setupBranchAndWorktree — coverage edges", () => {
     assert.ok(addIdx > orphanRemoveIdx, "orphan removal must precede `git worktree add`");
   });
 
+  // pyrycode-mobile #1430, 2026-10-02: a timed-out documentation run left
+  // documentation-1430 on feature/1430, clean and already on origin. The
+  // verifier's fast-forward ran `git branch -f` before the orphan cleanup
+  // and git refused: "cannot force update the branch 'feature/1430' used by
+  // worktree at '.../documentation-1430'".
+  function fastForwardWithOrphan(n: number, orphanPath: string, removeOrphan: ExecHandler, branchForce: ExecHandler) {
+    return makeTestContext({
+      item: { issueNumber: n },
+      mockOptions: {
+        execImpls: {
+          [`git rev-parse --verify feature/${n}`]: () => "",
+          [`git rev-parse --verify origin/feature/${n}`]: () => "",
+          [`git rev-parse origin/feature/${n}`]: () => "newer-origin-sha\n",
+          [`git rev-parse feature/${n}`]: () => "older-local-sha\n",
+          "git merge-base --is-ancestor": () => "", // local is behind origin
+          "git worktree list --porcelain": () =>
+            `worktree ${orphanPath}\nHEAD older-local-sha\nbranch refs/heads/feature/${n}\n\n`,
+          [`git worktree remove "${orphanPath}"`]: removeOrphan,
+          [`git branch -f feature/${n} origin/feature/${n}`]: branchForce,
+        },
+      },
+    });
+  }
+
+  test("orphan worktree holding the branch + fast-forward needed → orphan removed first, branch updated, no error (#1430)", async () => {
+    const orphanPath = "/tmp/.pyrycode-worktrees/pyrycode-mobile/documentation-1430";
+    let orphanRemoved = false;
+    const { ctx, client, calls } = fastForwardWithOrphan(
+      1430,
+      orphanPath,
+      () => { orphanRemoved = true; return ""; },
+      // Real git refuses while any worktree still has the branch checked out.
+      () => orphanRemoved
+        ? ""
+        : execError({ stderr: `fatal: cannot force update the branch 'feature/1430' used by worktree at '${orphanPath}'` }),
+    );
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: true });
+    assert.deepEqual(client.addLabelCalls, []);
+    assert.equal(client.comments.length, 0);
+    const removeIdx = calls.exec.findIndex(c => c.cmd === `git worktree remove "${orphanPath}"`);
+    const branchIdx = calls.exec.findIndex(c => c.cmd === "git branch -f feature/1430 origin/feature/1430");
+    const addIdx = calls.exec.findIndex(c => c.cmd.includes("git worktree add"));
+    assert.ok(removeIdx >= 0, "the orphan is removed");
+    assert.ok(removeIdx < branchIdx, "the orphan is removed before the branch is updated");
+    assert.ok(branchIdx < addIdx, "the branch is updated before the new worktree is added");
+  });
+
+  test("dirty orphan worktree holding the branch → kept, branch update fails, comment names it and its uncommitted changes", async () => {
+    const orphanPath = "/tmp/.pyrycode-worktrees/pyrycode-mobile/documentation-1431";
+    const { ctx, client, calls } = fastForwardWithOrphan(
+      1431,
+      orphanPath,
+      () => execError({ stderr: `fatal: '${orphanPath}' contains modified or untracked files, use --force to delete it` }),
+      () => execError({ stderr: `fatal: cannot force update the branch 'feature/1431' used by worktree at '${orphanPath}'` }),
+    );
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: false });
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1431, label: "error:developer" }]);
+    assert.equal(client.comments.length, 1);
+    const body = client.comments[0]!.body;
+    assert.match(body, /Failed to set up branch `feature\/1431` \(action: fast-forward-from-origin\)/);
+    assert.ok(body.includes(`- \`${orphanPath}\` has uncommitted changes`), "the comment names the dirty worktree and why it stayed");
+    assert.ok(!calls.exec.some(c => c.cmd.includes("--force")), "a dirty worktree is never force-removed");
+    assert.ok(!calls.exec.some(c => c.cmd.includes("git worktree add")));
+  });
+
   test("codegraph symlink — source missing → warn, no symlink, still {ok:true}", async () => {
     // `decideCodegraphSymlink({sourceExists:false, destExists:false})`
     // returns `skip / no-source` — caller should warn but not fail.
@@ -1279,6 +1353,155 @@ describe("setupBranchAndWorktree — coverage edges", () => {
     const gitCmds = calls.exec.filter(c => c.cmd.startsWith("git"));
     assert.equal(gitCmds.length, 1, "PO path runs exactly one git command");
     assert.equal(gitCmds[0]!.cmd, "git checkout main && git pull");
+  });
+});
+
+// pyrycode-mobile #1340, 2026-10-02: the verifier crashed after the pre-run
+// merge of main, the merge commit was only ever pushed at the end of a run,
+// and the next dispatch refused with abort-local-strictly-ahead. The merge is
+// now pushed as soon as it is committed, when origin already has the branch.
+describe("setupBranchAndWorktree — pushing the pre-run merge", () => {
+  // `git rev-parse HEAD` in the worktree: the first read (before the merge)
+  // and every later one differ, as they do when the merge made a commit.
+  function headMovesOnMerge(): ExecHandler {
+    let reads = 0;
+    return () => (reads++ === 0 ? "before-merge-sha\n" : "after-merge-sha\n");
+  }
+  // Local and origin exist and agree: reuse-local-already-synced.
+  function onOrigin(n: number): Record<string, ExecHandler> {
+    return {
+      [`git rev-parse --verify feature/${n}`]: () => "",
+      [`git rev-parse --verify origin/feature/${n}`]: () => "",
+      [`git rev-parse origin/feature/${n}`]: () => "synced\n",
+      [`git rev-parse feature/${n}`]: () => "synced\n",
+    };
+  }
+  const pushes = (calls: CallLog) => calls.exec.filter(c => c.cmd.startsWith("git push"));
+
+  test("merge moved HEAD on a branch origin has → pushed from the worktree right after the merge", async () => {
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 1340 },
+      mockOptions: { execImpls: { ...onOrigin(1340), "git rev-parse HEAD": headMovesOnMerge() } },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: true });
+    assert.deepEqual(pushes(calls).map(c => c.cmd), ["git push origin feature/1340"]);
+    const pushIdx = calls.exec.findIndex(c => c.cmd === "git push origin feature/1340");
+    const mergeIdx = calls.exec.findIndex(c => c.cmd.includes("merge main --no-edit"));
+    assert.ok(pushIdx > mergeIdx, "the push follows the merge");
+    assert.equal(calls.exec[pushIdx]!.opts?.cwd, ctx.worktreeDir, "pushed from the worktree");
+    assert.deepEqual(client.addLabelCalls, []);
+    assert.equal(client.comments.length, 0);
+  });
+
+  test("no-op merge (HEAD unchanged) → nothing pushed", async () => {
+    const { ctx, calls } = makeTestContext({
+      item: { issueNumber: 1341 },
+      mockOptions: { execImpls: { ...onOrigin(1341), "git rev-parse HEAD": () => "unchanged-sha\n" } },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: true });
+    assert.deepEqual(pushes(calls), []);
+  });
+
+  test("branch not on origin yet → nothing pushed, the end-of-run push creates it as before", async () => {
+    const { ctx, calls } = makeTestContext({
+      item: { issueNumber: 1342 },
+      mockOptions: {
+        execImpls: {
+          "git rev-parse --verify feature/1342": () => execError({ stderr: "fatal" }),
+          "git rev-parse --verify origin/feature/1342": () => execError({ stderr: "fatal" }),
+          "git rev-parse HEAD": headMovesOnMerge(),
+        },
+      },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: true });
+    assert.ok(calls.exec.some(c => c.cmd === "git branch feature/1342 main"), "fresh ticket path");
+    assert.deepEqual(pushes(calls), []);
+  });
+
+  test("push fails → only a warning, the dispatch carries on with no label or comment", async () => {
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 1343 },
+      mockOptions: {
+        execImpls: {
+          ...onOrigin(1343),
+          "git rev-parse HEAD": headMovesOnMerge(),
+          "git push origin feature/1343": () => execError({ stderr: "fatal: unable to access remote" }),
+        },
+      },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: true });
+    assert.equal(pushes(calls).length, 1, "the push was attempted once");
+    assert.deepEqual(client.addLabelCalls, []);
+    assert.equal(client.comments.length, 0);
+    const addIdx = calls.exec.findIndex(c => c.cmd.includes("git worktree add"));
+    assert.ok(!calls.exec.slice(addIdx + 1).some(c => c.cmd.includes("git worktree remove")), "the worktree stays for the run");
+  });
+
+  test("import-only merge the dispatcher resolved and committed → pushed too", async () => {
+    const probe = makeTestContext({ item: { issueNumber: 1344 } });
+    const path = resolve(probe.ctx.worktreeDir, "Thread.kt");
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 1344 },
+      mockOptions: {
+        execImpls: {
+          ...onOrigin(1344),
+          "git rev-parse HEAD": headMovesOnMerge(),
+          "merge main --no-edit": () => execError({ stderr: "CONFLICT (content): Merge conflict in Thread.kt" }),
+          "git diff --name-only --diff-filter=U -z": () => "Thread.kt\0",
+        },
+        fsMap: {
+          [path]: ["<<<<<<< HEAD", "import a.Feature", "||||||| base", "=======", "import a.Main", ">>>>>>> main", ""].join("\n"),
+        },
+      },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: true });
+    assert.match(client.comments[0]!.body, /Import-only merge conflict resolved/);
+    const commitIdx = calls.exec.findIndex(c => c.cmd === "git commit --no-edit");
+    const pushIdx = calls.exec.findIndex(c => c.cmd === "git push origin feature/1344");
+    assert.ok(commitIdx >= 0 && pushIdx > commitIdx, "the push follows the resolved merge's commit");
+  });
+
+  test("conflicted merge left for the code owner → never pushed here", async () => {
+    const probe = makeTestContext({ item: { issueNumber: 1345 } });
+    const path = resolve(probe.ctx.worktreeDir, "Thread.kt");
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 1345 },
+      mockOptions: {
+        execImpls: {
+          ...onOrigin(1345),
+          "git rev-parse HEAD": headMovesOnMerge(),
+          "merge main --no-edit": () => execError({ stderr: "CONFLICT (content): Merge conflict in Thread.kt" }),
+          "git diff --name-only --diff-filter=U -z": () => "Thread.kt\0",
+          "git rev-parse MERGE_HEAD": () => "mainsha\n",
+          "git merge-base HEAD MERGE_HEAD": () => "basesha\n",
+        },
+        fsMap: {
+          [path]: ["<<<<<<< HEAD", "val x = 1", "||||||| base", "val x = 0", "=======", "val x = 2", ">>>>>>> main", ""].join("\n"),
+        },
+      },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: true });
+    assert.match(client.comments[0]!.body, /Merge conflict left for developer/);
+    assert.ok(ctx.pendingMerge, "the merge is left for the run");
+    assert.deepEqual(pushes(calls), []);
   });
 });
 
