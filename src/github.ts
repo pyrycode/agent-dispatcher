@@ -26,6 +26,58 @@ function latestMarkerAt(comments: any[], marker: string): Date | null {
   return latest;
 }
 
+/** One page of an issue's comments and the issue's last page number. */
+export type CommentsPage = { comments: any[]; lastPage: number | null };
+
+/**
+ * The `rel="last"` page number in a GitHub `Link` header, or null when the
+ * header has none: a single page, or the last page itself.
+ */
+export function lastPageFromLink(link: string | null): number | null {
+  for (const part of (link ?? "").split(",")) {
+    if (!/rel="last"/.test(part)) continue;
+    const page = Number(part.match(/[?&]page=(\d+)/)?.[1]);
+    return Number.isInteger(page) && page > 0 ? page : null;
+  }
+  return null;
+}
+
+/**
+ * Most comment pages `countMarkersNewestFirst` reads for one count: 1000
+ * comments. Bounds the calls a pathological ticket can cost the loop.
+ */
+export const MARKER_COUNT_MAX_PAGES = 10;
+
+/**
+ * Count the comments carrying `marker`, reading the newest pages first.
+ *
+ * GitHub lists an issue's comments oldest first and this endpoint cannot
+ * reverse the order. A single page therefore sees only the oldest 100, and
+ * busy pyrycode-mobile tickets pass 100 (family-dispatch, gate and verdict
+ * comments pile up) while the final-merge markers are posted late in a
+ * ticket's life: exactly the window a single page misses (2026-10-02).
+ *
+ * Page 1 is read first because its `Link` header names the last page. Then
+ * the pages run from the last one backwards until `maxPages` have been
+ * read. Past that the middle pages are skipped, which only ever drops
+ * comments older than the newest `maxPages - 1` pages.
+ */
+export async function countMarkersNewestFirst(
+  fetchPage: (page: number) => Promise<CommentsPage>,
+  marker: string,
+  maxPages: number,
+): Promise<number> {
+  const count = (comments: any[]) =>
+    comments.filter((c) => typeof c?.body === "string" && c.body.includes(marker)).length;
+  const first = await fetchPage(1);
+  let total = count(first.comments);
+  let read = 1;
+  for (let page = first.lastPage ?? 1; page > 1 && read < maxPages; page--, read++) {
+    total += count((await fetchPage(page)).comments);
+  }
+  return total;
+}
+
 /** Transient GitHub responses worth another attempt for an IDEMPOTENT
  *  request: server-side 5xx and secondary-rate-limit 429. `fetch()` only
  *  throws on a network-level failure, so without opting in a 502/429 falls
@@ -898,16 +950,27 @@ export class GitHubProjectClient {
   }
 
   /**
-   * One page of an issue's comments. Shared by the marker readers below
-   * (auto-retry time, auto-retry count, stranded-`wip:` markers, any marker
-   * count) so they can't drift apart. THROWS on fetch failure (fetchWithRetry
-   * exhausted); each caller decides what a failed read means for it.
+   * The first page of an issue's comments, oldest first. Shared by the
+   * marker readers below (auto-retry time, auto-retry count, stranded-`wip:`
+   * markers) so they can't drift apart. THROWS on fetch failure
+   * (fetchWithRetry exhausted); each caller decides what a failed read means
+   * for it.
    *
-   * One page (100) is far more than any ticket accrues in practice.
+   * These readers see only the oldest 100 comments. `countMarkerComments`
+   * reads further, because busy tickets pass 100.
    */
   private async fetchIssueComments(issueNumber: number): Promise<any[]> {
+    return (await this.fetchIssueCommentsPage(issueNumber, 1)).comments;
+  }
+
+  /**
+   * Page `page` of an issue's comments, 100 to a page, oldest first, with
+   * the last page's number from the `Link` header (null when there is only
+   * one page, or on the last page itself). THROWS on fetch failure.
+   */
+  private async fetchIssueCommentsPage(issueNumber: number, page: number): Promise<CommentsPage> {
     const response = await fetchWithRetry(
-      `https://api.github.com/repos/${this.config.owner}/${this.config.repo}/issues/${issueNumber}/comments?per_page=100`,
+      `https://api.github.com/repos/${this.config.owner}/${this.config.repo}/issues/${issueNumber}/comments?per_page=100&page=${page}`,
       {
         headers: {
           Authorization: `token ${this.config.token}`,
@@ -919,7 +982,7 @@ export class GitHubProjectClient {
       throw new Error(`Failed to fetch comments: ${response.statusText}`);
     }
 
-    return await response.json();
+    return { comments: await response.json(), lastPage: lastPageFromLink(response.headers.get("link")) };
   }
 
   /**
@@ -959,13 +1022,18 @@ export class GitHubProjectClient {
   }
 
   /**
-   * How many of an issue's comments carry `marker`. The final-merge loop
-   * guard counts its routing comments this way (merge-handoff.ts). THROWS on
-   * fetch failure; the caller leaves the ticket for the next cycle.
+   * How many of an issue's comments carry `marker`, newest pages first and
+   * at most MARKER_COUNT_MAX_PAGES pages (see `countMarkersNewestFirst`).
+   * The final-merge loop guard counts its routing comments this way
+   * (merge-handoff.ts). THROWS on fetch failure; the caller leaves the
+   * ticket for the next cycle.
    */
   async countMarkerComments(issueNumber: number, marker: string): Promise<number> {
-    const comments = await this.fetchIssueComments(issueNumber);
-    return comments.filter((c) => typeof c?.body === "string" && c.body.includes(marker)).length;
+    return countMarkersNewestFirst(
+      (page) => this.fetchIssueCommentsPage(issueNumber, page),
+      marker,
+      MARKER_COUNT_MAX_PAGES,
+    );
   }
 
   /**
