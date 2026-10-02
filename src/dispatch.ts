@@ -21,6 +21,13 @@ import {
   buildResumePrompt,
   captureSessionId,
   initPermissionDenialState,
+  advanceIdleWatchdogState,
+  idleStallMessage,
+  idleWatchdogTickMs,
+  initIdleWatchdogState,
+  parseIdleTimeoutMs,
+  shouldFireIdleWatchdog,
+  IDLE_STALL_REASON,
   maxTurnsFor,
   mergeLegResults,
   parseBudgetScale,
@@ -843,6 +850,27 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
       }
     }, opts.timeoutMs);
 
+    // Idle watchdog (claude runner only). Fires when no stream line has
+    // arrived for PYRY_AGENT_IDLE_TIMEOUT_MINUTES while no tool call is
+    // outstanding, and kills the run the way the wall clock does. Added
+    // after pyrycode-mobile #1430 (2026-10-02) sat silent for twenty
+    // minutes inside one assistant turn and the 38-minute wall clock took
+    // its finished edits with it. Decision logic is pure, in
+    // agent-runtime.ts (`shouldFireIdleWatchdog`); this is only the clock
+    // and the kill. Codex emits a different event stream, so it keeps the
+    // wall clock alone. The wall clock stays armed as the backstop.
+    const idleMs = isCodex ? 0 : parseIdleTimeoutMs(process.env.PYRY_AGENT_IDLE_TIMEOUT_MINUTES);
+    let idleState = initIdleWatchdogState(Date.now());
+    let idleStalled = false;
+    const idleTimer = idleMs > 0 ? setInterval(() => {
+      if (idleStalled || timedOut || !shouldFireIdleWatchdog(idleState, Date.now(), idleMs)) return;
+      idleStalled = true;
+      if (idleTimer) clearInterval(idleTimer);
+      appendFileSync(opts.logFile, `\n💤 IDLE STALL — no stream output for ${idleMs / 1000}s with no tool call outstanding; killing agent\n`);
+      console.log(`   💤 Idle stall: no stream output for ${idleMs / 60_000}min, killing agent`);
+      killChildPgrp(child, "SIGTERM");
+    }, idleWatchdogTickMs(idleMs)) : null;
+
     const handleWatchdogAction = (action: ReturnType<typeof advancePermissionDenialState>["action"]) => {
       if (action === "logDenial") {
         const ts = new Date().toISOString();
@@ -876,6 +904,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
       promptStream.pipe(child.stdin!);
       promptStream.on("error", (err) => {
         clearTimeout(timer);
+        if (idleTimer) clearInterval(idleTimer);
         killChildPgrp(child, "SIGTERM");
         reject(err);
       });
@@ -894,10 +923,17 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
         if (!line.trim()) continue;
         try {
           const msg = JSON.parse(line);
+          if (idleTimer) idleState = advanceIdleWatchdogState(idleState, msg, Date.now());
           if (codex) { codex.accept(msg); logStreamMessage(opts.logFile, msg); continue; }
           initSessionId = captureSessionId(initSessionId, msg);
           logStreamMessage(opts.logFile, msg);
-          if (msg.type === "result") resultMsg = msg;
+          if (msg.type === "result") {
+            resultMsg = msg;
+            // The run has its outcome. A process that lingers after its
+            // result is not a stalled agent; the wall clock bounds it as
+            // before, and the result still counts.
+            if (idleTimer) clearInterval(idleTimer);
+          }
           // Drive the Layer 2 denial watchdog. State transitions are
           // pure; only side effects (log lines, SIGTERM) go through
           // handleWatchdogAction.
@@ -905,6 +941,8 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
           denialState = advanced.state;
           handleWatchdogAction(advanced.action);
         } catch {
+          // A line that does not parse is still a sign of life.
+          if (idleTimer) idleState = advanceIdleWatchdogState(idleState, null, Date.now());
           appendFileSync(opts.logFile, `[stream] ${line.slice(0, 500)}\n`);
         }
       }
@@ -917,6 +955,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
 
     child.on("close", (code) => {
       clearTimeout(timer);
+      if (idleTimer) clearInterval(idleTimer);
       if (forceExitTimer) clearTimeout(forceExitTimer);
       // Untrack the pgrp ONLY if it has actually drained. The pgrp ID
       // persists in the kernel until its LAST member exits, not until
@@ -963,15 +1002,22 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
         const sourceComplete = !opts.sourceReview || (code === 0 && !timedOut && !denialState.hadPermissionDenial
           && !r.is_error && r.subtype === "success" && report?.status === "completed"
           && typeof report.summary === "string" && report.summary.trim().length > 0);
+        // A result frame written after the idle watchdog's SIGTERM is the
+        // stalled run's death notice, not its outcome. Name the stall so
+        // handleAgentResultErrors' message carries `idle_stall` and the
+        // retry allowlist classifies it as transient. A success that
+        // happened to land after the kill still counts as a success.
+        const stalledResult = idleStalled && r.is_error === true;
         resolve({
           output: opts.sourceReview ? report?.summary || r.result || "" : r.result || "",
           sessionId: pickFinalSessionId(r.session_id, initSessionId),
-          isError: r.is_error || !sourceComplete,
+          isError: r.is_error || !sourceComplete || stalledResult,
           numTurns: r.num_turns || 0,
           totalCostUsd: r.total_cost_usd || 0,
           durationMs: r.duration_ms || 0,
           usage: r.usage || {},
-          terminalReason: opts.sourceReview ? (sourceComplete ? "stop" : "source_review_incomplete") : r.terminal_reason || "",
+          terminalReason: stalledResult ? IDLE_STALL_REASON
+            : opts.sourceReview ? (sourceComplete ? "stop" : "source_review_incomplete") : r.terminal_reason || "",
           rawResult: r,
           hadPermissionDenial: denialState.hadPermissionDenial,
           stoppedAtDenial: denialState.stoppedAtDenial,
@@ -1003,6 +1049,10 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
           lastAssistantText: denialState.lastAssistantText,
           timedOut,
         });
+      } else if (idleStalled) {
+        // Checked before the wall clock: the stall is the cause even when
+        // the backstop also fired while the kill was landing.
+        reject(new Error(idleStallMessage(idleMs)));
       } else if (timedOut) {
         reject(new Error(`Agent timed out after ${opts.timeoutMs / 1000}s`));
       } else {
@@ -1012,6 +1062,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
 
     child.on("error", (err) => {
       clearTimeout(timer);
+      if (idleTimer) clearInterval(idleTimer);
       // Same probe-before-delete as the close handler — `error` can
       // fire for spawn failures (no pgrp existed) OR for kill failures
       // (pgrp may still have live members). Probe ESRCH to disambiguate.

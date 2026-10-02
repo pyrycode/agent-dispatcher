@@ -17,8 +17,15 @@ import assert from "node:assert/strict";
 
 import { AGENTS } from "./types.js";
 import {
+  advanceIdleWatchdogState,
   advancePermissionDenialState,
   buildResumeArgv,
+  DEFAULT_IDLE_TIMEOUT_MINUTES,
+  idleStallMessage,
+  idleWatchdogTickMs,
+  initIdleWatchdogState,
+  parseIdleTimeoutMs,
+  shouldFireIdleWatchdog,
   buildResumePrompt,
   captureSessionId,
   decideCodegraphHealth,
@@ -100,6 +107,7 @@ import {
   REAL_CLAUDE_GATE_RUNNING_LABEL,
   shouldAddReadyLabel,
   shouldSkipDispatch,
+  classifyAgentError,
 } from "./pipeline-decisions.js";
 import { buildBaselineCommand, buildBaselineFilter, formatGateEvidenceComment, parseGateOutput, stripPackageQualifier } from "./gate-output.js";
 import { mapParentChain } from "./github.js";
@@ -6064,5 +6072,109 @@ describe("decidePendingDoneFinalizations", () => {
   test("the pending label blocks re-dispatch of that agent only", () => {
     assert.equal(shouldSkipDispatch([`${PENDING_DONE_PREFIX}builder`], "builder"), true);
     assert.equal(shouldSkipDispatch([`${PENDING_DONE_PREFIX}builder`], "verifier"), false);
+  });
+});
+
+describe("idle-stream watchdog — claude runner (pyrycode-mobile #1430, 2026-10-02)", () => {
+  const MIN = 60_000;
+  const T0 = 1_000_000;
+  const toolUse = (id: string) => ({
+    type: "assistant",
+    message: { content: [{ type: "tool_use", id, name: "Bash", input: { command: "./gradlew test" } }] },
+  });
+  const toolResult = (id: string) => ({
+    type: "user",
+    message: { content: [{ type: "tool_result", tool_use_id: id, content: "BUILD SUCCESSFUL" }] },
+  });
+  const thinking = { type: "assistant", message: { content: [{ type: "thinking", thinking: "..." }] } };
+  const system = { type: "system", subtype: "init", session_id: "s" };
+
+  test("fires after N minutes of silence with no tool outstanding", () => {
+    let s = initIdleWatchdogState(T0);
+    s = advanceIdleWatchdogState(s, system, T0);
+    s = advanceIdleWatchdogState(s, toolUse("t1"), T0 + 1000);
+    s = advanceIdleWatchdogState(s, toolResult("t1"), T0 + 2000);
+    // #1430's shape: a thinking block arrives, then the turn wedges.
+    s = advanceIdleWatchdogState(s, thinking, T0 + 3000);
+    assert.equal(shouldFireIdleWatchdog(s, T0 + 3000 + 10 * MIN - 1, 10 * MIN), false, "just under N");
+    assert.equal(shouldFireIdleWatchdog(s, T0 + 3000 + 10 * MIN, 10 * MIN), true, "at N");
+  });
+
+  test("does not fire while a tool call is outstanding, however long the silence", () => {
+    let s = initIdleWatchdogState(T0);
+    s = advanceIdleWatchdogState(s, toolUse("gradle"), T0);
+    assert.equal(shouldFireIdleWatchdog(s, T0 + 60 * MIN, 10 * MIN), false);
+    // The result comes back: the clock restarts from that line.
+    s = advanceIdleWatchdogState(s, toolResult("gradle"), T0 + 30 * MIN);
+    assert.equal(shouldFireIdleWatchdog(s, T0 + 39 * MIN, 10 * MIN), false);
+    assert.equal(shouldFireIdleWatchdog(s, T0 + 40 * MIN, 10 * MIN), true);
+  });
+
+  test("parallel tool calls: stays quiet until every one has returned", () => {
+    let s = initIdleWatchdogState(T0);
+    s = advanceIdleWatchdogState(s, {
+      type: "assistant",
+      message: { content: [{ type: "tool_use", id: "a" }, { type: "tool_use", id: "b" }] },
+    }, T0);
+    s = advanceIdleWatchdogState(s, toolResult("a"), T0 + 1000);
+    assert.equal(shouldFireIdleWatchdog(s, T0 + 30 * MIN, 10 * MIN), false, "b still running");
+    s = advanceIdleWatchdogState(s, toolResult("b"), T0 + 2000);
+    assert.equal(shouldFireIdleWatchdog(s, T0 + 2000 + 10 * MIN, 10 * MIN), true);
+  });
+
+  test("a result for an id it never saw does not open or close anything", () => {
+    let s = initIdleWatchdogState(T0);
+    s = advanceIdleWatchdogState(s, toolResult("unknown"), T0);
+    assert.equal(s.outstandingToolIds.size, 0);
+  });
+
+  test("resets on any stream line: system notices, text, and lines that do not parse", () => {
+    let s = initIdleWatchdogState(T0);
+    for (const [msg, at] of [[system, 9 * MIN], [null, 18 * MIN], [{ type: "rate_limit_event" }, 27 * MIN]] as const) {
+      s = advanceIdleWatchdogState(s, msg, T0 + at);
+      assert.equal(shouldFireIdleWatchdog(s, T0 + at + 9 * MIN, 10 * MIN), false);
+    }
+    assert.equal(shouldFireIdleWatchdog(s, T0 + 37 * MIN, 10 * MIN), true);
+  });
+
+  test("advancing never mutates the previous state", () => {
+    const before = initIdleWatchdogState(T0);
+    const after = advanceIdleWatchdogState(before, toolUse("t1"), T0 + 5);
+    assert.equal(before.outstandingToolIds.size, 0);
+    assert.equal(before.lastLineAt, T0);
+    assert.equal(after.outstandingToolIds.size, 1);
+  });
+
+  test("disabled at 0: never fires", () => {
+    const s = initIdleWatchdogState(T0);
+    assert.equal(shouldFireIdleWatchdog(s, T0 + 24 * 60 * MIN, 0), false);
+  });
+
+  test("PYRY_AGENT_IDLE_TIMEOUT_MINUTES: default 10, 0 disables, garbage keeps the default", () => {
+    assert.equal(DEFAULT_IDLE_TIMEOUT_MINUTES, 10);
+    assert.equal(parseIdleTimeoutMs(undefined), 10 * MIN);
+    assert.equal(parseIdleTimeoutMs(""), 10 * MIN);
+    assert.equal(parseIdleTimeoutMs("0"), 0);
+    assert.equal(parseIdleTimeoutMs("15"), 15 * MIN);
+    assert.equal(parseIdleTimeoutMs("0.5"), 30_000);
+    assert.equal(parseIdleTimeoutMs("-1"), 0);
+    assert.equal(parseIdleTimeoutMs("ten"), 10 * MIN);
+  });
+
+  test("the poll tick is a tenth of the threshold, clamped to 1s..30s", () => {
+    assert.equal(idleWatchdogTickMs(10 * MIN), 30_000);
+    assert.equal(idleWatchdogTickMs(2 * MIN), 12_000);
+    assert.equal(idleWatchdogTickMs(600), 1_000);
+  });
+
+  test("the stall error is classified transient, so the dispatcher retries with backoff", () => {
+    const msg = idleStallMessage(10 * MIN);
+    assert.match(msg, /idle_stall/);
+    assert.match(msg, /10min/);
+    const r = classifyAgentError(msg);
+    assert.equal(r.transient, true);
+    assert.equal(r.signature, "idle stream stall");
+    // The result-frame door: handleAgentResultErrors names the reason.
+    assert.equal(classifyAgentError("Agent error (idle_stall): subtype=error_during_execution. Ran 15m 2s (timeout 25min).", { terminalReason: "idle_stall" }).transient, true);
   });
 });

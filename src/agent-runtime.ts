@@ -1095,3 +1095,146 @@ export function advancePermissionDenialState(
     action: "none",
   };
 }
+
+// --------- Idle-stream watchdog (claude runner) ---------
+
+/**
+ * Default idle threshold for the claude runner's stream watchdog, in
+ * minutes. Override with `PYRY_AGENT_IDLE_TIMEOUT_MINUTES`; `0` disables.
+ *
+ * Why it exists. On 2026-10-02 pyrycode-mobile #1430's documentation run
+ * went silent: its log shows four system stream messages between 05:03:30
+ * and 05:05:17, then nothing until 05:25:10, and the 38-minute wall clock
+ * killed it at 05:31 with finished edits uncommitted. Claude's own
+ * transcript shows the gap sat inside ONE assistant turn: a thinking block
+ * arrived at 05:05:17 and the Edit that followed it took twenty minutes to
+ * come back. The API stream had wedged mid-turn.
+ *
+ * pyry's own streamrunner watchdog (pyrycode#360, 240s) did not catch it.
+ * That watchdog only arms while claude "owes" an assistant turn, and the
+ * thinking block counted as the turn arriving, so the wedge after it was
+ * invisible. This watchdog keys on the opposite fact: is a TOOL running?
+ * If no tool call is outstanding, claude itself is the only thing that can
+ * be working, and N minutes of silence from it is a stall, whichever
+ * content block it was in the middle of.
+ *
+ * Neither claude spawn passes `--include-partial-messages` (the dispatcher's
+ * legacy `claude -p` argv does not, and pyry agent-run's BuildClaudeArgs
+ * does not), so a line arrives only per finished content block, tool result
+ * or system notice. A long legitimate block is therefore silent until it
+ * completes. Ten minutes clears a full 32k-token output block at observed
+ * generation rates with room to spare; the per-ticket retry cap bounds a
+ * false positive.
+ */
+export const DEFAULT_IDLE_TIMEOUT_MINUTES = 10;
+
+/**
+ * Parse `PYRY_AGENT_IDLE_TIMEOUT_MINUTES` into milliseconds.
+ *
+ * - **Unset / empty**: the 10-minute default.
+ * - **0**: watchdog disabled.
+ * - **Positive number**: that many minutes (fractions allowed).
+ * - **Negative**: treated as 0 (off), matching `parseResumeLegs`.
+ * - **Garbage / NaN**: falls back to the default. A typo in the knob
+ *   should not silently disable the safety net.
+ */
+export function parseIdleTimeoutMs(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return DEFAULT_IDLE_TIMEOUT_MINUTES * 60_000;
+  const n = Number(raw.trim());
+  if (!Number.isFinite(n)) return DEFAULT_IDLE_TIMEOUT_MINUTES * 60_000;
+  return n <= 0 ? 0 : Math.round(n * 60_000);
+}
+
+/**
+ * The substring every idle-stall failure carries. `RETRY_ALLOWLIST`
+ * (pipeline-decisions.ts) matches it, so a stalled run is classified as
+ * transient and re-dispatched with backoff instead of parking. pyry's own
+ * watchdog emits the same token, so both detectors share one retry path.
+ */
+export const IDLE_STALL_REASON = "idle_stall";
+
+/** The error text a dispatcher-detected stall fails with. */
+export function idleStallMessage(idleMs: number): string {
+  const minutes = Math.round((idleMs / 60_000) * 10) / 10;
+  return `Agent ${IDLE_STALL_REASON}: no stream output for ${minutes}min with no tool call outstanding`;
+}
+
+/**
+ * Watchdog state, advanced once per stream-json line.
+ *
+ * - `lastLineAt`: when the last line of any kind arrived. Every line is
+ *   activity, including system notices and lines that fail to parse.
+ * - `outstandingToolIds`: `tool_use` ids the agent has issued whose
+ *   `tool_result` has not come back yet. While this is non-empty a tool is
+ *   running, and a tool such as a Gradle test run legitimately prints
+ *   nothing for many minutes; the wall clock bounds that case instead.
+ */
+export interface IdleWatchdogState {
+  lastLineAt: number;
+  outstandingToolIds: ReadonlySet<string>;
+}
+
+export function initIdleWatchdogState(now: number): IdleWatchdogState {
+  return { lastLineAt: now, outstandingToolIds: new Set() };
+}
+
+function contentBlocks(msg: Record<string, unknown>): Record<string, unknown>[] {
+  const message = msg.message as Record<string, unknown> | undefined;
+  const content = message?.content;
+  if (!Array.isArray(content)) return [];
+  return content.filter((b): b is Record<string, unknown> => !!b && typeof b === "object");
+}
+
+/**
+ * Advance the watchdog on one stream line. `msg` is the parsed JSON, or
+ * null for a line that did not parse (still activity). Assistant
+ * `tool_use` blocks add their id; user `tool_result` blocks remove theirs.
+ *
+ * Pure: no I/O, no clock. The driver passes `now`.
+ */
+export function advanceIdleWatchdogState(
+  state: IdleWatchdogState,
+  msg: unknown,
+  now: number,
+): IdleWatchdogState {
+  let outstanding = state.outstandingToolIds;
+  if (msg && typeof msg === "object") {
+    const m = msg as Record<string, unknown>;
+    if (m.type === "assistant") {
+      for (const b of contentBlocks(m)) {
+        if (b.type === "tool_use" && typeof b.id === "string") {
+          if (outstanding === state.outstandingToolIds) outstanding = new Set(outstanding);
+          (outstanding as Set<string>).add(b.id);
+        }
+      }
+    } else if (m.type === "user") {
+      for (const b of contentBlocks(m)) {
+        if (b.type === "tool_result" && typeof b.tool_use_id === "string" && outstanding.has(b.tool_use_id)) {
+          if (outstanding === state.outstandingToolIds) outstanding = new Set(outstanding);
+          (outstanding as Set<string>).delete(b.tool_use_id);
+        }
+      }
+    }
+  }
+  return { lastLineAt: now, outstandingToolIds: outstanding };
+}
+
+/**
+ * True when the run has stalled: the watchdog is enabled, no tool call is
+ * outstanding, and nothing has arrived for at least `idleMs`.
+ */
+export function shouldFireIdleWatchdog(
+  state: IdleWatchdogState,
+  now: number,
+  idleMs: number,
+): boolean {
+  if (idleMs <= 0) return false;
+  if (state.outstandingToolIds.size > 0) return false;
+  return now - state.lastLineAt >= idleMs;
+}
+
+/** How often the driver checks the watchdog: a tenth of the threshold,
+ *  clamped to [1s, 30s], so a firing lands within 10% of the threshold. */
+export function idleWatchdogTickMs(idleMs: number): number {
+  return Math.min(30_000, Math.max(1_000, Math.round(idleMs / 10)));
+}
