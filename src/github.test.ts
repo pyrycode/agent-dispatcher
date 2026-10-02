@@ -4,7 +4,15 @@
 
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { decideListingGapReport, mergeListingWithOpenIssues, type ListingGaps, GitHubProjectClient } from "./github.js";
+import {
+  countMarkersNewestFirst,
+  decideListingGapReport,
+  lastPageFromLink,
+  mergeListingWithOpenIssues,
+  type CommentsPage,
+  type ListingGaps,
+  GitHubProjectClient,
+} from "./github.js";
 
 type Item = { issueNumber: number; status: string; labels: string[] };
 const item = (issueNumber: number, status: string, labels: string[] = []): Item => ({ issueNumber, status, labels });
@@ -150,4 +158,74 @@ test("Backlog priority uses native project position and verifies the returned fi
   await client.moveItemToTop("FIX");
   (client as any).gql = async () => ({ updateProjectV2ItemPosition: { items: { nodes: [{ id: "OTHER" }] } } });
   await assert.rejects(client.moveItemToTop("FIX"), /Could not verify top position/);
+});
+
+
+// The final-merge loop guard counts its marker comments (merge-handoff.ts).
+// GitHub lists comments oldest first, busy pyrycode-mobile tickets pass 100
+// comments, and the markers come late, so a single page misses them.
+describe("marker count across comment pages", () => {
+  const MARKER = "<!-- final-merge-handoff -->";
+  /** `total` comments, 100 to a page, with the marker on the given 0-based comment indexes. */
+  function pages(total: number, markerAt: number[]) {
+    const all = Array.from({ length: total }, (_, i) => ({ body: markerAt.includes(i) ? `${MARKER}\n## 🔀 Final merge` : `comment ${i}` }));
+    const last = Math.max(1, Math.ceil(total / 100));
+    const read: number[] = [];
+    const fetchPage = async (page: number): Promise<CommentsPage> => {
+      read.push(page);
+      return { comments: all.slice((page - 1) * 100, page * 100), lastPage: last > 1 && page < last ? last : null };
+    };
+    return { fetchPage, read };
+  }
+
+  test("finds markers past the first 100 comments, newest pages first", async () => {
+    const { fetchPage, read } = pages(250, [150, 240]);
+    assert.equal(await countMarkersNewestFirst(fetchPage, MARKER, 10), 2);
+    assert.deepEqual(read, [1, 3, 2]);
+  });
+
+  test("a single page is read once", async () => {
+    const { fetchPage, read } = pages(40, [3, 39]);
+    assert.equal(await countMarkersNewestFirst(fetchPage, MARKER, 10), 2);
+    assert.deepEqual(read, [1]);
+  });
+
+  test("a pathological ticket costs at most maxPages reads, keeping the newest pages", async () => {
+    // 3000 comments: a marker on the newest page counts, one in the skipped
+    // middle does not.
+    const { fetchPage, read } = pages(3000, [2950, 500]);
+    assert.equal(await countMarkersNewestFirst(fetchPage, MARKER, 10), 1);
+    assert.deepEqual(read, [1, 30, 29, 28, 27, 26, 25, 24, 23, 22]);
+  });
+
+  test("lastPageFromLink reads GitHub's rel=last link", () => {
+    const link =
+      '<https://api.github.com/repositories/1/issues/1430/comments?per_page=100&page=2>; rel="next", ' +
+      '<https://api.github.com/repositories/1/issues/1430/comments?per_page=100&page=3>; rel="last"';
+    assert.equal(lastPageFromLink(link), 3);
+    assert.equal(lastPageFromLink('<https://api.github.com/x?page=1>; rel="prev"'), null);
+    assert.equal(lastPageFromLink(null), null);
+  });
+
+  test("the client counts markers beyond the first 100 comments", async () => {
+    // pyrycode-mobile #1430 shape: 250 comments, both handoff markers late.
+    const comments = Array.from({ length: 250 }, (_, i) => ({ body: i === 130 || i === 245 ? `${MARKER}\n## 🔀` : `c${i}` }));
+    const urls: string[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string) => {
+      urls.push(url);
+      const page = Number(new URL(url).searchParams.get("page"));
+      const headers: Record<string, string> = page < 3
+        ? { link: `<https://api.github.com/repos/o/r/issues/1430/comments?per_page=100&page=${page + 1}>; rel="next", <https://api.github.com/repos/o/r/issues/1430/comments?per_page=100&page=3>; rel="last"` }
+        : {};
+      return new Response(JSON.stringify(comments.slice((page - 1) * 100, page * 100)), { status: 200, headers });
+    }) as typeof fetch;
+    try {
+      const client = new GitHubProjectClient({ owner: "o", repo: "r", token: "test" } as any);
+      assert.equal(await client.countMarkerComments(1430, MARKER), 2);
+      assert.deepEqual(urls.map((u) => new URL(u).searchParams.get("page")), ["1", "3", "2"]);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
 });

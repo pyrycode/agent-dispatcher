@@ -9,7 +9,7 @@ import { DispatchPool, candidateKey, excludeInFlight, freeSeats, resolvePollInte
 import { countVerdictsSince, parseVerdictArtifacts, pickVerdictPr, shouldFlagMissingVerdict } from "./verdict-guard.js";
 import { countOpenPrs, shouldFlagMissingPr } from "./pr-guard.js";
 import { resolveImportOnlyMerge } from "./merge-resolve.js";
-import { MERGE_HANDOFF_LABEL, checkMergeResolution, decideConflictRoute, findMergeCommit, mergeHandoffNote, mergeResolutionComment, mergeResolutionSection, readPendingMerge, type PendingMerge, type ResolutionNote } from "./merge-handoff.js";
+import { FINAL_MERGE_HANDOFF_MARKER, FINAL_MERGE_HANDOFF_MAX, MERGE_HANDOFF_LABEL, checkMergeResolution, decideConflictRoute, decideFinalMergeRoute, findMergeCommit, mergeHandoffNote, mergeResolutionComment, mergeResolutionSection, readPendingMerge, type PendingMerge, type ResolutionNote } from "./merge-handoff.js";
 
 import { buildClaudeSourceReviewInvocation, buildCodexInvocation, codexChildEnv, CODEX_ROLE_GUIDANCE, CodexStreamAdapter, formatRunCost, resumeCommand, resolveAgentRunner, type AgentRunner } from "./agent-runner.js";
 
@@ -1823,6 +1823,11 @@ export interface DispatchClient {
    *  code owner read the merge resolution notes from it (merge-handoff.ts).
    *  Throws on fetch failure (the prompt goes out without the notes). */
   getIssueCommentBodies(issueNumber: number): Promise<string[]>;
+  /** How many of an issue's comments carry `marker`. The final-merge loop
+   *  guard counts its routing comments with it (`handOffFinalMerge`).
+   *  Throws on fetch failure (the caller leaves the ticket for the next
+   *  cycle). */
+  countMarkerComments(issueNumber: number, marker: string): Promise<number>;
 }
 
 // IO surface every phase function depends on. Threading it through
@@ -5822,8 +5827,9 @@ export async function runConcurrentDispatches(
 
 /**
  * Auto-merge retry budget. The dispatcher tries the merge this many
- * times across cycles before applying `error:merge-conflict` and
- * stopping. Spread across cycles (not within a cycle) because the
+ * times across cycles before handing the conflict to the code owner
+ * (`handOffFinalMerge`), or to a human with `error:merge-conflict` when
+ * it cannot. Spread across cycles (not within a cycle) because the
  * conflict failure mode is usually a sibling PR mid-merge against the
  * same line — back-to-back attempts within one cycle can't help, but a
  * retry one cycle later (after the sibling has landed or also failed)
@@ -5842,8 +5848,8 @@ const MERGE_RETRY_MAX_ATTEMPTS = 3;
  *
  *   - Bumps the counter and skips this cycle (the dispatcher's natural
  *     poll loop produces the retry on the next cycle), or
- *   - Falls through to the existing `handleMergeConflict` flow when
- *     retries are exhausted.
+ *   - Hands the conflict on with `handOffFinalMerge` when retries are
+ *     exhausted.
  *
  * The counter is cleared here in the auto-merge path, on merge and on
  * give-up, never by `decideDoneCleanup`. That pass runs before the
@@ -5867,7 +5873,7 @@ async function handleConflictWithRetry(
   });
 
   if (decision.shouldGiveUp) {
-    await handleMergeConflict(client, item, prNumber, notifyDiscord);
+    await handOffFinalMerge(client, item, prNumber, notifyDiscord);
     return;
   }
 
@@ -5896,11 +5902,95 @@ async function handleConflictWithRetry(
 }
 
 /**
+ * Send a Done ticket whose PR still conflicts after the merge retries back
+ * to its code owner, only to finish the merge (see merge-handoff.ts for the
+ * incidents, 2026-10-02). Same route as a conflict before a later stage's
+ * run: a comment, MERGE_HANDOFF_LABEL and `needs-rework:<owner>`, so the
+ * rework router moves the ticket without counting a rework. The ticket
+ * waits in the last stage's column, which the router scans; Done is not
+ * one of its columns. The owner's next run then meets the conflict in its
+ * pre-run merge and takes the "Merge conflict left for <owner>" path, and
+ * the review stages and documentation run again before the next merge.
+ *
+ * Falls back to `handleMergeConflict` (a human) when the stage set has no
+ * owner to send it to, when the ticket already went back
+ * FINAL_MERGE_HANDOFF_MAX times, or when the route's comment or labels
+ * fail. The routing comment opens with FINAL_MERGE_HANDOFF_MARKER and is
+ * posted before the labels, so a failed attempt still counts toward the
+ * guard: an overcount parks a ticket one route early, an undercount could
+ * let it circle once more. When the earlier routes cannot be counted, the
+ * ticket is left as it is: the retry counter stays spent, so the next
+ * cycle's conflict lands here again.
+ */
+async function handOffFinalMerge(
+  client: DispatchClient,
+  item: ProjectItem,
+  prNumber: number,
+  notifyDiscord: DispatchDeps["notifyDiscord"],
+): Promise<void> {
+  let prior: number;
+  try {
+    prior = await client.countMarkerComments(item.issueNumber, FINAL_MERGE_HANDOFF_MARKER);
+  } catch (e: any) {
+    console.warn(`   ⚠️  PR #${prNumber} for #${item.issueNumber} conflicts, but its earlier merge handoffs could not be counted; retrying next cycle: ${e?.message ?? e}`);
+    return;
+  }
+  const route = decideFinalMergeRoute(activeStageSet().agents, REAL_CLAUDE_GATE_FAIL_COLUMN, prior);
+  if (route.kind === "park") {
+    await handleMergeConflict(client, item, prNumber, notifyDiscord, route.reason);
+    return;
+  }
+
+  console.warn(`   🔀 PR #${prNumber} for #${item.issueNumber} conflicts with ${defaultBranch}; sending it to ${route.owner} to finish the merge (not a rework)`);
+  try {
+    await client.addComment(
+      item.issueNumber,
+      `${FINAL_MERGE_HANDOFF_MARKER}\n## 🔀 Final merge sent to ${route.owner}\n\n` +
+      `PR #${prNumber} conflicts with \`${defaultBranch}\`, and the dispatcher's ${MERGE_RETRY_MAX_ATTEMPTS} merge attempts are used up.\n\n` +
+      `This ticket goes back to ${route.owner} only to finish this merge. It does not count as a rework. ` +
+      `${route.owner}'s next run merges \`${defaultBranch}\` into \`feature/${item.issueNumber}\` and settles the conflict. ` +
+      `After that the ticket passes the review stages and documentation again, and the dispatcher merges it from Done.\n\n` +
+      `This is merge handoff ${prior + 1} of ${FINAL_MERGE_HANDOFF_MAX}. If the PR conflicts again after the last one, the ticket parks for a human.`,
+    );
+    await client.addLabel(item.issueNumber, MERGE_HANDOFF_LABEL);
+    await client.addLabel(item.issueNumber, `needs-rework:${route.owner}`);
+  } catch (e: any) {
+    console.warn(`   ⚠️  Failed to route the final merge of #${item.issueNumber} to ${route.owner}: ${e?.message ?? e}`);
+    await handleMergeConflict(
+      client, item, prNumber, notifyDiscord,
+      `Sending it back to ${route.owner} to finish the merge failed: ${e?.message ?? e}.`,
+    );
+    return;
+  }
+  // A fresh set of merge attempts for the ticket's next time in Done.
+  for (const label of item.labels) {
+    if (label.startsWith("merge-attempt:")) {
+      try { await client.removeLabel(item.issueNumber, label); } catch {}
+    }
+  }
+  // Non-fatal like the rollback in handleMergeConflict. A ticket left in
+  // Done loses `needs-rework:` to the Done cleanup next cycle and retries
+  // the merge afresh. If it still conflicts it comes back here, with this
+  // route's marker already counted.
+  try {
+    await client.updateItemStatus(item.id, route.column);
+    console.log(`   📋 Moved #${item.issueNumber} Status to ${route.column} (was Done; PR conflicts) for the rework router`);
+  } catch (statusErr: any) {
+    console.warn(`   ⚠️  Failed to move #${item.issueNumber} Status to ${route.column}: ${statusErr?.message ?? statusErr}`);
+  }
+  try {
+    await notifyDiscord(`🔀 Merge conflict on PR #${prNumber} (#${item.issueNumber}) — sent back to ${route.owner} to finish the merge (handoff ${prior + 1}/${FINAL_MERGE_HANDOFF_MAX}).`);
+  } catch (e: any) {
+    console.warn(`   ⚠️  Discord notify failed for #${item.issueNumber}: ${e?.message ?? e}`);
+  }
+}
+
+/**
  * Apply the conflict-block path: `error:merge-conflict` label + triage
  * comment + Discord notify + Status rollback to In Code Review.
  *
- * Invoked from `runAutoMerge`'s merge step when it returns
- * `isMergeConflictError`, once retries are exhausted. (A conflict at the
+ * Invoked from `handOffFinalMerge` when the conflict cannot go to the
+ * code owner; `reason` says why in the comment. (A conflict at the
  * pre-merge rebase used to come here too; since 2026-09-23 it falls
  * through to the plain merge instead, which may still be clean.)
  *
@@ -5917,8 +6007,9 @@ async function handleMergeConflict(
   item: ProjectItem,
   prNumber: number,
   notifyDiscord: DispatchDeps["notifyDiscord"],
+  reason: string,
 ): Promise<void> {
-  console.warn(`   🛑 PR #${prNumber} for #${item.issueNumber} has merge conflicts — labelling for triage`);
+  console.warn(`   🛑 PR #${prNumber} for #${item.issueNumber} has merge conflicts — labelling for triage (${reason})`);
   try {
     await client.addLabel(item.issueNumber, "error:merge-conflict");
     // The retries are spent. Clear the counter so a ticket that comes
@@ -5931,7 +6022,7 @@ async function handleMergeConflict(
     await client.addComment(
       item.issueNumber,
       `## 🛑 Auto-merge blocked by merge conflict\n\n` +
-      `PR #${prNumber} cannot be merged into \`${defaultBranch}\` cleanly. ` +
+      `PR #${prNumber} cannot be merged into \`${defaultBranch}\` cleanly. ${reason}\n\n` +
       `The dispatcher has stopped retrying this PR; resolve the conflict manually:\n\n` +
       `\`\`\`bash\n` +
       `gh pr checkout ${prNumber}\n` +
@@ -5990,8 +6081,11 @@ async function handleMergeConflict(
  *   - `gh pr merge <n> --merge --delete-branch`. On success: pull
  *     merged changes to local main (non-fatal failure), strip pipeline
  *     labels from the issue, Discord notify. On conflict (detected
- *     via `isMergeConflictError` on stderr): `handleMergeConflict`.
- *     Non-conflict failures: silent, retry next cycle.
+ *     via `isMergeConflictError` on stderr): `handleConflictWithRetry`,
+ *     which retries across cycles and then hands the merge to the code
+ *     owner (`handOffFinalMerge`, 2026-10-02) or, failing that, to a
+ *     human (`handleMergeConflict`). Non-conflict failures: silent, retry
+ *     next cycle.
  *
  * The conflict-block-via-label pattern is the 2026-05-08 fix that
  * stopped infinite retry loops on stale-PR conflicts; the pre-merge
@@ -6139,7 +6233,7 @@ export async function runAutoMerge(
           // re-entry — but we got here, so the label isn't set yet.
           // Same path as the pre-merge rebase conflict (Step 1.5):
           // retry across cycles up to MERGE_RETRY_MAX_ATTEMPTS, then
-          // fall through to handleMergeConflict.
+          // hand off with handOffFinalMerge.
           await handleConflictWithRetry(client, item, prNumber, notifyDiscord);
           continue;
         }

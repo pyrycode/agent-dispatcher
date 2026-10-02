@@ -107,6 +107,59 @@ export function decideConflictRoute(
   return { kind: "park" };
 }
 
+// The final merge. A Done ticket whose PR still conflicts with main once the
+// auto-merge's retries are spent used to park with `error:merge-conflict` for
+// a human: Mobile #1017, #1346 and #1430 in the week to 2026-10-02. Mobile
+// merges 17 to 48 PRs a day, so a ticket that spends half an hour in
+// documentation often ends behind main. The pre-run route above settled 40
+// such conflicts on 32 Mobile tickets between 2026-09-23 and 2026-10-02 with
+// no human, so the final merge takes the same route. The request counts as
+// coming from the set's last stage, and the ticket waits in that stage's
+// column for the rework router, the same board state a pre-run route from
+// that stage leaves. The owner's next run then hits the conflict in its own
+// pre-run merge and finishes it there, and the review stages run again.
+//
+// A ticket main keeps overtaking could circle forever, so each route posts a
+// comment opening with FINAL_MERGE_HANDOFF_MARKER and the third conflict
+// parks for a human as before.
+
+/** Opens the comment of every final-merge route; the loop guard counts them. */
+export const FINAL_MERGE_HANDOFF_MARKER = "<!-- final-merge-handoff -->";
+
+/** Final-merge routes one ticket gets before its next conflict parks. */
+export const FINAL_MERGE_HANDOFF_MAX = 2;
+
+export type FinalMergeRoute =
+  /** Send the ticket to `owner`, waiting in `column` for the rework router. */
+  | { kind: "route"; owner: string; column: string }
+  /** A human decides. `reason` is one sentence for the parking comment. */
+  | { kind: "park"; reason: string };
+
+/**
+ * Decide who settles a Done ticket's conflict once the merge retries are
+ * spent. `agents` is the stage set's board order, `ownerColumn` the code
+ * owner's column, and `priorHandoffs` how many final-merge routes the
+ * ticket's comments already record.
+ */
+export function decideFinalMergeRoute(
+  agents: readonly AgentConfig[],
+  ownerColumn: string,
+  priorHandoffs: number,
+): FinalMergeRoute {
+  const last = agents[agents.length - 1];
+  const route = last ? decideConflictRoute(agents, last.name, ownerColumn) : null;
+  if (!last || route?.kind !== "route") {
+    return { kind: "park", reason: "No agent in this board's stage set owns the code before its last stage, so nobody can be sent to finish the merge." };
+  }
+  if (priorHandoffs >= FINAL_MERGE_HANDOFF_MAX) {
+    return {
+      kind: "park",
+      reason: `It has already gone back to ${route.owner} ${priorHandoffs} times to finish a merge with the default branch, and it conflicts again.`,
+    };
+  }
+  return { kind: "route", owner: route.owner, column: last.column };
+}
+
 /** A merge left in progress for the owner's run, and what the check needs. */
 export type PendingMerge = {
   /** Files git left conflicted, relative to the worktree. */
