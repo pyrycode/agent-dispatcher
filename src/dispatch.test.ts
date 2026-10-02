@@ -8925,7 +8925,7 @@ describe("partial-work salvage — stopped run with an existing PR (mobile #1430
         },
       },
     });
-    ctx.pendingMerge = { paths: ["src/Thread.kt"], mainSha: "mainsha", baseSha: "basesha", headSha: "headsha" };
+    ctx.pendingMerge = { paths: ["src/Thread.kt"], mainSha: "mainsha", baseSha: "basesha", headSha: "headsha", mainConflictLines: {} };
 
     const res = await salvagePartialWork(ctx, "timeout");
 

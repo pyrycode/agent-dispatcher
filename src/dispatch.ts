@@ -3467,7 +3467,7 @@ export async function salvagePartialWork(
       )));
     } catch { /* unknown: the dirty check alone decides */ }
     const mergeCheckProblems = ctx.pendingMerge && !mergeInProgress
-      ? checkMergeResolution(agentCwd, ctx.pendingMerge, ctx.deps)
+      ? checkMergeResolution(agentCwd, ctx.pendingMerge, ctx.deps).problems
       : [];
 
     const decision = decidePartialWorkSalvage({
