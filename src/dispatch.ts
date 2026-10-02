@@ -33,6 +33,9 @@ import {
   decidePartialWorkSalvage,
   runStopKind,
   type RunStopKind,
+  appendStderrTail,
+  noResultErrorMessage,
+  scrubCredentials,
   maxTurnsFor,
   mergeLegResults,
   parseBudgetScale,
@@ -953,10 +956,17 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
       }
     });
 
+    // Keep the stderr tail for every runner, not just Codex: a claude run
+    // that dies without a result frame leaves nothing else behind
+    // (pyrycode-mobile #1340, 2026-10-02). Still mirrored to the
+    // dispatcher's terminal as before.
     child.stderr!.on("data", (chunk: Buffer) => {
-      if (isCodex) stderrTail = (stderrTail + chunk.toString()).slice(-4000);
+      stderrTail = appendStderrTail(stderrTail, chunk.toString());
       process.stderr.write(chunk);
     });
+    const logStderrTail = () => {
+      if (stderrTail.trim()) writeLog(opts.logFile, "STDERR (tail)", scrubCredentials(stderrTail));
+    };
 
     child.on("close", (code) => {
       clearTimeout(timer);
@@ -997,7 +1007,12 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
         } catch { /* partial JSON, already logged via stream */ }
       }
 
-      if (codex) { resolve(codex.finish(code, timedOut, Date.now() - startedAt, stderrTail)); return; }
+      if (codex) {
+        const finished = codex.finish(code, timedOut, Date.now() - startedAt, stderrTail);
+        if (finished.isError) logStderrTail();
+        resolve(finished);
+        return;
+      }
 
       if (resultMsg) {
         const r = resultMsg as any;
@@ -1013,6 +1028,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
         // retry allowlist classifies it as transient. A success that
         // happened to land after the kill still counts as a success.
         const stalledResult = idleStalled && r.is_error === true;
+        if (r.is_error || !sourceComplete || stalledResult) logStderrTail();
         resolve({
           output: opts.sourceReview ? report?.summary || r.result || "" : r.result || "",
           sessionId: pickFinalSessionId(r.session_id, initSessionId),
@@ -1031,6 +1047,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
           timedOut,
         });
       } else if (denialState.hadPermissionDenial) {
+        logStderrTail();
         // Force-exit produced no `result` event — synthesize a
         // permission-denied "result" so handleAgentResultErrors can
         // route to the new salvage path instead of throwing into the
@@ -1055,13 +1072,18 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
           timedOut,
         });
       } else if (idleStalled) {
+        logStderrTail();
         // Checked before the wall clock: the stall is the cause even when
         // the backstop also fired while the kill was landing.
         reject(new AgentRunStoppedError(idleStallMessage(idleMs), "idle_stall"));
       } else if (timedOut) {
+        logStderrTail();
         reject(new AgentRunStoppedError(`Agent timed out after ${opts.timeoutMs / 1000}s`, "timeout"));
       } else {
-        reject(new Error(`Claude CLI exited with code ${code}, no result message received`));
+        logStderrTail();
+        // The scrubbed stderr tail rides in the message, so the ticket's
+        // error comment shows why the CLI died (pyrycode-mobile #1340).
+        reject(new Error(noResultErrorMessage(code, stderrTail)));
       }
     });
 

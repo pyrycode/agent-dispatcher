@@ -1348,3 +1348,75 @@ export function decidePartialWorkSalvage(opts: {
   }
   return { salvage: true };
 }
+
+// --------- Runner stderr: keep the tail, scrub credentials ---------
+
+/**
+ * How much of a runner's stderr the dispatcher keeps, and how much of that
+ * goes into an error message.
+ *
+ * Why. On 2026-10-02 pyrycode-mobile #1340's verifier failed after 21
+ * minutes with only "Claude CLI exited with code 1, no result message
+ * received". The dispatcher wrote the CLI's stderr to its own terminal and
+ * kept none of it (the tail was collected for Codex only), so the cause is
+ * unknowable. Every runner now keeps the last STDERR_TAIL_CAP characters,
+ * writes them to the run's log on failure, and appends the last
+ * STDERR_MESSAGE_CHARS to the no-result error, which lands in the ticket's
+ * error comment inside its code block.
+ */
+export const STDERR_TAIL_CAP = 4000;
+export const STDERR_MESSAGE_CHARS = 1500;
+
+/** Append a stderr chunk, keeping only the last `cap` characters. */
+export function appendStderrTail(tail: string, chunk: string, cap = STDERR_TAIL_CAP): string {
+  return (tail + chunk).slice(-cap);
+}
+
+const REDACTED = "[REDACTED]";
+
+/**
+ * Credential shapes to blank before text leaves the machine. Order
+ * matters: specific shapes first, so the generic `token=`/`key=` rule
+ * does not leave a recognisable prefix behind.
+ */
+const CREDENTIAL_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
+  // `Authorization: Bearer <token>` and friends.
+  [/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, `Bearer ${REDACTED}`],
+  // Anthropic API and OAuth keys: sk-ant-api03-..., sk-ant-oat01-...
+  [/\bsk-ant-[A-Za-z0-9_-]+/g, `sk-ant-${REDACTED}`],
+  // GitHub tokens: classic and OAuth/app/refresh (gh[pousr]_), fine-grained (github_pat_).
+  [/\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})/g, REDACTED],
+  // Credentials embedded in a URL: https://user:secret@host
+  [/(\bhttps?:\/\/[^\s:/@]+:)[^\s@/]+@/gi, `$1${REDACTED}@`],
+  // A long base64-looking value after token=, key=, secret= or password=
+  // (also `:` and quoted forms, e.g. CLAUDE_CODE_OAUTH_TOKEN=..., "api_key": "...").
+  [/(\b[A-Za-z0-9_-]*(?:token|key|secret|password)["']?\s*[=:]\s*["']?)[A-Za-z0-9+/_.=-]{16,}/gi, `$1${REDACTED}`],
+];
+
+/**
+ * Blank anything that looks like a credential. Used on every piece of
+ * runner stderr before it reaches a log, an error message or a GitHub
+ * comment; the Codex adapter shares it for its stderr-derived failure
+ * text, which previously went to the ticket unscrubbed.
+ */
+export function scrubCredentials(text: string): string {
+  let out = text;
+  for (const [pattern, replacement] of CREDENTIAL_PATTERNS) out = out.replace(pattern, replacement);
+  return out;
+}
+
+/**
+ * The scrubbed last `max` characters of a stderr tail, ready to sit inside
+ * the error comment's code block: a run of three or more backticks would
+ * close that block early, so those become quotes. "" when there is none.
+ */
+export function stderrForMessage(tail: string, max = STDERR_MESSAGE_CHARS): string {
+  return scrubCredentials(tail).slice(-max).replace(/`{3,}/g, "'''").trim();
+}
+
+/** The runner's error when the CLI exits without a result frame. */
+export function noResultErrorMessage(code: number | null, stderrTail: string): string {
+  const base = `Claude CLI exited with code ${code}, no result message received`;
+  const tail = stderrForMessage(stderrTail);
+  return tail ? `${base}\n--- stderr (last ${STDERR_MESSAGE_CHARS} chars) ---\n${tail}` : base;
+}

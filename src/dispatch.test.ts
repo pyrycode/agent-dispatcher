@@ -92,7 +92,7 @@ import {
   tallyFamilyComments,
 } from "./pipeline-decisions.js";
 import { AGENTS } from "./types.js";
-import { AgentRunStoppedError, idleStallMessage, ResourceExhaustedError, timeoutFor } from "./agent-runtime.js";
+import { AgentRunStoppedError, idleStallMessage, noResultErrorMessage, ResourceExhaustedError, timeoutFor } from "./agent-runtime.js";
 import { resolveAgentsRepoRoot, resolveTargetRepoRoot } from "./worktree.js";
 
 // Importing dispatch.ts loads the fork's .env, so a fork running this suite
@@ -8260,5 +8260,22 @@ describe("partial-work salvage — stopped run with an existing PR (mobile #1430
     assert.ok(calls.logs.some(l => l.section === "PARTIAL_SALVAGE_PUSH_FAILED" && /non-fast-forward/.test(l.content)));
     assert.ok(client.addLabelCalls.some(c => c.label === "error:documentation"), "the error path still runs");
     assert.ok(!cleanupRan(calls.exec), "the worktree holding the only copy is not torn down");
+  });
+});
+
+describe("no-result exit keeps Claude's stderr (pyrycode-mobile #1340, 2026-10-02)", () => {
+  test("the ticket's error comment shows the scrubbed stderr tail inside its code block", async () => {
+    const key = "sk-ant-api03-" + "k".repeat(48);
+    const { ctx, client } = makeTestContext({ agent: { name: "verifier", producesCommits: false }, item: { issueNumber: 1340 } });
+    const err = new Error(noResultErrorMessage(1, `Error: Request timed out.\n    at retry (cli.js:1:2)\nusing ${key}\n`));
+
+    await handleDispatchError(err, ctx, null);
+
+    const body = client.comments.find(c => /Agent Error: verifier/.test(c.body))?.body ?? "";
+    const block = body.slice(body.indexOf("```\n") + 4, body.lastIndexOf("\n```"));
+    assert.match(block, /^Claude CLI exited with code 1, no result message received/);
+    assert.match(block, /--- stderr \(last 1500 chars\) ---\nError: Request timed out\./);
+    assert.ok(!body.includes(key), "no credential reaches GitHub");
+    assert.ok(client.addLabelCalls.some(c => c.label === "error:verifier"), "still parks: the tail adds evidence, not a retry");
   });
 });

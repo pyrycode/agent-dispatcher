@@ -13,6 +13,7 @@ import { runClaudeStreaming } from "./dispatch.js";
 //   stall-result  as stall, but answers SIGTERM with an error result frame
 //   linger        a success result, then the process hangs on exit
 //   tool-silence  a tool call that runs longer than the idle threshold
+//   crash         stderr only, exit 1, no result frame (pyrycode-mobile #1340)
 const FIXTURE = `#!${process.execPath}
 const out = (m) => process.stdout.write(JSON.stringify(m) + "\\n");
 const mode = process.env.MODE;
@@ -29,6 +30,10 @@ if (mode === "linger") {
     });
   }
   setTimeout(() => {}, 30_000);
+} else if (mode === "crash") {
+  process.stderr.write("Error: Request timed out.\\n    at retry (cli.js:1:2)\\n");
+  process.stderr.write("auth header: Bearer " + "c".repeat(40) + "\\n");
+  process.exitCode = 1; // natural exit, so the piped stderr is flushed first
 } else if (mode === "tool-silence") {
   out({ type: "assistant", message: { content: [{ type: "tool_use", id: "gradle", name: "Bash", input: {} }] } });
   setTimeout(() => {
@@ -98,4 +103,19 @@ test("idle watchdog stays quiet while a tool call is outstanding", async t => {
   assert.equal(result.isError, false);
   assert.equal(result.output, "done");
   assert.doesNotMatch(readFileSync(logFile, "utf8"), /IDLE STALL/);
+});
+
+test("a CLI that exits without a result keeps its stderr: scrubbed tail in the error and the log", async t => {
+  const { run, logFile } = await runFixture(t, "crash", "10");
+  await assert.rejects(run, (err: Error) => {
+    assert.match(err.message, /^Claude CLI exited with code 1, no result message received\n--- stderr/);
+    assert.match(err.message, /Error: Request timed out\./);
+    assert.match(err.message, /Bearer \[REDACTED\]/);
+    assert.ok(!err.message.includes("c".repeat(40)));
+    return true;
+  });
+  const log = readFileSync(logFile, "utf8");
+  assert.match(log, /STDERR \(tail\)/);
+  assert.match(log, /at retry \(cli\.js:1:2\)/);
+  assert.ok(!log.includes("c".repeat(40)), "the log copy is scrubbed too");
 });

@@ -17,6 +17,12 @@ import assert from "node:assert/strict";
 
 import { AGENTS } from "./types.js";
 import {
+  appendStderrTail,
+  noResultErrorMessage,
+  scrubCredentials,
+  STDERR_MESSAGE_CHARS,
+  STDERR_TAIL_CAP,
+  stderrForMessage,
   AgentRunStoppedError,
   canSalvagePartialWork,
   decidePartialWorkSalvage,
@@ -6236,5 +6242,72 @@ describe("partial-work salvage decisions (mobile #1430, #1332)", () => {
     refused({ mergeCheckProblems: ["`a.kt` still has conflict markers."] }, /conflict markers/);
     refused({ gitStatusOutput: "", commitsAheadOfOrigin: 0 }, /nothing to save/);
     refused({ gitStatusOutput: "  \n", commitsAheadOfOrigin: -1 }, /nothing to save/);
+  });
+});
+
+describe("runner stderr: tail, scrub and message (pyrycode-mobile #1340, 2026-10-02)", () => {
+  // Built at runtime so no literal credential-shaped string sits in the repo.
+  const anthropic = "sk-ant-api03-" + "a1B2".repeat(20);
+  const oauth = "sk-ant-oat01-" + "Q".repeat(60);
+  const ghp = "ghp_" + "x".repeat(36);
+  const gho = "gho_" + "y".repeat(36);
+  const pat = "github_pat_" + "11ABCDEFG0" + "z".repeat(60);
+  const b64 = "dGhpcyBpcyBhIHZlcnkgbG9uZyBzZWNyZXQgdmFsdWU=";
+
+  test("appendStderrTail keeps only the last cap characters", () => {
+    let tail = "";
+    for (let i = 0; i < 100; i++) tail = appendStderrTail(tail, `line ${i}\n`.padEnd(100, "."));
+    assert.equal(tail.length, STDERR_TAIL_CAP);
+    assert.ok(tail.endsWith(`line 99\n`.padEnd(100, ".")));
+    assert.equal(appendStderrTail("abc", "def", 4), "cdef");
+  });
+
+  test("scrubCredentials blanks every credential shape named in the ticket", () => {
+    const cases: [string, string][] = [
+      [`ANTHROPIC_API_KEY used: ${anthropic}`, anthropic],
+      [`oauth ${oauth} expired`, oauth],
+      [`Authorization: Bearer ${b64}`, b64],
+      [`remote: ${ghp} rejected`, ghp],
+      [`token ${gho}`, gho],
+      [`fine-grained ${pat}`, pat],
+      [`GET /v1?token=${b64}&x=1`, b64],
+      [`api_key=${b64}`, b64],
+      [`CLAUDE_CODE_OAUTH_TOKEN=${b64}`, b64],
+      [`{"secret_key": "${b64}"}`, b64],
+      [`fatal: https://x-access-token:hunter2hunter2@github.com/o/r.git`, "hunter2hunter2"],
+    ];
+    for (const [text, secret] of cases) {
+      const out = scrubCredentials(text);
+      assert.ok(!out.includes(secret), `secret survived in: ${out}`);
+      assert.match(out, /\[REDACTED\]/, text);
+    }
+  });
+
+  test("scrubCredentials leaves ordinary diagnostics alone", () => {
+    const text = [
+      "Error: ECONNRESET reading response body",
+      "API Error: 529 overloaded_error",
+      "at Object.<anonymous> (/opt/claude/cli.js:12:34)",
+      "key=short token=abc",
+      "the monkey ran",
+    ].join("\n");
+    assert.equal(scrubCredentials(text), text);
+  });
+
+  test("stderrForMessage: scrubbed, last 1500 chars, cannot close the comment's code block", () => {
+    const long = "x".repeat(3000) + `\nfinal error ${anthropic}\n\`\`\`\nnot a fence`;
+    const out = stderrForMessage(long);
+    assert.ok(out.length <= STDERR_MESSAGE_CHARS);
+    assert.match(out, /final error sk-ant-\[REDACTED\]/);
+    assert.ok(!out.includes("```"), "a triple backtick would end the ticket comment's code block");
+    assert.equal(stderrForMessage("  \n"), "");
+  });
+
+  test("noResultErrorMessage appends the scrubbed tail, and nothing when stderr was empty", () => {
+    assert.equal(noResultErrorMessage(1, ""), "Claude CLI exited with code 1, no result message received");
+    const msg = noResultErrorMessage(1, `Error: stream closed\nAuthorization: Bearer ${b64}\n`);
+    assert.match(msg, /^Claude CLI exited with code 1, no result message received\n--- stderr \(last 1500 chars\) ---\n/);
+    assert.match(msg, /Error: stream closed/);
+    assert.ok(!msg.includes(b64));
   });
 });
