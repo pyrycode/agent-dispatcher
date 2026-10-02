@@ -923,6 +923,21 @@ export class GitHubProjectClient {
   }
 
   /**
+   * Every comment body on an issue, oldest first: the merge resolution
+   * notes the stages after the code owner read (merge-handoff.ts). Sorted
+   * by createdAt rather than trusting the page order, like the marker
+   * readers. THROWS on fetch failure; the prompt then goes out without the
+   * notes. One page (100), as for the markers.
+   */
+  async getIssueCommentBodies(issueNumber: number): Promise<string[]> {
+    const created = (c: any) => Date.parse(c?.created_at ?? "") || 0;
+    return (await this.fetchIssueComments(issueNumber))
+      .filter((c) => typeof c?.body === "string")
+      .sort((a, b) => created(a) - created(b))
+      .map((c) => c.body);
+  }
+
+  /**
    * The two stranded-`wip:` sweep markers on an issue, newest of each kind,
    * from one comments fetch. `observedAt` is when the sweep first saw a
    * `wip:` label it believes nothing is running; `sweptAt` is when it last
