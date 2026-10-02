@@ -102,7 +102,9 @@ import {
 import {
   decideBranchSetup,
   decideCodegraphSymlink,
+  describeHeldWorktrees,
   findWorktreesForBranch,
+  type HeldWorktree,
   resolveAgentsRepoRootWithEnv,
   resolveDefaultBranch,
   resolveTargetRepoRoot,
@@ -2410,6 +2412,20 @@ export async function setupBranchAndWorktree(
     originIsAncestorOfLocal,
   });
 
+  // Remove stale and orphan worktrees BEFORE the branch is updated. `git
+  // branch -f` refuses a branch that any worktree has checked out, and this
+  // cleanup used to run only after the branch setup: on 2026-10-02
+  // pyrycode-mobile #1430's verifier failed with "cannot force update the
+  // branch 'feature/1430' used by worktree at '.../documentation-1430'". That
+  // worktree, left by a timed-out documentation run, was clean and its HEAD
+  // was already on origin, so the cleanup would have removed it had it run
+  // first. The branch setup reads only refs, and removing a worktree changes
+  // none, so nothing above depends on the old order. The two integrity
+  // aborts skip the cleanup and leave every worktree in place for triage,
+  // as they did before.
+  const aborting = branchAction === "abort-local-strictly-ahead" || branchAction === "abort-local-diverged";
+  const heldWorktrees = aborting ? [] : removeBlockingWorktrees(ctx);
+
   try {
     switch (branchAction) {
       case "create-from-main":
@@ -2496,46 +2512,14 @@ export async function setupBranchAndWorktree(
     }
   } catch (e) {
     console.error(`   ❌ Git branch setup failed: ${e}`);
-    await client.addComment(item.issueNumber, `## ⚠️ Dispatch Error: ${agent.name}\n\nFailed to set up branch \`${branchName}\` (action: ${branchAction}). Manual intervention required.\n\n\`\`\`\n${e}\n\`\`\``);
+    await client.addComment(item.issueNumber, `## ⚠️ Dispatch Error: ${agent.name}\n\nFailed to set up branch \`${branchName}\` (action: ${branchAction}). Manual intervention required.${describeHeldWorktrees(branchName, heldWorktrees)}\n\n\`\`\`\n${e}\n\`\`\``);
     try { await client.addLabel(item.issueNumber, `error:${agent.name}`); } catch {}
     return { ok: false };
   }
 
-  // Create worktree from the feature branch
+  // Create worktree from the feature branch. Stale and orphan worktrees
+  // were removed before the branch setup above.
   try {
-    // Clean up stale worktree at the SAME path (previous failed run with
-    // matching agent prefix).
-    try {
-      execSync(`git worktree remove "${worktreeDir}"`, { cwd: repoRoot, stdio: "pipe" });
-    } catch {}
-
-    // Clean up orphan worktrees checked out at the SAME BRANCH under a
-    // different path. `git worktree add` fails with "fatal: '<branch>' is
-    // already checked out at '<other-path>'" otherwise. This happens when
-    // a previous cycle's cleanup execSync at lines ~985-991 was swallowed
-    // (permissions, lockfile contention) — the orphan blocks all future
-    // dispatches on this branch with error:<agent> until a human steps in.
-    // Prune first to drop dead refs (worktree dir was removed but git's
-    // metadata still references it), then remove clean worktrees still
-    // matching the branch. Dirty worktrees remain and block reuse safely.
-    try {
-      execSync(`git worktree prune`, { cwd: repoRoot, stdio: "pipe" });
-      const porcelain = execSync(`git worktree list --porcelain`, {
-        cwd: repoRoot, encoding: "utf-8", timeout: 15_000,
-      });
-      for (const orphanPath of findWorktreesForBranch(porcelain, branchName)) {
-        if (orphanPath === worktreeDir) continue; // already removed above
-        try {
-          execSync(`git worktree remove "${orphanPath}"`, { cwd: repoRoot, stdio: "pipe" });
-          console.log(`   🧹 Removed orphan worktree ${orphanPath} (branch ${branchName})`);
-        } catch (e) {
-          console.warn(`   ⚠️  Failed to remove orphan worktree ${orphanPath}: ${e}`);
-        }
-      }
-    } catch (e) {
-      console.warn(`   ⚠️  Failed to inspect worktrees for ${branchName}: ${e}`);
-    }
-
     mkdirSync(dirname(worktreeDir), { recursive: true });
     execSync(`git worktree add "${worktreeDir}" ${branchName}`, { cwd: repoRoot, stdio: "pipe" });
     console.log(`   🌳 Created worktree at ${worktreeDir}`);
@@ -2569,7 +2553,7 @@ export async function setupBranchAndWorktree(
     }
   } catch (e) {
     console.error(`   ❌ Failed to create worktree: ${e}`);
-    await client.addComment(item.issueNumber, `## ⚠️ Dispatch Error: ${agent.name}\n\nFailed to create git worktree.\n\n\`\`\`\n${e}\n\`\`\``);
+    await client.addComment(item.issueNumber, `## ⚠️ Dispatch Error: ${agent.name}\n\nFailed to create git worktree.${describeHeldWorktrees(branchName, heldWorktrees)}\n\n\`\`\`\n${e}\n\`\`\``);
     try { await client.addLabel(item.issueNumber, `error:${agent.name}`); } catch {}
     return { ok: false };
   }
@@ -2650,6 +2634,64 @@ export async function setupBranchAndWorktree(
 
   pushPreRunMerge(ctx, remoteExists, headBefore);
   return { ok: true };
+}
+
+// Remove the worktrees that would block this dispatch's branch, and return
+// the ones that stay. Runs before the branch setup (see the #1430 note in
+// setupBranchAndWorktree).
+//
+// Two kinds:
+//  - a stale worktree at the SAME path (a previous failed run with the same
+//    agent prefix).
+//  - orphan worktrees checked out at the SAME BRANCH under a different path.
+//    `git worktree add` fails with "fatal: '<branch>' is already checked out
+//    at '<other-path>'" and `git branch -f` with "cannot force update the
+//    branch" otherwise. This happens when a previous cycle's cleanup was
+//    swallowed (permissions, lockfile contention) or its run timed out; the
+//    orphan blocks all future dispatches on this branch with error:<agent>
+//    until a human steps in.
+// Prune first to drop dead refs (worktree dir was removed but git's metadata
+// still references it), then remove clean worktrees still matching the
+// branch. Only `git worktree remove` without --force: a worktree with
+// uncommitted changes stays and keeps blocking the branch on purpose. Those
+// are returned so the error comment can name them.
+function removeBlockingWorktrees(ctx: DispatchContext): HeldWorktree[] {
+  const { branchName, worktreeDir } = ctx;
+  const { execSync } = ctx.deps;
+  const errorText = (e: any): string => e?.stderr?.toString?.().trim() || e?.message || String(e);
+  const held: HeldWorktree[] = [];
+
+  let samePathError = "";
+  try {
+    execSync(`git worktree remove "${worktreeDir}"`, { cwd: repoRoot, stdio: "pipe" });
+  } catch (e) {
+    // Usually "is not a working tree": nothing was there.
+    samePathError = errorText(e);
+  }
+
+  try {
+    execSync(`git worktree prune`, { cwd: repoRoot, stdio: "pipe" });
+    const porcelain = execSync(`git worktree list --porcelain`, {
+      cwd: repoRoot, encoding: "utf-8", timeout: 15_000,
+    });
+    for (const orphanPath of findWorktreesForBranch(porcelain, branchName)) {
+      if (orphanPath === worktreeDir) {
+        // Still listed, so its removal above was refused.
+        held.push({ path: orphanPath, error: samePathError });
+        continue;
+      }
+      try {
+        execSync(`git worktree remove "${orphanPath}"`, { cwd: repoRoot, stdio: "pipe" });
+        console.log(`   🧹 Removed orphan worktree ${orphanPath} (branch ${branchName})`);
+      } catch (e) {
+        console.warn(`   ⚠️  Failed to remove orphan worktree ${orphanPath}: ${e}`);
+        held.push({ path: orphanPath, error: errorText(e) });
+      }
+    }
+  } catch (e) {
+    console.warn(`   ⚠️  Failed to inspect worktrees for ${branchName}: ${e}`);
+  }
+  return held;
 }
 
 /** HEAD of a worktree, or "" when it cannot be read. */

@@ -231,6 +231,38 @@ export function findWorktreesForBranch(
   return out;
 }
 
+/** A worktree on the branch that the dispatcher's cleanup could not remove. */
+export interface HeldWorktree {
+  path: string;
+  /** git's refusal from `git worktree remove` (never run with --force). */
+  error: string;
+}
+
+/**
+ * Text for a dispatch-error comment naming the worktrees that still have
+ * the branch checked out after the cleanup, so a human knows where to look.
+ * Returns "" when there are none.
+ *
+ * The cleanup removes worktrees without --force, so one with uncommitted
+ * changes stays and keeps blocking the branch on purpose. git's own error
+ * ("cannot force update the branch ... used by worktree at ...") names the
+ * path but not why the dispatcher left it there; this says so. A refusal
+ * for another reason (a locked worktree) is quoted as git gave it.
+ *
+ * Pure function; the caller collects the refusals.
+ */
+export function describeHeldWorktrees(branchName: string, held: HeldWorktree[]): string {
+  if (held.length === 0) return "";
+  const lines = held.map(({ path, error }) =>
+    /modified or untracked files/.test(error)
+      ? `- \`${path}\` has uncommitted changes (modified or untracked files).`
+      : `- \`${path}\` could not be removed: ${error.split("\n")[0]?.trim() || "unknown error"}`,
+  );
+  return `\n\n\`${branchName}\` is still checked out in a worktree the dispatcher would not remove:\n\n` +
+    `${lines.join("\n")}\n\n` +
+    `The dispatcher never force-removes a worktree, so nothing there was lost. Save or discard its changes, remove it, then retry.`;
+}
+
 // --------- Path resolution ---------
 
 /**

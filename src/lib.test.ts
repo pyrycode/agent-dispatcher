@@ -106,6 +106,7 @@ import { mapParentChain } from "./github.js";
 import {
   decideBranchSetup,
   decideCodegraphSymlink,
+  describeHeldWorktrees,
   findWorktreesForBranch,
   resolveAgentsRepoRoot,
   resolveAgentsRepoRootWithEnv,
@@ -3362,6 +3363,35 @@ describe("findWorktreesForBranch", () => {
       findWorktreesForBranch(porcelain, "feature/100"),
       ["/repo/.pyrycode-worktrees/architect-100"],
     );
+  });
+});
+
+describe("describeHeldWorktrees", () => {
+  // pyrycode-mobile #1430, 2026-10-02: the stale-worktree cleanup now runs
+  // before the branch update. A dirty worktree still stays (no --force), and
+  // the error comment has to say which one and why.
+
+  test("nothing held → empty, the comment is unchanged", () => {
+    assert.equal(describeHeldWorktrees("feature/1430", []), "");
+  });
+
+  test("a dirty worktree → named, with its uncommitted changes", () => {
+    const text = describeHeldWorktrees("feature/1430", [{
+      path: "/w/.pyrycode-worktrees/pyrycode-mobile/documentation-1430",
+      error: "fatal: '/w/.pyrycode-worktrees/pyrycode-mobile/documentation-1430' contains modified or untracked files, use --force to delete it",
+    }]);
+    assert.match(text, /`feature\/1430` is still checked out/);
+    assert.match(text, /- `\/w\/\.pyrycode-worktrees\/pyrycode-mobile\/documentation-1430` has uncommitted changes/);
+    assert.match(text, /never force-removes/);
+  });
+
+  test("refused for another reason → git's first line quoted, not called uncommitted changes", () => {
+    const text = describeHeldWorktrees("feature/7", [{
+      path: "/w/locked-7",
+      error: "fatal: cannot remove a locked working tree;\nuse 'remove -f -f' to override or unlock first",
+    }]);
+    assert.match(text, /- `\/w\/locked-7` could not be removed: fatal: cannot remove a locked working tree;$/m);
+    assert.doesNotMatch(text, /uncommitted/);
   });
 });
 
