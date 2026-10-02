@@ -9,7 +9,7 @@ import { DispatchPool, candidateKey, excludeInFlight, freeSeats, resolvePollInte
 import { countVerdictsSince, parseVerdictArtifacts, pickVerdictPr, shouldFlagMissingVerdict } from "./verdict-guard.js";
 import { countOpenPrs, shouldFlagMissingPr } from "./pr-guard.js";
 import { resolveImportOnlyMerge } from "./merge-resolve.js";
-import { MERGE_HANDOFF_LABEL, checkMergeResolution, decideConflictRoute, mergeHandoffNote, readPendingMerge, type PendingMerge } from "./merge-handoff.js";
+import { MERGE_HANDOFF_LABEL, checkMergeResolution, decideConflictRoute, findMergeCommit, mergeHandoffNote, mergeResolutionComment, mergeResolutionSection, readPendingMerge, type PendingMerge, type ResolutionNote } from "./merge-handoff.js";
 
 import { buildClaudeSourceReviewInvocation, buildCodexInvocation, codexChildEnv, CODEX_ROLE_GUIDANCE, CodexStreamAdapter, formatRunCost, resumeCommand, resolveAgentRunner, type AgentRunner } from "./agent-runner.js";
 
@@ -1174,6 +1174,7 @@ async function buildPromptForAgent(
   agent: AgentConfig,
   item: ProjectItem,
   specRoot: string,
+  client: Pick<DispatchClient, "getIssueCommentBodies">,
 ): Promise<string> {
   const parts: string[] = [];
 
@@ -1290,6 +1291,19 @@ async function buildPromptForAgent(
     } catch (e) {
       console.warn(`   ⚠️  Failed to look up PR for #${ticketNum}: ${e}`);
       parts.push(`\n## Pull Request\nCould not determine PR number. Find it with: gh pr list --head feature/${ticketNum}`);
+    }
+  }
+
+  // A merge the code owner finished may have changed main's lines inside
+  // the conflict blocks. The dispatcher pushed it and listed those lines in
+  // an issue comment, which no review stage reads unless it is put here
+  // (merge-handoff.ts, pyrycode-mobile #1355 on 2026-10-02).
+  if (ticketNum > 0 && decideConflictRoute(activeStageSet().agents, agent.name, REAL_CLAUDE_GATE_FAIL_COLUMN).kind === "route") {
+    try {
+      const section = mergeResolutionSection(await client.getIssueCommentBodies(ticketNum));
+      if (section) parts.push(section);
+    } catch (e) {
+      console.warn(`   ⚠️  Failed to read merge resolution notes for #${ticketNum}: ${e}`);
     }
   }
 
@@ -1802,6 +1816,10 @@ export interface DispatchClient {
    *  (`runFamilyBreaker` fails open for the cycle, falling back to the
    *  convenience label). */
   getFamilyDispatchState(issueNumber: number): Promise<{ markerCount: number; breakerCommented: boolean }>;
+  /** Every comment body on an issue, oldest first. The stages after the
+   *  code owner read the merge resolution notes from it (merge-handoff.ts).
+   *  Throws on fetch failure (the prompt goes out without the notes). */
+  getIssueCommentBodies(issueNumber: number): Promise<string[]>;
 }
 
 // IO surface every phase function depends on. Threading it through
@@ -2610,7 +2628,8 @@ export async function setupBranchAndWorktree(
           `## 🔀 Merge conflict left for ${agent.name}\n\n` +
           `Merging \`${defaultBranch}\` into \`${branchName}\` conflicted in:\n\n${fileList}\n\n` +
           `The ${agent.name} run finishes the merge first. When it ends, the dispatcher checks that the merge is committed, ` +
-          `no conflict markers remain and every line \`${defaultBranch}\` added to those files survived, before anything is pushed.`,
+          `no conflict markers remain and every line \`${defaultBranch}\` added outside the conflict blocks survived, before anything is pushed. ` +
+          `Lines of \`${defaultBranch}\` inside the conflict blocks that the resolution changes are listed on this ticket for the review stages.`,
         );
       } catch {}
       return { ok: true };
@@ -2671,7 +2690,7 @@ export async function prepareAgentSpawn(
   const runner = resolveAgentRunner(process.env);
 
   // Build prompt AFTER worktree creation so specs are read from the feature branch
-  const prompt = await buildPromptForAgent(agent, item, agentCwd);
+  const prompt = await buildPromptForAgent(agent, item, agentCwd, client);
 
   // Re-index QMD in the worktree so the agent has the latest docs.
   // Gated on useWorktree because there's no isolated tree to re-index in
@@ -3238,9 +3257,12 @@ export async function handlePostRun(
 
   // A merge left for this run must be finished, and must keep main's side,
   // before the safety-net commit or the push can touch it. On failure the
-  // worktree stays as it is for a human, and nothing reaches origin.
+  // worktree stays as it is for a human, and nothing reaches origin. Main's
+  // lines the resolution changed inside the conflict blocks do not stop it;
+  // they are posted for the review stages once the push lands.
+  let resolutionNotes: ResolutionNote[] = [];
   if (ctx.pendingMerge && useWorktree && item.issueNumber > 0) {
-    const problems = checkMergeResolution(agentCwd, ctx.pendingMerge, ctx.deps);
+    const { problems, notes } = checkMergeResolution(agentCwd, ctx.pendingMerge, ctx.deps);
     if (problems.length > 0) {
       console.error(`   ❌ ${agent.name} did not finish the merge of ${defaultBranch} cleanly on #${item.issueNumber}`);
       ctx.deps.writeLog(logFile, "MERGE CHECK FAILED", problems.join("\n"));
@@ -3256,7 +3278,10 @@ export async function handlePostRun(
       } catch {}
       return { ok: false };
     }
-    console.log(`   🔀 Merge of ${defaultBranch} finished; main's side is intact in ${ctx.pendingMerge.paths.length} file(s)`);
+    resolutionNotes = notes;
+    console.log(notes.length === 0
+      ? `   🔀 Merge of ${defaultBranch} finished; main's side is intact in ${ctx.pendingMerge.paths.length} file(s)`
+      : `   🔀 Merge of ${defaultBranch} finished; main's lines changed inside the conflicts in ${notes.length} file(s), noted for review`);
   }
 
   const output = streamResult.output;
@@ -3355,6 +3380,18 @@ export async function handlePostRun(
         await client.addComment(item.issueNumber, `## ⚠️ Dispatch Error: ${agent.name}\n\n\`git push -u origin ${branchName}\` failed — the agent's commits never reached origin. Common cause: out-of-band push to \`${branchName}\` advanced the remote past this worktree's HEAD (non-fast-forward).\n\nTreating as \`error:${agent.name}\`. To retry: investigate the worktree state, rebase if appropriate, then strip the \`error:${agent.name}\` label.\n\n\`\`\`\n${detail}\n\`\`\``);
       } catch {}
       return { ok: false };
+    }
+  }
+
+  // The merge is on origin now, so the review stages can look at what it
+  // changed of main's side. They read this comment through their prompt.
+  if (ctx.pendingMerge && resolutionNotes.length > 0) {
+    const comment = mergeResolutionComment(defaultBranch, resolutionNotes, findMergeCommit(agentCwd, ctx.pendingMerge, ctx.deps));
+    ctx.deps.writeLog(logFile, "MERGE RESOLUTION NOTE", comment);
+    try {
+      await client.addComment(item.issueNumber, comment);
+    } catch (e) {
+      console.warn(`   ⚠️  Failed to post the merge resolution note on #${item.issueNumber}: ${e}`);
     }
   }
 

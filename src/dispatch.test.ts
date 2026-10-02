@@ -59,6 +59,7 @@ import {
   setupBranchAndWorktree,
   SIGINT_DEBOUNCE_MS,
   SIGINT_FORCE_EXIT_WINDOW_MS,
+  DEFAULT_DEPS,
   type DispatchClient,
   type DispatchContext,
   type DispatchDeps,
@@ -78,6 +79,7 @@ import {
   type StreamResult,
 } from "./dispatch.js";
 import { formatGateEvidenceComment } from "./gate-output.js";
+import { MERGE_RESOLUTION_NOTE_MARKER, mergeResolutionComment } from "./merge-handoff.js";
 import { resetActiveStageSetForTests, resolveStageSet } from "./stage-sets.js";
 import type { AgentConfig, BlockerInfo, ProjectItem } from "./types.js";
 import {
@@ -407,6 +409,7 @@ export class MockGitHubClient implements DispatchClient {
   updateItemStatusCalls: { itemId: string; newStatus: string }[] = [];
   closeIssueCalls: number[] = [];
   getLatestRetryAtCalls: number[] = [];
+  getIssueCommentBodiesCalls: number[] = [];
   retryAtByIssue: Map<number, Date | null> = new Map();
   /** Pre-seeded family tallies for `getFamilyDispatchState` — markers
    *  that existed on the root before this cycle. Comments posted through
@@ -440,6 +443,7 @@ export class MockGitHubClient implements DispatchClient {
     getAllProjectItems?: Error;
     getStrandedWipMarkers?: Error | ((issueNumber: number) => Error | null);
     closeIssue?: Error | ((issueNumber: number) => Error | null);
+    getIssueCommentBodies?: Error;
   } = {};
 
   constructor(opts: {
@@ -567,6 +571,13 @@ export class MockGitHubClient implements DispatchClient {
     }
     const item = this.itemsByIssueNumber.get(issueNumber);
     if (item) item.state = "CLOSED";
+  }
+
+  /** Comments posted through this client, oldest first. */
+  async getIssueCommentBodies(issueNumber: number): Promise<string[]> {
+    this.getIssueCommentBodiesCalls.push(issueNumber);
+    if (this.failures.getIssueCommentBodies) throw this.failures.getIssueCommentBodies;
+    return this.comments.filter(c => c.issueNumber === issueNumber).map(c => c.body);
   }
 
   async getLatestRetryAt(issueNumber: number): Promise<Date | null> {
@@ -1044,7 +1055,10 @@ describe("setupBranchAndWorktree — failure modes", () => {
     assert.deepEqual(client.addLabelCalls, []);
     assert.match(client.comments[0]!.body, /Merge conflict left for developer/);
     assert.match(client.comments[0]!.body, /`Thread\.kt`/);
-    assert.deepEqual(ctx.pendingMerge, { paths: ["Thread.kt"], mainSha: "mainsha", baseSha: "basesha", headSha: "headsha" });
+    assert.deepEqual(ctx.pendingMerge, {
+      paths: ["Thread.kt"], mainSha: "mainsha", baseSha: "basesha", headSha: "headsha",
+      mainConflictLines: { "Thread.kt": ["val x = 2"] },
+    });
     assert.ok(!calls.fs.some(f => f.kind === "write" && f.path === path), "the dispatcher resolves nothing itself");
     assert.ok(!calls.exec.some(c => c.cmd.includes("git merge --abort")), "the merge stays for the agent");
     assert.ok(!calls.exec.some(c => c.cmd.includes("git commit")));
@@ -7917,7 +7931,7 @@ describe("runPendingDoneFinalize", () => {
 // checked before the safety-net commit and the push; a run that errors is
 // never salvaged, since salvage would push whatever markers it left.
 describe("merge handoff — the owner's run", () => {
-  const pendingMerge = { paths: ["Thread.kt"], mainSha: "mainsha", baseSha: "basesha", headSha: "headsha" };
+  const pendingMerge = { paths: ["Thread.kt"], mainSha: "mainsha", baseSha: "basesha", headSha: "headsha", mainConflictLines: {} };
 
   test("merge still in progress → error:<agent>, comment, no commit, no push, {ok:false}", async () => {
     const { ctx, client, calls } = makeTestContext({
@@ -7936,7 +7950,7 @@ describe("merge handoff — the owner's run", () => {
     assert.ok(!calls.exec.some(c => c.cmd.includes("git push")));
   });
 
-  test("main's added line dropped → names it, no push, {ok:false}", async () => {
+  test("main's added line outside the conflicts dropped → names it, no push, {ok:false}", async () => {
     const { ctx, client, calls } = makeTestContext({
       item: { issueNumber: 808 },
       mockOptions: {
@@ -7952,7 +7966,7 @@ describe("merge handoff — the owner's run", () => {
     const result = await handlePostRun(STREAM_OK(), ctx, false);
 
     assert.deepEqual(result, { ok: false });
-    assert.match(client.comments[0]!.body, /lost 1 line\(s\) main added: `turnOutcome = turnOutcome,`/);
+    assert.match(client.comments[0]!.body, /lost 1 line\(s\) main added outside the conflict blocks: `turnOutcome = turnOutcome,`/);
     assert.ok(!calls.exec.some(c => c.cmd.includes("git push")));
   });
 
@@ -7978,6 +7992,50 @@ describe("merge handoff — the owner's run", () => {
     assert.ok(calls.exec.some(c => c.cmd.includes("git push -u origin feature/808")));
   });
 
+  // pyrycode-mobile #1355, 2026-10-02: the ticket rewrote main's line
+  // inside the conflict on purpose. The merge goes out, and the review
+  // stages are told what changed.
+  const changedInsideConflict = (extra: Record<string, ExecHandler> = {}) => makeTestContext({
+    item: { issueNumber: 1355 },
+    mockOptions: {
+      execImpls: {
+        ...extra,
+        "git rev-parse -q --verify MERGE_HEAD": () => execError({ status: 1 }),
+        "git show HEAD:": () => "Composer {\n  sendInLocalWindow { send(trimmed) }\n}\n",
+        "git diff -U0 basesha mainsha": () => "+++ b/Thread.kt\n+  sendInLocalWindow { send(text) }\n",
+        "git rev-list --merges --parents headsha..HEAD": () => "mergesha headsha mainsha\n",
+        "git status --porcelain": () => "",
+        "git rev-list --count main..": () => "3\n",
+      },
+    },
+  });
+  const insideConflict = { ...pendingMerge, mainConflictLines: { "Thread.kt": ["sendInLocalWindow { send(text) }"] } };
+
+  test("main's line changed inside a conflict → pushes, then notes it for review with the merge commit", async () => {
+    const { ctx, client, calls } = changedInsideConflict();
+    ctx.pendingMerge = insideConflict;
+
+    const result = await handlePostRun(STREAM_OK(), ctx, false);
+
+    assert.deepEqual(result, { ok: true });
+    assert.ok(!client.addLabelCalls.some(c => c.label.startsWith("error:")));
+    assert.ok(calls.exec.some(c => c.cmd.includes("git push -u origin feature/1355")));
+    const notes = client.comments.filter(c => c.body.includes(MERGE_RESOLUTION_NOTE_MARKER));
+    assert.equal(notes.length, 1);
+    assert.match(notes[0]!.body, /merge commit mergesha/);
+    assert.match(notes[0]!.body, /`Thread\.kt`, 1 line\(s\):\n\n```text\nsendInLocalWindow \{ send\(text\) \}\n```/);
+  });
+
+  test("a failed push posts no review note: nothing reached origin to review", async () => {
+    const { ctx, client } = changedInsideConflict({ "git push": () => execError({ stderr: "non-fast-forward" }) });
+    ctx.pendingMerge = insideConflict;
+
+    const result = await handlePostRun(STREAM_OK(), ctx, false);
+
+    assert.deepEqual(result, { ok: false });
+    assert.ok(!client.comments.some(c => c.body.includes(MERGE_RESOLUTION_NOTE_MARKER)));
+  });
+
   test("a run that errors mid-merge is never salvaged", async () => {
     const { ctx, client, calls } = makeTestContext({ item: { issueNumber: 808 } });
     ctx.pendingMerge = pendingMerge;
@@ -7988,6 +8046,49 @@ describe("merge handoff — the owner's run", () => {
     );
     assert.ok(!calls.exec.some(c => c.cmd.includes("git add -A") || c.cmd.includes("git push")));
     assert.ok(!client.addLabelCalls.some(c => c.label === "error:max_turns_salvaged"));
+  });
+});
+
+// The stages after the code owner read the merge resolution note through
+// their prompt; comments reach no other prompt (merge-handoff.ts, #1355).
+// Only stages that need no `gh` call are built here.
+describe("buildPromptForAgent — merge resolution to review", () => {
+  const item = makeProjectItem({ issueNumber: 1355 });
+  const specRoot = resolve(tmpdir(), "no-spec-root-for-merge-notes");
+  const note = mergeResolutionComment("main", [{ path: "Composer.kt", lines: ["sendInLocalWindow { send(text) }"] }], "mergesha");
+  async function prompt(set: string, name: string, client: MockGitHubClient) {
+    const agent = resolveStageSet(set).agents.find(a => a.name === name)!;
+    return withStageSet(set, () => DEFAULT_DEPS.buildPromptForAgent(agent, item, specRoot, client));
+  }
+  async function clientWithNote() {
+    const client = new MockGitHubClient();
+    await client.addComment(1355, note);
+    return client;
+  }
+
+  test("a stage after the code owner gets the note, fenced as data", async () => {
+    for (const set of ["classic", "builder"]) {
+      const text = await prompt(set, "documentation", await clientWithNote());
+      assert.match(text, /\n## Merge resolution to review\n/, set);
+      assert.match(text, /----- BEGIN MERGE NOTES -----\n[\s\S]*sendInLocalWindow \{ send\(text\) \}[\s\S]*\n----- END MERGE NOTES -----/, set);
+    }
+  });
+
+  test("the code owner and earlier stages get no section and read no comments", async () => {
+    for (const [set, name] of [["classic", "developer"], ["classic", "architect"], ["builder", "builder"]] as const) {
+      const client = await clientWithNote();
+      const text = await prompt(set, name, client);
+      assert.doesNotMatch(text, /Merge resolution to review/, `${set}/${name}`);
+      assert.deepEqual(client.getIssueCommentBodiesCalls, [], `${set}/${name}`);
+    }
+  });
+
+  test("a failed comment read sends the prompt without the section", async () => {
+    const client = await clientWithNote();
+    client.failures.getIssueCommentBodies = new Error("rate limited");
+    const text = await prompt("classic", "documentation", client);
+    assert.doesNotMatch(text, /Merge resolution to review/);
+    assert.match(text, /# Ticket #1355/);
   });
 });
 
