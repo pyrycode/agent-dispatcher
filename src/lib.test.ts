@@ -23,6 +23,7 @@ import {
   STDERR_MESSAGE_CHARS,
   STDERR_TAIL_CAP,
   stderrForMessage,
+  withoutStderrSection,
   AgentRunStoppedError,
   canSalvagePartialWork,
   decidePartialWorkSalvage,
@@ -6355,6 +6356,16 @@ describe("runner stderr: tail, scrub and message (pyrycode-mobile #1340, 2026-10
     assert.match(out, /final error sk-ant-\[REDACTED\]/);
     assert.ok(!out.includes("```"), "a triple backtick would end the ticket comment's code block");
     assert.equal(stderrForMessage("  \n"), "");
+  });
+
+  test("withoutStderrSection: retry classification never reads the stderr tail", () => {
+    // A bare `429` or `529` in stderr, here a line number and a PID, must not
+    // turn a crash into a transient retry.
+    const msg = noResultErrorMessage(1, "at cli.js:4290:12\nworker 15291 exited\n");
+    assert.equal(withoutStderrSection(msg), "Claude CLI exited with code 1, no result message received");
+    assert.equal(classifyAgentError(msg).transient, true, "the raw message would have matched the allowlist");
+    assert.equal(classifyAgentError(withoutStderrSection(msg)).transient, false);
+    assert.equal(withoutStderrSection("Agent idle_stall: no output"), "Agent idle_stall: no output");
   });
 
   test("noResultErrorMessage appends the scrubbed tail, and nothing when stderr was empty", () => {

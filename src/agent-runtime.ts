@@ -1414,9 +1414,26 @@ export function stderrForMessage(tail: string, max = STDERR_MESSAGE_CHARS): stri
   return scrubCredentials(tail).slice(-max).replace(/`{3,}/g, "'''").trim();
 }
 
+/** Opens the stderr section that {@link noResultErrorMessage} appends. */
+export const STDERR_SECTION_PREFIX = "\n--- stderr (last ";
+
 /** The runner's error when the CLI exits without a result frame. */
 export function noResultErrorMessage(code: number | null, stderrTail: string): string {
   const base = `Claude CLI exited with code ${code}, no result message received`;
   const tail = stderrForMessage(stderrTail);
-  return tail ? `${base}\n--- stderr (last ${STDERR_MESSAGE_CHARS} chars) ---\n${tail}` : base;
+  return tail ? `${base}${STDERR_SECTION_PREFIX}${STDERR_MESSAGE_CHARS} chars) ---\n${tail}` : base;
+}
+
+/**
+ * The part of an error message the retry classifier reads: everything
+ * before the stderr section. The stderr tail is evidence for the operator,
+ * not a failure signature. RETRY_ALLOWLIST matches bare substrings such as
+ * `429` and `529`, which a line number, a PID or a timestamp in arbitrary
+ * stderr would hit, turning a crash that should park for a human into four
+ * backoff retries. Classification therefore sees exactly the text it saw
+ * before the tail was added (2026-10-02, #1340).
+ */
+export function withoutStderrSection(message: string): string {
+  const i = message.indexOf(STDERR_SECTION_PREFIX);
+  return i < 0 ? message : message.slice(0, i);
 }

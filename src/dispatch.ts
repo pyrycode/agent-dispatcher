@@ -36,6 +36,7 @@ import {
   appendStderrTail,
   noResultErrorMessage,
   scrubCredentials,
+  withoutStderrSection,
   maxTurnsFor,
   mergeLegResults,
   parseBudgetScale,
@@ -2369,7 +2370,7 @@ export async function handleDispatchError(
   if (item.issueNumber > 0) {
     const classifyText = isResourceExhausted
       ? `${error.message} ${(error as ResourceExhaustedError).errno}`
-      : (error?.message ?? "");
+      : withoutStderrSection(error?.message ?? "");
     // The structured `terminal_reason` is passed alongside the text so a
     // server-side API failure retries on claude's own classification rather
     // than on whichever wording the API happened to use. 15 of 79 such
