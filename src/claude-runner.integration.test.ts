@@ -119,3 +119,42 @@ test("a CLI that exits without a result keeps its stderr: scrubbed tail in the e
   assert.match(log, /at retry \(cli\.js:1:2\)/);
   assert.ok(!log.includes("c".repeat(40)), "the log copy is scrubbed too");
 });
+
+// pyrycode-mobile #1432 (2026-10-02): the source review's prompt was piped
+// in after spawn, the dispatcher's event loop did not get to it within the
+// CLI's 3-second stdin window, and the CLI exited 1 with no result. The
+// prompt now IS the child's stdin, a regular file the kernel serves, so its
+// delivery no longer depends on this process. The fixture reports what fd 0
+// is and what it read, while the parent blocks its own event loop for 1.5 s
+// right after starting the run, the shape of a burst of blocking git calls.
+const STDIN_FIXTURE = `#!${process.execPath}
+const fs = require("node:fs");
+const out = (m) => process.stdout.write(JSON.stringify(m) + "\\n");
+const kind = fs.fstatSync(0).isFile() ? "file" : "other";
+const text = kind === "file" ? fs.readFileSync(0, "utf8") : "";
+out({ type: "system", subtype: "init", session_id: "sess-stdin" });
+out({ type: "result", subtype: "success", is_error: false, num_turns: 1, result: kind + ":" + text, session_id: "sess-stdin", terminal_reason: "completed" });
+`;
+
+test("a runner that reads its prompt on stdin gets the prompt file itself, even while the event loop is blocked", async t => {
+  const root = mkdtempSync(join(tmpdir(), "claude-stdin-test-"));
+  const savedLegacy = process.env.PYRY_USE_LEGACY_CLAUDE;
+  process.env.PYRY_USE_LEGACY_CLAUDE = "1"; // the `claude -p` path reads the prompt from stdin
+  t.after(() => {
+    rmSync(root, { recursive: true, force: true });
+    if (savedLegacy === undefined) delete process.env.PYRY_USE_LEGACY_CLAUDE;
+    else process.env.PYRY_USE_LEGACY_CLAUDE = savedLegacy;
+  });
+  writeFileSync(join(root, "claude"), STDIN_FIXTURE);
+  chmodSync(join(root, "claude"), 0o755);
+  writeFileSync(join(root, "prompt.txt"), "review this diff");
+  writeFileSync(join(root, "system.txt"), "role");
+  const run = runClaudeStreaming({
+    runner: "claude", cwd: root, promptFile: join(root, "prompt.txt"), systemPromptFile: join(root, "system.txt"),
+    model: "fixture-model", effort: "high", maxTurns: 10, allowedTools: "Bash", disallowedTools: "",
+    timeoutMs: 20_000, logFile: join(root, "run.log"), env: { PATH: root + ":" + process.env.PATH },
+  });
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1500);
+  const result = await run;
+  assert.equal(result.output, "file:review this diff");
+});

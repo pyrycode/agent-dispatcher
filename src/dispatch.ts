@@ -1,5 +1,5 @@
 import { type ChildProcess, execSync, spawn, spawnSync } from "node:child_process";
-import { readFileSync, existsSync, writeFileSync, mkdirSync, mkdtempSync, rmdirSync, appendFileSync, readdirSync, createReadStream, createWriteStream, statSync, symlinkSync, unlinkSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync, mkdirSync, mkdtempSync, rmdirSync, appendFileSync, readdirSync, createWriteStream, statSync, symlinkSync, unlinkSync, openSync, closeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve, dirname, basename } from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -827,15 +827,37 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
     // (defined above the spawn function), which use the negative-PID
     // syntax to signal the whole pgrp.
     //
-    // stdio remains piped so the dispatcher reads stream-json as
+    // stdout and stderr stay piped so the dispatcher reads stream-json as
     // before; the child is NOT `unref()`d — its lifecycle stays bound
     // to the dispatcher's event loop. Surfaced 2026-05-22.
-    const child = spawn(bin, args, {
-      cwd: opts.cwd,
-      env: isCodex ? codexChildEnv(opts.env) : opts.env,
-      stdio: ["pipe", "pipe", "pipe"],
-      detached: true,
-    });
+    //
+    // STDIN IS THE PROMPT FILE ITSELF, handed over as a file descriptor.
+    // It used to be piped from a read stream after spawn, which needs this
+    // process's event loop to run. The dispatcher is one process doing
+    // blocking git and gh calls for every board item, and the Claude CLI
+    // gives up when no stdin arrives within 3 seconds: "no stdin data
+    // received in 3s, proceeding without it", then "Input must be
+    // provided ... when using --print", exit 1, no result. That killed
+    // pyrycode-mobile #1432's source review 13 seconds after spawn on
+    // 2026-10-02, 38 seconds after a restart, and is the likely cause of
+    // #1340's identical exit that morning. With the file as stdin the
+    // kernel serves the prompt; nothing here has to run in time. A runner
+    // that reads its prompt from disk (pyry agent-run) gets no stdin, as
+    // before when the pipe was closed at once.
+    const readsPromptOnStdin = isCodex || claudeReadsStdin;
+    const promptFd = readsPromptOnStdin ? openSync(opts.promptFile, "r") : null;
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(bin, args, {
+        cwd: opts.cwd,
+        env: isCodex ? codexChildEnv(opts.env) : opts.env,
+        stdio: [promptFd ?? "ignore", "pipe", "pipe"],
+        detached: true,
+      });
+    } finally {
+      // The child holds its own copy from the moment spawn returns.
+      if (promptFd !== null) closeSync(promptFd);
+    }
     // Track the new pgrp leader so SIGINT-force-exit / SIGHUP can tear
     // it down without a `child` reference. `child.pid` is undefined if
     // spawn synchronously failed; the surrounding `retrySpawnOnTransientError`
@@ -912,27 +934,6 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
       }
     };
 
-    child.stdin!.on("error", (err: NodeJS.ErrnoException) => {
-      // An early CLI rejection closes stdin. Its exit/result remains authoritative.
-      if (err.code !== "EPIPE") { killChildPgrp(child, "SIGTERM"); reject(err); }
-    });
-    if (isCodex || claudeReadsStdin) {
-      // Pipe the prompt file content into claude's stdin, then close. Replaces
-      // the prior `bash -c "cat ${file} | claude ..."` which made promptFile
-      // pass through a shell quoting layer.
-      const promptStream = createReadStream(opts.promptFile);
-      promptStream.pipe(child.stdin!);
-      promptStream.on("error", (err) => {
-        clearTimeout(timer);
-        if (idleTimer) clearInterval(idleTimer);
-        killChildPgrp(child, "SIGTERM");
-        reject(err);
-      });
-    } else {
-      // pyry agent-run reads --prompt-file directly from disk; close stdin
-      // so the child doesn't wait for input that won't come.
-      child.stdin!.end();
-    }
 
     child.stdout!.on("data", (chunk: Buffer) => {
       buffer += decoder.write(chunk);
