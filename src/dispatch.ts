@@ -58,6 +58,14 @@ import {
 } from "./main-sweep.js";
 import { recordFlakyTests } from "./flaky-tickets.js";
 import { recordInheritedTests } from "./inherited-tickets.js";
+import {
+  decideVerifierGateReuse,
+  hashGateList,
+  parseVerifierGatePass,
+  verifierGatePassFileName,
+  verifierGateReuseEnabled,
+  type VerifierGatePass,
+} from "./verifier-gate-reuse.js";
 import { activeStageSet } from "./stage-sets.js";
 import { resolveEffort } from "./effort-policy.js";
 import {
@@ -3709,6 +3717,9 @@ export interface VerifierGatesOutcome {
   outputTail: string;
   /** One human-readable line per executed gate, for the GATES log. */
   summary: string[];
+  /** The stdout and stderr log of every executed gate, in run order. A
+   *  recorded pass names them as its evidence (verifier-gate-reuse.ts). */
+  logPaths: string[];
 }
 
 /**
@@ -3736,10 +3747,12 @@ export async function runVerifierGates(opts: {
 }): Promise<VerifierGatesOutcome> {
   const logsDir = opts.logsDir ?? LOGS_DIR;
   const summary: string[] = [];
+  const logPaths: string[] = [];
   for (let i = 0; i < opts.gates.length; i++) {
     const gate = opts.gates[i]!;
     const stdoutPath = resolve(logsDir, `verifier-gate_#${opts.issueNumber}_${i + 1}.log`);
     const stderrPath = resolve(logsDir, `verifier-gate_#${opts.issueNumber}_${i + 1}.stderr.log`);
+    logPaths.push(stdoutPath, stderrPath);
     const outcome = await opts.deps.spawnGate({
       command: gate,
       cwd: opts.cwd,
@@ -3771,10 +3784,67 @@ export async function runVerifierGates(opts: {
       const outputTail = combined.length > VERIFIER_GATE_TAIL_CAP
         ? combined.slice(-VERIFIER_GATE_TAIL_CAP)
         : combined;
-      return { ok: false, failedGate: gate, outputTail, summary };
+      return { ok: false, failedGate: gate, outputTail, summary, logPaths };
     }
   }
-  return { ok: true, failedGate: null, outputTail: "", summary };
+  return { ok: true, failedGate: null, outputTail: "", summary, logPaths };
+}
+
+/**
+ * HEAD of the gated worktree after the default branch was merged in: the
+ * commit a recorded gate pass is keyed by. Empty when it cannot stand for
+ * the files the gates test, because git failed or because a conflicted merge
+ * was left for the agent to finish and the worktree holds files HEAD does
+ * not describe. Empty means no reuse and no record.
+ */
+function mergedWorktreeHead(ctx: DispatchContext): string {
+  if (ctx.pendingMerge) return "";
+  try {
+    const head = String(ctx.deps.execSync("git rev-parse HEAD", {
+      cwd: ctx.agentCwd, encoding: "utf-8", stdio: "pipe", timeout: 15_000,
+    })).trim();
+    return /^[0-9a-f]{40,64}$/.test(head) ? head : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * The recorded gate pass for this dispatch, when it may stand in for running
+ * the gates (`decideVerifierGateReuse`). Any read or parse failure returns
+ * null, and the caller runs the gates as normal.
+ */
+function readReusableGatePass(
+  ctx: DispatchContext,
+  passFile: string,
+  commit: string,
+  gatesHash: string,
+): VerifierGatePass | null {
+  const issueNumber = ctx.item.issueNumber;
+  let raw: string;
+  try {
+    raw = String(ctx.deps.readFileSync(passFile, "utf-8"));
+  } catch (e: any) {
+    // No pass recorded yet is the common case and needs no line.
+    if (e?.code !== "ENOENT") console.warn(`   ⚠️  Could not read the recorded gate pass for #${issueNumber}, so the gates run: ${e?.message ?? e}`);
+    return null;
+  }
+  const pass = parseVerifierGatePass(raw);
+  if (pass === null) {
+    console.warn(`   ⚠️  Recorded gate pass for #${issueNumber} is unreadable, so the gates run`);
+    return null;
+  }
+  const decision = decideVerifierGateReuse({
+    pass,
+    issueNumber,
+    commit,
+    gatesHash,
+    nowMs: Date.now(),
+    logExists: (p) => ctx.deps.existsSync(p),
+  });
+  if (decision.reuse) return decision.pass;
+  console.log(`   🧪 Recorded gate pass for #${issueNumber} not reused (${decision.reason})`);
+  return null;
 }
 
 /**
@@ -3803,6 +3873,10 @@ export async function runVerifierGates(opts: {
  *   a deterministic bounce would loop forever on a failure that
  *   pre-exists on the merge base. Nothing is labelled or commented here;
  *   routing is the model's verdict, not the gate's.
+ * - **Already green on this commit** → a full pass recorded on the same
+ *   merged HEAD with the same gate list in the last 24 hours is reused:
+ *   no gate runs, and the green note says whose results they are. See
+ *   verifier-gate-reuse.ts; `PYRY_VERIFIER_GATE_REUSE=0` turns it off.
  */
 export async function maybeRunPreSpawnGates(
   ctx: DispatchContext,
@@ -3818,6 +3892,42 @@ export async function maybeRunPreSpawnGates(
     return { promptNote: "" };
   }
 
+  const greenNote = (lead: string): string => [
+    "",
+    "",
+    "## Deterministic gates",
+    "",
+    lead,
+    ...gates.map((g) => `- \`${g}\``),
+    "",
+    "Treat these as green — do not spend turns re-running them just to establish a baseline.",
+  ].join("\n");
+
+  // A full pass on this exact merged commit with this exact gate list is
+  // reused instead of run again. #1340's verifier crashed one second after
+  // 22 minutes of green gates on 2026-10-02, and its retry would have paid
+  // for all of them again. With reuse off, or HEAD unknown, nothing is read
+  // or recorded and the gates run exactly as before.
+  const passFile = resolve(LOGS_DIR, verifierGatePassFileName(item.issueNumber));
+  const gatesHash = hashGateList(gates);
+  const commit = verifierGateReuseEnabled(process.env) ? mergedWorktreeHead(ctx) : "";
+  if (commit !== "") {
+    const reused = readReusableGatePass(ctx, passFile, commit, gatesHash);
+    if (reused !== null) {
+      console.log(`   ♻️  Pre-${agent.name} gates already passed on ${commit.slice(0, 12)} at ${reused.passedAt}; reusing that result`);
+      ctx.deps.writeLog(
+        logFile,
+        "GATES",
+        [`Reused the pass recorded at ${reused.passedAt} on commit ${commit}; no gate ran in this dispatch.`, ...reused.summary].join("\n"),
+      );
+      return {
+        promptNote: greenNote(
+          `The dispatcher ran the fork's deterministic gates on this same commit (\`${commit}\`) at ${reused.passedAt}, and all passed. These results are reused from that run rather than run again:`,
+        ),
+      };
+    }
+  }
+
   console.log(`   🧪 Pre-${agent.name} gates (${gates.length}): ${gates.map((g) => `\`${g}\``).join(", ")}`);
   const result = await runVerifierGates({
     gates,
@@ -3829,17 +3939,27 @@ export async function maybeRunPreSpawnGates(
 
   if (result.ok) {
     console.log(`   ✅ Pre-${agent.name} gates green`);
-    const promptNote = [
-      "",
-      "",
-      "## Deterministic gates",
-      "",
-      "The dispatcher ran the fork's deterministic gates in this worktree before spawning you; all passed:",
-      ...gates.map((g) => `- \`${g}\``),
-      "",
-      "Treat these as green — do not spend turns re-running them just to establish a baseline.",
-    ].join("\n");
-    return { promptNote };
+    // Only a full pass is recorded. A red, timed-out or unspawnable gate
+    // never is, so a retry after a flaky failure runs the gates again.
+    if (commit !== "") {
+      const pass: VerifierGatePass = {
+        issueNumber: item.issueNumber,
+        commit,
+        gatesHash,
+        gates,
+        passedAt: new Date().toISOString(),
+        summary: result.summary,
+        logPaths: result.logPaths,
+      };
+      try {
+        ctx.deps.writeFileSync(passFile, JSON.stringify(pass, null, 2) + "\n");
+      } catch (e: any) {
+        console.warn(`   ⚠️  Could not record the gate pass for #${item.issueNumber}, so a retry runs the gates again: ${e?.message ?? e}`);
+      }
+    }
+    return {
+      promptNote: greenNote("The dispatcher ran the fork's deterministic gates in this worktree before spawning you; all passed:"),
+    };
   }
 
   console.log(

@@ -78,6 +78,7 @@ import {
   type StreamResult,
 } from "./dispatch.js";
 import { formatGateEvidenceComment } from "./gate-output.js";
+import { hashGateList, type VerifierGatePass } from "./verifier-gate-reuse.js";
 import { resetActiveStageSetForTests, resolveStageSet } from "./stage-sets.js";
 import type { AgentConfig, BlockerInfo, ProjectItem } from "./types.js";
 import {
@@ -103,6 +104,7 @@ delete process.env.PYRY_STAGE_SET;
 delete process.env.PYRY_BUDGET_SCALE;
 delete process.env.PYRY_EFFORT_POLICY;
 delete process.env.PYRY_VERIFIER_PARALLEL_REVIEW;
+delete process.env.PYRY_VERIFIER_GATE_REUSE;
 resetActiveStageSetForTests();
 
 // Recompute agentsRepoRoot the same way dispatch.ts does so test
@@ -7410,6 +7412,155 @@ describe("pre-verifier gates — dispatchToAgent wiring", () => {
 
       assert.match(result.promptNote, /Z{120}-END/, "the gate's output tail must reach the verifier");
     }));
+  });
+});
+
+describe("pre-verifier gates — reusing a pass on the same commit (2026-10-02, #1340)", () => {
+  // #1340's verifier crashed one second after 22 minutes of green gates. A
+  // retry on the same merged commit must not pay for them again. Anything
+  // that changes what the gates would see, or casts doubt on the recorded
+  // evidence, runs them exactly as before.
+  const HEAD = "c".repeat(40);
+  const logsDir = resolve(TEST_AGENTS_REPO_ROOT, "logs");
+  const passFile = (n: number) => resolve(logsDir, `verifier-gate_#${n}.pass.json`);
+  const gateLogs = (n: number, count: number) =>
+    Array.from({ length: count }, (_, i) => [
+      resolve(logsDir, `verifier-gate_#${n}_${i + 1}.log`),
+      resolve(logsDir, `verifier-gate_#${n}_${i + 1}.stderr.log`),
+    ]).flat();
+  const recorded = (n: number, overrides: Partial<VerifierGatePass> = {}): VerifierGatePass => ({
+    issueNumber: n,
+    commit: HEAD,
+    gatesHash: hashGateList(["make check"]),
+    gates: ["make check"],
+    passedAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+    summary: ["✓ make check (exit 0)"],
+    logPaths: gateLogs(n, 1),
+    ...overrides,
+  });
+  /** A recorded pass on disk plus the gate logs it names. */
+  const fsWith = (n: number, pass: VerifierGatePass | string, logs = gateLogs(n, 1)): Record<string, string> => ({
+    [passFile(n)]: typeof pass === "string" ? pass : JSON.stringify(pass),
+    ...Object.fromEntries(logs.map((p) => [p, ""])),
+  });
+  const headImpls = (head = HEAD): Record<string, ExecHandler> => ({ "git rev-parse HEAD": () => `${head}\n` });
+  const passWrites = (calls: CallLog, n: number) =>
+    calls.fs.filter((f) => f.kind === "write" && f.path === passFile(n));
+
+  async function runGates(n: number, mockOptions: MockDepsOptions, gates = "make check") {
+    return withStageSet("builder", () => withVerifierGates(gates, async () => {
+      const { ctx, calls } = makeTestContext({ agent: builderAgent("verifier"), item: { issueNumber: n }, mockOptions });
+      const result = await maybeRunPreSpawnGates(ctx);
+      return { result, calls };
+    }));
+  }
+
+  test("a green run records the pass; a retry on the same commit reuses it and runs no gate", async () => {
+    const first = await runGates(1500, { execImpls: headImpls() });
+    assert.equal(first.calls.gates.length, 1);
+    const writes = passWrites(first.calls, 1500);
+    assert.equal(writes.length, 1, "a full pass is recorded");
+    const written = JSON.parse(writes[0]!.content!) as VerifierGatePass;
+    assert.equal(written.issueNumber, 1500);
+    assert.equal(written.commit, HEAD, "keyed by HEAD of the merged worktree");
+    assert.equal(written.gatesHash, hashGateList(["make check"]));
+    assert.deepEqual(written.logPaths, gateLogs(1500, 1), "names the gate logs as its evidence");
+    assert.deepEqual(written.summary, ["✓ make check (exit 0)"]);
+
+    const retry = await runGates(1500, { execImpls: headImpls(), fsMap: fsWith(1500, writes[0]!.content!) });
+
+    assert.equal(retry.calls.gates.length, 0, "no gate runs on a reused pass");
+    assert.match(retry.result.promptNote, /## Deterministic gates/, "the verifier's green heading is unchanged");
+    assert.ok(!retry.result.promptNote.includes("TRIAGE MODE"));
+    assert.match(retry.result.promptNote, /reused from that run/);
+    assert.ok(retry.result.promptNote.includes(written.passedAt), "the note names when the reused run happened");
+    assert.ok(retry.result.promptNote.includes(HEAD), "and that it ran on this same commit");
+    assert.match(retry.result.promptNote, /- `make check`/);
+    const log = loggedText(retry.calls);
+    assert.match(log, /Reused the pass recorded at/);
+    assert.match(log, /✓ make check \(exit 0\)/);
+    assert.equal(passWrites(retry.calls, 1500).length, 0, "a reuse does not re-stamp the pass");
+  });
+
+  test("a different merged commit runs the gates and records the new commit", async () => {
+    const other = "d".repeat(40);
+    const { result, calls } = await runGates(1501, { execImpls: headImpls(other), fsMap: fsWith(1501, recorded(1501)) });
+    assert.equal(calls.gates.length, 1);
+    assert.ok(!result.promptNote.includes("reused"));
+    const writes = passWrites(calls, 1501);
+    assert.equal(writes.length, 1);
+    assert.equal((JSON.parse(writes[0]!.content!) as VerifierGatePass).commit, other);
+  });
+
+  test("a different gate list runs the gates", async () => {
+    const { result, calls } = await runGates(
+      1502,
+      { execImpls: headImpls(), fsMap: fsWith(1502, recorded(1502)) },
+      "make check;make build",
+    );
+    assert.deepEqual(calls.gates.map((g) => g.command), ["make check", "make build"]);
+    assert.ok(!result.promptNote.includes("reused"));
+  });
+
+  test("a pass over 24 hours old runs the gates", async () => {
+    const stale = recorded(1503, { passedAt: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString() });
+    const { calls } = await runGates(1503, { execImpls: headImpls(), fsMap: fsWith(1503, stale) });
+    assert.equal(calls.gates.length, 1);
+  });
+
+  test("a gate log the pass names is gone → the gates run", async () => {
+    const [stdoutLog] = gateLogs(1504, 1);
+    const { calls } = await runGates(1504, { execImpls: headImpls(), fsMap: fsWith(1504, recorded(1504), [stdoutLog!]) });
+    assert.equal(calls.gates.length, 1);
+  });
+
+  test("PYRY_VERIFIER_GATE_REUSE=0: the gates run, nothing is read or recorded, HEAD is not asked", async () => {
+    const prior = process.env.PYRY_VERIFIER_GATE_REUSE;
+    process.env.PYRY_VERIFIER_GATE_REUSE = "0";
+    try {
+      const { calls } = await runGates(1505, { execImpls: headImpls(), fsMap: fsWith(1505, recorded(1505)) });
+      assert.equal(calls.gates.length, 1, "a matching pass is ignored");
+      assert.equal(passWrites(calls, 1505).length, 0);
+      assert.ok(!calls.fs.some((f) => f.path === passFile(1505)), "the pass file is not even read");
+      assert.ok(!calls.exec.some((e) => e.cmd.includes("git rev-parse HEAD")));
+    } finally {
+      if (prior === undefined) delete process.env.PYRY_VERIFIER_GATE_REUSE;
+      else process.env.PYRY_VERIFIER_GATE_REUSE = prior;
+    }
+  });
+
+  for (const [label, outcome] of [
+    ["red exit", { exitCode: 1, timedOut: false, spawnError: null }],
+    ["timeout", { exitCode: null, timedOut: true, spawnError: null }],
+    ["spawn error", { exitCode: null, timedOut: false, spawnError: "could not spawn gate command: ENOENT" }],
+  ] as const) {
+    test(`a run with a ${label} on any gate is never recorded, so a retry runs the gates again`, async () => {
+      const { result, calls } = await runGates(
+        1506,
+        {
+          execImpls: headImpls(),
+          gateImpl: (req) => req.command === "make build" ? outcome : { exitCode: 0, timedOut: false, spawnError: null },
+        },
+        "make check;make build",
+      );
+      assert.match(result.promptNote, /TRIAGE MODE/);
+      assert.equal(passWrites(calls, 1506).length, 0);
+    });
+  }
+
+  test("a corrupt pass file falls back to running the gates, and the new pass replaces it", async () => {
+    const { result, calls } = await runGates(1507, { execImpls: headImpls(), fsMap: fsWith(1507, '{"commit": tru') });
+    assert.equal(calls.gates.length, 1);
+    assert.ok(!result.promptNote.includes("reused"));
+    assert.match(result.promptNote, /## Deterministic gates/);
+    assert.equal(passWrites(calls, 1507).length, 1);
+  });
+
+  test("HEAD unknown: the gates run and nothing is recorded under an empty key", async () => {
+    // The default mock execSync answers every command with "".
+    const { calls } = await runGates(1508, { fsMap: fsWith(1508, recorded(1508, { commit: "" })) });
+    assert.equal(calls.gates.length, 1);
+    assert.equal(passWrites(calls, 1508).length, 0);
   });
 });
 

@@ -1,0 +1,133 @@
+// Verifier gate reuse: skip the pre-verifier gates when they already passed
+// on this exact commit.
+//
+// On pyrycode-mobile the pre-verifier gates take 11 to 22 minutes a pass,
+// most of it emulator device tests. On 2026-10-02 #1340's verifier crashed
+// one second after all seven gates passed ("Claude CLI exited with code 1,
+// no result message received"). Any retry on the same commit ran every gate
+// again for nothing.
+//
+// So a full pass is written down, keyed by the issue, the commit the gates
+// ran on (HEAD of the worktree after the default branch was merged in) and
+// a hash of the ordered gate list. The next verifier dispatch for the issue
+// reuses it when all three match, the pass is less than a day old and the
+// gate logs it names are still on disk. Only a full pass is recorded: a red,
+// timed-out or unspawnable gate never is, so a retry after a flaky failure
+// runs the gates again. `PYRY_VERIFIER_GATE_REUSE=0` turns the whole thing
+// off.
+//
+// Pure helpers here; the file I/O stays in dispatch.ts.
+
+import { createHash } from "node:crypto";
+
+/** A recorded pass older than this is run again rather than reused. */
+export const VERIFIER_GATE_REUSE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+/** On unless `PYRY_VERIFIER_GATE_REUSE` is exactly `0`. Read at dispatch
+ *  time, like the other verifier gate settings. */
+export function verifierGateReuseEnabled(env: NodeJS.ProcessEnv): boolean {
+  return env.PYRY_VERIFIER_GATE_REUSE?.trim() !== "0";
+}
+
+/** File name of an issue's recorded pass, in the logs dir beside the gate
+ *  logs. One per issue: each new pass overwrites the last. */
+export function verifierGatePassFileName(issueNumber: number): string {
+  return `verifier-gate_#${issueNumber}.pass.json`;
+}
+
+/** Hash of the ordered gate command list. JSON keeps it unambiguous: no
+ *  delimiter inside a command can make two different lists hash alike. */
+export function hashGateList(gates: readonly string[]): string {
+  return createHash("sha256").update(JSON.stringify(gates)).digest("hex");
+}
+
+/** What a full pass records. */
+export interface VerifierGatePass {
+  issueNumber: number;
+  /** HEAD of the merged worktree the gates ran on. */
+  commit: string;
+  /** `hashGateList` of the gates that ran. */
+  gatesHash: string;
+  /** The gate commands themselves, for a person reading the file. */
+  gates: string[];
+  /** ISO time the last gate finished. */
+  passedAt: string;
+  /** One line per gate, as the GATES log section shows them. */
+  summary: string[];
+  /** The stdout and stderr log of every gate in the run. */
+  logPaths: string[];
+}
+
+/**
+ * Read a recorded pass back. Anything that is not the shape written by
+ * dispatch.ts, including a truncated or hand-edited file, comes back as null
+ * and the caller runs the gates as normal.
+ */
+export function parseVerifierGatePass(raw: string): VerifierGatePass | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof value !== "object" || value === null) return null;
+  const r = value as Record<string, unknown>;
+  const isStrings = (x: unknown): x is string[] =>
+    Array.isArray(x) && x.every((s) => typeof s === "string");
+  if (
+    typeof r.issueNumber !== "number"
+    || typeof r.commit !== "string"
+    || typeof r.gatesHash !== "string"
+    || !isStrings(r.gates)
+    || typeof r.passedAt !== "string"
+    || !isStrings(r.summary)
+    || !isStrings(r.logPaths)
+  ) {
+    return null;
+  }
+  return {
+    issueNumber: r.issueNumber,
+    commit: r.commit,
+    gatesHash: r.gatesHash,
+    gates: r.gates,
+    passedAt: r.passedAt,
+    summary: r.summary,
+    logPaths: r.logPaths,
+  };
+}
+
+export type VerifierGateReuseDecision =
+  | { reuse: true; pass: VerifierGatePass }
+  | {
+    reuse: false;
+    reason: "no-record" | "other-issue" | "commit-changed" | "gates-changed" | "expired" | "log-missing";
+  };
+
+/**
+ * Whether a recorded pass stands in for running the gates now. Every part of
+ * the key must match, the pass must be younger than
+ * `VERIFIER_GATE_REUSE_MAX_AGE_MS`, and every gate log it names must still
+ * exist, since those logs are the evidence the reused verdict rests on. An
+ * unknown current commit never matches.
+ */
+export function decideVerifierGateReuse(opts: {
+  pass: VerifierGatePass | null;
+  issueNumber: number;
+  commit: string;
+  gatesHash: string;
+  nowMs: number;
+  logExists: (path: string) => boolean;
+}): VerifierGateReuseDecision {
+  const { pass } = opts;
+  if (pass === null) return { reuse: false, reason: "no-record" };
+  if (pass.issueNumber !== opts.issueNumber) return { reuse: false, reason: "other-issue" };
+  if (opts.commit === "" || pass.commit !== opts.commit) return { reuse: false, reason: "commit-changed" };
+  if (pass.gatesHash !== opts.gatesHash) return { reuse: false, reason: "gates-changed" };
+  // A pass stamped in the future, or with no readable time, is not trusted.
+  const ageMs = opts.nowMs - Date.parse(pass.passedAt);
+  if (!(ageMs >= 0 && ageMs < VERIFIER_GATE_REUSE_MAX_AGE_MS)) return { reuse: false, reason: "expired" };
+  if (pass.logPaths.length === 0 || !pass.logPaths.every((p) => opts.logExists(p))) {
+    return { reuse: false, reason: "log-missing" };
+  }
+  return { reuse: true, pass };
+}
