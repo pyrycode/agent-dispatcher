@@ -3791,21 +3791,23 @@ export async function runVerifierGates(opts: {
 }
 
 /**
- * HEAD of the gated worktree after the default branch was merged in: the
- * commit a recorded gate pass is keyed by. Empty when it cannot stand for
- * the files the gates test, because git failed or because a conflicted merge
- * was left for the agent to finish and the worktree holds files HEAD does
- * not describe. Empty means no reuse and no record.
+ * HEAD of the gated worktree after the default branch was merged in, and its
+ * tree. A recorded gate pass is keyed by the tree and names the commit. Null
+ * when they cannot stand for the files the gates test, because git failed or
+ * because a conflicted merge was left for the agent to finish and the
+ * worktree holds files HEAD does not describe. Null means no reuse and no
+ * record.
  */
-function mergedWorktreeHead(ctx: DispatchContext): string {
-  if (ctx.pendingMerge) return "";
+function mergedWorktreeHead(ctx: DispatchContext): { commit: string; tree: string } | null {
+  if (ctx.pendingMerge) return null;
   try {
-    const head = String(ctx.deps.execSync("git rev-parse HEAD", {
+    const [commit = "", tree = ""] = String(ctx.deps.execSync("git rev-parse HEAD HEAD^{tree}", {
       cwd: ctx.agentCwd, encoding: "utf-8", stdio: "pipe", timeout: 15_000,
-    })).trim();
-    return /^[0-9a-f]{40,64}$/.test(head) ? head : "";
+    })).trim().split(/\s+/);
+    const sha = /^[0-9a-f]{40,64}$/;
+    return sha.test(commit) && sha.test(tree) ? { commit, tree } : null;
   } catch {
-    return "";
+    return null;
   }
 }
 
@@ -3817,7 +3819,7 @@ function mergedWorktreeHead(ctx: DispatchContext): string {
 function readReusableGatePass(
   ctx: DispatchContext,
   passFile: string,
-  commit: string,
+  tree: string,
   gatesHash: string,
 ): VerifierGatePass | null {
   const issueNumber = ctx.item.issueNumber;
@@ -3837,7 +3839,7 @@ function readReusableGatePass(
   const decision = decideVerifierGateReuse({
     pass,
     issueNumber,
-    commit,
+    tree,
     gatesHash,
     nowMs: Date.now(),
     logExists: (p) => ctx.deps.existsSync(p),
@@ -3873,8 +3875,8 @@ function readReusableGatePass(
  *   a deterministic bounce would loop forever on a failure that
  *   pre-exists on the merge base. Nothing is labelled or commented here;
  *   routing is the model's verdict, not the gate's.
- * - **Already green on this commit** → a full pass recorded on the same
- *   merged HEAD with the same gate list in the last 24 hours is reused:
+ * - **Already green on these files** → a full pass recorded on the same
+ *   merged tree with the same gate list in the last 24 hours is reused:
  *   no gate runs, and the green note says whose results they are. See
  *   verifier-gate-reuse.ts; `PYRY_VERIFIER_GATE_REUSE=0` turns it off.
  */
@@ -3903,26 +3905,34 @@ export async function maybeRunPreSpawnGates(
     "Treat these as green — do not spend turns re-running them just to establish a baseline.",
   ].join("\n");
 
-  // A full pass on this exact merged commit with this exact gate list is
-  // reused instead of run again. #1340's verifier crashed one second after
-  // 22 minutes of green gates on 2026-10-02, and its retry would have paid
-  // for all of them again. With reuse off, or HEAD unknown, nothing is read
-  // or recorded and the gates run exactly as before.
+  // A full pass on exactly these files with this exact gate list is reused
+  // instead of run again. #1340's verifier crashed one second after 22
+  // minutes of green gates on 2026-10-02, and its retry would have paid for
+  // all of them again. The match is on the merged tree, not the merge
+  // commit, which gets a new SHA each time it is re-made. With reuse off, or
+  // HEAD unknown, nothing is read or recorded and the gates run as before.
   const passFile = resolve(LOGS_DIR, verifierGatePassFileName(item.issueNumber));
   const gatesHash = hashGateList(gates);
-  const commit = verifierGateReuseEnabled(process.env) ? mergedWorktreeHead(ctx) : "";
-  if (commit !== "") {
-    const reused = readReusableGatePass(ctx, passFile, commit, gatesHash);
+  const head = verifierGateReuseEnabled(process.env) ? mergedWorktreeHead(ctx) : null;
+  if (head !== null) {
+    const reused = readReusableGatePass(ctx, passFile, head.tree, gatesHash);
     if (reused !== null) {
-      console.log(`   ♻️  Pre-${agent.name} gates already passed on ${commit.slice(0, 12)} at ${reused.passedAt}; reusing that result`);
+      const sameCommit = reused.commit === head.commit;
+      console.log(`   ♻️  Pre-${agent.name} gates already passed at ${reused.passedAt} on ${reused.commit.slice(0, 12)}${sameCommit ? "" : `, same files as ${head.commit.slice(0, 12)}`}; reusing that result`);
       ctx.deps.writeLog(
         logFile,
         "GATES",
-        [`Reused the pass recorded at ${reused.passedAt} on commit ${commit}; no gate ran in this dispatch.`, ...reused.summary].join("\n"),
+        [
+          `Reused the pass recorded at ${reused.passedAt} on commit ${reused.commit} (tree ${reused.tree}); no gate ran in this dispatch.`,
+          ...reused.summary,
+        ].join("\n"),
       );
+      const where = sameCommit
+        ? `on this same commit (\`${head.commit}\`)`
+        : `on commit \`${reused.commit}\`, whose files are identical to this worktree's (tree \`${head.tree}\`)`;
       return {
         promptNote: greenNote(
-          `The dispatcher ran the fork's deterministic gates on this same commit (\`${commit}\`) at ${reused.passedAt}, and all passed. These results are reused from that run rather than run again:`,
+          `The dispatcher ran the fork's deterministic gates ${where} at ${reused.passedAt}, and all passed. These results are reused from that run rather than run again:`,
         ),
       };
     }
@@ -3941,10 +3951,11 @@ export async function maybeRunPreSpawnGates(
     console.log(`   ✅ Pre-${agent.name} gates green`);
     // Only a full pass is recorded. A red, timed-out or unspawnable gate
     // never is, so a retry after a flaky failure runs the gates again.
-    if (commit !== "") {
+    if (head !== null) {
       const pass: VerifierGatePass = {
         issueNumber: item.issueNumber,
-        commit,
+        commit: head.commit,
+        tree: head.tree,
         gatesHash,
         gates,
         passedAt: new Date().toISOString(),

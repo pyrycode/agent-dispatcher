@@ -12,6 +12,7 @@ import {
 } from "./verifier-gate-reuse.js";
 
 const COMMIT = "a".repeat(40);
+const TREE = "e".repeat(40);
 const GATES = ["./gradlew check", "python3 scripts/android-test-gate.py ui"];
 const NOW = Date.parse("2026-10-02T09:00:00.000Z");
 const LOGS = ["/logs/verifier-gate_#1340_1.log", "/logs/verifier-gate_#1340_1.stderr.log"];
@@ -20,6 +21,7 @@ function pass(overrides: Partial<VerifierGatePass> = {}): VerifierGatePass {
   return {
     issueNumber: 1340,
     commit: COMMIT,
+    tree: TREE,
     gatesHash: hashGateList(GATES),
     gates: GATES,
     passedAt: new Date(NOW - 60 * 60 * 1000).toISOString(),
@@ -31,7 +33,7 @@ function pass(overrides: Partial<VerifierGatePass> = {}): VerifierGatePass {
 
 function decide(overrides: {
   pass?: VerifierGatePass | null;
-  commit?: string;
+  tree?: string;
   gatesHash?: string;
   nowMs?: number;
   existing?: readonly string[];
@@ -40,26 +42,34 @@ function decide(overrides: {
   return decideVerifierGateReuse({
     pass: overrides.pass === undefined ? pass() : overrides.pass,
     issueNumber: 1340,
-    commit: overrides.commit ?? COMMIT,
+    tree: overrides.tree ?? TREE,
     gatesHash: overrides.gatesHash ?? hashGateList(GATES),
     nowMs: overrides.nowMs ?? NOW,
     logExists: (p) => existing.has(p),
   });
 }
 
-describe("verifier gate reuse — a pass on the same commit is not paid for twice (2026-10-02, #1340)", () => {
-  test("matching issue, commit and gate list, under a day old, logs on disk → reuse", () => {
+describe("verifier gate reuse — a pass on the same files is not paid for twice (2026-10-02, #1340)", () => {
+  test("matching issue, tree and gate list, under a day old, logs on disk → reuse", () => {
     const d = decide();
     assert.equal(d.reuse, true);
-    if (d.reuse) assert.equal(d.pass.commit, COMMIT);
+    if (d.reuse) assert.equal(d.pass.commit, COMMIT, "the recorded commit comes back for the note");
   });
 
-  test("a different merged commit is a different tree to test → no reuse", () => {
-    assert.deepEqual(decide({ commit: "b".repeat(40) }), { reuse: false, reason: "commit-changed" });
+  test("a re-made merge commit over the same files still reuses: the commit is not part of the key", () => {
+    // The decision never sees the current commit at all; a record naming
+    // another commit with the same tree is a match.
+    const d = decide({ pass: pass({ commit: "b".repeat(40) }) });
+    assert.equal(d.reuse, true);
+    if (d.reuse) assert.equal(d.pass.commit, "b".repeat(40));
   });
 
-  test("an unknown current commit never matches, even an empty recorded one", () => {
-    assert.deepEqual(decide({ commit: "", pass: pass({ commit: "" }) }), { reuse: false, reason: "commit-changed" });
+  test("a different merged tree is different files to test → no reuse", () => {
+    assert.deepEqual(decide({ tree: "f".repeat(40) }), { reuse: false, reason: "tree-changed" });
+  });
+
+  test("an unknown current tree never matches, even an empty recorded one", () => {
+    assert.deepEqual(decide({ tree: "", pass: pass({ tree: "" }) }), { reuse: false, reason: "tree-changed" });
   });
 
   test("a different gate list, including the same gates in another order → no reuse", () => {
@@ -114,6 +124,8 @@ describe("verifier gate reuse — a pass on the same commit is not paid for twic
     const { logPaths: _dropped, ...noLogs } = pass();
     assert.equal(parseVerifierGatePass(JSON.stringify(noLogs)), null);
     assert.equal(parseVerifierGatePass(JSON.stringify({ ...pass(), commit: 7 })), null);
+    const { tree: _noTree, ...treeless } = pass();
+    assert.equal(parseVerifierGatePass(JSON.stringify(treeless)), null, "a record without a tree cannot be matched");
     assert.equal(parseVerifierGatePass(JSON.stringify({ ...pass(), summary: [1] })), null);
   });
 

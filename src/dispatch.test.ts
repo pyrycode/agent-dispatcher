@@ -7415,12 +7415,14 @@ describe("pre-verifier gates — dispatchToAgent wiring", () => {
   });
 });
 
-describe("pre-verifier gates — reusing a pass on the same commit (2026-10-02, #1340)", () => {
+describe("pre-verifier gates — reusing a pass on the same files (2026-10-02, #1340)", () => {
   // #1340's verifier crashed one second after 22 minutes of green gates. A
-  // retry on the same merged commit must not pay for them again. Anything
-  // that changes what the gates would see, or casts doubt on the recorded
-  // evidence, runs them exactly as before.
+  // retry on the same merged files must not pay for them again, even when
+  // the merge commit was re-made with a new SHA. Anything that changes what
+  // the gates would see, or casts doubt on the recorded evidence, runs them
+  // exactly as before.
   const HEAD = "c".repeat(40);
+  const TREE = "e".repeat(40);
   const logsDir = resolve(TEST_AGENTS_REPO_ROOT, "logs");
   const passFile = (n: number) => resolve(logsDir, `verifier-gate_#${n}.pass.json`);
   const gateLogs = (n: number, count: number) =>
@@ -7431,6 +7433,7 @@ describe("pre-verifier gates — reusing a pass on the same commit (2026-10-02, 
   const recorded = (n: number, overrides: Partial<VerifierGatePass> = {}): VerifierGatePass => ({
     issueNumber: n,
     commit: HEAD,
+    tree: TREE,
     gatesHash: hashGateList(["make check"]),
     gates: ["make check"],
     passedAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
@@ -7443,7 +7446,10 @@ describe("pre-verifier gates — reusing a pass on the same commit (2026-10-02, 
     [passFile(n)]: typeof pass === "string" ? pass : JSON.stringify(pass),
     ...Object.fromEntries(logs.map((p) => [p, ""])),
   });
-  const headImpls = (head = HEAD): Record<string, ExecHandler> => ({ "git rev-parse HEAD": () => `${head}\n` });
+  /** `git rev-parse HEAD HEAD^{tree}` answers the commit, then its tree. */
+  const headImpls = (commit = HEAD, tree = TREE): Record<string, ExecHandler> => ({
+    "git rev-parse HEAD": () => `${commit}\n${tree}\n`,
+  });
   const passWrites = (calls: CallLog, n: number) =>
     calls.fs.filter((f) => f.kind === "write" && f.path === passFile(n));
 
@@ -7462,7 +7468,8 @@ describe("pre-verifier gates — reusing a pass on the same commit (2026-10-02, 
     assert.equal(writes.length, 1, "a full pass is recorded");
     const written = JSON.parse(writes[0]!.content!) as VerifierGatePass;
     assert.equal(written.issueNumber, 1500);
-    assert.equal(written.commit, HEAD, "keyed by HEAD of the merged worktree");
+    assert.equal(written.tree, TREE, "keyed by the tree of the merged worktree");
+    assert.equal(written.commit, HEAD, "and names the commit it ran on");
     assert.equal(written.gatesHash, hashGateList(["make check"]));
     assert.deepEqual(written.logPaths, gateLogs(1500, 1), "names the gate logs as its evidence");
     assert.deepEqual(written.summary, ["✓ make check (exit 0)"]);
@@ -7474,7 +7481,7 @@ describe("pre-verifier gates — reusing a pass on the same commit (2026-10-02, 
     assert.ok(!retry.result.promptNote.includes("TRIAGE MODE"));
     assert.match(retry.result.promptNote, /reused from that run/);
     assert.ok(retry.result.promptNote.includes(written.passedAt), "the note names when the reused run happened");
-    assert.ok(retry.result.promptNote.includes(HEAD), "and that it ran on this same commit");
+    assert.match(retry.result.promptNote, /on this same commit \(`c{40}`\)/, "and that it ran on this same commit");
     assert.match(retry.result.promptNote, /- `make check`/);
     const log = loggedText(retry.calls);
     assert.match(log, /Reused the pass recorded at/);
@@ -7482,14 +7489,30 @@ describe("pre-verifier gates — reusing a pass on the same commit (2026-10-02, 
     assert.equal(passWrites(retry.calls, 1500).length, 0, "a reuse does not re-stamp the pass");
   });
 
-  test("a different merged commit runs the gates and records the new commit", async () => {
-    const other = "d".repeat(40);
-    const { result, calls } = await runGates(1501, { execImpls: headImpls(other), fsMap: fsWith(1501, recorded(1501)) });
+  test("a re-made merge commit over the same files reuses the pass and names the commit it ran on", async () => {
+    // The #1340 retry shape: the merge of main was made again, so HEAD has
+    // a new SHA, but the files the gates would test are identical.
+    const remade = "d".repeat(40);
+    const { result, calls } = await runGates(1509, { execImpls: headImpls(remade, TREE), fsMap: fsWith(1509, recorded(1509)) });
+    assert.equal(calls.gates.length, 0, "identical files, so no gate runs");
+    assert.match(result.promptNote, /## Deterministic gates/);
+    assert.match(result.promptNote, /on commit `c{40}`, whose files are identical to this worktree's \(tree `e{40}`\)/);
+    assert.match(result.promptNote, /reused from that run/);
+    assert.match(loggedText(calls), /Reused the pass recorded at .* on commit c{40} \(tree e{40}\)/);
+    assert.equal(passWrites(calls, 1509).length, 0);
+  });
+
+  test("a different merged tree runs the gates and records the new tree and commit", async () => {
+    const otherCommit = "d".repeat(40);
+    const otherTree = "f".repeat(40);
+    const { result, calls } = await runGates(1501, { execImpls: headImpls(otherCommit, otherTree), fsMap: fsWith(1501, recorded(1501)) });
     assert.equal(calls.gates.length, 1);
     assert.ok(!result.promptNote.includes("reused"));
     const writes = passWrites(calls, 1501);
     assert.equal(writes.length, 1);
-    assert.equal((JSON.parse(writes[0]!.content!) as VerifierGatePass).commit, other);
+    const written = JSON.parse(writes[0]!.content!) as VerifierGatePass;
+    assert.equal(written.tree, otherTree);
+    assert.equal(written.commit, otherCommit);
   });
 
   test("a different gate list runs the gates", async () => {
@@ -7558,7 +7581,7 @@ describe("pre-verifier gates — reusing a pass on the same commit (2026-10-02, 
 
   test("HEAD unknown: the gates run and nothing is recorded under an empty key", async () => {
     // The default mock execSync answers every command with "".
-    const { calls } = await runGates(1508, { fsMap: fsWith(1508, recorded(1508, { commit: "" })) });
+    const { calls } = await runGates(1508, { fsMap: fsWith(1508, recorded(1508, { commit: "", tree: "" })) });
     assert.equal(calls.gates.length, 1);
     assert.equal(passWrites(calls, 1508).length, 0);
   });

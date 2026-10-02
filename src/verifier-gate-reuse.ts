@@ -1,5 +1,5 @@
 // Verifier gate reuse: skip the pre-verifier gates when they already passed
-// on this exact commit.
+// on exactly these files.
 //
 // On pyrycode-mobile the pre-verifier gates take 11 to 22 minutes a pass,
 // most of it emulator device tests. On 2026-10-02 #1340's verifier crashed
@@ -7,14 +7,21 @@
 // no result message received"). Any retry on the same commit ran every gate
 // again for nothing.
 //
-// So a full pass is written down, keyed by the issue, the commit the gates
-// ran on (HEAD of the worktree after the default branch was merged in) and
-// a hash of the ordered gate list. The next verifier dispatch for the issue
-// reuses it when all three match, the pass is less than a day old and the
-// gate logs it names are still on disk. Only a full pass is recorded: a red,
-// timed-out or unspawnable gate never is, so a retry after a flaky failure
-// runs the gates again. `PYRY_VERIFIER_GATE_REUSE=0` turns the whole thing
-// off.
+// So a full pass is written down, keyed by the issue, the tree the gates ran
+// on (the files of HEAD after the default branch was merged in) and a hash
+// of the ordered gate list. The next verifier dispatch for the issue reuses
+// it when all three match, the pass is less than a day old and the gate logs
+// it names are still on disk.
+//
+// The key is the tree, not the commit. Identical files give identical gate
+// results, and the merge of the default branch is a fresh commit with a new
+// SHA whenever it is made again over the same two parents. Keying on that
+// SHA would miss exactly the retries this exists for. The commit is still
+// recorded, so the note and the log can say which run is being reused.
+//
+// Only a full pass is recorded: a red, timed-out or unspawnable gate never
+// is, so a retry after a flaky failure runs the gates again.
+// `PYRY_VERIFIER_GATE_REUSE=0` turns the whole thing off.
 //
 // Pure helpers here; the file I/O stays in dispatch.ts.
 
@@ -44,8 +51,12 @@ export function hashGateList(gates: readonly string[]): string {
 /** What a full pass records. */
 export interface VerifierGatePass {
   issueNumber: number;
-  /** HEAD of the merged worktree the gates ran on. */
+  /** HEAD of the merged worktree the gates ran on. Recorded for the note
+   *  and the log; reuse does not match on it. */
   commit: string;
+  /** `HEAD^{tree}` of that worktree: the files the gates tested. The
+   *  reuse key. */
+  tree: string;
   /** `hashGateList` of the gates that ran. */
   gatesHash: string;
   /** The gate commands themselves, for a person reading the file. */
@@ -77,6 +88,7 @@ export function parseVerifierGatePass(raw: string): VerifierGatePass | null {
   if (
     typeof r.issueNumber !== "number"
     || typeof r.commit !== "string"
+    || typeof r.tree !== "string"
     || typeof r.gatesHash !== "string"
     || !isStrings(r.gates)
     || typeof r.passedAt !== "string"
@@ -88,6 +100,7 @@ export function parseVerifierGatePass(raw: string): VerifierGatePass | null {
   return {
     issueNumber: r.issueNumber,
     commit: r.commit,
+    tree: r.tree,
     gatesHash: r.gatesHash,
     gates: r.gates,
     passedAt: r.passedAt,
@@ -100,20 +113,21 @@ export type VerifierGateReuseDecision =
   | { reuse: true; pass: VerifierGatePass }
   | {
     reuse: false;
-    reason: "no-record" | "other-issue" | "commit-changed" | "gates-changed" | "expired" | "log-missing";
+    reason: "no-record" | "other-issue" | "tree-changed" | "gates-changed" | "expired" | "log-missing";
   };
 
 /**
  * Whether a recorded pass stands in for running the gates now. Every part of
  * the key must match, the pass must be younger than
  * `VERIFIER_GATE_REUSE_MAX_AGE_MS`, and every gate log it names must still
- * exist, since those logs are the evidence the reused verdict rests on. An
- * unknown current commit never matches.
+ * exist, since those logs are the evidence the reused verdict rests on. The
+ * match is on the tree, so a re-made merge commit over the same files still
+ * reuses. An unknown current tree never matches.
  */
 export function decideVerifierGateReuse(opts: {
   pass: VerifierGatePass | null;
   issueNumber: number;
-  commit: string;
+  tree: string;
   gatesHash: string;
   nowMs: number;
   logExists: (path: string) => boolean;
@@ -121,7 +135,7 @@ export function decideVerifierGateReuse(opts: {
   const { pass } = opts;
   if (pass === null) return { reuse: false, reason: "no-record" };
   if (pass.issueNumber !== opts.issueNumber) return { reuse: false, reason: "other-issue" };
-  if (opts.commit === "" || pass.commit !== opts.commit) return { reuse: false, reason: "commit-changed" };
+  if (opts.tree === "" || pass.tree !== opts.tree) return { reuse: false, reason: "tree-changed" };
   if (pass.gatesHash !== opts.gatesHash) return { reuse: false, reason: "gates-changed" };
   // A pass stamped in the future, or with no readable time, is not trusted.
   const ageMs = opts.nowMs - Date.parse(pass.passedAt);
