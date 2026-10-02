@@ -17,8 +17,25 @@ import assert from "node:assert/strict";
 
 import { AGENTS } from "./types.js";
 import {
+  appendStderrTail,
+  noResultErrorMessage,
+  scrubCredentials,
+  STDERR_MESSAGE_CHARS,
+  STDERR_TAIL_CAP,
+  stderrForMessage,
+  AgentRunStoppedError,
+  canSalvagePartialWork,
+  decidePartialWorkSalvage,
+  runStopKind,
+  advanceIdleWatchdogState,
   advancePermissionDenialState,
   buildResumeArgv,
+  DEFAULT_IDLE_TIMEOUT_MINUTES,
+  idleStallMessage,
+  idleWatchdogTickMs,
+  initIdleWatchdogState,
+  parseIdleTimeoutMs,
+  shouldFireIdleWatchdog,
   buildResumePrompt,
   captureSessionId,
   decideCodegraphHealth,
@@ -100,6 +117,7 @@ import {
   REAL_CLAUDE_GATE_RUNNING_LABEL,
   shouldAddReadyLabel,
   shouldSkipDispatch,
+  classifyAgentError,
 } from "./pipeline-decisions.js";
 import { buildBaselineCommand, buildBaselineFilter, formatGateEvidenceComment, parseGateOutput, stripPackageQualifier } from "./gate-output.js";
 import { mapParentChain } from "./github.js";
@@ -6118,5 +6136,232 @@ describe("decidePendingDoneFinalizations", () => {
   test("the pending label blocks re-dispatch of that agent only", () => {
     assert.equal(shouldSkipDispatch([`${PENDING_DONE_PREFIX}builder`], "builder"), true);
     assert.equal(shouldSkipDispatch([`${PENDING_DONE_PREFIX}builder`], "verifier"), false);
+  });
+});
+
+describe("idle-stream watchdog — claude runner (pyrycode-mobile #1430, 2026-10-02)", () => {
+  const MIN = 60_000;
+  const T0 = 1_000_000;
+  const toolUse = (id: string) => ({
+    type: "assistant",
+    message: { content: [{ type: "tool_use", id, name: "Bash", input: { command: "./gradlew test" } }] },
+  });
+  const toolResult = (id: string) => ({
+    type: "user",
+    message: { content: [{ type: "tool_result", tool_use_id: id, content: "BUILD SUCCESSFUL" }] },
+  });
+  const thinking = { type: "assistant", message: { content: [{ type: "thinking", thinking: "..." }] } };
+  const system = { type: "system", subtype: "init", session_id: "s" };
+
+  test("fires after N minutes of silence with no tool outstanding", () => {
+    let s = initIdleWatchdogState(T0);
+    s = advanceIdleWatchdogState(s, system, T0);
+    s = advanceIdleWatchdogState(s, toolUse("t1"), T0 + 1000);
+    s = advanceIdleWatchdogState(s, toolResult("t1"), T0 + 2000);
+    // #1430's shape: a thinking block arrives, then the turn wedges.
+    s = advanceIdleWatchdogState(s, thinking, T0 + 3000);
+    assert.equal(shouldFireIdleWatchdog(s, T0 + 3000 + 10 * MIN - 1, 10 * MIN), false, "just under N");
+    assert.equal(shouldFireIdleWatchdog(s, T0 + 3000 + 10 * MIN, 10 * MIN), true, "at N");
+  });
+
+  test("does not fire while a tool call is outstanding, however long the silence", () => {
+    let s = initIdleWatchdogState(T0);
+    s = advanceIdleWatchdogState(s, toolUse("gradle"), T0);
+    assert.equal(shouldFireIdleWatchdog(s, T0 + 60 * MIN, 10 * MIN), false);
+    // The result comes back: the clock restarts from that line.
+    s = advanceIdleWatchdogState(s, toolResult("gradle"), T0 + 30 * MIN);
+    assert.equal(shouldFireIdleWatchdog(s, T0 + 39 * MIN, 10 * MIN), false);
+    assert.equal(shouldFireIdleWatchdog(s, T0 + 40 * MIN, 10 * MIN), true);
+  });
+
+  test("parallel tool calls: stays quiet until every one has returned", () => {
+    let s = initIdleWatchdogState(T0);
+    s = advanceIdleWatchdogState(s, {
+      type: "assistant",
+      message: { content: [{ type: "tool_use", id: "a" }, { type: "tool_use", id: "b" }] },
+    }, T0);
+    s = advanceIdleWatchdogState(s, toolResult("a"), T0 + 1000);
+    assert.equal(shouldFireIdleWatchdog(s, T0 + 30 * MIN, 10 * MIN), false, "b still running");
+    s = advanceIdleWatchdogState(s, toolResult("b"), T0 + 2000);
+    assert.equal(shouldFireIdleWatchdog(s, T0 + 2000 + 10 * MIN, 10 * MIN), true);
+  });
+
+  test("a result for an id it never saw does not open or close anything", () => {
+    let s = initIdleWatchdogState(T0);
+    s = advanceIdleWatchdogState(s, toolResult("unknown"), T0);
+    assert.equal(s.outstandingToolIds.size, 0);
+  });
+
+  test("resets on any stream line: system notices, text, and lines that do not parse", () => {
+    let s = initIdleWatchdogState(T0);
+    for (const [msg, at] of [[system, 9 * MIN], [null, 18 * MIN], [{ type: "rate_limit_event" }, 27 * MIN]] as const) {
+      s = advanceIdleWatchdogState(s, msg, T0 + at);
+      assert.equal(shouldFireIdleWatchdog(s, T0 + at + 9 * MIN, 10 * MIN), false);
+    }
+    assert.equal(shouldFireIdleWatchdog(s, T0 + 37 * MIN, 10 * MIN), true);
+  });
+
+  test("advancing never mutates the previous state", () => {
+    const before = initIdleWatchdogState(T0);
+    const after = advanceIdleWatchdogState(before, toolUse("t1"), T0 + 5);
+    assert.equal(before.outstandingToolIds.size, 0);
+    assert.equal(before.lastLineAt, T0);
+    assert.equal(after.outstandingToolIds.size, 1);
+  });
+
+  test("disabled at 0: never fires", () => {
+    const s = initIdleWatchdogState(T0);
+    assert.equal(shouldFireIdleWatchdog(s, T0 + 24 * 60 * MIN, 0), false);
+  });
+
+  test("PYRY_AGENT_IDLE_TIMEOUT_MINUTES: default 10, 0 disables, garbage keeps the default", () => {
+    assert.equal(DEFAULT_IDLE_TIMEOUT_MINUTES, 10);
+    assert.equal(parseIdleTimeoutMs(undefined), 10 * MIN);
+    assert.equal(parseIdleTimeoutMs(""), 10 * MIN);
+    assert.equal(parseIdleTimeoutMs("0"), 0);
+    assert.equal(parseIdleTimeoutMs("15"), 15 * MIN);
+    assert.equal(parseIdleTimeoutMs("0.5"), 30_000);
+    assert.equal(parseIdleTimeoutMs("-1"), 0);
+    assert.equal(parseIdleTimeoutMs("ten"), 10 * MIN);
+  });
+
+  test("the poll tick is a tenth of the threshold, clamped to 1s..30s", () => {
+    assert.equal(idleWatchdogTickMs(10 * MIN), 30_000);
+    assert.equal(idleWatchdogTickMs(2 * MIN), 12_000);
+    assert.equal(idleWatchdogTickMs(600), 1_000);
+  });
+
+  test("the stall error is classified transient, so the dispatcher retries with backoff", () => {
+    const msg = idleStallMessage(10 * MIN);
+    assert.match(msg, /idle_stall/);
+    assert.match(msg, /10min/);
+    const r = classifyAgentError(msg);
+    assert.equal(r.transient, true);
+    assert.equal(r.signature, "idle stream stall");
+    // The result-frame door: handleAgentResultErrors names the reason.
+    assert.equal(classifyAgentError("Agent error (idle_stall): subtype=error_during_execution. Ran 15m 2s (timeout 25min).", { terminalReason: "idle_stall" }).transient, true);
+  });
+});
+
+describe("partial-work salvage decisions (mobile #1430, #1332)", () => {
+  const result = (over: Partial<{ isError: boolean; timedOut: boolean; terminalReason: string; hadPermissionDenial: boolean }> = {}) => ({
+    isError: true, timedOut: false, terminalReason: "", hadPermissionDenial: false, ...over,
+  });
+
+  test("runStopKind reads both doors: the runner's rejection and a marked result frame", () => {
+    assert.equal(runStopKind(new AgentRunStoppedError("Agent timed out after 2280s", "timeout"), null), "timeout");
+    assert.equal(runStopKind(new AgentRunStoppedError("Agent idle_stall: ...", "idle_stall"), null), "idle_stall");
+    assert.equal(runStopKind(new Error("Agent error ()"), result({ timedOut: true })), "timeout");
+    assert.equal(runStopKind(new Error("Agent error (idle_stall)"), result({ terminalReason: "idle_stall" })), "idle_stall");
+  });
+
+  test("runStopKind: anything else is not a stop", () => {
+    assert.equal(runStopKind(new Error("Claude CLI exited with code 1, no result message received"), null), null);
+    assert.equal(runStopKind(new Error("x"), result({ terminalReason: "max_turns" })), null);
+    assert.equal(runStopKind(new Error("x"), result({ isError: false, timedOut: true })), null, "a success that landed after the kill");
+    assert.equal(runStopKind(new Error("x"), result({ timedOut: true, hadPermissionDenial: true })), null, "a denial is a policy stop");
+    assert.equal(runStopKind(new Error("x"), result({ timedOut: true, terminalReason: "codex_blocked" })), null, "never work around a rejected action");
+  });
+
+  test("canSalvagePartialWork: only stages that own commits, in a worktree, on a real ticket", () => {
+    const base = { stopKind: "timeout" as const, useWorktree: true, issueNumber: 1430 };
+    for (const name of ["architect", "developer", "documentation"]) {
+      assert.equal(canSalvagePartialWork({ ...base, agent: AGENTS.find(a => a.name === name)! }), true, name);
+    }
+    for (const name of ["po", "qa", "code-review"]) {
+      assert.equal(canSalvagePartialWork({ ...base, agent: AGENTS.find(a => a.name === name)! }), false, name);
+    }
+    const dev = AGENTS.find(a => a.name === "developer")!;
+    assert.equal(canSalvagePartialWork({ ...base, stopKind: null, agent: dev }), false);
+    assert.equal(canSalvagePartialWork({ ...base, useWorktree: false, agent: dev }), false);
+    assert.equal(canSalvagePartialWork({ ...base, issueNumber: 0, agent: dev }), false);
+  });
+
+  const ok = { openPrCount: 1, gitStatusOutput: " M a.md\n", commitsAheadOfOrigin: 0, mergeInProgress: false, mergeCheckProblems: [] as string[] };
+
+  test("decidePartialWorkSalvage: PR + dirty tree, or PR + local commits → salvage", () => {
+    assert.deepEqual(decidePartialWorkSalvage(ok), { salvage: true });
+    assert.deepEqual(decidePartialWorkSalvage({ ...ok, gitStatusOutput: "", commitsAheadOfOrigin: 2 }), { salvage: true });
+  });
+
+  test("decidePartialWorkSalvage: each gate refuses on its own", () => {
+    const refused = (over: Partial<typeof ok>, why: RegExp) => {
+      const d = decidePartialWorkSalvage({ ...ok, ...over });
+      assert.equal(d.salvage, false);
+      assert.match((d as { reason: string }).reason, why);
+    };
+    refused({ openPrCount: 0 }, /no open pull request/);
+    refused({ openPrCount: -1 }, /could not look up/);
+    refused({ mergeInProgress: true }, /MERGE_HEAD/);
+    refused({ mergeCheckProblems: ["`a.kt` still has conflict markers."] }, /conflict markers/);
+    refused({ gitStatusOutput: "", commitsAheadOfOrigin: 0 }, /nothing to save/);
+    refused({ gitStatusOutput: "  \n", commitsAheadOfOrigin: -1 }, /nothing to save/);
+  });
+});
+
+describe("runner stderr: tail, scrub and message (pyrycode-mobile #1340, 2026-10-02)", () => {
+  // Built at runtime so no literal credential-shaped string sits in the repo.
+  const anthropic = "sk-ant-api03-" + "a1B2".repeat(20);
+  const oauth = "sk-ant-oat01-" + "Q".repeat(60);
+  const ghp = "ghp_" + "x".repeat(36);
+  const gho = "gho_" + "y".repeat(36);
+  const pat = "github_pat_" + "11ABCDEFG0" + "z".repeat(60);
+  const b64 = "dGhpcyBpcyBhIHZlcnkgbG9uZyBzZWNyZXQgdmFsdWU=";
+
+  test("appendStderrTail keeps only the last cap characters", () => {
+    let tail = "";
+    for (let i = 0; i < 100; i++) tail = appendStderrTail(tail, `line ${i}\n`.padEnd(100, "."));
+    assert.equal(tail.length, STDERR_TAIL_CAP);
+    assert.ok(tail.endsWith(`line 99\n`.padEnd(100, ".")));
+    assert.equal(appendStderrTail("abc", "def", 4), "cdef");
+  });
+
+  test("scrubCredentials blanks every credential shape named in the ticket", () => {
+    const cases: [string, string][] = [
+      [`ANTHROPIC_API_KEY used: ${anthropic}`, anthropic],
+      [`oauth ${oauth} expired`, oauth],
+      [`Authorization: Bearer ${b64}`, b64],
+      [`remote: ${ghp} rejected`, ghp],
+      [`token ${gho}`, gho],
+      [`fine-grained ${pat}`, pat],
+      [`GET /v1?token=${b64}&x=1`, b64],
+      [`api_key=${b64}`, b64],
+      [`CLAUDE_CODE_OAUTH_TOKEN=${b64}`, b64],
+      [`{"secret_key": "${b64}"}`, b64],
+      [`fatal: https://x-access-token:hunter2hunter2@github.com/o/r.git`, "hunter2hunter2"],
+    ];
+    for (const [text, secret] of cases) {
+      const out = scrubCredentials(text);
+      assert.ok(!out.includes(secret), `secret survived in: ${out}`);
+      assert.match(out, /\[REDACTED\]/, text);
+    }
+  });
+
+  test("scrubCredentials leaves ordinary diagnostics alone", () => {
+    const text = [
+      "Error: ECONNRESET reading response body",
+      "API Error: 529 overloaded_error",
+      "at Object.<anonymous> (/opt/claude/cli.js:12:34)",
+      "key=short token=abc",
+      "the monkey ran",
+    ].join("\n");
+    assert.equal(scrubCredentials(text), text);
+  });
+
+  test("stderrForMessage: scrubbed, last 1500 chars, cannot close the comment's code block", () => {
+    const long = "x".repeat(3000) + `\nfinal error ${anthropic}\n\`\`\`\nnot a fence`;
+    const out = stderrForMessage(long);
+    assert.ok(out.length <= STDERR_MESSAGE_CHARS);
+    assert.match(out, /final error sk-ant-\[REDACTED\]/);
+    assert.ok(!out.includes("```"), "a triple backtick would end the ticket comment's code block");
+    assert.equal(stderrForMessage("  \n"), "");
+  });
+
+  test("noResultErrorMessage appends the scrubbed tail, and nothing when stderr was empty", () => {
+    assert.equal(noResultErrorMessage(1, ""), "Claude CLI exited with code 1, no result message received");
+    const msg = noResultErrorMessage(1, `Error: stream closed\nAuthorization: Bearer ${b64}\n`);
+    assert.match(msg, /^Claude CLI exited with code 1, no result message received\n--- stderr \(last 1500 chars\) ---\n/);
+    assert.match(msg, /Error: stream closed/);
+    assert.ok(!msg.includes(b64));
   });
 });

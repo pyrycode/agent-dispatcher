@@ -1095,3 +1095,328 @@ export function advancePermissionDenialState(
     action: "none",
   };
 }
+
+// --------- Idle-stream watchdog (claude runner) ---------
+
+/**
+ * Default idle threshold for the claude runner's stream watchdog, in
+ * minutes. Override with `PYRY_AGENT_IDLE_TIMEOUT_MINUTES`; `0` disables.
+ *
+ * Why it exists. On 2026-10-02 pyrycode-mobile #1430's documentation run
+ * went silent: its log shows four system stream messages between 05:03:30
+ * and 05:05:17, then nothing until 05:25:10, and the 38-minute wall clock
+ * killed it at 05:31 with finished edits uncommitted. Claude's own
+ * transcript shows the gap sat inside ONE assistant turn: a thinking block
+ * arrived at 05:05:17 and the Edit that followed it took twenty minutes to
+ * come back. The API stream had wedged mid-turn.
+ *
+ * pyry's own streamrunner watchdog (pyrycode#360, 240s) did not catch it.
+ * That watchdog only arms while claude "owes" an assistant turn, and the
+ * thinking block counted as the turn arriving, so the wedge after it was
+ * invisible. This watchdog keys on the opposite fact: is a TOOL running?
+ * If no tool call is outstanding, claude itself is the only thing that can
+ * be working, and N minutes of silence from it is a stall, whichever
+ * content block it was in the middle of.
+ *
+ * Neither claude spawn passes `--include-partial-messages` (the dispatcher's
+ * legacy `claude -p` argv does not, and pyry agent-run's BuildClaudeArgs
+ * does not), so a line arrives only per finished content block, tool result
+ * or system notice. A long legitimate block is therefore silent until it
+ * completes. Ten minutes clears a full 32k-token output block at observed
+ * generation rates with room to spare; the per-ticket retry cap bounds a
+ * false positive.
+ */
+export const DEFAULT_IDLE_TIMEOUT_MINUTES = 10;
+
+/**
+ * Parse `PYRY_AGENT_IDLE_TIMEOUT_MINUTES` into milliseconds.
+ *
+ * - **Unset / empty**: the 10-minute default.
+ * - **0**: watchdog disabled.
+ * - **Positive number**: that many minutes (fractions allowed).
+ * - **Negative**: treated as 0 (off), matching `parseResumeLegs`.
+ * - **Garbage / NaN**: falls back to the default. A typo in the knob
+ *   should not silently disable the safety net.
+ */
+export function parseIdleTimeoutMs(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return DEFAULT_IDLE_TIMEOUT_MINUTES * 60_000;
+  const n = Number(raw.trim());
+  if (!Number.isFinite(n)) return DEFAULT_IDLE_TIMEOUT_MINUTES * 60_000;
+  return n <= 0 ? 0 : Math.round(n * 60_000);
+}
+
+/**
+ * The substring every idle-stall failure carries. `RETRY_ALLOWLIST`
+ * (pipeline-decisions.ts) matches it, so a stalled run is classified as
+ * transient and re-dispatched with backoff instead of parking. pyry's own
+ * watchdog emits the same token, so both detectors share one retry path.
+ */
+export const IDLE_STALL_REASON = "idle_stall";
+
+/** The error text a dispatcher-detected stall fails with. */
+export function idleStallMessage(idleMs: number): string {
+  const minutes = Math.round((idleMs / 60_000) * 10) / 10;
+  return `Agent ${IDLE_STALL_REASON}: no stream output for ${minutes}min with no tool call outstanding`;
+}
+
+/**
+ * Watchdog state, advanced once per stream-json line.
+ *
+ * - `lastLineAt`: when the last line of any kind arrived. Every line is
+ *   activity, including system notices and lines that fail to parse.
+ * - `outstandingToolIds`: `tool_use` ids the agent has issued whose
+ *   `tool_result` has not come back yet. While this is non-empty a tool is
+ *   running, and a tool such as a Gradle test run legitimately prints
+ *   nothing for many minutes; the wall clock bounds that case instead.
+ */
+export interface IdleWatchdogState {
+  lastLineAt: number;
+  outstandingToolIds: ReadonlySet<string>;
+}
+
+export function initIdleWatchdogState(now: number): IdleWatchdogState {
+  return { lastLineAt: now, outstandingToolIds: new Set() };
+}
+
+function contentBlocks(msg: Record<string, unknown>): Record<string, unknown>[] {
+  const message = msg.message as Record<string, unknown> | undefined;
+  const content = message?.content;
+  if (!Array.isArray(content)) return [];
+  return content.filter((b): b is Record<string, unknown> => !!b && typeof b === "object");
+}
+
+/**
+ * Advance the watchdog on one stream line. `msg` is the parsed JSON, or
+ * null for a line that did not parse (still activity). Assistant
+ * `tool_use` blocks add their id; user `tool_result` blocks remove theirs.
+ *
+ * Pure: no I/O, no clock. The driver passes `now`.
+ */
+export function advanceIdleWatchdogState(
+  state: IdleWatchdogState,
+  msg: unknown,
+  now: number,
+): IdleWatchdogState {
+  let outstanding = state.outstandingToolIds;
+  if (msg && typeof msg === "object") {
+    const m = msg as Record<string, unknown>;
+    if (m.type === "assistant") {
+      for (const b of contentBlocks(m)) {
+        if (b.type === "tool_use" && typeof b.id === "string") {
+          if (outstanding === state.outstandingToolIds) outstanding = new Set(outstanding);
+          (outstanding as Set<string>).add(b.id);
+        }
+      }
+    } else if (m.type === "user") {
+      for (const b of contentBlocks(m)) {
+        if (b.type === "tool_result" && typeof b.tool_use_id === "string" && outstanding.has(b.tool_use_id)) {
+          if (outstanding === state.outstandingToolIds) outstanding = new Set(outstanding);
+          (outstanding as Set<string>).delete(b.tool_use_id);
+        }
+      }
+    }
+  }
+  return { lastLineAt: now, outstandingToolIds: outstanding };
+}
+
+/**
+ * True when the run has stalled: the watchdog is enabled, no tool call is
+ * outstanding, and nothing has arrived for at least `idleMs`.
+ */
+export function shouldFireIdleWatchdog(
+  state: IdleWatchdogState,
+  now: number,
+  idleMs: number,
+): boolean {
+  if (idleMs <= 0) return false;
+  if (state.outstandingToolIds.size > 0) return false;
+  return now - state.lastLineAt >= idleMs;
+}
+
+/** How often the driver checks the watchdog: a tenth of the threshold,
+ *  clamped to [1s, 30s], so a firing lands within 10% of the threshold. */
+export function idleWatchdogTickMs(idleMs: number): number {
+  return Math.min(30_000, Math.max(1_000, Math.round(idleMs / 10)));
+}
+
+// --------- Partial-work salvage for runs that already have a PR ---------
+
+/** How a run was stopped by the dispatcher rather than finishing. */
+export type RunStopKind = "timeout" | "idle_stall";
+
+/**
+ * The runner's rejection when the dispatcher itself stopped the run and no
+ * result frame came back: the wall clock, or the idle watchdog. Typed so
+ * the orchestrator can tell these from every other failure without
+ * matching message text. The message is unchanged from the plain `Error`
+ * it replaces, so retry classification and comments read the same.
+ *
+ * This is the door most timeouts arrive through: a SIGTERMed `pyry
+ * agent-run` writes no result frame, so pyrycode-mobile #1430 (2026-10-02)
+ * and #1332 (2026-10-01) both failed with "Agent timed out after 2280s"
+ * here, never reaching `handleAgentResultErrors` at all.
+ */
+export class AgentRunStoppedError extends Error {
+  constructor(message: string, readonly kind: RunStopKind) {
+    super(message);
+    this.name = "AgentRunStoppedError";
+  }
+}
+
+/**
+ * Which stop, if any, ended this run. Both doors count: the runner's
+ * rejection (`AgentRunStoppedError`) and a result frame the dispatcher
+ * marked (`timedOut`, or terminal reason `idle_stall` from either the
+ * dispatcher's watchdog or pyry's). A result that is not an error is not
+ * a stop. Neither is a permission denial or a Codex blocked or refinement
+ * outcome: those are policy stops with their own handling, and saving
+ * their work automatically could repeat the action that was refused.
+ */
+export function runStopKind(
+  error: unknown,
+  streamResult: {
+    isError: boolean;
+    timedOut: boolean;
+    terminalReason: string;
+    hadPermissionDenial: boolean;
+  } | null,
+): RunStopKind | null {
+  if (error instanceof AgentRunStoppedError) return error.kind;
+  if (!streamResult || !streamResult.isError || streamResult.hadPermissionDenial) return null;
+  if (["codex_blocked", "needs_refinement", "waiting_on_blocker"].includes(streamResult.terminalReason)) return null;
+  if (streamResult.terminalReason === IDLE_STALL_REASON) return "idle_stall";
+  if (streamResult.timedOut) return "timeout";
+  return null;
+}
+
+/**
+ * True when this run's stage may have its partial work committed and
+ * pushed for it. Only stages that own commits on the branch qualify:
+ * `producesCommits` is already that list (architect, developer, builder,
+ * documentation). Reviewer stages (verifier, code-review, qa) and the
+ * refiner/PO carry `false`, so their worktree is never pushed for them.
+ */
+export function canSalvagePartialWork(opts: {
+  stopKind: RunStopKind | null;
+  agent: Pick<AgentConfig, "producesCommits">;
+  useWorktree: boolean;
+  issueNumber: number;
+}): boolean {
+  return opts.stopKind !== null && opts.agent.producesCommits && opts.useWorktree && opts.issueNumber > 0;
+}
+
+/**
+ * Whether to commit and push a stopped run's leftovers to its branch.
+ *
+ * Why. The draft-PR salvage (`shouldAttemptSafeSalvage`) only covers a
+ * branch with no pull request yet, because it opens one. Every rework,
+ * documentation and later run already has a PR, so a timeout there left
+ * its edits in the worktree: pyrycode-mobile #1430 (2026-10-02) and #1332
+ * (2026-10-01) both timed out in documentation with finished edits
+ * uncommitted. A dirty worktree also blocks the next run from recreating
+ * it, and unpushed local commits make the next setup abort as "local
+ * ahead of origin". Pushing to the existing branch fixes both; the PR
+ * already exists, so nothing new is opened and nothing auto-advances.
+ *
+ * Gates, all required:
+ * - an open PR on the branch (`openPrCount > 0`; -1 means the lookup
+ *   failed, which skips);
+ * - no merge in progress (`MERGE_HEAD`), and a merge handed to this run
+ *   passed `checkMergeResolution`, so conflict markers are never pushed;
+ * - something to save: uncommitted changes, or local commits origin lacks.
+ *
+ * Pure; the caller (`salvagePartialWork` in dispatch.ts) does the I/O.
+ */
+export function decidePartialWorkSalvage(opts: {
+  openPrCount: number;
+  gitStatusOutput: string;
+  /** `git rev-list --count origin/<branch>..HEAD`; -1 when unknown. */
+  commitsAheadOfOrigin: number;
+  mergeInProgress: boolean;
+  /** `checkMergeResolution` problems for a merge handed to this run; empty otherwise. */
+  mergeCheckProblems: readonly string[];
+}): { salvage: true } | { salvage: false; reason: string } {
+  if (opts.openPrCount < 0) return { salvage: false, reason: "could not look up the branch's pull request" };
+  if (opts.openPrCount === 0) return { salvage: false, reason: "no open pull request on the branch" };
+  if (opts.mergeInProgress) return { salvage: false, reason: "a merge is still in progress (MERGE_HEAD)" };
+  if (opts.mergeCheckProblems.length > 0) {
+    return { salvage: false, reason: `the merge handed to this run failed its check: ${opts.mergeCheckProblems.join(" ")}` };
+  }
+  const dirty = opts.gitStatusOutput.trim().length > 0;
+  if (!dirty && opts.commitsAheadOfOrigin <= 0) {
+    return { salvage: false, reason: "nothing to save: worktree clean and in sync with origin" };
+  }
+  return { salvage: true };
+}
+
+// --------- Runner stderr: keep the tail, scrub credentials ---------
+
+/**
+ * How much of a runner's stderr the dispatcher keeps, and how much of that
+ * goes into an error message.
+ *
+ * Why. On 2026-10-02 pyrycode-mobile #1340's verifier failed after 21
+ * minutes with only "Claude CLI exited with code 1, no result message
+ * received". The dispatcher wrote the CLI's stderr to its own terminal and
+ * kept none of it (the tail was collected for Codex only), so the cause is
+ * unknowable. Every runner now keeps the last STDERR_TAIL_CAP characters,
+ * writes them to the run's log on failure, and appends the last
+ * STDERR_MESSAGE_CHARS to the no-result error, which lands in the ticket's
+ * error comment inside its code block.
+ */
+export const STDERR_TAIL_CAP = 4000;
+export const STDERR_MESSAGE_CHARS = 1500;
+
+/** Append a stderr chunk, keeping only the last `cap` characters. */
+export function appendStderrTail(tail: string, chunk: string, cap = STDERR_TAIL_CAP): string {
+  return (tail + chunk).slice(-cap);
+}
+
+const REDACTED = "[REDACTED]";
+
+/**
+ * Credential shapes to blank before text leaves the machine. Order
+ * matters: specific shapes first, so the generic `token=`/`key=` rule
+ * does not leave a recognisable prefix behind.
+ */
+const CREDENTIAL_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
+  // `Authorization: Bearer <token>` and friends.
+  [/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, `Bearer ${REDACTED}`],
+  // Anthropic API and OAuth keys: sk-ant-api03-..., sk-ant-oat01-...
+  [/\bsk-ant-[A-Za-z0-9_-]+/g, `sk-ant-${REDACTED}`],
+  // GitHub tokens: classic and OAuth/app/refresh (gh[pousr]_), fine-grained (github_pat_).
+  [/\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})/g, REDACTED],
+  // Credentials embedded in a URL: https://user:secret@host
+  [/(\bhttps?:\/\/[^\s:/@]+:)[^\s@/]+@/gi, `$1${REDACTED}@`],
+  // A long base64-looking value after token=, key=, secret= or password=
+  // (also `:` and quoted forms, e.g. CLAUDE_CODE_OAUTH_TOKEN=..., "api_key": "...").
+  [/(\b[A-Za-z0-9_-]*(?:token|key|secret|password)["']?\s*[=:]\s*["']?)[A-Za-z0-9+/_.=-]{16,}/gi, `$1${REDACTED}`],
+];
+
+/**
+ * Blank anything that looks like a credential. Used on every piece of
+ * runner stderr before it reaches a log, an error message or a GitHub
+ * comment; the Codex adapter shares it for its stderr-derived failure
+ * text, which previously went to the ticket unscrubbed.
+ */
+export function scrubCredentials(text: string): string {
+  let out = text;
+  for (const [pattern, replacement] of CREDENTIAL_PATTERNS) out = out.replace(pattern, replacement);
+  return out;
+}
+
+/**
+ * The scrubbed last `max` characters of a stderr tail, ready to sit inside
+ * the error comment's code block: a run of three or more backticks would
+ * close that block early, so those become quotes. "" when there is none.
+ */
+export function stderrForMessage(tail: string, max = STDERR_MESSAGE_CHARS): string {
+  return scrubCredentials(tail).slice(-max).replace(/`{3,}/g, "'''").trim();
+}
+
+/** The runner's error when the CLI exits without a result frame. */
+export function noResultErrorMessage(code: number | null, stderrTail: string): string {
+  const base = `Claude CLI exited with code ${code}, no result message received`;
+  const tail = stderrForMessage(stderrTail);
+  return tail ? `${base}\n--- stderr (last ${STDERR_MESSAGE_CHARS} chars) ---\n${tail}` : base;
+}

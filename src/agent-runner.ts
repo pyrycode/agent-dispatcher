@@ -3,6 +3,7 @@ import { delimiter, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import type { StreamResult } from "./dispatch.js";
+import { scrubCredentials } from "./agent-runtime.js";
 
 export type AgentRunner = "claude" | "codex";
 
@@ -160,7 +161,9 @@ export class CodexStreamAdapter {
       : isError ? (temporaryModelAccessFailure ? "api_error" : "codex_error")
       : outcome?.status === "needs_refinement" ? "needs_refinement"
       : outcome?.status === "waiting_on_blocker" ? "waiting_on_blocker" : "stop";
-    const failure = blocked ? (this.approvalRejected ? "Automatic approval review rejected an action. Operator review required." : outcome!.summary) : this.errorText || stderr.trim() || `Codex exited with code ${code} without a successful completed task outcome`;
+    // Stderr reaches the ticket through this text, so scrub it like the
+    // claude runner's no-result tail (shared helper, 2026-10-02).
+    const failure = blocked ? (this.approvalRejected ? "Automatic approval review rejected an action. Operator review required." : outcome!.summary) : scrubCredentials(this.errorText || stderr.trim()) || `Codex exited with code ${code} without a successful completed task outcome`;
     return {
       runner: "codex", costKnown: false,
       output: isError ? failure : outcome!.summary,
