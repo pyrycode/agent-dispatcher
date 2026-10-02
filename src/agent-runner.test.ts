@@ -79,6 +79,15 @@ describe("Codex event adapter", () => {
     s.accept({type:"turn.completed",usage:{}});assert.equal(s.finish(0,false,2).isError,false);
     s.accept({type:"turn.failed",error:{message:"failed"}});assert.equal(s.finish(0,false,2).isError,true);
   });
+  test("stderr-derived failure text is scrubbed before it can reach the ticket", () => {
+    const key = "sk-ant-api03-" + "Z".repeat(40);
+    const s=new CodexStreamAdapter();
+    const r=s.finish(1,false,2,`fatal: auth failed with ${key}\n`);
+    assert.equal(r.isError,true);
+    assert.match(r.output,/fatal: auth failed/);
+    assert.ok(!r.output.includes(key), "the key must not survive into the output");
+    assert.match(r.output,/\[REDACTED\]/);
+  });
   test("timeout retains thread for salvage and overrides a completed event", () => {
     const s=new CodexStreamAdapter();s.accept({type:"thread.started",thread_id:"thread-1"});
     s.accept({type:"turn.completed",usage:{}});

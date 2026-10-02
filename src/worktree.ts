@@ -143,6 +143,41 @@ export function decideBranchSetup(opts: {
   return "abort-local-diverged";
 }
 
+/**
+ * Decide whether to push the pre-run merge of the default branch into the
+ * feature branch as soon as it is committed, instead of only when the run
+ * ends.
+ *
+ * Before every agent run the dispatcher merges the default branch into
+ * `feature/<n>` inside the worktree. That merge used to reach origin only
+ * with the end-of-run push, so a run that died in between (a crash, a kill)
+ * stranded the merge commit locally, and the next dispatch refused with
+ * `abort-local-strictly-ahead` ("a prior dispatch committed work but failed
+ * to push"). Three of the last four such errors were the dispatcher's own
+ * merge: pyrycode-mobile #1340 on 2026-10-02 (the verifier crashed after the
+ * merge), #1250 and #680 before it.
+ *
+ * Push only when:
+ *  - the branch already exists on origin. A fresh ticket's branch is first
+ *    created on origin by the end-of-run push, as before, not by this one.
+ *  - HEAD moved, so the merge made a commit (or fast-forwarded). A no-op
+ *    merge has nothing to push.
+ *  - both HEAD readings are known. When either could not be read, leave it
+ *    to the end-of-run push.
+ *
+ * Pure decision; the caller reads HEAD before and after the merge and runs
+ * the push.
+ */
+export function shouldPushPreRunMerge(opts: {
+  remoteExists: boolean;
+  headBefore: string;
+  headAfter: string;
+}): boolean {
+  if (!opts.remoteExists) return false;
+  if (opts.headBefore === "" || opts.headAfter === "") return false;
+  return opts.headBefore !== opts.headAfter;
+}
+
 // --------- Worktree introspection ---------
 
 /**
@@ -194,6 +229,38 @@ export function findWorktreesForBranch(
     }
   }
   return out;
+}
+
+/** A worktree on the branch that the dispatcher's cleanup could not remove. */
+export interface HeldWorktree {
+  path: string;
+  /** git's refusal from `git worktree remove` (never run with --force). */
+  error: string;
+}
+
+/**
+ * Text for a dispatch-error comment naming the worktrees that still have
+ * the branch checked out after the cleanup, so a human knows where to look.
+ * Returns "" when there are none.
+ *
+ * The cleanup removes worktrees without --force, so one with uncommitted
+ * changes stays and keeps blocking the branch on purpose. git's own error
+ * ("cannot force update the branch ... used by worktree at ...") names the
+ * path but not why the dispatcher left it there; this says so. A refusal
+ * for another reason (a locked worktree) is quoted as git gave it.
+ *
+ * Pure function; the caller collects the refusals.
+ */
+export function describeHeldWorktrees(branchName: string, held: HeldWorktree[]): string {
+  if (held.length === 0) return "";
+  const lines = held.map(({ path, error }) =>
+    /modified or untracked files/.test(error)
+      ? `- \`${path}\` has uncommitted changes (modified or untracked files).`
+      : `- \`${path}\` could not be removed: ${error.split("\n")[0]?.trim() || "unknown error"}`,
+  );
+  return `\n\n\`${branchName}\` is still checked out in a worktree the dispatcher would not remove:\n\n` +
+    `${lines.join("\n")}\n\n` +
+    `The dispatcher never force-removes a worktree, so nothing there was lost. Save or discard its changes, remove it, then retry.`;
 }
 
 // --------- Path resolution ---------

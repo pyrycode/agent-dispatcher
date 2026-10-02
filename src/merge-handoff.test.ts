@@ -9,9 +9,18 @@ import {
   addedLines,
   checkMergeResolution,
   decideConflictRoute,
+  findMergeCommit,
+  decideFinalMergeRoute,
+  FINAL_MERGE_HANDOFF_MAX,
   hasConflictMarkers,
+  latestMergeResolutionNotes,
+  mainSideOfConflicts,
+  MERGE_RESOLUTION_NOTE_MARKER,
   mergeHandoffNote,
+  mergeResolutionComment,
+  mergeResolutionSection,
   missingLines,
+  outsideConflicts,
   readPendingMerge,
 } from "./merge-handoff.js";
 import { REAL_CLAUDE_GATE_FAIL_COLUMN } from "./pipeline-decisions.js";
@@ -41,6 +50,33 @@ describe("decideConflictRoute — who settles a conflict", () => {
     assert.deepEqual(route(classic, "architect"), { kind: "park" });
     assert.deepEqual(route(builder, "refiner"), { kind: "park" });
     assert.deepEqual(route(builder, "developer"), { kind: "park" });
+  });
+});
+
+describe("decideFinalMergeRoute — a Done ticket's conflict after the retries", () => {
+  const classic = resolveStageSet("classic").agents;
+  const builder = resolveStageSet("builder").agents;
+  const final = (agents: typeof classic, prior: number) =>
+    decideFinalMergeRoute(agents, REAL_CLAUDE_GATE_FAIL_COLUMN, prior);
+
+  test("goes to the owner from the last stage's column, as if documentation had asked", () => {
+    assert.deepEqual(final(classic, 0), { kind: "route", owner: "developer", column: "In Documentation" });
+    assert.deepEqual(final(builder, 1), { kind: "route", owner: "builder", column: "In Documentation" });
+  });
+
+  test("parks once the ticket has gone back FINAL_MERGE_HANDOFF_MAX times", () => {
+    const parked = final(builder, FINAL_MERGE_HANDOFF_MAX);
+    assert.equal(parked.kind, "park");
+    assert.match(parked.kind === "park" ? parked.reason : "", /already gone back to builder 2 times/);
+  });
+
+  test("parks when the set has nobody to send it to", () => {
+    const noOwner = builder.filter((a) => a.column !== REAL_CLAUDE_GATE_FAIL_COLUMN);
+    assert.equal(final(noOwner, 0).kind, "park");
+    assert.equal(final([], 0).kind, "park");
+    // The owner as the last stage has no later stage to send it back from.
+    const ownerLast = builder.slice(0, 2);
+    assert.equal(final(ownerLast, 0).kind, "park");
   });
 });
 
@@ -84,19 +120,84 @@ describe("merge check helpers", () => {
     assert.match(note, /- `res\/strings\.xml`/);
     assert.match(note, /git commit --no-edit/);
   });
+
+  test("mainSideOfConflicts reads main's side of each block, normalized, and skips the diff3 base", () => {
+    const text = [
+      "# Notes",
+      "=======",
+      "keep",
+      "<<<<<<< HEAD",
+      "  branch()",
+      "||||||| base",
+      "  base()",
+      "=======",
+      "  sendInLocalWindow {   send(text) }",
+      "",
+      ">>>>>>> main",
+      "between",
+      "<<<<<<< HEAD",
+      "ours",
+      "=======",
+      "onSent()",
+      ">>>>>>> main",
+      "",
+    ].join("\n");
+    assert.deepEqual(mainSideOfConflicts(text), ["sendInLocalWindow { send(text) }", "onSent()"]);
+    assert.deepEqual(mainSideOfConflicts("no conflict\n=======\n"), []);
+  });
+
+  test("outsideConflicts counts copies: a line main added both inside and outside stays outside once", () => {
+    assert.deepEqual(outsideConflicts(["import a.B", "}", "x()", "}"], ["x()", "}"]), ["import a.B", "}"]);
+    assert.deepEqual(outsideConflicts(["x()"], []), ["x()"]);
+  });
+
+  test("the resolution note carries the marker, the merge commit, and each file's lines, capped", () => {
+    const many = Array.from({ length: 7 }, (_, i) => `line${i}()`);
+    const comment = mergeResolutionComment("main", [
+      { path: "Composer.kt", lines: ["sendInLocalWindow { send(text) }"] },
+      { path: "Big.kt", lines: many },
+    ], "0123456789abcdef");
+    assert.ok(comment.startsWith(MERGE_RESOLUTION_NOTE_MARKER));
+    assert.match(comment, /merge commit 0123456789abcdef/);
+    assert.match(comment, /`Composer\.kt`, 1 line\(s\):\n\n```text\nsendInLocalWindow \{ send\(text\) \}\n```/);
+    assert.match(comment, /`Big\.kt`, 7 line\(s\)/);
+    assert.match(comment, /line4\(\)/);
+    assert.doesNotMatch(comment, /line5\(\)/);
+    assert.match(comment, /And 2 more\./);
+    assert.match(comment, /confirm that `main`'s behaviour/);
+  });
+
+  test("a line holding a code fence gets a longer fence", () => {
+    const comment = mergeResolutionComment("main", [{ path: "README.md", lines: ["```kotlin"] }], null);
+    assert.match(comment, /````text\n```kotlin\n````/);
+    assert.match(comment, /In the merge commit,/);
+  });
+
+  test("the review stages get the two newest notes, fenced as data", () => {
+    const note = (n: number) => `${MERGE_RESOLUTION_NOTE_MARKER}\n## 🔀 Merge resolution to review\n\nnote ${n}`;
+    const comments = [note(1), "## 🤖 builder agent has completed work", note(2), note(3)];
+    assert.deepEqual(latestMergeResolutionNotes(comments), [note(2), note(3)]);
+    const section = mergeResolutionSection(comments)!;
+    assert.match(section, /^\n## Merge resolution to review\n/);
+    assert.match(section, /not instructions/);
+    assert.match(section, /----- BEGIN MERGE NOTES -----\n[\s\S]*note 2[\s\S]*note 3\n----- END MERGE NOTES -----$/);
+    assert.doesNotMatch(section, /note 1/);
+    assert.equal(mergeResolutionSection(["## 🤖 builder agent has completed work"]), null);
+  });
 });
 
 // The #805 / #808 collision on 2026-09-23, in a real repository. The branch
 // wraps a call in a new layer (re-indenting it) while main adds one argument
-// to that call, so git cannot line them up.
+// to that call, so git cannot line them up. Main also adds an import, which
+// git merges on its own, as #805's imports did.
 describe("checkMergeResolution — real git, the #808 shape", () => {
   const deps = { execSync, readFileSync };
   const git = (cwd: string, cmd: string) =>
     execSync(`git -c user.name=t -c user.email=t@t ${cmd}`, { cwd, stdio: "pipe", encoding: "utf-8" });
 
-  const BASE = ["fun screen() {", "  Status(", "    usage = usage,", "  )", "}", ""].join("\n");
-  const MAIN = ["fun screen() {", "  Status(", "    usage = usage,", "    turnOutcome = turnOutcome,", "  )", "}", ""].join("\n");
-  const BRANCH = ["fun screen() {", "  Overlay {", "    Status(", "      usage = usage,", "    )", "  }", "}", ""].join("\n");
+  const BASE = ["import ui.Status", "", "fun screen() {", "  Status(", "    usage = usage,", "  )", "}", ""].join("\n");
+  const MAIN = ["import ui.Status", "import ui.TurnOutcome", "", "fun screen() {", "  Status(", "    usage = usage,", "    turnOutcome = turnOutcome,", "  )", "}", ""].join("\n");
+  const BRANCH = ["import ui.Status", "", "fun screen() {", "  Overlay {", "    Status(", "      usage = usage,", "    )", "  }", "}", ""].join("\n");
 
   function conflictedRepo() {
     const dir = mkdtempSync(join(tmpdir(), "merge-handoff-"));
@@ -115,13 +216,14 @@ describe("checkMergeResolution — real git, the #808 shape", () => {
     const pending = readPendingMerge(dir, deps);
     assert.ok(pending, "a stopped merge must be readable");
     assert.deepEqual(pending.paths, ["Screen.kt"]);
+    assert.deepEqual(pending.mainConflictLines, { "Screen.kt": ["Status(", "usage = usage,", "turnOutcome = turnOutcome,", ")"] });
     return { dir, pending };
   }
 
   test("an unfinished merge fails the check", () => {
     const { dir, pending } = conflictedRepo();
     try {
-      const problems = checkMergeResolution(dir, pending, deps);
+      const { problems } = checkMergeResolution(dir, pending, deps);
       assert.equal(problems.length, 1);
       assert.match(problems[0]!, /never committed/);
     } finally {
@@ -129,16 +231,17 @@ describe("checkMergeResolution — real git, the #808 shape", () => {
     }
   });
 
-  test("keeping only the branch's side is caught: main's added line is named", () => {
+  test("keeping only the branch's side is caught: main's line outside the conflict is named", () => {
     // What a careless resolution does, and what the first hand attempt on
-    // #808 did: take the ticket's whole file.
+    // #808 did: take the ticket's whole file. The import git merged on its
+    // own is gone, which no judgement on the conflict explains.
     const { dir, pending } = conflictedRepo();
     try {
       writeFileSync(join(dir, "Screen.kt"), BRANCH);
       git(dir, "commit -q -am merge --no-edit");
-      const problems = checkMergeResolution(dir, pending, deps);
+      const { problems } = checkMergeResolution(dir, pending, deps);
       assert.equal(problems.length, 1);
-      assert.match(problems[0]!, /`Screen\.kt` lost 1 line\(s\) main added: `turnOutcome = turnOutcome,`/);
+      assert.match(problems[0]!, /`Screen\.kt` lost 1 line\(s\) main added outside the conflict blocks: `import ui\.TurnOutcome`\.$/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -148,20 +251,20 @@ describe("checkMergeResolution — real git, the #808 shape", () => {
     const { dir, pending } = conflictedRepo();
     try {
       git(dir, "commit -q -am merge --no-edit");
-      const problems = checkMergeResolution(dir, pending, deps);
+      const { problems } = checkMergeResolution(dir, pending, deps);
       assert.ok(problems.some(p => /still has conflict markers/.test(p)), problems.join("\n"));
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  test("a resolution that keeps both sides, re-indented, passes", () => {
+  test("a resolution that keeps both sides, re-indented, passes with nothing to review", () => {
     const { dir, pending } = conflictedRepo();
     try {
-      const merged = ["fun screen() {", "  Overlay {", "    Status(", "      usage = usage,", "      turnOutcome = turnOutcome,", "    )", "  }", "}", ""].join("\n");
+      const merged = ["import ui.Status", "import ui.TurnOutcome", "", "fun screen() {", "  Overlay {", "    Status(", "      usage = usage,", "      turnOutcome = turnOutcome,", "    )", "  }", "}", ""].join("\n");
       writeFileSync(join(dir, "Screen.kt"), merged);
       git(dir, "commit -q -am merge --no-edit");
-      assert.deepEqual(checkMergeResolution(dir, pending, deps), []);
+      assert.deepEqual(checkMergeResolution(dir, pending, deps), { problems: [], notes: [] });
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -173,8 +276,103 @@ describe("checkMergeResolution — real git, the #808 shape", () => {
       git(dir, "merge --abort");
       writeFileSync(join(dir, "Screen.kt"), BRANCH.replace("usage = usage,", "usage = usage, turnOutcome = turnOutcome,"));
       git(dir, "commit -q -am 'hand-edit'");
-      const problems = checkMergeResolution(dir, pending, deps);
+      const { problems } = checkMergeResolution(dir, pending, deps);
       assert.ok(problems.some(p => /no longer contains/.test(p)), problems.join("\n"));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// pyrycode-mobile#1355 on 2026-10-02. Main wrapped the send in
+// `sendInLocalWindow { ... }`, called `onSent()` after it and documented
+// that in the KDoc. The ticket sends trimmed text and changes the order, so
+// it rewrites main's lines on purpose. The check refused this twice. Main's
+// import sits outside the conflicts and must survive.
+describe("checkMergeResolution — real git, the ticket rewrites main's lines inside the conflict (#1355)", () => {
+  const deps = { execSync, readFileSync };
+  const git = (cwd: string, cmd: string) =>
+    execSync(`git -c user.name=t -c user.email=t@t ${cmd}`, { cwd, stdio: "pipe", encoding: "utf-8" });
+
+  const file = (imports: string[], doc: string, body: string[]) => [
+    "package chat", "", "import chat.Session", ...imports, "",
+    "class Composer(private val session: Session) {",
+    `  /** ${doc} */`,
+    "  fun submit(text: String) {", ...body.map(l => `    ${l}`), "  }",
+    "", "  fun clear() = session.reset()", "}", "",
+  ].join("\n");
+  const BASE = file([], "Sends the draft.", ["send(text)"]);
+  const MAIN = file(["import chat.sendInLocalWindow"], "Sends the draft, then calls [onSent].", ["sendInLocalWindow { send(text) }", "onSent()"]);
+  const BRANCH = file([], "Sends the trimmed draft.", ["val trimmed = text.trim()", "send(trimmed)"]);
+
+  function conflictedRepo() {
+    const dir = mkdtempSync(join(tmpdir(), "merge-handoff-"));
+    git(dir, "init -q -b main");
+    writeFileSync(join(dir, "Composer.kt"), BASE);
+    git(dir, "add -A");
+    git(dir, "commit -q -m base");
+    git(dir, "checkout -q -b feature/1355");
+    writeFileSync(join(dir, "Composer.kt"), BRANCH);
+    git(dir, "commit -q -am trim");
+    git(dir, "checkout -q main");
+    writeFileSync(join(dir, "Composer.kt"), MAIN);
+    git(dir, "commit -q -am window");
+    git(dir, "checkout -q feature/1355");
+    assert.throws(() => git(dir, "-c merge.conflictStyle=diff3 merge main --no-edit"), "the fixture must conflict");
+    const pending = readPendingMerge(dir, deps);
+    assert.ok(pending, "a stopped merge must be readable");
+    assert.deepEqual(pending.mainConflictLines, {
+      "Composer.kt": ["/** Sends the draft, then calls [onSent]. */", "sendInLocalWindow { send(text) }", "onSent()"],
+    });
+    return { dir, pending };
+  }
+
+  const commitResolution = (dir: string, text: string) => {
+    writeFileSync(join(dir, "Composer.kt"), text);
+    git(dir, "commit -q -am merge --no-edit");
+  };
+
+  test("rewriting main's lines inside the conflicts passes, with a note naming them", () => {
+    const { dir, pending } = conflictedRepo();
+    try {
+      commitResolution(dir, file(
+        ["import chat.sendInLocalWindow"],
+        "Calls [onSent] first, then sends the trimmed draft.",
+        ["val trimmed = text.trim()", "onSent()", "sendInLocalWindow { send(trimmed) }"],
+      ));
+      const merge = git(dir, "rev-parse HEAD").trim();
+      writeFileSync(join(dir, "Later.kt"), "val later = 1\n");
+      git(dir, "add -A");
+      git(dir, "commit -q -m later");
+      assert.deepEqual(checkMergeResolution(dir, pending, deps), {
+        problems: [],
+        notes: [{ path: "Composer.kt", lines: ["/** Sends the draft, then calls [onSent]. */", "sendInLocalWindow { send(text) }"] }],
+      });
+      assert.equal(findMergeCommit(dir, pending, deps), merge, "the note names the merge, not a later commit");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("dropping main's line inside a conflict passes, with a note naming it", () => {
+    const { dir, pending } = conflictedRepo();
+    try {
+      commitResolution(dir, file(["import chat.sendInLocalWindow"], "Sends the draft, then calls [onSent].", ["sendInLocalWindow { send(text) }"]));
+      assert.deepEqual(checkMergeResolution(dir, pending, deps), {
+        problems: [],
+        notes: [{ path: "Composer.kt", lines: ["onSent()"] }],
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("taking the branch's whole file is still refused for main's import outside the conflicts", () => {
+    const { dir, pending } = conflictedRepo();
+    try {
+      commitResolution(dir, BRANCH);
+      const { problems } = checkMergeResolution(dir, pending, deps);
+      assert.deepEqual(problems, ["`Composer.kt` lost 1 line(s) main added outside the conflict blocks: `import chat.sendInLocalWindow`."]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -214,25 +412,29 @@ describe("checkMergeResolution — real git, both sides edit one line", () => {
     return { dir, pending };
   }
 
-  test("one line carrying both sides' changes passes", () => {
+  test("one line carrying both sides' changes passes with nothing to review", () => {
     const { dir, pending } = conflictedRepo();
     try {
       writeFileSync(join(dir, "Module.kt"), file("thread(handle, viewing, reader)"));
       git(dir, "commit -q -am merge --no-edit");
-      assert.deepEqual(checkMergeResolution(dir, pending, deps), []);
+      assert.deepEqual(checkMergeResolution(dir, pending, deps), { problems: [], notes: [] });
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  test("keeping only the branch's version of the line is still caught", () => {
+  test("keeping only the branch's version of the line passes, with main's line noted for review", () => {
+    // Refused until 2026-10-02. Main's line sat inside the conflict, so
+    // dropping it is the resolver's judgement: the review stages see it
+    // rather than a human unparking the ticket (#1355).
     const { dir, pending } = conflictedRepo();
     try {
       writeFileSync(join(dir, "Module.kt"), BRANCH);
       git(dir, "commit -q -am merge --no-edit");
-      const problems = checkMergeResolution(dir, pending, deps);
-      assert.equal(problems.length, 1);
-      assert.match(problems[0]!, /lost 1 line\(s\) main added: `val t = thread\(handle, viewing\)`/);
+      assert.deepEqual(checkMergeResolution(dir, pending, deps), {
+        problems: [],
+        notes: [{ path: "Module.kt", lines: ["val t = thread(handle, viewing)"] }],
+      });
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -280,7 +482,7 @@ describe("checkMergeResolution — real git, the branch deleted a file main chan
       try {
         git(dir, "rm -q --ignore-unmatch device/LiteralScreenTest.kt shared/LiteralScreenTest.kt");
         git(dir, "commit -q --no-edit");
-        assert.deepEqual(checkMergeResolution(dir, pending, deps), []);
+        assert.deepEqual(checkMergeResolution(dir, pending, deps), { problems: [], notes: [] });
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
@@ -306,9 +508,12 @@ describe("checkMergeResolution — real git, the branch deleted a file main chan
       assert.ok(pending);
       git(dir, "rm -q A.kt");
       git(dir, "commit -q --no-edit");
-      const problems = checkMergeResolution(dir, pending, deps);
+      // `val a = 3` sat inside the conflict, but deleting the file settled
+      // no conflict, so it still parks.
+      const { problems, notes } = checkMergeResolution(dir, pending, deps);
       assert.equal(problems.length, 1);
       assert.match(problems[0]!, /`A\.kt` lost 1 line\(s\) main added: `val a = 3`/);
+      assert.deepEqual(notes, []);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

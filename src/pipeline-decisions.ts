@@ -348,10 +348,12 @@ export interface ReworkRoute {
  *
  * A route on a ticket carrying MERGE_HANDOFF_LABEL is a merge handoff: the
  * dispatcher's merge before a later stage conflicted and sent the ticket to
- * its code owner. It moves like any rework and the marker is stripped with
- * it, but it is flagged so the caller counts nothing. Nothing was wrong with
- * the ticket, and main has to move again for the next conflict, so it cannot
- * loop on its own.
+ * its code owner. Since 2026-10-02 the final merge from Done does the same
+ * once its retries are spent, leaving the ticket in the last stage's column.
+ * It moves like any rework and the marker is stripped with it, but it is
+ * flagged so the caller counts nothing. Nothing was wrong with the ticket,
+ * and main has to move again for the next conflict, so it cannot loop on its
+ * own; the final merge also stops after FINAL_MERGE_HANDOFF_MAX routes.
  *
  * Pure function over already-collected items; the caller does the I/O
  * (status updates and label removals).

@@ -9,7 +9,7 @@ import { DispatchPool, candidateKey, excludeInFlight, freeSeats, resolvePollInte
 import { countVerdictsSince, parseVerdictArtifacts, pickVerdictPr, shouldFlagMissingVerdict } from "./verdict-guard.js";
 import { countOpenPrs, shouldFlagMissingPr } from "./pr-guard.js";
 import { resolveImportOnlyMerge } from "./merge-resolve.js";
-import { MERGE_HANDOFF_LABEL, checkMergeResolution, decideConflictRoute, mergeHandoffNote, readPendingMerge, type PendingMerge } from "./merge-handoff.js";
+import { FINAL_MERGE_HANDOFF_MARKER, FINAL_MERGE_HANDOFF_MAX, MERGE_HANDOFF_LABEL, checkMergeResolution, decideConflictRoute, decideFinalMergeRoute, findMergeCommit, mergeHandoffNote, mergeResolutionComment, mergeResolutionSection, readPendingMerge, type PendingMerge, type ResolutionNote } from "./merge-handoff.js";
 
 import { buildClaudeSourceReviewInvocation, buildCodexInvocation, codexChildEnv, CODEX_ROLE_GUIDANCE, CodexStreamAdapter, formatRunCost, resumeCommand, resolveAgentRunner, type AgentRunner } from "./agent-runner.js";
 
@@ -21,6 +21,22 @@ import {
   buildResumePrompt,
   captureSessionId,
   initPermissionDenialState,
+  advanceIdleWatchdogState,
+  idleStallMessage,
+  idleWatchdogTickMs,
+  initIdleWatchdogState,
+  parseIdleTimeoutMs,
+  shouldFireIdleWatchdog,
+  IDLE_STALL_REASON,
+  AgentRunStoppedError,
+  canSalvagePartialWork,
+  decidePartialWorkSalvage,
+  runStopKind,
+  type RunStopKind,
+  appendStderrTail,
+  noResultErrorMessage,
+  scrubCredentials,
+  withoutStderrSection,
   maxTurnsFor,
   mergeLegResults,
   parseBudgetScale,
@@ -58,6 +74,14 @@ import {
 } from "./main-sweep.js";
 import { recordFlakyTests } from "./flaky-tickets.js";
 import { recordInheritedTests } from "./inherited-tickets.js";
+import {
+  decideVerifierGateReuse,
+  hashGateList,
+  parseVerifierGatePass,
+  verifierGatePassFileName,
+  verifierGateReuseEnabled,
+  type VerifierGatePass,
+} from "./verifier-gate-reuse.js";
 import { activeStageSet } from "./stage-sets.js";
 import { resolveEffort } from "./effort-policy.js";
 import {
@@ -102,11 +126,14 @@ import {
 import {
   decideBranchSetup,
   decideCodegraphSymlink,
+  describeHeldWorktrees,
   findWorktreesForBranch,
+  type HeldWorktree,
   resolveAgentsRepoRootWithEnv,
   resolveDefaultBranch,
   resolveTargetRepoRoot,
   shouldAutoCommit,
+  shouldPushPreRunMerge,
 } from "./worktree.js";
 import {
   runAutoAdvance,
@@ -843,6 +870,27 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
       }
     }, opts.timeoutMs);
 
+    // Idle watchdog (claude runner only). Fires when no stream line has
+    // arrived for PYRY_AGENT_IDLE_TIMEOUT_MINUTES while no tool call is
+    // outstanding, and kills the run the way the wall clock does. Added
+    // after pyrycode-mobile #1430 (2026-10-02) sat silent for twenty
+    // minutes inside one assistant turn and the 38-minute wall clock took
+    // its finished edits with it. Decision logic is pure, in
+    // agent-runtime.ts (`shouldFireIdleWatchdog`); this is only the clock
+    // and the kill. Codex emits a different event stream, so it keeps the
+    // wall clock alone. The wall clock stays armed as the backstop.
+    const idleMs = isCodex ? 0 : parseIdleTimeoutMs(process.env.PYRY_AGENT_IDLE_TIMEOUT_MINUTES);
+    let idleState = initIdleWatchdogState(Date.now());
+    let idleStalled = false;
+    const idleTimer = idleMs > 0 ? setInterval(() => {
+      if (idleStalled || timedOut || !shouldFireIdleWatchdog(idleState, Date.now(), idleMs)) return;
+      idleStalled = true;
+      if (idleTimer) clearInterval(idleTimer);
+      appendFileSync(opts.logFile, `\n💤 IDLE STALL — no stream output for ${idleMs / 1000}s with no tool call outstanding; killing agent\n`);
+      console.log(`   💤 Idle stall: no stream output for ${idleMs / 60_000}min, killing agent`);
+      killChildPgrp(child, "SIGTERM");
+    }, idleWatchdogTickMs(idleMs)) : null;
+
     const handleWatchdogAction = (action: ReturnType<typeof advancePermissionDenialState>["action"]) => {
       if (action === "logDenial") {
         const ts = new Date().toISOString();
@@ -876,6 +924,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
       promptStream.pipe(child.stdin!);
       promptStream.on("error", (err) => {
         clearTimeout(timer);
+        if (idleTimer) clearInterval(idleTimer);
         killChildPgrp(child, "SIGTERM");
         reject(err);
       });
@@ -894,10 +943,17 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
         if (!line.trim()) continue;
         try {
           const msg = JSON.parse(line);
+          if (idleTimer) idleState = advanceIdleWatchdogState(idleState, msg, Date.now());
           if (codex) { codex.accept(msg); logStreamMessage(opts.logFile, msg); continue; }
           initSessionId = captureSessionId(initSessionId, msg);
           logStreamMessage(opts.logFile, msg);
-          if (msg.type === "result") resultMsg = msg;
+          if (msg.type === "result") {
+            resultMsg = msg;
+            // The run has its outcome. A process that lingers after its
+            // result is not a stalled agent; the wall clock bounds it as
+            // before, and the result still counts.
+            if (idleTimer) clearInterval(idleTimer);
+          }
           // Drive the Layer 2 denial watchdog. State transitions are
           // pure; only side effects (log lines, SIGTERM) go through
           // handleWatchdogAction.
@@ -905,18 +961,28 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
           denialState = advanced.state;
           handleWatchdogAction(advanced.action);
         } catch {
+          // A line that does not parse is still a sign of life.
+          if (idleTimer) idleState = advanceIdleWatchdogState(idleState, null, Date.now());
           appendFileSync(opts.logFile, `[stream] ${line.slice(0, 500)}\n`);
         }
       }
     });
 
+    // Keep the stderr tail for every runner, not just Codex: a claude run
+    // that dies without a result frame leaves nothing else behind
+    // (pyrycode-mobile #1340, 2026-10-02). Still mirrored to the
+    // dispatcher's terminal as before.
     child.stderr!.on("data", (chunk: Buffer) => {
-      if (isCodex) stderrTail = (stderrTail + chunk.toString()).slice(-4000);
+      stderrTail = appendStderrTail(stderrTail, chunk.toString());
       process.stderr.write(chunk);
     });
+    const logStderrTail = () => {
+      if (stderrTail.trim()) writeLog(opts.logFile, "STDERR (tail)", scrubCredentials(stderrTail));
+    };
 
     child.on("close", (code) => {
       clearTimeout(timer);
+      if (idleTimer) clearInterval(idleTimer);
       if (forceExitTimer) clearTimeout(forceExitTimer);
       // Untrack the pgrp ONLY if it has actually drained. The pgrp ID
       // persists in the kernel until its LAST member exits, not until
@@ -953,7 +1019,12 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
         } catch { /* partial JSON, already logged via stream */ }
       }
 
-      if (codex) { resolve(codex.finish(code, timedOut, Date.now() - startedAt, stderrTail)); return; }
+      if (codex) {
+        const finished = codex.finish(code, timedOut, Date.now() - startedAt, stderrTail);
+        if (finished.isError) logStderrTail();
+        resolve(finished);
+        return;
+      }
 
       if (resultMsg) {
         const r = resultMsg as any;
@@ -963,15 +1034,23 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
         const sourceComplete = !opts.sourceReview || (code === 0 && !timedOut && !denialState.hadPermissionDenial
           && !r.is_error && r.subtype === "success" && report?.status === "completed"
           && typeof report.summary === "string" && report.summary.trim().length > 0);
+        // A result frame written after the idle watchdog's SIGTERM is the
+        // stalled run's death notice, not its outcome. Name the stall so
+        // handleAgentResultErrors' message carries `idle_stall` and the
+        // retry allowlist classifies it as transient. A success that
+        // happened to land after the kill still counts as a success.
+        const stalledResult = idleStalled && r.is_error === true;
+        if (r.is_error || !sourceComplete || stalledResult) logStderrTail();
         resolve({
           output: opts.sourceReview ? report?.summary || r.result || "" : r.result || "",
           sessionId: pickFinalSessionId(r.session_id, initSessionId),
-          isError: r.is_error || !sourceComplete,
+          isError: r.is_error || !sourceComplete || stalledResult,
           numTurns: r.num_turns || 0,
           totalCostUsd: r.total_cost_usd || 0,
           durationMs: r.duration_ms || 0,
           usage: r.usage || {},
-          terminalReason: opts.sourceReview ? (sourceComplete ? "stop" : "source_review_incomplete") : r.terminal_reason || "",
+          terminalReason: stalledResult ? IDLE_STALL_REASON
+            : opts.sourceReview ? (sourceComplete ? "stop" : "source_review_incomplete") : r.terminal_reason || "",
           rawResult: r,
           hadPermissionDenial: denialState.hadPermissionDenial,
           stoppedAtDenial: denialState.stoppedAtDenial,
@@ -980,6 +1059,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
           timedOut,
         });
       } else if (denialState.hadPermissionDenial) {
+        logStderrTail();
         // Force-exit produced no `result` event — synthesize a
         // permission-denied "result" so handleAgentResultErrors can
         // route to the new salvage path instead of throwing into the
@@ -1003,15 +1083,25 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
           lastAssistantText: denialState.lastAssistantText,
           timedOut,
         });
+      } else if (idleStalled) {
+        logStderrTail();
+        // Checked before the wall clock: the stall is the cause even when
+        // the backstop also fired while the kill was landing.
+        reject(new AgentRunStoppedError(idleStallMessage(idleMs), "idle_stall"));
       } else if (timedOut) {
-        reject(new Error(`Agent timed out after ${opts.timeoutMs / 1000}s`));
+        logStderrTail();
+        reject(new AgentRunStoppedError(`Agent timed out after ${opts.timeoutMs / 1000}s`, "timeout"));
       } else {
-        reject(new Error(`Claude CLI exited with code ${code}, no result message received`));
+        logStderrTail();
+        // The scrubbed stderr tail rides in the message, so the ticket's
+        // error comment shows why the CLI died (pyrycode-mobile #1340).
+        reject(new Error(noResultErrorMessage(code, stderrTail)));
       }
     });
 
     child.on("error", (err) => {
       clearTimeout(timer);
+      if (idleTimer) clearInterval(idleTimer);
       // Same probe-before-delete as the close handler — `error` can
       // fire for spawn failures (no pgrp existed) OR for kill failures
       // (pgrp may still have live members). Probe ESRCH to disambiguate.
@@ -1174,6 +1264,7 @@ async function buildPromptForAgent(
   agent: AgentConfig,
   item: ProjectItem,
   specRoot: string,
+  client: Pick<DispatchClient, "getIssueCommentBodies">,
 ): Promise<string> {
   const parts: string[] = [];
 
@@ -1290,6 +1381,19 @@ async function buildPromptForAgent(
     } catch (e) {
       console.warn(`   ⚠️  Failed to look up PR for #${ticketNum}: ${e}`);
       parts.push(`\n## Pull Request\nCould not determine PR number. Find it with: gh pr list --head feature/${ticketNum}`);
+    }
+  }
+
+  // A merge the code owner finished may have changed main's lines inside
+  // the conflict blocks. The dispatcher pushed it and listed those lines in
+  // an issue comment, which no review stage reads unless it is put here
+  // (merge-handoff.ts, pyrycode-mobile #1355 on 2026-10-02).
+  if (ticketNum > 0 && decideConflictRoute(activeStageSet().agents, agent.name, REAL_CLAUDE_GATE_FAIL_COLUMN).kind === "route") {
+    try {
+      const section = mergeResolutionSection(await client.getIssueCommentBodies(ticketNum));
+      if (section) parts.push(section);
+    } catch (e) {
+      console.warn(`   ⚠️  Failed to read merge resolution notes for #${ticketNum}: ${e}`);
     }
   }
 
@@ -1802,6 +1906,15 @@ export interface DispatchClient {
    *  (`runFamilyBreaker` fails open for the cycle, falling back to the
    *  convenience label). */
   getFamilyDispatchState(issueNumber: number): Promise<{ markerCount: number; breakerCommented: boolean }>;
+  /** Every comment body on an issue, oldest first. The stages after the
+   *  code owner read the merge resolution notes from it (merge-handoff.ts).
+   *  Throws on fetch failure (the prompt goes out without the notes). */
+  getIssueCommentBodies(issueNumber: number): Promise<string[]>;
+  /** How many of an issue's comments carry `marker`. The final-merge loop
+   *  guard counts its routing comments with it (`handOffFinalMerge`).
+   *  Throws on fetch failure (the caller leaves the ticket for the next
+   *  cycle). */
+  countMarkerComments(issueNumber: number, marker: string): Promise<number>;
 }
 
 // IO surface every phase function depends on. Threading it through
@@ -2049,10 +2162,18 @@ export async function dispatchToAgent(
     const preserveBlockedWork = streamResult?.runner === "codex"
       && ["codex_blocked", "needs_refinement"].includes(streamResult.terminalReason) && ctx.useWorktree;
     if (preserveBlockedWork) error.message += `\nWorktree preserved for recovery: ${ctx.worktreeDir}`;
+    // A run the dispatcher stopped (wall clock or idle stall) on a branch
+    // that already has a PR: push its leftovers BEFORE the error path and
+    // the worktree teardown, then let the error continue as before. See
+    // `decidePartialWorkSalvage` for the incidents (mobile #1430, #1332).
+    const stopKind = saferSalvaged || preserveBlockedWork ? null : runStopKind(error, streamResult);
+    const partial = stopKind ? await salvagePartialWork(ctx, stopKind) : { keepWorktree: false };
     await handleDispatchError(error, ctx, streamResult);
     // A rejected commit can leave useful edits. Never erase them or use
     // automatic salvage to work around an approval rejection.
     if (preserveBlockedWork) return;
+    // Committed but not pushed: the kept worktree is now the only copy.
+    if (partial.keepWorktree) return;
   }
 
   await cleanupAfterDispatch(ctx);
@@ -2249,7 +2370,7 @@ export async function handleDispatchError(
   if (item.issueNumber > 0) {
     const classifyText = isResourceExhausted
       ? `${error.message} ${(error as ResourceExhaustedError).errno}`
-      : (error?.message ?? "");
+      : withoutStderrSection(error?.message ?? "");
     // The structured `terminal_reason` is passed alongside the text so a
     // server-side API failure retries on claude's own classification rather
     // than on whichever wording the API happened to use. 15 of 79 such
@@ -2409,6 +2530,20 @@ export async function setupBranchAndWorktree(
     originIsAncestorOfLocal,
   });
 
+  // Remove stale and orphan worktrees BEFORE the branch is updated. `git
+  // branch -f` refuses a branch that any worktree has checked out, and this
+  // cleanup used to run only after the branch setup: on 2026-10-02
+  // pyrycode-mobile #1430's verifier failed with "cannot force update the
+  // branch 'feature/1430' used by worktree at '.../documentation-1430'". That
+  // worktree, left by a timed-out documentation run, was clean and its HEAD
+  // was already on origin, so the cleanup would have removed it had it run
+  // first. The branch setup reads only refs, and removing a worktree changes
+  // none, so nothing above depends on the old order. The two integrity
+  // aborts skip the cleanup and leave every worktree in place for triage,
+  // as they did before.
+  const aborting = branchAction === "abort-local-strictly-ahead" || branchAction === "abort-local-diverged";
+  const heldWorktrees = aborting ? [] : removeBlockingWorktrees(ctx);
+
   try {
     switch (branchAction) {
       case "create-from-main":
@@ -2495,46 +2630,14 @@ export async function setupBranchAndWorktree(
     }
   } catch (e) {
     console.error(`   ❌ Git branch setup failed: ${e}`);
-    await client.addComment(item.issueNumber, `## ⚠️ Dispatch Error: ${agent.name}\n\nFailed to set up branch \`${branchName}\` (action: ${branchAction}). Manual intervention required.\n\n\`\`\`\n${e}\n\`\`\``);
+    await client.addComment(item.issueNumber, `## ⚠️ Dispatch Error: ${agent.name}\n\nFailed to set up branch \`${branchName}\` (action: ${branchAction}). Manual intervention required.${describeHeldWorktrees(branchName, heldWorktrees)}\n\n\`\`\`\n${e}\n\`\`\``);
     try { await client.addLabel(item.issueNumber, `error:${agent.name}`); } catch {}
     return { ok: false };
   }
 
-  // Create worktree from the feature branch
+  // Create worktree from the feature branch. Stale and orphan worktrees
+  // were removed before the branch setup above.
   try {
-    // Clean up stale worktree at the SAME path (previous failed run with
-    // matching agent prefix).
-    try {
-      execSync(`git worktree remove "${worktreeDir}"`, { cwd: repoRoot, stdio: "pipe" });
-    } catch {}
-
-    // Clean up orphan worktrees checked out at the SAME BRANCH under a
-    // different path. `git worktree add` fails with "fatal: '<branch>' is
-    // already checked out at '<other-path>'" otherwise. This happens when
-    // a previous cycle's cleanup execSync at lines ~985-991 was swallowed
-    // (permissions, lockfile contention) — the orphan blocks all future
-    // dispatches on this branch with error:<agent> until a human steps in.
-    // Prune first to drop dead refs (worktree dir was removed but git's
-    // metadata still references it), then remove clean worktrees still
-    // matching the branch. Dirty worktrees remain and block reuse safely.
-    try {
-      execSync(`git worktree prune`, { cwd: repoRoot, stdio: "pipe" });
-      const porcelain = execSync(`git worktree list --porcelain`, {
-        cwd: repoRoot, encoding: "utf-8", timeout: 15_000,
-      });
-      for (const orphanPath of findWorktreesForBranch(porcelain, branchName)) {
-        if (orphanPath === worktreeDir) continue; // already removed above
-        try {
-          execSync(`git worktree remove "${orphanPath}"`, { cwd: repoRoot, stdio: "pipe" });
-          console.log(`   🧹 Removed orphan worktree ${orphanPath} (branch ${branchName})`);
-        } catch (e) {
-          console.warn(`   ⚠️  Failed to remove orphan worktree ${orphanPath}: ${e}`);
-        }
-      }
-    } catch (e) {
-      console.warn(`   ⚠️  Failed to inspect worktrees for ${branchName}: ${e}`);
-    }
-
     mkdirSync(dirname(worktreeDir), { recursive: true });
     execSync(`git worktree add "${worktreeDir}" ${branchName}`, { cwd: repoRoot, stdio: "pipe" });
     console.log(`   🌳 Created worktree at ${worktreeDir}`);
@@ -2568,7 +2671,7 @@ export async function setupBranchAndWorktree(
     }
   } catch (e) {
     console.error(`   ❌ Failed to create worktree: ${e}`);
-    await client.addComment(item.issueNumber, `## ⚠️ Dispatch Error: ${agent.name}\n\nFailed to create git worktree.\n\n\`\`\`\n${e}\n\`\`\``);
+    await client.addComment(item.issueNumber, `## ⚠️ Dispatch Error: ${agent.name}\n\nFailed to create git worktree.${describeHeldWorktrees(branchName, heldWorktrees)}\n\n\`\`\`\n${e}\n\`\`\``);
     try { await client.addLabel(item.issueNumber, `error:${agent.name}`); } catch {}
     return { ok: false };
   }
@@ -2576,6 +2679,9 @@ export async function setupBranchAndWorktree(
   // Merge default branch into the feature branch INSIDE the worktree (not in the main repo).
   // diff3 markers carry the common ancestor, which is how an import-only
   // conflict is told apart from one that needs a human (see merge-resolve.ts).
+  // HEAD is read before the merge so a committed merge can be pushed right
+  // away (see pushPreRunMerge).
+  const headBefore = readWorktreeHead(execSync, worktreeDir);
   try {
     execSync(`git -c merge.conflictStyle=diff3 merge ${defaultBranch} --no-edit`, { cwd: worktreeDir, stdio: "pipe" });
     console.log(`   🔀 Merged ${defaultBranch} into ${branchName} (in worktree)`);
@@ -2593,6 +2699,7 @@ export async function setupBranchAndWorktree(
           `\n\nAny other conflict still stops here for a human.`,
         );
       } catch {}
+      pushPreRunMerge(ctx, remoteExists, headBefore);
       return { ok: true };
     }
 
@@ -2610,7 +2717,8 @@ export async function setupBranchAndWorktree(
           `## 🔀 Merge conflict left for ${agent.name}\n\n` +
           `Merging \`${defaultBranch}\` into \`${branchName}\` conflicted in:\n\n${fileList}\n\n` +
           `The ${agent.name} run finishes the merge first. When it ends, the dispatcher checks that the merge is committed, ` +
-          `no conflict markers remain and every line \`${defaultBranch}\` added to those files survived, before anything is pushed.`,
+          `no conflict markers remain and every line \`${defaultBranch}\` added outside the conflict blocks survived, before anything is pushed. ` +
+          `Lines of \`${defaultBranch}\` inside the conflict blocks that the resolution changes are listed on this ticket for the review stages.`,
         );
       } catch {}
       return { ok: true };
@@ -2643,7 +2751,102 @@ export async function setupBranchAndWorktree(
     return { ok: false };
   }
 
+  pushPreRunMerge(ctx, remoteExists, headBefore);
   return { ok: true };
+}
+
+// Remove the worktrees that would block this dispatch's branch, and return
+// the ones that stay. Runs before the branch setup (see the #1430 note in
+// setupBranchAndWorktree).
+//
+// Two kinds:
+//  - a stale worktree at the SAME path (a previous failed run with the same
+//    agent prefix).
+//  - orphan worktrees checked out at the SAME BRANCH under a different path.
+//    `git worktree add` fails with "fatal: '<branch>' is already checked out
+//    at '<other-path>'" and `git branch -f` with "cannot force update the
+//    branch" otherwise. This happens when a previous cycle's cleanup was
+//    swallowed (permissions, lockfile contention) or its run timed out; the
+//    orphan blocks all future dispatches on this branch with error:<agent>
+//    until a human steps in.
+// Prune first to drop dead refs (worktree dir was removed but git's metadata
+// still references it), then remove clean worktrees still matching the
+// branch. Only `git worktree remove` without --force: a worktree with
+// uncommitted changes stays and keeps blocking the branch on purpose. Those
+// are returned so the error comment can name them.
+function removeBlockingWorktrees(ctx: DispatchContext): HeldWorktree[] {
+  const { branchName, worktreeDir } = ctx;
+  const { execSync } = ctx.deps;
+  const errorText = (e: any): string => e?.stderr?.toString?.().trim() || e?.message || String(e);
+  const held: HeldWorktree[] = [];
+
+  let samePathError = "";
+  try {
+    execSync(`git worktree remove "${worktreeDir}"`, { cwd: repoRoot, stdio: "pipe" });
+  } catch (e) {
+    // Usually "is not a working tree": nothing was there.
+    samePathError = errorText(e);
+  }
+
+  try {
+    execSync(`git worktree prune`, { cwd: repoRoot, stdio: "pipe" });
+    const porcelain = execSync(`git worktree list --porcelain`, {
+      cwd: repoRoot, encoding: "utf-8", timeout: 15_000,
+    });
+    for (const orphanPath of findWorktreesForBranch(porcelain, branchName)) {
+      if (orphanPath === worktreeDir) {
+        // Still listed, so its removal above was refused.
+        held.push({ path: orphanPath, error: samePathError });
+        continue;
+      }
+      try {
+        execSync(`git worktree remove "${orphanPath}"`, { cwd: repoRoot, stdio: "pipe" });
+        console.log(`   🧹 Removed orphan worktree ${orphanPath} (branch ${branchName})`);
+      } catch (e) {
+        console.warn(`   ⚠️  Failed to remove orphan worktree ${orphanPath}: ${e}`);
+        held.push({ path: orphanPath, error: errorText(e) });
+      }
+    }
+  } catch (e) {
+    console.warn(`   ⚠️  Failed to inspect worktrees for ${branchName}: ${e}`);
+  }
+  return held;
+}
+
+/** HEAD of a worktree, or "" when it cannot be read. */
+function readWorktreeHead(execSync: DispatchDeps["execSync"], cwd: string): string {
+  try {
+    return execSync(`git rev-parse HEAD`, { cwd, encoding: "utf-8", stdio: "pipe" }).trim();
+  } catch {
+    return "";
+  }
+}
+
+// Push the pre-run merge of the default branch as soon as it is committed.
+// The end-of-run push used to be the only one, so a run that died after the
+// merge stranded the merge commit locally and the next dispatch refused with
+// "a prior dispatch committed work but failed to push" — pyrycode-mobile
+// #1340 on 2026-10-02 (the verifier crashed after the merge), and #1250 and
+// #680 before it. See `shouldPushPreRunMerge` for when this pushes.
+//
+// Called after a clean merge and after an import-only auto-resolved merge.
+// A conflicted merge left in progress for the code owner never reaches here:
+// that run finishes it and the end-of-run push carries it, after the checks.
+//
+// Best effort: a failed push only warns. The end-of-run push stays the
+// fallback, and it still parks the ticket if origin refuses it then.
+function pushPreRunMerge(ctx: DispatchContext, remoteExists: boolean, headBefore: string): void {
+  const { branchName, worktreeDir } = ctx;
+  const { execSync } = ctx.deps;
+  const headAfter = readWorktreeHead(execSync, worktreeDir);
+  if (!shouldPushPreRunMerge({ remoteExists, headBefore, headAfter })) return;
+  try {
+    execSync(`git push origin ${branchName}`, { cwd: worktreeDir, stdio: "pipe", timeout: 60_000 });
+    console.log(`   📤 Pushed the merge of ${defaultBranch} into ${branchName} to origin`);
+  } catch (e: any) {
+    const detail = e?.stderr?.toString?.().trim() || e?.message || String(e);
+    console.warn(`   ⚠️  Failed to push the merge of ${defaultBranch} into ${branchName}; the end-of-run push will retry: ${detail}`);
+  }
 }
 
 type SpawnConfig = Parameters<typeof runClaudeStreaming>[0];
@@ -2671,7 +2874,7 @@ export async function prepareAgentSpawn(
   const runner = resolveAgentRunner(process.env);
 
   // Build prompt AFTER worktree creation so specs are read from the feature branch
-  const prompt = await buildPromptForAgent(agent, item, agentCwd);
+  const prompt = await buildPromptForAgent(agent, item, agentCwd, client);
 
   // Re-index QMD in the worktree so the agent has the latest docs.
   // Gated on useWorktree because there's no isolated tree to re-index in
@@ -3066,7 +3269,7 @@ export async function handleAgentResultErrors(
   // finishing a merge may have left conflict markers, so it is never
   // salvaged: the error path parks it for a human instead.
   if (ctx.pendingMerge) {
-    throw new Error(`${ctx.agent.name} ended in error while finishing a merge of ${defaultBranch}; not salvaged, so a half-finished merge is never pushed. Worktree: ${ctx.agentCwd}`);
+    throw new Error(`${ctx.agent.name} ended in error while finishing a merge of ${defaultBranch}; not salvaged unless the merge check passes, so a half-finished merge is never pushed. Worktree: ${ctx.agentCwd}`);
   }
 
   const { agent, item, client, agentCwd, useWorktree, branchName, logFile } = ctx;
@@ -3144,10 +3347,17 @@ export async function handleAgentResultErrors(
   // widened here: the PR-already-exists path above still requires
   // `max_turns`, because that path AUTO-ADVANCES the ticket as a success
   // and no observed failure justifies loosening an auto-advance.
+  //
+  // A wall-clock kill on a branch that ALREADY has an open PR is not this
+  // path's case: it would commit, push and set the block label, then fail
+  // on `gh pr create` because the branch has its PR. Those runs throw on
+  // to the outer catch, where `salvagePartialWork` pushes the work to the
+  // existing PR instead (2026-10-02). A failed lookup keeps the old path.
   if (!salvaged
       && (streamResult.terminalReason === "max_turns" || streamResult.timedOut === true)
       && useWorktree
-      && item.issueNumber > 0) {
+      && item.issueNumber > 0
+      && !(streamResult.terminalReason !== "max_turns" && (openPrNumbersFor(ctx)?.length ?? 0) > 0)) {
     const ok = await attemptSaferSalvage({
       agentCwd, branchName, agent, item,
       streamResult, client, logFile,
@@ -3186,6 +3396,148 @@ export async function handleAgentResultErrors(
   }
 
   return saferSalvaged;
+}
+
+/** Numbers of the open pull requests on the ticket's branch, drafts
+ *  included; null when the lookup failed. */
+function openPrNumbersFor(ctx: DispatchContext): number[] | null {
+  try {
+    const json = String(ctx.deps.execSync(
+      `gh pr list --head "${ctx.branchName}" --state open --json number`,
+      { cwd: ctx.agentCwd, encoding: "utf-8", timeout: 15_000 },
+    ));
+    const prs = JSON.parse(json || "[]") as unknown;
+    if (!Array.isArray(prs)) return [];
+    return prs.map((p: any) => p?.number).filter((n: unknown): n is number => typeof n === "number");
+  } catch (e: any) {
+    const detail = e?.stderr?.toString?.() || e?.message || String(e);
+    ctx.deps.writeLog(ctx.logFile, "PR_LOOKUP_FAILED", `gh pr list for ${ctx.branchName} failed: ${detail}`);
+    return null;
+  }
+}
+
+/**
+ * Commit and push what a stopped run left in its worktree to the branch's
+ * existing pull request, and say so on the ticket. Runs from
+ * `dispatchToAgent`'s catch, BEFORE `handleDispatchError` and the
+ * worktree teardown, for a run that ended by wall-clock timeout or idle
+ * stall. Decision in `decidePartialWorkSalvage` (agent-runtime.ts), which
+ * also carries the incidents.
+ *
+ * It never changes how the failure itself is handled: an idle stall still
+ * goes to the transient retry, a timeout still parks under
+ * `error:<agent>`. The difference is that the work is on GitHub, and the
+ * next run's worktree starts from it.
+ *
+ * Returns `keepWorktree: true` only when a commit was made and the push
+ * failed. The worktree is then clean, so the teardown would remove it and
+ * leave the work as an unpushed local commit; the caller skips the
+ * teardown instead and the comment points at the path.
+ */
+export async function salvagePartialWork(
+  ctx: DispatchContext,
+  stopKind: RunStopKind,
+): Promise<{ keepWorktree: boolean }> {
+  const { agent, item, client, agentCwd, branchName, logFile, useWorktree } = ctx;
+  const { execSync, spawnSync } = ctx.deps;
+  if (!canSalvagePartialWork({ stopKind, agent, useWorktree, issueNumber: item.issueNumber })) {
+    return { keepWorktree: false };
+  }
+  const stopped = stopKind === "timeout"
+    ? "hit its wall-clock limit"
+    : "stalled (its stream went silent with no tool running)";
+  try {
+    const prLookup = openPrNumbersFor(ctx);
+    const prNumbers = prLookup ?? [];
+    const openPrCount = prLookup === null ? -1 : prLookup.length;
+    const gitStatusOutput = String(execSync(`git status --porcelain`, { cwd: agentCwd, encoding: "utf-8", timeout: 15_000 }));
+    // `-q --verify` prints MERGE_HEAD's sha when a merge is in progress
+    // and exits 1 with no output when none is.
+    let mergeInProgress = false;
+    try {
+      mergeInProgress = String(execSync(
+        `git rev-parse -q --verify MERGE_HEAD`,
+        { cwd: agentCwd, encoding: "utf-8", stdio: "pipe", timeout: 15_000 },
+      )).trim().length > 0;
+    } catch { /* exit 1: no merge in progress */ }
+    let commitsAheadOfOrigin = -1;
+    try {
+      commitsAheadOfOrigin = parseCommitsAhead(String(execSync(
+        `git rev-list --count origin/${branchName}..HEAD`,
+        { cwd: agentCwd, encoding: "utf-8", timeout: 15_000 },
+      )));
+    } catch { /* unknown: the dirty check alone decides */ }
+    const mergeCheckProblems = ctx.pendingMerge && !mergeInProgress
+      ? checkMergeResolution(agentCwd, ctx.pendingMerge, ctx.deps).problems
+      : [];
+
+    const decision = decidePartialWorkSalvage({
+      openPrCount, gitStatusOutput, commitsAheadOfOrigin, mergeInProgress, mergeCheckProblems,
+    });
+    if (!decision.salvage) {
+      ctx.deps.writeLog(logFile, "PARTIAL_SALVAGE_SKIPPED", `${stopKind}: ${decision.reason}`);
+      console.log(`   💾 Partial-work salvage skipped for #${item.issueNumber}: ${decision.reason}`);
+      return { keepWorktree: false };
+    }
+
+    const dirty = gitStatusOutput.trim().length > 0;
+    if (dirty) {
+      execSync(`git add -A`, { cwd: agentCwd, stdio: "pipe", timeout: 15_000 });
+      const runShape = stopKind === "timeout" ? "a timed-out run" : "a stalled run";
+      const commit = spawnSync(
+        "git",
+        [
+          "commit",
+          "-m", `wip(${agent.name}): partial work from ${runShape} (#${item.issueNumber})`,
+          "-m", `Auto-committed by the dispatcher when the ${agent.name} run ${stopped}. Unfinished; the next run continues from here.`,
+        ],
+        { cwd: agentCwd, stdio: "pipe", timeout: 15_000 },
+      );
+      if (commit.status !== 0) {
+        throw new Error(`git commit failed: ${commit.stderr?.toString() || commit.stdout?.toString() || "unknown"}`);
+      }
+    }
+    let sha = "";
+    try {
+      sha = String(execSync(`git rev-parse --short HEAD`, { cwd: agentCwd, encoding: "utf-8", timeout: 15_000 })).trim();
+    } catch { /* cosmetic */ }
+    const what = dirty ? `committed its uncommitted changes${sha ? ` as \`${sha}\`` : ""}` : "found local commits origin did not have";
+    const pr = prNumbers.length > 0 ? ` (PR ${prNumbers.map((n) => `#${n}`).join(", ")})` : "";
+
+    const push = spawnSync("git", ["push", "-u", "origin", branchName], { cwd: agentCwd, stdio: "pipe", timeout: 30_000 });
+    if (push.status !== 0) {
+      const detail = push.stderr?.toString() || push.stdout?.toString() || "unknown";
+      ctx.deps.writeLog(logFile, "PARTIAL_SALVAGE_PUSH_FAILED", detail);
+      console.warn(`   ⚠️  Partial-work push failed for #${item.issueNumber}; worktree kept at ${agentCwd}`);
+      try {
+        await client.addComment(
+          item.issueNumber,
+          `## ⚠️ Partial work not pushed\n\n` +
+          `The ${agent.name} run ${stopped}. The dispatcher ${what} on \`${branchName}\`, but \`git push\` failed, ` +
+          `so the work is only in the kept worktree at \`${agentCwd}\`. Push it from there before the next run, ` +
+          `or the next run's setup stops on a local branch that is ahead of origin. Details are in the dispatcher log.`,
+        );
+      } catch {}
+      return { keepWorktree: true };
+    }
+
+    ctx.deps.writeLog(logFile, "PARTIAL_SALVAGE", `${stopKind}: ${what}; pushed ${branchName}${pr}`);
+    console.log(`   💾 Partial work from the stopped ${agent.name} run pushed to ${branchName}${pr}`);
+    try {
+      await client.addComment(
+        item.issueNumber,
+        `## 💾 Partial work saved\n\n` +
+        `The ${agent.name} run ${stopped}. The dispatcher ${what} and pushed them to \`${branchName}\`${pr}, ` +
+        `so nothing is lost when the worktree is removed. The work is unfinished. ` +
+        `The next ${agent.name} run on this ticket continues from it.`,
+      );
+    } catch (e) { console.warn(`   ⚠️  Failed to post partial-work comment: ${e}`); }
+    return { keepWorktree: false };
+  } catch (e) {
+    console.warn(`   ⚠️  Partial-work salvage failed for #${item.issueNumber}: ${e}`);
+    ctx.deps.writeLog(logFile, "PARTIAL_SALVAGE_FAILED", String(e));
+    return { keepWorktree: false };
+  }
 }
 
 // Post-run side-effect chain after a successful (or successfully-salvaged)
@@ -3238,9 +3590,12 @@ export async function handlePostRun(
 
   // A merge left for this run must be finished, and must keep main's side,
   // before the safety-net commit or the push can touch it. On failure the
-  // worktree stays as it is for a human, and nothing reaches origin.
+  // worktree stays as it is for a human, and nothing reaches origin. Main's
+  // lines the resolution changed inside the conflict blocks do not stop it;
+  // they are posted for the review stages once the push lands.
+  let resolutionNotes: ResolutionNote[] = [];
   if (ctx.pendingMerge && useWorktree && item.issueNumber > 0) {
-    const problems = checkMergeResolution(agentCwd, ctx.pendingMerge, ctx.deps);
+    const { problems, notes } = checkMergeResolution(agentCwd, ctx.pendingMerge, ctx.deps);
     if (problems.length > 0) {
       console.error(`   ❌ ${agent.name} did not finish the merge of ${defaultBranch} cleanly on #${item.issueNumber}`);
       ctx.deps.writeLog(logFile, "MERGE CHECK FAILED", problems.join("\n"));
@@ -3256,7 +3611,10 @@ export async function handlePostRun(
       } catch {}
       return { ok: false };
     }
-    console.log(`   🔀 Merge of ${defaultBranch} finished; main's side is intact in ${ctx.pendingMerge.paths.length} file(s)`);
+    resolutionNotes = notes;
+    console.log(notes.length === 0
+      ? `   🔀 Merge of ${defaultBranch} finished; main's side is intact in ${ctx.pendingMerge.paths.length} file(s)`
+      : `   🔀 Merge of ${defaultBranch} finished; main's lines changed inside the conflicts in ${notes.length} file(s), noted for review`);
   }
 
   const output = streamResult.output;
@@ -3355,6 +3713,18 @@ export async function handlePostRun(
         await client.addComment(item.issueNumber, `## ⚠️ Dispatch Error: ${agent.name}\n\n\`git push -u origin ${branchName}\` failed — the agent's commits never reached origin. Common cause: out-of-band push to \`${branchName}\` advanced the remote past this worktree's HEAD (non-fast-forward).\n\nTreating as \`error:${agent.name}\`. To retry: investigate the worktree state, rebase if appropriate, then strip the \`error:${agent.name}\` label.\n\n\`\`\`\n${detail}\n\`\`\``);
       } catch {}
       return { ok: false };
+    }
+  }
+
+  // The merge is on origin now, so the review stages can look at what it
+  // changed of main's side. They read this comment through their prompt.
+  if (ctx.pendingMerge && resolutionNotes.length > 0) {
+    const comment = mergeResolutionComment(defaultBranch, resolutionNotes, findMergeCommit(agentCwd, ctx.pendingMerge, ctx.deps));
+    ctx.deps.writeLog(logFile, "MERGE RESOLUTION NOTE", comment);
+    try {
+      await client.addComment(item.issueNumber, comment);
+    } catch (e) {
+      console.warn(`   ⚠️  Failed to post the merge resolution note on #${item.issueNumber}: ${e}`);
     }
   }
 
@@ -3709,6 +4079,9 @@ export interface VerifierGatesOutcome {
   outputTail: string;
   /** One human-readable line per executed gate, for the GATES log. */
   summary: string[];
+  /** The stdout and stderr log of every executed gate, in run order. A
+   *  recorded pass names them as its evidence (verifier-gate-reuse.ts). */
+  logPaths: string[];
 }
 
 /**
@@ -3736,10 +4109,12 @@ export async function runVerifierGates(opts: {
 }): Promise<VerifierGatesOutcome> {
   const logsDir = opts.logsDir ?? LOGS_DIR;
   const summary: string[] = [];
+  const logPaths: string[] = [];
   for (let i = 0; i < opts.gates.length; i++) {
     const gate = opts.gates[i]!;
     const stdoutPath = resolve(logsDir, `verifier-gate_#${opts.issueNumber}_${i + 1}.log`);
     const stderrPath = resolve(logsDir, `verifier-gate_#${opts.issueNumber}_${i + 1}.stderr.log`);
+    logPaths.push(stdoutPath, stderrPath);
     const outcome = await opts.deps.spawnGate({
       command: gate,
       cwd: opts.cwd,
@@ -3771,10 +4146,69 @@ export async function runVerifierGates(opts: {
       const outputTail = combined.length > VERIFIER_GATE_TAIL_CAP
         ? combined.slice(-VERIFIER_GATE_TAIL_CAP)
         : combined;
-      return { ok: false, failedGate: gate, outputTail, summary };
+      return { ok: false, failedGate: gate, outputTail, summary, logPaths };
     }
   }
-  return { ok: true, failedGate: null, outputTail: "", summary };
+  return { ok: true, failedGate: null, outputTail: "", summary, logPaths };
+}
+
+/**
+ * HEAD of the gated worktree after the default branch was merged in, and its
+ * tree. A recorded gate pass is keyed by the tree and names the commit. Null
+ * when they cannot stand for the files the gates test, because git failed or
+ * because a conflicted merge was left for the agent to finish and the
+ * worktree holds files HEAD does not describe. Null means no reuse and no
+ * record.
+ */
+function mergedWorktreeHead(ctx: DispatchContext): { commit: string; tree: string } | null {
+  if (ctx.pendingMerge) return null;
+  try {
+    const [commit = "", tree = ""] = String(ctx.deps.execSync("git rev-parse HEAD HEAD^{tree}", {
+      cwd: ctx.agentCwd, encoding: "utf-8", stdio: "pipe", timeout: 15_000,
+    })).trim().split(/\s+/);
+    const sha = /^[0-9a-f]{40,64}$/;
+    return sha.test(commit) && sha.test(tree) ? { commit, tree } : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The recorded gate pass for this dispatch, when it may stand in for running
+ * the gates (`decideVerifierGateReuse`). Any read or parse failure returns
+ * null, and the caller runs the gates as normal.
+ */
+function readReusableGatePass(
+  ctx: DispatchContext,
+  passFile: string,
+  tree: string,
+  gatesHash: string,
+): VerifierGatePass | null {
+  const issueNumber = ctx.item.issueNumber;
+  let raw: string;
+  try {
+    raw = String(ctx.deps.readFileSync(passFile, "utf-8"));
+  } catch (e: any) {
+    // No pass recorded yet is the common case and needs no line.
+    if (e?.code !== "ENOENT") console.warn(`   ⚠️  Could not read the recorded gate pass for #${issueNumber}, so the gates run: ${e?.message ?? e}`);
+    return null;
+  }
+  const pass = parseVerifierGatePass(raw);
+  if (pass === null) {
+    console.warn(`   ⚠️  Recorded gate pass for #${issueNumber} is unreadable, so the gates run`);
+    return null;
+  }
+  const decision = decideVerifierGateReuse({
+    pass,
+    issueNumber,
+    tree,
+    gatesHash,
+    nowMs: Date.now(),
+    logExists: (p) => ctx.deps.existsSync(p),
+  });
+  if (decision.reuse) return decision.pass;
+  console.log(`   🧪 Recorded gate pass for #${issueNumber} not reused (${decision.reason})`);
+  return null;
 }
 
 /**
@@ -3803,6 +4237,10 @@ export async function runVerifierGates(opts: {
  *   a deterministic bounce would loop forever on a failure that
  *   pre-exists on the merge base. Nothing is labelled or commented here;
  *   routing is the model's verdict, not the gate's.
+ * - **Already green on these files** → a full pass recorded on the same
+ *   merged tree with the same gate list in the last 24 hours is reused:
+ *   no gate runs, and the green note says whose results they are. See
+ *   verifier-gate-reuse.ts; `PYRY_VERIFIER_GATE_REUSE=0` turns it off.
  */
 export async function maybeRunPreSpawnGates(
   ctx: DispatchContext,
@@ -3818,6 +4256,50 @@ export async function maybeRunPreSpawnGates(
     return { promptNote: "" };
   }
 
+  const greenNote = (lead: string): string => [
+    "",
+    "",
+    "## Deterministic gates",
+    "",
+    lead,
+    ...gates.map((g) => `- \`${g}\``),
+    "",
+    "Treat these as green — do not spend turns re-running them just to establish a baseline.",
+  ].join("\n");
+
+  // A full pass on exactly these files with this exact gate list is reused
+  // instead of run again. #1340's verifier crashed one second after 22
+  // minutes of green gates on 2026-10-02, and its retry would have paid for
+  // all of them again. The match is on the merged tree, not the merge
+  // commit, which gets a new SHA each time it is re-made. With reuse off, or
+  // HEAD unknown, nothing is read or recorded and the gates run as before.
+  const passFile = resolve(LOGS_DIR, verifierGatePassFileName(item.issueNumber));
+  const gatesHash = hashGateList(gates);
+  const head = verifierGateReuseEnabled(process.env) ? mergedWorktreeHead(ctx) : null;
+  if (head !== null) {
+    const reused = readReusableGatePass(ctx, passFile, head.tree, gatesHash);
+    if (reused !== null) {
+      const sameCommit = reused.commit === head.commit;
+      console.log(`   ♻️  Pre-${agent.name} gates already passed at ${reused.passedAt} on ${reused.commit.slice(0, 12)}${sameCommit ? "" : `, same files as ${head.commit.slice(0, 12)}`}; reusing that result`);
+      ctx.deps.writeLog(
+        logFile,
+        "GATES",
+        [
+          `Reused the pass recorded at ${reused.passedAt} on commit ${reused.commit} (tree ${reused.tree}); no gate ran in this dispatch.`,
+          ...reused.summary,
+        ].join("\n"),
+      );
+      const where = sameCommit
+        ? `on this same commit (\`${head.commit}\`)`
+        : `on commit \`${reused.commit}\`, whose files are identical to this worktree's (tree \`${head.tree}\`)`;
+      return {
+        promptNote: greenNote(
+          `The dispatcher ran the fork's deterministic gates ${where} at ${reused.passedAt}, and all passed. These results are reused from that run rather than run again:`,
+        ),
+      };
+    }
+  }
+
   console.log(`   🧪 Pre-${agent.name} gates (${gates.length}): ${gates.map((g) => `\`${g}\``).join(", ")}`);
   const result = await runVerifierGates({
     gates,
@@ -3829,17 +4311,28 @@ export async function maybeRunPreSpawnGates(
 
   if (result.ok) {
     console.log(`   ✅ Pre-${agent.name} gates green`);
-    const promptNote = [
-      "",
-      "",
-      "## Deterministic gates",
-      "",
-      "The dispatcher ran the fork's deterministic gates in this worktree before spawning you; all passed:",
-      ...gates.map((g) => `- \`${g}\``),
-      "",
-      "Treat these as green — do not spend turns re-running them just to establish a baseline.",
-    ].join("\n");
-    return { promptNote };
+    // Only a full pass is recorded. A red, timed-out or unspawnable gate
+    // never is, so a retry after a flaky failure runs the gates again.
+    if (head !== null) {
+      const pass: VerifierGatePass = {
+        issueNumber: item.issueNumber,
+        commit: head.commit,
+        tree: head.tree,
+        gatesHash,
+        gates,
+        passedAt: new Date().toISOString(),
+        summary: result.summary,
+        logPaths: result.logPaths,
+      };
+      try {
+        ctx.deps.writeFileSync(passFile, JSON.stringify(pass, null, 2) + "\n");
+      } catch (e: any) {
+        console.warn(`   ⚠️  Could not record the gate pass for #${item.issueNumber}, so a retry runs the gates again: ${e?.message ?? e}`);
+      }
+    }
+    return {
+      promptNote: greenNote("The dispatcher ran the fork's deterministic gates in this worktree before spawning you; all passed:"),
+    };
   }
 
   console.log(
@@ -5701,8 +6194,9 @@ export async function runConcurrentDispatches(
 
 /**
  * Auto-merge retry budget. The dispatcher tries the merge this many
- * times across cycles before applying `error:merge-conflict` and
- * stopping. Spread across cycles (not within a cycle) because the
+ * times across cycles before handing the conflict to the code owner
+ * (`handOffFinalMerge`), or to a human with `error:merge-conflict` when
+ * it cannot. Spread across cycles (not within a cycle) because the
  * conflict failure mode is usually a sibling PR mid-merge against the
  * same line — back-to-back attempts within one cycle can't help, but a
  * retry one cycle later (after the sibling has landed or also failed)
@@ -5721,8 +6215,8 @@ const MERGE_RETRY_MAX_ATTEMPTS = 3;
  *
  *   - Bumps the counter and skips this cycle (the dispatcher's natural
  *     poll loop produces the retry on the next cycle), or
- *   - Falls through to the existing `handleMergeConflict` flow when
- *     retries are exhausted.
+ *   - Hands the conflict on with `handOffFinalMerge` when retries are
+ *     exhausted.
  *
  * The counter is cleared here in the auto-merge path, on merge and on
  * give-up, never by `decideDoneCleanup`. That pass runs before the
@@ -5746,7 +6240,7 @@ async function handleConflictWithRetry(
   });
 
   if (decision.shouldGiveUp) {
-    await handleMergeConflict(client, item, prNumber, notifyDiscord);
+    await handOffFinalMerge(client, item, prNumber, notifyDiscord);
     return;
   }
 
@@ -5775,11 +6269,95 @@ async function handleConflictWithRetry(
 }
 
 /**
+ * Send a Done ticket whose PR still conflicts after the merge retries back
+ * to its code owner, only to finish the merge (see merge-handoff.ts for the
+ * incidents, 2026-10-02). Same route as a conflict before a later stage's
+ * run: a comment, MERGE_HANDOFF_LABEL and `needs-rework:<owner>`, so the
+ * rework router moves the ticket without counting a rework. The ticket
+ * waits in the last stage's column, which the router scans; Done is not
+ * one of its columns. The owner's next run then meets the conflict in its
+ * pre-run merge and takes the "Merge conflict left for <owner>" path, and
+ * the review stages and documentation run again before the next merge.
+ *
+ * Falls back to `handleMergeConflict` (a human) when the stage set has no
+ * owner to send it to, when the ticket already went back
+ * FINAL_MERGE_HANDOFF_MAX times, or when the route's comment or labels
+ * fail. The routing comment opens with FINAL_MERGE_HANDOFF_MARKER and is
+ * posted before the labels, so a failed attempt still counts toward the
+ * guard: an overcount parks a ticket one route early, an undercount could
+ * let it circle once more. When the earlier routes cannot be counted, the
+ * ticket is left as it is: the retry counter stays spent, so the next
+ * cycle's conflict lands here again.
+ */
+async function handOffFinalMerge(
+  client: DispatchClient,
+  item: ProjectItem,
+  prNumber: number,
+  notifyDiscord: DispatchDeps["notifyDiscord"],
+): Promise<void> {
+  let prior: number;
+  try {
+    prior = await client.countMarkerComments(item.issueNumber, FINAL_MERGE_HANDOFF_MARKER);
+  } catch (e: any) {
+    console.warn(`   ⚠️  PR #${prNumber} for #${item.issueNumber} conflicts, but its earlier merge handoffs could not be counted; retrying next cycle: ${e?.message ?? e}`);
+    return;
+  }
+  const route = decideFinalMergeRoute(activeStageSet().agents, REAL_CLAUDE_GATE_FAIL_COLUMN, prior);
+  if (route.kind === "park") {
+    await handleMergeConflict(client, item, prNumber, notifyDiscord, route.reason);
+    return;
+  }
+
+  console.warn(`   🔀 PR #${prNumber} for #${item.issueNumber} conflicts with ${defaultBranch}; sending it to ${route.owner} to finish the merge (not a rework)`);
+  try {
+    await client.addComment(
+      item.issueNumber,
+      `${FINAL_MERGE_HANDOFF_MARKER}\n## 🔀 Final merge sent to ${route.owner}\n\n` +
+      `PR #${prNumber} conflicts with \`${defaultBranch}\`, and the dispatcher's ${MERGE_RETRY_MAX_ATTEMPTS} merge attempts are used up.\n\n` +
+      `This ticket goes back to ${route.owner} only to finish this merge. It does not count as a rework. ` +
+      `${route.owner}'s next run merges \`${defaultBranch}\` into \`feature/${item.issueNumber}\` and settles the conflict. ` +
+      `After that the ticket passes the review stages and documentation again, and the dispatcher merges it from Done.\n\n` +
+      `This is merge handoff ${prior + 1} of ${FINAL_MERGE_HANDOFF_MAX}. If the PR conflicts again after the last one, the ticket parks for a human.`,
+    );
+    await client.addLabel(item.issueNumber, MERGE_HANDOFF_LABEL);
+    await client.addLabel(item.issueNumber, `needs-rework:${route.owner}`);
+  } catch (e: any) {
+    console.warn(`   ⚠️  Failed to route the final merge of #${item.issueNumber} to ${route.owner}: ${e?.message ?? e}`);
+    await handleMergeConflict(
+      client, item, prNumber, notifyDiscord,
+      `Sending it back to ${route.owner} to finish the merge failed: ${e?.message ?? e}.`,
+    );
+    return;
+  }
+  // A fresh set of merge attempts for the ticket's next time in Done.
+  for (const label of item.labels) {
+    if (label.startsWith("merge-attempt:")) {
+      try { await client.removeLabel(item.issueNumber, label); } catch {}
+    }
+  }
+  // Non-fatal like the rollback in handleMergeConflict. A ticket left in
+  // Done loses `needs-rework:` to the Done cleanup next cycle and retries
+  // the merge afresh. If it still conflicts it comes back here, with this
+  // route's marker already counted.
+  try {
+    await client.updateItemStatus(item.id, route.column);
+    console.log(`   📋 Moved #${item.issueNumber} Status to ${route.column} (was Done; PR conflicts) for the rework router`);
+  } catch (statusErr: any) {
+    console.warn(`   ⚠️  Failed to move #${item.issueNumber} Status to ${route.column}: ${statusErr?.message ?? statusErr}`);
+  }
+  try {
+    await notifyDiscord(`🔀 Merge conflict on PR #${prNumber} (#${item.issueNumber}) — sent back to ${route.owner} to finish the merge (handoff ${prior + 1}/${FINAL_MERGE_HANDOFF_MAX}).`);
+  } catch (e: any) {
+    console.warn(`   ⚠️  Discord notify failed for #${item.issueNumber}: ${e?.message ?? e}`);
+  }
+}
+
+/**
  * Apply the conflict-block path: `error:merge-conflict` label + triage
  * comment + Discord notify + Status rollback to In Code Review.
  *
- * Invoked from `runAutoMerge`'s merge step when it returns
- * `isMergeConflictError`, once retries are exhausted. (A conflict at the
+ * Invoked from `handOffFinalMerge` when the conflict cannot go to the
+ * code owner; `reason` says why in the comment. (A conflict at the
  * pre-merge rebase used to come here too; since 2026-09-23 it falls
  * through to the plain merge instead, which may still be clean.)
  *
@@ -5796,8 +6374,9 @@ async function handleMergeConflict(
   item: ProjectItem,
   prNumber: number,
   notifyDiscord: DispatchDeps["notifyDiscord"],
+  reason: string,
 ): Promise<void> {
-  console.warn(`   🛑 PR #${prNumber} for #${item.issueNumber} has merge conflicts — labelling for triage`);
+  console.warn(`   🛑 PR #${prNumber} for #${item.issueNumber} has merge conflicts — labelling for triage (${reason})`);
   try {
     await client.addLabel(item.issueNumber, "error:merge-conflict");
     // The retries are spent. Clear the counter so a ticket that comes
@@ -5810,7 +6389,7 @@ async function handleMergeConflict(
     await client.addComment(
       item.issueNumber,
       `## 🛑 Auto-merge blocked by merge conflict\n\n` +
-      `PR #${prNumber} cannot be merged into \`${defaultBranch}\` cleanly. ` +
+      `PR #${prNumber} cannot be merged into \`${defaultBranch}\` cleanly. ${reason}\n\n` +
       `The dispatcher has stopped retrying this PR; resolve the conflict manually:\n\n` +
       `\`\`\`bash\n` +
       `gh pr checkout ${prNumber}\n` +
@@ -5869,8 +6448,11 @@ async function handleMergeConflict(
  *   - `gh pr merge <n> --merge --delete-branch`. On success: pull
  *     merged changes to local main (non-fatal failure), strip pipeline
  *     labels from the issue, Discord notify. On conflict (detected
- *     via `isMergeConflictError` on stderr): `handleMergeConflict`.
- *     Non-conflict failures: silent, retry next cycle.
+ *     via `isMergeConflictError` on stderr): `handleConflictWithRetry`,
+ *     which retries across cycles and then hands the merge to the code
+ *     owner (`handOffFinalMerge`, 2026-10-02) or, failing that, to a
+ *     human (`handleMergeConflict`). Non-conflict failures: silent, retry
+ *     next cycle.
  *
  * The conflict-block-via-label pattern is the 2026-05-08 fix that
  * stopped infinite retry loops on stale-PR conflicts; the pre-merge
@@ -6018,7 +6600,7 @@ export async function runAutoMerge(
           // re-entry — but we got here, so the label isn't set yet.
           // Same path as the pre-merge rebase conflict (Step 1.5):
           // retry across cycles up to MERGE_RETRY_MAX_ATTEMPTS, then
-          // fall through to handleMergeConflict.
+          // hand off with handOffFinalMerge.
           await handleConflictWithRetry(client, item, prNumber, notifyDiscord);
           continue;
         }

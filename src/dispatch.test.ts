@@ -52,6 +52,7 @@ import {
   runDoneCleanup,
   runStrandedWipSweep,
   runPendingDoneFinalize,
+  salvagePartialWork,
   strandedWipMinAgeMs,
   runFamilyBreaker,
   selectPastParkedFamilies,
@@ -59,6 +60,7 @@ import {
   setupBranchAndWorktree,
   SIGINT_DEBOUNCE_MS,
   SIGINT_FORCE_EXIT_WINDOW_MS,
+  DEFAULT_DEPS,
   type DispatchClient,
   type DispatchContext,
   type DispatchDeps,
@@ -78,6 +80,9 @@ import {
   type StreamResult,
 } from "./dispatch.js";
 import { formatGateEvidenceComment } from "./gate-output.js";
+import { FINAL_MERGE_HANDOFF_MARKER, MERGE_RESOLUTION_NOTE_MARKER, mergeResolutionComment } from "./merge-handoff.js";
+import { runReworkRouting } from "./reconcile.js";
+import { hashGateList, type VerifierGatePass } from "./verifier-gate-reuse.js";
 import { resetActiveStageSetForTests, resolveStageSet } from "./stage-sets.js";
 import type { AgentConfig, BlockerInfo, ProjectItem } from "./types.js";
 import {
@@ -91,7 +96,7 @@ import {
   tallyFamilyComments,
 } from "./pipeline-decisions.js";
 import { AGENTS } from "./types.js";
-import { ResourceExhaustedError, timeoutFor } from "./agent-runtime.js";
+import { AgentRunStoppedError, idleStallMessage, noResultErrorMessage, ResourceExhaustedError, timeoutFor } from "./agent-runtime.js";
 import { resolveAgentsRepoRoot, resolveTargetRepoRoot } from "./worktree.js";
 
 // Importing dispatch.ts loads the fork's .env, so a fork running this suite
@@ -103,6 +108,7 @@ delete process.env.PYRY_STAGE_SET;
 delete process.env.PYRY_BUDGET_SCALE;
 delete process.env.PYRY_EFFORT_POLICY;
 delete process.env.PYRY_VERIFIER_PARALLEL_REVIEW;
+delete process.env.PYRY_VERIFIER_GATE_REUSE;
 resetActiveStageSetForTests();
 
 // Recompute agentsRepoRoot the same way dispatch.ts does so test
@@ -407,6 +413,7 @@ export class MockGitHubClient implements DispatchClient {
   updateItemStatusCalls: { itemId: string; newStatus: string }[] = [];
   closeIssueCalls: number[] = [];
   getLatestRetryAtCalls: number[] = [];
+  getIssueCommentBodiesCalls: number[] = [];
   retryAtByIssue: Map<number, Date | null> = new Map();
   /** Pre-seeded family tallies for `getFamilyDispatchState` — markers
    *  that existed on the root before this cycle. Comments posted through
@@ -422,6 +429,11 @@ export class MockGitHubClient implements DispatchClient {
   getStrandedWipMarkersCalls: number[] = [];
   getAllProjectItemsCalls = 0;
   clearItemsCacheCalls = 0;
+  /** Comment bodies already on a ticket before this test's writes, for
+   *  `countMarkerComments`. Comments posted through THIS client count on
+   *  top (same durable-comment semantics as the family tally). */
+  priorCommentsByIssue: Map<number, string[]> = new Map();
+  countMarkerCommentsCalls: { issueNumber: number; marker: string }[] = [];
   /** Clock stamped onto comments posted through this client. Overridable so
    *  a test can post a marker and then have it read back as old. */
   commentClock: () => Date = () => new Date();
@@ -440,6 +452,8 @@ export class MockGitHubClient implements DispatchClient {
     getAllProjectItems?: Error;
     getStrandedWipMarkers?: Error | ((issueNumber: number) => Error | null);
     closeIssue?: Error | ((issueNumber: number) => Error | null);
+    getIssueCommentBodies?: Error;
+    countMarkerComments?: Error;
   } = {};
 
   constructor(opts: {
@@ -569,6 +583,13 @@ export class MockGitHubClient implements DispatchClient {
     if (item) item.state = "CLOSED";
   }
 
+  /** Comments posted through this client, oldest first. */
+  async getIssueCommentBodies(issueNumber: number): Promise<string[]> {
+    this.getIssueCommentBodiesCalls.push(issueNumber);
+    if (this.failures.getIssueCommentBodies) throw this.failures.getIssueCommentBodies;
+    return this.comments.filter(c => c.issueNumber === issueNumber).map(c => c.body);
+  }
+
   async getLatestRetryAt(issueNumber: number): Promise<Date | null> {
     this.getLatestRetryAtCalls.push(issueNumber);
     if (this.failures.getLatestRetryAt) throw this.failures.getLatestRetryAt;
@@ -577,6 +598,16 @@ export class MockGitHubClient implements DispatchClient {
 
   async countRetryMarkers(_issueNumber: number): Promise<number> {
     return 0;
+  }
+
+  async countMarkerComments(issueNumber: number, marker: string): Promise<number> {
+    this.countMarkerCommentsCalls.push({ issueNumber, marker });
+    if (this.failures.countMarkerComments) throw this.failures.countMarkerComments;
+    const bodies = [
+      ...(this.priorCommentsByIssue.get(issueNumber) ?? []),
+      ...this.comments.filter(c => c.issueNumber === issueNumber).map(c => c.body),
+    ];
+    return bodies.filter(b => b.includes(marker)).length;
   }
 
   async getAllProjectItems(): Promise<ProjectItem[]> {
@@ -869,6 +900,9 @@ describe("setupBranchAndWorktree — failure modes", () => {
     assert.ok(!/have DIVERGED/.test(body), "strictly-ahead must not use divergence framing");
     assert.ok(!/would REVERT/.test(body));
     assert.ok(!calls.exec.some(c => c.cmd.includes("git worktree add")));
+    // The stale-worktree cleanup now runs before the branch setup, but an
+    // integrity abort still leaves every worktree in place for triage.
+    assert.ok(!calls.exec.some(c => c.cmd.includes("git worktree remove") || c.cmd.includes("git worktree prune")));
   });
 
   test("git branch creation throws → caught, label + comment + {ok:false}", async () => {
@@ -1012,12 +1046,13 @@ describe("setupBranchAndWorktree — failure modes", () => {
     ">>>>>>> main",
     "",
   ].join("\n");
-  function codeConflictContext(issueNumber: number, agent: Partial<AgentConfig>) {
+  function codeConflictContext(issueNumber: number, agent: Partial<AgentConfig>, client?: MockGitHubClient) {
     const probe = makeTestContext({ item: { issueNumber }, agent });
     const path = resolve(probe.ctx.worktreeDir, "Thread.kt");
     const made = makeTestContext({
       item: { issueNumber },
       agent,
+      client,
       mockOptions: {
         execImpls: {
           ...happyExecBaseline(),
@@ -1044,7 +1079,10 @@ describe("setupBranchAndWorktree — failure modes", () => {
     assert.deepEqual(client.addLabelCalls, []);
     assert.match(client.comments[0]!.body, /Merge conflict left for developer/);
     assert.match(client.comments[0]!.body, /`Thread\.kt`/);
-    assert.deepEqual(ctx.pendingMerge, { paths: ["Thread.kt"], mainSha: "mainsha", baseSha: "basesha", headSha: "headsha" });
+    assert.deepEqual(ctx.pendingMerge, {
+      paths: ["Thread.kt"], mainSha: "mainsha", baseSha: "basesha", headSha: "headsha",
+      mainConflictLines: { "Thread.kt": ["val x = 2"] },
+    });
     assert.ok(!calls.fs.some(f => f.kind === "write" && f.path === path), "the dispatcher resolves nothing itself");
     assert.ok(!calls.exec.some(c => c.cmd.includes("git merge --abort")), "the merge stays for the agent");
     assert.ok(!calls.exec.some(c => c.cmd.includes("git commit")));
@@ -1069,6 +1107,47 @@ describe("setupBranchAndWorktree — failure modes", () => {
     assert.ok(calls.exec.some(c => c.cmd.includes("git merge --abort")));
     const addIdx = calls.exec.findIndex(c => c.cmd.includes("git worktree add"));
     assert.ok(calls.exec.slice(addIdx + 1).some(c => c.cmd.includes("git worktree remove")), "the routed stage cleans up its worktree");
+  });
+
+  test("final merge out of retries → owner, router (uncounted, labels cleaned), then this path in the owner's run", async () => {
+    // pyrycode-mobile #1430, 2026-10-02: the PR conflicted with main after
+    // documentation and parked for a human. The final merge now takes the
+    // route above. The stale done:* labels stand in for any the Done
+    // cleanup has not stripped yet.
+    const client = new MockGitHubClient({
+      items: [{
+        id: "PVTI_1430", issueNumber: 1430, status: "Done",
+        labels: ["done:code-review", "done:documentation", "merge-attempt:2", "size:s"], state: "OPEN",
+      }],
+    });
+    const { deps: mergeDeps } = makeMockDeps({
+      execImpls: {
+        "gh pr list --head \"feature/1430\"": () => "1431\n",
+        "gh pr merge 1431 --merge --delete-branch": () => execError({ stderr: "X Pull request #1431 is not mergeable" }),
+      },
+    });
+    const ticket = () => client.itemsByIssueNumber.get(1430)!;
+
+    // 1. The spent final merge routes the ticket to the owner.
+    await runAutoMerge(client, mergeDeps);
+    assert.equal(ticket().status, "In Documentation");
+    assert.deepEqual(ticket().labels, ["done:code-review", "done:documentation", "size:s", "merge-handoff", "needs-rework:developer"]);
+
+    // 2. The rework router moves it without counting a rework, and strips
+    // the marker, the trigger and the stale done:* labels, exactly as for
+    // a pre-run handoff.
+    const labelsAddedBefore = client.addLabelCalls.length;
+    await runReworkRouting(client);
+    assert.equal(ticket().status, "In Development");
+    assert.deepEqual(ticket().labels, ["size:s"]);
+    assert.deepEqual(client.addLabelCalls.slice(labelsAddedBefore), [], "no rework-count, no error:rework-loop");
+
+    // 3. The owner's pre-run merge hits the conflict and keeps it for its run.
+    const { ctx } = codeConflictContext(1430, {}, client);
+    const result = await setupBranchAndWorktree(ctx);
+    assert.deepEqual(result, { ok: true });
+    assert.match(client.comments.at(-1)!.body, /Merge conflict left for developer/);
+    assert.deepEqual(ctx.pendingMerge?.paths, ["Thread.kt"]);
   });
 
   test("code conflict before an earlier stage → parks for a human as before", async () => {
@@ -1230,6 +1309,77 @@ describe("setupBranchAndWorktree — coverage edges", () => {
     assert.ok(addIdx > orphanRemoveIdx, "orphan removal must precede `git worktree add`");
   });
 
+  // pyrycode-mobile #1430, 2026-10-02: a timed-out documentation run left
+  // documentation-1430 on feature/1430, clean and already on origin. The
+  // verifier's fast-forward ran `git branch -f` before the orphan cleanup
+  // and git refused: "cannot force update the branch 'feature/1430' used by
+  // worktree at '.../documentation-1430'".
+  function fastForwardWithOrphan(n: number, orphanPath: string, removeOrphan: ExecHandler, branchForce: ExecHandler) {
+    return makeTestContext({
+      item: { issueNumber: n },
+      mockOptions: {
+        execImpls: {
+          [`git rev-parse --verify feature/${n}`]: () => "",
+          [`git rev-parse --verify origin/feature/${n}`]: () => "",
+          [`git rev-parse origin/feature/${n}`]: () => "newer-origin-sha\n",
+          [`git rev-parse feature/${n}`]: () => "older-local-sha\n",
+          "git merge-base --is-ancestor": () => "", // local is behind origin
+          "git worktree list --porcelain": () =>
+            `worktree ${orphanPath}\nHEAD older-local-sha\nbranch refs/heads/feature/${n}\n\n`,
+          [`git worktree remove "${orphanPath}"`]: removeOrphan,
+          [`git branch -f feature/${n} origin/feature/${n}`]: branchForce,
+        },
+      },
+    });
+  }
+
+  test("orphan worktree holding the branch + fast-forward needed → orphan removed first, branch updated, no error (#1430)", async () => {
+    const orphanPath = "/tmp/.pyrycode-worktrees/pyrycode-mobile/documentation-1430";
+    let orphanRemoved = false;
+    const { ctx, client, calls } = fastForwardWithOrphan(
+      1430,
+      orphanPath,
+      () => { orphanRemoved = true; return ""; },
+      // Real git refuses while any worktree still has the branch checked out.
+      () => orphanRemoved
+        ? ""
+        : execError({ stderr: `fatal: cannot force update the branch 'feature/1430' used by worktree at '${orphanPath}'` }),
+    );
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: true });
+    assert.deepEqual(client.addLabelCalls, []);
+    assert.equal(client.comments.length, 0);
+    const removeIdx = calls.exec.findIndex(c => c.cmd === `git worktree remove "${orphanPath}"`);
+    const branchIdx = calls.exec.findIndex(c => c.cmd === "git branch -f feature/1430 origin/feature/1430");
+    const addIdx = calls.exec.findIndex(c => c.cmd.includes("git worktree add"));
+    assert.ok(removeIdx >= 0, "the orphan is removed");
+    assert.ok(removeIdx < branchIdx, "the orphan is removed before the branch is updated");
+    assert.ok(branchIdx < addIdx, "the branch is updated before the new worktree is added");
+  });
+
+  test("dirty orphan worktree holding the branch → kept, branch update fails, comment names it and its uncommitted changes", async () => {
+    const orphanPath = "/tmp/.pyrycode-worktrees/pyrycode-mobile/documentation-1431";
+    const { ctx, client, calls } = fastForwardWithOrphan(
+      1431,
+      orphanPath,
+      () => execError({ stderr: `fatal: '${orphanPath}' contains modified or untracked files, use --force to delete it` }),
+      () => execError({ stderr: `fatal: cannot force update the branch 'feature/1431' used by worktree at '${orphanPath}'` }),
+    );
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: false });
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1431, label: "error:developer" }]);
+    assert.equal(client.comments.length, 1);
+    const body = client.comments[0]!.body;
+    assert.match(body, /Failed to set up branch `feature\/1431` \(action: fast-forward-from-origin\)/);
+    assert.ok(body.includes(`- \`${orphanPath}\` has uncommitted changes`), "the comment names the dirty worktree and why it stayed");
+    assert.ok(!calls.exec.some(c => c.cmd.includes("--force")), "a dirty worktree is never force-removed");
+    assert.ok(!calls.exec.some(c => c.cmd.includes("git worktree add")));
+  });
+
   test("codegraph symlink — source missing → warn, no symlink, still {ok:true}", async () => {
     // `decideCodegraphSymlink({sourceExists:false, destExists:false})`
     // returns `skip / no-source` — caller should warn but not fail.
@@ -1279,6 +1429,155 @@ describe("setupBranchAndWorktree — coverage edges", () => {
     const gitCmds = calls.exec.filter(c => c.cmd.startsWith("git"));
     assert.equal(gitCmds.length, 1, "PO path runs exactly one git command");
     assert.equal(gitCmds[0]!.cmd, "git checkout main && git pull");
+  });
+});
+
+// pyrycode-mobile #1340, 2026-10-02: the verifier crashed after the pre-run
+// merge of main, the merge commit was only ever pushed at the end of a run,
+// and the next dispatch refused with abort-local-strictly-ahead. The merge is
+// now pushed as soon as it is committed, when origin already has the branch.
+describe("setupBranchAndWorktree — pushing the pre-run merge", () => {
+  // `git rev-parse HEAD` in the worktree: the first read (before the merge)
+  // and every later one differ, as they do when the merge made a commit.
+  function headMovesOnMerge(): ExecHandler {
+    let reads = 0;
+    return () => (reads++ === 0 ? "before-merge-sha\n" : "after-merge-sha\n");
+  }
+  // Local and origin exist and agree: reuse-local-already-synced.
+  function onOrigin(n: number): Record<string, ExecHandler> {
+    return {
+      [`git rev-parse --verify feature/${n}`]: () => "",
+      [`git rev-parse --verify origin/feature/${n}`]: () => "",
+      [`git rev-parse origin/feature/${n}`]: () => "synced\n",
+      [`git rev-parse feature/${n}`]: () => "synced\n",
+    };
+  }
+  const pushes = (calls: CallLog) => calls.exec.filter(c => c.cmd.startsWith("git push"));
+
+  test("merge moved HEAD on a branch origin has → pushed from the worktree right after the merge", async () => {
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 1340 },
+      mockOptions: { execImpls: { ...onOrigin(1340), "git rev-parse HEAD": headMovesOnMerge() } },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: true });
+    assert.deepEqual(pushes(calls).map(c => c.cmd), ["git push origin feature/1340"]);
+    const pushIdx = calls.exec.findIndex(c => c.cmd === "git push origin feature/1340");
+    const mergeIdx = calls.exec.findIndex(c => c.cmd.includes("merge main --no-edit"));
+    assert.ok(pushIdx > mergeIdx, "the push follows the merge");
+    assert.equal(calls.exec[pushIdx]!.opts?.cwd, ctx.worktreeDir, "pushed from the worktree");
+    assert.deepEqual(client.addLabelCalls, []);
+    assert.equal(client.comments.length, 0);
+  });
+
+  test("no-op merge (HEAD unchanged) → nothing pushed", async () => {
+    const { ctx, calls } = makeTestContext({
+      item: { issueNumber: 1341 },
+      mockOptions: { execImpls: { ...onOrigin(1341), "git rev-parse HEAD": () => "unchanged-sha\n" } },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: true });
+    assert.deepEqual(pushes(calls), []);
+  });
+
+  test("branch not on origin yet → nothing pushed, the end-of-run push creates it as before", async () => {
+    const { ctx, calls } = makeTestContext({
+      item: { issueNumber: 1342 },
+      mockOptions: {
+        execImpls: {
+          "git rev-parse --verify feature/1342": () => execError({ stderr: "fatal" }),
+          "git rev-parse --verify origin/feature/1342": () => execError({ stderr: "fatal" }),
+          "git rev-parse HEAD": headMovesOnMerge(),
+        },
+      },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: true });
+    assert.ok(calls.exec.some(c => c.cmd === "git branch feature/1342 main"), "fresh ticket path");
+    assert.deepEqual(pushes(calls), []);
+  });
+
+  test("push fails → only a warning, the dispatch carries on with no label or comment", async () => {
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 1343 },
+      mockOptions: {
+        execImpls: {
+          ...onOrigin(1343),
+          "git rev-parse HEAD": headMovesOnMerge(),
+          "git push origin feature/1343": () => execError({ stderr: "fatal: unable to access remote" }),
+        },
+      },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: true });
+    assert.equal(pushes(calls).length, 1, "the push was attempted once");
+    assert.deepEqual(client.addLabelCalls, []);
+    assert.equal(client.comments.length, 0);
+    const addIdx = calls.exec.findIndex(c => c.cmd.includes("git worktree add"));
+    assert.ok(!calls.exec.slice(addIdx + 1).some(c => c.cmd.includes("git worktree remove")), "the worktree stays for the run");
+  });
+
+  test("import-only merge the dispatcher resolved and committed → pushed too", async () => {
+    const probe = makeTestContext({ item: { issueNumber: 1344 } });
+    const path = resolve(probe.ctx.worktreeDir, "Thread.kt");
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 1344 },
+      mockOptions: {
+        execImpls: {
+          ...onOrigin(1344),
+          "git rev-parse HEAD": headMovesOnMerge(),
+          "merge main --no-edit": () => execError({ stderr: "CONFLICT (content): Merge conflict in Thread.kt" }),
+          "git diff --name-only --diff-filter=U -z": () => "Thread.kt\0",
+        },
+        fsMap: {
+          [path]: ["<<<<<<< HEAD", "import a.Feature", "||||||| base", "=======", "import a.Main", ">>>>>>> main", ""].join("\n"),
+        },
+      },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: true });
+    assert.match(client.comments[0]!.body, /Import-only merge conflict resolved/);
+    const commitIdx = calls.exec.findIndex(c => c.cmd === "git commit --no-edit");
+    const pushIdx = calls.exec.findIndex(c => c.cmd === "git push origin feature/1344");
+    assert.ok(commitIdx >= 0 && pushIdx > commitIdx, "the push follows the resolved merge's commit");
+  });
+
+  test("conflicted merge left for the code owner → never pushed here", async () => {
+    const probe = makeTestContext({ item: { issueNumber: 1345 } });
+    const path = resolve(probe.ctx.worktreeDir, "Thread.kt");
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 1345 },
+      mockOptions: {
+        execImpls: {
+          ...onOrigin(1345),
+          "git rev-parse HEAD": headMovesOnMerge(),
+          "merge main --no-edit": () => execError({ stderr: "CONFLICT (content): Merge conflict in Thread.kt" }),
+          "git diff --name-only --diff-filter=U -z": () => "Thread.kt\0",
+          "git rev-parse MERGE_HEAD": () => "mainsha\n",
+          "git merge-base HEAD MERGE_HEAD": () => "basesha\n",
+        },
+        fsMap: {
+          [path]: ["<<<<<<< HEAD", "val x = 1", "||||||| base", "val x = 0", "=======", "val x = 2", ">>>>>>> main", ""].join("\n"),
+        },
+      },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: true });
+    assert.match(client.comments[0]!.body, /Merge conflict left for developer/);
+    assert.ok(ctx.pendingMerge, "the merge is left for the run");
+    assert.deepEqual(pushes(calls), []);
   });
 });
 
@@ -4366,10 +4665,12 @@ describe("runAutoMerge", () => {
     assert.ok(!client.addLabelCalls.some(c => c.label === "error:merge-conflict"));
   });
 
-  test("merge conflict on retries-exhausted attempt → error:merge-conflict label + triage comment + Discord notify + Status rolled back to In Code Review", async () => {
+  test("merge conflict on retries-exhausted attempt → sent to the code owner: marker comment, merge-handoff + needs-rework:developer, Status to In Documentation, Discord notify", async () => {
     // Pre-seeded `merge-attempt:2` simulates the 3rd attempt — that's
-    // when retries are exhausted and the dispatcher gives up. Earlier
-    // attempts bump the counter and skip; see the retry tests below.
+    // when retries are exhausted. Earlier attempts bump the counter and
+    // skip; see the retry tests below. Since 2026-10-02 the spent retries
+    // send the ticket to its code owner instead of parking it (pyrycode-
+    // mobile #1017, #1346 and #1430 parked for a human that week).
     const client = new MockGitHubClient({
       items: [
         { id: "PVTI_1201", issueNumber: 1201, status: "Done", labels: ["done:documentation", "merge-attempt:2"], state: "OPEN" },
@@ -4389,35 +4690,191 @@ describe("runAutoMerge", () => {
 
     await runAutoMerge(client, deps);
 
-    // The conflict-block label was applied (stops retry loop on next cycle).
-    assert.ok(client.addLabelCalls.some(c => c.issueNumber === 1201 && c.label === "error:merge-conflict"));
-    // Triage comment posted with manual-resolution recipe.
+    // The route the pre-run merge uses: marker first, then the owner's rework label.
+    assert.deepEqual(client.addLabelCalls, [
+      { issueNumber: 1201, label: "merge-handoff" },
+      { issueNumber: 1201, label: "needs-rework:developer" },
+    ]);
+    // One routing comment, opening with the loop guard's marker.
     assert.equal(client.comments.length, 1);
-    assert.match(client.comments[0]!.body, /Auto-merge blocked by merge conflict/);
-    assert.match(client.comments[0]!.body, /gh pr checkout 790/);
-    assert.match(client.comments[0]!.body, /git fetch origin main/);
-    // Discord notify (one 🛑 message).
-    assert.equal(calls.discord.length, 1);
-    assert.match(calls.discord[0]!, /^🛑 Merge conflict on PR #790/);
-    // Pipeline labels NOT stripped (the merge failed, so the ticket
-    // isn't really done; labels stay until human resolves). Only the
-    // spent retry counter is cleared, so a later return to Done retries
-    // afresh.
+    const body = client.comments[0]!.body;
+    assert.ok(body.startsWith(FINAL_MERGE_HANDOFF_MARKER), "the marker opens the comment the guard counts");
+    assert.match(body, /Final merge sent to developer/);
+    assert.match(body, /PR #790 conflicts with `main`/);
+    assert.match(body, /only to finish this merge\. It does not count as a rework/);
+    assert.match(body, /merge handoff 1 of 2/);
+    assert.deepEqual(client.countMarkerCommentsCalls, [{ issueNumber: 1201, marker: FINAL_MERGE_HANDOFF_MARKER }]);
+    // Only the spent retry counter is cleared, so the ticket's next time
+    // in Done retries afresh. The router strips the rest when it moves it.
     assert.deepEqual(
       client.removeLabelCalls.filter(c => c.issueNumber === 1201).map(c => c.label),
       ["merge-attempt:2"],
     );
-    // Status rolled back from Done → In Code Review (the column-as-truth
-    // fix shipped 2026-05-09 evening). Without this the ticket sits at
-    // Status=Done with a still-open conflicting PR — exact bug #218 hit
-    // this morning.
-    assert.deepEqual(
-      client.updateItemStatusCalls,
-      [{ itemId: "PVTI_1201", newStatus: "In Code Review" }],
-      "merge-conflict path must roll Status back from Done → In Code Review",
-    );
-    // Items map reflects the rollback (state actually changed, not just recorded).
-    assert.equal(client.itemsByIssueNumber.get(1201)!.status, "In Code Review");
+    // Done is not a column the rework router scans: the ticket waits in
+    // the last stage's column, as after a pre-run route from documentation.
+    assert.deepEqual(client.updateItemStatusCalls, [{ itemId: "PVTI_1201", newStatus: "In Documentation" }]);
+    assert.equal(client.itemsByIssueNumber.get(1201)!.status, "In Documentation");
+    // Discord still hears about it.
+    assert.equal(calls.discord.length, 1);
+    assert.match(calls.discord[0]!, /^🔀 Merge conflict on PR #790 \(#1201\) — sent back to developer/);
+  });
+
+  test("retries-exhausted conflict in the builder set → sent to the builder", async () => {
+    await withStageSet("builder", async () => {
+      const client = new MockGitHubClient({
+        items: [
+          { id: "PVTI_1430", issueNumber: 1430, status: "Done", labels: ["merge-attempt:2"], state: "OPEN" },
+        ],
+      });
+      const { deps } = makeMockDeps({
+        execImpls: {
+          "gh pr list --head \"feature/1430\"": () => "1431\n",
+          "gh pr merge 1431 --merge --delete-branch": () => execError({ stderr: "X Pull request #1431 is not mergeable" }),
+        },
+      });
+
+      await runAutoMerge(client, deps);
+
+      assert.deepEqual(client.addLabelCalls.map(c => c.label), ["merge-handoff", "needs-rework:builder"]);
+      assert.match(client.comments[0]!.body, /Final merge sent to builder/);
+      assert.equal(client.itemsByIssueNumber.get(1430)!.status, "In Documentation");
+    });
+  });
+
+  test("two earlier final-merge handoffs → parks for a human as before, saying why", async () => {
+    // The loop guard: main overtook the ticket twice already.
+    const client = new MockGitHubClient({
+      items: [
+        { id: "PVTI_1202", issueNumber: 1202, status: "Done", labels: ["merge-attempt:2"], state: "OPEN" },
+      ],
+    });
+    client.priorCommentsByIssue.set(1202, [
+      `${FINAL_MERGE_HANDOFF_MARKER}\n## 🔀 Final merge sent to developer`,
+      "## ✅ some agent comment",
+      `${FINAL_MERGE_HANDOFF_MARKER}\n## 🔀 Final merge sent to developer`,
+    ]);
+    const { deps, calls } = makeMockDeps({
+      execImpls: {
+        "gh pr list --head \"feature/1202\"": () => "795\n",
+        "gh pr merge 795 --merge --delete-branch": () => execError({ stderr: "X Pull request #795 is not mergeable" }),
+      },
+    });
+
+    await runAutoMerge(client, deps);
+
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1202, label: "error:merge-conflict" }]);
+    assert.equal(client.comments.length, 1);
+    assert.match(client.comments[0]!.body, /Auto-merge blocked by merge conflict/);
+    assert.match(client.comments[0]!.body, /already gone back to developer 2 times/);
+    assert.match(client.comments[0]!.body, /gh pr checkout 795/);
+    assert.ok(!client.comments[0]!.body.includes(FINAL_MERGE_HANDOFF_MARKER), "a park is not a handoff");
+    assert.deepEqual(client.updateItemStatusCalls, [{ itemId: "PVTI_1202", newStatus: "In Code Review" }]);
+    assert.equal(calls.discord.length, 1);
+    assert.match(calls.discord[0]!, /^🛑 Merge conflict on PR #795/);
+  });
+
+  test("the route's labels fail → parks for a human as before, saying why", async () => {
+    const client = new MockGitHubClient({
+      items: [
+        { id: "PVTI_1203", issueNumber: 1203, status: "Done", labels: ["merge-attempt:2"], state: "OPEN" },
+      ],
+    });
+    client.failures.addLabel = (_n, label) => label.startsWith("needs-rework:") ? new Error("REST 502") : null;
+    const { deps, calls } = makeMockDeps({
+      execImpls: {
+        "gh pr list --head \"feature/1203\"": () => "796\n",
+        "gh pr merge 796 --merge --delete-branch": () => execError({ stderr: "X Pull request #796 is not mergeable" }),
+      },
+    });
+
+    await runAutoMerge(client, deps);
+
+    assert.ok(client.addLabelCalls.some(c => c.label === "error:merge-conflict"));
+    // The routing comment went out first, so the attempt still counts
+    // toward the guard; the park comment follows it.
+    assert.equal(client.comments.length, 2);
+    assert.match(client.comments[1]!.body, /Sending it back to developer to finish the merge failed: REST 502/);
+    assert.deepEqual(client.updateItemStatusCalls, [{ itemId: "PVTI_1203", newStatus: "In Code Review" }]);
+    assert.match(calls.discord[0]!, /^🛑 Merge conflict on PR #796/);
+  });
+
+  test("earlier handoffs cannot be counted → nothing changes; the spent counter brings it back next cycle", async () => {
+    const client = new MockGitHubClient({
+      items: [
+        { id: "PVTI_1204", issueNumber: 1204, status: "Done", labels: ["merge-attempt:2"], state: "OPEN" },
+      ],
+    });
+    client.failures.countMarkerComments = new Error("Failed to fetch comments: Bad Gateway");
+    const { deps, calls } = makeMockDeps({
+      execImpls: {
+        "gh pr list --head \"feature/1204\"": () => "797\n",
+        "gh pr merge 797 --merge --delete-branch": () => execError({ stderr: "X Pull request #797 is not mergeable" }),
+      },
+    });
+
+    await runAutoMerge(client, deps);
+
+    assert.deepEqual(client.addLabelCalls, []);
+    assert.deepEqual(client.removeLabelCalls, []);
+    assert.equal(client.comments.length, 0);
+    assert.equal(client.updateItemStatusCalls.length, 0);
+    assert.equal(calls.discord.length, 0);
+    assert.deepEqual(client.itemsByIssueNumber.get(1204)!.labels, ["merge-attempt:2"]);
+  });
+
+  test("the route's Status move fails → labels stay, non-fatal", async () => {
+    const client = new MockGitHubClient({
+      items: [
+        { id: "PVTI_1209", issueNumber: 1209, status: "Done", labels: ["merge-attempt:2"], state: "OPEN" },
+      ],
+    });
+    client.failures.updateItemStatus = new Error("project field permission denied");
+    const { deps, calls } = makeMockDeps({
+      execImpls: {
+        "gh pr list --head \"feature/1209\"": () => "798\n",
+        "gh pr merge 798 --merge --delete-branch": () => execError({ stderr: "X Pull request #798 is not mergeable" }),
+      },
+    });
+
+    await runAutoMerge(client, deps);
+
+    assert.deepEqual(client.addLabelCalls.map(c => c.label), ["merge-handoff", "needs-rework:developer"]);
+    assert.ok(!client.addLabelCalls.some(c => c.label === "error:merge-conflict"));
+    assert.equal(client.itemsByIssueNumber.get(1209)!.status, "Done");
+    assert.equal(calls.discord.length, 1);
+  });
+
+  test("a ticket main keeps overtaking goes to the owner twice, then parks", async () => {
+    // Each route's own comment is what the next round counts.
+    const client = new MockGitHubClient({
+      items: [
+        { id: "PVTI_1212", issueNumber: 1212, status: "Done", labels: ["merge-attempt:2"], state: "OPEN" },
+      ],
+    });
+    const { deps } = makeMockDeps({
+      execImpls: {
+        "gh pr list --head \"feature/1212\"": () => "799\n",
+        "gh pr merge 799 --merge --delete-branch": () => execError({ stderr: "X Pull request #799 is not mergeable" }),
+      },
+    });
+    const backInDoneWithRetriesSpent = () => {
+      const item = client.itemsByIssueNumber.get(1212)!;
+      item.status = "Done";
+      item.labels = ["merge-attempt:2"];
+    };
+
+    await runAutoMerge(client, deps);
+    assert.equal(client.itemsByIssueNumber.get(1212)!.status, "In Documentation");
+    backInDoneWithRetriesSpent();
+    await runAutoMerge(client, deps);
+    assert.equal(client.itemsByIssueNumber.get(1212)!.status, "In Documentation");
+    assert.match(client.comments[1]!.body, /merge handoff 2 of 2/);
+    backInDoneWithRetriesSpent();
+    await runAutoMerge(client, deps);
+
+    assert.equal(client.itemsByIssueNumber.get(1212)!.status, "In Code Review");
+    assert.ok(client.itemsByIssueNumber.get(1212)!.labels.includes("error:merge-conflict"));
+    assert.equal(client.addLabelCalls.filter(c => c.label === "needs-rework:developer").length, 2);
   });
 
   test("merge conflict — Status rollback failure is non-fatal (label still applied, sibling items still process)", async () => {
@@ -4428,13 +4885,15 @@ describe("runAutoMerge", () => {
     // Status is cosmetic correctness.
     //
     // Pre-seeded `merge-attempt:2` on both items so the next conflict
-    // triggers the give-up path (retries exhausted), not a counter bump.
+    // triggers the give-up path (retries exhausted), not a counter bump,
+    // and two earlier handoffs each so the give-up parks for a human.
     const client = new MockGitHubClient({
       items: [
         { id: "PVTI_1207", issueNumber: 1207, status: "Done", labels: ["done:documentation", "merge-attempt:2"], state: "OPEN" },
         { id: "PVTI_1208", issueNumber: 1208, status: "Done", labels: ["done:documentation", "merge-attempt:2"], state: "OPEN" },
       ],
     });
+    for (const n of [1207, 1208]) client.priorCommentsByIssue.set(n, [FINAL_MERGE_HANDOFF_MARKER, FINAL_MERGE_HANDOFF_MARKER]);
     // Rollback fails for 1207 only; 1208 should still process normally.
     client.failures.updateItemStatus = (itemId) =>
       itemId === "PVTI_1207" ? new Error("project field permission denied") : null;
@@ -4490,7 +4949,7 @@ describe("runAutoMerge", () => {
     assert.ok(!client.removeLabelCalls.some(c => c.label.startsWith("merge-attempt:")));
   });
 
-  test("conflict every cycle with Done cleanup in between → gives up on the third cycle (mobile #878 regression)", async () => {
+  test("conflict every cycle with Done cleanup in between → hands off on the third cycle (mobile #878 regression)", async () => {
     // The real poll loop runs runDoneCleanup before runAutoMerge in
     // every cycle. Cleanup used to strip merge-attempt:N from the open
     // Done ticket, so the count read zero each cycle and the retry
@@ -4512,8 +4971,9 @@ describe("runAutoMerge", () => {
       await runAutoMerge(client, deps);
     }
 
-    assert.ok(client.addLabelCalls.some(c => c.issueNumber === 1220 && c.label === "error:merge-conflict"));
-    assert.equal(client.itemsByIssueNumber.get(1220)!.status, "In Code Review");
+    assert.ok(client.addLabelCalls.some(c => c.issueNumber === 1220 && c.label === "needs-rework:developer"));
+    assert.ok(!client.addLabelCalls.some(c => c.label === "error:merge-conflict"));
+    assert.equal(client.itemsByIssueNumber.get(1220)!.status, "In Documentation");
     assert.equal(calls.discord.length, 1);
     // The spent counter is cleared on give-up.
     assert.ok(!client.itemsByIssueNumber.get(1220)!.labels.some(l => l.startsWith("merge-attempt:")));
@@ -4827,19 +5287,21 @@ describe("runAutoMerge", () => {
     assert.ok(!client.addLabelCalls.some(c => c.label === "error:merge-conflict"));
   });
 
-  test("pre-merge rebase conflict, merge conflicts too, retries exhausted → label + comment + Status rollback", async () => {
+  test("pre-merge rebase conflict, merge conflicts too, retries and handoffs exhausted → label + comment + Status rollback", async () => {
     // A rebase conflict falls back to the plain merge (2026-09-23: a
     // rebase can conflict where the merge is clean). When the merge
     // conflicts as well, the same load-bearing conflict path applies:
     // label + triage comment + Discord + Status rollback.
     //
     // Pre-seeded `merge-attempt:2` so this is the 3rd (final) attempt —
-    // retries exhausted, dispatcher gives up.
+    // retries exhausted, dispatcher gives up — and two earlier handoffs,
+    // so the give-up parks for a human.
     const client = new MockGitHubClient({
       items: [
         { id: "PVTI_1401", issueNumber: 1401, status: "Done", labels: ["done:documentation", "merge-attempt:2"], state: "OPEN" },
       ],
     });
+    client.priorCommentsByIssue.set(1401, [FINAL_MERGE_HANDOFF_MARKER, FINAL_MERGE_HANDOFF_MARKER]);
     const { deps, calls } = makeMockDeps({
       execImpls: {
         "gh pr list --head \"feature/1401\"": () => "901\n",
@@ -7413,6 +7875,178 @@ describe("pre-verifier gates — dispatchToAgent wiring", () => {
   });
 });
 
+describe("pre-verifier gates — reusing a pass on the same files (2026-10-02, #1340)", () => {
+  // #1340's verifier crashed one second after 22 minutes of green gates. A
+  // retry on the same merged files must not pay for them again, even when
+  // the merge commit was re-made with a new SHA. Anything that changes what
+  // the gates would see, or casts doubt on the recorded evidence, runs them
+  // exactly as before.
+  const HEAD = "c".repeat(40);
+  const TREE = "e".repeat(40);
+  const logsDir = resolve(TEST_AGENTS_REPO_ROOT, "logs");
+  const passFile = (n: number) => resolve(logsDir, `verifier-gate_#${n}.pass.json`);
+  const gateLogs = (n: number, count: number) =>
+    Array.from({ length: count }, (_, i) => [
+      resolve(logsDir, `verifier-gate_#${n}_${i + 1}.log`),
+      resolve(logsDir, `verifier-gate_#${n}_${i + 1}.stderr.log`),
+    ]).flat();
+  const recorded = (n: number, overrides: Partial<VerifierGatePass> = {}): VerifierGatePass => ({
+    issueNumber: n,
+    commit: HEAD,
+    tree: TREE,
+    gatesHash: hashGateList(["make check"]),
+    gates: ["make check"],
+    passedAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+    summary: ["✓ make check (exit 0)"],
+    logPaths: gateLogs(n, 1),
+    ...overrides,
+  });
+  /** A recorded pass on disk plus the gate logs it names. */
+  const fsWith = (n: number, pass: VerifierGatePass | string, logs = gateLogs(n, 1)): Record<string, string> => ({
+    [passFile(n)]: typeof pass === "string" ? pass : JSON.stringify(pass),
+    ...Object.fromEntries(logs.map((p) => [p, ""])),
+  });
+  /** `git rev-parse HEAD HEAD^{tree}` answers the commit, then its tree. */
+  const headImpls = (commit = HEAD, tree = TREE): Record<string, ExecHandler> => ({
+    "git rev-parse HEAD": () => `${commit}\n${tree}\n`,
+  });
+  const passWrites = (calls: CallLog, n: number) =>
+    calls.fs.filter((f) => f.kind === "write" && f.path === passFile(n));
+
+  async function runGates(n: number, mockOptions: MockDepsOptions, gates = "make check") {
+    return withStageSet("builder", () => withVerifierGates(gates, async () => {
+      const { ctx, calls } = makeTestContext({ agent: builderAgent("verifier"), item: { issueNumber: n }, mockOptions });
+      const result = await maybeRunPreSpawnGates(ctx);
+      return { result, calls };
+    }));
+  }
+
+  test("a green run records the pass; a retry on the same commit reuses it and runs no gate", async () => {
+    const first = await runGates(1500, { execImpls: headImpls() });
+    assert.equal(first.calls.gates.length, 1);
+    const writes = passWrites(first.calls, 1500);
+    assert.equal(writes.length, 1, "a full pass is recorded");
+    const written = JSON.parse(writes[0]!.content!) as VerifierGatePass;
+    assert.equal(written.issueNumber, 1500);
+    assert.equal(written.tree, TREE, "keyed by the tree of the merged worktree");
+    assert.equal(written.commit, HEAD, "and names the commit it ran on");
+    assert.equal(written.gatesHash, hashGateList(["make check"]));
+    assert.deepEqual(written.logPaths, gateLogs(1500, 1), "names the gate logs as its evidence");
+    assert.deepEqual(written.summary, ["✓ make check (exit 0)"]);
+
+    const retry = await runGates(1500, { execImpls: headImpls(), fsMap: fsWith(1500, writes[0]!.content!) });
+
+    assert.equal(retry.calls.gates.length, 0, "no gate runs on a reused pass");
+    assert.match(retry.result.promptNote, /## Deterministic gates/, "the verifier's green heading is unchanged");
+    assert.ok(!retry.result.promptNote.includes("TRIAGE MODE"));
+    assert.match(retry.result.promptNote, /reused from that run/);
+    assert.ok(retry.result.promptNote.includes(written.passedAt), "the note names when the reused run happened");
+    assert.match(retry.result.promptNote, /on this same commit \(`c{40}`\)/, "and that it ran on this same commit");
+    assert.match(retry.result.promptNote, /- `make check`/);
+    const log = loggedText(retry.calls);
+    assert.match(log, /Reused the pass recorded at/);
+    assert.match(log, /✓ make check \(exit 0\)/);
+    assert.equal(passWrites(retry.calls, 1500).length, 0, "a reuse does not re-stamp the pass");
+  });
+
+  test("a re-made merge commit over the same files reuses the pass and names the commit it ran on", async () => {
+    // The #1340 retry shape: the merge of main was made again, so HEAD has
+    // a new SHA, but the files the gates would test are identical.
+    const remade = "d".repeat(40);
+    const { result, calls } = await runGates(1509, { execImpls: headImpls(remade, TREE), fsMap: fsWith(1509, recorded(1509)) });
+    assert.equal(calls.gates.length, 0, "identical files, so no gate runs");
+    assert.match(result.promptNote, /## Deterministic gates/);
+    assert.match(result.promptNote, /on commit `c{40}`, whose files are identical to this worktree's \(tree `e{40}`\)/);
+    assert.match(result.promptNote, /reused from that run/);
+    assert.match(loggedText(calls), /Reused the pass recorded at .* on commit c{40} \(tree e{40}\)/);
+    assert.equal(passWrites(calls, 1509).length, 0);
+  });
+
+  test("a different merged tree runs the gates and records the new tree and commit", async () => {
+    const otherCommit = "d".repeat(40);
+    const otherTree = "f".repeat(40);
+    const { result, calls } = await runGates(1501, { execImpls: headImpls(otherCommit, otherTree), fsMap: fsWith(1501, recorded(1501)) });
+    assert.equal(calls.gates.length, 1);
+    assert.ok(!result.promptNote.includes("reused"));
+    const writes = passWrites(calls, 1501);
+    assert.equal(writes.length, 1);
+    const written = JSON.parse(writes[0]!.content!) as VerifierGatePass;
+    assert.equal(written.tree, otherTree);
+    assert.equal(written.commit, otherCommit);
+  });
+
+  test("a different gate list runs the gates", async () => {
+    const { result, calls } = await runGates(
+      1502,
+      { execImpls: headImpls(), fsMap: fsWith(1502, recorded(1502)) },
+      "make check;make build",
+    );
+    assert.deepEqual(calls.gates.map((g) => g.command), ["make check", "make build"]);
+    assert.ok(!result.promptNote.includes("reused"));
+  });
+
+  test("a pass over 24 hours old runs the gates", async () => {
+    const stale = recorded(1503, { passedAt: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString() });
+    const { calls } = await runGates(1503, { execImpls: headImpls(), fsMap: fsWith(1503, stale) });
+    assert.equal(calls.gates.length, 1);
+  });
+
+  test("a gate log the pass names is gone → the gates run", async () => {
+    const [stdoutLog] = gateLogs(1504, 1);
+    const { calls } = await runGates(1504, { execImpls: headImpls(), fsMap: fsWith(1504, recorded(1504), [stdoutLog!]) });
+    assert.equal(calls.gates.length, 1);
+  });
+
+  test("PYRY_VERIFIER_GATE_REUSE=0: the gates run, nothing is read or recorded, HEAD is not asked", async () => {
+    const prior = process.env.PYRY_VERIFIER_GATE_REUSE;
+    process.env.PYRY_VERIFIER_GATE_REUSE = "0";
+    try {
+      const { calls } = await runGates(1505, { execImpls: headImpls(), fsMap: fsWith(1505, recorded(1505)) });
+      assert.equal(calls.gates.length, 1, "a matching pass is ignored");
+      assert.equal(passWrites(calls, 1505).length, 0);
+      assert.ok(!calls.fs.some((f) => f.path === passFile(1505)), "the pass file is not even read");
+      assert.ok(!calls.exec.some((e) => e.cmd.includes("git rev-parse HEAD")));
+    } finally {
+      if (prior === undefined) delete process.env.PYRY_VERIFIER_GATE_REUSE;
+      else process.env.PYRY_VERIFIER_GATE_REUSE = prior;
+    }
+  });
+
+  for (const [label, outcome] of [
+    ["red exit", { exitCode: 1, timedOut: false, spawnError: null }],
+    ["timeout", { exitCode: null, timedOut: true, spawnError: null }],
+    ["spawn error", { exitCode: null, timedOut: false, spawnError: "could not spawn gate command: ENOENT" }],
+  ] as const) {
+    test(`a run with a ${label} on any gate is never recorded, so a retry runs the gates again`, async () => {
+      const { result, calls } = await runGates(
+        1506,
+        {
+          execImpls: headImpls(),
+          gateImpl: (req) => req.command === "make build" ? outcome : { exitCode: 0, timedOut: false, spawnError: null },
+        },
+        "make check;make build",
+      );
+      assert.match(result.promptNote, /TRIAGE MODE/);
+      assert.equal(passWrites(calls, 1506).length, 0);
+    });
+  }
+
+  test("a corrupt pass file falls back to running the gates, and the new pass replaces it", async () => {
+    const { result, calls } = await runGates(1507, { execImpls: headImpls(), fsMap: fsWith(1507, '{"commit": tru') });
+    assert.equal(calls.gates.length, 1);
+    assert.ok(!result.promptNote.includes("reused"));
+    assert.match(result.promptNote, /## Deterministic gates/);
+    assert.equal(passWrites(calls, 1507).length, 1);
+  });
+
+  test("HEAD unknown: the gates run and nothing is recorded under an empty key", async () => {
+    // The default mock execSync answers every command with "".
+    const { calls } = await runGates(1508, { fsMap: fsWith(1508, recorded(1508, { commit: "", tree: "" })) });
+    assert.equal(calls.gates.length, 1);
+    assert.equal(passWrites(calls, 1508).length, 0);
+  });
+});
+
 describe("stage-set threading tripwires (source assertions)", () => {
   test("pollLoop derives its poll order from the resolved stage set, not the AGENTS const", () => {
     const source = readDispatchSource();
@@ -7917,7 +8551,7 @@ describe("runPendingDoneFinalize", () => {
 // checked before the safety-net commit and the push; a run that errors is
 // never salvaged, since salvage would push whatever markers it left.
 describe("merge handoff — the owner's run", () => {
-  const pendingMerge = { paths: ["Thread.kt"], mainSha: "mainsha", baseSha: "basesha", headSha: "headsha" };
+  const pendingMerge = { paths: ["Thread.kt"], mainSha: "mainsha", baseSha: "basesha", headSha: "headsha", mainConflictLines: {} };
 
   test("merge still in progress → error:<agent>, comment, no commit, no push, {ok:false}", async () => {
     const { ctx, client, calls } = makeTestContext({
@@ -7936,7 +8570,7 @@ describe("merge handoff — the owner's run", () => {
     assert.ok(!calls.exec.some(c => c.cmd.includes("git push")));
   });
 
-  test("main's added line dropped → names it, no push, {ok:false}", async () => {
+  test("main's added line outside the conflicts dropped → names it, no push, {ok:false}", async () => {
     const { ctx, client, calls } = makeTestContext({
       item: { issueNumber: 808 },
       mockOptions: {
@@ -7952,7 +8586,7 @@ describe("merge handoff — the owner's run", () => {
     const result = await handlePostRun(STREAM_OK(), ctx, false);
 
     assert.deepEqual(result, { ok: false });
-    assert.match(client.comments[0]!.body, /lost 1 line\(s\) main added: `turnOutcome = turnOutcome,`/);
+    assert.match(client.comments[0]!.body, /lost 1 line\(s\) main added outside the conflict blocks: `turnOutcome = turnOutcome,`/);
     assert.ok(!calls.exec.some(c => c.cmd.includes("git push")));
   });
 
@@ -7978,6 +8612,50 @@ describe("merge handoff — the owner's run", () => {
     assert.ok(calls.exec.some(c => c.cmd.includes("git push -u origin feature/808")));
   });
 
+  // pyrycode-mobile #1355, 2026-10-02: the ticket rewrote main's line
+  // inside the conflict on purpose. The merge goes out, and the review
+  // stages are told what changed.
+  const changedInsideConflict = (extra: Record<string, ExecHandler> = {}) => makeTestContext({
+    item: { issueNumber: 1355 },
+    mockOptions: {
+      execImpls: {
+        ...extra,
+        "git rev-parse -q --verify MERGE_HEAD": () => execError({ status: 1 }),
+        "git show HEAD:": () => "Composer {\n  sendInLocalWindow { send(trimmed) }\n}\n",
+        "git diff -U0 basesha mainsha": () => "+++ b/Thread.kt\n+  sendInLocalWindow { send(text) }\n",
+        "git rev-list --merges --parents headsha..HEAD": () => "mergesha headsha mainsha\n",
+        "git status --porcelain": () => "",
+        "git rev-list --count main..": () => "3\n",
+      },
+    },
+  });
+  const insideConflict = { ...pendingMerge, mainConflictLines: { "Thread.kt": ["sendInLocalWindow { send(text) }"] } };
+
+  test("main's line changed inside a conflict → pushes, then notes it for review with the merge commit", async () => {
+    const { ctx, client, calls } = changedInsideConflict();
+    ctx.pendingMerge = insideConflict;
+
+    const result = await handlePostRun(STREAM_OK(), ctx, false);
+
+    assert.deepEqual(result, { ok: true });
+    assert.ok(!client.addLabelCalls.some(c => c.label.startsWith("error:")));
+    assert.ok(calls.exec.some(c => c.cmd.includes("git push -u origin feature/1355")));
+    const notes = client.comments.filter(c => c.body.includes(MERGE_RESOLUTION_NOTE_MARKER));
+    assert.equal(notes.length, 1);
+    assert.match(notes[0]!.body, /merge commit mergesha/);
+    assert.match(notes[0]!.body, /`Thread\.kt`, 1 line\(s\):\n\n```text\nsendInLocalWindow \{ send\(text\) \}\n```/);
+  });
+
+  test("a failed push posts no review note: nothing reached origin to review", async () => {
+    const { ctx, client } = changedInsideConflict({ "git push": () => execError({ stderr: "non-fast-forward" }) });
+    ctx.pendingMerge = insideConflict;
+
+    const result = await handlePostRun(STREAM_OK(), ctx, false);
+
+    assert.deepEqual(result, { ok: false });
+    assert.ok(!client.comments.some(c => c.body.includes(MERGE_RESOLUTION_NOTE_MARKER)));
+  });
+
   test("a run that errors mid-merge is never salvaged", async () => {
     const { ctx, client, calls } = makeTestContext({ item: { issueNumber: 808 } });
     ctx.pendingMerge = pendingMerge;
@@ -7988,6 +8666,49 @@ describe("merge handoff — the owner's run", () => {
     );
     assert.ok(!calls.exec.some(c => c.cmd.includes("git add -A") || c.cmd.includes("git push")));
     assert.ok(!client.addLabelCalls.some(c => c.label === "error:max_turns_salvaged"));
+  });
+});
+
+// The stages after the code owner read the merge resolution note through
+// their prompt; comments reach no other prompt (merge-handoff.ts, #1355).
+// Only stages that need no `gh` call are built here.
+describe("buildPromptForAgent — merge resolution to review", () => {
+  const item = makeProjectItem({ issueNumber: 1355 });
+  const specRoot = resolve(tmpdir(), "no-spec-root-for-merge-notes");
+  const note = mergeResolutionComment("main", [{ path: "Composer.kt", lines: ["sendInLocalWindow { send(text) }"] }], "mergesha");
+  async function prompt(set: string, name: string, client: MockGitHubClient) {
+    const agent = resolveStageSet(set).agents.find(a => a.name === name)!;
+    return withStageSet(set, () => DEFAULT_DEPS.buildPromptForAgent(agent, item, specRoot, client));
+  }
+  async function clientWithNote() {
+    const client = new MockGitHubClient();
+    await client.addComment(1355, note);
+    return client;
+  }
+
+  test("a stage after the code owner gets the note, fenced as data", async () => {
+    for (const set of ["classic", "builder"]) {
+      const text = await prompt(set, "documentation", await clientWithNote());
+      assert.match(text, /\n## Merge resolution to review\n/, set);
+      assert.match(text, /----- BEGIN MERGE NOTES -----\n[\s\S]*sendInLocalWindow \{ send\(text\) \}[\s\S]*\n----- END MERGE NOTES -----/, set);
+    }
+  });
+
+  test("the code owner and earlier stages get no section and read no comments", async () => {
+    for (const [set, name] of [["classic", "developer"], ["classic", "architect"], ["builder", "builder"]] as const) {
+      const client = await clientWithNote();
+      const text = await prompt(set, name, client);
+      assert.doesNotMatch(text, /Merge resolution to review/, `${set}/${name}`);
+      assert.deepEqual(client.getIssueCommentBodiesCalls, [], `${set}/${name}`);
+    }
+  });
+
+  test("a failed comment read sends the prompt without the section", async () => {
+    const client = await clientWithNote();
+    client.failures.getIssueCommentBodies = new Error("rate limited");
+    const text = await prompt("classic", "documentation", client);
+    assert.doesNotMatch(text, /Merge resolution to review/);
+    assert.match(text, /# Ticket #1355/);
   });
 });
 
@@ -8033,5 +8754,248 @@ describe("clearGateWorktreePath", () => {
     const { fn, calls } = exec(() => false);
     assert.equal(clearGateWorktreePath(fn, "/tmp/repo", dir, "s"), null);
     assert.ok(!calls.some(c => c.includes("worktree move")));
+  });
+});
+
+// =====================================================================
+// Partial-work salvage — a stopped run on a branch that already has a PR
+// =====================================================================
+//
+// pyrycode-mobile #1430 (2026-10-02) and #1332 (2026-10-01) both timed out
+// in documentation with finished edits uncommitted. Their tickets already
+// had a PR, so the draft-PR salvage never applied, and both timeouts came
+// through the runner's REJECT door ("Agent timed out after 2280s", no
+// result frame). These tests drive dispatchToAgent through both doors.
+
+describe("partial-work salvage — stopped run with an existing PR (mobile #1430, #1332)", () => {
+  const DOC_AGENT: Partial<AgentConfig> = {
+    name: "documentation", column: "In Documentation", claudeMdPath: "documentation/CLAUDE.md", producesCommits: true,
+  };
+  const PR_JSON = `[{"number": 1431}]`;
+  const NO_MERGE = { "git rev-parse -q --verify MERGE_HEAD": () => execError({ status: 1 }) };
+
+  function stoppedRun(opts: {
+    issue: number;
+    agent?: Partial<AgentConfig>;
+    stop: { reject: Error } | { result: StreamResult };
+    exec?: Record<string, ExecHandler>;
+    spawn?: Record<string, SpawnHandler>;
+  }) {
+    const agent = makeAgentConfig(opts.agent ?? DOC_AGENT);
+    const client = new MockGitHubClient({ status: { [opts.issue]: agent.column }, labels: { [opts.issue]: [] } });
+    const item = makeProjectItem({ issueNumber: opts.issue, status: agent.column });
+    const { deps, calls } = makeMockDeps({
+      execImpls: { ...fullHappyExecImpls(`feature/${opts.issue}`), ...NO_MERGE, ...opts.exec },
+      spawnImpls: opts.spawn,
+      fsMap: { [claudeMdAbsPath(agent.claudeMdPath)]: "role prompt" },
+      ...("result" in opts.stop ? { streamResult: opts.stop.result } : {}),
+    });
+    if ("reject" in opts.stop) {
+      const err = opts.stop.reject;
+      deps.runClaudeStreaming = (async () => { calls.claudeStreams += 1; throw err; }) as DispatchDeps["runClaudeStreaming"];
+    }
+    return { agent, item, client, deps, calls };
+  }
+  const commitOf = (calls: CallLog) => calls.spawn.find(c => c.cmd === "git" && c.args[0] === "commit");
+  const pushOf = (calls: CallLog) => calls.spawn.find(c => c.cmd === "git" && c.args[0] === "push");
+
+  test("timeout through the reject door, PR + dirty tree → commit, push, comment, then park as before", async () => {
+    const { agent, item, client, deps, calls } = stoppedRun({
+      issue: 1430,
+      stop: { reject: new AgentRunStoppedError("Agent timed out after 2280s", "timeout") },
+      exec: { "gh pr list --head": () => PR_JSON, "git status --porcelain": () => " M docs/knowledge/features/development-verification.md\n" },
+    });
+
+    await dispatchToAgent(agent, item, client, deps);
+
+    const commit = commitOf(calls);
+    assert.ok(commit, "the dirty tree is committed");
+    assert.equal(commit!.args[2], "wip(documentation): partial work from a timed-out run (#1430)");
+    assert.ok(calls.exec.some(c => c.cmd === "git add -A"));
+    assert.deepEqual(pushOf(calls)?.args, ["push", "-u", "origin", "feature/1430"]);
+    const saved = client.comments.findIndex(c => /Partial work saved/.test(c.body));
+    const parked = client.comments.findIndex(c => /Agent Error: documentation/.test(c.body));
+    assert.ok(saved >= 0, "the ticket says the work was pushed");
+    assert.match(client.comments[saved]!.body, /PR #1431/);
+    assert.match(client.comments[saved]!.body, /next documentation run on this ticket continues from it/);
+    assert.ok(parked > saved, "the original error still parks, after the salvage comment");
+    assert.ok(client.addLabelCalls.some(c => c.label === "error:documentation"), "a timeout still parks under error:<agent>");
+    assert.ok(!client.addLabelCalls.some(c => c.label === "error:max_turns_salvaged"));
+    assert.ok(cleanupRan(calls.exec), "teardown runs after a successful push");
+  });
+
+  for (const door of ["reject", "result"] as const) {
+    test(`idle stall through the ${door} door → salvage, then the transient retry still runs`, async () => {
+      const stop = door === "reject"
+        ? { reject: new AgentRunStoppedError(idleStallMessage(600_000), "idle_stall") }
+        : { result: streamResult({ isError: true, terminalReason: "idle_stall", output: "Now update the catalog." }) };
+      const { agent, item, client, deps, calls } = stoppedRun({
+        issue: 1431,
+        stop,
+        exec: { "gh pr list --head": () => PR_JSON, "git status --porcelain": () => "?? docs/new-child.md\n" },
+      });
+
+      await dispatchToAgent(agent, item, client, deps);
+
+      assert.equal(commitOf(calls)?.args[2], "wip(documentation): partial work from a stalled run (#1431)");
+      assert.ok(pushOf(calls), "pushed to the existing branch");
+      assert.ok(client.comments.some(c => /Partial work saved/.test(c.body) && /stalled/.test(c.body)));
+      assert.ok(client.comments.some(c => /Auto-retry scheduled/.test(c.body)), "the stall is still retried as transient");
+      assert.ok(!client.addLabelCalls.some(c => c.label === "error:documentation"), "no park on a transient stall");
+    });
+  }
+
+  test("timeout through the result door with a PR → the draft-PR salvage stands aside, the partial salvage pushes", async () => {
+    const { agent, item, client, deps, calls } = stoppedRun({
+      issue: 1332,
+      agent: { name: "developer" },
+      stop: { result: streamResult({ isError: true, terminalReason: "", timedOut: true, sessionId: "" }) },
+      exec: { "gh pr list --head": () => PR_JSON, "git status --porcelain": () => " M src/a.go\n" },
+    });
+
+    await dispatchToAgent(agent, item, client, deps);
+
+    assert.ok(!calls.spawn.some(c => c.cmd === "gh" && c.args.includes("create")), "no second PR is attempted");
+    assert.ok(!client.addLabelCalls.some(c => c.label === "error:max_turns_salvaged"));
+    assert.equal(commitOf(calls)?.args[2], "wip(developer): partial work from a timed-out run (#1332)");
+    assert.ok(pushOf(calls));
+    assert.ok(client.addLabelCalls.some(c => c.label === "error:developer"));
+  });
+
+  test("clean tree with local commits origin lacks → pushes without a new commit", async () => {
+    const { agent, item, client, deps, calls } = stoppedRun({
+      issue: 1433,
+      stop: { reject: new AgentRunStoppedError("Agent timed out after 2280s", "timeout") },
+      exec: { "gh pr list --head": () => PR_JSON, "git status --porcelain": () => "", "git rev-list --count origin/feature/1433..HEAD": () => "2\n" },
+    });
+
+    await dispatchToAgent(agent, item, client, deps);
+
+    assert.equal(commitOf(calls), undefined);
+    assert.ok(pushOf(calls));
+    assert.ok(client.comments.some(c => /found local commits origin did not have/.test(c.body)));
+  });
+
+  for (const reviewer of ["verifier", "code-review", "qa"]) {
+    test(`skipped for a reviewer stage (${reviewer})`, async () => {
+      const { agent, item, client, deps, calls } = stoppedRun({
+        issue: 1434,
+        agent: { name: reviewer, column: "In Code Review", claudeMdPath: `${reviewer}/CLAUDE.md`, producesCommits: false },
+        stop: { reject: new AgentRunStoppedError("Agent timed out after 2400s", "timeout") },
+        exec: { "gh pr list --head": () => PR_JSON, "git status --porcelain": () => " M src/a.go\n" },
+      });
+
+      await dispatchToAgent(agent, item, client, deps);
+
+      assert.equal(commitOf(calls), undefined);
+      assert.equal(pushOf(calls), undefined);
+      assert.ok(!calls.exec.some(c => c.cmd.includes("gh pr list")), "a reviewer stage is not even probed");
+      assert.ok(!client.comments.some(c => /Partial work/.test(c.body)));
+      assert.ok(client.addLabelCalls.some(c => c.label === `error:${reviewer}`));
+    });
+  }
+
+  test("skipped with MERGE_HEAD present: a half-finished merge is never pushed", async () => {
+    const { agent, item, client, deps, calls } = stoppedRun({
+      issue: 1435,
+      agent: { name: "developer" },
+      stop: { reject: new AgentRunStoppedError("Agent timed out after 1500s", "timeout") },
+      exec: { "gh pr list --head": () => PR_JSON, "git status --porcelain": () => "UU src/a.go\n", "git rev-parse -q --verify MERGE_HEAD": () => "mainsha\n" },
+    });
+
+    await dispatchToAgent(agent, item, client, deps);
+
+    assert.ok(!calls.exec.some(c => c.cmd === "git add -A"));
+    assert.equal(commitOf(calls), undefined);
+    assert.equal(pushOf(calls), undefined);
+    assert.ok(calls.logs.some(l => l.section === "PARTIAL_SALVAGE_SKIPPED" && /MERGE_HEAD/.test(l.content)));
+  });
+
+  test("a merge handed to the run must pass the merge check", async () => {
+    // Committed merge (no MERGE_HEAD), but the file still has markers.
+    const { ctx, client, calls } = makeTestContext({
+      agent: { name: "developer" },
+      item: { issueNumber: 1436 },
+      mockOptions: {
+        execImpls: {
+          ...NO_MERGE,
+          "gh pr list --head": () => PR_JSON,
+          "git status --porcelain": () => " M src/Thread.kt\n",
+          "git show HEAD:": () => "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> main\n",
+        },
+      },
+    });
+    ctx.pendingMerge = { paths: ["src/Thread.kt"], mainSha: "mainsha", baseSha: "basesha", headSha: "headsha", mainConflictLines: {} };
+
+    const res = await salvagePartialWork(ctx, "timeout");
+
+    assert.deepEqual(res, { keepWorktree: false });
+    assert.equal(commitOf(calls), undefined);
+    assert.equal(pushOf(calls), undefined);
+    assert.equal(client.comments.length, 0);
+    assert.ok(calls.logs.some(l => l.section === "PARTIAL_SALVAGE_SKIPPED" && /conflict markers/.test(l.content)));
+  });
+
+  test("skipped when the worktree is clean and in sync with origin", async () => {
+    const { agent, item, client, deps, calls } = stoppedRun({
+      issue: 1437,
+      stop: { reject: new AgentRunStoppedError("Agent timed out after 2280s", "timeout") },
+      exec: { "gh pr list --head": () => PR_JSON, "git status --porcelain": () => "", "git rev-list --count origin/feature/1437..HEAD": () => "0\n" },
+    });
+
+    await dispatchToAgent(agent, item, client, deps);
+
+    assert.equal(pushOf(calls), undefined);
+    assert.ok(!client.comments.some(c => /Partial work/.test(c.body)));
+    assert.ok(calls.logs.some(l => l.section === "PARTIAL_SALVAGE_SKIPPED" && /nothing to save/.test(l.content)));
+  });
+
+  test("skipped when the branch has no PR (the draft-PR salvage owns that case)", async () => {
+    const { agent, item, client, deps, calls } = stoppedRun({
+      issue: 1438,
+      stop: { reject: new AgentRunStoppedError("Agent timed out after 2280s", "timeout") },
+      exec: { "gh pr list --head": () => "[]", "git status --porcelain": () => " M a.md\n" },
+    });
+
+    await dispatchToAgent(agent, item, client, deps);
+
+    assert.equal(pushOf(calls), undefined);
+    assert.ok(calls.logs.some(l => l.section === "PARTIAL_SALVAGE_SKIPPED" && /no open pull request/.test(l.content)));
+  });
+
+  test("push failure → comment names the kept worktree, and the teardown is skipped", async () => {
+    const { agent, item, client, deps, calls } = stoppedRun({
+      issue: 1439,
+      stop: { reject: new AgentRunStoppedError("Agent timed out after 2280s", "timeout") },
+      exec: { "gh pr list --head": () => PR_JSON, "git status --porcelain": () => " M a.md\n" },
+      spawn: { "git push": () => ({ status: 1, stderr: "! [rejected] non-fast-forward" }) },
+    });
+
+    await dispatchToAgent(agent, item, client, deps);
+
+    assert.ok(commitOf(calls), "committed locally first");
+    const note = client.comments.find(c => /Partial work not pushed/.test(c.body));
+    assert.ok(note, "the ticket says the push failed");
+    assert.match(note!.body, /kept worktree at `[^`]*documentation-1439`/);
+    assert.ok(calls.logs.some(l => l.section === "PARTIAL_SALVAGE_PUSH_FAILED" && /non-fast-forward/.test(l.content)));
+    assert.ok(client.addLabelCalls.some(c => c.label === "error:documentation"), "the error path still runs");
+    assert.ok(!cleanupRan(calls.exec), "the worktree holding the only copy is not torn down");
+  });
+});
+
+describe("no-result exit keeps Claude's stderr (pyrycode-mobile #1340, 2026-10-02)", () => {
+  test("the ticket's error comment shows the scrubbed stderr tail inside its code block", async () => {
+    const key = "sk-ant-api03-" + "k".repeat(48);
+    const { ctx, client } = makeTestContext({ agent: { name: "verifier", producesCommits: false }, item: { issueNumber: 1340 } });
+    const err = new Error(noResultErrorMessage(1, `Error: Request timed out.\n    at retry (cli.js:1:2)\nusing ${key}\n`));
+
+    await handleDispatchError(err, ctx, null);
+
+    const body = client.comments.find(c => /Agent Error: verifier/.test(c.body))?.body ?? "";
+    const block = body.slice(body.indexOf("```\n") + 4, body.lastIndexOf("\n```"));
+    assert.match(block, /^Claude CLI exited with code 1, no result message received/);
+    assert.match(block, /--- stderr \(last 1500 chars\) ---\nError: Request timed out\./);
+    assert.ok(!body.includes(key), "no credential reaches GitHub");
+    assert.ok(client.addLabelCalls.some(c => c.label === "error:verifier"), "still parks: the tail adds evidence, not a retry");
   });
 });
