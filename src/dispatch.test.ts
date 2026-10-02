@@ -1282,6 +1282,155 @@ describe("setupBranchAndWorktree — coverage edges", () => {
   });
 });
 
+// pyrycode-mobile #1340, 2026-10-02: the verifier crashed after the pre-run
+// merge of main, the merge commit was only ever pushed at the end of a run,
+// and the next dispatch refused with abort-local-strictly-ahead. The merge is
+// now pushed as soon as it is committed, when origin already has the branch.
+describe("setupBranchAndWorktree — pushing the pre-run merge", () => {
+  // `git rev-parse HEAD` in the worktree: the first read (before the merge)
+  // and every later one differ, as they do when the merge made a commit.
+  function headMovesOnMerge(): ExecHandler {
+    let reads = 0;
+    return () => (reads++ === 0 ? "before-merge-sha\n" : "after-merge-sha\n");
+  }
+  // Local and origin exist and agree: reuse-local-already-synced.
+  function onOrigin(n: number): Record<string, ExecHandler> {
+    return {
+      [`git rev-parse --verify feature/${n}`]: () => "",
+      [`git rev-parse --verify origin/feature/${n}`]: () => "",
+      [`git rev-parse origin/feature/${n}`]: () => "synced\n",
+      [`git rev-parse feature/${n}`]: () => "synced\n",
+    };
+  }
+  const pushes = (calls: CallLog) => calls.exec.filter(c => c.cmd.startsWith("git push"));
+
+  test("merge moved HEAD on a branch origin has → pushed from the worktree right after the merge", async () => {
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 1340 },
+      mockOptions: { execImpls: { ...onOrigin(1340), "git rev-parse HEAD": headMovesOnMerge() } },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: true });
+    assert.deepEqual(pushes(calls).map(c => c.cmd), ["git push origin feature/1340"]);
+    const pushIdx = calls.exec.findIndex(c => c.cmd === "git push origin feature/1340");
+    const mergeIdx = calls.exec.findIndex(c => c.cmd.includes("merge main --no-edit"));
+    assert.ok(pushIdx > mergeIdx, "the push follows the merge");
+    assert.equal(calls.exec[pushIdx]!.opts?.cwd, ctx.worktreeDir, "pushed from the worktree");
+    assert.deepEqual(client.addLabelCalls, []);
+    assert.equal(client.comments.length, 0);
+  });
+
+  test("no-op merge (HEAD unchanged) → nothing pushed", async () => {
+    const { ctx, calls } = makeTestContext({
+      item: { issueNumber: 1341 },
+      mockOptions: { execImpls: { ...onOrigin(1341), "git rev-parse HEAD": () => "unchanged-sha\n" } },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: true });
+    assert.deepEqual(pushes(calls), []);
+  });
+
+  test("branch not on origin yet → nothing pushed, the end-of-run push creates it as before", async () => {
+    const { ctx, calls } = makeTestContext({
+      item: { issueNumber: 1342 },
+      mockOptions: {
+        execImpls: {
+          "git rev-parse --verify feature/1342": () => execError({ stderr: "fatal" }),
+          "git rev-parse --verify origin/feature/1342": () => execError({ stderr: "fatal" }),
+          "git rev-parse HEAD": headMovesOnMerge(),
+        },
+      },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: true });
+    assert.ok(calls.exec.some(c => c.cmd === "git branch feature/1342 main"), "fresh ticket path");
+    assert.deepEqual(pushes(calls), []);
+  });
+
+  test("push fails → only a warning, the dispatch carries on with no label or comment", async () => {
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 1343 },
+      mockOptions: {
+        execImpls: {
+          ...onOrigin(1343),
+          "git rev-parse HEAD": headMovesOnMerge(),
+          "git push origin feature/1343": () => execError({ stderr: "fatal: unable to access remote" }),
+        },
+      },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: true });
+    assert.equal(pushes(calls).length, 1, "the push was attempted once");
+    assert.deepEqual(client.addLabelCalls, []);
+    assert.equal(client.comments.length, 0);
+    const addIdx = calls.exec.findIndex(c => c.cmd.includes("git worktree add"));
+    assert.ok(!calls.exec.slice(addIdx + 1).some(c => c.cmd.includes("git worktree remove")), "the worktree stays for the run");
+  });
+
+  test("import-only merge the dispatcher resolved and committed → pushed too", async () => {
+    const probe = makeTestContext({ item: { issueNumber: 1344 } });
+    const path = resolve(probe.ctx.worktreeDir, "Thread.kt");
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 1344 },
+      mockOptions: {
+        execImpls: {
+          ...onOrigin(1344),
+          "git rev-parse HEAD": headMovesOnMerge(),
+          "merge main --no-edit": () => execError({ stderr: "CONFLICT (content): Merge conflict in Thread.kt" }),
+          "git diff --name-only --diff-filter=U -z": () => "Thread.kt\0",
+        },
+        fsMap: {
+          [path]: ["<<<<<<< HEAD", "import a.Feature", "||||||| base", "=======", "import a.Main", ">>>>>>> main", ""].join("\n"),
+        },
+      },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: true });
+    assert.match(client.comments[0]!.body, /Import-only merge conflict resolved/);
+    const commitIdx = calls.exec.findIndex(c => c.cmd === "git commit --no-edit");
+    const pushIdx = calls.exec.findIndex(c => c.cmd === "git push origin feature/1344");
+    assert.ok(commitIdx >= 0 && pushIdx > commitIdx, "the push follows the resolved merge's commit");
+  });
+
+  test("conflicted merge left for the code owner → never pushed here", async () => {
+    const probe = makeTestContext({ item: { issueNumber: 1345 } });
+    const path = resolve(probe.ctx.worktreeDir, "Thread.kt");
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 1345 },
+      mockOptions: {
+        execImpls: {
+          ...onOrigin(1345),
+          "git rev-parse HEAD": headMovesOnMerge(),
+          "merge main --no-edit": () => execError({ stderr: "CONFLICT (content): Merge conflict in Thread.kt" }),
+          "git diff --name-only --diff-filter=U -z": () => "Thread.kt\0",
+          "git rev-parse MERGE_HEAD": () => "mainsha\n",
+          "git merge-base HEAD MERGE_HEAD": () => "basesha\n",
+        },
+        fsMap: {
+          [path]: ["<<<<<<< HEAD", "val x = 1", "||||||| base", "val x = 0", "=======", "val x = 2", ">>>>>>> main", ""].join("\n"),
+        },
+      },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: true });
+    assert.match(client.comments[0]!.body, /Merge conflict left for developer/);
+    assert.ok(ctx.pendingMerge, "the merge is left for the run");
+    assert.deepEqual(pushes(calls), []);
+  });
+});
+
 // =====================================================================
 // AGENTS per-agent model / effort config
 // =====================================================================

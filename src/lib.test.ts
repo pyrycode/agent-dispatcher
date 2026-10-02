@@ -112,6 +112,7 @@ import {
   resolveDefaultBranch,
   resolveTargetRepoRoot,
   shouldAutoCommit,
+  shouldPushPreRunMerge,
 } from "./worktree.js";
 
 describe("resolveAgentsRepoRoot", () => {
@@ -2982,6 +2983,29 @@ describe("decideBranchSetup", () => {
       decideBranchSetup({ localExists: true, remoteExists: true }),
       "abort-local-diverged",
     );
+  });
+});
+
+describe("shouldPushPreRunMerge", () => {
+  // pyrycode-mobile #1340, 2026-10-02: a pre-run merge that only the
+  // end-of-run push carried was stranded when the run crashed, and the next
+  // dispatch refused with abort-local-strictly-ahead.
+
+  test("branch on origin, HEAD moved → push", () => {
+    assert.equal(shouldPushPreRunMerge({ remoteExists: true, headBefore: "a", headAfter: "b" }), true);
+  });
+
+  test("branch on origin, HEAD unchanged (no-op merge) → no push", () => {
+    assert.equal(shouldPushPreRunMerge({ remoteExists: true, headBefore: "a", headAfter: "a" }), false);
+  });
+
+  test("branch not on origin → no push, even when HEAD moved", () => {
+    assert.equal(shouldPushPreRunMerge({ remoteExists: false, headBefore: "a", headAfter: "b" }), false);
+  });
+
+  test("either HEAD unreadable → no push, the end-of-run push decides", () => {
+    assert.equal(shouldPushPreRunMerge({ remoteExists: true, headBefore: "", headAfter: "b" }), false);
+    assert.equal(shouldPushPreRunMerge({ remoteExists: true, headBefore: "a", headAfter: "" }), false);
   });
 });
 

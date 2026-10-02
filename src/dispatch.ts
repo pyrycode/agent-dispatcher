@@ -107,6 +107,7 @@ import {
   resolveDefaultBranch,
   resolveTargetRepoRoot,
   shouldAutoCommit,
+  shouldPushPreRunMerge,
 } from "./worktree.js";
 import {
   runAutoAdvance,
@@ -2576,6 +2577,9 @@ export async function setupBranchAndWorktree(
   // Merge default branch into the feature branch INSIDE the worktree (not in the main repo).
   // diff3 markers carry the common ancestor, which is how an import-only
   // conflict is told apart from one that needs a human (see merge-resolve.ts).
+  // HEAD is read before the merge so a committed merge can be pushed right
+  // away (see pushPreRunMerge).
+  const headBefore = readWorktreeHead(execSync, worktreeDir);
   try {
     execSync(`git -c merge.conflictStyle=diff3 merge ${defaultBranch} --no-edit`, { cwd: worktreeDir, stdio: "pipe" });
     console.log(`   🔀 Merged ${defaultBranch} into ${branchName} (in worktree)`);
@@ -2593,6 +2597,7 @@ export async function setupBranchAndWorktree(
           `\n\nAny other conflict still stops here for a human.`,
         );
       } catch {}
+      pushPreRunMerge(ctx, remoteExists, headBefore);
       return { ok: true };
     }
 
@@ -2643,7 +2648,44 @@ export async function setupBranchAndWorktree(
     return { ok: false };
   }
 
+  pushPreRunMerge(ctx, remoteExists, headBefore);
   return { ok: true };
+}
+
+/** HEAD of a worktree, or "" when it cannot be read. */
+function readWorktreeHead(execSync: DispatchDeps["execSync"], cwd: string): string {
+  try {
+    return execSync(`git rev-parse HEAD`, { cwd, encoding: "utf-8", stdio: "pipe" }).trim();
+  } catch {
+    return "";
+  }
+}
+
+// Push the pre-run merge of the default branch as soon as it is committed.
+// The end-of-run push used to be the only one, so a run that died after the
+// merge stranded the merge commit locally and the next dispatch refused with
+// "a prior dispatch committed work but failed to push" — pyrycode-mobile
+// #1340 on 2026-10-02 (the verifier crashed after the merge), and #1250 and
+// #680 before it. See `shouldPushPreRunMerge` for when this pushes.
+//
+// Called after a clean merge and after an import-only auto-resolved merge.
+// A conflicted merge left in progress for the code owner never reaches here:
+// that run finishes it and the end-of-run push carries it, after the checks.
+//
+// Best effort: a failed push only warns. The end-of-run push stays the
+// fallback, and it still parks the ticket if origin refuses it then.
+function pushPreRunMerge(ctx: DispatchContext, remoteExists: boolean, headBefore: string): void {
+  const { branchName, worktreeDir } = ctx;
+  const { execSync } = ctx.deps;
+  const headAfter = readWorktreeHead(execSync, worktreeDir);
+  if (!shouldPushPreRunMerge({ remoteExists, headBefore, headAfter })) return;
+  try {
+    execSync(`git push origin ${branchName}`, { cwd: worktreeDir, stdio: "pipe", timeout: 60_000 });
+    console.log(`   📤 Pushed the merge of ${defaultBranch} into ${branchName} to origin`);
+  } catch (e: any) {
+    const detail = e?.stderr?.toString?.().trim() || e?.message || String(e);
+    console.warn(`   ⚠️  Failed to push the merge of ${defaultBranch} into ${branchName}; the end-of-run push will retry: ${detail}`);
+  }
 }
 
 type SpawnConfig = Parameters<typeof runClaudeStreaming>[0];
