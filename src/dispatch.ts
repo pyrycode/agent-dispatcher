@@ -2069,6 +2069,12 @@ export type DispatchDeps = {
    *  which matters because sibling dispatch streams and their watchdogs
    *  run on the same loop. */
   spawnGate: GateSpawner;
+  /** Run a short maintenance command (the per-spawn QMD refresh) without
+   *  blocking the event loop. See `runCommandAsync`. */
+  runCommand: CommandRunner;
+  /** Start a post-merge codegraph reindex in the background and return at
+   *  once. See `createCodegraphReindexer`. */
+  reindexCodegraph: (repoRoot: string) => void;
 };
 
 // Default curation runner: spawn the memory-curation shell runner in inline
@@ -2091,6 +2097,142 @@ function runMemoryCuration(opts: { agentsRepoRoot: string }): Promise<{ ok: bool
   });
 }
 
+export interface CommandOutcome {
+  ok: boolean;
+  exitCode: number | null;
+  timedOut: boolean;
+  /** The last few KB of stdout and stderr together, or the spawn error. */
+  output: string;
+}
+
+export type CommandRunner = (
+  cmd: string,
+  args: string[],
+  opts: { cwd: string; timeoutMs: number },
+) => Promise<CommandOutcome>;
+
+/**
+ * Run a command asynchronously, in its own process group, with a timeout.
+ *
+ * Replaces `execSync` for the maintenance commands that run while agents are
+ * live. `execSync` blocks the event loop for the whole run, and the loop is
+ * what drains every running agent's stdout. On pyrybox on 2026-10-04 a
+ * 60-second post-merge `codegraph index -f` held the loop while a refiner
+ * exited: its pipe filled, `pyry agent-run` gave up after its 5-second
+ * WaitDelay, and the final result line was lost (pyrycode#2782, twice in a
+ * day).
+ *
+ * **Kills the whole group on timeout.** `execSync`'s timeout signals only the
+ * `/bin/sh` it started, so the real command lived on: the box had eight
+ * orphaned `codegraph index -f` and five `qmd embed` runs competing for its
+ * CPU, which made the next run time out too. `detached: true` makes the child
+ * a group leader; the timeout sends SIGTERM to the group, then SIGKILL after
+ * a grace period.
+ */
+export function runCommandAsync(
+  cmd: string,
+  args: string[],
+  opts: { cwd: string; timeoutMs: number },
+): Promise<CommandOutcome> {
+  return new Promise((res) => {
+    let child: ChildProcess;
+    try {
+      child = spawn(cmd, args, { cwd: opts.cwd, stdio: ["ignore", "pipe", "pipe"], detached: true });
+    } catch (e: any) {
+      res({ ok: false, exitCode: null, timedOut: false, output: `could not spawn ${cmd}: ${e?.message ?? e}` });
+      return;
+    }
+    if (child.pid !== undefined) liveChildPgrpPids.add(child.pid);
+
+    let tail = "";
+    const keep = (chunk: Buffer) => { tail = (tail + chunk.toString("utf8")).slice(-4096); };
+    child.stdout!.on("data", keep);
+    child.stderr!.on("data", keep);
+
+    let timedOut = false;
+    let killTimer: NodeJS.Timeout | undefined;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killChildPgrp(child, "SIGTERM");
+      killTimer = setTimeout(() => killChildPgrp(child, "SIGKILL"), 10_000);
+    }, opts.timeoutMs);
+
+    let settled = false;
+    const finish = (outcome: CommandOutcome) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
+      untrackChildPgrpIfDrained(child);
+      res(outcome);
+    };
+    child.on("error", (err) => finish({ ok: false, exitCode: null, timedOut, output: `${cmd}: ${err.message}` }));
+    child.on("close", (code) => finish({ ok: code === 0 && !timedOut, exitCode: code, timedOut, output: tail.trim() }));
+  });
+}
+
+/** Generous, because the reindex no longer blocks anything while it runs. */
+export const CODEGRAPH_REINDEX_TIMEOUT_MS = 10 * 60_000;
+
+/**
+ * Post-merge codegraph reindex that runs in the background, one at a time.
+ *
+ * `request` starts `codegraph index -f` and returns at once; the auto-merge
+ * never awaits it. A request while a run is in progress is coalesced: one
+ * more run follows the current one, covering every merge that landed
+ * meanwhile. Two runs never overlap, so they never fight over the index.
+ * A failure only logs; the next merge tries again.
+ */
+export function createCodegraphReindexer(
+  run: CommandRunner,
+  timeoutMs = CODEGRAPH_REINDEX_TIMEOUT_MS,
+): { request: (repoRoot: string) => void; whenIdle: () => Promise<void> } {
+  let busy = false;
+  let pending: string | null = null;
+  let idle: Promise<void> = Promise.resolve();
+
+  const runOnce = async (repoRoot: string): Promise<void> => {
+    try {
+      const out = await run("codegraph", ["index", "-f"], { cwd: repoRoot, timeoutMs });
+      if (out.ok) {
+        console.log(`   📚 codegraph index refreshed`);
+        return;
+      }
+      const why = out.timedOut
+        ? `timed out after ${Math.round(timeoutMs / 1000)}s`
+        : `${out.exitCode === null ? "failed" : `exit ${out.exitCode}`}${out.output ? `: ${out.output.split("\n").slice(-3).join(" | ")}` : ""}`;
+      console.warn(`   ⚠️  Post-merge codegraph reindex failed (next merge will retry): ${why}`);
+    } catch (e: any) {
+      console.warn(`   ⚠️  Post-merge codegraph reindex failed (next merge will retry): ${e?.message ?? e}`);
+    }
+  };
+
+  const loop = async (first: string): Promise<void> => {
+    let next: string | null = first;
+    while (next !== null) {
+      await runOnce(next);
+      next = pending;
+      pending = null;
+    }
+    busy = false;
+  };
+
+  return {
+    request(repoRoot: string): void {
+      if (busy) {
+        pending = repoRoot;
+        console.log(`   📚 codegraph reindex already running; one more pass will follow it`);
+        return;
+      }
+      busy = true;
+      idle = loop(repoRoot);
+    },
+    whenIdle: () => idle,
+  };
+}
+
+const defaultCodegraphReindexer = createCodegraphReindexer(runCommandAsync);
+
 export const DEFAULT_DEPS: DispatchDeps = {
   execSync,
   spawnSync,
@@ -2108,6 +2250,8 @@ export const DEFAULT_DEPS: DispatchDeps = {
   // further down the module, so a direct reference here would hit the
   // temporal dead zone at load. The arrow resolves it at call time.
   spawnGate: (req) => spawnGateCommand(req),
+  runCommand: runCommandAsync,
+  reindexCodegraph: (repoRoot) => defaultCodegraphReindexer.request(repoRoot),
 };
 
 // Auto-curation trigger, cooldown-gated. Fires an inline curation pass when the
@@ -2986,7 +3130,7 @@ export async function prepareAgentSpawn(
   promptNote = "",
 ): Promise<{ ok: true; config: SpawnConfig; promptText: string; systemPrompt: string } | { ok: false }> {
   const { agent, item, client, agentCwd, useWorktree, worktreeDir, branchName, logFile } = ctx;
-  const { execSync, readFileSync, writeFileSync, buildPromptForAgent } = ctx.deps;
+  const { execSync, readFileSync, writeFileSync, buildPromptForAgent, runCommand } = ctx.deps;
 
   const runner = selectRunner(agent.name);
   // The runner file can switch to Codex while the dispatcher runs. Startup
@@ -3000,21 +3144,20 @@ export async function prepareAgentSpawn(
   // Gated on useWorktree because there's no isolated tree to re-index in
   // the no-worktree path; running QMD in repoRoot would mutate main's
   // index across other dispatcher cycles.
+  //
+  // Awaited, but through an async spawn rather than execSync: a sibling
+  // agent may be running, and its output is drained by this event loop
+  // (see `runCommandAsync`). A timeout stops the whole process group.
   if (useWorktree) {
-    try {
-      execSync(`qmd update 2>&1 && qmd embed 2>&1`, { cwd: agentCwd, encoding: "utf-8", timeout: 120_000 });
+    const qmd = await runCommand("sh", ["-c", "qmd update 2>&1 && qmd embed 2>&1"], { cwd: agentCwd, timeoutMs: 120_000 });
+    if (qmd.ok) {
       console.log(`   📚 QMD index updated`);
-    } catch (e: any) {
-      // execSync attaches captured stdout/stderr to the thrown error.
-      // The previous catch only stringified `e` (Error message only) —
-      // qmd's actual failure message was hidden, leaving us guessing.
-      // Surface both so the next failure produces actionable diagnostic
-      // data (qmd's own error text, not just "Command failed: qmd...").
-      const stdout = e.stdout?.toString().trim() ?? "";
-      const stderr = e.stderr?.toString().trim() ?? "";
-      const detail = [stderr, stdout].filter(s => s.length > 0).join("\n");
-      const indented = detail ? "\n      " + detail.split("\n").join("\n      ") : "";
-      console.warn(`   ⚠️  QMD re-index failed (agents will use stale index): ${e.message}${indented}`);
+    } else {
+      // Surface qmd's own output so a failure is actionable, not just
+      // "Command failed: qmd...".
+      const why = qmd.timedOut ? "timed out after 120s" : qmd.exitCode === null ? "failed" : `exit ${qmd.exitCode}`;
+      const indented = qmd.output ? "\n      " + qmd.output.split("\n").join("\n      ") : "";
+      console.warn(`   ⚠️  QMD re-index failed (agents will use stale index): ${why}${indented}`);
     }
   }
 
@@ -6794,13 +6937,12 @@ export async function runAutoMerge(
         // Non-fatal: codegraph isn't load-bearing — agents fall through
         // to grep on missing/stale indexes per `decideCodegraphHealth`.
         // Same posture as the `git pull` failure path above.
+        //
+        // Started in the background and never awaited (2026-10-04): run
+        // inline, it held the event loop for a minute while agents were
+        // live, and their output pipes filled. See `createCodegraphReindexer`.
         if (existsSync(resolve(repoRoot, ".codegraph"))) {
-          try {
-            execSync(`codegraph index -f`, { cwd: repoRoot, stdio: "pipe", timeout: 60_000 });
-            console.log(`   📚 codegraph index refreshed`);
-          } catch (e: any) {
-            console.warn(`   ⚠️  Post-merge codegraph reindex failed (next merge will retry): ${e?.message ?? e}`);
-          }
+          deps.reindexCodegraph(repoRoot);
         }
 
         // Clean up pipeline labels — they're noise on completed tickets.
