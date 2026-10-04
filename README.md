@@ -183,6 +183,11 @@ perform.
 After both phases settle, a normal verifier receives the complete source findings
 and green or red gate evidence. It validates findings, finishes deferred Figma and
 live-evidence checks, performs any red-gate triage, then publishes the verdict.
+
+The two model phases share the verifier's wall-clock budget, but gate time is not
+charged to it. The final verifier gets the budget the source review left, and
+never less than half of it, however long the gates took. Each gate stays bounded
+by `PYRY_VERIFIER_GATE_TIMEOUT_MS`.
 A failed or blocked preliminary review parks the dispatch as an error; an
 existing PR cannot salvage it into a pass. Both model phases share the original
 verifier wall-clock budget. Claude also shares its turn limit across both phases.

@@ -3048,6 +3048,23 @@ export async function prepareAgentSpawn(
   };
 }
 
+/** Share of the verifier's wall-clock budget the final review always gets. */
+export const VERIFIER_FINAL_REVIEW_MIN_SHARE = 0.5;
+
+/**
+ * Wall clock for the final review after the overlapped source review. The
+ * two model phases share one budget, so the final review gets what the
+ * source review left, but never less than `VERIFIER_FINAL_REVIEW_MIN_SHARE`
+ * of it. Gate time is not charged: in serial mode the gates already run
+ * before the agent's clock starts, and each gate keeps its own
+ * `VERIFIER_GATE_TIMEOUT_MS`. Charging the gates here starved the final
+ * review on a loaded host: mobile #1619 lost two runs on 2026-10-03 to
+ * an hour of green gates and never got a verdict.
+ */
+export function finalReviewBudgetMs(timeoutMs: number, sourceReviewMs: number): number {
+  return Math.max(timeoutMs - sourceReviewMs, Math.ceil(timeoutMs * VERIFIER_FINAL_REVIEW_MIN_SHARE));
+}
+
 /** Source review and deterministic checks share a dispatch, not a verdict.
  * Both must settle before a normal verifier can triage and publish. A failed
  * preliminary run goes straight to dispatch error handling, never salvage. */
@@ -3056,7 +3073,6 @@ async function runParallelVerifierReview(
   spawn: { config: SpawnConfig; promptText: string; systemPrompt: string },
 ): Promise<StreamResult> {
   const { config, promptText } = spawn;
-  const deadline = Date.now() + config.timeoutMs;
   const sourcePromptFile = config.promptFile + ".source.txt";
   const sourceSystemFile = config.promptFile + ".source-system.txt";
   const sourceLogFile = config.logFile.replace(/\.log$/, ".source.log");
@@ -3094,9 +3110,12 @@ async function runParallelVerifierReview(
   ctx.deps.writeFileSync(sourceSystemFile, sourceInstructions);
   ctx.deps.writeLog(sourceLogFile, "SOURCE REVIEW", sourceInstructions + "\n\n" + sourcePrompt);
   console.log("   🔎 Source review running alongside verifier gates; verdict waits for both");
+  const sourceStartedAt = Date.now();
+  let sourceReviewMs = 0;
   const results = await Promise.allSettled([
     maybeRunPreSpawnGates(ctx),
-    ctx.deps.runClaudeStreaming({ ...config, sourceReview: true, sourceReviewRoot: ctx.agentCwd, promptFile: sourcePromptFile, systemPromptFile: sourceSystemFile, logFile: sourceLogFile }),
+    ctx.deps.runClaudeStreaming({ ...config, sourceReview: true, sourceReviewRoot: ctx.agentCwd, promptFile: sourcePromptFile, systemPromptFile: sourceSystemFile, logFile: sourceLogFile })
+      .finally(() => { sourceReviewMs = Date.now() - sourceStartedAt; }),
   ]);
   const [gates, review] = results;
   if (gates.status === "rejected") throw gates.reason;
@@ -3115,8 +3134,7 @@ async function runParallelVerifierReview(
   ].join("\n");
   ctx.deps.writeFileSync(config.promptFile, promptText + finalNote);
   ctx.deps.writeLog(ctx.logFile, "FINAL REVIEW INPUT", finalNote);
-  const remainingMs = deadline - Date.now();
-  if (remainingMs <= 0) throw new Error("Verifier budget exhausted before final review. No verdict published.");
+  const remainingMs = finalReviewBudgetMs(config.timeoutMs, sourceReviewMs);
   const remainingTurns = isClaude ? config.maxTurns - source.numTurns : config.maxTurns;
   if (remainingTurns <= 0) throw new Error("Verifier turn budget exhausted before final review. No verdict published.");
   const final = await ctx.deps.runClaudeStreaming({ ...config, timeoutMs: remainingMs, maxTurns: remainingTurns });
