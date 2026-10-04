@@ -74,6 +74,7 @@ import {
   runVerifierGates,
   VERIFIER_GATE_TAIL_CAP,
   VERIFIER_GATE_TIMEOUT_MS,
+  VERIFIER_FINAL_REVIEW_MIN_SHARE,
   type GateRunnerDeps,
   type GateSpawnOutcome,
   type GateSpawnRequest,
@@ -3574,6 +3575,50 @@ describe("parallel verifier source review", () => {
         assert.equal(finalRuns, failure === "final budget exhausted" ? 1 : 0);
         assert.ok(!f.client.addLabelCalls.some(x => x.label === "done:verifier"));
       }, "claude");
+    });
+  }
+  // Mobile #1619, 2026-10-03: an hour of green gates on a loaded host used
+  // the whole verifier budget and the final review never ran. Gate time is
+  // not charged to the final review; only the source review's time is, and
+  // the final review keeps at least VERIFIER_FINAL_REVIEW_MIN_SHARE of it.
+  for (const c of [
+    { name: "gates outlasting the whole budget still leave the final review what the source review did not use", sourceShare: 0.1, gateShare: 1.2, expected: (budget: number) => budget - Math.round(budget * 0.1) },
+    { name: "a long source review still leaves the final review its minimum share", sourceShare: 0.8, gateShare: 0.9, expected: (budget: number) => Math.ceil(budget * VERIFIER_FINAL_REVIEW_MIN_SHARE) },
+  ]) {
+    test(`final review budget: ${c.name}`, async () => {
+      await withParallelReview(async () => {
+        const f = fixture();
+        const realNow = Date.now;
+        const t0 = realNow();
+        let clock = t0;
+        Date.now = () => clock;
+        try {
+          let budget = 0;
+          let finalTimeout: number | null = null;
+          f.deps.spawnGate = async () => {
+            await new Promise<void>(r => setTimeout(r, 5));
+            clock = t0 + Math.round(budget * c.gateShare);
+            return { exitCode: 0, timedOut: false, spawnError: null };
+          };
+          f.deps.runClaudeStreaming = async opts => {
+            if (opts.sourceReview) {
+              budget = opts.timeoutMs;
+              await new Promise<void>(r => setImmediate(r));
+              clock = t0 + Math.round(budget * c.sourceShare);
+              return streamResult({ output: "Source findings" });
+            }
+            finalTimeout = opts.timeoutMs;
+            return streamResult({ output: "Final verdict" });
+          };
+          await f.run();
+          assert.ok(budget > 0);
+          assert.equal(finalTimeout, c.expected(budget));
+          assert.ok(f.client.addLabelCalls.some(x => x.label === "done:verifier"));
+          assert.ok(!f.client.addLabelCalls.some(x => x.label === "error:verifier"));
+        } finally {
+          Date.now = realNow;
+        }
+      });
     });
   }
   for (const mode of ["classic", "empty gates", "opted out"] as const) {
