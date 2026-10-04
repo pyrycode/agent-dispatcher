@@ -3148,7 +3148,14 @@ export async function prepareAgentSpawn(
   // Awaited, but through an async spawn rather than execSync: a sibling
   // agent may be running, and its output is drained by this event loop
   // (see `runCommandAsync`). A timeout stops the whole process group.
-  if (useWorktree) {
+  //
+  // PYRY_SKIP_QMD_REFRESH=1 opts a fork out, for a host that keeps the index
+  // fresh on its own. pyrybox refreshes pyrycode's index from a timer when
+  // main moves, so there this per-spawn run only burned its 120 s limit on
+  // the CPU before every agent. Read per spawn, like the runner file.
+  if (useWorktree && process.env.PYRY_SKIP_QMD_REFRESH === "1") {
+    console.log(`   📚 QMD refresh skipped (PYRY_SKIP_QMD_REFRESH=1)`);
+  } else if (useWorktree) {
     const qmd = await runCommand("sh", ["-c", "qmd update 2>&1 && qmd embed 2>&1"], { cwd: agentCwd, timeoutMs: 120_000 });
     if (qmd.ok) {
       console.log(`   📚 QMD index updated`);
