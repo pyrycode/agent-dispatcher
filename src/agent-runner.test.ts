@@ -5,7 +5,9 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { buildCodexInvocation, CodexStreamAdapter, formatRunCost, resumeCommand, resolveAgentRunner, resolveCodexExecutable } from "./agent-runner.js";
+import { agentShellEnvNameProblem, buildCodexInvocation, CodexStreamAdapter, formatRunCost, resolveAgentShellEnv, resumeCommand, resolveAgentRunner, resolveCodexExecutable } from "./agent-runner.js";
+import { advanceCodexIdleWatchdogState, initIdleWatchdogState, runStopKind, shouldFireIdleWatchdog, type IdleWatchdogState } from "./agent-runtime.js";
+import { classifyAgentError } from "./pipeline-decisions.js";
 
 describe("runner selection", () => {
   test("Claude stays the default and unknown runners fail closed", () => {
@@ -44,6 +46,72 @@ describe("Codex invocation", () => {
     const spec = buildCodexInvocation({cwd:"/repo",role:"role",model:"chosen-model",effort:"high"});
     assert.equal(spec.args[spec.args.indexOf("--model")+1],"chosen-model");
     assert.ok(spec.args.includes('model_reasoning_effort="high"'));
+  });
+});
+describe("PYRY_AGENT_SHELL_ENV: non-secret settings for Codex commands", () => {
+  const quiet = () => ({ warnings: [] as string[], warned: new Set<string>() });
+  test("refuses names that look secret, in any case, and names that are not plain upper-case", () => {
+    for (const name of ["GITHUB_TOKEN", "OPENAI_API_KEY", "MY_SECRET_DIR", "DB_PASSWORD", "SMTP_PASSWD", "AWS_CREDENTIALS",
+      "GH_AUTH_HOST", "PRIVATE_DIR", "OP_SERVICE_ACCOUNT", "OP_CONNECT_HOST", "SSH_KEYFILE"]) {
+      assert.match(agentShellEnvNameProblem(name) ?? "", /secret/, name);
+    }
+    for (const name of ["android_home", "Java_Home", "1PATH", "A-B", "A.B", "A B", "ANDROID_HOME=x", ""]) {
+      assert.match(agentShellEnvNameProblem(name) ?? "", /upper-case/, name);
+    }
+    for (const name of ["ANDROID_HOME", "JAVA_HOME", "PYRYCODE_SRC", "PYRYCODE_RELAY_SRC", "_X", "GRADLE_USER_HOME"]) {
+      assert.equal(agentShellEnvNameProblem(name), null, name);
+    }
+  });
+  test("passes listed names that are set and non-blank, comma- or space-separated, once each", () => {
+    const q = quiet();
+    const env = {
+      PYRY_AGENT_SHELL_ENV: "ANDROID_HOME, JAVA_HOME PYRYCODE_SRC,,ANDROID_HOME UNSET_ONE BLANK_ONE",
+      ANDROID_HOME: "/sdk", JAVA_HOME: "/Applications/Android Studio.app/jbr", PYRYCODE_SRC: "/src/pyrycode", BLANK_ONE: "  ",
+    };
+    assert.deepEqual(resolveAgentShellEnv(env, { warn: m => q.warnings.push(m), warned: q.warned }), {
+      ANDROID_HOME: "/sdk", JAVA_HOME: "/Applications/Android Studio.app/jbr", PYRYCODE_SRC: "/src/pyrycode",
+    });
+    assert.deepEqual(q.warnings, []);
+  });
+  test("unset or empty list passes nothing", () => {
+    const q = quiet();
+    assert.deepEqual(resolveAgentShellEnv({ ANDROID_HOME: "/sdk" }, { warn: m => q.warnings.push(m), warned: q.warned }), {});
+    assert.deepEqual(resolveAgentShellEnv({ PYRY_AGENT_SHELL_ENV: " ", ANDROID_HOME: "/sdk" }, { warn: m => q.warnings.push(m), warned: q.warned }), {});
+    assert.deepEqual(q.warnings, []);
+  });
+  test("a refused name is skipped with one warning per process, even when set, across many runs", () => {
+    const q = quiet();
+    const env = { PYRY_AGENT_SHELL_ENV: "ANDROID_HOME,GITHUB_TOKEN,op_session,GITHUB_TOKEN", ANDROID_HOME: "/sdk", GITHUB_TOKEN: "ghp_fixture", op_session: "x" };
+    for (let run = 0; run < 3; run++) {
+      assert.deepEqual(resolveAgentShellEnv(env, { warn: m => q.warnings.push(m), warned: q.warned }), { ANDROID_HOME: "/sdk" });
+    }
+    assert.equal(q.warnings.length, 2);
+    assert.ok(q.warnings.some(m => m.includes('"GITHUB_TOKEN"') && /secret/.test(m)));
+    assert.ok(q.warnings.some(m => m.includes('"op_session"')));
+    assert.ok(q.warnings.every(m => !m.includes("ghp_fixture")), "a warning names the variable, never its value");
+  });
+  test("each allowed setting becomes one -c shell_environment_policy.set override with a quoted value", () => {
+    const spec = buildCodexInvocation({ cwd: "/repo", role: "role", model: "", effort: "", agentsRepoPath: "/agents",
+      shellEnv: { ANDROID_HOME: "/sdk", JAVA_HOME: '/Applications/Android Studio.app/Contents/jbr "x"' } });
+    const sets = spec.args.flatMap((arg, i) => spec.args[i - 1] === "-c" && arg.startsWith("shell_environment_policy.set.") ? [arg] : []);
+    assert.deepEqual(sets, [
+      'shell_environment_policy.set.AGENTS_REPO_PATH="/agents"',
+      'shell_environment_policy.set.ANDROID_HOME="/sdk"',
+      `shell_environment_policy.set.JAVA_HOME=${JSON.stringify('/Applications/Android Studio.app/Contents/jbr "x"')}`,
+    ]);
+    assert.ok(!spec.args.some(arg => arg.startsWith("shell_environment_policy.inherit")), "the user's inheritance policy is left alone");
+    assert.equal(spec.args.at(-1), "-");
+  });
+  test("AGENTS_REPO_PATH is not set twice when also listed", () => {
+    const spec = buildCodexInvocation({ cwd: "/repo", role: "role", model: "", effort: "", agentsRepoPath: "/agents",
+      shellEnv: { AGENTS_REPO_PATH: "/agents", ANDROID_HOME: "/sdk" } });
+    assert.equal(spec.args.filter(arg => arg.startsWith("shell_environment_policy.set.AGENTS_REPO_PATH=")).length, 1);
+  });
+  test("no settings leaves the invocation as before; source review never gets them", () => {
+    const before = buildCodexInvocation({ cwd: "/repo", role: "role", model: "m", effort: "high" });
+    assert.deepEqual(buildCodexInvocation({ cwd: "/repo", role: "role", model: "m", effort: "high", shellEnv: {} }), before);
+    const review = buildCodexInvocation({ cwd: "/tmp/review", role: "role", model: "m", effort: "high", sourceReview: true, shellEnv: { ANDROID_HOME: "/sdk" } });
+    assert.ok(!review.args.some(arg => arg.startsWith("shell_environment_policy.set.ANDROID_HOME")));
   });
 });
 describe("Codex event adapter", () => {
@@ -194,4 +262,107 @@ test("approval rejection on stderr also blocks refinement", () => {
   const result = adapter.finish(0, false, 1, "This action was rejected due to unacceptable risk");
   assert.equal(result.terminalReason, "codex_blocked");
   assert.equal(result.isError, true);
+});
+
+describe("Codex idle watchdog — recorded event sequences", () => {
+  const MIN = 60_000;
+  const IDLE = 10 * MIN;
+  const at = (hms: string, day = "2026-09-20") => Date.parse(`${day}T${hms}Z`);
+  const cmd = (phase: "started" | "completed", id: string) =>
+    ({ type: `item.${phase}`, item: { id, type: "command_execution", command: "/bin/zsh -lc 'true'", aggregated_output: "", status: phase === "started" ? "in_progress" : "completed" } });
+  const mcp = (phase: "started" | "completed", id: string) =>
+    ({ type: `item.${phase}`, item: { id, type: "mcp_tool_call", server: "figma", tool: "get_screenshot", arguments: {}, status: phase === "started" ? "in_progress" : "completed" } });
+  const message = (id: string) => ({ type: "item.completed", item: { id, type: "agent_message", text: "Working." } });
+  const play = (events: Array<[number, unknown]>, start: number): IdleWatchdogState => {
+    let s = initIdleWatchdogState(start);
+    for (const [t, e] of events) s = advanceCodexIdleWatchdogState(s, e, t);
+    return s;
+  };
+
+  test("builder #626, 2026-09-20: silent 30 minutes after a Figma call returned, nothing outstanding → fires at 10", () => {
+    const s = play([
+      [at("17:06:39"), mcp("started", "item_11")],
+      [at("17:06:44"), mcp("completed", "item_11")],
+      [at("17:06:55"), cmd("started", "item_12")],
+      [at("17:06:55"), cmd("completed", "item_12")],
+      [at("17:06:55"), mcp("started", "item_13")],
+      [at("17:06:58"), mcp("completed", "item_13")],
+    ], at("17:05:43"));
+    assert.equal(s.outstandingToolIds.size, 0);
+    assert.equal(shouldFireIdleWatchdog(s, at("17:16:57"), IDLE), false);
+    assert.equal(shouldFireIdleWatchdog(s, at("17:16:58"), IDLE), true, "fires 20 minutes before the 40-minute wall clock did");
+  });
+
+  test("a long Gradle command, with other commands finishing around it, never trips it", () => {
+    // Builder #1642, 2026-10-04: item_18 ran 7 minutes while the agent ran
+    // and finished other commands and wrote messages.
+    const day = "2026-10-04";
+    let s = play([
+      [at("09:42:24", day), cmd("started", "item_18")],
+      [at("09:42:34", day), message("item_19")],
+      [at("09:42:37", day), cmd("started", "item_20")],
+      [at("09:42:41", day), cmd("completed", "item_20")],
+    ], at("09:40:20", day));
+    assert.deepEqual([...s.outstandingToolIds], ["item_18"]);
+    assert.equal(shouldFireIdleWatchdog(s, at("10:30:00", day), IDLE), false, "a running command is bounded by the wall clock, not this");
+    s = advanceCodexIdleWatchdogState(s, cmd("completed", "item_18"), at("09:49:26", day));
+    assert.equal(shouldFireIdleWatchdog(s, at("09:59:25", day), IDLE), false);
+    assert.equal(shouldFireIdleWatchdog(s, at("09:59:26", day), IDLE), true);
+  });
+
+  test("an MCP tool call or file change in flight holds it off too; a todo list does not", () => {
+    const start = at("10:00:00");
+    let s = play([[start, mcp("started", "m1")]], start);
+    assert.equal(shouldFireIdleWatchdog(s, start + 60 * MIN, IDLE), false);
+    s = advanceCodexIdleWatchdogState(s, mcp("completed", "m1"), start + MIN);
+    s = advanceCodexIdleWatchdogState(s, { type: "item.started", item: { id: "t", type: "todo_list", items: [] } }, start + 2 * MIN);
+    assert.equal(shouldFireIdleWatchdog(s, start + 12 * MIN, IDLE), true, "a plan stays open all turn; it is not a running tool");
+    s = advanceCodexIdleWatchdogState(s, { type: "item.started", item: { id: "f", type: "file_change", changes: [], status: "in_progress" } }, start + 13 * MIN);
+    assert.equal(shouldFireIdleWatchdog(s, start + 40 * MIN, IDLE), false);
+  });
+
+  test("verifier #1291, 2026-09-30: 10.3 silent minutes while Codex retried a slow stream would fire 16 s early (accepted)", () => {
+    const day = "2026-09-30";
+    const s = play([[at("01:51:44", day), cmd("started", "item_23")], [at("01:51:44", day), cmd("completed", "item_23")]], at("01:48:47", day));
+    assert.equal(shouldFireIdleWatchdog(s, at("02:01:44", day), IDLE), true);
+  });
+
+  test("every event is activity, including reconnect notices and unknown types", () => {
+    const start = at("10:00:00");
+    let s = initIdleWatchdogState(start);
+    s = advanceCodexIdleWatchdogState(s, { type: "error", message: "Reconnecting... 2/5" }, start + 9 * MIN);
+    assert.equal(shouldFireIdleWatchdog(s, start + 18 * MIN, IDLE), false);
+    s = advanceCodexIdleWatchdogState(s, null, start + 18 * MIN);
+    assert.equal(shouldFireIdleWatchdog(s, start + 27 * MIN, IDLE), false);
+  });
+
+  test("a stalled Codex run fails as idle_stall, which retries, and keeps its partial work", () => {
+    const s = new CodexStreamAdapter();
+    s.accept({ type: "thread.started", thread_id: "stalled" });
+    s.accept({ type: "turn.started" });
+    s.accept({ type: "item.completed", item: { type: "agent_message", text: "Checking the screenshot." } });
+    const r = s.finish(null, false, 30 * MIN, "", IDLE);
+    assert.equal(r.isError, true);
+    assert.equal(r.terminalReason, "idle_stall");
+    assert.match(r.output, /idle_stall: no stream output for 10min/);
+    assert.equal(r.sessionId, "stalled");
+    assert.equal(classifyAgentError(`Agent error (${r.terminalReason}). ${r.output}`, { terminalReason: r.terminalReason }).transient, true);
+    assert.equal(runStopKind(null, r), "idle_stall");
+    // The stall is the cause even when the wall clock also fired meanwhile.
+    assert.equal(s.finish(null, true, 30 * MIN, "", IDLE).terminalReason, "idle_stall");
+  });
+
+  test("a blocked outcome or rejected action is never turned into a retryable stall", () => {
+    const blocked = new CodexStreamAdapter();
+    blocked.accept({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ status: "blocked", summary: "Rejected" }) } });
+    assert.equal(blocked.finish(null, false, 1, "", IDLE).terminalReason, "codex_blocked");
+    const rejected = new CodexStreamAdapter();
+    rejected.accept({ type: "item.completed", item: { type: "command_execution", aggregated_output: "This action was rejected due to unacceptable risk" } });
+    assert.equal(rejected.finish(null, false, 1, "", IDLE).terminalReason, "codex_blocked");
+  });
+
+  test("without a stall the adapter reports as before", () => {
+    const s = new CodexStreamAdapter();
+    assert.equal(s.finish(null, true, 1).terminalReason, "timeout");
+  });
 });

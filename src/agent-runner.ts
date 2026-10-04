@@ -3,7 +3,7 @@ import { delimiter, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import type { StreamResult } from "./dispatch.js";
-import { scrubCredentials } from "./agent-runtime.js";
+import { IDLE_STALL_REASON, idleStallMessage, scrubCredentials } from "./agent-runtime.js";
 
 export type AgentRunner = "claude" | "codex";
 
@@ -58,9 +58,69 @@ export function resolveCodexExecutable(env: NodeJS.ProcessEnv, options: {
   throw new Error("Codex executable not found. Install Codex or set PYRY_CODEX_BIN to its absolute executable path before starting the dispatcher.");
 }
 
+/**
+ * Why a name in `PYRY_AGENT_SHELL_ENV` is refused, or null when it may pass.
+ *
+ * The list exists to hand Codex tool commands a few non-secret settings,
+ * such as `ANDROID_HOME`, that the user's `inherit = "core"` shell policy
+ * drops. A secret must never ride along by mistake, so any name that looks
+ * like one is refused outright, whatever its value. The name also becomes a
+ * bare key in a Codex `-c` override, so it must be a plain upper-case
+ * variable name.
+ */
+export function agentShellEnvNameProblem(name: string): string | null {
+  if (!/^[A-Z_][A-Z0-9_]*$/.test(name)) return "it is not an upper-case variable name";
+  if (/^OP_/i.test(name) || /KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|AUTH|PRIVATE/i.test(name)) {
+    return "it looks like a secret";
+  }
+  return null;
+}
+
+/** Names already warned about, so a refused name warns once per process. */
+const warnedAgentShellEnvNames = new Set<string>();
+
+/**
+ * The fork's `PYRY_AGENT_SHELL_ENV` allowlist resolved against `env`: each
+ * listed name that passes `agentShellEnvNameProblem` and has a non-blank
+ * value. Comma- or space-separated, duplicates ignored. Unset or empty
+ * yields nothing, which leaves the Codex invocation exactly as before.
+ *
+ * Pass the environment the Codex child actually gets (`codexChildEnv`), so a
+ * variable the dispatcher deliberately withholds from Codex stays withheld.
+ */
+export function resolveAgentShellEnv(env: NodeJS.ProcessEnv, opts: {
+  warn?: (message: string) => void;
+  warned?: Set<string>;
+} = {}): Record<string, string> {
+  const warn = opts.warn ?? ((message: string) => console.warn(message));
+  const warned = opts.warned ?? warnedAgentShellEnvNames;
+  const out: Record<string, string> = {};
+  for (const name of new Set((env.PYRY_AGENT_SHELL_ENV ?? "").split(/[\s,]+/).filter(Boolean))) {
+    const problem = agentShellEnvNameProblem(name);
+    if (problem) {
+      if (!warned.has(name)) {
+        warned.add(name);
+        warn(`   ⚠️  PYRY_AGENT_SHELL_ENV: skipping ${JSON.stringify(name)} because ${problem}. Codex commands will not see it.`);
+      }
+      continue;
+    }
+    const value = env[name];
+    if (value === undefined || value.trim() === "") continue;
+    out[name] = value;
+  }
+  return out;
+}
+
 export function buildCodexInvocation(opts: {
   cwd: string; role: string; model: string; effort: string; bin?: string; agentsRepoPath?: string; sourceReview?: boolean;
+  /** Non-secret settings for tool commands, from `resolveAgentShellEnv`. */
+  shellEnv?: Readonly<Record<string, string>>;
 }): { bin: string; args: string[] } {
+  // The read-only source reviewer runs with --ignore-user-config, so the
+  // user's core-only shell policy does not apply to it and it builds
+  // nothing. It gets no extra settings.
+  const shellEnv = opts.sourceReview ? [] : Object.entries(opts.shellEnv ?? {})
+    .filter(([name]) => !(name === "AGENTS_REPO_PATH" && opts.agentsRepoPath));
   return {
     bin: opts.bin || "codex",
     args: [
@@ -86,6 +146,9 @@ export function buildCodexInvocation(opts: {
       // Core shell inheritance drops custom variables. Supply only this
       // non-secret path so role checklists remain readable from tool commands.
       ...(opts.agentsRepoPath ? ["-c", `shell_environment_policy.set.AGENTS_REPO_PATH=${JSON.stringify(opts.agentsRepoPath)}`] : []),
+      // The fork's PYRY_AGENT_SHELL_ENV allowlist, the same way: named,
+      // non-secret settings such as ANDROID_HOME, never the whole env.
+      ...shellEnv.flatMap(([name, value]) => ["-c", `shell_environment_policy.set.${name}=${JSON.stringify(value)}`]),
       ...(opts.model ? ["--model", opts.model] : []),
       ...(opts.effort ? ["-c", `model_reasoning_effort=${JSON.stringify(opts.effort)}`] : []),
       "-",
@@ -144,7 +207,14 @@ export class CodexStreamAdapter {
     }
   }
 
-  finish(code: number | null, timedOut: boolean, durationMs: number, stderr = ""): StreamResult {
+  /**
+   * `idleStallMs` is the idle threshold when the dispatcher's idle watchdog
+   * stopped the run, else 0. A stall is reported as `idle_stall`, which
+   * retries as transient, except that a blocked outcome or rejected action
+   * still wins: those must never retry by themselves.
+   */
+  finish(code: number | null, timedOut: boolean, durationMs: number, stderr = "", idleStallMs = 0): StreamResult {
+    const idleStalled = idleStallMs > 0;
     let outcome: { status: "completed" | "blocked" | "needs_refinement" | "waiting_on_blocker"; summary: string } | undefined;
     try {
       const parsed = JSON.parse(this.lastText);
@@ -152,18 +222,21 @@ export class CodexStreamAdapter {
     } catch { /* Missing or malformed task outcome fails closed. */ }
     this.approvalRejected ||= /This action was rejected due to unacceptable risk/.test(stderr);
     const blocked = this.approvalRejected || outcome?.status === "blocked";
-    const isError = timedOut || code !== 0 || this.failed || !this.completed || !outcome || blocked;
+    const isError = timedOut || idleStalled || code !== 0 || this.failed || !this.completed || !outcome || blocked;
     // Codex reports this temporary access-check outage as a generic failed turn.
     // Map the observed server failure to the existing capped API retry path.
     // A disconnect alone can also mean permanent model denial, so keep it narrow.
     const temporaryModelAccessFailure = this.failed && /^stream disconnected before completion: Unable to verify model access right now\.\s*Please retry\.?$/i.test(this.errorText.trim());
-    const terminalReason = blocked ? "codex_blocked" : timedOut ? "timeout"
+    // The stall is the cause even when the wall clock also fired meanwhile.
+    const terminalReason = blocked ? "codex_blocked" : idleStalled ? IDLE_STALL_REASON : timedOut ? "timeout"
       : isError ? (temporaryModelAccessFailure ? "api_error" : "codex_error")
       : outcome?.status === "needs_refinement" ? "needs_refinement"
       : outcome?.status === "waiting_on_blocker" ? "waiting_on_blocker" : "stop";
     // Stderr reaches the ticket through this text, so scrub it like the
     // claude runner's no-result tail (shared helper, 2026-10-02).
-    const failure = blocked ? (this.approvalRejected ? "Automatic approval review rejected an action. Operator review required." : outcome!.summary) : scrubCredentials(this.errorText || stderr.trim()) || `Codex exited with code ${code} without a successful completed task outcome`;
+    const failure = blocked ? (this.approvalRejected ? "Automatic approval review rejected an action. Operator review required." : outcome!.summary)
+      : idleStalled ? idleStallMessage(idleStallMs)
+      : scrubCredentials(this.errorText || stderr.trim()) || `Codex exited with code ${code} without a successful completed task outcome`;
     return {
       runner: "codex", costKnown: false,
       output: isError ? failure : outcome!.summary,

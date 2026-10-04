@@ -6743,6 +6743,61 @@ describe("spawnGateCommand — the real spawner", () => {
     assert.equal(readFileSync(stderrPath, "utf-8").trim(), "to-stderr");
   });
 
+  test("waiting for the Android device moves the deadline by the time waited", { timeout: 20_000 }, async (t) => {
+    const saved = process.env.PYRY_TIMEOUT_CEILING_FACTOR;
+    process.env.PYRY_TIMEOUT_CEILING_FACTOR = "10";
+    t.after(() => { if (saved === undefined) delete process.env.PYRY_TIMEOUT_CEILING_FACTOR; else process.env.PYRY_TIMEOUT_CEILING_FACTOR = saved; });
+    const outcome = await spawnGateCommand({
+      command: "echo 'Android gate: device held by ui from /w since x; waiting up to 30s' >&2; sleep 3.5; " +
+        "echo 'Android gate: device free after 4s waiting' >&2; sleep 0.3; echo done",
+      cwd: tmpdir(),
+      env: { PATH: process.env.PATH ?? "" },
+      timeoutMs: 2500,
+      stdoutPath: tmp("device-wait.log"),
+      stderrPath: tmp("device-wait.err.log"),
+    });
+    assert.equal(outcome.timedOut, false, "a 2.5 s budget plus the 3.5 s wait covers a 3.8 s command");
+    assert.equal(outcome.exitCode, 0);
+    assert.ok((outcome.waitCreditMs ?? 0) >= 3000, `credit ${outcome.waitCreditMs}`);
+    assert.equal(readFileSync(tmp("device-wait.log"), "utf-8").trim(), "done");
+  });
+
+  test("waiting for a Gradle build place on stdout moves the deadline too", { timeout: 20_000 }, async (t) => {
+    const saved = process.env.PYRY_TIMEOUT_CEILING_FACTOR;
+    process.env.PYRY_TIMEOUT_CEILING_FACTOR = "10";
+    t.after(() => { if (saved === undefined) delete process.env.PYRY_TIMEOUT_CEILING_FACTOR; else process.env.PYRY_TIMEOUT_CEILING_FACTOR = saved; });
+    const outcome = await spawnGateCommand({
+      command: "echo 'Pyrycode build slots: all 2 places are taken by other pipeline builds; waiting (0 min so far).'; sleep 3.5; " +
+        "echo 'Pyrycode build slots: got a place after 4 s.'; sleep 0.3; echo built",
+      cwd: tmpdir(),
+      env: { PATH: process.env.PATH ?? "" },
+      timeoutMs: 2500,
+      stdoutPath: tmp("slot-wait.log"),
+      stderrPath: tmp("slot-wait.err.log"),
+    });
+    assert.equal(outcome.timedOut, false);
+    assert.equal(outcome.exitCode, 0);
+    assert.ok((outcome.waitCreditMs ?? 0) >= 3000, `credit ${outcome.waitCreditMs}`);
+  });
+
+  test("a gate still waiting at the hard ceiling is torn down", { timeout: 20_000 }, async (t) => {
+    const saved = process.env.PYRY_TIMEOUT_CEILING_FACTOR;
+    process.env.PYRY_TIMEOUT_CEILING_FACTOR = "2";
+    t.after(() => { if (saved === undefined) delete process.env.PYRY_TIMEOUT_CEILING_FACTOR; else process.env.PYRY_TIMEOUT_CEILING_FACTOR = saved; });
+    const started = Date.now();
+    const outcome = await spawnGateCommand({
+      command: "echo 'Android gate: device held by live from /w since x; waiting up to 600s' >&2; sleep 30",
+      cwd: tmpdir(),
+      env: { PATH: process.env.PATH ?? "" },
+      timeoutMs: 2000,
+      stdoutPath: tmp("ceiling.log"),
+      stderrPath: tmp("ceiling.err.log"),
+    });
+    assert.equal(outcome.timedOut, true);
+    assert.ok(Date.now() - started < 10_000, "twice the 2 s budget, not the 600 s wait");
+    assert.ok((outcome.waitCreditMs ?? 0) > 0);
+  });
+
   test("a timeout tears the command down and reports it", { timeout: 15_000 }, async () => {
     const outcome = await spawnGateCommand({
       command: "sleep 30",
@@ -7788,6 +7843,15 @@ describe("runVerifierGates — deterministic gate execution", () => {
     assert.equal(result.ok, false);
     assert.equal(result.failedGate, "make slow");
     assert.match(result.summary[0]!, /timed out after 10min/);
+  });
+
+  test("a timeout after credited waiting says how much was credited", async () => {
+    const { deps } = gateDeps({
+      gateImpl: () => ({ exitCode: null, timedOut: true, spawnError: null, waitCreditMs: 45 * 60_000 }),
+    });
+    const result = await runVerifierGates({ gates: ["python3 scripts/android-test-gate.py ui"], cwd: "/wt", issueNumber: 11, deps });
+    assert.equal(result.ok, false);
+    assert.match(result.summary[0]!, /timed out after 10min plus 45min credited for waiting/);
   });
 
   test("spawn error counts as red", async () => {

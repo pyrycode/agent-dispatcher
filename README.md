@@ -102,19 +102,22 @@ Optional:
 | `PYRY_POLL_INTERVAL_MS` | `60000` | How long the loop waits between board reads when no run settles first. Whole milliseconds, floor `10000`; anything else keeps the default. Only idle pickup latency changes: a dispatch or a settled run wakes the loop at once. Mobile runs `120000` since 2026-09-22 to ease the account-wide GitHub API limit. |
 | `PYRY_VERIFIER_GATES` | `go vet ./...; go build ./...` | Builder stage set only: `;`-delimited deterministic gate commands the dispatcher itself runs in the ticket's worktree before spawning the verifier. Same parsing as `SALVAGE_GATES`; set to `""` to skip the pre-verifier gate step. A fork's `.env` sets the full list, e.g. `make check;make build`. Inert in the classic set. |
 | `PYRY_VERIFIER_PARALLEL_REVIEW` | `0` | Exact `1` opts a Claude or Codex verifier into preliminary source review alongside its deterministic gates. Both must finish before the final verifier can triage and publish. Other roles, classic and empty gate lists keep sequential behaviour. See below. |
-| `PYRY_VERIFIER_GATE_TIMEOUT_MS` | `600000` | Builder stage set only: wall clock for each `PYRY_VERIFIER_GATES` command. A gate that runs past it reads as red and the verifier spawns in triage mode. Raise it for a fork whose slowest gate needs longer; Desktop runs `1800000` since 2026-09-25 because its serial Playwright tier takes about 15 minutes. |
+| `PYRY_VERIFIER_GATE_TIMEOUT_MS` | `600000` | Builder stage set only: wall clock for each `PYRY_VERIFIER_GATES` command, extended by any time the command spends waiting for the Android device or a Gradle build place, up to `PYRY_TIMEOUT_CEILING_FACTOR` times this value. A gate that runs past it reads as red and the verifier spawns in triage mode. Raise it for a fork whose slowest gate needs longer; Desktop runs `1800000` since 2026-09-25 because its serial Playwright tier takes about 15 minutes. |
 | `PYRY_VERIFIER_GATE_REUSE` | `1` | Builder stage set only. When every verifier gate passes, the dispatcher records the pass in `logs/verifier-gate_#<issue>.pass.json`, keyed by the tree of the merged commit the gates ran on, meaning its files, and the ordered gate list. The commit is recorded too, for the note and the log. The next verifier dispatch for that issue reuses it instead of running the gates, when both match, the pass is under 24 hours old and its gate logs still exist. A run with any red, timed-out or unspawnable gate is never recorded. The exact string `0` turns reuse off. |
 | `DISCORD_WEBHOOK_URL` | — | Notify on dispatch start/end |
 | `PYRY_LOG_RETENTION_DAYS` | `30` | Rotate logs older than N days; `0` disables |
 | `PYRY_RESUME_LEGS` | `1` | Resume-in-place: how many same-session continuation legs a budget-exhausted run gets before salvage. `0` disables the feature entirely (byte-identical pre-resume behaviour). See above. |
-| `PYRY_AGENT_IDLE_TIMEOUT_MINUTES` | `10` | Claude runner only: kill a run whose stream has been silent this long while no tool call is outstanding, and fail it with `idle_stall`, which retries with backoff like any transient error. A running tool, such as a long Gradle test run, never trips it; the wall clock still bounds that. Fractions allowed; `0` disables. Added after pyrycode-mobile #1430 sat silent for twenty minutes inside one assistant turn on 2026-10-02. |
+| `PYRY_AGENT_IDLE_TIMEOUT_MINUTES` | `10` | Both runners: kill a run whose stream has been silent this long while no tool call is outstanding, and fail it with `idle_stall`, which retries with backoff like any transient error. A running tool, such as a long Gradle test run, never trips it; the wall clock still bounds that. For Codex, a tool call is any item between its `item.started` and `item.completed` events, except a to-do list. Fractions allowed; `0` disables. Added after pyrycode-mobile #1430 sat silent for twenty minutes inside one assistant turn on 2026-10-02, and extended to Codex on 2026-10-04. See "Time limits and waiting". |
+| `PYRY_TIMEOUT_GRACE_MINUTES` | `20` | Codex runner only: when a run's budget is spent while a command it started earlier is still running, wait up to this long for that command to finish before stopping the run, so any wait it reports can be credited. Commands started after the deadline hold nothing. Fractions allowed; `0` disables; garbage keeps the default. See "Time limits and waiting". |
+| `PYRY_TIMEOUT_CEILING_FACTOR` | `2` | Hard ceiling, as a multiple of the normal budget, that wait credit and grace can never take a Codex run or a dispatcher-run gate past. `1` turns all extension off, which is the behaviour before 2026-10-04. Below 1, empty or garbage keeps `2`. See "Time limits and waiting". |
 | `PYRY_BUDGET_SCALE` | `1` | Multiplier on every agent's turn cap and wall-clock timeout, for a fork whose tickets or model need a different budget without changing the others. Timeouts round to whole minutes. Unset, empty, non-numeric, zero or negative keeps `1`. Mobile runs `1.5` since 2026-09-23, after moving to Opus 5.5 and raising its ticket ceiling to 1600 lines. Printed in the startup banner. |
 | `PYRY_REQUIRED_ENV` | — | Comma- or space-separated names of environment variables this fork cannot work without, such as `ANDROID_HOME`. Checked every cycle against the dispatcher's own environment. While one is unset or blank, no agent is dispatched and neither the live gate nor the main sweep starts, a warning is logged and one Discord message is sent. Board upkeep, rework routing and merges carry on. Restart the dispatcher with the variable set to resume. Unset requires nothing. Added after mobile #1631 parked on 2026-10-03, when a restart lost `ANDROID_HOME` and the builder found Gradle could not locate the SDK. Printed in the startup banner. |
+| `PYRY_AGENT_SHELL_ENV` | — | Codex runner only. Comma- or space-separated names of non-secret settings that Codex agents' shell commands should see, such as `ANDROID_HOME`. The user's Codex config inherits only core variables into tool commands, so without this a builder cannot see what the fork's `.env` supplies. Each listed name that is set and not blank in the environment Codex gets is passed as its own `-c shell_environment_policy.set.NAME=...` override, the same way `AGENTS_REPO_PATH` is. A name that looks secret, containing `KEY`, `SECRET`, `TOKEN`, `PASSWORD`, `PASSWD`, `CREDENTIAL`, `AUTH` or `PRIVATE` or starting with `OP_` in any case, or that is not an upper-case variable name, is skipped with one warning per dispatcher process. The read-only preliminary source review gets none of them: it ignores the user config, so the core-only policy does not apply to it, and it builds nothing. Unset passes nothing. The Claude runner needs nothing, since its shells inherit the environment. Printed in the startup banner. Mobile #1631 parked on 2026-10-03 on "ANDROID_HOME is missing from the dispatcher environment". |
 | `PYRY_FAMILY_DISPATCH_LIMIT` | `24` | Family circuit breaker: dispatch budget per ticket family before the whole lineage is parked under `error:family-breaker` on its root. Per-family resume via a reset comment on the root; this knob is the global fallback. See above. |
 | `OWNER_TYPE` | `user` | `user` or `organization` for GitHub Project owner |
 | `PYRY_REAL_CLAUDE_GATE_CMD` | — | Shell command that runs the fork's live-claude suite. **Empty disables the gate entirely** and gated tickets park for an operator. See below. |
 | `PYRY_REAL_CLAUDE_GATE_FORMAT` | `go-json` | How to read what the command wrote: `go-json`, `playwright-json` or `junit-xml` |
-| `PYRY_REAL_CLAUDE_GATE_TIMEOUT_MS` | `1800000` | Outer wall clock for one gate run. Must exceed the command's own inner timeout. |
+| `PYRY_REAL_CLAUDE_GATE_TIMEOUT_MS` | `1800000` | Outer wall clock for one gate run. Must exceed the command's own inner timeout. Extended by waiting for the Android device or a build place, like the verifier gates. |
 | `PYRY_REAL_CLAUDE_GATE_MIN_EXECUTED` | `1` | Floor for the executed-test guard. Set near the suite's real count. |
 | `PYRY_REAL_CLAUDE_GATE_BASELINE_CMD` | — | Base-commit re-run template with a `{{TESTS}}` placeholder. Runs only when the branch has named failures, so it costs seconds. Unset means failures are attributed to the branch. |
 | `PYRY_REAL_CLAUDE_GATE_BACKGROUND` | — | `1` runs the gate beside the poll loop. Only verifiers and the main sweep wait for it; builders, refiners and documentation keep working. Unset keeps the gate running alone. See below. |
@@ -125,7 +128,7 @@ Optional:
 | `PYRY_REAL_CLAUDE_GATE_FULL_EVERY` | `10` | Merges on the base since the last clean full run that force the whole suite again. State in `logs/real-claude-gate-full-state.json`. |
 | `PYRY_MAIN_SWEEP_CMD` | — | Main sweep: an in-depth command, too slow for every verifier pass, run against main when the board is idle or every `PYRY_MAIN_SWEEP_EVERY` merges. Runs inline, never beside a verifier. A failure files one Backlog ticket. **Empty disables it.** State in `logs/main-sweep-state.json`. |
 | `PYRY_MAIN_SWEEP_EVERY` | `5` | Merges since the last sweep that force one while the board is busy. |
-| `PYRY_MAIN_SWEEP_TIMEOUT_MS` | `1800000` | Outer wall clock for one sweep. |
+| `PYRY_MAIN_SWEEP_TIMEOUT_MS` | `1800000` | Outer wall clock for one sweep. Extended by waiting for the Android device or a build place, like the verifier gates. |
 | `PYRY_MAIN_SWEEP_FORMAT` | — | Optional `go-json`, `playwright-json` or `junit-xml`, to name the failing tests in the ticket. Without it the exit code alone judges the run. |
 
 > **Load order.** `dotenv` now loads the fork's `.env` before any module-top constant reads `process.env`, so every variable in this table works from the file. Before 2026-08-07 the load sat below several of those reads, and `TARGET_REPO_PATH`, `TARGET_DEFAULT_BRANCH`, `SALVAGE_GATES` and `PYRY_AUTOCURATE_MEMORY` were silently file-blind — each fork's launcher pre-exported `TARGET_REPO_PATH` to work around it. Values a launcher exports, or that `op run --env-file` injects, still take precedence over the file.
@@ -404,6 +407,9 @@ Each Codex launch explicitly sets `AGENTS_REPO_PATH` in its shell environment
 configuration when the dispatcher supplies that path. This keeps role checklists
 readable when the user's shell policy inherits only core variables. The override
 carries only this non-secret path and leaves the user's inheritance policy intact.
+`PYRY_AGENT_SHELL_ENV` adds further named, non-secret settings the same way, for
+example `ANDROID_HOME,JAVA_HOME` so Gradle commands find the SDK and JDK without
+the agent spelling them out inline. Secret-looking names are refused.
 
 A successful process must emit a completed turn and a valid final JSON outcome
 with `status: completed`. A `blocked` outcome, missing outcome, failed turn,
@@ -485,6 +491,71 @@ checks and pushes them, then removes only `needs-live-artifacts`. Existing rewor
 routing clears prior approvals. Review and the live gate run again before the
 ordinary documentation handoff. A green disposable checkout alone cannot complete
 a capture ticket. This workflow does not give agents Claude credentials.
+
+## Time limits and waiting
+
+A time limit should stop work that has stalled, not work that is queued behind
+another ticket or slowed by a busy host. Two host-wide queues sit in front of
+pipeline work on the mobile host: the Android device hold in the product's
+`scripts/android-test-gate.py`, and the pipeline Gradle build places in
+`~/.gradle/init.d/pyry-build-slots.gradle`. Both print what they are doing, and
+the dispatcher reads those lines:
+
+- `Android gate: device held by ...; waiting up to Ns`, then
+  `Android gate: device free after Ns waiting` or
+  `Android gate: device busy, not a test result: gave up after Ns; ...`.
+- `Pyrycode build slots: all N places are taken by other pipeline builds; waiting (M min so far).`
+  once a minute, then `Pyrycode build slots: got a place after N s.` or
+  `Pyrycode build slots: no place after 20 minutes; building without one.`
+
+Only lines that start with these exact words count, so a search hit on the
+scripts' own source does not.
+
+**Gates the dispatcher runs.** The verifier gates, the real-claude gate and the
+main sweep are read as they run. While a gate's output shows it waiting, its
+deadline moves with the wait. An open device wait counts up to its printed limit
+and an open build-place wait up to shortly after its last once-a-minute note, so
+a waiter that dies without a final line stops earning time on its own.
+
+**Codex agent runs.** `codex exec --json` reports a command's output only when
+the command finishes, as `aggregated_output` on its `item.completed` event, so a
+wait is credited once some command's output shows its final line. Builders
+often redirect a gate's output to a file and read it with `tail`, so the line
+may arrive later, in a short command. Each distinct line is credited once, and
+only for the part of its reported wait during which one of the run's own
+commands was running, within that many seconds before the line was seen.
+Reading an old log, or a wait behind a detached background process, earns
+little or nothing. Mobile #1646's builder was killed at 70 minutes on
+2026-10-04, two minutes after updating its pull request and before it could
+report, having spent more than half an hour waiting for the device. Replayed
+against its log, this credits the last of those waits, 500 seconds, which moves
+the deadline eight minutes later. The earlier waits never printed a final line
+the run read back, so they earn nothing.
+
+When the budget is spent while a command started earlier is still running, the
+run gets up to `PYRY_TIMEOUT_GRACE_MINUTES` for that command to finish. Once
+every such command has finished the deadline applies again, with whatever credit
+they brought. A command whose output was redirected shows nothing when it ends,
+so a grace like that usually ends with the stop.
+
+**Idle Codex runs.** The idle watchdog now covers Codex too. Across 672 Codex
+runs in the mobile logs, two went over ten minutes silent with nothing
+outstanding: builder #626 on 2026-09-20, silent for 30 minutes until its wall
+clock ended it, and verifier #1291 on 2026-09-30, 10.3 minutes while Codex
+retried a slow model stream and then finished. The default catches the first 20
+minutes sooner and would have stopped the second 16 seconds early. That run
+would have retried, which is cheap next to a run that never comes back.
+
+**Hard ceiling.** Nothing runs past `PYRY_TIMEOUT_CEILING_FACTOR` times its
+normal budget, twice by default, so a hung run still ends. With mobile's
+settings, a 60-minute verifier gate can wait the full 45 minutes for the device
+and still have its hour, inside a 120-minute ceiling.
+
+The Claude runner keeps its plain wall clock. No Claude fork runs these queues
+today, and Claude's shell tool caps a foreground command at ten minutes and
+backgrounds longer ones, so a wait rarely finishes inside the command that
+would report it. The stranded running-label sweep is unchanged: it never
+touches a run this dispatcher has in flight, however long it takes.
 
 ## Codex pipeline helpers
 
