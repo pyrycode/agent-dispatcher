@@ -70,6 +70,10 @@ import {
   clearGateWorktreePath,
   worktreePath,
   spawnGateCommand,
+  createCodegraphReindexer,
+  runCommandAsync,
+  type CommandOutcome,
+  type CommandRunner,
   maybeRunPreSpawnGates,
   runVerifierGates,
   VERIFIER_GATE_TAIL_CAP,
@@ -145,6 +149,10 @@ export type CallLog = {
   /** `writeLog` sections captured through the deps seam. Nothing may land
    *  on the real filesystem: see the log-write containment suite. */
   logs: { logFile: string; section: string; content: string }[];
+  /** Every `deps.runCommand` call (async maintenance commands, e.g. QMD). */
+  run: { cmd: string; args: string[]; opts: { cwd: string; timeoutMs: number } }[];
+  /** Every `deps.reindexCodegraph` request (post-merge, fire-and-forget). */
+  reindex: string[];
 };
 
 function emptyCallLog(): CallLog {
@@ -157,6 +165,8 @@ function emptyCallLog(): CallLog {
     claudeStreams: 0,
     gates: [],
     logs: [],
+    run: [],
+    reindex: [],
   };
 }
 
@@ -216,6 +226,11 @@ export type MockDepsOptions = {
    * `calls.gates` either way.
    */
   gateImpl?: (req: GateSpawnRequest) => GateSpawnOutcome;
+  /**
+   * Pattern → outcome for `deps.runCommand`, matched against
+   * `[cmd, ...args].join(" ")`. Unknown commands succeed.
+   */
+  runImpls?: Record<string, () => Partial<CommandOutcome>>;
 };
 
 export function makeMockDeps(opts: MockDepsOptions = {}): { deps: DispatchDeps; calls: CallLog } {
@@ -352,6 +367,13 @@ export function makeMockDeps(opts: MockDepsOptions = {}): { deps: DispatchDeps; 
     },
     curateMemoryIndex: async () => ({ ok: true }),
     spawnGate: mockSpawnGate,
+    runCommand: async (cmd, args, runOpts) => {
+      calls.run.push({ cmd, args, opts: runOpts });
+      const joined = [cmd, ...args].join(" ");
+      const hit = Object.entries(opts.runImpls ?? {}).find(([pattern]) => joined.includes(pattern));
+      return { ok: true, exitCode: 0, timedOut: false, output: "", ...(hit ? hit[1]() : {}) };
+    },
+    reindexCodegraph: (repoRoot) => { calls.reindex.push(repoRoot); },
   };
 
   return { deps, calls };
@@ -1748,15 +1770,13 @@ describe("prepareAgentSpawn", () => {
 
   test("QMD re-index fails → warning logged, dispatch continues", async () => {
     const claudeMd = claudeMdAbsPath("developer/CLAUDE.md");
-    const { ctx } = makeTestContext({
+    const { ctx, calls } = makeTestContext({
       item: { issueNumber: 202 },
       mockOptions: {
         fsMap: { [claudeMd]: "system prompt" },
-        execImpls: {
-          // QMD failure shape: stderr + non-zero exit. The catch surfaces
-          // both stderr and stdout in the warning; test just verifies the
-          // outer call still succeeds.
-          "qmd update": () => execError({ status: 1, stderr: "qmd: index lock taken" }),
+        runImpls: {
+          // QMD failure shape: non-zero exit with qmd's own output.
+          "qmd update": () => ({ ok: false, exitCode: 1, output: "qmd: index lock taken" }),
         },
       },
     });
@@ -1765,6 +1785,12 @@ describe("prepareAgentSpawn", () => {
 
     // QMD failure is non-fatal — dispatch proceeds with the (stale) index.
     assert.ok(result.ok, "QMD failure must not abort dispatch");
+    // Runs through the async runner in the worktree, never through execSync,
+    // which would block the event loop that drains sibling agents' output.
+    assert.equal(calls.run.length, 1);
+    assert.ok(calls.run[0]!.args.join(" ").includes("qmd update"));
+    assert.equal(calls.run[0]!.opts.cwd, ctx.agentCwd);
+    assert.ok(!calls.exec.some(c => c.cmd.includes("qmd")), "qmd must not run through execSync");
   });
 
   test("PO path skips QMD re-index (no useWorktree)", async () => {
@@ -1784,7 +1810,10 @@ describe("prepareAgentSpawn", () => {
     // The QMD index lives in the worktree; running it in repoRoot would
     // mutate main's index across other dispatcher cycles. Gate is
     // `useWorktree` — PO has it false.
-    const qmdCalls = calls.exec.filter(c => c.cmd.includes("qmd"));
+    const qmdCalls = [
+      ...calls.exec.filter(c => c.cmd.includes("qmd")),
+      ...calls.run.filter(c => c.args.join(" ").includes("qmd")),
+    ];
     assert.equal(qmdCalls.length, 0, "PO must never invoke qmd (no isolated tree)");
   });
 
@@ -5211,16 +5240,16 @@ describe("runAutoMerge", () => {
         "gh pr list --head \"feature/1300\"": () => "800\n",
         "gh pr merge 800 --merge --delete-branch": () => "",
         "git checkout main && git pull": () => "",
-        "codegraph index -f": () => "✓ Indexed 14 files",
       },
     });
 
     await runAutoMerge(client, deps);
 
-    // codegraph index -f invoked at the target repo root.
-    const cgCall = calls.exec.find(c => c.cmd.includes("codegraph index -f"));
-    assert.ok(cgCall, "codegraph index -f must be invoked when .codegraph exists");
-    assert.equal(cgCall.opts?.cwd, TEST_REPO_ROOT, "must run codegraph index -f at the target repo root");
+    // A background reindex requested at the target repo root, and never
+    // run inline through execSync (2026-10-04: a blocking reindex starved
+    // live agents' output pipes).
+    assert.deepEqual(calls.reindex, [TEST_REPO_ROOT], "reindex must be requested at the target repo root");
+    assert.ok(!calls.exec.some(c => c.cmd.includes("codegraph")), "codegraph must not run through execSync");
     // Standard merge path still completed (label cleanup). Merged ping
     // dropped 2026-06-07 — no Discord notify.
     assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1300 && c.label === "done:documentation"));
@@ -5253,19 +5282,18 @@ describe("runAutoMerge", () => {
     // No codegraph invocation of any kind.
     assert.ok(!calls.exec.some(c => c.cmd.includes("codegraph")),
       "no codegraph command should run when .codegraph is absent");
+    assert.equal(calls.reindex.length, 0, "no reindex should be requested when .codegraph is absent");
     // Standard merge path still completed. Merged ping dropped 2026-06-07 —
     // no Discord notify.
     assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1301));
     assert.equal(calls.discord.length, 0);
   });
 
-  test("codegraph reindex failure is non-fatal — labels still cleaned", async () => {
-    // Codegraph isn't load-bearing. If `codegraph index -f` errors
-    // (lock contention, disk full, transient binary issue), the
-    // dispatcher must log a warning and continue — the merge already
-    // happened on origin, the labels matter more than a temporarily
-    // stale index. Same posture as the existing post-merge `git pull`
-    // failure path (line 1858-1861).
+  test("codegraph reindex runs in the background — the merge path never waits for it", async () => {
+    // The reindex can take minutes on a busy box. Awaiting it, or running it
+    // through execSync, stalls the loop that drains live agents' output
+    // (pyrycode#2782, 2026-10-04). Here the reindex never finishes at all,
+    // and the merge must still complete.
     const client = new MockGitHubClient({
       items: [
         { issueNumber: 1302, status: "Done", labels: ["done:documentation"], state: "OPEN" },
@@ -5277,22 +5305,21 @@ describe("runAutoMerge", () => {
         "gh pr list --head \"feature/1302\"": () => "802\n",
         "gh pr merge 802 --merge --delete-branch": () => "",
         "git checkout main && git pull": () => "",
-        "codegraph index -f": () => execError({
-          stderr: "Error: lock file exists at /path/.codegraph/lock",
-          message: "Command failed: codegraph index -f",
-        }),
       },
     });
+    const started: string[] = [];
+    const reindexer = createCodegraphReindexer(async (_cmd, _args, opts) => {
+      started.push(opts.cwd);
+      return new Promise<CommandOutcome>(() => {});
+    });
+    deps.reindexCodegraph = reindexer.request;
 
     await runAutoMerge(client, deps);
 
-    // The reindex was attempted (proves the path runs even on failure).
-    assert.ok(calls.exec.some(c => c.cmd.includes("codegraph index -f")));
-    // Critical: the rest of the merge path completed despite codegraph's failure.
+    assert.deepEqual(started, [TEST_REPO_ROOT], "the reindex was started");
+    // The rest of the merge path completed while it was still running.
     assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1302 && c.label === "done:documentation"));
-    // Merged ping dropped 2026-06-07 — no Discord notify.
     assert.equal(calls.discord.length, 0);
-    // No error label applied — codegraph failure isn't a ticket-level signal.
     assert.ok(!client.addLabelCalls.some(c => c.label.startsWith("error:")));
   });
 
@@ -6653,6 +6680,142 @@ describe("buildGateSpawnEnv", () => {
     await run();
     assert.ok(!("GITHUB_TOKEN" in spawnRequests[0].env));
     assert.ok(!("ANTHROPIC_API_KEY" in spawnRequests[0].env));
+  });
+});
+
+describe("createCodegraphReindexer (post-merge, background, one at a time)", () => {
+  // A runner whose runs stay open until the test releases them.
+  const heldRunner = () => {
+    const runs: { cwd: string; release: (o: Partial<CommandOutcome>) => void }[] = [];
+    const run: CommandRunner = (_cmd, _args, opts) => new Promise<CommandOutcome>((res) => {
+      runs.push({ cwd: opts.cwd, release: (o) => res({ ok: true, exitCode: 0, timedOut: false, output: "", ...o }) });
+    });
+    return { run, runs };
+  };
+  const tick = () => new Promise<void>((r) => setImmediate(r));
+  const withWarnings = async (fn: (warnings: string[]) => Promise<void>) => {
+    const warnings: string[] = [];
+    const origWarn = console.warn;
+    const origLog = console.log;
+    console.warn = (...a: unknown[]) => { warnings.push(a.join(" ")); };
+    console.log = () => {};
+    try { await fn(warnings); } finally { console.warn = origWarn; console.log = origLog; }
+  };
+
+  test("runs codegraph index -f at the repo root and returns before it finishes", async () => {
+    await withWarnings(async () => {
+      const calls: { cmd: string; args: string[]; cwd: string }[] = [];
+      const reindexer = createCodegraphReindexer(async (cmd, args, opts) => {
+        calls.push({ cmd, args, cwd: opts.cwd });
+        return { ok: true, exitCode: 0, timedOut: false, output: "" };
+      });
+      reindexer.request("/repo");
+      await reindexer.whenIdle();
+      assert.deepEqual(calls, [{ cmd: "codegraph", args: ["index", "-f"], cwd: "/repo" }]);
+    });
+  });
+
+  test("never overlaps: requests during a run coalesce into one follow-up run", async () => {
+    await withWarnings(async () => {
+      const { run, runs } = heldRunner();
+      const reindexer = createCodegraphReindexer(run);
+      reindexer.request("/repo");
+      reindexer.request("/repo");
+      reindexer.request("/repo");
+      await tick();
+      assert.equal(runs.length, 1, "only one run while the first is in progress");
+
+      runs[0]!.release({});
+      await tick();
+      assert.equal(runs.length, 2, "one follow-up run covers every merge that landed meanwhile");
+
+      runs[1]!.release({});
+      await reindexer.whenIdle();
+      assert.equal(runs.length, 2, "no further runs once nothing is pending");
+
+      reindexer.request("/repo");
+      await tick();
+      assert.equal(runs.length, 3, "a later request starts a fresh run");
+      runs[2]!.release({});
+      await reindexer.whenIdle();
+    });
+  });
+
+  test("a failure or timeout only logs, and the next request runs again", async () => {
+    await withWarnings(async (warnings) => {
+      const { run, runs } = heldRunner();
+      const reindexer = createCodegraphReindexer(run, 60_000);
+
+      reindexer.request("/repo");
+      await tick();
+      runs[0]!.release({ ok: false, exitCode: 1, output: "Error: lock file exists" });
+      await reindexer.whenIdle();
+      assert.equal(warnings.length, 1);
+      assert.match(warnings[0]!, /Post-merge codegraph reindex failed \(next merge will retry\): exit 1: Error: lock file exists/);
+
+      reindexer.request("/repo");
+      await tick();
+      runs[1]!.release({ ok: false, exitCode: null, timedOut: true });
+      await reindexer.whenIdle();
+      assert.match(warnings[1]!, /next merge will retry\): timed out after 60s/);
+      assert.equal(runs.length, 2);
+    });
+  });
+
+  test("a runner that throws is contained", async () => {
+    await withWarnings(async (warnings) => {
+      const reindexer = createCodegraphReindexer(async () => { throw new Error("spawn EAGAIN"); });
+      reindexer.request("/repo");
+      await reindexer.whenIdle();
+      assert.match(warnings[0]!, /next merge will retry\): spawn EAGAIN/);
+    });
+  });
+});
+
+describe("runCommandAsync — the real runner", () => {
+  test("reports success and output without blocking the event loop", { timeout: 15_000 }, async () => {
+    let ticks = 0;
+    const timer = setInterval(() => { ticks += 1; }, 20);
+    try {
+      const out = await runCommandAsync("sh", ["-c", "sleep 0.3; echo indexed"], { cwd: tmpdir(), timeoutMs: 10_000 });
+      assert.equal(out.ok, true);
+      assert.equal(out.exitCode, 0);
+      assert.equal(out.output, "indexed");
+      // execSync would have frozen the interval for the whole 300 ms.
+      assert.ok(ticks >= 5, `event loop kept running during the command (ticks=${ticks})`);
+    } finally {
+      clearInterval(timer);
+    }
+  });
+
+  test("reports a non-zero exit", { timeout: 15_000 }, async () => {
+    const out = await runCommandAsync("sh", ["-c", "echo broke >&2; exit 3"], { cwd: tmpdir(), timeoutMs: 10_000 });
+    assert.equal(out.ok, false);
+    assert.equal(out.exitCode, 3);
+    assert.equal(out.timedOut, false);
+    assert.equal(out.output, "broke");
+  });
+
+  test("a missing binary resolves as a failure instead of throwing", { timeout: 15_000 }, async () => {
+    const out = await runCommandAsync("definitely-not-a-real-binary-xyz", [], { cwd: tmpdir(), timeoutMs: 10_000 });
+    assert.equal(out.ok, false);
+    assert.equal(out.exitCode, null);
+  });
+
+  test("a timeout kills the whole process group, not just the shell", { timeout: 15_000 }, async () => {
+    // execSync's timeout killed only /bin/sh. The real command lived on, and
+    // pyrybox collected eight orphaned `codegraph index -f` runs (2026-10-04).
+    const pidFile = resolve(tmpdir(), `run-command-test-${process.pid}.pid`);
+    const out = await runCommandAsync(
+      "sh",
+      ["-c", `sleep 30 & echo $! > "${pidFile}"; wait`],
+      { cwd: tmpdir(), timeoutMs: 300 },
+    );
+    assert.equal(out.timedOut, true);
+    assert.equal(out.ok, false);
+    const grandchild = Number(readFileSync(pidFile, "utf-8").trim());
+    assert.ok(grandchild > 1);
+    assert.throws(() => process.kill(grandchild, 0), /ESRCH/, "the grandchild must be gone");
   });
 });
 
