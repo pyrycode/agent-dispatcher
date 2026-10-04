@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 
 import {
   classifyAgentError,
+  classifyBlockedRun,
   backoffDelayMs,
   isRetryEligible,
   extractErrorRetryCount,
@@ -176,6 +177,83 @@ describe("classifyAgentError", () => {
     assert.equal(classifyAgentError("", { terminalReason: " API_ERROR " }).transient, true);
     // A reason with no error text at all is still classifiable.
     assert.equal(classifyAgentError(null, { terminalReason: "api_error" }).transient, true);
+  });
+});
+
+// A Codex run that stops with `status: blocked` is retried only when its own
+// summary says a tool, MCP server or environment variable was missing. The
+// strings below are the summaries as the dispatcher logged them, prefix and
+// recovery line included.
+describe("classifyBlockedRun — missing tools and environment retry, everything else parks (2026-10-04)", () => {
+  const blocked = (summary: string) =>
+    `Codex task blocked: ${summary}\nWorktree preserved for recovery: /Users/x/Workspace/Projects/.pyrycode-worktrees/pyrycode-mobile/builder-1`;
+
+  test("each observed missing-tool and missing-variable block is transient", () => {
+    const cases: { text: string; sig: string }[] = [
+      // mobile #1646, 2026-10-03 20:32
+      { sig: "required tool unavailable", text: blocked("Required Figma tools are unavailable in this session. builder/ui-work.md requires fetching design context and screenshots before planning UI work and explicitly requires stopping when those tools are missing. Redispatch #1646 with callable Figma tools. No repository changes, commits, or PR were made.") },
+      // mobile #1668, 2026-10-04 09:01
+      { sig: "required tool unavailable", text: blocked("Required Figma tools `get_design_context` and `get_screenshot` are unavailable. [ui-work.md](/Users/x/pyrycode-mobile-agents/builder/ui-work.md) requires: “If the Figma tools are unavailable or fail to authenticate, stop as for a missing tool.” Ticket #1668 needs node 675:5938 read before planning. No files changed; no PR opened.") },
+      // mobile #1631, 2026-10-03 18:53
+      { sig: "environment variable missing", text: blocked("ANDROID_HOME is missing from the dispatcher environment. Gradle failed with “SDK location not found,” so required tests cannot run. The plan is committed on feature/1631 (7990a30b); test-first changes remain uncommitted. No production implementation or PR was created. Redispatch with ANDROID_HOME set.") },
+      // mobile #1305, 2026-09-30
+      { sig: "environment variable missing", text: blocked("Dispatcher fault: AGENTS_REPO_PATH is unset. Ticket #1305 is security-sensitive, so the builder instructions require stopping before the mandatory security review. No files changed. Redispatch with AGENTS_REPO_PATH configured.") },
+      // desktop #1696, 2026-09-30
+      { sig: "required tool unavailable", text: blocked("#1696 requires Figma design context and screenshots before committing the plan. The Figma plugin is not installed, so those tools are unavailable. Install and connect Figma, then rerun. No files changed, tests run, commits made, or PR opened.") },
+      { sig: "required tool unavailable", text: blocked("The figma MCP server is not connected, so design context cannot be read.") },
+      { sig: "environment variable missing", text: blocked("Missing required environment variable for the emulator gate.") },
+    ];
+    for (const c of cases) {
+      const r = classifyBlockedRun(c.text);
+      assert.equal(r.transient, true, c.text);
+      assert.equal(r.signature, c.sig, c.text);
+    }
+  });
+
+  test("a block that needs a person still parks at once", () => {
+    const parks = [
+      // The automatic approval reviewer refused an action. Retrying would repeat it.
+      "Automatic approval review rejected an action. Operator review required.",
+      // A role conflict only a maintainer can lift (mobile #631).
+      "Confirmed and documented #631’s builder-scope blocker. A maintainer must permit ticket-required edits to app/build.gradle.kts in the builder instructions before redispatch.",
+      // A design decision (desktop #1240).
+      "Moved #1240 to Inbox and verified. Needs a Figma drawing or Juhana’s approval to reuse the session-boundary style.",
+      // Denied permission (pyrycode #2261).
+      "Permission denied for commenting on and relabeling GitHub issue #2261. The goal was to route it back to refinement.",
+      // A red baseline with a filed blocker (mobile #1277).
+      "A fresh Spotless run fails on formatting in files unchanged from main. Filed blocker #1280 and linked it to #1277.",
+      // Missing evidence and credentials are the ticket's acceptance, not a tool.
+      "Live acceptance remains blocked by missing credentials: 0 executed, 0 passed, 1 skipped.",
+      "Artifact completion is blocked by missing API 35 dispatcher evidence and unrecorded API 33 Claude/runtime-image metadata.",
+      // A Figma auth failure worded without "unavailable" stays parked: the match is kept to the observed wording.
+      "Figma access blocked planning: the screenshot tool returned “Authentication required,” and design-context retrieval failed.",
+      // Ordinary words that merely look like a variable or a tool.
+      "the user_id is missing from the payload, so the export tool cannot be specified without a product decision",
+    ];
+    for (const summary of parks) {
+      assert.deepEqual(classifyBlockedRun(blocked(summary)), { transient: false, signature: "" }, summary);
+    }
+  });
+
+  test("a person-needed word vetoes a missing-tool match in the same summary", () => {
+    const mixed = blocked("Required Figma tools are unavailable, and the spacing needs a human decision anyway.");
+    assert.equal(classifyBlockedRun(mixed).transient, false);
+  });
+
+  test("an observed approval rejection never retries, whatever the summary says", () => {
+    const text = blocked("Required Figma tools are unavailable in this session.");
+    assert.equal(classifyBlockedRun(text, { approvalRejected: true }).transient, false);
+  });
+
+  test("the transport allowlist never reads a blocked summary, and blocked wording never reaches it", () => {
+    // A block that mentions a dropped connection is still the agent's own stop.
+    assert.equal(classifyBlockedRun(blocked("connection reset; reviewer rejected required action")).transient, false);
+    // And the missing-tool wording does not widen the transport classifier.
+    assert.equal(classifyAgentError(blocked("Required Figma tools are unavailable in this session.")).transient, false);
+  });
+
+  test("null, undefined and empty are not transient", () => {
+    for (const t of [null, undefined, ""]) assert.equal(classifyBlockedRun(t).transient, false);
   });
 });
 

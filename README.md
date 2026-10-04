@@ -109,6 +109,7 @@ Optional:
 | `PYRY_RESUME_LEGS` | `1` | Resume-in-place: how many same-session continuation legs a budget-exhausted run gets before salvage. `0` disables the feature entirely (byte-identical pre-resume behaviour). See above. |
 | `PYRY_AGENT_IDLE_TIMEOUT_MINUTES` | `10` | Claude runner only: kill a run whose stream has been silent this long while no tool call is outstanding, and fail it with `idle_stall`, which retries with backoff like any transient error. A running tool, such as a long Gradle test run, never trips it; the wall clock still bounds that. Fractions allowed; `0` disables. Added after pyrycode-mobile #1430 sat silent for twenty minutes inside one assistant turn on 2026-10-02. |
 | `PYRY_BUDGET_SCALE` | `1` | Multiplier on every agent's turn cap and wall-clock timeout, for a fork whose tickets or model need a different budget without changing the others. Timeouts round to whole minutes. Unset, empty, non-numeric, zero or negative keeps `1`. Mobile runs `1.5` since 2026-09-23, after moving to Opus 5.5 and raising its ticket ceiling to 1600 lines. Printed in the startup banner. |
+| `PYRY_REQUIRED_ENV` | — | Comma- or space-separated names of environment variables this fork cannot work without, such as `ANDROID_HOME`. Checked every cycle against the dispatcher's own environment. While one is unset or blank, no agent is dispatched and neither the live gate nor the main sweep starts, a warning is logged and one Discord message is sent. Board upkeep, rework routing and merges carry on. Restart the dispatcher with the variable set to resume. Unset requires nothing. Added after mobile #1631 parked on 2026-10-03, when a restart lost `ANDROID_HOME` and the builder found Gradle could not locate the SDK. Printed in the startup banner. |
 | `PYRY_FAMILY_DISPATCH_LIMIT` | `24` | Family circuit breaker: dispatch budget per ticket family before the whole lineage is parked under `error:family-breaker` on its root. Per-family resume via a reset comment on the root; this knob is the global fallback. See above. |
 | `OWNER_TYPE` | `user` | `user` or `organization` for GitHub Project owner |
 | `PYRY_REAL_CLAUDE_GATE_CMD` | — | Shell command that runs the fork's live-claude suite. **Empty disables the gate entirely** and gated tickets park for an operator. See below. |
@@ -210,7 +211,9 @@ Some tickets can only be accepted by running against real claude rather than the
 
 While that suite is running, the ticket carries `wip:real-claude-gate`. The dispatcher removes it when the run finishes, whether the result passes, fails, or needs human attention. A ticket with any `wip:` label is not selected for another gate run. The existing stranded-running-label sweep clears a marker left by an interrupted process after its safety delay.
 
-**What it does per run.** Fetches, resolves the branch from `origin` only, records how many commits behind the base branch it is, probes for conflicts with `git merge-tree --write-tree` before touching the disk, creates a **detached** worktree at the head commit, merges the base branch into it, runs the command, then judges by reading the output file back off disk. The worktree is removed either way. Both log files end in `.log`, so the existing rotation sweeps them.
+**What it does per run.** Fetches, resolves the branch from `origin` only, records how many commits behind the base branch it is, probes for conflicts with `git merge-tree --write-tree`, creates a **detached** worktree at the head commit, merges the base branch into it, runs the command, then judges by reading the output file back off disk. The worktree is removed either way. Both log files end in `.log`, so the existing rotation sweeps them.
+
+**When the branch conflicts with the base.** The gate merges with the same diff3 markers as the dispatcher's other merges. A conflict where both sides only added imports is settled in the gate's own worktree by the import-only resolver, and the suite runs on the result. That resolution is never pushed: the next stage's own merge settles the same conflict the same way, and the evidence comment names the files. Any other conflict goes to the ticket's code owner exactly as a conflicting final merge does. The ticket moves to the owner's column, In Development, with `merge-handoff` and `needs-rework:<owner>`. The rework router then clears the trail and counts no rework. `needs-real-claude` stays on, so after the owner settles the merge and the review stages pass, the gate runs again. Gate and final-merge handoffs share one budget of `FINAL_MERGE_HANDOFF_MAX` routes, two, counted by the same hidden comment marker. A conflict after that parks as before. Before 2026-10-04 every conflict parked: mobile #1337 twice on 2026-10-01, and #1631 on 2026-10-04 over two changes that each added one argument to the same call. Each waited hours for a person to merge main.
 
 **Outcomes.**
 
@@ -220,6 +223,9 @@ While that suite is running, the ticket carries `wip:real-claude-gate`. The disp
 | flaky: every failure passed on a same-tree re-run | → In Documentation | removes `needs-real-claude` | yes, naming the flaky tests |
 | fail | → In Development | adds the set's fail rework label (`needs-rework:developer` classic, `needs-rework:builder` builder), **keeps** `needs-real-claude` | no |
 | failures the branch inherited | stays in Inbox behind separate fix tickets | **keeps** `needs-real-claude`, no rework label or counter change | yes, naming the fix tickets |
+| branch conflicts with the base, imports only | settled in the gate's worktree, then judged like any other run | as for that run's verdict | as for that run's verdict |
+| branch conflicts with the base, anything else | → In Development, for the code owner to finish the merge | adds `merge-handoff` and the owner's `needs-rework:<owner>`, **keeps** `needs-real-claude`, no rework counted | yes |
+| branch conflicts again after two merge handoffs | stays in Inbox | adds `error:real-claude-gate` | yes |
 | nothing executed | stays in Inbox | adds `error:real-claude-gate` | yes |
 | no usable result | stays in Inbox | adds `error:real-claude-gate` | yes |
 
@@ -402,9 +408,25 @@ carries only this non-secret path and leaves the user's inheritance policy intac
 A successful process must emit a completed turn and a valid final JSON outcome
 with `status: completed`. A `blocked` outcome, missing outcome, failed turn,
 nonzero exit or dispatcher timeout cannot advance a ticket. A blocked outcome
-parks the ticket without automatic retry and preserves its worktree for recovery.
-This avoids deleting edits after a required commit or external action is rejected.
-The operator must inspect that worktree before re-queueing the ticket.
+preserves its worktree for recovery and is never salvaged. This avoids deleting
+edits after a required commit or external action is rejected.
+
+Most blocked outcomes park the ticket at once, and the operator must inspect that
+worktree before re-queueing it. One kind retries instead: a summary saying a
+required tool, MCP server or environment variable was missing or unavailable.
+Such a block takes the same transient auto-retry as a dropped connection, with
+the same 5, 10, 20 and 40 minute backoff and the same four-retry cap, then parks
+with `error:<agent>` as before. The match covers the observed summaries:
+"Required Figma tools are unavailable in this session" on mobile #1646 and
+"Required Figma tools `get_design_context` and `get_screenshot` are unavailable"
+on #1668, both of which cleared on their own, and "ANDROID_HOME is missing from
+the dispatcher environment" on #1631. Checked against all 23 distinct blocked
+summaries in the Mobile, Desktop and pyrycode logs, it matched five: these three
+and two of the same kind. It matched none of the eighteen that need a person. A summary naming an approval, a human,
+a maintainer, a decision or a denied permission always parks, and so does any run
+where the approval reviewer rejected an action. The retry never discards or
+salvages the blocked run's work: when that run left uncommitted edits or unpushed
+commits, the retry refuses to start over them and parks, saying why.
 
 A builder may instead return `status: needs_refinement` for a planning problem.
 The dispatcher posts its explanation on the assigned issue and adds
