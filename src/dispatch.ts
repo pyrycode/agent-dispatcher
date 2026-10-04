@@ -11,7 +11,7 @@ import { countOpenPrs, shouldFlagMissingPr } from "./pr-guard.js";
 import { resolveImportOnlyMerge } from "./merge-resolve.js";
 import { FINAL_MERGE_HANDOFF_MARKER, FINAL_MERGE_HANDOFF_MAX, MERGE_HANDOFF_LABEL, checkMergeResolution, decideConflictRoute, decideFinalMergeRoute, findMergeCommit, mergeHandoffNote, mergeResolutionComment, mergeResolutionSection, readPendingMerge, type PendingMerge, type ResolutionNote } from "./merge-handoff.js";
 
-import { buildClaudeSourceReviewInvocation, buildCodexInvocation, codexChildEnv, CODEX_ROLE_GUIDANCE, CodexStreamAdapter, formatRunCost, resumeCommand, resolveAgentRunner, type AgentRunner } from "./agent-runner.js";
+import { buildClaudeSourceReviewInvocation, buildCodexInvocation, codexChildEnv, CODEX_ROLE_GUIDANCE, CodexStreamAdapter, formatRunCost, resolveAgentShellEnv, resumeCommand, resolveAgentRunner, type AgentRunner } from "./agent-runner.js";
 
 import { GitHubProjectClient } from "./github.js";
 import { type AgentConfig, type ProjectItem } from "./types.js";
@@ -778,7 +778,10 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
     let bin: string;
     let args: string[];
     if (isCodex) {
-      ({ bin, args } = buildCodexInvocation({ cwd: opts.cwd, role: readFileSync(opts.systemPromptFile, "utf8") + (opts.sourceReview ? "" : CODEX_ROLE_GUIDANCE), model: opts.model, effort: opts.effort, bin: opts.env.PYRY_CODEX_BIN, agentsRepoPath: opts.env.AGENTS_REPO_PATH, sourceReview: opts.sourceReview }));
+      ({ bin, args } = buildCodexInvocation({ cwd: opts.cwd, role: readFileSync(opts.systemPromptFile, "utf8") + (opts.sourceReview ? "" : CODEX_ROLE_GUIDANCE), model: opts.model, effort: opts.effort, bin: opts.env.PYRY_CODEX_BIN, agentsRepoPath: opts.env.AGENTS_REPO_PATH, sourceReview: opts.sourceReview,
+        // Resolved from the env Codex itself gets, so nothing withheld from
+        // Codex can come back through the allowlist.
+        shellEnv: resolveAgentShellEnv(codexChildEnv(opts.env)) }));
     } else if (opts.sourceReview) {
       if (!opts.sourceReviewRoot) throw new Error("Claude source review requires an explicit source root");
       ({ bin, args } = buildClaudeSourceReviewInvocation({ root: opts.sourceReviewRoot, model: opts.model, effort: opts.effort, maxTurns: opts.maxTurns, systemPromptFile: opts.systemPromptFile }));
@@ -7180,6 +7183,12 @@ export async function pollLoop(): Promise<void> {
   console.log(
     `   Required environment: ${REQUIRED_ENV_NAMES.length > 0 ? REQUIRED_ENV_NAMES.join(", ") : "none declared"} (PYRY_REQUIRED_ENV)`,
   );
+  {
+    // Resolved here once so a refused name warns at startup, not mid-run.
+    // Each Codex run resolves the values again from its own child env.
+    const shellEnvNames = Object.keys(resolveAgentShellEnv(codexChildEnv(scrubSpawnEnv(process.env))));
+    console.log(`   Codex command settings: ${shellEnvNames.length > 0 ? shellEnvNames.join(", ") : "none"} (PYRY_AGENT_SHELL_ENV)`);
+  }
   // The missing set the preflight last announced, so it notifies once.
   const envPreflight: EnvPreflightState = { announced: null };
 

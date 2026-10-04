@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { buildCodexInvocation, CodexStreamAdapter, formatRunCost, resumeCommand, resolveAgentRunner, resolveCodexExecutable } from "./agent-runner.js";
+import { agentShellEnvNameProblem, buildCodexInvocation, CodexStreamAdapter, formatRunCost, resolveAgentShellEnv, resumeCommand, resolveAgentRunner, resolveCodexExecutable } from "./agent-runner.js";
 
 describe("runner selection", () => {
   test("Claude stays the default and unknown runners fail closed", () => {
@@ -44,6 +44,72 @@ describe("Codex invocation", () => {
     const spec = buildCodexInvocation({cwd:"/repo",role:"role",model:"chosen-model",effort:"high"});
     assert.equal(spec.args[spec.args.indexOf("--model")+1],"chosen-model");
     assert.ok(spec.args.includes('model_reasoning_effort="high"'));
+  });
+});
+describe("PYRY_AGENT_SHELL_ENV: non-secret settings for Codex commands", () => {
+  const quiet = () => ({ warnings: [] as string[], warned: new Set<string>() });
+  test("refuses names that look secret, in any case, and names that are not plain upper-case", () => {
+    for (const name of ["GITHUB_TOKEN", "OPENAI_API_KEY", "MY_SECRET_DIR", "DB_PASSWORD", "SMTP_PASSWD", "AWS_CREDENTIALS",
+      "GH_AUTH_HOST", "PRIVATE_DIR", "OP_SERVICE_ACCOUNT", "OP_CONNECT_HOST", "SSH_KEYFILE"]) {
+      assert.match(agentShellEnvNameProblem(name) ?? "", /secret/, name);
+    }
+    for (const name of ["android_home", "Java_Home", "1PATH", "A-B", "A.B", "A B", "ANDROID_HOME=x", ""]) {
+      assert.match(agentShellEnvNameProblem(name) ?? "", /upper-case/, name);
+    }
+    for (const name of ["ANDROID_HOME", "JAVA_HOME", "PYRYCODE_SRC", "PYRYCODE_RELAY_SRC", "_X", "GRADLE_USER_HOME"]) {
+      assert.equal(agentShellEnvNameProblem(name), null, name);
+    }
+  });
+  test("passes listed names that are set and non-blank, comma- or space-separated, once each", () => {
+    const q = quiet();
+    const env = {
+      PYRY_AGENT_SHELL_ENV: "ANDROID_HOME, JAVA_HOME PYRYCODE_SRC,,ANDROID_HOME UNSET_ONE BLANK_ONE",
+      ANDROID_HOME: "/sdk", JAVA_HOME: "/Applications/Android Studio.app/jbr", PYRYCODE_SRC: "/src/pyrycode", BLANK_ONE: "  ",
+    };
+    assert.deepEqual(resolveAgentShellEnv(env, { warn: m => q.warnings.push(m), warned: q.warned }), {
+      ANDROID_HOME: "/sdk", JAVA_HOME: "/Applications/Android Studio.app/jbr", PYRYCODE_SRC: "/src/pyrycode",
+    });
+    assert.deepEqual(q.warnings, []);
+  });
+  test("unset or empty list passes nothing", () => {
+    const q = quiet();
+    assert.deepEqual(resolveAgentShellEnv({ ANDROID_HOME: "/sdk" }, { warn: m => q.warnings.push(m), warned: q.warned }), {});
+    assert.deepEqual(resolveAgentShellEnv({ PYRY_AGENT_SHELL_ENV: " ", ANDROID_HOME: "/sdk" }, { warn: m => q.warnings.push(m), warned: q.warned }), {});
+    assert.deepEqual(q.warnings, []);
+  });
+  test("a refused name is skipped with one warning per process, even when set, across many runs", () => {
+    const q = quiet();
+    const env = { PYRY_AGENT_SHELL_ENV: "ANDROID_HOME,GITHUB_TOKEN,op_session,GITHUB_TOKEN", ANDROID_HOME: "/sdk", GITHUB_TOKEN: "ghp_fixture", op_session: "x" };
+    for (let run = 0; run < 3; run++) {
+      assert.deepEqual(resolveAgentShellEnv(env, { warn: m => q.warnings.push(m), warned: q.warned }), { ANDROID_HOME: "/sdk" });
+    }
+    assert.equal(q.warnings.length, 2);
+    assert.ok(q.warnings.some(m => m.includes('"GITHUB_TOKEN"') && /secret/.test(m)));
+    assert.ok(q.warnings.some(m => m.includes('"op_session"')));
+    assert.ok(q.warnings.every(m => !m.includes("ghp_fixture")), "a warning names the variable, never its value");
+  });
+  test("each allowed setting becomes one -c shell_environment_policy.set override with a quoted value", () => {
+    const spec = buildCodexInvocation({ cwd: "/repo", role: "role", model: "", effort: "", agentsRepoPath: "/agents",
+      shellEnv: { ANDROID_HOME: "/sdk", JAVA_HOME: '/Applications/Android Studio.app/Contents/jbr "x"' } });
+    const sets = spec.args.flatMap((arg, i) => spec.args[i - 1] === "-c" && arg.startsWith("shell_environment_policy.set.") ? [arg] : []);
+    assert.deepEqual(sets, [
+      'shell_environment_policy.set.AGENTS_REPO_PATH="/agents"',
+      'shell_environment_policy.set.ANDROID_HOME="/sdk"',
+      `shell_environment_policy.set.JAVA_HOME=${JSON.stringify('/Applications/Android Studio.app/Contents/jbr "x"')}`,
+    ]);
+    assert.ok(!spec.args.some(arg => arg.startsWith("shell_environment_policy.inherit")), "the user's inheritance policy is left alone");
+    assert.equal(spec.args.at(-1), "-");
+  });
+  test("AGENTS_REPO_PATH is not set twice when also listed", () => {
+    const spec = buildCodexInvocation({ cwd: "/repo", role: "role", model: "", effort: "", agentsRepoPath: "/agents",
+      shellEnv: { AGENTS_REPO_PATH: "/agents", ANDROID_HOME: "/sdk" } });
+    assert.equal(spec.args.filter(arg => arg.startsWith("shell_environment_policy.set.AGENTS_REPO_PATH=")).length, 1);
+  });
+  test("no settings leaves the invocation as before; source review never gets them", () => {
+    const before = buildCodexInvocation({ cwd: "/repo", role: "role", model: "m", effort: "high" });
+    assert.deepEqual(buildCodexInvocation({ cwd: "/repo", role: "role", model: "m", effort: "high", shellEnv: {} }), before);
+    const review = buildCodexInvocation({ cwd: "/tmp/review", role: "role", model: "m", effort: "high", sourceReview: true, shellEnv: { ANDROID_HOME: "/sdk" } });
+    assert.ok(!review.args.some(arg => arg.startsWith("shell_environment_policy.set.ANDROID_HOME")));
   });
 });
 describe("Codex event adapter", () => {

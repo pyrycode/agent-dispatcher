@@ -143,6 +143,20 @@ test("security review remains readable with a core shell environment", async t =
   assert.ok(!observed.argv.some((arg: string) => arg.startsWith("shell_environment_policy.inherit=")));
 });
 
+test("PYRY_AGENT_SHELL_ENV reaches Codex as named overrides, never secrets or withheld Claude settings", async t => {
+  const f = fixture(t, "normal");
+  const result = await runClaudeStreaming({
+    ...f.options,
+    env: { ...f.options.env, PYRY_AGENT_SHELL_ENV: "ANDROID_HOME,JAVA_HOME,FIXTURE_TOKEN,CLAUDE_CONFIG_DIR",
+      ANDROID_HOME: "/fixture/sdk", JAVA_HOME: "/fixture/jbr home", FIXTURE_TOKEN: "fixture-secret" },
+  });
+  assert.equal(result.isError, false, result.output);
+  const argv: string[] = JSON.parse(readFileSync(join(f.dir, "observed.json"), "utf8")).argv;
+  const sets = argv.filter(arg => arg.startsWith("shell_environment_policy.set."));
+  assert.deepEqual(sets, ['shell_environment_policy.set.ANDROID_HOME="/fixture/sdk"', 'shell_environment_policy.set.JAVA_HOME="/fixture/jbr home"']);
+  assert.ok(!argv.some(arg => arg.includes("fixture-secret")));
+});
+
 test("Codex JSON split across chunks and terminal event without newline is consumed", async t => {
   const f = fixture(t, "chunks");
   const result = await runClaudeStreaming(f.options);
