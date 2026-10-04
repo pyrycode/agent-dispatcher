@@ -11,6 +11,7 @@ import {
   decideConflictRoute,
   findMergeCommit,
   decideFinalMergeRoute,
+  decideGateMergeRoute,
   FINAL_MERGE_HANDOFF_MAX,
   hasConflictMarkers,
   latestMergeResolutionNotes,
@@ -77,6 +78,30 @@ describe("decideFinalMergeRoute — a Done ticket's conflict after the retries",
     // The owner as the last stage has no later stage to send it back from.
     const ownerLast = builder.slice(0, 2);
     assert.equal(final(ownerLast, 0).kind, "park");
+  });
+});
+
+describe("decideGateMergeRoute — a conflict the live gate found (2026-10-04)", () => {
+  const classic = resolveStageSet("classic").agents;
+  const builder = resolveStageSet("builder").agents;
+  const gate = (agents: typeof classic, prior: number) =>
+    decideGateMergeRoute(agents, REAL_CLAUDE_GATE_FAIL_COLUMN, prior);
+
+  test("goes to the final merge's owner, straight into the owner's column", () => {
+    // Inbox, where the gate holds a ticket, is not a column the rework router scans.
+    assert.deepEqual(gate(classic, 0), { kind: "route", owner: "developer", column: "In Development" });
+    assert.deepEqual(gate(builder, 1), { kind: "route", owner: "builder", column: "In Development" });
+  });
+
+  test("shares the final merge's budget and parks with the same reason when it is spent", () => {
+    for (const prior of [FINAL_MERGE_HANDOFF_MAX, FINAL_MERGE_HANDOFF_MAX + 1]) {
+      assert.deepEqual(gate(builder, prior), decideFinalMergeRoute(builder, REAL_CLAUDE_GATE_FAIL_COLUMN, prior));
+      assert.equal(gate(builder, prior).kind, "park");
+    }
+  });
+
+  test("parks when the set has nobody to send it to", () => {
+    assert.equal(gate(builder.filter((a) => a.column !== REAL_CLAUDE_GATE_FAIL_COLUMN), 0).kind, "park");
   });
 });
 

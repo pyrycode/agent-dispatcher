@@ -79,6 +79,8 @@ import {
   type GateSpawnOutcome,
   type GateSpawnRequest,
   type StreamResult,
+  runEnvPreflight,
+  type EnvPreflightState,
 } from "./dispatch.js";
 import { formatGateEvidenceComment } from "./gate-output.js";
 import { FINAL_MERGE_HANDOFF_MARKER, MERGE_RESOLUTION_NOTE_MARKER, mergeResolutionComment } from "./merge-handoff.js";
@@ -6139,6 +6141,7 @@ function makeGateDeps(over: Partial<GateRunnerDeps> & {
 } = {}) {
   const calls: string[] = [];
   const spawnRequests: GateSpawnRequest[] = [];
+  const writes: { path: string; text: string }[] = [];
 
   const deps: Partial<GateRunnerDeps> = {
     execSync: ((cmd: string) => {
@@ -6152,6 +6155,8 @@ function makeGateDeps(over: Partial<GateRunnerDeps> & {
       if (over.fileContents === null) throw new Error("ENOENT");
       return over.fileContents ?? '{"Action":"pass","Package":"p","Test":"TestA"}';
     }) as any,
+    // Never the real filesystem: only the import-only resolver writes.
+    writeFileSync: ((path: string, text: string) => { writes.push({ path, text: String(text) }); }) as any,
     statSync: (() => ({ size: 42 })) as any,
     now: () => 0,
     spawnGate: async (req: GateSpawnRequest) => {
@@ -6161,8 +6166,11 @@ function makeGateDeps(over: Partial<GateRunnerDeps> & {
     ...over,
   };
 
-  return { deps, calls, spawnRequests };
+  return { deps, calls, spawnRequests, writes };
 }
+
+/** Any `git merge <rev>` the gate runs, whatever config flags precede it. */
+const isGateMerge = (c: string) => /^git (?:-c \S+ )?merge [0-9a-f]/.test(c);
 
 const GATE_BASE_SHA = "b".repeat(40);
 const GATE_HEAD_SHA = "h".repeat(40);
@@ -6215,13 +6223,22 @@ describe("runRealClaudeGateSuite — worktree safety", () => {
     assert.ok(removes.length >= 2, "expected a pre-run cleanup and a post-run removal");
   });
 
-  test("removes the worktree when the merge conflicts, and reports it", async () => {
-    const { run, calls } = gateRun({ gitFail: (c) => c.startsWith("git merge ") });
+  test("removes the worktree when the merge fails, and reports it", async () => {
+    // No conflicted files and a clean probe: a merge failure that is not a
+    // conflict, so it stays an ordinary run error and is not handed on.
+    const { run, calls } = gateRun({ gitFail: (c) => isGateMerge(c) || c === "git merge --abort" });
     const report = await run();
 
     assert.match(report.runError ?? "", /could not merge/);
+    assert.equal(report.mergeConflict, undefined);
     assert.ok(calls.some(c => c.includes("merge --abort")));
     assert.ok(calls.some(c => c.includes("worktree remove")));
+  });
+
+  test("merges with diff3 markers, as the pre-run merge does, so the import-only resolver can read the base", async () => {
+    const { run, calls } = gateRun();
+    await run();
+    assert.ok(calls.some(c => c === `git -c merge.conflictStyle=diff3 merge ${GATE_BASE_SHA} --no-edit`));
   });
 
   test("moves a leftover worktree that removal refuses aside before creating its own (agent-dispatcher#79)", async () => {
@@ -6510,16 +6527,69 @@ describe("runRealClaudeGateSuite — same-tree re-run before the base comparison
 });
 
 describe("runRealClaudeGateSuite — refusing to run", () => {
-  test("reports a conflict from the merge-tree probe without touching the disk", async () => {
-    // The probe stays in the object database, so it cannot contend with a
-    // live dispatch. Preferred over the pull request's `mergeable` field,
-    // which GitHub computes asynchronously and reports as unknown for a
-    // window after each push.
-    const { run, calls } = gateRun({ probeStatus: 1 });
+  // Until 2026-10-04 a probe conflict ended the run before any worktree
+  // existed, and the ticket parked with `error:real-claude-gate`. The
+  // resolver needs a working tree, so a conflict now gets the gate's own
+  // detached worktree, the same one a clean run uses, and is reported as a
+  // conflict only when the resolver cannot settle it.
+  const CONFLICTED = "app/src/main/java/de/pyryco/mobile/ui/Thread.kt";
+  const conflictOut = (cmd: string) =>
+    cmd === "git diff --name-only --diff-filter=U -z" ? `${CONFLICTED}\0` : GATE_SHAS[cmd] ?? "";
+
+  test("a conflict the import-only resolver cannot settle comes back as a merge conflict, and nothing runs", async () => {
+    // Mobile #1631, 2026-10-04: two changes each added one argument to the
+    // same call. Not imports, so it needs the code owner.
+    const { run, calls, spawnRequests, writes } = gateRun({
+      probeStatus: 1,
+      gitFail: isGateMerge,
+      gitOut: conflictOut,
+      fileContents: "<<<<<<< HEAD\nsend(a, b)\n||||||| base\nsend(a)\n=======\nsend(a, c)\n>>>>>>> bbbb\n",
+    });
     const report = await run();
 
-    assert.match(report.runError ?? "", /conflicts with/);
-    assert.ok(!calls.some(c => c.includes("worktree add")), "no worktree should be created");
+    assert.deepEqual(report.mergeConflict, { paths: [CONFLICTED] });
+    assert.match(report.runError ?? "", /conflicts with `origin\/main`/);
+    assert.ok(report.runError!.includes(CONFLICTED), "the run error names the conflicted file");
+    assert.equal(spawnRequests.length, 0, "the suite never runs on a conflict");
+    assert.equal(writes.length, 0, "a refused resolution writes nothing");
+    assert.ok(calls.some(c => c === "git merge --abort"));
+    assert.ok(calls.some(c => c.includes("worktree remove")));
+  });
+
+  test("an import-only conflict is settled in the gate worktree and the suite runs on the result", async () => {
+    // Mobile #803 shape: both sides added one import at the same slot.
+    const conflicted = [
+      "package de.pyryco.mobile.ui",
+      "",
+      "<<<<<<< HEAD",
+      "import de.pyryco.mobile.data.ThinkingProgress",
+      "||||||| 5c02b67",
+      "=======",
+      "import de.pyryco.mobile.data.SessionSettings",
+      ">>>>>>> main",
+      "",
+      "class Thread",
+    ].join("\n");
+    const { run, calls, spawnRequests, writes } = gateRun({
+      probeStatus: 1,
+      gitFail: isGateMerge,
+      gitOut: conflictOut,
+      readFileSync: ((path: string) => path.endsWith(CONFLICTED)
+        ? conflicted
+        : '{"Action":"pass","Package":"p","Test":"TestA"}') as any,
+    });
+    const report = await run();
+
+    assert.equal(report.runError, null);
+    assert.equal(report.mergeConflict, undefined);
+    assert.deepEqual(report.importResolvedPaths, [CONFLICTED]);
+    assert.equal(writes.length, 1);
+    assert.match(writes[0].text, /SessionSettings\nimport de\.pyryco\.mobile\.data\.ThinkingProgress/);
+    assert.ok(calls.some(c => c === "git commit --no-edit"), "the resolution is committed in the detached worktree");
+    assert.ok(!calls.some(c => c.includes("git push")), "the gate never pushes the resolution");
+    assert.ok(!calls.some(c => c === "git merge --abort"));
+    assert.equal(spawnRequests.length, 1, "the suite runs against the resolved merge");
+    assert.equal(report.tally?.executed, 1);
   });
 
   test("an unsupported probe does not disable the gate", async () => {
@@ -8369,6 +8439,145 @@ test("Codex blocked outcome never retries even if its summary mentions a transie
   assert.ok(!client.addLabelCalls.some(x => x.label.startsWith("error-retry-count:")));
   assert.ok(client.comments.some(x => x.body.includes("codex resume codex-thread")));
   assert.ok(!client.comments.some(x => x.body.includes("claude --resume codex-thread")));
+});
+
+// 2026-10-04: a block whose stated reason is a missing tool or environment
+// variable takes the capped transient retry instead of parking at once.
+describe("Codex blocked on a missing tool or variable — auto-retry", () => {
+  const figma = "Codex task blocked: Required Figma tools `get_design_context` and `get_screenshot` are unavailable. Ticket #1668 needs node 675:5938 read before planning. No files changed; no PR opened.";
+
+  test("schedules a backoff retry instead of parking (mobile #1668)", async () => {
+    const { ctx, client, calls } = makeTestContext({ item: { issueNumber: 1668 } });
+    await handleDispatchError(new Error(figma), ctx,
+      streamResult({ runner: "codex", isError: true, terminalReason: "codex_blocked", sessionId: "codex-thread" }));
+    const labels = client.addLabelCalls.map(c => c.label);
+    assert.deepEqual(labels, ["error-retry-count:1"]);
+    assert.ok(!labels.includes("error:developer"), "a missing tool is not a park");
+    assert.ok(client.comments.some(c => c.body.includes("required tool unavailable")));
+    assert.match(calls.discord[0] ?? "", /auto-retry 1\/4 scheduled/);
+  });
+
+  test("a missing dispatcher variable retries too (mobile #1631)", async () => {
+    const { ctx, client } = makeTestContext({ item: { issueNumber: 1631 } });
+    await handleDispatchError(
+      new Error("Codex task blocked: ANDROID_HOME is missing from the dispatcher environment. Gradle failed with “SDK location not found,” so required tests cannot run."),
+      ctx, streamResult({ runner: "codex", isError: true, terminalReason: "codex_blocked" }));
+    assert.deepEqual(client.addLabelCalls.map(c => c.label), ["error-retry-count:1"]);
+  });
+
+  test("at the retry cap it parks with error:<agent>, as any transient does", async () => {
+    const { ctx, client } = makeTestContext({ item: { issueNumber: 1668, labels: ["error-retry-count:4"] } });
+    await handleDispatchError(new Error(figma), ctx,
+      streamResult({ runner: "codex", isError: true, terminalReason: "codex_blocked" }));
+    assert.ok(client.addLabelCalls.some(c => c.label === "error:developer"));
+    assert.ok(client.comments.some(c => c.body.includes("Transient retries exhausted")));
+  });
+
+  test("an approval rejection parks at once, even beside a missing-tool summary", async () => {
+    for (const [message, denied] of [
+      ["Codex task blocked: Automatic approval review rejected an action. Operator review required.", false],
+      [figma, true],
+    ] as const) {
+      const { ctx, client } = makeTestContext({});
+      await handleDispatchError(new Error(message), ctx,
+        streamResult({ runner: "codex", isError: true, terminalReason: "codex_blocked", hadPermissionDenial: denied }));
+      assert.ok(client.addLabelCalls.some(c => c.label === "error:developer"), message);
+      assert.ok(!client.addLabelCalls.some(c => c.label.startsWith("error-retry-count:")), message);
+    }
+  });
+
+  test("a block that needs a human decision still parks at once", async () => {
+    const { ctx, client } = makeTestContext({});
+    await handleDispatchError(
+      new Error("Codex task blocked: Needs a Figma drawing or Juhana’s approval to reuse the session-boundary style. A human decision is required."),
+      ctx, streamResult({ runner: "codex", isError: true, terminalReason: "codex_blocked" }));
+    assert.ok(client.addLabelCalls.some(c => c.label === "error:developer"));
+    assert.ok(!client.addLabelCalls.some(c => c.label.startsWith("error-retry-count:")));
+  });
+
+  test("end to end: the worktree is still preserved and nothing is salvaged", async () => {
+    const client = new MockGitHubClient({ status: { 1646: "In Development" }, labels: { 1646: [] } });
+    let spawnIndex = 0;
+    const { deps, calls } = makeMockDeps({
+      execImpls: fullHappyExecImpls("feature/1646"),
+      fsMap: { [claudeMdAbsPath("developer/CLAUDE.md")]: "role" },
+      streamResult: () => {
+        spawnIndex = calls.exec.length;
+        return streamResult({ runner: "codex", isError: true, terminalReason: "codex_blocked", sessionId: "codex-thread",
+          output: "Required Figma tools are unavailable in this session. No repository changes, commits, or PR were made." });
+      },
+    });
+    await dispatchToAgent(makeAgentConfig({}), makeProjectItem({ issueNumber: 1646 }), client, deps);
+    assert.ok(client.addLabelCalls.some(c => c.label === "error-retry-count:1"));
+    assert.ok(!client.addLabelCalls.some(c => c.label === "error:developer"));
+    assert.ok(!client.addLabelCalls.some(c => c.label === "done:developer"));
+    assert.ok(!calls.exec.slice(spawnIndex).some(c => c.cmd.includes("git add") || c.cmd.includes("git push")));
+  });
+});
+
+describe("runEnvPreflight — a required variable missing from the dispatcher holds dispatch (2026-10-04)", () => {
+  test("holds and notifies once while the same variable stays missing", async () => {
+    const state: EnvPreflightState = { announced: null };
+    const sent: string[] = [];
+    const run = () => runEnvPreflight({
+      required: ["ANDROID_HOME", "JAVA_HOME"],
+      env: { JAVA_HOME: "/jbr" },
+      state,
+      notify: async (m) => { sent.push(m); },
+    });
+
+    assert.deepEqual(await run(), ["ANDROID_HOME"]);
+    assert.deepEqual(await run(), ["ANDROID_HOME"], "still held on the next cycle");
+    assert.deepEqual(await run(), ["ANDROID_HOME"]);
+    assert.equal(sent.length, 1, "one Discord message, not one per cycle");
+    assert.match(sent[0]!, /`ANDROID_HOME` missing from the dispatcher environment/);
+    assert.match(sent[0]!, /PYRY_REQUIRED_ENV/);
+  });
+
+  test("a blank value counts as missing", async () => {
+    const state: EnvPreflightState = { announced: null };
+    const missing = await runEnvPreflight({ required: ["ANDROID_HOME"], env: { ANDROID_HOME: "  " }, state, notify: async () => {} });
+    assert.deepEqual(missing, ["ANDROID_HOME"]);
+  });
+
+  test("nothing declared, or everything present, never holds or notifies", async () => {
+    const sent: string[] = [];
+    const notify = async (m: string) => { sent.push(m); };
+    assert.deepEqual(await runEnvPreflight({ required: [], env: {}, state: { announced: null }, notify }), []);
+    assert.deepEqual(await runEnvPreflight({ required: ["ANDROID_HOME"], env: { ANDROID_HOME: "/sdk" }, state: { announced: null }, notify }), []);
+    assert.equal(sent.length, 0);
+  });
+
+  test("a different missing set is announced again, and recovery re-arms the notice", async () => {
+    const state: EnvPreflightState = { announced: null };
+    const sent: string[] = [];
+    const notify = async (m: string) => { sent.push(m); };
+    const required = ["ANDROID_HOME", "JAVA_HOME"];
+
+    await runEnvPreflight({ required, env: {}, state, notify });
+    await runEnvPreflight({ required, env: { JAVA_HOME: "/jbr" }, state, notify });
+    assert.equal(sent.length, 2, "the set changed, so the operator hears about it");
+    assert.deepEqual(await runEnvPreflight({ required, env: { JAVA_HOME: "/jbr", ANDROID_HOME: "/sdk" }, state, notify }), []);
+    assert.equal(state.announced, null);
+    await runEnvPreflight({ required, env: { JAVA_HOME: "/jbr" }, state, notify });
+    assert.equal(sent.length, 3, "a fresh outage after recovery is announced again");
+  });
+
+  test("a failing Discord webhook does not stop the hold", async () => {
+    const missing = await runEnvPreflight({
+      required: ["ANDROID_HOME"], env: {}, state: { announced: null },
+      notify: async () => { throw new Error("webhook 500"); },
+    });
+    assert.deepEqual(missing, ["ANDROID_HOME"]);
+  });
+
+  test("the poll loop holds the live gate, the main sweep and selection on it (source tripwire)", () => {
+    const src = readDispatchSource();
+    assert.match(src, /const gateRunner = envHeld \? null : realClaudeGateRunner;/);
+    assert.equal((src.match(/^\s+gateRunner,$/gm) ?? []).length, 2, "both gate calls take the held runner");
+    assert.match(src, /envHeld\s*\?\s*\{ candidates: \[\], tallies: new Map<number, number>\(\) \}\s*:\s*await selectPastParkedFamilies/);
+    assert.match(src, /if \(mainSweep !== null && sweepRun === null && !gateActive && !envHeld\)/);
+  });
 });
 
 test("Codex blocked work, including shutdown timeout, preserves edits without salvage", async () => {

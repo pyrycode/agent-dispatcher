@@ -694,6 +694,21 @@ export interface GateRunReport {
    * and why. Absent when the fork has selection off, so every run is full.
    */
   selection?: GateSelection;
+  /**
+   * Set when the branch conflicts with the base and the import-only resolver
+   * could not settle it, so nothing ran. `paths` lists the conflicted files,
+   * empty when git could not name them. `runError` is set as well, so any
+   * reader that does not know this field still parks the ticket as before.
+   * The execution step hands such a ticket to its code owner to finish the
+   * merge (see merge-handoff.ts) instead of parking it.
+   */
+  mergeConflict?: { paths: string[] };
+  /**
+   * Files where the branch and the base both added imports at the same spot,
+   * which the import-only resolver (merge-resolve.ts) settled in the gate's
+   * own merge before the run. Absent or empty when the merge was clean.
+   */
+  importResolvedPaths?: string[];
 }
 
 /**
@@ -766,6 +781,12 @@ export function formatGateEvidenceComment(opts: {
       ? `- Commits behind \`${report.baseRef}\` before the merge: could not be computed`
       : `- The branch was **${report.commitsBehind} commit(s) behind** \`${report.baseRef}\` before the merge`,
   );
+  if ((report.importResolvedPaths?.length ?? 0) > 0) {
+    lines.push(
+      `- The merge conflicted only where both sides added imports, in ${report.importResolvedPaths!.map(p => `\`${p}\``).join(", ")}. ` +
+      `The run kept both sets in sorted order, as the dispatcher's own merges do`,
+    );
+  }
   lines.push(
     `- Exit status \`${report.exitCode ?? "none"}\`` +
     (report.timedOut ? " (killed by the outer timeout)" : "") +

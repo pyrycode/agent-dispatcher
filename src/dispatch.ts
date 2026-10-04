@@ -100,6 +100,9 @@ import {
   shouldAddReadyLabel,
   shouldSkipDispatch,
   classifyAgentError,
+  classifyBlockedRun,
+  missingRequiredEnv,
+  parseRequiredEnv,
   backoffDelayMs,
   isRetryEligible,
   extractErrorRetryCount,
@@ -233,6 +236,13 @@ const defaultBranch = resolveDefaultBranch(process.env.TARGET_DEFAULT_BRANCH);
 // (`;`-delimited shell commands), or `SALVAGE_GATES=""` to opt out of
 // gating entirely.
 const salvageGates = parseSalvageGates(process.env.SALVAGE_GATES);
+
+// Environment variables this fork cannot work without, from
+// `PYRY_REQUIRED_ENV` (comma- or space-separated names). Empty by default,
+// which makes the preflight a no-op. When one is missing or blank in the
+// dispatcher's own environment, nothing that needs it starts: no agent
+// dispatch, no live gate, no main sweep. See `runEnvPreflight`.
+const REQUIRED_ENV_NAMES = parseRequiredEnv(process.env.PYRY_REQUIRED_ENV);
 
 // Auto-curation of the memory index (opt-in). When the lesson floor — the part
 // the deterministic trim cannot reduce — crosses the watermark, the dispatcher
@@ -2377,9 +2387,17 @@ export async function handleDispatchError(
     // than on whichever wording the API happened to use. 15 of 79 such
     // failures parked a human on a wording the allowlist had never seen
     // (measured 2026-08-24 over 4103 logs) — see API_ERROR_TERMINAL_REASON.
-    const { transient, signature } = ["codex_blocked", "needs_refinement"].includes(streamResult?.terminalReason ?? "")
-      ? { transient: false, signature: "" }
-      : classifyAgentError(classifyText, { terminalReason: streamResult?.terminalReason });
+    //
+    // A blocked Codex run is the agent's own judgement, so the transport
+    // allowlist never reads it. Only a stated missing tool, MCP server or
+    // environment variable retries (classifyBlockedRun, 2026-10-04); a
+    // rejected action and every other block still park at once.
+    const terminalReason = streamResult?.terminalReason ?? "";
+    const { transient, signature } = terminalReason === "codex_blocked"
+      ? classifyBlockedRun(classifyText, { approvalRejected: streamResult?.hadPermissionDenial === true })
+      : terminalReason === "needs_refinement"
+        ? { transient: false, signature: "" }
+        : classifyAgentError(classifyText, { terminalReason: streamResult?.terminalReason });
     if (transient) {
       const outcome = await scheduleTransientRetry({ agent, item, client, logFile, signature, deps: ctx.deps });
       if (outcome.kind === "retry") {
@@ -4927,6 +4945,8 @@ export interface GateRunnerDeps {
   spawnSync: typeof spawnSync;
   mkdirSync: typeof mkdirSync;
   readFileSync: typeof readFileSync;
+  /** Only the import-only resolver writes, inside the gate's own worktree. */
+  writeFileSync: typeof writeFileSync;
   statSync: typeof statSync;
   spawnGate: GateSpawner;
   now: () => number;
@@ -4942,6 +4962,7 @@ export const DEFAULT_GATE_RUNNER_DEPS: GateRunnerDeps = {
   spawnSync,
   mkdirSync,
   readFileSync,
+  writeFileSync,
   statSync,
   spawnGate: spawnGateCommand,
   now: Date.now,
@@ -4979,7 +5000,9 @@ export const DEFAULT_GATE_RUNNER_DEPS: GateRunnerDeps = {
  *    working tree exists. The probe stays in the object database, so it
  *    cannot contend with a live dispatch's worktree. Preferred over the pull
  *    request's `mergeable` field, which GitHub computes asynchronously and
- *    reports as unknown for a window after every push.
+ *    reports as unknown for a window after every push. A conflict no longer
+ *    ends the run here: the merge in step 4 gets the import-only resolver
+ *    first, as every other merge the dispatcher makes does.
  *
  * 4. **Create the worktree DETACHED.** This is load-bearing twice over.
  *    Checking out the branch and merging the base into it would leave a merge
@@ -4989,6 +5012,13 @@ export const DEFAULT_GATE_RUNNER_DEPS: GateRunnerDeps = {
  *    commits that must never be pushed. The gate would poison every ticket it
  *    passed. Separately, a detached worktree holds no branch, so it can never
  *    collide with a live dispatch worktree.
+ *
+ *    A conflict where both sides only added imports is settled in this
+ *    worktree by `resolveImportOnlyMerge`, and the run goes ahead on the
+ *    result. The resolution is never pushed: the next stage's own pre-run
+ *    merge settles the same conflict the same way. Any other conflict comes
+ *    back as `mergeConflict`, which the execution step hands to the code
+ *    owner to finish the merge (reconcile.ts, 2026-10-04).
  *
  * 5. **Run the command, then judge by reading the output file back off
  *    disk** rather than from an in-memory buffer, so the bytes that produced
@@ -5144,13 +5174,12 @@ export async function runRealClaudeGateSuite(opts: {
     ["merge-tree", "--write-tree", report.baseSha, report.headSha],
     { cwd: targetRepo, encoding: "utf-8", timeout: 120_000 },
   );
-  if (probe.status === 1) {
-    return finish(
-      `\`${branchName}\` conflicts with \`${baseRef}\`, so there is no merged state to gate. ` +
-      `Resolve the conflict and the gate will run on the next cycle.`,
+  const probeConflict = probe.status === 1;
+  if (probeConflict) {
+    console.log(
+      `   🔀 Real-claude gate: \`${branchName}\` conflicts with \`${baseRef}\`; trying the import-only resolver before handing it on`,
     );
-  }
-  if (probe.status !== 0) {
+  } else if (probe.status !== 0) {
     // An unsupported or failing probe must not disable the gate: the merge
     // in step 4 would surface a real conflict anyway. Note it and continue.
     console.warn(
@@ -5173,12 +5202,38 @@ export async function runRealClaudeGateSuite(opts: {
     return finish(`could not create the gate worktree: ${e?.message ?? e}`);
   }
 
+  // diff3 markers carry the common ancestor, which is how an import-only
+  // conflict is told apart from one that needs judgement (merge-resolve.ts),
+  // exactly as in the pre-run merge.
   try {
-    deps.execSync(`git merge ${report.baseSha} --no-edit`, { cwd: worktreeDir, stdio: "pipe", timeout: 120_000 });
+    deps.execSync(`git -c merge.conflictStyle=diff3 merge ${report.baseSha} --no-edit`, { cwd: worktreeDir, stdio: "pipe", timeout: 120_000 });
   } catch (e: any) {
-    try { deps.execSync(`git merge --abort`, { cwd: worktreeDir, stdio: "pipe" }); } catch {}
-    removeWorktree();
-    return finish(`could not merge ${baseRef} into ${branchName} for the run: ${e?.message ?? e}`);
+    // Read the conflicted files before the resolver stages anything, so a
+    // resolver that fails half way still leaves a conflict reported as one.
+    let conflicted: string[] = [];
+    try {
+      conflicted = String(deps.execSync(`git diff --name-only --diff-filter=U -z`, { cwd: worktreeDir, encoding: "utf-8", stdio: "pipe" }))
+        .split("\0").filter(Boolean);
+    } catch {}
+    const resolvedPaths = conflicted.length > 0 ? resolveImportOnlyMerge(worktreeDir, deps) : null;
+    if (resolvedPaths !== null) {
+      report.importResolvedPaths = resolvedPaths;
+      console.log(
+        `   🔀 Real-claude gate: kept both sides' imports in ${resolvedPaths.length} file(s); running against that merge`,
+      );
+    } else {
+      try { deps.execSync(`git merge --abort`, { cwd: worktreeDir, stdio: "pipe" }); } catch {}
+      removeWorktree();
+      if (probeConflict || conflicted.length > 0) {
+        report.mergeConflict = { paths: conflicted };
+        return finish(
+          `\`${branchName}\` conflicts with \`${baseRef}\`, so there is no merged state to gate. ` +
+          (conflicted.length > 0 ? `Conflicted: ${conflicted.map(p => `\`${p}\``).join(", ")}. ` : "") +
+          `Resolve the conflict and the gate will run on the next cycle.`,
+        );
+      }
+      return finish(`could not merge ${baseRef} into ${branchName} for the run: ${e?.message ?? e}`);
+    }
   }
 
   // 5. Run it, then judge what landed on disk.
@@ -6978,6 +7033,71 @@ export function decideDrainNotification(opts: {
   return { notify: false, armed: false };
 }
 
+/** What the preflight remembers between cycles: the missing set it last announced. */
+export interface EnvPreflightState {
+  announced: string | null;
+}
+
+/**
+ * Hold work while a variable the fork declares in `PYRY_REQUIRED_ENV` is
+ * missing or blank in the dispatcher's own environment. Returns the missing
+ * names; empty means carry on as usual.
+ *
+ * Why. On 2026-10-03 the mobile dispatcher came back from a restart without
+ * `ANDROID_HOME`. The next builder run, #1631, found Gradle failing with "SDK
+ * location not found" and parked with `error:builder`, though nothing was
+ * wrong with the ticket. Every run started in that environment would have
+ * done the same, and the live gate and main sweep need the same SDK. Checking
+ * a name in `process.env` costs nothing; an agent run that discovers it costs
+ * minutes and a parked ticket.
+ *
+ * Only the dispatcher's environment is checked. No agent is spawned to probe
+ * tools or MCP servers, which would cost as much as the run it protects; a
+ * flaky MCP server is left to the blocked-run auto-retry instead.
+ *
+ * Announced once per missing set, with a warning and a Discord message, and
+ * one short log line every cycle after that, so the channel is not flooded
+ * every poll. The set cannot change without a restart, so in practice that is
+ * once per dispatcher process.
+ */
+export async function runEnvPreflight(opts: {
+  required: readonly string[];
+  env: Readonly<Record<string, string | undefined>>;
+  state: EnvPreflightState;
+  notify: (message: string) => Promise<void>;
+}): Promise<string[]> {
+  const missing = missingRequiredEnv(opts.required, opts.env);
+  if (missing.length === 0) {
+    if (opts.state.announced !== null) {
+      console.log(`   ✅ Required environment present again (${opts.required.join(", ")}); dispatch resumes`);
+      opts.state.announced = null;
+    }
+    return missing;
+  }
+  const key = missing.join(",");
+  if (opts.state.announced === key) {
+    console.log(`   ⏸️  Dispatch held: ${missing.join(", ")} still missing from the dispatcher environment`);
+    return missing;
+  }
+  opts.state.announced = key;
+  const names = missing.map((n) => `\`${n}\``).join(", ");
+  console.warn(
+    `   🛑 ${missing.join(", ")} missing from the dispatcher environment, and this fork declares ` +
+    `${missing.length > 1 ? "them" : "it"} required in PYRY_REQUIRED_ENV. Holding agent dispatch, the live gate ` +
+    `and the main sweep. Restart the dispatcher with ${missing.length > 1 ? "them" : "it"} set.`,
+  );
+  try {
+    await opts.notify(
+      `🛑 **${process.env.GITHUB_REPO ?? "dispatcher"}**: ${names} missing from the dispatcher environment ` +
+      `(required by PYRY_REQUIRED_ENV). No agent, live gate or main sweep starts until the dispatcher is restarted ` +
+      `with ${missing.length > 1 ? "them" : "it"} set. Board upkeep and merges carry on.`,
+    );
+  } catch (e: any) {
+    console.warn(`   ⚠️  Discord notify failed for the environment preflight: ${e?.message ?? e}`);
+  }
+  return missing;
+}
+
 export async function pollLoop(): Promise<void> {
   const client = new GitHubProjectClient({
     owner: process.env.GITHUB_OWNER!,
@@ -7057,6 +7177,11 @@ export async function pollLoop(): Promise<void> {
     }
   }
   console.log(`   Family breaker: ${FAMILY_DISPATCH_LIMIT} dispatches per ticket family (PYRY_FAMILY_DISPATCH_LIMIT)`);
+  console.log(
+    `   Required environment: ${REQUIRED_ENV_NAMES.length > 0 ? REQUIRED_ENV_NAMES.join(", ") : "none declared"} (PYRY_REQUIRED_ENV)`,
+  );
+  // The missing set the preflight last announced, so it notifies once.
+  const envPreflight: EnvPreflightState = { announced: null };
 
   // Real-claude gate execution. Null when PYRY_REAL_CLAUDE_GATE_CMD is unset,
   // which makes the whole step a no-op and leaves gated tickets parked for an
@@ -7264,11 +7389,22 @@ export async function pollLoop(): Promise<void> {
     // In the background mode it waits only for verifiers and the main sweep,
     // and while it waits or runs, only verifiers are held back. The run goes
     // on beside the loop; the next gate run starts after it settles.
+    //
+    // A required environment variable missing from this process holds the
+    // gate, the main sweep and agent dispatch below. Board upkeep and merges
+    // carry on. See runEnvPreflight.
+    const envHeld = (await runEnvPreflight({
+      required: REQUIRED_ENV_NAMES,
+      env: process.env,
+      state: envPreflight,
+      notify: notifyDiscord,
+    })).length > 0;
+    const gateRunner = envHeld ? null : realClaudeGateRunner;
     let gateHeld = false;
     if (!REAL_CLAUDE_GATE_BACKGROUND) {
       gateHeld = await runRealClaudeGateExecution(
         client,
-        realClaudeGateRunner,
+        gateRunner,
         REAL_CLAUDE_GATE_MIN_EXECUTED,
         notifyDiscord,
         // A running main sweep holds the emulators the same way a run does.
@@ -7283,7 +7419,7 @@ export async function pollLoop(): Promise<void> {
         : 0;
       gateHeld = await runRealClaudeGateExecution(
         client,
-        realClaudeGateRunner,
+        gateRunner,
         REAL_CLAUDE_GATE_MIN_EXECUTED,
         notifyDiscord,
         verifiersInFlight + (sweepRun !== null ? 1 : 0),
@@ -7372,13 +7508,15 @@ export async function pollLoop(): Promise<void> {
     // Family circuit breaker: between selection and prep, before any
     // wip:<agent> write or worktree creation. See selectPastParkedFamilies.
     const seats = freeSeats(MAX_CONCURRENT, pool.size);
-    const { candidates: selected, tallies: familyTallies } = await selectPastParkedFamilies({
-      itemsByColumn,
-      pollOrder,
-      maxConcurrent: seats,
-      rootLabelsByIssue,
-      client,
-    });
+    const { candidates: selected, tallies: familyTallies } = envHeld
+      ? { candidates: [], tallies: new Map<number, number>() }
+      : await selectPastParkedFamilies({
+        itemsByColumn,
+        pollOrder,
+        maxConcurrent: seats,
+        rootLabelsByIssue,
+        client,
+      });
     const candidates = gateHeld && !REAL_CLAUDE_GATE_BACKGROUND
       ? []
       : holdVerifiersDuringSweep(excludeInFlight(selected, pool.keys()), sweepRun !== null || gateHoldsVerifiers);
@@ -7387,7 +7525,8 @@ export async function pollLoop(): Promise<void> {
     // Edge-triggered "board drained" ping: fire once when the board goes from
     // busy to nothing-left-to-dispatch, so the operator knows the agents are
     // done or stuck and it's time to look. A held gate is not a drained board.
-    const drain = decideDrainNotification({ hasCandidates: dispatched || gateHeld || gateRun !== null, activeWork, armed: sawActiveWork });
+    // A board held by the environment preflight is not drained either.
+    const drain = decideDrainNotification({ hasCandidates: dispatched || gateHeld || gateRun !== null || envHeld, activeWork, armed: sawActiveWork });
     sawActiveWork = drain.armed;
     if (drain.notify) {
       await notifyDiscord(`📭 **${process.env.GITHUB_REPO}**: no tickets left to dispatch. Everything is done, blocked, or parked for review.`);
@@ -7457,7 +7596,7 @@ export async function pollLoop(): Promise<void> {
     // In-depth run against main, in the background, never beside a
     // verifier's gates. After the merge so this cycle's merge counts. See
     // startMainSweepCycle.
-    if (mainSweep !== null && sweepRun === null && !gateActive) {
+    if (mainSweep !== null && sweepRun === null && !gateActive && !envHeld) {
       const verifierBusy = [...pool.keys()].some((k) => k.startsWith("verifier#")) ||
         [...itemsByColumn.values()].some((items) => items.some((i) => i.labels.includes("wip:verifier")));
       const { finished } = await startMainSweepCycle({

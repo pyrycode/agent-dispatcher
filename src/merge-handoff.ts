@@ -160,6 +160,34 @@ export function decideFinalMergeRoute(
   return { kind: "route", owner: route.owner, column: last.column };
 }
 
+// The live gate. A real-claude gate run merges main into the branch before it
+// runs the suite. Until 2026-10-04 a conflict there parked the ticket with
+// `error:real-claude-gate` for a human: mobile #1337 twice on 2026-10-01, 17
+// and 18 commits behind main, and #1631 on 2026-10-04, where two changes had
+// each added one argument to the same call. Each sat for hours until someone
+// merged main into the branch. The gate first tries the import-only resolver
+// in its own merge, then takes the final merge's route: the same owner, the
+// same labels, and the same budget. Its comments open with
+// FINAL_MERGE_HANDOFF_MARKER too, so gate and final-merge handoffs together
+// give a ticket FINAL_MERGE_HANDOFF_MAX routes before the next conflict parks.
+//
+// The ticket goes straight to the owner's column, where a failing gate run
+// also sends it. The gate's holding column, Inbox, is not one the rework
+// router scans, so the ticket cannot wait there for it.
+
+/**
+ * Decide who settles a conflict the live gate found. Same owner and budget
+ * as `decideFinalMergeRoute`; only the column differs, see above.
+ */
+export function decideGateMergeRoute(
+  agents: readonly AgentConfig[],
+  ownerColumn: string,
+  priorHandoffs: number,
+): FinalMergeRoute {
+  const route = decideFinalMergeRoute(agents, ownerColumn, priorHandoffs);
+  return route.kind === "route" ? { ...route, column: ownerColumn } : route;
+}
+
 /** A merge left in progress for the owner's run, and what the check needs. */
 export type PendingMerge = {
   /** Files git left conflicted, relative to the worktree. */

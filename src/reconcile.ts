@@ -29,6 +29,7 @@ import { type ProjectItem } from "./types.js";
 import { activeStageSet } from "./stage-sets.js";
 import {
   MANUAL_ADVANCE_GATES,
+  REAL_CLAUDE_GATE_FAIL_COLUMN,
   REAL_CLAUDE_GATE_FROM_COLUMN,
   REAL_CLAUDE_GATE_LABEL,
   REAL_CLAUDE_GATE_RUNNING_LABEL,
@@ -45,7 +46,14 @@ import {
   extractReworkCount,
   isRetryWaiting,
   REWORK_TARGET_ERROR_LABEL,
+  type RealClaudeGateRunCandidate,
 } from "./pipeline-decisions.js";
+import {
+  FINAL_MERGE_HANDOFF_MARKER,
+  FINAL_MERGE_HANDOFF_MAX,
+  MERGE_HANDOFF_LABEL,
+  decideGateMergeRoute,
+} from "./merge-handoff.js";
 import { selectDispatches } from "./dispatch-selection.js";
 import { formatGateEvidenceComment, gateRunFloor, type GateRunReport } from "./gate-output.js";
 import type { FlakyRunContext, FlakyTicketResult } from "./flaky-tickets.js";
@@ -76,6 +84,9 @@ export interface ReconcileClient {
    */
   getIssueLabels(issueNumber: number): Promise<string[]>;
   getOpenBlockers(issueNumber: number): Promise<number[]>;
+  /** How many of the issue's comments contain `marker`. The live gate reads
+   *  the merge-handoff budget it shares with the final merge through it. */
+  countMarkerComments(issueNumber: number, marker: string): Promise<number>;
   clearItemsCache(): void;
 }
 
@@ -591,6 +602,18 @@ export async function runRealClaudeGateExecution(
         };
       }
 
+      // A conflict with the base is neither the branch's test failure nor an
+      // environment problem: the code owner can settle it. Hand it over the
+      // way the final merge does (merge-handoff.ts), without a rework and
+      // without the error label. When the shared budget is spent, or the
+      // route cannot be written, fall through and park exactly as before.
+      let conflictParkNote = "";
+      if (report.mergeConflict) {
+        const handoff = await handOffGateConflict(client, candidate, report, notifyDiscord);
+        if (handoff.kind === "routed") return;
+        conflictParkNote = handoff.reason;
+      }
+
       const raw = decideGateVerdict({
         runError: report.runError,
         timedOut: report.timedOut,
@@ -608,6 +631,7 @@ export async function runRealClaudeGateExecution(
         baselineFailures: report.baselineFailures,
         rerunFailures: report.rerunFailures,
       });
+      if (conflictParkNote !== "") reason = `${reason} ${conflictParkNote.replace(/\.$/, "")}`;
       let inheritedTickets: InheritedTicketResult = { blockers: [], untracked: [] };
       if (preExisting.length > 0) {
         try {
@@ -765,6 +789,75 @@ export async function runRealClaudeGateExecution(
   }
   await work();
   return false;
+}
+
+/**
+ * Send a gated ticket whose branch conflicts with the base to its code owner,
+ * only to finish the merge (see `decideGateMergeRoute` for the incidents).
+ * The same comment marker, labels and owner as the final merge's handoff in
+ * dispatch.ts: the rework router then moves nothing and counts nothing, the
+ * owner's next run meets the conflict in its own pre-run merge and finishes
+ * it there, and the review stages and this gate run again after it.
+ * `needs-real-claude` stays on throughout.
+ *
+ * Returns `park` with one sentence for the evidence comment when the shared
+ * handoff budget is spent, when the earlier handoffs cannot be counted, or
+ * when a write fails. The caller then parks the ticket exactly as it did
+ * before this route existed. The comment is posted before the labels and the
+ * move, so a failed attempt still counts toward the budget.
+ */
+async function handOffGateConflict(
+  client: ReconcileClient,
+  candidate: RealClaudeGateRunCandidate,
+  report: GateRunReport,
+  notifyDiscord: (message: string) => Promise<void>,
+): Promise<{ kind: "routed" } | { kind: "park"; reason: string }> {
+  let prior: number;
+  try {
+    prior = await client.countMarkerComments(candidate.issueNumber, FINAL_MERGE_HANDOFF_MARKER);
+  } catch (e: any) {
+    return { kind: "park", reason: `Its earlier merge handoffs could not be counted, so it was not sent on: ${e?.message ?? e}.` };
+  }
+  const route = decideGateMergeRoute(activeStageSet().agents, REAL_CLAUDE_GATE_FAIL_COLUMN, prior);
+  if (route.kind === "park") return route;
+
+  const files = report.mergeConflict?.paths ?? [];
+  const behind = report.commitsBehind === null ? "" : `, ${report.commitsBehind} commit(s) behind it,`;
+  try {
+    await client.addComment(
+      candidate.issueNumber,
+      `${FINAL_MERGE_HANDOFF_MARKER}\n## 🔀 Live gate merge sent to ${route.owner}\n\n` +
+      `The real-claude gate merges \`${report.baseRef}\` into \`${report.branchName}\` before it runs the live suite. ` +
+      `The branch${behind} conflicts with it` +
+      (files.length > 0 ? ` in:\n\n${files.map(p => `- \`${p}\``).join("\n")}\n\n` : `. `) +
+      `The conflict is more than imports added on both sides, so the dispatcher cannot settle it, and nothing ran.\n\n` +
+      `This ticket goes back to ${route.owner} only to finish this merge. It does not count as a rework. ` +
+      `${route.owner}'s next run merges the default branch into \`${report.branchName}\` and settles the conflict. ` +
+      `\`${REAL_CLAUDE_GATE_LABEL}\` stays on, so after the review stages the live gate runs again on the merged branch.\n\n` +
+      `This is merge handoff ${prior + 1} of ${FINAL_MERGE_HANDOFF_MAX}, counted together with any final-merge handoffs. ` +
+      `If the branch conflicts again after the last one, the ticket parks for a human.`,
+    );
+    await client.addLabel(candidate.issueNumber, MERGE_HANDOFF_LABEL);
+    await client.addLabel(candidate.issueNumber, `needs-rework:${route.owner}`);
+    await client.updateItemStatus(candidate.itemId, route.column);
+  } catch (e: any) {
+    console.warn(`   ⚠️  Real-claude gate: failed to send #${candidate.issueNumber}'s merge to ${route.owner}: ${e?.message ?? e}`);
+    return { kind: "park", reason: `Sending it to ${route.owner} to finish the merge failed: ${e?.message ?? e}.` };
+  }
+
+  console.log(
+    `   🔀 Real-claude gate #${candidate.issueNumber}: conflicts with ${report.baseRef}; sent to ${route.owner} ` +
+    `in ${route.column} to finish the merge (not a rework, handoff ${prior + 1}/${FINAL_MERGE_HANDOFF_MAX})`,
+  );
+  try {
+    await notifyDiscord(
+      `🔀 Live gate merge conflict on #${candidate.issueNumber} — sent back to ${route.owner} to finish the merge ` +
+      `(handoff ${prior + 1}/${FINAL_MERGE_HANDOFF_MAX}).`,
+    );
+  } catch (e: any) {
+    console.warn(`   ⚠️  Discord notify failed for #${candidate.issueNumber}: ${e?.message ?? e}`);
+  }
+  return { kind: "routed" };
 }
 
 /** Default for `runRealClaudeGateExecution`'s flake filing: file nothing. */

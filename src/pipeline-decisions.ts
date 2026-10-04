@@ -2272,6 +2272,104 @@ export function classifyAgentError(
 }
 
 /**
+ * Reasons a Codex agent gives for stopping with `status: blocked` that a
+ * later run can clear by itself: a tool, MCP server or environment variable
+ * it needs was missing or unavailable when it looked.
+ *
+ * Every pattern comes from a summary that parked a ticket for a cause outside
+ * the ticket's own work:
+ *   - "Required Figma tools are unavailable in this session" (mobile #1646,
+ *     2026-10-03) and "Required Figma tools `get_design_context` and
+ *     `get_screenshot` are unavailable" (mobile #1668, 2026-10-04). Both
+ *     cleared on their own; a Codex call to the Figma `whoami` tool worked
+ *     hours later the same day. Desktop #1696 said "those tools are
+ *     unavailable" on 2026-09-30.
+ *   - "ANDROID_HOME is missing from the dispatcher environment" (mobile
+ *     #1631, 2026-10-03) and "AGENTS_REPO_PATH is unset" (mobile #1305,
+ *     2026-09-30). The dispatcher's environment, not the agent's work.
+ *
+ * Kept narrow on purpose. Checked against every blocked summary in the
+ * Mobile, Desktop and pyrycode logs up to 2026-10-04, 23 distinct ones: it
+ * matches the five above and none of the eighteen that need a person, such as
+ * a role conflict, a missing design decision or a denied permission.
+ *
+ * The variable pattern is case-sensitive so that only an upper-case name with
+ * an underscore reads as an environment variable, never a field or a word.
+ */
+export const BLOCKED_RETRY_PATTERNS: readonly { signature: string; pattern: RegExp }[] = [
+  {
+    signature: "required tool unavailable",
+    pattern: /\b(?:tools?|mcp(?: servers?)?)\b(?:(?!\.\s)[^\n]){0,160}?\b(?:is|are|was|were)\s+(?:unavailable|not available|not connected|disconnected)\b/i,
+  },
+  {
+    signature: "environment variable missing",
+    pattern: /\b[A-Z][A-Z0-9]*_[A-Z0-9_]*[A-Z0-9]\b`?\s+(?:environment variable\s+)?(?:is|was)\s+(?:missing|unset|not set|empty)\b/,
+  },
+  {
+    signature: "environment variable missing",
+    pattern: /\bmissing\s+(?:required\s+)?environment\s+variables?\b/i,
+  },
+];
+
+/**
+ * Words that mean a person has to act, whatever else the summary says. Any of
+ * them keeps a blocked run parked even when it also names a missing tool. The
+ * automatic approval reviewer's rejection is the most important one: retrying
+ * it would repeat an action that was refused.
+ */
+export const BLOCKED_NEVER_RETRY = /\bapproval\b|unacceptable risk|permission denied|\bhuman\b|\bmaintainer\b|\bdecision\b/i;
+
+/**
+ * Classify a Codex run that stopped with `status: blocked`. Transient only
+ * when its stated reason is a missing or unavailable tool, MCP server or
+ * environment variable (`BLOCKED_RETRY_PATTERNS`), and nothing in it says a
+ * person must act (`BLOCKED_NEVER_RETRY`). A rejected action is never
+ * transient, whatever the text says.
+ *
+ * Transient blocked runs go through the same capped auto-retry as transport
+ * errors. A tool that stays missing parks at the cap, as before, about 75
+ * minutes later instead of at once.
+ *
+ * Separate from `classifyAgentError` because a blocked summary is the agent's
+ * own prose. The transport allowlist must never read it: a blocked summary
+ * mentioning "connection reset" is still a block (see dispatch.test.ts).
+ */
+export function classifyBlockedRun(
+  text: string | null | undefined,
+  opts?: { approvalRejected?: boolean },
+): { transient: boolean; signature: string } {
+  if (!text || opts?.approvalRejected) return { transient: false, signature: "" };
+  if (BLOCKED_NEVER_RETRY.test(text)) return { transient: false, signature: "" };
+  for (const entry of BLOCKED_RETRY_PATTERNS) {
+    if (entry.pattern.test(text)) return { transient: true, signature: entry.signature };
+  }
+  return { transient: false, signature: "" };
+}
+
+// --------- Required environment preflight ---------
+
+/**
+ * The names in `PYRY_REQUIRED_ENV`: separated by commas or whitespace, with
+ * blanks and repeats dropped. Unset or empty means nothing is required, which
+ * keeps the preflight a no-op for every fork that does not opt in.
+ */
+export function parseRequiredEnv(raw: string | undefined): string[] {
+  return [...new Set((raw ?? "").split(/[\s,]+/).filter(Boolean))];
+}
+
+/**
+ * The required names that are unset or blank in `env`, in declared order. A
+ * blank value counts as missing: `ANDROID_HOME=` is no more use to Gradle
+ * than no `ANDROID_HOME` at all.
+ */
+export function missingRequiredEnv(
+  required: readonly string[],
+  env: Readonly<Record<string, string | undefined>>,
+): string[] {
+  return required.filter((name) => (env[name] ?? "").trim() === "");
+}
+
+/**
  * Deterministic [0,1) PRNG seeded on (issueNumber, attempt). Same inputs
  * always yield the same value, so `backoffDelayMs` produces a STABLE
  * `eligible_at` across the poll cycles that recompute it from board state

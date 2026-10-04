@@ -119,6 +119,8 @@ import {
   shouldAddReadyLabel,
   shouldSkipDispatch,
   classifyAgentError,
+  missingRequiredEnv,
+  parseRequiredEnv,
 } from "./pipeline-decisions.js";
 import { buildBaselineCommand, buildBaselineFilter, formatGateEvidenceComment, parseGateOutput, stripPackageQualifier } from "./gate-output.js";
 import { mapParentChain } from "./github.js";
@@ -4930,6 +4932,20 @@ describe("formatGateEvidenceComment", () => {
     assert.doesNotMatch(body, /Suite-level failure with no failing test/);
   });
 
+  test("names the files an import-only conflict was settled in, so the merged state stays auditable", () => {
+    const body = formatGateEvidenceComment({
+      verdict: "pass", reason: "176 test(s) executed, none failed",
+      report: { ...baseReport, importResolvedPaths: ["app/Thread.kt", "app/Settings.kt"] },
+      minExecuted: 150, action: "moved it to In Documentation",
+    });
+    assert.match(body, /conflicted only where both sides added imports, in `app\/Thread\.kt`, `app\/Settings\.kt`/);
+    const clean = formatGateEvidenceComment({
+      verdict: "pass", reason: "176 test(s) executed, none failed",
+      report: baseReport, minExecuted: 150, action: "moved it to In Documentation",
+    });
+    assert.doesNotMatch(clean, /added imports/);
+  });
+
   test("carries the commits-behind figure so the merged-state claim is auditable", () => {
     const body = formatGateEvidenceComment({
       verdict: "pass", reason: "176 test(s) executed, none failed",
@@ -6374,5 +6390,25 @@ describe("runner stderr: tail, scrub and message (pyrycode-mobile #1340, 2026-10
     assert.match(msg, /^Claude CLI exited with code 1, no result message received\n--- stderr \(last 1500 chars\) ---\n/);
     assert.match(msg, /Error: stream closed/);
     assert.ok(!msg.includes(b64));
+  });
+});
+
+describe("PYRY_REQUIRED_ENV parsing (2026-10-04)", () => {
+  test("splits on commas and whitespace, dropping blanks and repeats", () => {
+    assert.deepEqual(parseRequiredEnv("ANDROID_HOME"), ["ANDROID_HOME"]);
+    assert.deepEqual(parseRequiredEnv(" ANDROID_HOME, JAVA_HOME  ANDROID_HOME,,"), ["ANDROID_HOME", "JAVA_HOME"]);
+  });
+
+  test("unset or empty requires nothing, so the preflight is a no-op by default", () => {
+    assert.deepEqual(parseRequiredEnv(undefined), []);
+    assert.deepEqual(parseRequiredEnv(""), []);
+    assert.deepEqual(parseRequiredEnv(" , "), []);
+  });
+
+  test("missingRequiredEnv names unset and blank variables, in declared order", () => {
+    const env = { JAVA_HOME: "/jbr", ANDROID_HOME: "", PYRYCODE_SRC: "   " };
+    assert.deepEqual(missingRequiredEnv(["PYRYCODE_SRC", "JAVA_HOME", "ANDROID_HOME", "GRADLE_USER_HOME"], env),
+      ["PYRYCODE_SRC", "ANDROID_HOME", "GRADLE_USER_HOME"]);
+    assert.deepEqual(missingRequiredEnv([], env), []);
   });
 });

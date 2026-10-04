@@ -95,6 +95,18 @@ class MockClient implements ReconcileClient {
     return [...(this.items.find(i => i.issueNumber === issueNumber)?.labels ?? [])];
   }
 
+  /**
+   * Marker comments already on the issue before the test, per issue, plus
+   * every comment posted through this client that carries the marker.
+   */
+  priorMarkerComments = new Map<number, number>();
+  countMarkerCommentsError: Error | null = null;
+  async countMarkerComments(issueNumber: number, marker: string): Promise<number> {
+    if (this.countMarkerCommentsError) throw this.countMarkerCommentsError;
+    const posted = this.addCommentCalls.filter(c => c.issueNumber === issueNumber && c.body.includes(marker)).length;
+    return (this.priorMarkerComments.get(issueNumber) ?? 0) + posted;
+  }
+
   clearItemsCache(): void {
     this.clearItemsCacheCalls++;
   }
@@ -1248,5 +1260,137 @@ test("failed artifact rework label write cannot move the ticket forward", async 
     await runRealClaudeGateExecution(client, async () => report(), 150, async () => {});
     assert.equal(item.status, "Inbox");
     assert.deepEqual(client.removeLabelCalls, [{ issueNumber: 77, label: REAL_CLAUDE_GATE_RUNNING_LABEL }]);
+  });
+});
+
+// =====================================================================
+// Live gate merge conflict → code owner (2026-10-04)
+// =====================================================================
+//
+// Mobile #1337 parked twice on 2026-10-01, 17 and 18 commits behind main,
+// and #1631 on 2026-10-04, over a conflict as small as two changes each
+// adding one argument to the same call. Each waited hours for a person to
+// merge main. The final merge already sends that shape to the code owner
+// (merge-handoff.ts); the gate now does the same, within the same budget.
+
+describe("real-claude gate — a branch that conflicts with main goes to its code owner", () => {
+  const conflicted = () => report({
+    runError: "`feature/77` conflicts with `origin/main`, so there is no merged state to gate. Resolve the conflict and the gate will run on the next cycle.",
+    exitCode: null,
+    tally: null,
+    branchName: "feature/77",
+    commitsBehind: 18,
+    mergeConflict: { paths: ["app/src/main/java/Thread.kt"] },
+  });
+
+  test("hands the merge to the builder without a rework, without the error label, and keeping needs-real-claude", async () => {
+    await withStageSet("builder", async () => {
+      const item = builderParkedItem({ labels: ["done:builder", "done:verifier", "needs-real-claude", "rework-count:2"] });
+      const client = new MockClient([item]);
+      const notifications: string[] = [];
+
+      await runRealClaudeGateExecution(client, async () => conflicted(), 150, async (m) => { notifications.push(m); });
+
+      assert.equal(item.status, "In Development", "straight to the owner's column; Inbox is not one the router scans");
+      assert.ok(item.labels.includes("merge-handoff"));
+      assert.ok(item.labels.includes("needs-rework:builder"));
+      assert.ok(item.labels.includes("needs-real-claude"), "the gate must run again after the merge");
+      assert.ok(!item.labels.includes("error:real-claude-gate"), "a conflict the owner can settle is not a park");
+      assert.ok(!item.labels.includes(REAL_CLAUDE_GATE_RUNNING_LABEL));
+      assert.equal(client.addCommentCalls.length, 1, "the handoff comment replaces the evidence comment");
+      const comment = client.addCommentCalls[0]!.body;
+      assert.ok(comment.startsWith("<!-- final-merge-handoff -->"), "counts toward the final merge's shared budget");
+      assert.match(comment, /app\/src\/main\/java\/Thread\.kt/);
+      assert.match(comment, /18 commit\(s\) behind/);
+      assert.match(comment, /handoff 1 of 2/);
+      assert.match(comment, /does not count as a rework/);
+      assert.equal(notifications.length, 1);
+      assert.match(notifications[0]!, /sent back to builder to finish the merge \(handoff 1\/2\)/);
+
+      // The router then clears the trail and counts nothing.
+      await runReworkRouting(client);
+      assert.equal(item.status, "In Development");
+      assert.deepEqual(item.labels.sort(), ["needs-real-claude", "rework-count:2"]);
+    });
+  });
+
+  test("classic set: the developer owns the merge", async () => {
+    const item = parkedItem();
+    const client = new MockClient([item]);
+
+    await runRealClaudeGateExecution(client, async () => conflicted(), 150, async () => {});
+
+    assert.equal(item.status, "In Development");
+    assert.ok(item.labels.includes("needs-rework:developer"));
+    assert.ok(item.labels.includes("merge-handoff"));
+    assert.ok(!item.labels.includes("error:real-claude-gate"));
+  });
+
+  test("with the shared handoff budget spent it parks exactly as before, and says why", async () => {
+    await withStageSet("builder", async () => {
+      const item = builderParkedItem();
+      const client = new MockClient([item]);
+      client.priorMarkerComments.set(77, 2);
+      const notifications: string[] = [];
+
+      await runRealClaudeGateExecution(client, async () => conflicted(), 150, async (m) => { notifications.push(m); });
+
+      assert.equal(item.status, "Inbox");
+      assert.equal(client.updateItemStatusCalls.length, 0);
+      assert.deepEqual(client.addLabelCalls, [
+        { issueNumber: 77, label: REAL_CLAUDE_GATE_RUNNING_LABEL },
+        { issueNumber: 77, label: "error:real-claude-gate" },
+      ]);
+      assert.ok(!item.labels.includes("merge-handoff"));
+      assert.equal(notifications.length, 1);
+      assert.match(notifications[0]!, /could not judge #77/);
+      const evidence = client.addCommentCalls[0]?.body ?? "";
+      assert.match(evidence, /NO USABLE RESULT/);
+      assert.match(evidence, /already gone back to builder 2 times/);
+    });
+  });
+
+  test("parks as before when the earlier handoffs cannot be counted", async () => {
+    await withStageSet("builder", async () => {
+      const item = builderParkedItem();
+      const client = new MockClient([item]);
+      client.countMarkerCommentsError = new Error("Failed to fetch comments: Bad Gateway");
+
+      await runRealClaudeGateExecution(client, async () => conflicted(), 150, async () => {});
+
+      assert.equal(item.status, "Inbox");
+      assert.ok(item.labels.includes("error:real-claude-gate"));
+      assert.ok(!item.labels.includes("needs-rework:builder"));
+      assert.match(client.addCommentCalls[0]?.body ?? "", /could not be counted/);
+    });
+  });
+
+  test("parks rather than strand the ticket in Inbox when the move fails", async () => {
+    // The labels are already on by then. Without the park, a ticket carrying
+    // needs-rework in Inbox would be skipped by the gate and never routed.
+    await withStageSet("builder", async () => {
+      const item = builderParkedItem();
+      const client = new MockClient([item]);
+      client.updateItemStatus = async () => { throw new Error("GraphQL 502"); };
+
+      await runRealClaudeGateExecution(client, async () => conflicted(), 150, async () => {});
+
+      assert.equal(item.status, "Inbox");
+      assert.ok(item.labels.includes("error:real-claude-gate"));
+      assert.match(client.addCommentCalls.at(-1)?.body ?? "", /Sending it to builder to finish the merge failed: GraphQL 502/);
+    });
+  });
+
+  test("a run error that is not a conflict still parks at once", async () => {
+    await withStageSet("builder", async () => {
+      const item = builderParkedItem();
+      const client = new MockClient([item]);
+
+      await runRealClaudeGateExecution(client, async () => report({ runError: "git fetch origin failed: offline", tally: null }), 150, async () => {});
+
+      assert.equal(item.status, "Inbox");
+      assert.ok(item.labels.includes("error:real-claude-gate"));
+      assert.ok(!item.labels.includes("merge-handoff"));
+    });
   });
 });
