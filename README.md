@@ -332,7 +332,29 @@ PYRY_AGENT_RUNNER=codex
 ```
 
 Unset it or set `claude` to return to Claude. Unknown values fail startup before
-board processing. The installed Codex CLI must support `exec --json`,
+board processing.
+
+### Runner file: switch without a restart
+
+A restart drains first, and a drain can wait most of an hour for running agents.
+So the runner can also come from a JSON file that the dispatcher reads again
+before every agent spawn:
+
+```json
+{"runner": "codex", "roles": {"verifier": "claude"}}
+```
+
+- **Keys:** both are optional. A role entry beats `runner`, and `runner` beats
+  `PYRY_AGENT_RUNNER`, which stays the fallback when the file is absent.
+- **Location:** `<agents repo>/runner.json` by default. `PYRY_RUNNER_FILE` points
+  elsewhere, and an empty value turns the file off.
+- **Startup:** a broken file fails startup, like a bad `PYRY_AGENT_RUNNER`. Codex
+  is pinned at startup when any entry selects it, or at first use otherwise.
+- **While running:** a file that turns broken keeps the last valid one in force
+  and logs one warning per distinct error. Deleting the file returns to the
+  fallback.
+- **Resumed runs:** a resumed run keeps the runner its session started on.
+- **Logs:** each spawn's DISPATCH block records the runner it used. The installed Codex CLI must support `exec --json`,
 `--approve-for-me`, and `--output-schema`. The integration was verified with CLI
 0.153.4. Authenticate Codex on the dispatcher host before starting the queue.
 Claude authentication is not reused.
