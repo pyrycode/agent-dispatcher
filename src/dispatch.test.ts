@@ -1793,6 +1793,35 @@ describe("prepareAgentSpawn", () => {
     assert.ok(!calls.exec.some(c => c.cmd.includes("qmd")), "qmd must not run through execSync");
   });
 
+  test("PYRY_SKIP_QMD_REFRESH=1 → no qmd run, skip line logged, dispatch continues", async () => {
+    const claudeMd = claudeMdAbsPath("developer/CLAUDE.md");
+    const { ctx, calls } = makeTestContext({
+      item: { issueNumber: 204 },
+      mockOptions: { fsMap: { [claudeMd]: "system prompt" } },
+    });
+    const saved = process.env.PYRY_SKIP_QMD_REFRESH;
+    const logged: string[] = [];
+    const origLog = console.log;
+    process.env.PYRY_SKIP_QMD_REFRESH = "1";
+    console.log = (...args: unknown[]) => { logged.push(args.join(" ")); };
+    let result;
+    try {
+      result = await prepareAgentSpawn(ctx);
+    } finally {
+      console.log = origLog;
+      if (saved === undefined) delete process.env.PYRY_SKIP_QMD_REFRESH;
+      else process.env.PYRY_SKIP_QMD_REFRESH = saved;
+    }
+
+    assert.ok(result.ok);
+    const qmdCalls = [
+      ...calls.exec.filter(c => c.cmd.includes("qmd")),
+      ...calls.run.filter(c => c.args.join(" ").includes("qmd")),
+    ];
+    assert.equal(qmdCalls.length, 0, "the opt-out must skip the per-spawn qmd run");
+    assert.equal(logged.filter(l => l.includes("QMD refresh skipped")).length, 1, "exactly one skip line");
+  });
+
   test("PO path skips QMD re-index (no useWorktree)", async () => {
     const claudeMd = claudeMdAbsPath("po/CLAUDE.md");
     const { ctx, calls } = makeTestContext({
