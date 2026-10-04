@@ -24,6 +24,7 @@ import { fileURLToPath } from "node:url";
 import { dispatchInbox, installSignalHandlers, pollLoop } from "./dispatch.js";
 import { decideCodegraphHealth, findMissingAgentClaudeMds } from "./agent-runtime.js";
 import { resolveAgentRunner, resolveCodexExecutable } from "./agent-runner.js";
+import { loadRunnerFileStrict, runnerFilePath, runnersInUse } from "./runner-file.js";
 import { activeStageSet, type StageSet } from "./stage-sets.js";
 import { validateEffortPolicy } from "./effort-policy.js";
 import { resolveAgentsRepoRootWithEnv, resolveTargetRepoRoot } from "./worktree.js";
@@ -55,7 +56,15 @@ let stageSet: StageSet;
 try {
   stageSet = activeStageSet();
   validateEffortPolicy(process.env.PYRY_EFFORT_POLICY, stageSet.name);
-  if (resolveAgentRunner(process.env) === "codex") {
+  // Every runner the runner file or PYRY_AGENT_RUNNER can pick must be
+  // installed now; a broken runner file fails here, before the board.
+  const runnerFile = loadRunnerFileStrict(runnerFilePath(process.env, resolveAgentsRepoRootWithEnv({
+    envValue: process.env.AGENTS_REPO_PATH,
+    fallbackSrcDir: dirname(fileURLToPath(import.meta.url)),
+  })));
+  const runners = runnersInUse(runnerFile, resolveAgentRunner(process.env));
+  if (runnerFile) console.log(`Runner file: ${JSON.stringify(runnerFile)} (read again before every agent run)`);
+  if (runners.has("codex")) {
     process.env.PYRY_CODEX_BIN = resolveCodexExecutable(process.env);
     console.log(`Codex executable: ${process.env.PYRY_CODEX_BIN}`);
   }

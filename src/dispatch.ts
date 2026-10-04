@@ -25,7 +25,8 @@ import {
   runClockDeadline,
   type RunClock,
 } from "./wait-credit.js";
-import { buildClaudeSourceReviewInvocation, buildCodexInvocation, codexChildEnv, CODEX_ROLE_GUIDANCE, CodexStreamAdapter, formatRunCost, resolveAgentShellEnv, resumeCommand, resolveAgentRunner, type AgentRunner } from "./agent-runner.js";
+import { buildClaudeSourceReviewInvocation, buildCodexInvocation, codexChildEnv, CODEX_ROLE_GUIDANCE, CodexStreamAdapter, formatRunCost, resolveAgentShellEnv, resumeCommand, resolveAgentRunner, resolveCodexExecutable, type AgentRunner } from "./agent-runner.js";
+import { createRunnerSelector, runnerFilePath } from "./runner-file.js";
 
 import { GitHubProjectClient } from "./github.js";
 import { type AgentConfig, type ProjectItem } from "./types.js";
@@ -228,6 +229,11 @@ const agentsRepoRoot = resolveAgentsRepoRootWithEnv({
 // this call needs, and it reads `AGENTS_REPO_PATH`, which every launcher
 // exports directly rather than through the .env file.
 config({ path: resolve(agentsRepoRoot, ".env") });
+
+// The agent runner, Claude or Codex, is read before every spawn from the
+// fork's runner file, falling back to PYRY_AGENT_RUNNER (runner-file.ts).
+// Created after the .env load so PYRY_RUNNER_FILE and the fallback apply.
+const selectRunner = createRunnerSelector({ path: runnerFilePath(process.env, agentsRepoRoot), env: process.env });
 
 // The target repo — where code lives and agents work.
 // Falls through to resolveTargetRepoRoot (parent of agents/) when unset, so
@@ -2982,7 +2988,10 @@ export async function prepareAgentSpawn(
   const { agent, item, client, agentCwd, useWorktree, worktreeDir, branchName, logFile } = ctx;
   const { execSync, readFileSync, writeFileSync, buildPromptForAgent } = ctx.deps;
 
-  const runner = resolveAgentRunner(process.env);
+  const runner = selectRunner(agent.name);
+  // The runner file can switch to Codex while the dispatcher runs. Startup
+  // pins the executable only for runners in use then, so pin it on first use.
+  if (runner === "codex" && !process.env.PYRY_CODEX_BIN) process.env.PYRY_CODEX_BIN = resolveCodexExecutable(process.env);
 
   // Build prompt AFTER worktree creation so specs are read from the feature branch
   const prompt = await buildPromptForAgent(agent, item, agentCwd, client);
