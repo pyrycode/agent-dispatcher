@@ -3,7 +3,7 @@ import { delimiter, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import type { StreamResult } from "./dispatch.js";
-import { scrubCredentials } from "./agent-runtime.js";
+import { IDLE_STALL_REASON, idleStallMessage, scrubCredentials } from "./agent-runtime.js";
 
 export type AgentRunner = "claude" | "codex";
 
@@ -207,7 +207,14 @@ export class CodexStreamAdapter {
     }
   }
 
-  finish(code: number | null, timedOut: boolean, durationMs: number, stderr = ""): StreamResult {
+  /**
+   * `idleStallMs` is the idle threshold when the dispatcher's idle watchdog
+   * stopped the run, else 0. A stall is reported as `idle_stall`, which
+   * retries as transient, except that a blocked outcome or rejected action
+   * still wins: those must never retry by themselves.
+   */
+  finish(code: number | null, timedOut: boolean, durationMs: number, stderr = "", idleStallMs = 0): StreamResult {
+    const idleStalled = idleStallMs > 0;
     let outcome: { status: "completed" | "blocked" | "needs_refinement" | "waiting_on_blocker"; summary: string } | undefined;
     try {
       const parsed = JSON.parse(this.lastText);
@@ -215,18 +222,21 @@ export class CodexStreamAdapter {
     } catch { /* Missing or malformed task outcome fails closed. */ }
     this.approvalRejected ||= /This action was rejected due to unacceptable risk/.test(stderr);
     const blocked = this.approvalRejected || outcome?.status === "blocked";
-    const isError = timedOut || code !== 0 || this.failed || !this.completed || !outcome || blocked;
+    const isError = timedOut || idleStalled || code !== 0 || this.failed || !this.completed || !outcome || blocked;
     // Codex reports this temporary access-check outage as a generic failed turn.
     // Map the observed server failure to the existing capped API retry path.
     // A disconnect alone can also mean permanent model denial, so keep it narrow.
     const temporaryModelAccessFailure = this.failed && /^stream disconnected before completion: Unable to verify model access right now\.\s*Please retry\.?$/i.test(this.errorText.trim());
-    const terminalReason = blocked ? "codex_blocked" : timedOut ? "timeout"
+    // The stall is the cause even when the wall clock also fired meanwhile.
+    const terminalReason = blocked ? "codex_blocked" : idleStalled ? IDLE_STALL_REASON : timedOut ? "timeout"
       : isError ? (temporaryModelAccessFailure ? "api_error" : "codex_error")
       : outcome?.status === "needs_refinement" ? "needs_refinement"
       : outcome?.status === "waiting_on_blocker" ? "waiting_on_blocker" : "stop";
     // Stderr reaches the ticket through this text, so scrub it like the
     // claude runner's no-result tail (shared helper, 2026-10-02).
-    const failure = blocked ? (this.approvalRejected ? "Automatic approval review rejected an action. Operator review required." : outcome!.summary) : scrubCredentials(this.errorText || stderr.trim()) || `Codex exited with code ${code} without a successful completed task outcome`;
+    const failure = blocked ? (this.approvalRejected ? "Automatic approval review rejected an action. Operator review required." : outcome!.summary)
+      : idleStalled ? idleStallMessage(idleStallMs)
+      : scrubCredentials(this.errorText || stderr.trim()) || `Codex exited with code ${code} without a successful completed task outcome`;
     return {
       runner: "codex", costKnown: false,
       output: isError ? failure : outcome!.summary,

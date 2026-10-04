@@ -1096,11 +1096,20 @@ export function advancePermissionDenialState(
   };
 }
 
-// --------- Idle-stream watchdog (claude runner) ---------
+// --------- Idle-stream watchdog (claude and codex runners) ---------
 
 /**
- * Default idle threshold for the claude runner's stream watchdog, in
- * minutes. Override with `PYRY_AGENT_IDLE_TIMEOUT_MINUTES`; `0` disables.
+ * Default idle threshold for the stream watchdog, in minutes, for both
+ * runners. Override with `PYRY_AGENT_IDLE_TIMEOUT_MINUTES`; `0` disables.
+ *
+ * Codex since 2026-10-04: builder #626 on 2026-09-20 sat silent for 30
+ * minutes after a Figma screenshot returned, with nothing outstanding, until
+ * its 40-minute wall clock killed it. Across 672 Codex runs in the mobile
+ * logs that was one of only two silences over ten minutes with nothing
+ * outstanding. The other, verifier #1291 on 2026-09-30, was 10.3 minutes of
+ * Codex retrying a slow model stream and then finishing; ten minutes would
+ * have killed it 16 seconds early and retried it. Accepted: the retry is
+ * cheap next to a run that never comes back.
  *
  * Why it exists. On 2026-10-02 pyrycode-mobile #1430's documentation run
  * went silent: its log shows four system stream messages between 05:03:30
@@ -1213,6 +1222,45 @@ export function advanceIdleWatchdogState(
           if (outstanding === state.outstandingToolIds) outstanding = new Set(outstanding);
           (outstanding as Set<string>).delete(b.tool_use_id);
         }
+      }
+    }
+  }
+  return { lastLineAt: now, outstandingToolIds: outstanding };
+}
+
+/**
+ * The Codex runner's version of `advanceIdleWatchdogState`, on `codex exec
+ * --json` events. Every item that reports `item.started` (command
+ * executions, MCP tool calls, file changes, web searches, and any type a
+ * later CLI adds) is outstanding until its `item.completed`. Messages and
+ * reasoning only ever complete, so they never hold the watchdog off. A
+ * `todo_list` is the exception: it stays open for the whole turn while no
+ * tool runs, so it is not counted.
+ *
+ * Shapes checked against the mobile fork's Codex logs, 672 runs from
+ * 2026-09-20 to 2026-10-04: `{"type":"item.started","item":{"id":"item_1",
+ * "type":"command_execution",...,"status":"in_progress"}}` then
+ * `{"type":"item.completed","item":{"id":"item_1",...,"exit_code":0}}`, and
+ * the same pairing for `mcp_tool_call`, `file_change` and `web_search`.
+ *
+ * Pure: no I/O, no clock. The driver passes `now`.
+ */
+export function advanceCodexIdleWatchdogState(
+  state: IdleWatchdogState,
+  event: unknown,
+  now: number,
+): IdleWatchdogState {
+  let outstanding = state.outstandingToolIds;
+  if (event && typeof event === "object") {
+    const e = event as Record<string, unknown>;
+    const item = e.item as Record<string, unknown> | undefined;
+    if (item && typeof item.id === "string" && item.type !== "todo_list") {
+      if (e.type === "item.started" && !outstanding.has(item.id)) {
+        outstanding = new Set(outstanding);
+        (outstanding as Set<string>).add(item.id);
+      } else if (e.type === "item.completed" && outstanding.has(item.id)) {
+        outstanding = new Set(outstanding);
+        (outstanding as Set<string>).delete(item.id);
       }
     }
   }

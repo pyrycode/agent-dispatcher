@@ -11,6 +11,20 @@ import { countOpenPrs, shouldFlagMissingPr } from "./pr-guard.js";
 import { resolveImportOnlyMerge } from "./merge-resolve.js";
 import { FINAL_MERGE_HANDOFF_MARKER, FINAL_MERGE_HANDOFF_MAX, MERGE_HANDOFF_LABEL, checkMergeResolution, decideConflictRoute, decideFinalMergeRoute, findMergeCommit, mergeHandoffNote, mergeResolutionComment, mergeResolutionSection, readPendingMerge, type PendingMerge, type ResolutionNote } from "./merge-handoff.js";
 
+import {
+  advanceGateWaitState,
+  advanceRunClock,
+  decideRunClock,
+  formatMinutes,
+  gateDeadline,
+  initGateWaitState,
+  initRunClock,
+  parseTimeoutCeilingFactor,
+  parseTimeoutGraceMs,
+  runClockCreditMs,
+  runClockDeadline,
+  type RunClock,
+} from "./wait-credit.js";
 import { buildClaudeSourceReviewInvocation, buildCodexInvocation, codexChildEnv, CODEX_ROLE_GUIDANCE, CodexStreamAdapter, formatRunCost, resolveAgentShellEnv, resumeCommand, resolveAgentRunner, type AgentRunner } from "./agent-runner.js";
 
 import { GitHubProjectClient } from "./github.js";
@@ -22,6 +36,7 @@ import {
   captureSessionId,
   initPermissionDenialState,
   advanceIdleWatchdogState,
+  advanceCodexIdleWatchdogState,
   idleStallMessage,
   idleWatchdogTickMs,
   initIdleWatchdogState,
@@ -485,6 +500,10 @@ function writeLog(logFile: string, section: string, content: string): void {
 
 export interface StreamResult {
   runner?: AgentRunner;
+  /** Codex only: wall-clock time credited back for waiting on the Android
+   *  device hold or a Gradle build place (wait-credit.ts). Absent or 0 when
+   *  none was. */
+  waitCreditMs?: number;
   /** False when the runner does not report monetary cost. */
   costKnown?: boolean;
   output: string;
@@ -896,34 +915,78 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
     let denialState = initPermissionDenialState();
     let forceExitTimer: NodeJS.Timeout | null = null;
 
-    const timer = setTimeout(() => {
+    // Codex wall clock (wait-credit.ts). Time a command spent waiting for the
+    // Android device hold or a Gradle build place is credited back once its
+    // output shows it; a command still running when the budget is spent gets
+    // a bounded grace to finish and show it; nothing passes the hard ceiling.
+    // The Claude runner keeps its plain wall clock.
+    let clock: RunClock | null = isCodex ? initRunClock({
+      startedAt,
+      budgetMs: opts.timeoutMs,
+      ceilingFactor: parseTimeoutCeilingFactor(process.env.PYRY_TIMEOUT_CEILING_FACTOR),
+      graceMs: parseTimeoutGraceMs(process.env.PYRY_TIMEOUT_GRACE_MINUTES),
+    }) : null;
+    let graceNoted = false;
+    const killForTimeout = (detail: string) => {
       timedOut = true;
-      appendFileSync(opts.logFile, `\n⏰ TIMEOUT — killing agent after ${opts.timeoutMs / 1000}s\n`);
+      appendFileSync(opts.logFile, `\n⏰ TIMEOUT — killing agent after ${Math.round((Date.now() - startedAt) / 1000)}s${detail}\n`);
       killChildPgrp(child, "SIGTERM");
       if (isCodex && !forceExitTimer) {
         forceExitTimer = setTimeout(() => killChildPgrp(child, "SIGKILL"), 2000);
       }
+    };
+    const checkClock = () => {
+      if (!clock || timedOut) return;
+      const now = Date.now();
+      const decision = decideRunClock(clock, now);
+      if (decision.kind === "stop") {
+        const credit = runClockCreditMs(clock);
+        killForTimeout(` (budget ${opts.timeoutMs / 1000}s` +
+          (credit > 0 ? `, plus ${Math.round(credit / 1000)}s credited for waiting on the device or a build place` : "") +
+          (decision.reason === "grace_ended" ? "; grace for a running command ran out"
+            : graceNoted ? "; the command the grace waited for has finished" : "") +
+          (decision.reason === "ceiling" ? "; hard ceiling reached" : "") + ")");
+        return;
+      }
+      if (decision.grace && !graceNoted) {
+        graceNoted = true;
+        appendFileSync(opts.logFile, `\n⏳ GRACE — budget spent while a command is running; waiting up to ` +
+          `${formatMinutes(decision.checkAt - now)} for it to finish before stopping\n`);
+      }
+      timer = setTimeout(checkClock, Math.max(1000, decision.checkAt - now));
+    };
+    let timer: NodeJS.Timeout = isCodex ? setTimeout(checkClock, opts.timeoutMs) : setTimeout(() => {
+      timedOut = true;
+      appendFileSync(opts.logFile, `\n⏰ TIMEOUT — killing agent after ${opts.timeoutMs / 1000}s\n`);
+      killChildPgrp(child, "SIGTERM");
     }, opts.timeoutMs);
 
-    // Idle watchdog (claude runner only). Fires when no stream line has
-    // arrived for PYRY_AGENT_IDLE_TIMEOUT_MINUTES while no tool call is
-    // outstanding, and kills the run the way the wall clock does. Added
-    // after pyrycode-mobile #1430 (2026-10-02) sat silent for twenty
-    // minutes inside one assistant turn and the 38-minute wall clock took
-    // its finished edits with it. Decision logic is pure, in
-    // agent-runtime.ts (`shouldFireIdleWatchdog`); this is only the clock
-    // and the kill. Codex emits a different event stream, so it keeps the
-    // wall clock alone. The wall clock stays armed as the backstop.
-    const idleMs = isCodex ? 0 : parseIdleTimeoutMs(process.env.PYRY_AGENT_IDLE_TIMEOUT_MINUTES);
+    // Idle watchdog, both runners. Fires when no stream line has arrived for
+    // PYRY_AGENT_IDLE_TIMEOUT_MINUTES while no tool call is outstanding, and
+    // kills the run the way the wall clock does. Added after pyrycode-mobile
+    // #1430 (2026-10-02) sat silent for twenty minutes inside one assistant
+    // turn and the 38-minute wall clock took its finished edits with it;
+    // extended to Codex on 2026-10-04, where builder #626 had sat silent for
+    // thirty minutes. Decision logic is pure, in agent-runtime.ts
+    // (`shouldFireIdleWatchdog`, with one state advance per runner's event
+    // shapes); this is only the clock and the kill. The wall clock stays
+    // armed as the backstop.
+    const idleMs = parseIdleTimeoutMs(process.env.PYRY_AGENT_IDLE_TIMEOUT_MINUTES);
     let idleState = initIdleWatchdogState(Date.now());
     let idleStalled = false;
+    // Codex: between a turn's end and the process exit the run has its
+    // outcome, so silence there is not a stall.
+    let codexTurnEnded = false;
     const idleTimer = idleMs > 0 ? setInterval(() => {
-      if (idleStalled || timedOut || !shouldFireIdleWatchdog(idleState, Date.now(), idleMs)) return;
+      if (idleStalled || timedOut || codexTurnEnded || !shouldFireIdleWatchdog(idleState, Date.now(), idleMs)) return;
       idleStalled = true;
       if (idleTimer) clearInterval(idleTimer);
       appendFileSync(opts.logFile, `\n💤 IDLE STALL — no stream output for ${idleMs / 1000}s with no tool call outstanding; killing agent\n`);
       console.log(`   💤 Idle stall: no stream output for ${idleMs / 60_000}min, killing agent`);
       killChildPgrp(child, "SIGTERM");
+      if (isCodex && !forceExitTimer) {
+        forceExitTimer = setTimeout(() => killChildPgrp(child, "SIGKILL"), 2000);
+      }
     }, idleWatchdogTickMs(idleMs)) : null;
 
     const handleWatchdogAction = (action: ReturnType<typeof advancePermissionDenialState>["action"]) => {
@@ -957,8 +1020,33 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
         if (!line.trim()) continue;
         try {
           const msg = JSON.parse(line);
-          if (idleTimer) idleState = advanceIdleWatchdogState(idleState, msg, Date.now());
-          if (codex) { codex.accept(msg); logStreamMessage(opts.logFile, msg); continue; }
+          if (idleTimer) {
+            idleState = isCodex ? advanceCodexIdleWatchdogState(idleState, msg, Date.now())
+              : advanceIdleWatchdogState(idleState, msg, Date.now());
+          }
+          if (codex) {
+            codex.accept(msg);
+            logStreamMessage(opts.logFile, msg);
+            if (msg.type === "turn.started") codexTurnEnded = false;
+            if (msg.type === "turn.completed" || msg.type === "turn.failed") codexTurnEnded = true;
+            if (clock && !timedOut) {
+              const before = runClockCreditMs(clock);
+              clock = advanceRunClock(clock, msg, Date.now());
+              const credit = runClockCreditMs(clock);
+              if (credit > before) {
+                appendFileSync(opts.logFile, `[${new Date().toISOString()}] ⏱️ WAIT CREDIT — +${Math.round((credit - before) / 1000)}s ` +
+                  `waiting on the device or a build place (total ${Math.round(credit / 1000)}s); deadline now ` +
+                  `${new Date(runClockDeadline(clock)).toISOString()}\n`);
+              }
+              // A command finishing past the budget decides now: either its
+              // output earned more time, or the grace it was given is over.
+              if (msg.type === "item.completed" && Date.now() - startedAt >= opts.timeoutMs) {
+                clearTimeout(timer);
+                checkClock();
+              }
+            }
+            continue;
+          }
           initSessionId = captureSessionId(initSessionId, msg);
           logStreamMessage(opts.logFile, msg);
           if (msg.type === "result") {
@@ -1034,7 +1122,8 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
       }
 
       if (codex) {
-        const finished = codex.finish(code, timedOut, Date.now() - startedAt, stderrTail);
+        const finished = codex.finish(code, timedOut, Date.now() - startedAt, stderrTail, idleStalled ? idleMs : 0);
+        if (clock) finished.waitCreditMs = runClockCreditMs(clock);
         if (finished.isError) logStderrTail();
         resolve(finished);
         return;
@@ -3430,8 +3519,10 @@ export async function handleAgentResultErrors(
     const elapsedMs = Date.now() - ctx.startTime;
     const elapsedStr = `${Math.floor(elapsedMs / 60_000)}m ${Math.round((elapsedMs % 60_000) / 1000)}s`;
     const timeoutMin = timeoutFor(agent, item.labels) / 60_000;
+    const credit = streamResult.waitCreditMs
+      ? `, plus ${formatMinutes(streamResult.waitCreditMs)} credited for waiting on the device or a build place` : "";
     throw new Error(
-      `Agent error (${reason})${diag ? `: ${diag}` : ""}. Ran ${elapsedStr} (timeout ${timeoutMin}min). Last agent text (not the failure cause): ${lastText}`
+      `Agent error (${reason})${diag ? `: ${diag}` : ""}. Ran ${elapsedStr} (timeout ${timeoutMin}min${credit}). Last agent text (not the failure cause): ${lastText}`
     );
   }
 
@@ -4169,7 +4260,8 @@ export async function runVerifierGates(opts: {
     const verdict = outcome.spawnError !== null
       ? `spawn error: ${outcome.spawnError}`
       : outcome.timedOut
-        ? `timed out after ${VERIFIER_GATE_TIMEOUT_MS / 60_000}min`
+        ? `timed out after ${VERIFIER_GATE_TIMEOUT_MS / 60_000}min` +
+          (outcome.waitCreditMs ? ` plus ${formatMinutes(outcome.waitCreditMs)} credited for waiting` : "")
         : `exit ${outcome.exitCode}`;
     summary.push(`${failed ? "✗" : "✓"} ${gate} (${verdict})`);
     if (failed) {
@@ -4771,6 +4863,10 @@ export interface GateSpawnRequest {
 export interface GateSpawnOutcome {
   exitCode: number | null;
   timedOut: boolean;
+  /** Time the command's output showed it waiting for the Android device hold
+   *  or a Gradle build place, which its deadline was extended by. Optional
+   *  so injected test spawners need not report it. */
+  waitCreditMs?: number;
   /** Non-null when the process could not be started or died abnormally. */
   spawnError: string | null;
 }
@@ -4871,14 +4967,51 @@ export const spawnGateCommand: GateSpawner = async (req) => {
   child.stdout!.pipe(out);
   child.stderr!.pipe(err);
 
+  // Read both streams as they are written for the queues' messages
+  // (wait-credit.ts): time spent waiting for the Android device hold or a
+  // Gradle build place moves the deadline, up to the hard ceiling. The files
+  // still get every byte through the pipes above.
+  const startedAt = Date.now();
+  const ceilingFactor = parseTimeoutCeilingFactor(process.env.PYRY_TIMEOUT_CEILING_FACTOR);
+  let waits = initGateWaitState(startedAt);
+  const watchLines = (stream: NodeJS.ReadableStream) => {
+    const decoder = new StringDecoder("utf8");
+    let partial = "";
+    stream.on("data", (chunk: Buffer) => {
+      partial += decoder.write(chunk);
+      const lines = partial.split("\n");
+      partial = lines.pop() ?? "";
+      // A queue message is one short line; a huge unterminated one is not.
+      if (partial.length > 16_384) partial = "";
+      for (const line of lines) waits = advanceGateWaitState(waits, line, Date.now());
+    });
+  };
+  watchLines(child.stdout!);
+  watchLines(child.stderr!);
+
   let timedOut = false;
   let killTimer: NodeJS.Timeout | null = null;
-  const timer = setTimeout(() => {
+  let creditLoggedMs = 0;
+  const checkDeadline = () => {
+    const now = Date.now();
+    const { deadlineAt, ceilingAt, creditMs } = gateDeadline(waits, now, req.timeoutMs, ceilingFactor);
+    if (now < deadlineAt) {
+      if (creditMs - creditLoggedMs >= 60_000) {
+        creditLoggedMs = creditMs;
+        console.log(`   ⏳ Gate waited ${formatMinutes(creditMs)} for the Android device or a build place; ` +
+          `deadline moved to ${new Date(deadlineAt).toISOString()} (hard ceiling ${new Date(ceilingAt).toISOString()})`);
+      }
+      timer = setTimeout(checkDeadline, Math.max(1000, deadlineAt - now));
+      return;
+    }
     timedOut = true;
-    console.warn(`   ⏰ Real-claude gate: outer timeout after ${Math.round(req.timeoutMs / 1000)}s — tearing down the process group`);
+    console.warn(`   ⏰ Gate command: outer timeout after ${Math.round((now - startedAt) / 1000)}s` +
+      (creditMs > 0 ? `, including ${formatMinutes(creditMs)} credited for waiting` : "") +
+      ` — tearing down the process group`);
     killChildPgrp(child, "SIGTERM");
     killTimer = setTimeout(() => killChildPgrp(child, "SIGKILL"), FORCE_EXIT_SIGKILL_GRACE_MS);
-  }, req.timeoutMs);
+  };
+  let timer: NodeJS.Timeout = setTimeout(checkDeadline, req.timeoutMs);
 
   const childDone = new Promise<{ exitCode: number | null; spawnError: string | null }>((res) => {
     child.on("close", (code) => res({ exitCode: code, spawnError: null }));
@@ -4900,7 +5033,8 @@ export const spawnGateCommand: GateSpawner = async (req) => {
   await Promise.all([outClosed, errClosed]);
 
   untrackChildPgrpIfDrained(child);
-  return { exitCode: result.exitCode, timedOut, spawnError: result.spawnError };
+  const waitCreditMs = gateDeadline(waits, Date.now(), req.timeoutMs, ceilingFactor).creditMs;
+  return { exitCode: result.exitCode, timedOut, spawnError: result.spawnError, ...(waitCreditMs > 0 ? { waitCreditMs } : {}) };
 };
 
 /** Injectable I/O for `runRealClaudeGateSuite`. */
@@ -7188,6 +7322,14 @@ export async function pollLoop(): Promise<void> {
     // Each Codex run resolves the values again from its own child env.
     const shellEnvNames = Object.keys(resolveAgentShellEnv(codexChildEnv(scrubSpawnEnv(process.env))));
     console.log(`   Codex command settings: ${shellEnvNames.length > 0 ? shellEnvNames.join(", ") : "none"} (PYRY_AGENT_SHELL_ENV)`);
+  }
+  {
+    const ceiling = parseTimeoutCeilingFactor(process.env.PYRY_TIMEOUT_CEILING_FACTOR);
+    const graceMs = parseTimeoutGraceMs(process.env.PYRY_TIMEOUT_GRACE_MINUTES);
+    console.log(ceiling > 1
+      ? `   Time limits: waiting for the Android device or a build place is credited back, up to ${ceiling}x the budget; ` +
+        `a running Codex command gets ${graceMs > 0 ? `up to ${formatMinutes(graceMs)}` : "no"} grace (PYRY_TIMEOUT_CEILING_FACTOR, PYRY_TIMEOUT_GRACE_MINUTES)`
+      : `   Time limits: fixed, no wait credit or grace (PYRY_TIMEOUT_CEILING_FACTOR=1)`);
   }
   // The missing set the preflight last announced, so it notifies once.
   const envPreflight: EnvPreflightState = { announced: null };

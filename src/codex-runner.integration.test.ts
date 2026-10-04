@@ -45,6 +45,20 @@ process.stdin.on('end', async () => {
     setInterval(() => {}, 1000);
     return;
   }
+  if (process.env.TEST_MODE === 'grace-credit' || process.env.TEST_MODE === 'grace-no-credit') {
+    // One command runs past the dispatcher's budget. With credit it reports
+    // a device wait as it finishes, and the run must be allowed to finish.
+    const credit = process.env.TEST_MODE === 'grace-credit';
+    process.stdout.write([events[0], events[1], {type:'item.started', item:{id:'gate', type:'command_execution', command:'gate', aggregated_output:'', exit_code:null, status:'in_progress'}}].map(e => JSON.stringify(e)).join('\\n') + '\\n');
+    const commandMs = Number(process.env.TEST_COMMAND_MS || 6000);
+    await new Promise(resolve => setTimeout(resolve, commandMs));
+    const output = credit ? 'Android gate: device held by ui from /w since x; waiting up to 2700s\\nAndroid gate: device free after ' + commandMs / 1000 + 's waiting\\nAndroid gate: 1 executed; process exit 0\\n' : 'BUILD SUCCESSFUL\\n';
+    process.stdout.write(JSON.stringify({type:'item.completed', item:{id:'gate', type:'command_execution', command:'gate', aggregated_output:output, exit_code:0, status:'completed'}}) + '\\n');
+    if (!credit) await new Promise(resolve => setTimeout(resolve, 1500));
+    process.stdout.write(events.slice(2).map(e => JSON.stringify(e)).join('\\n') + '\\n');
+    process.exitCode = 0;
+    return;
+  }
   if (process.env.TEST_MODE === 'reconnect') events.splice(2, 0, {type:'error',message:'Reconnecting 1/5: connection reset'});
   if (process.env.TEST_MODE === 'failed-command') events.splice(2, 0, {type:'item.completed',item:{id:'red-test',type:'command_execution',status:'failed',exit_code:1,aggregated_output:'Expected red test'}});
   if (process.env.TEST_MODE === 'refinement') events[2].item.text = JSON.stringify({status:'needs_refinement', summary:'Scope conflict requires refinement'});
@@ -221,4 +235,68 @@ test("Codex subprocess preserves the explicit refinement outcome", async t => {
   assert.equal(result.isError, false);
   assert.equal(result.terminalReason, "needs_refinement");
   assert.equal(result.output, "Scope conflict requires refinement");
+});
+
+/** Set dispatcher knobs for one test; they are read at spawn time. */
+function withEnv(t: { after: (fn: () => void) => void }, vars: Record<string, string>) {
+  const saved = Object.fromEntries(Object.keys(vars).map(k => [k, process.env[k]]));
+  Object.assign(process.env, vars);
+  t.after(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  });
+}
+
+test("Codex idle watchdog stops a silent run as idle_stall, before the wall clock, killing a process that ignores SIGTERM", { timeout: 15000 }, async t => {
+  withEnv(t, { PYRY_AGENT_IDLE_TIMEOUT_MINUTES: "0.01" });
+  const f = fixture(t, "timeout");
+  const start = Date.now();
+  const result = await runClaudeStreaming({ ...f.options, timeoutMs: 12000 });
+  assert.equal(result.isError, true);
+  assert.equal(result.terminalReason, "idle_stall");
+  assert.equal(result.timedOut, false);
+  assert.match(result.output, /idle_stall/);
+  assert.ok(Date.now() - start < 10000, "the idle stop must land well before the wall clock");
+  assert.match(readFileSync(f.options.logFile, "utf8"), /IDLE STALL/);
+});
+
+test("Codex command running past the budget gets a grace, and a wait it reports buys the time to finish", { timeout: 30000 }, async t => {
+  // Margins are wide because the fake can take seconds to boot on a loaded
+  // host: its command must start inside the 4 s budget, then finishes 6 s
+  // after boot showing a 6 s device wait, which moves the deadline to about
+  // 10 s, past its outcome.
+  withEnv(t, { PYRY_TIMEOUT_CEILING_FACTOR: "10" });
+  const f = fixture(t, "grace-credit");
+  const result = await runClaudeStreaming({ ...f.options, timeoutMs: 4000 });
+  assert.equal(result.isError, false, result.output);
+  assert.equal(result.timedOut, false);
+  assert.equal(result.output, "Fixture finished");
+  assert.ok((result.waitCreditMs ?? 0) >= 4000, `credit ${result.waitCreditMs}`);
+  const log = readFileSync(f.options.logFile, "utf8");
+  assert.match(log, /GRACE/);
+  assert.match(log, /WAIT CREDIT/);
+});
+
+test("Codex grace ends when the command finishes without showing a wait", { timeout: 30000 }, async t => {
+  withEnv(t, { PYRY_TIMEOUT_CEILING_FACTOR: "10" });
+  const f = fixture(t, "grace-no-credit");
+  const result = await runClaudeStreaming({ ...f.options, timeoutMs: 4000 });
+  // The fake would report success 1.5 s after its command; the kill lands first.
+  assert.equal(result.isError, true);
+  assert.equal(result.timedOut, true);
+  assert.equal(result.terminalReason, "timeout");
+  assert.match(readFileSync(f.options.logFile, "utf8"), /the command the grace waited for has finished/);
+});
+
+test("Codex grace still stops at the hard ceiling", { timeout: 30000 }, async t => {
+  // A 5 s ceiling on a 4 s budget; the command would report only 6 s after boot.
+  withEnv(t, { PYRY_TIMEOUT_CEILING_FACTOR: "1.25" });
+  const f = fixture(t, "grace-credit");
+  const start = Date.now();
+  const result = await runClaudeStreaming({ ...f.options, timeoutMs: 4000 });
+  assert.equal(result.timedOut, true);
+  assert.equal(result.isError, true);
+  assert.ok(Date.now() - start < 9000, "stopped at the ceiling, not after the command reported its wait");
+  assert.match(readFileSync(f.options.logFile, "utf8"), /hard ceiling reached/);
 });
