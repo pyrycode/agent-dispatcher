@@ -2421,15 +2421,66 @@ export type DispatchContext = {
 };
 
 /**
- * Folder for verdict handoff files. Both runners' agents already write
- * GitHub body files under `~/.codex/publish/<repository>/`, the folder the
- * pipeline helper reads, so the handoff sits beside them where neither
- * runner needs a new permission. `PYRY_VERDICT_HANDOFF_DIR` overrides it.
- * Read per dispatch, like the runner file.
+ * The home folder the pipeline helper for `pipeline` was installed with, or
+ * null when none of `homes` holds that helper.
+ *
+ * `codex-helpers/install` writes the installing user's home into each copy as
+ * `HOME = '...'` and puts the copy at `<home>/.codex/bin/<pipeline>-pipeline-action`.
+ * The helper then accepts body files only under `<home>/.codex/publish/<pipeline>`.
+ * That home is not always the dispatcher's: the pyrycode-agents container
+ * runs as /home/agent but recreates the Mac's /Users/juhanailmoniemi paths,
+ * because Codex's approval rules match exact paths, and its helpers are
+ * copies installed on the Mac. A candidate counts only when the helper found
+ * there names that same home and this pipeline.
  */
-export function verdictHandoffDir(): string {
+export function installedHelperHome(
+  pipeline: string,
+  homes: readonly string[],
+  readFile: (path: string) => string = (path) => readFileSync(path, "utf-8"),
+): string | null {
+  for (const home of homes) {
+    let text: string;
+    try {
+      text = readFile(resolve(home, ".codex/bin", `${pipeline}-pipeline-action`));
+    } catch {
+      continue;
+    }
+    // Python's repr of a string, as the installer writes it.
+    const value = (name: string) => new RegExp(`^${name} = (['"])(.+)\\1$`, "m").exec(text)?.[2];
+    const installedHome = value("HOME");
+    if (value("PIPELINE") === pipeline && installedHome && resolve(installedHome) === resolve(home)) return installedHome;
+  }
+  return null;
+}
+
+/** Where to look for the installed helpers: the dispatcher's own home, then
+ *  every home folder on the machine. */
+export function helperHomeCandidates(): string[] {
+  const homes = [homedir()];
+  for (const root of ["/Users", "/home"]) {
+    try {
+      for (const name of readdirSync(root)) homes.push(resolve(root, name));
+    } catch { /* no such folder on this system */ }
+  }
+  return [...new Set(homes)];
+}
+
+/**
+ * Folder for verdict handoff files. Both runners' agents already write
+ * GitHub body files under `<home>/.codex/publish/<repository>/`, the folder
+ * the pipeline helper reads, so the handoff sits beside them where neither
+ * runner needs a new permission. `<home>` is the one the helper was installed
+ * with (`installedHelperHome`), or the dispatcher's own home for a repository
+ * without a helper. On pyrycode-desktop #1721, 2026-10-05, the container's
+ * dispatcher used /home/agent, and the helper refused the verifier's verdict
+ * because it was not under /Users/juhanailmoniemi/.codex/publish/pyrycode-desktop.
+ * `PYRY_VERDICT_HANDOFF_DIR` overrides it. Read per dispatch, like the runner file.
+ */
+export function verdictHandoffDir(homes: readonly string[] = helperHomeCandidates()): string {
   const override = (process.env.PYRY_VERDICT_HANDOFF_DIR ?? "").trim();
-  return override !== "" ? resolve(override) : resolve(homedir(), ".codex/publish", basename(resolve(repoRoot)), "verdict-handoff");
+  if (override !== "") return resolve(override);
+  const repo = basename(resolve(repoRoot));
+  return resolve(installedHelperHome(repo, homes) ?? homedir(), ".codex/publish", repo, "verdict-handoff");
 }
 
 /** One file per agent and ticket. The dispatcher empties it before each run. */

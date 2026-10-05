@@ -215,8 +215,16 @@ live-evidence checks, performs any red-gate triage, then publishes the verdict.
 is told a handoff file in its prompt. It writes its finished verdict there before
 posting: a header with `decision: PASS` or `FAIL`, `commit:` with the full SHA of the
 PR head it reviewed, `labels:` with the labels the verdict adds, then a `---` line
-and the comment body. The file lives in `~/.codex/publish/<repository>/verdict-handoff/`,
+and the comment body. The file lives in `<home>/.codex/publish/<repository>/verdict-handoff/`,
 beside the GitHub body files both runners already write, or in `PYRY_VERDICT_HANDOFF_DIR`.
+`<home>` is the home folder written into the repository's installed pipeline helper,
+`<home>/.codex/bin/<repository>-pipeline-action`, because the helper accepts body files
+only under that home. The dispatcher looks for the helper in its own home first, then
+in every folder under `/Users` and `/home`, and uses its own home when there is none. In
+the pyrycode-agents container the dispatcher runs as `/home/agent`, but the helpers were
+installed on the Mac with `/Users/juhanailmoniemi`. Until 2026-10-05 the handoff went
+under `/home/agent`, and on pyrycode-desktop #1721 the helper refused to post the
+verifier's verdict from there.
 The dispatcher empties it before each run. When the run then fails or blocks because a
 GitHub write failed, nothing was posted on the PR since the run began, the file is
 complete and the PR head still equals the reviewed commit, the dispatcher posts the
