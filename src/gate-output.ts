@@ -551,6 +551,7 @@ export function buildBaselineFilter(
   format: GateOutputFormat = "go-json",
 ): string | null {
   if (format === "junit-xml") return buildJUnitBaselineFilter(qualifiedFailedNames);
+  if (format === "playwright-json") return buildPlaywrightBaselineFilter(qualifiedFailedNames);
   const safe = /^[A-Za-z0-9_/#.\-]+$/;
   const bare: string[] = [];
   for (const qualified of qualifiedFailedNames) {
@@ -586,6 +587,43 @@ function buildJUnitBaselineFilter(qualifiedFailedNames: readonly string[]): stri
   }
   if (names.length === 0) return null;
   return `'${names.join(",")}'`;
+}
+
+/** The separator `parsePlaywrightJson` joins a test's title path with. */
+const PLAYWRIGHT_TITLE_SEPARATOR = " › ";
+
+/**
+ * The Playwright side of `buildBaselineFilter`: a single-quoted regex for
+ * `-g`, one alternative per test.
+ *
+ * Playwright tests `-g` against the title path joined by single spaces, with
+ * the project name in front and any tags of a describe or test mixed in
+ * (`_grepTitleWithTags` in Playwright 1.61, compiled as
+ * `new RegExp(pattern, "gi")`). The parser names a test by the same path
+ * joined with ` › `. So each segment is escaped and the segments are joined
+ * with `.*`, which also matches the tags and the project name between them.
+ * The pattern is unanchored for the same reason. Over-matching only re-runs
+ * extra tests, and results are compared by full name, as with Go subtests.
+ *
+ * Inside single quotes the shell passes every character through except the
+ * quote itself, so only a quote, and any control character such as a newline,
+ * refuses the list. Spaces and `›` are why Playwright names need this builder:
+ * the Go rule refused them, and every pyrycode-desktop live FAIL said "could
+ * not build a safe test filter" (agent-dispatcher#132, #38).
+ */
+function buildPlaywrightBaselineFilter(qualifiedFailedNames: readonly string[]): string | null {
+  const unsafe = /['\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+  const escapeRegex = (s: string) => s.replace(/[.*+?^${}()|[\]\\/]/g, (m) => `\\${m}`);
+  const patterns: string[] = [];
+  for (const name of qualifiedFailedNames) {
+    if (unsafe.test(name)) return null;
+    const segments = name.split(PLAYWRIGHT_TITLE_SEPARATOR).map((s) => s.trim()).filter((s) => s !== "");
+    if (segments.length === 0) return null;
+    const pattern = segments.map(escapeRegex).join(".*");
+    if (!patterns.includes(pattern)) patterns.push(pattern);
+  }
+  if (patterns.length === 0) return null;
+  return `'(${patterns.join("|")})'`;
 }
 
 /** Placeholder a baseline command template must carry. */

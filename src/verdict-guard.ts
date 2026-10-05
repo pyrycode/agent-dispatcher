@@ -19,8 +19,8 @@
 //
 // The same artifacts feed the rework breaker's repeat rule (agent-dispatcher
 // #122): the `[MUST FIX]` findings of the newest FAIL verdict and the one
-// before it, compared by their `path → Symbol` keys. See
-// `findRepeatedMustFix`.
+// before it, compared by their `path → Symbol` keys and then by their text
+// (#130). See `findRepeatedMustFix`.
 //
 // Pure helpers here; the I/O (the `gh` calls) stays in dispatch.ts.
 
@@ -56,29 +56,91 @@ function isFailVerdict(body: string): boolean {
 /** `- [MUST FIX] `path` → `Symbol`: …`, arrow as `→` or `->`, symbol quoted or bare. */
 const MUST_FIX_KEY = /\[MUST FIX\]\s*`([^`]+)`\s*(?:→|->)\s*(?:`([^`]+)`|([^\s:`]+))/;
 
+/** One `[MUST FIX]` finding: its `path → Symbol` key and the text after it. */
+export interface MustFixFinding {
+  key: string;
+  text: string;
+}
+
 /**
- * The `path → Symbol` keys of a verdict's `[MUST FIX]` findings, in order,
- * without duplicates. The verifier prompt asks for the symbol rather than
- * the line because the builder's next push shifts line numbers, so a finding
- * with no symbol (a line-number finding, free text) yields no key.
+ * A verdict's `[MUST FIX]` findings, in order, each with its `path → Symbol`
+ * key and the rest of its line. The verifier prompt asks for the symbol
+ * rather than the line because the builder's next push shifts line numbers,
+ * so a finding with no symbol (a line-number finding, free text) is skipped.
  */
-export function extractMustFixKeys(body: string): string[] {
-  const keys = new Set<string>();
+export function extractMustFixFindings(body: string): MustFixFinding[] {
+  const out: MustFixFinding[] = [];
   for (const line of body.split("\n")) {
     const m = MUST_FIX_KEY.exec(line);
-    if (m) keys.add(`${m[1].trim()} → ${(m[2] ?? m[3]).trim()}`);
+    if (m) out.push({ key: `${m[1].trim()} → ${(m[2] ?? m[3]).trim()}`, text: line.slice(m.index + m[0].length) });
   }
-  return [...keys];
+  return out;
+}
+
+/** The distinct `path → Symbol` keys of a verdict's `[MUST FIX]` findings, in order. */
+export function extractMustFixKeys(body: string): string[] {
+  return [...new Set(extractMustFixFindings(body).map((f) => f.key))];
+}
+
+/**
+ * How alike two findings under the same key must read to count as one
+ * finding raised again, on `findingTextSimilarity`'s 0 to 1 scale.
+ *
+ * The location alone is not enough: a large function collects unrelated
+ * findings. Exact text is too much: the verifier rewords a finding it raises
+ * again. Measured on the verbatim verdicts for mobile #1747 on
+ * pyrycode-mobile PR #1755, 2026-10-05, all under `ThreadScreen.kt` →
+ * `ThreadScreen`: the ordering defect raised at 10:18 and again at 12:42
+ * ("the previously reported … defect remains") scores 0.56. The different
+ * paste-callback defect at 14:05 scores 0.11 against 12:42 and 0.13 against
+ * 10:18. Pinned by verdict-guard.test.ts.
+ */
+export const REPEAT_FINDING_SIMILARITY = 0.3;
+
+/** Short words that carry no meaning for telling two findings apart. */
+const FINDING_STOP_WORDS = new Set((
+  "a an and are as at be been but by can for from has have in into is it its no not of on or so " +
+  "than that the their then there these this those to was were which while with also only same each both " +
+  "still after before"
+).split(" "));
+
+/**
+ * A finding's text normalised to a set of word stems: lower case, links and
+ * Markdown dropped, split on anything that is not a letter or digit, short
+ * and stop words removed, and a plural `s` trimmed.
+ */
+function findingWords(text: string): Set<string> {
+  const words = text.toLowerCase()
+    .replace(/https?:\/\/\S+/g, " ")
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter((w) => w.length > 2 && !FINDING_STOP_WORDS.has(w))
+    .map((w) => w.replace(/s$/, ""));
+  return new Set(words);
+}
+
+/**
+ * Jaccard similarity of two findings' normalised word sets, 0 to 1. Two
+ * texts with no words left after normalising, such as a bare key, read as
+ * identical.
+ */
+export function findingTextSimilarity(a: string, b: string): number {
+  const wa = findingWords(a);
+  const wb = findingWords(b);
+  if (wa.size === 0 && wb.size === 0) return 1;
+  let shared = 0;
+  for (const w of wa) if (wb.has(w)) shared++;
+  return shared / (wa.size + wb.size - shared);
 }
 
 /**
  * The `[MUST FIX]` keys the newest FAIL verdict shares with the FAIL verdict
- * before it: the verifier raising the same finding after the builder said it
- * was fixed. Reviews and comments both count, ordered by time; PASS verdicts
- * and other comments are skipped. A verdict posted twice word for word, as a
- * review and a comment, is one round. Empty when there are fewer than two
- * FAIL verdicts or either has no parseable key, so the caller falls back to
- * the count rule.
+ * before it, where the two findings under that key also read alike
+ * (`REPEAT_FINDING_SIMILARITY`): the verifier raising the same finding after
+ * the builder said it was fixed, not a new finding in the same function.
+ * Reviews and comments both count, ordered by time; PASS verdicts and other
+ * comments are skipped. A verdict posted twice word for word, as a review and
+ * a comment, is one round. Empty when there are fewer than two FAIL verdicts
+ * or either has no parseable key, so the caller falls back to the count rule.
  */
 export function findRepeatedMustFix(artifacts: readonly VerdictArtifact[]): string[] {
   const fails = artifacts
@@ -87,8 +149,10 @@ export function findRepeatedMustFix(artifacts: readonly VerdictArtifact[]): stri
     .map((a) => a.body!.trim());
   const [newest, previous] = [...new Set(fails)];
   if (previous === undefined) return [];
-  const prior = new Set(extractMustFixKeys(previous));
-  return extractMustFixKeys(newest).filter((k) => prior.has(k));
+  const prior = extractMustFixFindings(previous);
+  const repeated = extractMustFixFindings(newest).filter((f) =>
+    prior.some((p) => p.key === f.key && findingTextSimilarity(p.text, f.text) >= REPEAT_FINDING_SIMILARITY));
+  return [...new Set(repeated.map((f) => f.key))];
 }
 
 /** How many artifacts were posted at or after the run started. */

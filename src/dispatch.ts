@@ -8,8 +8,9 @@ import { config } from "dotenv";
 import { DispatchPool, candidateKey, excludeInFlight, freeSeats, resolvePollIntervalMs } from "./dispatch-pool.js";
 import { countVerdictsSince, parseVerdictArtifacts, pickVerdictPr, shouldFlagMissingVerdict } from "./verdict-guard.js";
 import { countOpenPrs, shouldFlagMissingPr } from "./pr-guard.js";
-import { PENDING_VERDICT_PREFIX, decideVerdictRecovery, handoffMarker, isVerdictPublishFailure, parsePendingVerdictState, parsePrVerdictView, parseVerdictHandoff, serializePendingVerdictState, verdictHandoffNote, type HandoffParse, type PendingVerdictState, type VerdictPrLookup } from "./verdict-handoff.js";
+import { PENDING_VERDICT_PREFIX, REREVIEW_PATCH_CAP, decideVerdictRecovery, handoffMarker, isVerdictPublishFailure, parseLastVerdict, parsePendingVerdictState, parsePrVerdictView, parseVerdictHandoff, reReviewNote, serializeLastVerdict, serializePendingVerdictState, verdictHandoffNote, type HandoffParse, type PendingVerdictState, type VerdictHandoff, type VerdictPrLookup } from "./verdict-handoff.js";
 import { resolveImportOnlyMerge } from "./merge-resolve.js";
+import { gateReportSection } from "./gate-report.js";
 import { FINAL_MERGE_HANDOFF_MARKER, FINAL_MERGE_HANDOFF_MAX, MERGE_HANDOFF_LABEL, checkMergeResolution, decideConflictRoute, decideFinalMergeRoute, findMergeCommit, mergeHandoffNote, mergeResolutionComment, mergeResolutionSection, readPendingMerge, type PendingMerge, type ResolutionNote } from "./merge-handoff.js";
 
 import {
@@ -95,8 +96,11 @@ import {
 import { recordFlakyTests, type FlakyTicketClient } from "./flaky-tickets.js";
 import { recordInheritedTests } from "./inherited-tickets.js";
 import {
+  decideDocsOnlyGateReuse,
   decideVerifierGateReuse,
   hashGateList,
+  parseVerifierDocsGates,
+  parseVerifierDocsPaths,
   parseVerifierGatePass,
   verifierGatePassFileName,
   verifierGateReuseEnabled,
@@ -1453,6 +1457,7 @@ async function buildPromptForAgent(
   // The builder set's refiner is the PO contract under a new name, so it
   // is excluded the same way.
   const needsArchDoc = !["po", "refiner"].includes(agent.name);
+  const planTexts: string[] = [];
   if (needsArchDoc) {
     try {
       // readdirSync + filter — no shell, no template-string, no `2>/dev/null`
@@ -1466,7 +1471,9 @@ async function buildPromptForAgent(
         entries = readdirSync(archDir).filter(name => name.startsWith(prefix));
       }
       for (const name of entries) {
-        parts.push(`\n## Architecture Doc (from System Architect)\n${readFileSync(resolve(archDir, name), "utf-8")}`);
+        const doc = readFileSync(resolve(archDir, name), "utf-8");
+        planTexts.push(doc);
+        parts.push(`\n## Architecture Doc (from System Architect)\n${doc}`);
       }
     } catch (e) {
       console.warn(`   ⚠️  Failed to read architecture docs for #${ticketNum}: ${e}`);
@@ -1560,6 +1567,21 @@ async function buildPromptForAgent(
       if (section) parts.push(section);
     } catch (e) {
       console.warn(`   ⚠️  Failed to read merge resolution notes for #${ticketNum}: ${e}`);
+    }
+  }
+
+  // The documentation agent records test evidence it cannot otherwise see:
+  // the verifier gate results live only in these logs (#136).
+  if (agent.name === "documentation" && ticketNum > 0) {
+    try {
+      parts.push(gateReportSection({
+        issueNumber: ticketNum,
+        logsDir: LOGS_DIR,
+        env: process.env,
+        namingText: [item.body, ...planTexts].join("\n"),
+      }));
+    } catch (e) {
+      console.warn(`   ⚠️  Failed to build the gate report for #${ticketNum}: ${e}`);
     }
   }
 
@@ -2406,6 +2428,12 @@ export function pendingVerdictStatePath(agentName: string, issueNumber: number):
   return resolve(LOGS_DIR, `verdict-pending-${agentName}-${issueNumber}.json`);
 }
 
+/** Where the dispatcher keeps the ticket's last complete verdict, for the
+ *  next re-review (#135). Its own logs folder, like the pending state. */
+export function lastVerdictPath(agentName: string, issueNumber: number): string {
+  return resolve(LOGS_DIR, `verdict-last-${agentName}-${issueNumber}.json`);
+}
+
 /**
  * Path of a dispatcher-owned worktree. Every board's dispatcher shares the
  * `.pyrycode-worktrees` folder beside its repository, and ticket numbers
@@ -2480,8 +2508,9 @@ export async function dispatchToAgent(
   const gates = parallelReview ? { promptNote: "" } : await maybeRunPreSpawnGates(ctx);
 
   const mergeNote = ctx.pendingMerge ? mergeHandoffNote(defaultBranch, ctx.pendingMerge.paths) : "";
+  const reReview = prepareReReviewNote(ctx);
   const handoffNote = prepareVerdictHandoff(ctx);
-  const spawn = await prepareAgentSpawn(ctx, gates.promptNote + mergeNote + handoffNote);
+  const spawn = await prepareAgentSpawn(ctx, gates.promptNote + mergeNote + reReview + handoffNote);
   if (!spawn.ok) return;
 
   // streamResult is declared outside the try so handleDispatchError
@@ -2490,7 +2519,7 @@ export async function dispatchToAgent(
   let saferSalvaged = false;
   try {
     streamResult = parallelReview
-      ? await runParallelVerifierReview(ctx, spawn)
+      ? await runParallelVerifierReview(ctx, spawn, reReview !== "")
       : await ctx.deps.runClaudeStreaming(spawn.config);
     // Budget-exhausted runs may get a same-session continuation leg
     // (PYRY_RESUME_LEGS, default 1) before any salvage. A success comes
@@ -3587,6 +3616,8 @@ export function finalReviewBudgetMs(timeoutMs: number, sourceReviewMs: number): 
 async function runParallelVerifierReview(
   ctx: DispatchContext,
   spawn: { config: SpawnConfig; promptText: string; systemPrompt: string },
+  /** The prompt carries a re-review section (#135). */
+  reReview = false,
 ): Promise<StreamResult> {
   const { config, promptText } = spawn;
   const sourcePromptFile = config.promptFile + ".source.txt";
@@ -3611,7 +3642,9 @@ async function runParallelVerifierReview(
   const criteria = ctx.deps.existsSync(criteriaPath) ? ctx.deps.readFileSync(criteriaPath, "utf-8") : null;
   const sourceInstructions = [
     "You are the first of two reviewers on this pull request. Automated checks are running at the same time. Your job is to find the problems in this change so the final verifier can confirm them and publish one verdict.",
-    "You are done when every changed section has been judged with enough of the surrounding code to know whether it is correct. Read as much context as each change needs. You do not need to read every affected file from end to end. Review the entire diff on rework too, together with the local plan and the repository instructions.",
+    "You are done when every changed section has been judged with enough of the surrounding code to know whether it is correct. Read as much context as each change needs. You do not need to read every affected file from end to end. " + (reReview
+      ? "The prompt has a Re-review after FAIL section: check each finding of the previous verdict and review the commits since it, together with the local plan and the repository instructions. Review the rest of the diff only when that section says the change is broad."
+      : "Review the entire diff on rework too, together with the local plan and the repository instructions."),
     `The source worktree is ${JSON.stringify(ctx.agentCwd)}. Your working directory is isolated. ` + (isClaude
       ? "The complete merge-base diff is supplied in the prompt. Use Read, Glob and Grep to inspect files. Read large files in ranges with an offset and limit."
       : `Use git -C with this absolute path and compare against ${JSON.stringify(defaultBranch)} using the merge base. Command output longer than about 10000 tokens is cut in the middle, so read large files one range at a time, for example with sed -n, and reread any range that came back cut.`),
@@ -4105,6 +4138,75 @@ function prepareVerdictHandoff(ctx: DispatchContext): string {
     console.warn(`   ⚠️  Could not prepare the verdict handoff file ${path}: ${e}`);
   }
   return verdictHandoffNote(path);
+}
+
+/** Keep a complete verdict as the ticket's last one (#135). A failure only
+ *  costs the next re-review its narrowing. */
+function writeLastVerdict(
+  deps: Pick<DispatchDeps, "mkdirSync" | "writeFileSync">,
+  agentName: string,
+  issueNumber: number,
+  handoff: VerdictHandoff,
+): void {
+  const path = lastVerdictPath(agentName, issueNumber);
+  try {
+    deps.mkdirSync(dirname(path), { recursive: true });
+    deps.writeFileSync(path, serializeLastVerdict(handoff, new Date().toISOString()));
+  } catch (e) {
+    console.warn(`   ⚠️  Could not keep the last verdict for #${issueNumber} at ${path}: ${e}`);
+  }
+}
+
+/** After a verdict run that ended with a verdict: copy a complete handoff to
+ *  the ticket's last verdict. Missing or incomplete leaves the old one. */
+function recordLastVerdict(ctx: DispatchContext): void {
+  const path = ctx.verdictHandoffPath;
+  if (!path) return;
+  let handoff: HandoffParse;
+  try {
+    handoff = parseVerdictHandoff(String(ctx.deps.readFileSync(path, "utf-8")));
+  } catch {
+    return;
+  }
+  if (handoff.ok) writeLastVerdict(ctx.deps, ctx.agent.name, ctx.item.issueNumber, handoff.handoff);
+}
+
+/**
+ * The re-review section for a verifier dispatch (#135), or "" for a full
+ * review. Applies when the ticket's last verdict is a FAIL whose reviewed
+ * commit is an ancestor of the pushed feature branch head. The head is
+ * `origin/<branch>`, not the worktree HEAD, which may carry a fresh merge
+ * of the default branch. `--no-merges` keeps main's changes out of the log.
+ * Any git failure means no section.
+ */
+function prepareReReviewNote(ctx: DispatchContext): string {
+  const { agent, item } = ctx;
+  if (item.issueNumber <= 0 || !ctx.useWorktree) return "";
+  if (activeStageSet().preSpawnGate?.agentNames.has(agent.name) !== true) return "";
+  let last: ReturnType<typeof parseLastVerdict>;
+  try {
+    last = parseLastVerdict(String(ctx.deps.readFileSync(lastVerdictPath(agent.name, item.issueNumber), "utf-8")));
+  } catch {
+    return "";
+  }
+  if (last === null || last.decision !== "FAIL") return "";
+  const git = (args: string[]): string | null => {
+    const r = ctx.deps.spawnSync("git", args, { cwd: ctx.agentCwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+    return r.error || r.status !== 0 ? null : String(r.stdout ?? "");
+  };
+  const head = git(["rev-parse", "--verify", `origin/${ctx.branchName}^{commit}`])?.trim().toLowerCase() ?? "";
+  if (!/^[0-9a-f]{40}$/.test(head)) return "";
+  if (git(["merge-base", "--is-ancestor", last.commit, head]) === null) return "";
+  const range = `${last.commit}..${head}`;
+  const patch = git(["log", "-p", "--no-merges", "--no-ext-diff", range]);
+  if (patch === null) return "";
+  let stat: string | null = null;
+  if (patch.length > REREVIEW_PATCH_CAP) {
+    stat = git(["log", "--no-merges", "--stat", "--format=%h %s", range]);
+    if (stat === null) return "";
+  }
+  console.log(`   🔁 Re-review after FAIL on ${last.commit.slice(0, 12)}: ${stat === null ? "narrowed to the commits since" : "broad change, full review"}`);
+  return reReviewNote({ body: last.body, reviewed: last.commit, head, patch: stat === null ? patch : null, stat });
 }
 
 /** Find the ticket's PR and read its head and every review and comment. */
@@ -4613,6 +4715,7 @@ export async function handlePostRun(
       }
       return { ok: false };
     }
+    recordLastVerdict(ctx);
   }
 
   // Post-success labeling
@@ -4834,6 +4937,10 @@ export async function runVerifierGates(opts: {
    * that ran to an exit code.
    */
   assessRed?: (red: { gate: string; stdoutPath: string }) => Promise<GateBaselineAssessment | null>;
+  /** Each gate's log number, when not its position in `gates`. A docs-only
+   *  rerun keeps a gate's number in the full list, so it never overwrites a
+   *  reused gate's log. */
+  logNumbers?: readonly number[];
   deps: Pick<DispatchDeps, "spawnGate" | "readFileSync">;
 }): Promise<VerifierGatesOutcome> {
   const logsDir = opts.logsDir ?? LOGS_DIR;
@@ -4842,8 +4949,9 @@ export async function runVerifierGates(opts: {
   const baseline: GateBaselineAssessment[] = [];
   for (let i = 0; i < opts.gates.length; i++) {
     const gate = opts.gates[i]!;
-    const stdoutPath = resolve(logsDir, `verifier-gate_#${opts.issueNumber}_${i + 1}.log`);
-    const stderrPath = resolve(logsDir, `verifier-gate_#${opts.issueNumber}_${i + 1}.stderr.log`);
+    const n = opts.logNumbers?.[i] ?? i + 1;
+    const stdoutPath = resolve(logsDir, `verifier-gate_#${opts.issueNumber}_${n}.log`);
+    const stderrPath = resolve(logsDir, `verifier-gate_#${opts.issueNumber}_${n}.stderr.log`);
     logPaths.push(stdoutPath, stderrPath);
     const outcome = await opts.deps.spawnGate({
       command: gate,
@@ -5201,16 +5309,10 @@ function mergedWorktreeHead(ctx: DispatchContext): { commit: string; tree: strin
 }
 
 /**
- * The recorded gate pass for this dispatch, when it may stand in for running
- * the gates (`decideVerifierGateReuse`). Any read or parse failure returns
+ * The recorded gate pass for this issue. Any read or parse failure returns
  * null, and the caller runs the gates as normal.
  */
-function readReusableGatePass(
-  ctx: DispatchContext,
-  passFile: string,
-  tree: string,
-  gatesHash: string,
-): VerifierGatePass | null {
+function readRecordedGatePass(ctx: DispatchContext, passFile: string): VerifierGatePass | null {
   const issueNumber = ctx.item.issueNumber;
   let raw: string;
   try {
@@ -5223,8 +5325,22 @@ function readReusableGatePass(
   const pass = parseVerifierGatePass(raw);
   if (pass === null) {
     console.warn(`   ⚠️  Recorded gate pass for #${issueNumber} is unreadable, so the gates run`);
-    return null;
   }
+  return pass;
+}
+
+/**
+ * The recorded gate pass, when it may stand in for running the gates
+ * (`decideVerifierGateReuse`). Null means the gates run as normal.
+ */
+function readReusableGatePass(
+  ctx: DispatchContext,
+  pass: VerifierGatePass | null,
+  tree: string,
+  gatesHash: string,
+): VerifierGatePass | null {
+  if (pass === null) return null;
+  const issueNumber = ctx.item.issueNumber;
   const decision = decideVerifierGateReuse({
     pass,
     issueNumber,
@@ -5235,6 +5351,48 @@ function readReusableGatePass(
   });
   if (decision.reuse) return decision.pass;
   console.log(`   🧪 Recorded gate pass for #${issueNumber} not reused (${decision.reason})`);
+  return null;
+}
+
+/**
+ * The recorded gate pass on another tree, when only documentation changed
+ * since it (`decideDocsOnlyGateReuse`, #134). The changed files come from
+ * `git diff --name-only <pass commit> HEAD` in the worktree. A commit that
+ * is not a SHA, or any git error, means no reuse and every gate runs.
+ */
+function readDocsOnlyGateReuse(
+  ctx: DispatchContext,
+  pass: VerifierGatePass | null,
+  tree: string,
+  gates: readonly string[],
+  gatesHash: string,
+): Extract<ReturnType<typeof decideDocsOnlyGateReuse>, { reuse: true }> | null {
+  if (pass === null || pass.tree === tree) return null;
+  const issueNumber = ctx.item.issueNumber;
+  const decision = decideDocsOnlyGateReuse({
+    pass,
+    issueNumber,
+    tree,
+    gates,
+    gatesHash,
+    nowMs: Date.now(),
+    logExists: (p) => ctx.deps.existsSync(p),
+    docsPaths: parseVerifierDocsPaths(process.env.PYRY_VERIFIER_DOCS_PATHS),
+    docsGates: parseVerifierDocsGates(process.env.PYRY_VERIFIER_DOCS_GATES),
+    changedFiles: (fromCommit) => {
+      if (!/^[0-9a-f]{40,64}$/.test(fromCommit)) return null;
+      try {
+        return String(ctx.deps.execSync(`git diff --name-only ${fromCommit} HEAD`, {
+          cwd: ctx.agentCwd, encoding: "utf-8", stdio: "pipe", timeout: 15_000,
+        })).split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
+      } catch (e: any) {
+        console.warn(`   ⚠️  Could not list the files changed since the gate pass for #${issueNumber}, so every gate runs: ${e?.message ?? e}`);
+        return null;
+      }
+    },
+  });
+  if (decision.reuse) return decision;
+  console.log(`   🧪 Recorded gate pass for #${issueNumber} not reused for a docs-only change (${decision.reason})`);
   return null;
 }
 
@@ -5268,6 +5426,11 @@ function readReusableGatePass(
  *   merged tree with the same gate list in the last 24 hours is reused:
  *   no gate runs, and the green note says whose results they are. See
  *   verifier-gate-reuse.ts; `PYRY_VERIFIER_GATE_REUSE=0` turns it off.
+ * - **Only documentation changed since a green run** → when every file
+ *   changed since the recorded pass's commit matches
+ *   `PYRY_VERIFIER_DOCS_PATHS`, the code gates are reused and only the
+ *   `PYRY_VERIFIER_DOCS_GATES` run. The note lists the files and narrows
+ *   the review to them. A green rerun records a pass for this tree (#134).
  * - **Red only with failures main already has** → a gate with an output
  *   format in `PYRY_VERIFIER_GATE_FORMATS` has its failing names re-run
  *   once in this worktree, then read against the latest ancestor main
@@ -5311,8 +5474,10 @@ export async function maybeRunPreSpawnGates(
   const passFile = resolve(LOGS_DIR, verifierGatePassFileName(item.issueNumber));
   const gatesHash = hashGateList(gates);
   const head = verifierGateReuseEnabled(process.env) ? mergedWorktreeHead(ctx) : null;
+  let docsOnly: ReturnType<typeof readDocsOnlyGateReuse> = null;
   if (head !== null) {
-    const reused = readReusableGatePass(ctx, passFile, head.tree, gatesHash);
+    const recordedPass = readRecordedGatePass(ctx, passFile);
+    const reused = readReusableGatePass(ctx, recordedPass, head.tree, gatesHash);
     if (reused !== null) {
       const sameCommit = reused.commit === head.commit;
       console.log(`   ♻️  Pre-${agent.name} gates already passed at ${reused.passedAt} on ${reused.commit.slice(0, 12)}${sameCommit ? "" : `, same files as ${head.commit.slice(0, 12)}`}; reusing that result`);
@@ -5333,7 +5498,35 @@ export async function maybeRunPreSpawnGates(
         ),
       };
     }
+    // Only documentation changed since the recorded pass (#134): the code
+    // gates' results stand, and only the documentation gates run below.
+    docsOnly = readDocsOnlyGateReuse(ctx, recordedPass, head.tree, gates, gatesHash);
   }
+  const toRun = docsOnly?.rerun ?? gates;
+  const docsOnlyNote = (): string => {
+    if (docsOnly === null) return "";
+    const reusedGates = gates.filter((g) => !docsOnly!.rerun.includes(g));
+    return [
+      "",
+      "",
+      "## Deterministic gates",
+      "",
+      `The code gates were reused because only these documentation files changed since the green run at commit \`${docsOnly.pass.commit}\`, which passed every gate at ${docsOnly.pass.passedAt}:`,
+      "",
+      ...docsOnly.files.map((f) => `- \`${f}\``),
+      "",
+      "Reused gates:",
+      "",
+      ...reusedGates.map((g) => `- \`${g}\``),
+      ...(docsOnly.rerun.length > 0
+        ? ["", "The documentation gates ran again on this worktree and passed:", "", ...docsOnly.rerun.map((g) => `- \`${g}\``)]
+        : []),
+      "",
+      "Treat these as green. Do not spend turns re-running them.",
+      "",
+      "Check only the documentation files listed above against the open findings. Do not review the code again.",
+    ].join("\n");
+  };
 
   // A gate with an output format (PYRY_VERIFIER_GATE_FORMATS) has a red read
   // against main first; see assessVerifierGateRed. No format, no reading. A
@@ -5347,12 +5540,18 @@ export async function maybeRunPreSpawnGates(
     }
     : undefined;
 
-  console.log(`   🧪 Pre-${agent.name} gates (${gates.length}): ${gates.map((g) => `\`${g}\``).join(", ")}`);
+  if (docsOnly !== null) {
+    console.log(`   ♻️  Pre-${agent.name} code gates already passed at ${docsOnly.pass.passedAt} on ${docsOnly.pass.commit.slice(0, 12)}; only documentation changed since (${docsOnly.files.length} file(s)), reusing that result`);
+  }
+  console.log(`   🧪 Pre-${agent.name} gates (${toRun.length}): ${toRun.map((g) => `\`${g}\``).join(", ")}`);
   const result = await runVerifierGates({
-    gates,
+    gates: toRun,
     cwd: agentCwd,
     issueNumber: item.issueNumber,
     assessRed,
+    // A rerun gate keeps its number in the full list, so the reused gates'
+    // logs, the evidence the pass rests on, are not overwritten.
+    logNumbers: docsOnly !== null ? toRun.map((g) => gates.indexOf(g) + 1) : undefined,
     deps: ctx.deps,
   });
   const baselineLog = result.baseline.flatMap((a) => [
@@ -5361,7 +5560,11 @@ export async function maybeRunPreSpawnGates(
     ...a.baseline.map((entry) => `  ${a.gate}: ${describeBaselineEntry(entry)}`),
     ...(a.baseSkipReason ? [`  ${a.gate}: no base re-run, ${a.baseSkipReason}`] : []),
   ]);
-  ctx.deps.writeLog(logFile, "GATES", [...result.summary, ...baselineLog].join("\n"));
+  const docsOnlyLog = docsOnly === null ? [] : [
+    `Reused the pass recorded at ${docsOnly.pass.passedAt} on commit ${docsOnly.pass.commit} (tree ${docsOnly.pass.tree}) for every gate except the documentation gates; only documentation changed since: ${docsOnly.files.join(", ")}`,
+    ...gates.flatMap((g, i) => (docsOnly!.rerun.includes(g) ? [] : [docsOnly!.pass.summary[i] ?? `✓ ${g}`])),
+  ];
+  ctx.deps.writeLog(logFile, "GATES", [...docsOnlyLog, ...result.summary, ...baselineLog].join("\n"));
   const baselineTicket = await recordBaselineOnMainFailureTicket(ctx, result.baseline);
 
   if (result.ok && result.baseline.length > 0) {
@@ -5375,7 +5578,7 @@ export async function maybeRunPreSpawnGates(
     console.log(`   ✅ Pre-${agent.name} gates green once ${setAside} are set aside`);
     return {
       promptNote: [
-        greenNote(
+        docsOnly !== null ? docsOnlyNote() : greenNote(
           "The dispatcher ran the fork's deterministic gates in this worktree before spawning you. Every gate passed " +
           `apart from ${setAside}, so the gates count as green for your verdict:`,
         ),
@@ -5390,15 +5593,23 @@ export async function maybeRunPreSpawnGates(
     // Only a full pass is recorded. A red, timed-out or unspawnable gate
     // never is, so a retry after a flaky failure runs the gates again.
     if (head !== null) {
+      // A docs-only pass is recorded for this tree too, so a retry on the
+      // same files is an exact match. It combines the reused code gates'
+      // lines with the rerun documentation gates' lines, names the same
+      // logs, and keeps the original time so the code gates' evidence still
+      // ages out after a day.
+      const rerunLine = (g: string) => result.summary[docsOnly!.rerun.indexOf(g)];
       const pass: VerifierGatePass = {
         issueNumber: item.issueNumber,
         commit: head.commit,
         tree: head.tree,
         gatesHash,
         gates,
-        passedAt: new Date().toISOString(),
-        summary: result.summary,
-        logPaths: result.logPaths,
+        passedAt: docsOnly?.pass.passedAt ?? new Date().toISOString(),
+        summary: docsOnly === null
+          ? result.summary
+          : gates.map((g, i) => (docsOnly!.rerun.includes(g) ? rerunLine(g) : docsOnly!.pass.summary[i]) ?? `✓ ${g}`),
+        logPaths: docsOnly?.pass.logPaths ?? result.logPaths,
       };
       try {
         ctx.deps.writeFileSync(passFile, JSON.stringify(pass, null, 2) + "\n");
@@ -5407,7 +5618,9 @@ export async function maybeRunPreSpawnGates(
       }
     }
     return {
-      promptNote: greenNote("The dispatcher ran the fork's deterministic gates in this worktree before spawning you; all passed:"),
+      promptNote: docsOnly !== null
+        ? docsOnlyNote()
+        : greenNote("The dispatcher ran the fork's deterministic gates in this worktree before spawning you; all passed:"),
     };
   }
 
@@ -5727,7 +5940,7 @@ export async function runStrandedWipSweep(
  */
 export async function runPendingVerdictPublish(
   client: DispatchClient,
-  deps: Pick<DispatchDeps, "execSync" | "readFileSync" | "notifyDiscord"> = DEFAULT_DEPS,
+  deps: Pick<DispatchDeps, "execSync" | "readFileSync" | "writeFileSync" | "mkdirSync" | "notifyDiscord"> = DEFAULT_DEPS,
 ): Promise<void> {
   let items: ProjectItem[];
   try {
@@ -5774,6 +5987,7 @@ export async function runPendingVerdictPublish(
         console.warn(`   ⏸️  Pending verdict on #${item.issueNumber}: ${published.why}; retrying next cycle`);
         continue;
       }
+      writeLastVerdict(deps, agentName, item.issueNumber, state.handoff);
       // pending-done first, so the ticket is never without a label that
       // stops a re-dispatch of the agent.
       try {
