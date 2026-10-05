@@ -1,10 +1,14 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import {
   countVerdictsSince,
+  extractMustFixFindings,
   extractMustFixKeys,
   findRepeatedMustFix,
+  findingTextSimilarity,
+  REPEAT_FINDING_SIMILARITY,
   parseVerdictArtifacts,
   pickVerdictPr,
   shouldFlagMissingVerdict,
@@ -143,5 +147,62 @@ describe("repeated verifier finding — the rework breaker's repeat rule (agent-
       ],
     }));
     assert.deepStrictEqual(findRepeatedMustFix(unkeyed), []);
+  });
+});
+
+describe("repeated verifier finding compares the finding text, not only its location (agent-dispatcher#130)", () => {
+  // Verbatim verifier comments for mobile #1747 on pyrycode/pyrycode-mobile#1755.
+  // 10:18 and 12:42 raise the same mixed-route ordering defect in
+  // `ThreadScreen.kt` → `ThreadScreen`; 12:42 says it "remains". 14:05 raises
+  // a different defect, the paste callback, under the same location key. The
+  // location-only rule parked #1747 at 14:05.
+  const fixture = JSON.parse(readFileSync(new URL("./fixtures/mobile-1755-verdicts.json", import.meta.url), "utf8")) as {
+    comments: Array<{ createdAt: string; body: string }>;
+  };
+  const at = (time: string) => {
+    const c = fixture.comments.find((x) => x.createdAt === `2026-10-05T${time}Z`);
+    assert.ok(c, `fixture has the ${time} verdict`);
+    return c!;
+  };
+  const threadScreen = "app/src/main/java/de/pyryco/mobile/ui/conversations/thread/ThreadScreen.kt → ThreadScreen";
+  const artifactsOf = (...times: string[]) => parseVerdictArtifacts(JSON.stringify({ comments: times.map(at) }));
+
+  test("#1747 negative: 12:42 and 14:05 share the ThreadScreen key but raise different defects, so nothing repeats", () => {
+    assert.ok(extractMustFixKeys(at("12:42:48").body).includes(threadScreen));
+    assert.ok(extractMustFixKeys(at("14:05:22").body).includes(threadScreen), "the location-only rule saw a repeat here");
+    assert.deepStrictEqual(findRepeatedMustFix(artifactsOf("12:42:48", "14:05:22")), []);
+  });
+
+  test("#1747 positive: 10:18 and 12:42 raise the same ordering defect in reworded text, so it repeats", () => {
+    assert.deepStrictEqual(findRepeatedMustFix(artifactsOf("10:18:57", "12:42:48")), [threadScreen]);
+  });
+
+  test("the threshold sits between the measured #1755 pairs", () => {
+    const finding = (time: string) => extractMustFixFindings(at(time).body).find((f) => f.key === threadScreen)!.text;
+    const repeat = findingTextSimilarity(finding("10:18:57"), finding("12:42:48"));
+    const different = findingTextSimilarity(finding("12:42:48"), finding("14:05:22"));
+    assert.ok(repeat >= REPEAT_FINDING_SIMILARITY, `true repeat scored ${repeat}`);
+    assert.ok(different < REPEAT_FINDING_SIMILARITY, `different finding scored ${different}`);
+  });
+
+  test("same key with unrelated text is not a repeat; identical text under the same key still is", () => {
+    const verdict = (finding: string) => `## Verifier Review: #1\n\n**Decision: FAIL**\n\n### Findings\n- ${finding}\n`;
+    const a = "[MUST FIX] `app/src/Screen.kt` → `Screen`: the retry button stays enabled while a request is in flight, so a double tap sends two requests";
+    const b = "[MUST FIX] `app/src/Screen.kt` → `Screen`: the header title uses a hardcoded colour instead of the theme token";
+    const comments = (first: string, second: string) => parseVerdictArtifacts(JSON.stringify({ comments: [
+      { createdAt: "2026-10-05T09:00:00Z", body: verdict(first) },
+      { createdAt: "2026-10-05T10:00:00Z", body: verdict(second) },
+    ] }));
+    assert.deepStrictEqual(findRepeatedMustFix(comments(a, b)), []);
+    assert.deepStrictEqual(findRepeatedMustFix(comments(a, a.replace("so a double tap", "so a double-tap"))), ["app/src/Screen.kt → Screen"]);
+  });
+
+  test("extractMustFixFindings keeps each finding's text after the key, and a key with several findings keeps them all", () => {
+    const body = "- [MUST FIX] `a.kt` → `A`: first defect\n- [MUST FIX] `a.kt` → `A`, `helper`: second defect\n- [SHOULD FIX] `b.kt` → `B`: skipped";
+    assert.deepStrictEqual(extractMustFixFindings(body), [
+      { key: "a.kt → A", text: ": first defect" },
+      { key: "a.kt → A", text: ", `helper`: second defect" },
+    ]);
+    assert.deepStrictEqual(extractMustFixKeys(body), ["a.kt → A"]);
   });
 });
