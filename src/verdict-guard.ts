@@ -17,27 +17,78 @@
 // the ticket with a rework label. Otherwise the run is an error, not a
 // pass, and the ticket parks with `error:<agent>` for a person to look at.
 //
+// The same artifacts feed the rework breaker's repeat rule (agent-dispatcher
+// #122): the `[MUST FIX]` findings of the newest FAIL verdict and the one
+// before it, compared by their `path → Symbol` keys. See
+// `findRepeatedMustFix`.
+//
 // Pure helpers here; the I/O (the `gh` calls) stays in dispatch.ts.
 
 export interface VerdictArtifact {
   /** ISO-8601 timestamp of the review's submission or the comment's creation. */
   at: string;
+  /** The review's or comment's text, empty when the payload carried none. */
+  body?: string;
 }
 
 /**
- * Parse `gh pr view <n> --json reviews,comments` output into timestamps.
- * Tolerates either key being absent. Throws on malformed JSON so the caller
- * can decide to skip the guard rather than flag a run on a parse failure.
+ * Parse `gh pr view <n> --json reviews,comments` output into timestamps and
+ * bodies. Tolerates either key being absent. Throws on malformed JSON so the
+ * caller can decide to skip the guard rather than flag a run on a parse
+ * failure.
  */
 export function parseVerdictArtifacts(json: string): VerdictArtifact[] {
   const data = JSON.parse(json) as {
-    reviews?: Array<{ submittedAt?: string }>;
-    comments?: Array<{ createdAt?: string }>;
+    reviews?: Array<{ submittedAt?: string; body?: string }>;
+    comments?: Array<{ createdAt?: string; body?: string }>;
   };
   const out: VerdictArtifact[] = [];
-  for (const r of data.reviews ?? []) if (r.submittedAt) out.push({ at: r.submittedAt });
-  for (const c of data.comments ?? []) if (c.createdAt) out.push({ at: c.createdAt });
+  for (const r of data.reviews ?? []) if (r.submittedAt) out.push({ at: r.submittedAt, body: r.body ?? "" });
+  for (const c of data.comments ?? []) if (c.createdAt) out.push({ at: c.createdAt, body: c.body ?? "" });
   return out;
+}
+
+/** A verifier verdict that failed the PR: headed "Verifier Review" and ruling FAIL. */
+function isFailVerdict(body: string): boolean {
+  return /^##\s+Verifier Review\b/m.test(body) && /\*\*Decision:\s*FAIL\*\*/i.test(body);
+}
+
+/** `- [MUST FIX] `path` → `Symbol`: …`, arrow as `→` or `->`, symbol quoted or bare. */
+const MUST_FIX_KEY = /\[MUST FIX\]\s*`([^`]+)`\s*(?:→|->)\s*(?:`([^`]+)`|([^\s:`]+))/;
+
+/**
+ * The `path → Symbol` keys of a verdict's `[MUST FIX]` findings, in order,
+ * without duplicates. The verifier prompt asks for the symbol rather than
+ * the line because the builder's next push shifts line numbers, so a finding
+ * with no symbol (a line-number finding, free text) yields no key.
+ */
+export function extractMustFixKeys(body: string): string[] {
+  const keys = new Set<string>();
+  for (const line of body.split("\n")) {
+    const m = MUST_FIX_KEY.exec(line);
+    if (m) keys.add(`${m[1].trim()} → ${(m[2] ?? m[3]).trim()}`);
+  }
+  return [...keys];
+}
+
+/**
+ * The `[MUST FIX]` keys the newest FAIL verdict shares with the FAIL verdict
+ * before it: the verifier raising the same finding after the builder said it
+ * was fixed. Reviews and comments both count, ordered by time; PASS verdicts
+ * and other comments are skipped. A verdict posted twice word for word, as a
+ * review and a comment, is one round. Empty when there are fewer than two
+ * FAIL verdicts or either has no parseable key, so the caller falls back to
+ * the count rule.
+ */
+export function findRepeatedMustFix(artifacts: readonly VerdictArtifact[]): string[] {
+  const fails = artifacts
+    .filter((a) => a.body && isFailVerdict(a.body) && Number.isFinite(Date.parse(a.at)))
+    .sort((a, b) => Date.parse(b.at) - Date.parse(a.at))
+    .map((a) => a.body!.trim());
+  const [newest, previous] = [...new Set(fails)];
+  if (previous === undefined) return [];
+  const prior = new Set(extractMustFixKeys(previous));
+  return extractMustFixKeys(newest).filter((k) => prior.has(k));
 }
 
 /** How many artifacts were posted at or after the run started. */

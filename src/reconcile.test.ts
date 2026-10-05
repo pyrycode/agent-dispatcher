@@ -336,14 +336,15 @@ describe("runReworkRouting — cache invalidation", () => {
 
     await runReworkRouting(client);
 
-    // The route stripped the label and bumped rework-count.
+    // The route stripped the label and bumped the counter. A rework sent
+    // to anyone but the code owner counts on rework-other (#122).
     assert.ok(
       client.removeLabelCalls.some(c => c.issueNumber === 132 && c.label === "needs-rework:po"),
       "expected needs-rework:po to be stripped",
     );
     assert.ok(
-      client.addLabelCalls.some(c => c.issueNumber === 132 && c.label === "rework-count:1"),
-      "expected rework-count:1 to be added",
+      client.addLabelCalls.some(c => c.issueNumber === 132 && c.label === "rework-other:1"),
+      "expected rework-other:1 to be added",
     );
 
     // The fix: cache invalidated.
@@ -469,6 +470,155 @@ describe("runReworkRouting — cache invalidation", () => {
       await runReworkRouting(client);
 
       assert.deepEqual(client.addLabelCalls, [{ issueNumber: 809, label: "rework-count:2" }]);
+    });
+  });
+});
+
+// agent-dispatcher#122, 2026-10-05: the breaker counted every rework route
+// alike and parked at 3. Mobile #1782 was parked mid-progress (four verifier
+// rounds, different defects each time, passed on the next round once
+// restarted), and #1735 reached the limit on documentation asking the
+// verifier for evidence. Now only builder reworks count; a verifier finding
+// repeated across two FAIL verdicts parks at once; a hard cap backs it up.
+describe("runReworkRouting — builder rework breaker (#122)", () => {
+  const row = "[MUST FIX] `app/src/ui/ChannelListScreen.kt` → `ChannelRow`: hardcoded colour";
+  const failVerdict = (...findings: string[]) =>
+    `## Verifier Review: #1782\n\n**Decision: FAIL**\n**Gates:** green\n\n### Findings\n` +
+    findings.map(f => `- ${f}`).join("\n") + "\n\n### Summary\nFix the findings.";
+  const finding = (round: number) => `[MUST FIX] \`app/src/ui/Screen${round}.kt\` → \`Defect${round}\`: round ${round}`;
+
+  /** A PR whose comments are the given verdict bodies, an hour apart. */
+  const prJson = (bodies: string[]) => JSON.stringify({
+    reviews: [],
+    comments: bodies.map((body, i) => ({ createdAt: new Date(Date.UTC(2026, 9, 4, i)).toISOString(), body })),
+  });
+
+  /** Put the ticket in `status` with `trigger` and run one routing pass. */
+  async function route(client: MockClient, item: ProjectItem, status: string, trigger: string, options = {}) {
+    item.status = status;
+    item.labels.push(trigger);
+    await runReworkRouting(client, options);
+  }
+
+  test("three verifier reworks and two builder reworks leave the ticket unparked at rework-count:2", async () => {
+    await withStageSet("builder", async () => {
+      const item = makeItem({ id: "item-1735", issueNumber: 1735, labels: ["size:m"] });
+      const client = new MockClient([item]);
+      let reads = 0;
+      const options = { readPrVerdicts: async () => { reads++; return prJson([failVerdict(finding(reads))]); } };
+
+      await route(client, item, "In Documentation", "needs-rework:verifier", options);
+      await route(client, item, "In Code Review", "needs-rework:builder", options);
+      await route(client, item, "In Documentation", "needs-rework:verifier", options);
+      await route(client, item, "In Code Review", "needs-rework:builder", options);
+      await route(client, item, "In Documentation", "needs-rework:verifier", options);
+
+      assert.deepEqual(item.labels.sort(), ["rework-count:2", "rework-other:3", "size:m"]);
+      assert.equal(item.status, "In Code Review", "the last route went through");
+      assert.equal(client.addCommentCalls.length, 0, "no rework-loop comment");
+      assert.equal(reads, 2, "verdicts are read only on the verifier's routes to the builder");
+    });
+  });
+
+  test("two consecutive FAIL verdicts sharing a MUST FIX key park on the second route and name the key", async () => {
+    await withStageSet("builder", async () => {
+      const item = makeItem({ id: "item-1655", issueNumber: 1655, labels: [] });
+      const client = new MockClient([item]);
+      const verdicts = [failVerdict(row)];
+      const options = { readPrVerdicts: async () => prJson(verdicts) };
+
+      await route(client, item, "In Code Review", "needs-rework:builder", options);
+      assert.equal(item.status, "In Development", "one FAIL has nothing to repeat");
+      assert.ok(item.labels.includes("rework-count:1"));
+
+      verdicts.push(failVerdict(row, finding(2)));
+      await route(client, item, "In Code Review", "needs-rework:builder", options);
+
+      assert.equal(item.status, "In Code Review", "parked where it stands");
+      assert.ok(item.labels.includes("error:rework-loop"));
+      assert.ok(item.labels.includes("rework-count:1"), "the parked route counts nothing");
+      const comment = client.addCommentCalls.at(-1)?.body ?? "";
+      assert.match(comment, /Rework loop detected/);
+      assert.match(comment, /repeated finding/i);
+      assert.ok(comment.includes("app/src/ui/ChannelListScreen.kt → ChannelRow"), comment);
+
+      // Next cycle the trigger is still there: already parked, nothing more is written.
+      const comments = client.addCommentCalls.length;
+      await runReworkRouting(client, options);
+      assert.equal(client.addCommentCalls.length, comments);
+    });
+  });
+
+  test("the #1782 shape: builder reworks with disjoint findings keep routing until one would pass the hard cap", async () => {
+    await withStageSet("builder", async () => {
+      const item = makeItem({ id: "item-1782", issueNumber: 1782, labels: [] });
+      const client = new MockClient([item]);
+      const verdicts: string[] = [];
+      const options = { readPrVerdicts: async () => prJson(verdicts) };
+
+      for (let round = 1; round <= 4; round++) {
+        verdicts.push(failVerdict(finding(round)));
+        await route(client, item, "In Code Review", "needs-rework:builder", options);
+        assert.equal(item.status, "In Development", `round ${round} routes`);
+        assert.ok(item.labels.includes(`rework-count:${round}`));
+      }
+      assert.ok(!item.labels.includes("error:rework-loop"), "four rounds of progress do not park");
+
+      for (let round = 5; round <= 6; round++) {
+        verdicts.push(failVerdict(finding(round)));
+        await route(client, item, "In Code Review", "needs-rework:builder", options);
+      }
+      assert.ok(item.labels.includes("rework-count:6"));
+      assert.ok(!item.labels.includes("error:rework-loop"), "the sixth rework is still within the cap");
+
+      verdicts.push(failVerdict(finding(7)));
+      await route(client, item, "In Code Review", "needs-rework:builder", options);
+      assert.equal(item.status, "In Code Review");
+      assert.ok(item.labels.includes("error:rework-loop"), "the route that passes the cap parks");
+      const comment = client.addCommentCalls.at(-1)?.body ?? "";
+      assert.match(comment, /hard cap/i);
+      assert.match(comment, /6/);
+      assert.doesNotMatch(comment, /repeated finding/i);
+    });
+  });
+
+  test("FAIL verdicts with no parseable keys fall back to the count rule", async () => {
+    await withStageSet("builder", async () => {
+      const item = makeItem({ id: "item-50", issueNumber: 50, labels: ["rework-count:1"] });
+      const client = new MockClient([item]);
+      const keyless = [failVerdict("[MUST FIX] the suite is red"), failVerdict("[MUST FIX] the suite is red")];
+      const options = { hardCap: 2, readPrVerdicts: async () => prJson(keyless) };
+
+      await route(client, item, "In Code Review", "needs-rework:builder", options);
+      assert.equal(item.status, "In Development", "no keys, no repeat: the count rule lets it through");
+      assert.ok(item.labels.includes("rework-count:2"));
+
+      await route(client, item, "In Code Review", "needs-rework:builder", options);
+      assert.ok(item.labels.includes("error:rework-loop"), "a configured cap is honoured");
+      assert.match(client.addCommentCalls.at(-1)?.body ?? "", /hard cap/i);
+    });
+  });
+
+  test("a verdict read that fails, or finds no PR, is never a repeat", async () => {
+    await withStageSet("builder", async () => {
+      const failing = makeItem({ id: "item-51", issueNumber: 51, labels: [] });
+      const client = new MockClient([failing]);
+      const throwing = { readPrVerdicts: async (): Promise<string | null> => { throw new Error("gh: HTTP 502"); } };
+
+      await route(client, failing, "In Code Review", "needs-rework:builder", throwing);
+      assert.equal(failing.status, "In Development");
+      assert.ok(failing.labels.includes("rework-count:1"));
+
+      failing.labels = ["rework-count:6"];
+      await route(client, failing, "In Code Review", "needs-rework:builder", throwing);
+      assert.ok(failing.labels.includes("error:rework-loop"), "the count rule still applies");
+      assert.match(client.addCommentCalls.at(-1)?.body ?? "", /hard cap/i);
+
+      const noPr = makeItem({ id: "item-52", issueNumber: 52, labels: [] });
+      client.items.push(noPr);
+      await route(client, noPr, "In Code Review", "needs-rework:builder", { readPrVerdicts: async () => null });
+      assert.equal(noPr.status, "In Development");
+      assert.ok(noPr.labels.includes("rework-count:1"));
     });
   });
 });

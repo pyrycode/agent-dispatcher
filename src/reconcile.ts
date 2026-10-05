@@ -41,9 +41,12 @@ import {
   decideGateVerdict,
   decideRealClaudeGate,
   decideRealClaudeGateRun,
+  decideReworkBreaker,
   decideReworkRoutes,
   decideUnroutableRework,
   extractReworkCount,
+  extractReworkOtherCount,
+  REWORK_OTHER_PREFIX,
   isRetryWaiting,
   REWORK_TARGET_ERROR_LABEL,
   type RealClaudeGateRunCandidate,
@@ -55,6 +58,7 @@ import {
   decideGateMergeRoute,
 } from "./merge-handoff.js";
 import { selectDispatches } from "./dispatch-selection.js";
+import { findRepeatedMustFix, parseVerdictArtifacts } from "./verdict-guard.js";
 import { formatGateEvidenceComment, gateRunFloor, type GateRunReport } from "./gate-output.js";
 import type { FlakyRunContext, FlakyTicketResult } from "./flaky-tickets.js";
 import type { InheritedTicketResult } from "./inherited-tickets.js";
@@ -206,10 +210,31 @@ export async function runAutoAdvance(
 // up. The name→column map comes from the stage set; extractReworkTarget
 // lives in pipeline-decisions.ts.
 
-export async function runReworkRouting(client: ReconcileClient): Promise<void> {
+/** What `runReworkRouting` needs from the dispatcher beyond the board. */
+export interface ReworkRoutingOptions {
+  /** Builder rework hard cap, `PYRY_BUILDER_REWORK_CAP` resolved by the
+   *  caller. Defaults to REWORK_LOOP_THRESHOLD. */
+  hardCap?: number;
+  /** `gh pr view <n> --json reviews,comments` for the ticket's open pull
+   *  request, null when it has none. Throws when it cannot be read. Absent,
+   *  the repeat rule never fires and the count rule alone applies. */
+  readPrVerdicts?: (issueNumber: number) => Promise<string | null>;
+}
+
+export async function runReworkRouting(
+  client: ReconcileClient,
+  options: ReworkRoutingOptions = {},
+): Promise<void> {
   // Agents + the name→column routing map come from the resolved stage set
   // (classic: identical to the old AGENTS / AGENT_COLUMN_MAP pair).
-  const { agents, columnByAgent } = activeStageSet();
+  const { agents, columnByAgent, realClaudeGate } = activeStageSet();
+  const hardCap = options.hardCap ?? REWORK_LOOP_THRESHOLD;
+  // Only the code owner's rework counts toward the breaker: the agent
+  // owning In Development, whose rework label the live gate also applies.
+  const countedLabel = realClaudeGate.failReworkLabel;
+  // Columns of the agents that rule by verdict (the builder set's
+  // verifier). Only a route out of one of them reads the verdicts.
+  const verdictColumns = new Set(agents.filter(a => a.requiresVerdict).map(a => a.column));
 
   // Fetch items in every agent's column (one query per column, in parallel).
   const itemsByColumn = new Map<string, ProjectItem[]>();
@@ -227,8 +252,8 @@ export async function runReworkRouting(client: ReconcileClient): Promise<void> {
   // surface lives in lib.test.ts.
   const routes = decideReworkRoutes(columnByAgent, itemsByColumn);
 
-  // Apply each route: check rework counter (halt at threshold), move
-  // the item, strip stale labels, increment the counter. Track
+  // Apply each route: check the rework breaker, move the item, strip
+  // stale labels, increment the route's counter. Track
   // mutations the same way runAutoAdvance does — invalidate the cache
   // at the end if any state-changing operation happened.
   let mutated = false;
@@ -260,42 +285,68 @@ export async function runReworkRouting(client: ReconcileClient): Promise<void> {
       continue;
     }
 
-    // Find the source item to read its current rework count.
+    // Find the source item to read its current rework counters.
     const srcItems = itemsByColumn.get(route.fromColumn) ?? [];
     const srcItem = srcItems.find(it => it.id === route.itemId);
-    const currentCount = srcItem ? extractReworkCount(srcItem.labels) : 0;
+    const srcLabels = srcItem?.labels ?? [];
+    const currentCount = extractReworkCount(srcLabels);
+    const counted = !route.mergeHandoff && route.triggerLabel === countedLabel;
 
-    // Circuit breaker: halt rework routing on tickets that have reached
-    // the threshold. Adds error:rework-loop and a comment for human
-    // attention. Catches the recursive-rework class of failure
-    // (Pyrycode #41 hit 6 dev↔architect rounds before the dev agent
-    // self-halted by intelligence — this makes the halt structural).
-    if (!route.mergeHandoff && currentCount >= REWORK_LOOP_THRESHOLD) {
-      // The rework-loop comment + label only need to fire ONCE — once
-      // `error:rework-loop` is on the ticket, the dispatcher's own
-      // GLOBAL_BLOCK_LABELS gates further dispatch. But the trigger
-      // label (`needs-rework:<target>`) stays attached, so each cycle
-      // re-derives the same route and re-fires this branch. Without
-      // dedupe, the cycle log shows the same warning every minute
-      // forever (review #20).
-      const alreadyHalted = (srcItem?.labels ?? []).includes("error:rework-loop");
-      if (alreadyHalted) {
-        // Quiet path: ticket is already halted, nothing more to do.
-        continue;
+    // Circuit breaker on the code owner's reworks (see REWORK_LOOP_THRESHOLD
+    // and decideReworkBreaker): a verifier finding repeated across the last
+    // two FAIL verdicts parks at once, otherwise the route that would pass
+    // the hard cap parks. Adds error:rework-loop and a comment for human
+    // attention. Catches the recursive-rework class of failure (Pyrycode
+    // #41 hit 6 dev↔architect rounds before the dev agent self-halted by
+    // intelligence — this makes the halt structural).
+    //
+    // The rework-loop comment + label only need to fire ONCE — once
+    // `error:rework-loop` is on the ticket, the dispatcher's own
+    // GLOBAL_BLOCK_LABELS gates further dispatch. But the trigger label
+    // (`needs-rework:<target>`) stays attached, so each cycle re-derives
+    // the same route. Without this quiet path the cycle log shows the same
+    // warning every minute forever (review #20), and the verdicts would be
+    // re-read every cycle too.
+    if (counted && srcLabels.includes("error:rework-loop")) continue;
+    let repeatedKeys: string[] = [];
+    if (counted && verdictColumns.has(route.fromColumn) && options.readPrVerdicts) {
+      // An unreadable or unparseable verdict is never a repeat: the count
+      // rule decides alone.
+      try {
+        const json = await options.readPrVerdicts(route.issueNumber);
+        if (json !== null) repeatedKeys = findRepeatedMustFix(parseVerdictArtifacts(json));
+      } catch (e: any) {
+        console.warn(`   ⚠️  Could not read verdicts for #${route.issueNumber}; rework breaker uses the count alone: ${e?.message ?? e}`);
       }
+    }
+    const breaker = decideReworkBreaker({ counted, reworkCount: currentCount, hardCap, repeatedKeys });
+    if (breaker.park) {
+      const why = breaker.rule === "repeat"
+        ? `**Rule that fired:** repeated finding. The newest FAIL verdict on the pull request raises a \`[MUST FIX]\` ` +
+          `finding the FAIL verdict before it already raised, after a builder round that was meant to fix it:\n\n` +
+          breaker.keys.map(k => `- \`${k}\``).join("\n") + `\n\n` +
+          `Another round is unlikely to fix it on its own. The count did not matter: this ticket has ` +
+          `${currentCount} builder rework${currentCount === 1 ? "" : "s"}, and the hard cap is ${hardCap}.\n\n`
+        : `**Rule that fired:** hard cap. This ticket has already been sent back with \`${route.triggerLabel}\` ` +
+          `${currentCount} times, the cap is ${hardCap} (\`PYRY_BUILDER_REWORK_CAP\`), and no repeated verifier finding was found.\n\n`;
+      const resume = breaker.rule === "repeat"
+        ? `Clearing \`error:rework-loop\` alone parks it again, because the same two verdicts are still the newest. ` +
+          `Resolve the finding, or move the ticket to ${route.toColumn} by hand and remove both \`${route.triggerLabel}\` and \`error:rework-loop\`.`
+        : `Clear \`error:rework-loop\` and \`rework-count:${currentCount}\` to resume dispatch.`;
       try {
         await client.addLabel(route.issueNumber, "error:rework-loop");
         await client.addComment(
           route.issueNumber,
-          `## 🛑 Rework loop detected\n\nThis ticket has been rework'd ${currentCount} times across the pipeline. ` +
+          `## 🛑 Rework loop detected\n\n` +
+          why +
           `Halting dispatch to prevent further token burn.\n\n` +
           `**Triggering label this round:** \`${route.triggerLabel}\`\n` +
           `**Routed from:** ${route.fromColumn} (would have moved to ${route.toColumn})\n\n` +
-          `Manual intervention required. Inspect prior agent comments to find the root cause; ` +
-          `clear \`error:rework-loop\` and \`rework-count:${currentCount}\` to resume dispatch.`,
+          `Manual intervention required. Inspect prior agent comments to find the root cause. ${resume}`,
         );
         mutated = true;
-        console.log(`   🛑 Rework loop: #${route.issueNumber} hit threshold ${REWORK_LOOP_THRESHOLD} — halting dispatch (was: ${route.fromColumn} → ${route.toColumn})`);
+        const fired = breaker.rule === "repeat" ? `repeated finding ${breaker.keys.join(", ")}` : `hard cap ${hardCap}`;
+        console.log(`   🛑 Rework loop: #${route.issueNumber} ${fired} — halting dispatch (was: ${route.fromColumn} → ${route.toColumn})`);
       } catch (e) {
         console.warn(`   ⚠️  Failed to set rework-loop error on #${route.issueNumber}: ${e}`);
       }
@@ -307,29 +358,33 @@ export async function runReworkRouting(client: ReconcileClient): Promise<void> {
       for (const label of route.labelsToStrip) {
         try { await client.removeLabel(route.issueNumber, label); } catch {}
       }
-      // Bump the rework counter. Strip ALL existing rework-count:* labels
-      // first — extractReworkCount reads the max, but a buggy mutation
-      // chain could leave duplicates (rework-count:1 + rework-count:2).
-      // Stripping only the max would leave stragglers. Idempotent strip
-      // of every rework-count:* label keeps the state clean. (review #19)
+      // Bump the route's counter: rework-count for the code owner's rework,
+      // rework-other for any other. Strip ALL existing labels of that
+      // counter first — the extract helpers read the max, but a buggy
+      // mutation chain could leave duplicates (rework-count:1 +
+      // rework-count:2). Stripping only the max would leave stragglers.
+      // Idempotent strip of every label of the counter keeps the state
+      // clean. (review #19)
       mutated = true;
       const transition = route.fromColumn === route.toColumn
         ? `cleared at ${route.toColumn}`
         : `moved ${route.fromColumn} → ${route.toColumn}`;
       // A merge handoff is not a rework (see decideReworkRoutes): the
-      // counter stays where it is.
+      // counters stay where they are.
       if (route.mergeHandoff) {
         console.log(`   🔀 Merge handoff: #${route.issueNumber} ${transition} (${route.triggerLabel}, no rework counted)`);
         continue;
       }
-      const srcLabels = srcItem?.labels ?? [];
+      const prefix = counted ? "rework-count:" : REWORK_OTHER_PREFIX;
+      const next = (counted ? currentCount : extractReworkOtherCount(srcLabels)) + 1;
       for (const label of srcLabels) {
-        if (label.startsWith("rework-count:")) {
+        if (label.startsWith(prefix)) {
           try { await client.removeLabel(route.issueNumber, label); } catch {}
         }
       }
-      try { await client.addLabel(route.issueNumber, `rework-count:${currentCount + 1}`); } catch {}
-      console.log(`   ↩️  Rework: #${route.issueNumber} ${transition} (${route.triggerLabel}, count ${currentCount + 1}/${REWORK_LOOP_THRESHOLD})`);
+      try { await client.addLabel(route.issueNumber, `${prefix}${next}`); } catch {}
+      const tally = counted ? `builder rework ${next}/${hardCap}` : `${prefix}${next}, not counted toward the breaker`;
+      console.log(`   ↩️  Rework: #${route.issueNumber} ${transition} (${route.triggerLabel}, ${tally})`);
     } catch (e) {
       console.warn(`   ⚠️  Failed to route rework for #${route.issueNumber}: ${e}`);
     }

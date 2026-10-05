@@ -108,6 +108,7 @@ import {
   decidePostRunLabels,
   extractMergeAttemptCount,
   extractReworkCount,
+  extractReworkOtherCount,
   extractReworkTarget,
   isMergeConflictError,
   isPipelineLabel,
@@ -134,6 +135,7 @@ import {
   STRANDED_WIP_SWEPT_MARKER,
   decideFamilyBreaker,
   resolveFamilyDispatchLimit,
+  resolveReworkLoopCap,
   resolveFamilyRoot,
   collectOffBoardFamilyRoots,
   resolveFamilyTally,
@@ -160,6 +162,7 @@ import {
   runRealClaudeGate,
   runRealClaudeGateExecution,
   runReworkRouting,
+  type ReworkRoutingOptions,
   type RealClaudeGateRunner,
 } from "./reconcile.js";
 import {
@@ -402,6 +405,26 @@ const REAL_CLAUDE_GATE_SELECTION: GateSelectionConfig | null = (() => {
  * tickets (a clean ticket takes ~6 runs). See `runFamilyBreaker`.
  */
 const FAMILY_DISPATCH_LIMIT = resolveFamilyDispatchLimit(process.env.PYRY_FAMILY_DISPATCH_LIMIT);
+
+/**
+ * Rework breaker inputs (agent-dispatcher#122). The hard cap on builder
+ * reworks, default REWORK_LOOP_THRESHOLD (6), and the pull request read the
+ * repeat rule compares verdicts from: the ticket's open PR on
+ * `feature/<n>`, picked as the verdict guard picks it. A throw or a null
+ * leaves the count rule in charge. See `runReworkRouting`.
+ */
+const REWORK_ROUTING_OPTIONS: ReworkRoutingOptions = {
+  hardCap: resolveReworkLoopCap(process.env.PYRY_BUILDER_REWORK_CAP),
+  readPrVerdicts: async (issueNumber) => {
+    const prJson = execSync(
+      `gh pr list --head "feature/${issueNumber}" --state open --json number,isDraft`,
+      { cwd: repoRoot, encoding: "utf-8", timeout: 15_000 },
+    ).trim();
+    const pr = pickVerdictPr(prJson);
+    if (pr === null) return null;
+    return execSync(`gh pr view ${pr} --json reviews,comments`, { cwd: repoRoot, encoding: "utf-8", timeout: 15_000 });
+  },
+};
 
 /**
  * How many times one cycle re-runs selection after the family breaker
@@ -1273,7 +1296,9 @@ export type RefinementMode = "create-from-inbox" | "rework" | "refine";
 /**
  * Decide the `## Mode` for a po/refiner dispatch from the item alone.
  *
- * The routed-back signal is `rework-count:N`. `runReworkRouting` strips
+ * The routed-back signal is `rework-count:N`, or `rework-other:N` for a
+ * route that was not the code owner's rework (since #122, every route to
+ * po/refiner). `runReworkRouting` strips
  * the `needs-rework:<agent>` trigger BEFORE the target is dispatched
  * (`shouldSkipDispatch` blocks the target while it is still attached), so
  * the trigger itself is never on the item at prompt time. The counter is:
@@ -1301,6 +1326,7 @@ export function decideRefinementMode(
   if (item.issueNumber <= 0) return "create-from-inbox";
   const routedBack =
     extractReworkCount(item.labels) > 0 ||
+    extractReworkOtherCount(item.labels) > 0 ||
     item.labels.some(l => extractReworkTarget(l) === agentName);
   return routedBack ? "rework" : "refine";
 }
@@ -1321,8 +1347,11 @@ export function buildModeSection(
     case "create-from-inbox":
       return "\n## Mode\ncreate-from-inbox — raw user request, draft a structured GitHub issue.";
     case "rework": {
-      const count = extractReworkCount(item.labels);
-      const evidence = count > 0 ? ` (ticket carries \`rework-count:${count}\`)` : "";
+      const counters = ([
+        ["rework-count:", extractReworkCount(item.labels)],
+        ["rework-other:", extractReworkOtherCount(item.labels)],
+      ] as const).filter(([, n]) => n > 0).map(([prefix, n]) => `\`${prefix}${n}\``);
+      const evidence = counters.length > 0 ? ` (ticket carries ${counters.join(", ")})` : "";
       const reason = commentsIncluded
         ? "Read the previous agent comments above for the rework reason."
         : `No ticket comments are included above, so this prompt carries no rework reason. Check \`gh issue view ${item.issueNumber} --comments\` before assuming one.`;
@@ -1331,7 +1360,7 @@ export function buildModeSection(
     case "refine":
       // "Treat it as" rather than "this is": a human re-queue or a ticket
       // re-opened after Done-cleanup looks the same from the labels.
-      return `\n## Mode\nrefine — existing ${agent.column} ticket, not a rework. No agent has routed it back (no \`rework-count\` label), so treat this as a first refinement; there is no rework reason to look for.`;
+      return `\n## Mode\nrefine — existing ${agent.column} ticket, not a rework. No agent has routed it back (no \`rework-count\` or \`rework-other\` label), so treat this as a first refinement; there is no rework reason to look for.`;
   }
 }
 
@@ -7474,6 +7503,7 @@ export async function pollLoop(): Promise<void> {
     }
   }
   console.log(`   Family breaker: ${FAMILY_DISPATCH_LIMIT} dispatches per ticket family (PYRY_FAMILY_DISPATCH_LIMIT)`);
+  console.log(`   Rework breaker: ${REWORK_ROUTING_OPTIONS.hardCap} builder reworks, or a repeated verifier finding (PYRY_BUILDER_REWORK_CAP)`);
   console.log(
     `   Required environment: ${REQUIRED_ENV_NAMES.length > 0 ? REQUIRED_ENV_NAMES.join(", ") : "none declared"} (PYRY_REQUIRED_ENV)`,
   );
@@ -7678,7 +7708,7 @@ export async function pollLoop(): Promise<void> {
       gateRun === null ? pool.keys() : new Set([...pool.keys(), `real-claude-gate#${gateRun.issue}`]),
     );
     await runPendingDoneFinalize(client);
-    await runReworkRouting(client);
+    await runReworkRouting(client, REWORK_ROUTING_OPTIONS);
     await runRealClaudeGate(client);
     // Run the live gate for one parked ticket, here and only here.
     //
@@ -7891,7 +7921,7 @@ export async function pollLoop(): Promise<void> {
     // changes between cycles).
     await runClosedSweep(client);
     await runPendingDoneFinalize(client);
-    await runReworkRouting(client);
+    await runReworkRouting(client, REWORK_ROUTING_OPTIONS);
     await runRealClaudeGate(client);
     await runAutoAdvance(client, MAX_CONCURRENT, pool.size);
     await runDoneCleanup(client);
