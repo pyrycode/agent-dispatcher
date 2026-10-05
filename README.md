@@ -125,6 +125,12 @@ Optional:
 | `PYRY_BUDGET_SCALE` | `1` | Multiplier on every agent's turn cap and wall-clock timeout, for a fork whose tickets or model need a different budget without changing the others. Timeouts round to whole minutes. Unset, empty, non-numeric, zero or negative keeps `1`. Mobile runs `1.5` since 2026-09-23, after moving to Opus 5.5 and raising its ticket ceiling to 1600 lines. Printed in the startup banner. |
 | `PYRY_REQUIRED_ENV` | — | Comma- or space-separated names of environment variables this fork cannot work without, such as `ANDROID_HOME`. Checked every cycle against the dispatcher's own environment. While one is unset or blank, no agent is dispatched and neither the live gate nor the main sweep starts, a warning is logged and one Discord message is sent. Board upkeep, rework routing and merges carry on. Restart the dispatcher with the variable set to resume. Unset requires nothing. Added after mobile #1631 parked on 2026-10-03, when a restart lost `ANDROID_HOME` and the builder found Gradle could not locate the SDK. Printed in the startup banner. |
 | `PYRY_AGENT_SHELL_ENV` | — | Codex runner only. Comma- or space-separated names of non-secret settings that Codex agents' shell commands should see, such as `ANDROID_HOME`. The user's Codex config inherits only core variables into tool commands, so without this a builder cannot see what the fork's `.env` supplies. Each listed name that is set and not blank in the environment Codex gets is passed as its own `-c shell_environment_policy.set.NAME=...` override, the same way `AGENTS_REPO_PATH` is. A name that looks secret, containing `KEY`, `SECRET`, `TOKEN`, `PASSWORD`, `PASSWD`, `CREDENTIAL`, `AUTH` or `PRIVATE` or starting with `OP_` in any case, or that is not an upper-case variable name, is skipped with one warning per dispatcher process. The read-only preliminary source review gets none of them: it ignores the user config, so the core-only policy does not apply to it, and it builds nothing. Unset passes nothing. The Claude runner needs nothing, since its shells inherit the environment. Printed in the startup banner. Mobile #1631 parked on 2026-10-03 on "ANDROID_HOME is missing from the dispatcher environment". |
+| `PYRY_HEALTH_GITHUB_CMD` | — | Pre-dispatch health check: a shell command proving the agent can reach GitHub, such as `gh auth status --hostname github.com`. Exit 0 passes. Runs before every role's dispatch, in the environment the agent's tool commands get. Unset is off. See [Health check before dispatch](#health-check-before-dispatch). |
+| `PYRY_HEALTH_FIGMA_CMD` | — | Pre-dispatch health check for the Figma MCP tools, run in the agent process's environment. Guards `PYRY_HEALTH_FIGMA_ROLES`, default `builder,verifier`. Unset is off. |
+| `PYRY_HEALTH_LIVE_LOGIN_CMD` | — | Pre-dispatch health check for the live-test Claude login. Guards `PYRY_HEALTH_LIVE_LOGIN_ROLES`, default `builder`, and the dispatcher's own live gate. Unset is off. |
+| `PYRY_HEALTH_DAEMON_CMD` | — | Pre-dispatch health check for the test daemon, usually printing its version. Guards `PYRY_HEALTH_DAEMON_ROLES`, default `builder,verifier`, and the live gate. With `PYRY_HEALTH_DAEMON_MIN_VERSION` set, the first version number the command prints must be at least that. Unset is off. |
+| `PYRY_HEALTH_<CHECK>_ROLES` | per check | Comma- or space-separated roles a check guards, overriding its default. `all` or `*` means every role. `<CHECK>` is `GITHUB`, `FIGMA`, `LIVE_LOGIN` or `DAEMON`. GitHub defaults to every role. |
+| `PYRY_HEALTH_CACHE_MS` | `300000` | How long a health check result is kept, per check and environment, so a two-minute poll does not run `gh` or `op` every cycle. `0` re-runs every cycle. Garbage keeps the default. |
 | `PYRY_BUILDER_REWORK_CAP` | `6` | Rework breaker: how many times a ticket can be sent back to the code owner, `needs-rework:builder` in the builder set, before the next route parks it under `error:rework-loop`. Reworks routed to any other agent count on a separate `rework-other:N` label that never parks. On a verifier route to the builder, a `[MUST FIX]` finding with the same `path → Symbol` in the last two FAIL verdicts parks at once, whatever the count, when the two findings also read alike: their normalised word sets must overlap by at least 0.3 Jaccard similarity, so a different defect in the same function is not a repeat (agent-dispatcher#130); the parking comment says which rule fired. Zero, negative or garbage keeps `6`. Was a flat 3 on every rework route until 2026-10-05 (agent-dispatcher#122). Printed in the startup banner. |
 | `PYRY_FAMILY_DISPATCH_LIMIT` | `24` | Family circuit breaker: dispatch budget per ticket family before the whole lineage is parked under `error:family-breaker` on its root. Per-family resume via a reset comment on the root; this knob is the global fallback. See above. |
 | `OWNER_TYPE` | `user` | `user` or `organization` for GitHub Project owner |
@@ -644,6 +650,67 @@ today, and Claude's shell tool caps a foreground command at ten minutes and
 backgrounds longer ones, so a wait rarely finishes inside the command that
 would report it. The stranded running-label sweep is unchanged: it never
 touches a run this dispatcher has in flight, however long it takes.
+
+## Health check before dispatch
+
+A fork can name cheap commands that prove an agent run has what it needs.
+The dispatcher runs them after it selects a ticket, before any `wip:` label,
+family dispatch count or worktree. Exit 0 passes. A check whose command is
+unset is off, so a fork with no `PYRY_HEALTH_*` settings behaves as before.
+Added after 2026-10-01 to 2026-10-05, when a lost GitHub login, unavailable
+Figma tools, a missing live-test login and a stale test daemon errored more
+than twenty runs, each after the agent had spent its budget finding out
+(agent-dispatcher#131).
+
+- **Hold, not error.** A failed check leaves the ticket where it is and adds
+  `held:health-check`. No `error:` label, rework count, retry count or family
+  dispatch is recorded. One comment names the failed check and its exit
+  status. One Discord message goes out when a check starts failing, and one
+  when it passes again.
+- **Re-checked on later cycles.** While the check still fails, the held
+  ticket is left out of selection so other work gets its seat. Once it
+  passes, the label comes off and the agent starts.
+- **The agent's environment.** Checks run in the scrubbed environment the
+  agent gets, from the target repo. For a Codex builder with live tests, a
+  GitHub, live-login or daemon check sees only the names that builder's
+  tool commands inherit, so a dropped `GH_TOKEN` fails the check as it
+  failed desktop #1727. The Figma check sees the Codex process's own
+  environment, since the process is what connects to MCP servers.
+- **The live gate.** A failing live-login or daemon check skips the
+  dispatcher's live gate for the cycle. It runs in the gate's environment.
+- **Secrets.** A check's standard output is never posted or logged. Only
+  the exit status and a scrubbed first line of standard error are, apart
+  from the daemon check's version number.
+- **Cost.** Each result is kept for `PYRY_HEALTH_CACHE_MS`, five minutes by
+  default, per check and environment. A command is stopped after 60 seconds.
+
+Mobile, Codex runner, in `.env`. Mobile's live gate builds its own daemon,
+so it has no daemon check:
+
+```sh
+PYRY_HEALTH_GITHUB_CMD="gh auth status --hostname github.com"
+PYRY_HEALTH_FIGMA_CMD="codex mcp list | grep -Eq '^figma[[:space:]].*[[:space:]]enabled[[:space:]]+OAuth'"
+PYRY_HEALTH_LIVE_LOGIN_CMD='[ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || op read --no-newline "op://Dev agents/Claude long term token/password" >/dev/null'
+```
+
+Desktop, Codex runner. The daemon path is the same file as `PYRY_BIN`:
+
+```sh
+PYRY_HEALTH_GITHUB_CMD="gh auth status --hostname github.com"
+PYRY_HEALTH_FIGMA_CMD="codex mcp list | grep -Eq '^figma[[:space:]].*[[:space:]]enabled[[:space:]]+OAuth'"
+PYRY_HEALTH_LIVE_LOGIN_CMD='[ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || op read --no-newline "op://Dev agents/Claude long term token/password" >/dev/null'
+PYRY_HEALTH_DAEMON_CMD="/absolute/path/to/pyrycode-desktop-tests/pyry --version"
+PYRY_HEALTH_DAEMON_MIN_VERSION=0.33.0
+```
+
+The live-login command passes in the gate's environment, which carries the
+fork's `CLAUDE_CODE_OAUTH_TOKEN`, and in a builder's, which carries the
+restricted Dev Agents account instead. The Figma command proves that Codex
+has a Figma login configured. It cannot prove the server answers, which
+would need a model run. A daemon version only changes on a release; to
+require a particular pyrycode commit instead, make the daemon command fail
+unless that commit is an ancestor of the binary's `vcs.revision` from
+`go version -m`.
 
 ## Codex pipeline helpers
 

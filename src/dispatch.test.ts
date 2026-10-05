@@ -9408,10 +9408,19 @@ describe("runEnvPreflight — a required variable missing from the dispatcher ho
 
   test("the poll loop holds the live gate, the main sweep and selection on it (source tripwire)", () => {
     const src = readDispatchSource();
-    assert.match(src, /const gateRunner = envHeld \? null : realClaudeGateRunner;/);
+    assert.match(src, /const gateRunner = envHeld \|\| gateHealthFailures\.length > 0 \? null : realClaudeGateRunner;/);
     assert.equal((src.match(/^\s+gateRunner,$/gm) ?? []).length, 2, "both gate calls take the held runner");
     assert.match(src, /envHeld\s*\?\s*\{ candidates: \[\], tallies: new Map<number, number>\(\) \}\s*:\s*await selectPastParkedFamilies/);
     assert.match(src, /if \(mainSweep !== null && sweepRun === null && !gateActive && !envHeld\)/);
+  });
+
+  test("the poll loop runs the health checks between selection and prep (source tripwire, agent-dispatcher#131)", () => {
+    const src = readDispatchSource();
+    assert.match(src, /itemsByColumn: stillHeld\.itemsByColumn,/, "selection skips tickets still held");
+    assert.match(src, /const candidates = health\.dispatch;/, "only healthy candidates are dispatched");
+    const held = src.indexOf("const health = await holdUnhealthyCandidates(");
+    const prep = src.indexOf("await runPreDispatchPrep(candidates, client");
+    assert.ok(held > 0 && prep > held, "the check runs before any wip label or family count");
   });
 });
 
