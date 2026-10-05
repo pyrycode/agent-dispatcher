@@ -544,6 +544,13 @@ the agent's summary, which always mentions the approval. A genuine rejection, "T
 action was rejected due to unacceptable risk", still parks, even beside a reviewer
 failure.
 
+This covers MCP tool calls too. Codex writes nothing on stderr when it refuses an
+MCP call; the reason is in the `mcp_tool_call` item's `error.message`, which the
+match reads like any other tool item, as on mobile #1783's `codegraph_context`
+call. The run log keeps only a 300-character preview of each event, which cut
+that reason off, so a failed MCP call now also gets its own log line with Codex's
+error, or the tool's own error text, in full up to 4000 characters.
+
 A Codex turn that fails with "Selected model is at capacity. Please try a different
 model." takes the capped API retry, like "Unable to verify model access right
 now". Five mobile tickets parked on it on 2026-10-05.

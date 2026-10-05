@@ -27,7 +27,7 @@ import {
   runClockDeadline,
   type RunClock,
 } from "./wait-credit.js";
-import { buildClaudeSourceReviewInvocation, buildCodexInvocation, codexChildEnv, CODEX_ROLE_GUIDANCE, CodexStreamAdapter, formatRunCost, resolveAgentShellEnv, resumeCommand, resolveAgentRunner, resolveCodexExecutable, type AgentRunner } from "./agent-runner.js";
+import { buildClaudeSourceReviewInvocation, buildCodexInvocation, codexChildEnv, CODEX_ROLE_GUIDANCE, CodexStreamAdapter, failedMcpCallLogLine, formatRunCost, resolveAgentShellEnv, resumeCommand, resolveAgentRunner, resolveCodexExecutable, type AgentRunner } from "./agent-runner.js";
 import { createRunnerSelector, runnerFilePath } from "./runner-file.js";
 
 import { GitHubProjectClient } from "./github.js";
@@ -640,7 +640,7 @@ export function formatResultDiagnostics(raw: Record<string, unknown> | null | un
   return parts.join(" ");
 }
 
-function logStreamMessage(logFile: string, msg: Record<string, unknown>): void {
+export function logStreamMessage(logFile: string, msg: Record<string, unknown>): void {
   const ts = new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 
   switch (msg.type) {
@@ -675,6 +675,9 @@ function logStreamMessage(logFile: string, msg: Record<string, unknown>): void {
     default: {
       // Log unknown message types with a compact preview
       appendFileSync(logFile, `[${ts}] [${String(msg.type)}] ${JSON.stringify(msg).slice(0, 300)}\n`);
+      // A failed Codex MCP call's reason sits past the preview (#1783).
+      const mcpFailure = msg.type === "item.completed" ? failedMcpCallLogLine((msg as any).item) : null;
+      if (mcpFailure) appendFileSync(logFile, `[${ts}] ⚠️  ${mcpFailure}\n`);
     }
   }
 }

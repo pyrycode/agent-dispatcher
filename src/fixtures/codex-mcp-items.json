@@ -1,0 +1,75 @@
+{
+  "source": "Codex exec --json mcp_tool_call items. reviewerFailed1783: pyrycode-mobile #1783 builder, 2026-10-05 15:13:55 local, codex-cli 0.159.2; server, tool, arguments and error text verbatim from the Codex session record (thread 01a10bfb-53a2-7042-8c4c-1967dbf7fc67), in the exec item layout the run log's 300-character preview shows. The other three were captured live with codex-cli 0.159.2 on 2026-10-05.",
+  "reviewerFailed1783": {
+    "type": "item.completed",
+    "item": {
+      "id": "item_11",
+      "type": "mcp_tool_call",
+      "server": "codegraph",
+      "tool": "codegraph_context",
+      "arguments": {
+        "task": "Ticket 1783 keep running background-agent blocks at newest end. foldQueuedRows foldToolRuns ThreadRow listKey toolNestingDepths FollowNewestEnd; task roster joins and ordered lifecycle evidence."
+      },
+      "result": null,
+      "error": {
+        "message": "Automatic approval review failed: Selected model is at capacity. Please try a different model.\nThe action was not executed because automatic approval review could not be completed. This is a review failure, not a determination that the action is unsafe. Do not bypass the approval check; resolve the error or ask the user for guidance."
+      },
+      "status": "failed"
+    }
+  },
+  "codexRefused": {
+    "type": "item.completed",
+    "item": {
+      "id": "item_1",
+      "type": "mcp_tool_call",
+      "server": "codegraph",
+      "tool": "codegraph_status",
+      "arguments": {
+        "projectPath": "/tmp"
+      },
+      "result": null,
+      "error": {
+        "message": "MCP tool call requires approval, but approval policy is never"
+      },
+      "status": "failed"
+    }
+  },
+  "toolError": {
+    "type": "item.completed",
+    "item": {
+      "id": "item_1",
+      "type": "mcp_tool_call",
+      "server": "codegraph",
+      "tool": "codegraph_status",
+      "arguments": {
+        "projectPath": "/nonexistent/path/zz"
+      },
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "Error: Tool execution failed: CodeGraph not initialized in /nonexistent/path/zz. Run 'codegraph init' in that project first."
+          }
+        ],
+        "structured_content": null
+      },
+      "error": null,
+      "status": "failed"
+    }
+  },
+  "started": {
+    "type": "item.started",
+    "item": {
+      "id": "item_1",
+      "type": "mcp_tool_call",
+      "server": "codegraph",
+      "tool": "codegraph_status",
+      "arguments": {
+        "projectPath": "/tmp"
+      },
+      "result": null,
+      "error": null,
+      "status": "in_progress"
+    }
+  }
+}

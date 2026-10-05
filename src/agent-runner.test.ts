@@ -1,11 +1,11 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { agentShellEnvNameProblem, buildCodexInvocation, CodexStreamAdapter, formatRunCost, resolveAgentShellEnv, resumeCommand, resolveAgentRunner, resolveCodexExecutable } from "./agent-runner.js";
+import { agentShellEnvNameProblem, buildCodexInvocation, CodexStreamAdapter, failedMcpCallLogLine, formatRunCost, MCP_FAILURE_LOG_CAP, resolveAgentShellEnv, resumeCommand, resolveAgentRunner, resolveCodexExecutable } from "./agent-runner.js";
 import { advanceCodexIdleWatchdogState, initIdleWatchdogState, runStopKind, shouldFireIdleWatchdog, type IdleWatchdogState } from "./agent-runtime.js";
 import { classifyAgentError } from "./pipeline-decisions.js";
 
@@ -364,5 +364,33 @@ describe("Codex idle watchdog — recorded event sequences", () => {
   test("without a stall the adapter reports as before", () => {
     const s = new CodexStreamAdapter();
     assert.equal(s.finish(null, true, 1).terminalReason, "timeout");
+  });
+});
+
+describe("failed MCP call log line (#1783)", () => {
+  const items = JSON.parse(readFileSync(new URL("./fixtures/codex-mcp-items.json", import.meta.url), "utf8")) as Record<string, any>;
+
+  test("Codex's own error wins, with its line breaks marked", () => {
+    assert.equal(failedMcpCallLogLine(items.codexRefused.item),
+      "MCP tool call failed, reported by Codex: codegraph.codegraph_status: MCP tool call requires approval, but approval policy is never");
+    assert.match(failedMcpCallLogLine(items.reviewerFailed1783.item)!, /^MCP tool call failed, reported by Codex: codegraph\.codegraph_context: Automatic approval review failed: .* ⏎ The action was not executed/);
+  });
+
+  test("a tool's own error result is quoted from its text content", () => {
+    assert.match(failedMcpCallLogLine(items.toolError.item)!, /reported by the tool: codegraph\.codegraph_status: Error: Tool execution failed: CodeGraph not initialized/);
+  });
+
+  test("a call in progress, a success and other item types give nothing", () => {
+    assert.equal(failedMcpCallLogLine(items.started.item), null);
+    assert.equal(failedMcpCallLogLine({ ...items.toolError.item, status: "completed" }), null);
+    assert.equal(failedMcpCallLogLine({ type: "command_execution", status: "failed" }), null);
+    assert.equal(failedMcpCallLogLine(undefined), null);
+  });
+
+  test("a long reason is capped and credentials are scrubbed", () => {
+    const item = { ...items.codexRefused.item, error: { message: "x".repeat(MCP_FAILURE_LOG_CAP + 50) } };
+    assert.match(failedMcpCallLogLine(item)!, /x…\(truncated\)$/);
+    const secret = { ...items.codexRefused.item, error: { message: "auth failed for ghp_abcdefghijklmnopqrstuvwxyz0123456789" } };
+    assert.doesNotMatch(failedMcpCallLogLine(secret)!, /ghp_abcdefghijklmnopqrstuvwxyz0123456789/);
   });
 });
