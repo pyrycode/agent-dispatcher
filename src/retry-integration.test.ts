@@ -6,6 +6,7 @@
 
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import {
   handleAgentResultErrors,
@@ -22,6 +23,7 @@ import { classifyAgentError, RETRY_MAX_ATTEMPTS } from "./pipeline-decisions.js"
 import { AGENTS, type ProjectItem } from "./types.js";
 
 const RETRY_MARKER = "<!-- pyry-auto-retry -->";
+const signals = JSON.parse(readFileSync(new URL("./fixtures/codex-approval-signals.json", import.meta.url), "utf8")) as Record<string, any>;
 
 class FakeClient implements DispatchClient {
   addLabelCalls: { issueNumber: number; label: string }[] = [];
@@ -396,11 +398,10 @@ describe("Codex temporary model-access failure, desktop #1351", () => {
     adapter.accept({ type: "thread.started", thread_id: "desktop-1351" });
     adapter.accept({ type: "turn.started" });
     adapter.accept({ type: "error", message: `Reconnecting... 5/5 (${message})` });
-    if (options.blocked) adapter.accept({ type: "item.completed", item: {
-      type: "command_execution", aggregated_output: "This action was rejected due to unacceptable risk",
-    } });
+    // A refused shell command: a declined item, and Codex's reason on stderr (mobile #1766).
+    if (options.blocked) adapter.accept(signals.declinedCommand1766);
     adapter.accept({ type: "turn.failed", error: { message: options.message ?? message } });
-    return adapter.finish(1, options.timedOut ?? false, 43000);
+    return adapter.finish(1, options.timedOut ?? false, 43000, options.blocked ? signals.stderr.rejected1766 : "");
   }
 
   test("recorded terminal failure schedules a delayed ticket retry", async () => {

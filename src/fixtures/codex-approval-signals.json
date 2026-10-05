@@ -1,0 +1,55 @@
+{
+  "source": "Codex approval signals, codex-cli 0.159.2. The stderr lines and declinedCommand1766 are verbatim from the pyrycode-mobile run logs: #1766 (rejection, 2026-10-05 08:41Z), #1582 (reviewer at capacity, 07:01Z) and #1655 (review deadline and an unrelated process failure, 06:25Z and 06:27Z). relayedByTool is a browser-use call the reviewer refused, from a Codex session record of 2026-10-02 (thread 01a0fdec-d849-7562-b89a-b1066c136a8b), in the exec item layout. grep1726 rebuilds pyrycode-desktop #1726's verifier command of 2026-10-05: a completed command whose output quotes the dispatcher source. Its run log is in the desktop container, so the command and output are reconstructed from the ticket and the source at the time.",
+  "stderr": {
+    "rejected1766": "2026-10-05T08:41:42.974936Z ERROR codex_core::tools::router: error=exec_command failed: CreateProcess { message: \"Rejected(\\\"This action was rejected due to unacceptable risk.\\\\nReason: Applying Spotless repository-wide can rewrite unrelated files, contrary to the project instruction to avoid formatting unrelated files; scope the formatter to changed ticket files instead.\\\\nDo not bypass this rejection through a workaround or indirect execution. Continue with a safer alternative, or carry out checks to prove that the action is authorized or low risk before trying again. Complete unaffected work without asking for confirmation. Report anything that remains blocked, clarify why it was blocked by auto-review, inform the user of the risk and ask for approval.\\\")\" }",
+    "capacity1582": "2026-10-05T07:01:37.122057Z ERROR codex_core::tools::router: error=exec_command failed: CreateProcess { message: \"Rejected(\\\"Automatic approval review failed: Selected model is at capacity. Please try a different model.\\\\nThe action was not executed because automatic approval review could not be completed. This is a review failure, not a determination that the action is unsafe. Do not bypass the approval check; resolve the error or ask the user for guidance.\\\")\" }",
+    "deadline1655": "2026-10-05T06:27:48.311617Z ERROR codex_core::tools::router: error=exec_command failed: CreateProcess { message: \"Rejected(\\\"The automatic permission approval review did not finish before its deadline. Do not assume the action is unsafe based on the timeout alone. You may retry once, or ask the user for guidance or explicit approval.\\\")\" }",
+    "unrelated1655": "2026-10-05T06:25:56.787863Z ERROR codex_core::tools::router: error=exec_command failed: CreateProcess { message: \"Rejected(\\\"Failed to create unified exec process: No such file or directory (os error 2)\\\")\" }"
+  },
+  "declinedCommand1766": {
+    "type": "item.completed",
+    "item": {
+      "id": "item_69",
+      "type": "command_execution",
+      "command": "/bin/zsh -lc 'ANDROID_HOME=/Users/juhanailmoniemi/Library/Android/sdk ./gradlew spotlessApply --console=plain'",
+      "aggregated_output": "",
+      "exit_code": null,
+      "status": "declined"
+    }
+  },
+  "relayedByTool": {
+    "type": "item.completed",
+    "item": {
+      "id": "item_23",
+      "type": "mcp_tool_call",
+      "server": "cua_repl",
+      "tool": "js",
+      "arguments": {
+        "code": "await tab.getScreenshot(); await tab.click(80); await tab.getAXState();",
+        "title": "Check boulder shape and download access"
+      },
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "This action was rejected due to unacceptable risk.\nReason: Clicking the Download 3D Model control may initiate an asset download and violates the explicit research constraint of no download; only visual inspection is authorized.\nDo not bypass this rejection through a workaround or indirect execution. Continue with a safer alternative, or carry out checks to prove that the action is authorized or low risk before trying again. Complete unaffected work without asking for confirmation. Report anything that remains blocked, clarify why it was blocked by auto-review, inform the user of the risk and ask for approval."
+          }
+        ],
+        "structured_content": null
+      },
+      "error": null,
+      "status": "failed"
+    }
+  },
+  "grep1726": {
+    "type": "item.completed",
+    "item": {
+      "id": "item_41",
+      "type": "command_execution",
+      "command": "/bin/bash -lc \"rg -n 'unacceptable risk' src/agent-runner.ts\"",
+      "aggregated_output": "src/agent-runner.ts:251:          if (/This action was rejected due to unacceptable risk/.test(itemText)) this.approvalRejected = true;\nsrc/agent-runner.ts:296:    this.approvalRejected ||= /This action was rejected due to unacceptable risk/.test(stderr);\n",
+      "exit_code": 0,
+      "status": "completed"
+    }
+  }
+}

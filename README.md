@@ -556,6 +556,15 @@ the agent's summary, which always mentions the approval. A genuine rejection, "T
 action was rejected due to unacceptable risk", still parks, even beside a reviewer
 failure.
 
+"Codex output" means only the text Codex itself writes about a refused action: the
+message on a `codex_core::tools::router` ERROR line on stderr, the output of a
+`declined` command item, and the error or result text of a `failed` MCP call. Each
+phrase must start a line of that text. A command's output never counts, whatever it
+printed. Until 2026-10-05 every tool item was searched, so on pyrycode-desktop #1726
+a verifier that grepped a dispatcher source file containing the sentence was parked
+as rejected after a passing review. In codex-cli 0.159.2 a refused shell command's
+item carries no text at all; the reason is only on stderr, as on mobile #1766.
+
 This covers MCP tool calls too. Codex writes nothing on stderr when it refuses an
 MCP call; the reason is in the `mcp_tool_call` item's `error.message`, which the
 match reads like any other tool item, as on mobile #1783's `codegraph_context`

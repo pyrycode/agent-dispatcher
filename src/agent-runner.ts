@@ -183,13 +183,76 @@ export function buildCodexInvocation(opts: {
 }
 
 /**
+ * Codex's own words when its automatic approval reviewer rejected an action.
+ * codex-rs renders every rejection as "This action was rejected due to
+ * unacceptable risk.\nReason: ..." (`render_guardian_rejection` in
+ * prompts/src/guardian_instructions.rs), so the sentence starts a line of
+ * Codex's message. Tested only on `codexRefusalText` and
+ * `codexRouterMessages`, never on a command's output or the agent's summary.
+ */
+const APPROVAL_REJECTED = /^This action was rejected due to unacceptable risk/m;
+
+/**
  * Codex's own words when its automatic approval reviewer could not decide,
  * as opposed to rejecting. Seen on the `codex_core::tools::router` ERROR line
  * on stderr, pyrycode-mobile 2026-10-05: #1582 (the reviewer's model was at
- * capacity) and #1655 (the review missed its deadline). Matched only on
- * Codex's output, never on the agent's summary.
+ * capacity) and #1655 (the review missed its deadline), and in an MCP item's
+ * error on #1783. Each phrase starts a line of Codex's message
+ * (ext/guardian-reviewer/src/completion.rs, prompts/src/model_messages/guardian.rs).
+ * Tested on the same Codex-only text as `APPROVAL_REJECTED`.
  */
-const APPROVAL_REVIEW_FAILED = /automatic approval review could not be completed|This is a review failure, not a determination that the action is unsafe|automatic permission approval review did not finish before its deadline/i;
+const APPROVAL_REVIEW_FAILED = /^(?:Automatic approval review failed|The action was not executed because automatic approval review could not be completed|The automatic permission approval review did not finish before its deadline)/m;
+
+/**
+ * The text Codex itself wrote about an action it refused, from one completed
+ * item, or "". Never a command's output or a tool's successful result: the
+ * agent controls those. On pyrycode-desktop #1726, 2026-10-05, a verifier
+ * grepped a dispatcher source file that contains the rejection sentence, and
+ * the dispatcher parked a passing run as rejected.
+ *
+ * - `command_execution`: only a `declined` item. codex-rs gives a refused
+ *   tool call that status with the refusal as its output
+ *   (core/src/tools/events.rs). In codex-cli 0.159.2 a refused shell command's
+ *   item is `"aggregated_output":"","status":"declined"`, and the reason is
+ *   only on stderr, as on mobile #1766; see `codexRouterMessages`.
+ * - `mcp_tool_call`: only a `failed` item. Codex puts its refusal in
+ *   `error.message` (mobile #1783). A bundled tool that relays the reviewer,
+ *   such as browser use, puts it in the failed result's text.
+ */
+export function codexRefusalText(item: Record<string, any> | null | undefined): string {
+  if (item?.type === "command_execution") {
+    return item.status === "declined" && typeof item.aggregated_output === "string" ? item.aggregated_output : "";
+  }
+  if (item?.type === "mcp_tool_call" && item.status === "failed") {
+    const parts: string[] = [];
+    if (typeof item.error?.message === "string") parts.push(item.error.message);
+    if (Array.isArray(item.result?.content)) {
+      for (const c of item.result.content) if (c?.type === "text" && typeof c.text === "string") parts.push(c.text);
+    }
+    return parts.join("\n");
+  }
+  return "";
+}
+
+/**
+ * Codex's own message from each `codex_core::tools::router` ERROR line on
+ * stderr: the text after `error=`, or after `Rejected(\"` when the error
+ * wraps a refusal. A shell command refusal looks like this, from mobile #1766
+ * with codex-cli 0.159.2:
+ *
+ *   2026-10-05T08:41:42.974936Z ERROR codex_core::tools::router: error=exec_command failed: CreateProcess { message: "Rejected(\"This action was rejected due to unacceptable risk.\\nReason: ...
+ *
+ * Codex escapes line breaks there, so each message is one line, and the
+ * patterns above match only at its start. Other stderr text never counts.
+ */
+export function codexRouterMessages(stderr: string): string[] {
+  const messages: string[] = [];
+  for (const m of stderr.matchAll(/ERROR codex_core::tools::router: error=(.*)/g)) {
+    const refusal = /^[^"]*"Rejected\(\\"(.*)/.exec(m[1]);
+    messages.push(refusal ? refusal[1] : m[1]);
+  }
+  return messages;
+}
 
 /** Longest failed MCP call text the run log keeps. */
 export const MCP_FAILURE_LOG_CAP = 4000;
@@ -245,11 +308,12 @@ export class CodexStreamAdapter {
         break;
       case "item.completed":
         // Tool denial evidence is sticky. A later outcome must not route the
-        // rejected action through the dispatcher instead.
-        if (event.item?.type !== "agent_message") {
-          const itemText = JSON.stringify(event.item ?? {});
-          if (/This action was rejected due to unacceptable risk/.test(itemText)) this.approvalRejected = true;
-          if (APPROVAL_REVIEW_FAILED.test(itemText)) this.approvalReviewFailed = true;
+        // rejected action through the dispatcher instead. Only Codex's own
+        // refusal text counts, never what a command printed.
+        {
+          const refusal = codexRefusalText(event.item);
+          if (APPROVAL_REJECTED.test(refusal)) this.approvalRejected = true;
+          if (APPROVAL_REVIEW_FAILED.test(refusal)) this.approvalReviewFailed = true;
         }
         if (event.item?.type === "agent_message" && typeof event.item.text === "string") {
           this.lastText = event.item.text;
@@ -293,8 +357,10 @@ export class CodexStreamAdapter {
       const parsed = JSON.parse(this.lastText);
       if ((parsed.status === "completed" || parsed.status === "blocked" || parsed.status === "needs_refinement" || parsed.status === "waiting_on_blocker") && typeof parsed.summary === "string" && parsed.summary.trim()) outcome = parsed;
     } catch { /* Missing or malformed task outcome fails closed. */ }
-    this.approvalRejected ||= /This action was rejected due to unacceptable risk/.test(stderr);
-    this.approvalReviewFailed ||= APPROVAL_REVIEW_FAILED.test(stderr);
+    for (const message of codexRouterMessages(stderr)) {
+      if (APPROVAL_REJECTED.test(message)) this.approvalRejected = true;
+      if (APPROVAL_REVIEW_FAILED.test(message)) this.approvalReviewFailed = true;
+    }
     const blocked = this.approvalRejected || outcome?.status === "blocked";
     const isError = timedOut || idleStalled || code !== 0 || this.failed || !this.completed || !outcome || blocked;
     // Codex reports this temporary access-check outage as a generic failed turn.
