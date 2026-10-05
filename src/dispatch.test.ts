@@ -52,6 +52,9 @@ import {
   runDoneCleanup,
   runStrandedWipSweep,
   runPendingDoneFinalize,
+  runPendingVerdictPublish,
+  verdictHandoffPath,
+  pendingVerdictStatePath,
   salvagePartialWork,
   strandedWipMinAgeMs,
   runFamilyBreaker,
@@ -101,6 +104,7 @@ import {
   STRANDED_WIP_OBSERVED_MARKER,
   STRANDED_WIP_SWEPT_MARKER,
   tallyFamilyComments,
+  shouldSkipDispatch,
 } from "./pipeline-decisions.js";
 import { AGENTS } from "./types.js";
 import { AgentRunStoppedError, idleStallMessage, noResultErrorMessage, ResourceExhaustedError, timeoutFor } from "./agent-runtime.js";
@@ -9507,5 +9511,246 @@ describe("no-result exit keeps Claude's stderr (pyrycode-mobile #1340, 2026-10-0
     assert.match(block, /--- stderr \(last 1500 chars\) ---\nError: Request timed out\./);
     assert.ok(!body.includes(key), "no credential reaches GitHub");
     assert.ok(client.addLabelCalls.some(c => c.label === "error:verifier"), "still parks: the tail adds evidence, not a retry");
+  });
+});
+
+// =====================================================================
+// Verdict handoff: the dispatcher posts a finished verdict itself when the
+// agent's GitHub write fails (agent-dispatcher#118)
+// =====================================================================
+//
+// 2026-10-03, Mobile #1677 / PR #1680: a Codex verifier finished with PASS,
+// GitHub answered the verdict post with HTTP 503, the run ended blocked and
+// the ticket sat parked as error:verifier for nine hours.
+
+describe("verdict handoff (#118)", () => {
+  const SHA = "0123456789abcdef0123456789abcdef01234567";
+  const MOVED = "fedcba9876543210fedcba9876543210fedcba98";
+  const ISSUE = 1677;
+  const PR = 1680;
+  const publishBlock = "Review finished with PASS and no findings, but publishing the verdict comment failed with GitHub HTTP 503 and a GraphQL timeout. The verdict is saved in the handoff file.";
+  const handoffFile = (decision: "PASS" | "FAIL", labels = "") =>
+    `decision: ${decision}\ncommit: ${SHA}\nlabels: ${labels}\n---\n## Verifier Review: #${ISSUE}\n\n**Decision: ${decision}**\n`;
+
+  function fixture(opts: {
+    handoff?: string | null;
+    head?: string;
+    stream?: Partial<StreamResult>;
+  } = {}) {
+    const client = new MockGitHubClient({
+      status: { [ISSUE]: "In Code Review" },
+      items: [{ issueNumber: ISSUE, status: "In Code Review", labels: [], state: "OPEN" }],
+    });
+    const fsMap: Record<string, string> = { [claudeMdAbsPath("verifier/CLAUDE.md")]: "role" };
+    if (opts.handoff !== null) fsMap[verdictHandoffPath("verifier", ISSUE)] = opts.handoff ?? handoffFile("PASS");
+    let head = opts.head ?? SHA;
+    let prReadable = true;
+    const prComments = () => client.comments.filter(c => c.issueNumber === PR);
+    const { deps, calls } = makeMockDeps({
+      execImpls: {
+        ...fullHappyExecImpls(`feature/${ISSUE}`),
+        [`gh pr list --head feature/${ISSUE} --state open --json number,isDraft`]: () =>
+          prReadable ? JSON.stringify([{ number: PR, isDraft: false }]) : execError({ stderr: "HTTP 503" }),
+        [`gh pr view ${PR}`]: () => prReadable
+          ? JSON.stringify({
+            headRefOid: head, state: "OPEN", reviews: [],
+            comments: prComments().map(c => ({ createdAt: c.postedAt.toISOString(), body: c.body })),
+          })
+          : execError({ stderr: "HTTP 503" }),
+      },
+      fsMap,
+      streamResult: () => streamResult({
+        runner: "codex", isError: true, terminalReason: "codex_blocked", sessionId: "codex-thread",
+        output: publishBlock, ...opts.stream,
+      }),
+    });
+    // The mock filesystem records writes without applying them; the sweep
+    // reads the pending state the dispatch wrote.
+    const sweepDeps: DispatchDeps = {
+      ...deps,
+      readFileSync: ((path: string, enc?: any) => {
+        const written = [...calls.fs].reverse().find(f => f.kind === "write" && f.path === String(path));
+        return written ? written.content : deps.readFileSync(path, enc);
+      }) as DispatchDeps["readFileSync"],
+    };
+    const run = () => withStageSet("builder", () => withVerifierGates("", () =>
+      dispatchToAgent(builderAgent("verifier"), makeProjectItem({ issueNumber: ISSUE, status: "In Code Review" }), client, deps)));
+    const sweep = () => withStageSet("builder", async () => {
+      await runPendingVerdictPublish(client, sweepDeps);
+      await runPendingDoneFinalize(client);
+    });
+    return {
+      client, calls, run, sweep, prComments,
+      moveHead: (sha: string) => { head = sha; },
+      setPrReadable: (v: boolean) => { prReadable = v; },
+      labels: () => client.labelsByIssue.get(ISSUE) ?? [],
+    };
+  }
+
+  const parkedAsToday = (f: ReturnType<typeof fixture>) => {
+    assert.ok(f.labels().includes("error:verifier"), "parks with error:verifier");
+    assert.ok(f.client.comments.some(c => c.issueNumber === ISSUE && c.body.includes("## ⚠️ Agent Error: verifier")));
+    assert.equal(f.prComments().length, 0, "nothing posted on the PR");
+    assert.ok(!f.labels().some(l => l.startsWith("done:") || l.startsWith("pending-")));
+  };
+
+  test("the prompt names the handoff file, and the dispatcher empties it before the run", async () => {
+    const f = fixture();
+    await f.run();
+    const path = verdictHandoffPath("verifier", ISSUE);
+    assert.ok(f.calls.fs.some(c => c.kind === "write" && c.path === path && c.content === ""), "emptied before spawn");
+    const prompt = f.calls.fs.find(c => c.kind === "write" && c.path.endsWith(`.prompt-${ISSUE}.txt`));
+    assert.ok(prompt?.content?.includes(path), "prompt names the handoff path");
+    assert.match(prompt!.content!, /Verdict handoff/);
+  });
+
+  test("PASS blocked on a GitHub publish failure: body posted once, done:verifier, no error label or Agent Error comment", async () => {
+    const f = fixture();
+    await f.run();
+    assert.equal(f.prComments().length, 1, "the saved body is posted once on the PR");
+    assert.match(f.prComments()[0]!.body, /^## Verifier Review: #1677/);
+    assert.match(f.prComments()[0]!.body, /pyry-verdict-handoff agent=verifier issue=1677/);
+    assert.ok(f.labels().includes("done:verifier"));
+    assert.ok(!f.client.addLabelCalls.some(c => c.label.startsWith("error:")));
+    assert.ok(!f.client.comments.some(c => c.body.includes("Agent Error")));
+    assert.ok(!f.labels().some(l => l.startsWith("pending-")));
+  });
+
+  test("FAIL: body posted, needs-rework:builder added, routed to the builder as a normal rework", async () => {
+    const f = fixture({ handoff: handoffFile("FAIL", "needs-rework:builder") });
+    await f.run();
+    assert.equal(f.prComments().length, 1);
+    assert.match(f.prComments()[0]!.body, /\*\*Decision: FAIL\*\*/);
+    assert.ok(f.labels().includes("needs-rework:builder"));
+    assert.ok(!f.labels().includes("done:verifier"), "a FAIL never adds done:verifier");
+    assert.ok(!f.labels().some(l => l.startsWith("error:")));
+    assert.ok(f.client.comments.some(c => c.issueNumber === ISSUE && c.body.includes("rework by **builder**")));
+    // The rework router's input: the ticket now reads as a builder rework.
+    const routes = decideReworkRoutes(
+      resolveStageSet("builder").columnByAgent,
+      new Map([["In Code Review", [{ ...makeProjectItem({ issueNumber: ISSUE, status: "In Code Review" }), labels: f.labels() }]]]),
+    );
+    assert.equal(routes[0]?.toColumn, "In Development");
+    assert.equal(routes[0]?.triggerLabel, "needs-rework:builder");
+  });
+
+  test("a Claude run that exits cleanly saying the post failed is recovered the same way", async () => {
+    const f = fixture({ stream: { runner: "claude", isError: false, terminalReason: "stop", output: "Verdict ready, but gh pr comment failed with HTTP 502 from GitHub. Saved to the handoff file." } });
+    await f.run();
+    assert.equal(f.prComments().length, 1);
+    assert.ok(f.labels().includes("done:verifier"));
+    assert.ok(!f.labels().some(l => l.startsWith("error:")));
+  });
+
+  describe("the dispatcher's own post fails too", () => {
+    for (const earlierLanded of [true, false]) {
+      test(`pending marker, no re-dispatch, next cycle completes it${earlierLanded ? " without a duplicate when the failed post actually landed" : ""}`, async () => {
+        const f = fixture();
+        f.client.failures.addComment = new Error("HTTP 503");
+        await f.run();
+        assert.ok(f.labels().includes("pending-verdict:verifier"), "held with a pending marker");
+        assert.ok(!f.labels().some(l => l.startsWith("error:") || l.startsWith("done:")));
+        assert.ok(shouldSkipDispatch(f.labels(), "verifier"), "the pending marker stops a re-dispatch");
+        assert.ok(f.calls.fs.some(c => c.kind === "write" && c.path === pendingVerdictStatePath("verifier", ISSUE)));
+        // MockGitHubClient records a comment before throwing: that is a
+        // write GitHub reported as failed but stored.
+        if (!earlierLanded) f.client.comments = f.client.comments.filter(c => c.issueNumber !== PR);
+
+        if (!earlierLanded) {
+          // Still down next cycle: nothing changes.
+          await f.sweep();
+          assert.ok(f.labels().includes("pending-verdict:verifier"));
+        }
+
+        delete f.client.failures.addComment;
+        await f.sweep();
+        assert.equal(f.prComments().length, 1, "exactly one verdict on the PR");
+        assert.ok(f.labels().includes("done:verifier"));
+        assert.ok(!f.labels().some(l => l.startsWith("pending-") || l.startsWith("error:")));
+      });
+    }
+
+    test("an unreadable PR on the first attempt waits instead of parking, and posts once it reads", async () => {
+      const f = fixture();
+      f.setPrReadable(false);
+      await f.run();
+      assert.ok(f.labels().includes("pending-verdict:verifier"));
+      assert.ok(!f.labels().some(l => l.startsWith("error:")));
+      f.setPrReadable(true);
+      await f.sweep();
+      assert.equal(f.prComments().length, 1);
+      assert.ok(f.labels().includes("done:verifier"));
+    });
+
+    test("a FAIL completed on a later cycle leaves the rework label and no done label", async () => {
+      const f = fixture({ handoff: handoffFile("FAIL", "needs-rework:builder") });
+      f.client.failures.addComment = new Error("HTTP 503");
+      await f.run();
+      f.client.comments = f.client.comments.filter(c => c.issueNumber !== PR);
+      delete f.client.failures.addComment;
+      await f.sweep();
+      assert.equal(f.prComments().length, 1);
+      assert.ok(f.labels().includes("needs-rework:builder"));
+      assert.ok(!f.labels().some(l => l.startsWith("done:") || l.startsWith("pending-")));
+    });
+
+    test("the head moving while it waits parks the ticket on the next cycle", async () => {
+      const f = fixture();
+      f.client.failures.addComment = new Error("HTTP 503");
+      await f.run();
+      f.client.comments = f.client.comments.filter(c => c.issueNumber !== PR);
+      delete f.client.failures.addComment;
+      f.moveHead(MOVED);
+      await f.sweep();
+      assert.ok(f.labels().includes("error:verifier"));
+      assert.ok(!f.labels().includes("pending-verdict:verifier"));
+      assert.equal(f.prComments().length, 0);
+      assert.ok(f.client.comments.some(c => c.issueNumber === ISSUE && /head moved/.test(c.body)));
+    });
+
+    test("a lost pending state parks instead of waiting forever", async () => {
+      const client = new MockGitHubClient({
+        items: [{ issueNumber: ISSUE, status: "In Code Review", labels: ["pending-verdict:verifier"], state: "OPEN" }],
+      });
+      const { deps } = makeMockDeps({});
+      await withStageSet("builder", () => runPendingVerdictPublish(client, deps));
+      const labels = client.labelsByIssue.get(ISSUE) ?? [];
+      assert.ok(labels.includes("error:verifier"));
+      assert.ok(!labels.includes("pending-verdict:verifier"));
+    });
+  });
+
+  describe("parks as error:<agent> exactly as today", () => {
+    test("the reviewed commit differs from the PR head", async () => {
+      const f = fixture({ head: MOVED });
+      await f.run();
+      parkedAsToday(f);
+    });
+
+    test("no handoff file was saved", async () => {
+      const f = fixture({ handoff: null });
+      await f.run();
+      parkedAsToday(f);
+    });
+
+    test("the handoff is incomplete", async () => {
+      for (const handoff of ["", `decision: PASS\n---\n## Verifier Review`, handoffFile("FAIL")]) {
+        const f = fixture({ handoff });
+        await f.run();
+        parkedAsToday(f);
+      }
+    });
+
+    test("the block is not about publishing", async () => {
+      const f = fixture({ stream: { output: "The review needs a human decision on whether the new layout is intended." } });
+      await f.run();
+      parkedAsToday(f);
+    });
+
+    test("an approval rejection, even beside publish wording", async () => {
+      const f = fixture({ stream: { hadPermissionDenial: true } });
+      await f.run();
+      parkedAsToday(f);
+    });
   });
 });

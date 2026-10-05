@@ -1787,12 +1787,16 @@ export function decideFamilyBreaker(opts: {
 //   pending-done:<agent> — agent succeeded but the post-run column read
 //                          failed; the next board read finishes the
 //                          decision (see decidePendingDoneFinalizations)
+//   pending-verdict:<agent> — agent finished a verdict GitHub would not
+//                          take; the dispatcher posts the saved verdict on
+//                          a later cycle (see verdict-handoff.ts)
 export const PIPELINE_LABEL_PREFIXES = [
   "done:",
   "needs-rework:",
   "wip:",
   "error:",
   "pending-done:",
+  "pending-verdict:",
 ] as const;
 
 export const PENDING_DONE_PREFIX = "pending-done:";

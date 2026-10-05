@@ -1,6 +1,6 @@
 import { type ChildProcess, execSync, spawn, spawnSync } from "node:child_process";
 import { readFileSync, existsSync, writeFileSync, mkdirSync, mkdtempSync, rmdirSync, appendFileSync, readdirSync, createWriteStream, statSync, symlinkSync, unlinkSync, openSync, closeSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { resolve, dirname, basename } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
@@ -8,6 +8,7 @@ import { config } from "dotenv";
 import { DispatchPool, candidateKey, excludeInFlight, freeSeats, resolvePollIntervalMs } from "./dispatch-pool.js";
 import { countVerdictsSince, parseVerdictArtifacts, pickVerdictPr, shouldFlagMissingVerdict } from "./verdict-guard.js";
 import { countOpenPrs, shouldFlagMissingPr } from "./pr-guard.js";
+import { PENDING_VERDICT_PREFIX, decideVerdictRecovery, handoffMarker, isVerdictPublishFailure, parsePendingVerdictState, parsePrVerdictView, parseVerdictHandoff, serializePendingVerdictState, verdictHandoffNote, type HandoffParse, type PendingVerdictState, type VerdictPrLookup } from "./verdict-handoff.js";
 import { resolveImportOnlyMerge } from "./merge-resolve.js";
 import { FINAL_MERGE_HANDOFF_MARKER, FINAL_MERGE_HANDOFF_MAX, MERGE_HANDOFF_LABEL, checkMergeResolution, decideConflictRoute, decideFinalMergeRoute, findMergeCommit, mergeHandoffNote, mergeResolutionComment, mergeResolutionSection, readPendingMerge, type PendingMerge, type ResolutionNote } from "./merge-handoff.js";
 
@@ -2317,7 +2318,34 @@ export type DispatchContext = {
    *  the agent, and `handlePostRun` checks the result before pushing. See
    *  merge-handoff.ts. */
   pendingMerge?: PendingMerge;
+  /** Where a verdict run saves its finished verdict before posting it, for
+   *  agents marked `requiresVerdict`. Outside the worktree so it outlives
+   *  teardown. See verdict-handoff.ts. */
+  verdictHandoffPath?: string;
 };
+
+/**
+ * Folder for verdict handoff files. Both runners' agents already write
+ * GitHub body files under `~/.codex/publish/<repository>/`, the folder the
+ * pipeline helper reads, so the handoff sits beside them where neither
+ * runner needs a new permission. `PYRY_VERDICT_HANDOFF_DIR` overrides it.
+ * Read per dispatch, like the runner file.
+ */
+export function verdictHandoffDir(): string {
+  const override = (process.env.PYRY_VERDICT_HANDOFF_DIR ?? "").trim();
+  return override !== "" ? resolve(override) : resolve(homedir(), ".codex/publish", basename(resolve(repoRoot)), "verdict-handoff");
+}
+
+/** One file per agent and ticket. The dispatcher empties it before each run. */
+export function verdictHandoffPath(agentName: string, issueNumber: number): string {
+  return resolve(verdictHandoffDir(), `${agentName}-${issueNumber}.md`);
+}
+
+/** Where the dispatcher keeps a verdict waiting for GitHub between cycles.
+ *  Its own logs folder, out of the agents' reach. */
+export function pendingVerdictStatePath(agentName: string, issueNumber: number): string {
+  return resolve(LOGS_DIR, `verdict-pending-${agentName}-${issueNumber}.json`);
+}
 
 /**
  * Path of a dispatcher-owned worktree. Every board's dispatcher shares the
@@ -2355,6 +2383,7 @@ export function makeDispatchContext(
     startTime: Date.now(),
     startTs: new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }),
     deps,
+    ...(agent.requiresVerdict && item.issueNumber > 0 ? { verdictHandoffPath: verdictHandoffPath(agent.name, item.issueNumber) } : {}),
   };
 }
 
@@ -2392,7 +2421,8 @@ export async function dispatchToAgent(
   const gates = parallelReview ? { promptNote: "" } : await maybeRunPreSpawnGates(ctx);
 
   const mergeNote = ctx.pendingMerge ? mergeHandoffNote(defaultBranch, ctx.pendingMerge.paths) : "";
-  const spawn = await prepareAgentSpawn(ctx, gates.promptNote + mergeNote);
+  const handoffNote = prepareVerdictHandoff(ctx);
+  const spawn = await prepareAgentSpawn(ctx, gates.promptNote + mergeNote + handoffNote);
   if (!spawn.ok) return;
 
   // streamResult is declared outside the try so handleDispatchError
@@ -2414,6 +2444,28 @@ export async function dispatchToAgent(
     const postRun = await handlePostRun(streamResult, ctx, saferSalvaged);
     if (!postRun.ok) return;
   } catch (error: any) {
+    // A verdict run whose only failure was GitHub refusing the verdict:
+    // publish the saved verdict and carry on as a success, or hold the
+    // ticket for the next cycle. Anything else falls through and parks as
+    // before. See verdict-handoff.ts (agent-dispatcher#118).
+    const recovered = ctx.verdictHandoffPath && streamResult && !saferSalvaged
+      ? await recoverSavedVerdict(ctx, error?.message ?? "", streamResult.hadPermissionDenial)
+      : null;
+    if (recovered?.kind === "posted") {
+      const postRun = await handlePostRun({
+        ...streamResult!,
+        isError: false,
+        terminalReason: "stop",
+        output: `The agent's own GitHub write failed; the dispatcher posted its saved verdict.\n\n${streamResult!.output}`,
+      }, ctx, false, recovered.labels);
+      if (!postRun.ok) return;
+      await cleanupAfterDispatch(ctx);
+      return;
+    }
+    if (recovered?.kind === "pending") {
+      await cleanupAfterDispatch(ctx);
+      return;
+    }
     const preserveBlockedWork = streamResult?.runner === "codex"
       && ["codex_blocked", "needs_refinement"].includes(streamResult.terminalReason) && ctx.useWorktree;
     if (preserveBlockedWork) error.message += `\nWorktree preserved for recovery: ${ctx.worktreeDir}`;
@@ -3832,6 +3884,169 @@ export async function salvagePartialWork(
   }
 }
 
+// --------- Verdict handoff (agent-dispatcher#118) ---------
+//
+// The decisions are in verdict-handoff.ts; these functions do the file
+// reads, the `gh` reads and the GitHub writes around them.
+
+/** What `recoverSavedVerdict` did with a failed verdict run. Null: nothing,
+ *  the run is handled exactly as before. */
+export type VerdictRecoveryOutcome =
+  | { kind: "posted"; labels: string[] }
+  | { kind: "pending" }
+  | null;
+
+/**
+ * Empty the run's handoff file and return the prompt note that names it.
+ * Emptying it first means a verdict saved by an earlier run can never be
+ * read as this run's. A failure here only costs the recovery: the agent
+ * cannot save its verdict, and a failed post parks as before.
+ */
+function prepareVerdictHandoff(ctx: DispatchContext): string {
+  const path = ctx.verdictHandoffPath;
+  if (!path) return "";
+  try {
+    ctx.deps.mkdirSync(dirname(path), { recursive: true });
+    ctx.deps.writeFileSync(path, "");
+  } catch (e) {
+    console.warn(`   ⚠️  Could not prepare the verdict handoff file ${path}: ${e}`);
+  }
+  return verdictHandoffNote(path);
+}
+
+/** Find the ticket's PR and read its head and every review and comment. */
+function lookupVerdictPr(
+  execSyncFn: DispatchDeps["execSync"],
+  opts: { branch: string; pr: number | null; cwd: string },
+): VerdictPrLookup {
+  try {
+    let pr = opts.pr;
+    if (pr === null) {
+      const listJson = execSyncFn(
+        `gh pr list --head ${opts.branch} --state open --json number,isDraft`,
+        { cwd: opts.cwd, stdio: "pipe" },
+      ).toString().trim();
+      pr = pickVerdictPr(listJson);
+      if (pr === null) return { kind: "none" };
+    }
+    const viewJson = execSyncFn(
+      `gh pr view ${pr} --json headRefOid,state,reviews,comments`,
+      { cwd: opts.cwd, stdio: "pipe" },
+    ).toString();
+    return { kind: "found", number: pr, view: parsePrVerdictView(viewJson) };
+  } catch {
+    return { kind: "unreadable" };
+  }
+}
+
+/**
+ * Post a saved verdict on its PR and apply its labels to the ticket. The
+ * marker line ties the comment to its run, so a later attempt can tell that
+ * a post GitHub reported as failed was stored after all.
+ */
+async function publishSavedVerdict(
+  client: DispatchClient,
+  state: PendingVerdictState,
+  pr: number,
+  alreadyPosted: boolean,
+): Promise<{ ok: true } | { ok: false; why: string }> {
+  const marker = handoffMarker({ agent: state.agent, issueNumber: state.issueNumber, startedAtMs: state.startedAtMs });
+  if (!alreadyPosted) {
+    try {
+      await client.addComment(pr, `${state.handoff.body}\n\n${marker}`);
+    } catch (e) {
+      return { ok: false, why: `posting the verdict on PR #${pr} failed: ${e}` };
+    }
+  }
+  for (const label of state.handoff.labels) {
+    try {
+      await client.addLabel(state.issueNumber, label);
+    } catch (e) {
+      return { ok: false, why: `adding ${label} failed: ${e}` };
+    }
+  }
+  return { ok: true };
+}
+
+/**
+ * Keep a saved verdict for the next cycle: the state file first, since it
+ * is what the retry needs, then the label that stops a re-dispatch. Null
+ * when the state cannot be written, so the run parks rather than claiming
+ * a retry nothing will perform.
+ */
+async function holdPendingVerdict(ctx: DispatchContext, state: PendingVerdictState, why: string): Promise<VerdictRecoveryOutcome> {
+  const { agent, item, client, logFile } = ctx;
+  const statePath = pendingVerdictStatePath(agent.name, item.issueNumber);
+  try {
+    ctx.deps.mkdirSync(dirname(statePath), { recursive: true });
+    ctx.deps.writeFileSync(statePath, serializePendingVerdictState(state));
+  } catch (e) {
+    ctx.deps.writeLog(logFile, "VERDICT_HANDOFF_UNUSED", `could not keep the saved verdict for a retry (${e}); parking`);
+    return null;
+  }
+  const label = `${PENDING_VERDICT_PREFIX}${agent.name}`;
+  try {
+    await client.addLabel(item.issueNumber, label);
+  } catch (e) {
+    console.warn(`   ⚠️  Could not add ${label} to #${item.issueNumber} (${e}); the next cycle may dispatch ${agent.name} again`);
+  }
+  ctx.deps.writeLog(logFile, "VERDICT_PENDING", `${why}. Saved verdict kept at ${statePath}; the dispatcher retries each cycle.`);
+  console.warn(`   ⏸️  #${item.issueNumber} ${agent.name} verdict saved but not posted (${why}); retrying next cycle`);
+  await ctx.deps.notifyDiscord(
+    `⏸️ **${agent.name}** finished #${item.issueNumber} but its verdict could not be posted (${why.slice(0, 200)}). ` +
+    `The dispatcher saved it and retries each cycle. No action needed unless this persists.`,
+  );
+  return { kind: "pending" };
+}
+
+/**
+ * The run's own attempt to recover a verdict the agent could not post.
+ * Applies only to a `requiresVerdict` agent whose failure text says a GitHub
+ * write failed. Everything else returns null and is handled as before.
+ */
+async function recoverSavedVerdict(
+  ctx: DispatchContext,
+  failureText: string,
+  approvalRejected: boolean,
+): Promise<VerdictRecoveryOutcome> {
+  const { agent, item, logFile, startTime, verdictHandoffPath: path } = ctx;
+  if (!path || !agent.requiresVerdict || item.issueNumber <= 0) return null;
+  if (!isVerdictPublishFailure(failureText, { approvalRejected })) return null;
+
+  let handoff: HandoffParse | null = null;
+  try {
+    handoff = parseVerdictHandoff(String(ctx.deps.readFileSync(path, "utf-8")));
+  } catch {
+    handoff = null;
+  }
+  const pr = lookupVerdictPr(ctx.deps.execSync, { branch: ctx.branchName, pr: null, cwd: ctx.agentCwd });
+  const marker = handoffMarker({ agent: agent.name, issueNumber: item.issueNumber, startedAtMs: startTime });
+  const decision = decideVerdictRecovery({ handoff, pr, startedAtMs: startTime, firstAttempt: true, marker });
+  if (decision.kind === "park") {
+    ctx.deps.writeLog(logFile, "VERDICT_HANDOFF_UNUSED", decision.reason);
+    console.warn(`   ⚠️  ${agent.name} could not post its verdict and the dispatcher will not post it either: ${decision.reason}`);
+    return null;
+  }
+  // The decision parks a missing or incomplete handoff; this narrows the type.
+  if (handoff === null || !handoff.ok) return null;
+
+  const state: PendingVerdictState = {
+    agent: agent.name,
+    issueNumber: item.issueNumber,
+    pr: pr.kind === "found" ? pr.number : null,
+    startedAtMs: startTime,
+    handoff: handoff.handoff,
+  };
+  if (decision.kind === "wait") return holdPendingVerdict(ctx, state, "the pull request could not be read");
+
+  const published = await publishSavedVerdict(ctx.client, state, decision.pr, decision.kind === "already-posted");
+  if (!published.ok) return holdPendingVerdict(ctx, state, published.why);
+
+  ctx.deps.writeLog(logFile, "VERDICT_POSTED_BY_DISPATCHER", `${handoff.handoff.decision} verdict posted on PR #${decision.pr}${handoff.handoff.labels.length > 0 ? `, labels ${handoff.handoff.labels.join(", ")}` : ""}`);
+  console.log(`   📮 ${agent.name}'s GitHub write failed; posted its saved ${handoff.handoff.decision} verdict on PR #${decision.pr}`);
+  return { kind: "posted", labels: handoff.handoff.labels };
+}
+
 // Post-run side-effect chain after a successful (or successfully-salvaged)
 // claude invocation: usage logging, safety-net commit, push, empty-branch
 // guard, post-success labeling via `decidePostRunLabels`, completion
@@ -3845,6 +4060,9 @@ export async function handlePostRun(
   streamResult: StreamResult,
   ctx: DispatchContext,
   saferSalvaged: boolean,
+  /** Labels the dispatcher itself just applied (a recovered verdict's), added
+   *  to the post-run read so a failed read cannot lose a FAIL's rework label. */
+  appliedLabels: readonly string[] = [],
 ): Promise<{ ok: true } | { ok: false }> {
   const { agent, item, client, agentCwd, useWorktree, branchName, logFile, startTime } = ctx;
   const { execSync, spawnSync, notifyDiscord } = ctx.deps;
@@ -4032,6 +4250,7 @@ export async function handlePostRun(
     } catch (e) {
       console.warn(`   ⚠️  Failed to check post-run labels: ${e}`);
     }
+    postLabels = [...new Set([...postLabels, ...appliedLabels])];
   }
 
   // Empty-branch guard: agents that are supposed to produce commits
@@ -4166,7 +4385,18 @@ export async function handlePostRun(
       const detail = e?.stderr?.toString?.() ?? e?.message ?? String(e);
       console.warn(`   ⚠️  Verdict guard skipped (could not read the PR): ${detail.slice(0, 300)}`);
     }
-    if (shouldFlagMissingVerdict(agent, postLabels, verdicts)) {
+    // A clean exit that says the verdict post failed, with a finished
+    // verdict saved: publish it instead of parking. Claude runs end this
+    // way where Codex runs block. See verdict-handoff.ts.
+    let recovered: VerdictRecoveryOutcome = null;
+    if (shouldFlagMissingVerdict(agent, postLabels, verdicts) && ctx.verdictHandoffPath) {
+      recovered = await recoverSavedVerdict(ctx, output, streamResult.hadPermissionDenial);
+      if (recovered?.kind === "pending") return { ok: true };
+      // The labels the dispatcher just applied, so a FAIL routes as a rework
+      // without another read that could fail.
+      if (recovered?.kind === "posted") postLabels = [...new Set([...postLabels, ...recovered.labels])];
+    }
+    if (recovered === null && shouldFlagMissingVerdict(agent, postLabels, verdicts)) {
       console.error(`   ❌ ${agent.name} ended without a verdict — nothing posted on the PR since the run started and no rework label. Treating as error:${agent.name}.`);
       try {
         await client.addLabel(item.issueNumber, `error:${agent.name}`);
@@ -4924,6 +5154,111 @@ export async function runStrandedWipSweep(
   // without this the swept ticket stays invisible until the next poll.
   // Same idiom as `runReworkRouting` and `runAutoAdvance`.
   if (stripped) client.clearItemsCache();
+}
+
+/**
+ * Retry the saved verdicts that `recoverSavedVerdict` could not post because
+ * GitHub was still refusing writes (agent-dispatcher#118).
+ *
+ * For each `pending-verdict:<agent>` ticket on the cached board snapshot:
+ * read the saved state, re-check the PR, post the verdict unless this run's
+ * marker shows an earlier attempt landed, and apply its labels. Success
+ * swaps the label for `pending-done:<agent>`, so `runPendingDoneFinalize`,
+ * which runs next, adds `done:<agent>` on a PASS exactly as a normal post-run
+ * would, and leaves a FAIL's rework label to `runReworkRouting`. A GitHub
+ * failure changes nothing and the next cycle tries again. A lost state file,
+ * a moved head or a closed PR parks the ticket as `error:<agent>`.
+ */
+export async function runPendingVerdictPublish(
+  client: DispatchClient,
+  deps: Pick<DispatchDeps, "execSync" | "readFileSync" | "notifyDiscord"> = DEFAULT_DEPS,
+): Promise<void> {
+  let items: ProjectItem[];
+  try {
+    items = await client.getAllProjectItems();
+  } catch (error: any) {
+    console.error(`Error fetching board for pending-verdict publish: ${error.message}`);
+    return;
+  }
+
+  let mutated = false;
+  for (const item of items) {
+    for (const label of item.labels) {
+      if (!label.startsWith(PENDING_VERDICT_PREFIX)) continue;
+      const agentName = label.slice(PENDING_VERDICT_PREFIX.length);
+      let state: PendingVerdictState | null = null;
+      try {
+        state = parsePendingVerdictState(String(deps.readFileSync(pendingVerdictStatePath(agentName, item.issueNumber), "utf-8")));
+      } catch {
+        state = null;
+      }
+      if (state === null || state.agent !== agentName || state.issueNumber !== item.issueNumber) {
+        await parkPendingVerdict(client, deps, item, agentName, label, "the saved verdict could not be read back from the dispatcher's logs folder");
+        mutated = true;
+        continue;
+      }
+
+      const marker = handoffMarker({ agent: agentName, issueNumber: item.issueNumber, startedAtMs: state.startedAtMs });
+      const pr = lookupVerdictPr(deps.execSync, { branch: `feature/${item.issueNumber}`, pr: state.pr, cwd: repoRoot });
+      const decision = decideVerdictRecovery({
+        handoff: { ok: true, handoff: state.handoff }, pr, startedAtMs: state.startedAtMs, firstAttempt: false, marker,
+      });
+      if (decision.kind === "wait") {
+        console.warn(`   ⏸️  Pending verdict on #${item.issueNumber}: the pull request could not be read; retrying next cycle`);
+        continue;
+      }
+      if (decision.kind === "park") {
+        await parkPendingVerdict(client, deps, item, agentName, label, decision.reason);
+        mutated = true;
+        continue;
+      }
+
+      const published = await publishSavedVerdict(client, { ...state, pr: decision.pr }, decision.pr, decision.kind === "already-posted");
+      if (!published.ok) {
+        console.warn(`   ⏸️  Pending verdict on #${item.issueNumber}: ${published.why}; retrying next cycle`);
+        continue;
+      }
+      // pending-done first, so the ticket is never without a label that
+      // stops a re-dispatch of the agent.
+      try {
+        await client.addLabel(item.issueNumber, `${PENDING_DONE_PREFIX}${agentName}`);
+        await client.removeLabel(item.issueNumber, label);
+        mutated = true;
+      } catch (e) {
+        console.warn(`   ⚠️  Pending verdict on #${item.issueNumber}: posted, but swapping ${label} for ${PENDING_DONE_PREFIX}${agentName} failed (${e}); finishing next cycle`);
+        continue;
+      }
+      console.log(`   📮 Pending verdict: posted ${agentName}'s saved ${state.handoff.decision} verdict for #${item.issueNumber} on PR #${decision.pr}`);
+      await deps.notifyDiscord(`📮 **${agentName}** verdict for #${item.issueNumber} (${state.handoff.decision}) posted by the dispatcher on PR #${decision.pr} once GitHub accepted it.`);
+    }
+  }
+
+  // Same idiom as runPendingDoneFinalize: the next sub-step reads the
+  // cached snapshot and must see the new pending-done label.
+  if (mutated) client.clearItemsCache();
+}
+
+/** Park a pending verdict the dispatcher cannot safely post. */
+async function parkPendingVerdict(
+  client: DispatchClient,
+  deps: Pick<DispatchDeps, "notifyDiscord">,
+  item: ProjectItem,
+  agentName: string,
+  pendingLabel: string,
+  reason: string,
+): Promise<void> {
+  console.warn(`   ❌ Pending verdict on #${item.issueNumber} parked: ${reason}`);
+  try { await client.addLabel(item.issueNumber, `error:${agentName}`); } catch {}
+  try {
+    await client.addComment(
+      item.issueNumber,
+      `## ⚠️ Agent Error: ${agentName}\n\n` +
+      `The ${agentName} agent finished its review but could not post the verdict, and the dispatcher held the saved verdict to post once GitHub recovered. ` +
+      `It will not post it: ${reason}.\n\nManual intervention required.`,
+    );
+  } catch {}
+  try { await client.removeLabel(item.issueNumber, pendingLabel); } catch {}
+  await deps.notifyDiscord(`❌ **${agentName}** saved verdict for #${item.issueNumber} not posted: ${reason}. Manual intervention required.`);
 }
 
 /**
@@ -7677,6 +8012,7 @@ export async function pollLoop(): Promise<void> {
       client, notifyDiscord, STRANDED_WIP_MIN_AGE_MS, Date.now(),
       gateRun === null ? pool.keys() : new Set([...pool.keys(), `real-claude-gate#${gateRun.issue}`]),
     );
+    await runPendingVerdictPublish(client);
     await runPendingDoneFinalize(client);
     await runReworkRouting(client);
     await runRealClaudeGate(client);
@@ -7890,6 +8226,7 @@ export async function pollLoop(): Promise<void> {
     // dispatched (catches tickets advanced/closed by humans or label
     // changes between cycles).
     await runClosedSweep(client);
+    await runPendingVerdictPublish(client);
     await runPendingDoneFinalize(client);
     await runReworkRouting(client);
     await runRealClaudeGate(client);
