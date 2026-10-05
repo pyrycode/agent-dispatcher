@@ -172,6 +172,8 @@ The advance chain is Backlog → In Development → In Code Review → In Docume
 
 In the classic set this feature is entirely inert (locked by test): no gate runs, no env is read.
 
+**Gate report for the documentation agent.** The documentation agent's prompt gets a `## Gate report` section built from the dispatcher's own logs. It lists the ticket's recorded verifier gate pass, with its time, commit and each gate's line. It gives the executed, passed, failed and skipped counts of every verifier gate with a format in `PYRY_VERIFIER_GATE_FORMATS`, and of the newest real-claude gate output, read with `PYRY_REAL_CLAUDE_GATE_FORMAT`. For each test the issue body or the plan names, it gives the result in each of those runs: passed, failed, skipped or not run. A test counts as named when its method, the part after `#`, the last ` › ` segment or the last Go name segment, appears there as a whole word. A `Class#method` or Go `TestName` the text mentions is listed even when no log has it. A run whose log is missing or unreadable, or that has no format, is listed with no per-test counts, never as passed. With nothing to report the section says so in one line. No other agent gets it. Added after 11 of 15 pyrycode-mobile documentation send-backs in the week to 2026-10-05 asked for evidence the agent could not see (#136).
+
 **Parallel source review.** With `PYRY_VERIFIER_PARALLEL_REVIEW=1`, a Claude or Codex
 verifier starts its complete source review while the configured gates run. This
 preliminary phase uses an empty temporary working directory and ignores user

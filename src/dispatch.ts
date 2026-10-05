@@ -10,6 +10,7 @@ import { countVerdictsSince, parseVerdictArtifacts, pickVerdictPr, shouldFlagMis
 import { countOpenPrs, shouldFlagMissingPr } from "./pr-guard.js";
 import { PENDING_VERDICT_PREFIX, decideVerdictRecovery, handoffMarker, isVerdictPublishFailure, parsePendingVerdictState, parsePrVerdictView, parseVerdictHandoff, serializePendingVerdictState, verdictHandoffNote, type HandoffParse, type PendingVerdictState, type VerdictPrLookup } from "./verdict-handoff.js";
 import { resolveImportOnlyMerge } from "./merge-resolve.js";
+import { gateReportSection } from "./gate-report.js";
 import { FINAL_MERGE_HANDOFF_MARKER, FINAL_MERGE_HANDOFF_MAX, MERGE_HANDOFF_LABEL, checkMergeResolution, decideConflictRoute, decideFinalMergeRoute, findMergeCommit, mergeHandoffNote, mergeResolutionComment, mergeResolutionSection, readPendingMerge, type PendingMerge, type ResolutionNote } from "./merge-handoff.js";
 
 import {
@@ -1452,6 +1453,7 @@ async function buildPromptForAgent(
   // The builder set's refiner is the PO contract under a new name, so it
   // is excluded the same way.
   const needsArchDoc = !["po", "refiner"].includes(agent.name);
+  const planTexts: string[] = [];
   if (needsArchDoc) {
     try {
       // readdirSync + filter — no shell, no template-string, no `2>/dev/null`
@@ -1465,7 +1467,9 @@ async function buildPromptForAgent(
         entries = readdirSync(archDir).filter(name => name.startsWith(prefix));
       }
       for (const name of entries) {
-        parts.push(`\n## Architecture Doc (from System Architect)\n${readFileSync(resolve(archDir, name), "utf-8")}`);
+        const doc = readFileSync(resolve(archDir, name), "utf-8");
+        planTexts.push(doc);
+        parts.push(`\n## Architecture Doc (from System Architect)\n${doc}`);
       }
     } catch (e) {
       console.warn(`   ⚠️  Failed to read architecture docs for #${ticketNum}: ${e}`);
@@ -1559,6 +1563,21 @@ async function buildPromptForAgent(
       if (section) parts.push(section);
     } catch (e) {
       console.warn(`   ⚠️  Failed to read merge resolution notes for #${ticketNum}: ${e}`);
+    }
+  }
+
+  // The documentation agent records test evidence it cannot otherwise see:
+  // the verifier gate results live only in these logs (#136).
+  if (agent.name === "documentation" && ticketNum > 0) {
+    try {
+      parts.push(gateReportSection({
+        issueNumber: ticketNum,
+        logsDir: LOGS_DIR,
+        env: process.env,
+        namingText: [item.body, ...planTexts].join("\n"),
+      }));
+    } catch (e) {
+      console.warn(`   ⚠️  Failed to build the gate report for #${ticketNum}: ${e}`);
     }
   }
 
