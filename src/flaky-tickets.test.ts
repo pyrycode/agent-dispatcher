@@ -11,8 +11,10 @@ import {
   flakyMarker,
   recordFlakyTests,
   shortTestName,
+  buildFlakyRecurrenceComment,
   type FlakyRunContext,
   type FlakyTicketClient,
+  type VerifierGateFlakyContext,
 } from "./flaky-tickets.js";
 
 const NAME = "de.pyryco.mobile.e2e.InteractiveStreamE2ETest#interactiveTurn_stopRunningTurn_showsInterruptedThenRepliesAgain";
@@ -123,6 +125,43 @@ describe("flaky-test tickets", () => {
     assert.equal(shortTestName("p.C#method"), "method");
     assert.equal(shortTestName("github.com/o/r/internal/e2e.TestLive/sub"), "TestLive/sub");
     assert.equal(shortTestName("bare"), "bare");
+  });
+
+  test("a ticket filed from a verifier gate names the gate command and its log, not a real-claude report", async () => {
+    const gate = "python3 scripts/android-test-gate.py ui";
+    const gateCtx: VerifierGateFlakyContext = {
+      gatedIssue: 1760,
+      at: "2026-10-05T09:00:00.000Z",
+      verifierGate: {
+        gate,
+        commit: "d4e5f6a7b8".padEnd(40, "0"),
+        outputPath: "/logs/verifier-gate_#1760_2.log",
+        rerunOutputPath: "/logs/verifier-gate-rerun_#1760.log",
+      },
+    };
+    const client = new FakeClient();
+
+    const result = await recordFlakyTests(client, [NAME], gateCtx);
+
+    assert.deepEqual(result.filed, [{ name: NAME, issue: 3000 }]);
+    const { title, body } = client.created[0];
+    assert.equal(title, "flaky test: interactiveTurn_stopRunningTurn_showsInterruptedThenRepliesAgain");
+    assert.ok(body.includes(`Verifier gate run for #1760 at 2026-10-05T09:00:00.000Z`));
+    assert.ok(body.includes(`\`${gate}\` on merged commit \`d4e5f6a7b8\``));
+    assert.ok(body.includes("`/logs/verifier-gate_#1760_2.log`, re-run output: `/logs/verifier-gate-rerun_#1760.log`"));
+    assert.ok(!/real-claude|live gate|Branch `/.test(body), "no real-claude wording or report fields");
+    assert.equal(findFlakyTicket([{ number: 3000, body }], NAME), 3000, "the same per-test marker, so both gates share one ticket");
+
+    const comment = buildFlakyRecurrenceComment(NAME, gateCtx);
+    assert.ok(comment.includes(`\`${gate}\``));
+    assert.ok(comment.includes("/logs/verifier-gate_#1760_2.log"));
+  });
+
+  test("a real-claude ticket keeps its wording", () => {
+    const { title, body } = buildFlakyTestIssue(NAME, ctx());
+    assert.match(title, /^flaky live test: /);
+    assert.match(body, /The real-claude gate saw this test fail/);
+    assert.ok(body.includes("- Branch `feature/1016` at `c51aea6481`, merged with `origin/main` at `31234eccda`"));
   });
 
   test("the ticket body stays within the refiner's shape", () => {

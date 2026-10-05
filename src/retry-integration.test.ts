@@ -74,6 +74,9 @@ class FakeClient implements DispatchClient {
     return this.comments.filter((c) => c.issueNumber === issueNumber).map((c) => c.body);
   }
   async countMarkerComments(_issueNumber: number, _marker: string) { return 0; }
+  async listOpenIssuesWithLabel() { return []; }
+  async createIssue(): Promise<{ number: number; nodeId: string; url: string }> { throw new Error("not used"); }
+  async addItemToProject(): Promise<string> { throw new Error("not used"); }
   labels() { return this.addLabelCalls.map((c) => c.label); }
 }
 
