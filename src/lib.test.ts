@@ -14,6 +14,7 @@
 
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 
 import { AGENTS } from "./types.js";
 import {
@@ -5183,6 +5184,81 @@ describe("buildBaselineFilter", () => {
   test("junit-xml filter survives command substitution intact", () => {
     const cmd = buildBaselineCommand("python3 gate.py live --tests {{TESTS}}", buildBaselineFilter(["p.A$B#m"], "junit-xml")!);
     assert.equal(cmd, "python3 gate.py live --tests 'p.A$B#m'");
+  });
+
+  // Playwright's `-g` is a regex tested against the title path joined by
+  // spaces, with the project name and any tags mixed in (Playwright 1.61,
+  // `_grepTitleWithTags`, `new RegExp(pattern, "gi")`). The parser names a
+  // test by joining file, describes and title with ` › `. Before #132 the Go
+  // rule refused the space and the `›`, so every pyrycode-desktop live FAIL
+  // said "could not build a safe test filter" and no comparison ran.
+  const playwrightRegex = (filter: string): RegExp => {
+    assert.ok(filter.startsWith("'") && filter.endsWith("'"), `not single-quoted: ${filter}`);
+    return new RegExp(filter.slice(1, -1), "i");
+  };
+
+  test("playwright-json builds a quoted regex that matches Playwright's grep title", () => {
+    const f = buildBaselineFilter(["chat.spec.ts › Composer › sends on Enter"], "playwright-json");
+    assert.notEqual(f, null);
+    const re = playwrightRegex(f!);
+    assert.match(" chromium chat.spec.ts Composer sends on Enter", re);
+    assert.match(" chat.spec.ts Composer @slow sends on Enter @smoke", re);
+    assert.doesNotMatch(" other.spec.ts Composer sends on Enter", re);
+    assert.doesNotMatch(" chat.spec.ts Composer sends on Shift", re);
+  });
+
+  test("playwright-json joins several names as alternatives and deduplicates", () => {
+    const f = buildBaselineFilter(
+      ["a.spec.ts › one", "b.spec.ts › Suite › two", "a.spec.ts › one"],
+      "playwright-json",
+    );
+    assert.equal(f, "'(a\\.spec\\.ts.*one|b\\.spec\\.ts.*Suite.*two)'");
+    const re = playwrightRegex(f!);
+    assert.match(" a.spec.ts one", re);
+    assert.match(" b.spec.ts Suite two", re);
+  });
+
+  test("playwright-json escapes regex metacharacters so a title matches literally", () => {
+    const title = "x.spec.ts › parses (a|b) [1+2]? $5 ^c \\d {3} /path/ *";
+    const f = buildBaselineFilter([title], "playwright-json");
+    assert.notEqual(f, null);
+    const re = playwrightRegex(f!);
+    assert.match(" proj x.spec.ts parses (a|b) [1+2]? $5 ^c \\d {3} /path/ *", re);
+    // Unescaped, `(a|b)` would also match a title holding only `a`.
+    assert.doesNotMatch(" proj x.spec.ts parses a [1+2]? $5 ^c \\d {3} /path/ *", re);
+  });
+
+  test("playwright-json REFUSES the whole list for a quote, newline or control character", () => {
+    assert.equal(buildBaselineFilter(["a.spec.ts › ok", "a.spec.ts › it's broken"], "playwright-json"), null);
+    assert.equal(buildBaselineFilter(["a.spec.ts › two\nlines"], "playwright-json"), null);
+    assert.equal(buildBaselineFilter(["a.spec.ts › tab\there"], "playwright-json"), null);
+    assert.equal(buildBaselineFilter(["a.spec.ts › bell\u0007"], "playwright-json"), null);
+    assert.equal(buildBaselineFilter(["a.spec.ts › del\u007f"], "playwright-json"), null);
+    assert.equal(buildBaselineFilter([" › "], "playwright-json"), null);
+    assert.equal(buildBaselineFilter([""], "playwright-json"), null);
+    assert.equal(buildBaselineFilter([], "playwright-json"), null);
+  });
+
+  test("playwright-json filter reaches the shell as one -g argument with Desktop's template", () => {
+    const template = "npm install --no-audit --no-fund >&2 && npm run build >&2 && npx playwright test --config playwright.real-claude.config.ts --reporter=json -g {{TESTS}}";
+    const names = ["real-claude.spec.ts › Permissions › approves `rm` then $HOME; echo pwned › ok", "real-claude.spec.ts › streams"];
+    const cmd = buildBaselineCommand(template, buildBaselineFilter(names, "playwright-json")!);
+    assert.notEqual(cmd, null);
+    // Parse the tail exactly as the gate's shell would, and print each word.
+    const tail = cmd!.slice(cmd!.indexOf("npx playwright test"));
+    const out = execFileSync("sh", ["-c", `set -- ${tail}; for a; do printf '%s\\0' "$a"; done`], { encoding: "utf-8" });
+    const words = out.split("\0").slice(0, -1);
+    const g = words.indexOf("-g");
+    assert.equal(words.length, g + 2, `expected one argument after -g, got ${JSON.stringify(words.slice(g + 1))}`);
+    const re = new RegExp(words[g + 1]!, "i");
+    assert.match(" real-claude real-claude.spec.ts Permissions approves `rm` then $HOME; echo pwned ok", re);
+    assert.match(" real-claude real-claude.spec.ts streams", re);
+  });
+
+  test("go-json and junit-xml filters are unchanged by the Playwright builder", () => {
+    assert.equal(buildBaselineFilter(["p.TestA"], "go-json"), "'^(TestA)$'");
+    assert.equal(buildBaselineFilter(["p.Test With Space"], "go-json"), null);
+    assert.equal(buildBaselineFilter(["p.A#m"], "junit-xml"), "'p.A#m'");
   });
 });
 
