@@ -191,6 +191,41 @@ export function buildCodexInvocation(opts: {
  */
 const APPROVAL_REVIEW_FAILED = /automatic approval review could not be completed|This is a review failure, not a determination that the action is unsafe|automatic permission approval review did not finish before its deadline/i;
 
+/** Longest failed MCP call text the run log keeps. */
+export const MCP_FAILURE_LOG_CAP = 4000;
+
+/**
+ * The run-log line for a Codex MCP tool call that did not succeed, or null.
+ *
+ * The run log keeps a 300-character preview of each Codex event, and an MCP
+ * item's outcome comes after its arguments, so a failed call's reason never
+ * reached the log. On pyrycode-mobile #1783, 2026-10-05, a `codegraph_context`
+ * call was refused because Codex's approval reviewer was at capacity; Codex
+ * wrote nothing on stderr, and the log cut the item off inside its arguments.
+ * Only the agent's paraphrase survived. Two failure shapes, both seen live
+ * with codex-cli 0.159.2:
+ *
+ *   Codex refused or could not run the call:
+ *   {"type":"mcp_tool_call",...,"result":null,"error":{"message":"Automatic approval review failed: ..."},"status":"failed"}
+ *
+ *   The tool ran and reported an error:
+ *   {"type":"mcp_tool_call",...,"result":{"content":[{"type":"text","text":"Error: ..."}],"structured_content":null},"error":null,"status":"failed"}
+ *
+ * The adapter's own classification reads the whole item and needs none of this.
+ */
+export function failedMcpCallLogLine(item: Record<string, any> | null | undefined): string | null {
+  if (item?.type !== "mcp_tool_call") return null;
+  const errorMessage = typeof item.error?.message === "string" ? item.error.message : "";
+  if (item.status !== "failed" && errorMessage === "") return null;
+  const resultText = Array.isArray(item.result?.content)
+    ? item.result.content.filter((c: any) => c?.type === "text" && typeof c.text === "string").map((c: any) => c.text).join("\n")
+    : "";
+  const reason = (errorMessage || resultText || "no error message or result text").replace(/\s*\n\s*/g, " ⏎ ").trim();
+  const capped = reason.length > MCP_FAILURE_LOG_CAP ? `${reason.slice(0, MCP_FAILURE_LOG_CAP)}…(truncated)` : reason;
+  const source = errorMessage ? "Codex" : "the tool";
+  return `MCP tool call failed, reported by ${source}: ${String(item.server ?? "?")}.${String(item.tool ?? "?")}: ${scrubCredentials(capped)}`;
+}
+
 /** Native Codex JSONL is not Claude stream-json. A process exit alone is not success. */
 export class CodexStreamAdapter {
   private sessionId = "";

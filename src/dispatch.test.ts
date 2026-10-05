@@ -40,6 +40,7 @@ import {
   dispatchToAgent,
   handleAgentResultErrors,
   handleDispatchError,
+  logStreamMessage,
   handlePostRun,
   makeDispatchContext,
   maybeCurateMemory,
@@ -9230,6 +9231,81 @@ describe("Codex blocked on a missing tool or variable — auto-retry", () => {
 // and said plainly that this was not a rejection. The agent stopped blocked,
 // its summary named the approval, and the ticket parked. A retry would very
 // likely pass the review. A genuine rejection (#1727, #1766) keeps parking.
+// pyrycode-mobile #1783, 2026-10-05: the reviewer failure hit an MCP tool
+// call, not a shell command. Codex writes nothing on stderr for an MCP call;
+// the reason is only in the item's `error`. Real shapes in the fixture.
+describe("Codex approval reviewer failure on an MCP tool call (#1783)", () => {
+  const items = JSON.parse(readFileSync(new URL("./fixtures/codex-mcp-items.json", import.meta.url), "utf8")) as Record<string, any>;
+  const builder = { name: "builder", column: "In Development", claudeMdPath: "builder/CLAUDE.md" };
+  // The #1783 builder's own summary, verbatim.
+  const summary = "Required codegraph_context call did not execute: automatic approval review failed because its model was at capacity and prohibited bypassing the check. No files changed, plan committed, or PR opened. #1782 is confirmed closed and merged in PR #1784. Retry requires the approval-review service to be available.";
+
+  function blockedRun(...events: Record<string, any>[]): StreamResult {
+    const a = new CodexStreamAdapter();
+    a.accept({ type: "thread.started", thread_id: "01a10bfb-53a2-7042-8c4c-1967dbf7fc67" });
+    a.accept({ type: "turn.started" });
+    for (const e of events) a.accept(e);
+    a.accept({ type: "item.completed", item: { id: "item_14", type: "agent_message", text: JSON.stringify({ status: "blocked", summary }) } });
+    a.accept({ type: "turn.completed", usage: {} });
+    return a.finish(0, false, 1000, "");
+  }
+
+  async function handle(result: StreamResult) {
+    const { ctx, client } = makeTestContext({ item: { issueNumber: 1783, labels: [] }, agent: builder });
+    let error: any;
+    try { await handleAgentResultErrors(result, ctx); } catch (e) { error = e; }
+    assert.ok(error, "a blocked run always throws to the error path");
+    await handleDispatchError(error, ctx, result);
+    return { client, labels: client.addLabelCalls.map(c => c.label) };
+  }
+
+  test("the #1783 item with nothing on stderr → transient retry, no error:builder", async () => {
+    const result = blockedRun(items.started, items.reviewerFailed1783);
+    assert.equal(result.approvalReviewFailed, true);
+    assert.equal(result.hadPermissionDenial, false);
+    const { client, labels } = await handle(result);
+    assert.deepEqual(labels, ["error-retry-count:1"]);
+    assert.ok(client.comments.some(c => c.body.includes("approval review failed")));
+  });
+
+  test("the same summary without the item parks, as the agent's words are never trusted", async () => {
+    const result = blockedRun(items.started);
+    assert.equal(result.approvalReviewFailed, false);
+    assert.ok((await handle(result)).labels.includes("error:builder"));
+  });
+
+  test("a rejection carried in an MCP item's error parks, even beside a reviewer failure", async () => {
+    const rejected = structuredClone(items.codexRefused);
+    rejected.item.error.message = "This action was rejected due to unacceptable risk.";
+    const result = blockedRun(items.reviewerFailed1783, rejected);
+    assert.equal(result.hadPermissionDenial, true);
+    const { labels } = await handle(result);
+    assert.ok(labels.includes("error:builder"));
+    assert.ok(!labels.some(l => l.startsWith("error-retry-count:")));
+  });
+
+  test("other failed MCP calls set neither flag", () => {
+    const result = blockedRun(items.codexRefused, items.toolError);
+    assert.equal(result.approvalReviewFailed, false);
+    assert.equal(result.hadPermissionDenial, false);
+  });
+
+  test("the run log keeps a failed MCP call's reason that the event preview cuts off", () => {
+    const dir = mkdtempSync(join(tmpdir(), "mcp-log-"));
+    try {
+      const log = join(dir, "run.log");
+      writeFileSync(log, "");
+      for (const e of [items.started, items.reviewerFailed1783, items.toolError]) logStreamMessage(log, e);
+      const text = readFileSync(log, "utf8");
+      const preview = text.split("\n").find(l => l.includes("[item.completed]") && l.includes("codegraph_context"))!;
+      assert.doesNotMatch(preview, /approval review/, "the 300-character preview alone loses the reason, as in #1783's log");
+      assert.match(text, /⚠️  MCP tool call failed, reported by Codex: codegraph\.codegraph_context: Automatic approval review failed: Selected model is at capacity\. Please try a different model\. ⏎ The action was not executed because automatic approval review could not be completed\./);
+      assert.match(text, /⚠️  MCP tool call failed, reported by the tool: codegraph\.codegraph_status: Error: Tool execution failed: CodeGraph not initialized/);
+      assert.equal(text.match(/MCP tool call failed/g)?.length, 2, "an in-progress item adds nothing");
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
 describe("Codex approval reviewer failed to decide — auto-retry (#121)", () => {
   const capacityForm = "2026-10-05T07:12:01Z ERROR codex_core::tools::router: Automatic approval review failed: Selected model is at capacity. Please try a different model. " +
     "The action was not executed because automatic approval review could not be completed. This is a review failure, not a determination that the action is unsafe.";
