@@ -601,6 +601,7 @@ export function buildResumePrompt(reason: "max_turns" | "timeout"): string {
  *   keep the last leg's value.
  * - **Session id**: the last leg's, falling back to the first's (same
  *   session either way — `--resume` continues it, not forks it).
+ * - **Codex wait credit** sums across legs, like duration.
  *
  * Generic over the concrete StreamResult shape (defined in dispatch.ts)
  * to keep this module import-cycle-free.
@@ -611,6 +612,7 @@ export function mergeLegResults<T extends {
   totalCostUsd: number;
   durationMs: number;
   usage: Record<string, unknown>;
+  waitCreditMs?: number;
 }>(first: T, leg: T): T {
   const TOKEN_KEYS = [
     "input_tokens",
@@ -633,6 +635,9 @@ export function mergeLegResults<T extends {
     totalCostUsd: first.totalCostUsd + leg.totalCostUsd,
     durationMs: first.durationMs + leg.durationMs,
     usage,
+    // Codex wait credit (wait-credit.ts) is per leg; the dispatch waited for both.
+    ...(first.waitCreditMs || leg.waitCreditMs
+      ? { waitCreditMs: (first.waitCreditMs ?? 0) + (leg.waitCreditMs ?? 0) } : {}),
   };
 }
 

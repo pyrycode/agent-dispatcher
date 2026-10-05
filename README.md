@@ -37,6 +37,8 @@ Uncommitted changes are committed as one `wip(<agent>): partial work from an int
 
 Before any salvage, a run that exhausted its budget — the `max_turns` turn cap or the dispatcher's wall-clock timeout — gets up to `PYRY_RESUME_LEGS` continuation legs (default 1; `0` disables the feature and restores the pre-resume behaviour byte-for-byte). A continuation leg resumes the **same claude session** via `claude --resume <session-id>` with a fresh budget, inside the same dispatch and the same worktree, with every flag re-passed (they do not carry over on resume). Session ids are captured from the stream's init frame, so even a killed run that never emitted a result frame stays resumable. Most budget exhaustions are "ran out mid-task", not "stuck" — one fresh budget converts most of those human-triage interruptions into automatic completions. If the final leg is still exhausted, the salvage paths below run unchanged, keyed on the original run's result. Permission denials never resume; they keep their own salvage.
 
+A Codex run stopped by its wall clock gets the same continuation legs under the same rules: it resumes its own thread through `codex exec resume <thread-id>` with every flag re-passed and the same continuation prompt, and keeps its wait credit for the device and build places on each leg. A run never switches runner on continuation. A blocked Codex run, an idle stall or a Codex error never resumes.
+
 **Claude-binary bridge caveat:** continuation legs always spawn the `claude` CLI directly, regardless of `PYRY_USE_LEGACY_CLAUDE`, because the `pyry agent-run` wrapper has no resume support yet. This is a pilot bridge; it retires once the wrapper grows a `--resume` flag.
 
 **Economics note:** graceful resumption changes the economics of ticket splitting — a ticket that would previously burn a human triage cycle on a budget miss now just costs a second leg, so oversized-but-coherent tickets get cheaper relative to eager splits. The refiner guides flip their split-leaning default separately once this is observed live.
@@ -600,8 +602,9 @@ failed run, or approval rejection still becomes an agent error.
 
 Codex has no Claude-style max-turn budget. The existing per-stage wall-clock
 budget applies, with process-group termination and a two-second forced-stop grace
-period. Codex does not enter the Claude continuation path. Timeout results retain
-the thread ID and use the existing partial-work salvage path. Recovery messages
+period. A timed-out Codex run gets the same continuation legs as Claude, resuming
+its own thread (see Resume-in-place). If the continuation also runs out, the
+result retains the thread ID and uses the existing partial-work salvage path. Recovery messages
 point to `codex resume`. Transient process-spawn retry remains bounded as before;
 other failures use the existing error classification without pretending all Codex
 failures are Claude API errors.

@@ -6211,8 +6211,10 @@ describe("mergeLegResults — cross-leg usage aggregation", () => {
   });
 
   test("Codex wait credit sums across legs, and stays absent when neither leg had any", () => {
-    assert.equal(mergeLegResults({ ...firstLeg, waitCreditMs: 60_000 }, { ...resumeLeg, waitCreditMs: 30_000 }).waitCreditMs, 90_000);
-    assert.equal(mergeLegResults({ ...firstLeg, waitCreditMs: 60_000 }, resumeLeg).waitCreditMs, 60_000);
+    type Leg = typeof firstLeg & { waitCreditMs?: number };
+    const first: Leg = { ...firstLeg, waitCreditMs: 60_000 };
+    assert.equal(mergeLegResults<Leg>(first, { ...resumeLeg, waitCreditMs: 30_000 }).waitCreditMs, 90_000);
+    assert.equal(mergeLegResults<Leg>(first, resumeLeg).waitCreditMs, 60_000);
     assert.equal("waitCreditMs" in mergeLegResults(firstLeg, resumeLeg), false);
   });
 

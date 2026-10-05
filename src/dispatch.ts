@@ -705,7 +705,8 @@ interface RunClaudeOpts {
    * the `claude` binary regardless of PYRY_USE_LEGACY_CLAUDE (the pyry
    * agent-run wrapper has no resume support yet — pilot bridge, see
    * `buildResumeArgv`). `promptFile` then carries the continuation
-   * prompt, piped on stdin like the legacy spawn.
+   * prompt, piped on stdin like the legacy spawn. With the Codex runner
+   * it is the Codex thread id, resumed through `codex exec resume`.
    */
   resumeSessionId?: string;
 }
@@ -844,7 +845,6 @@ function killAllChildPgrps(sig: NodeJS.Signals | number): void {
 function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
   return new Promise((resolve, reject) => {
     const isCodex = opts.runner === "codex";
-    if (isCodex && opts.resumeSessionId) { reject(new Error("Codex automatic continuation is not supported")); return; }
     const codex = isCodex ? new CodexStreamAdapter() : null;
     const startedAt = Date.now();
     // Phase C cutover (2026-05-14, pyrycode/pyrycode#329): default-spawn
@@ -873,7 +873,8 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
         // Resolved from the env Codex itself gets, so nothing withheld from
         // Codex can come back through the allowlist.
         shellEnv: resolveAgentShellEnv(codexChildEnv(opts.env)),
-        builderLiveTests: opts.env.CLAUDE_CODE_ENTRYPOINT === "builder" && Boolean(opts.env.OP_SERVICE_ACCOUNT_TOKEN?.trim()) }));
+        builderLiveTests: opts.env.CLAUDE_CODE_ENTRYPOINT === "builder" && Boolean(opts.env.OP_SERVICE_ACCOUNT_TOKEN?.trim()),
+        resumeThreadId: opts.resumeSessionId }));
     } else if (opts.sourceReview) {
       if (!opts.sourceReviewRoot) throw new Error("Claude source review requires an explicit source root");
       ({ bin, args } = buildClaudeSourceReviewInvocation({ root: opts.sourceReviewRoot, model: opts.model, effort: opts.effort, maxTurns: opts.maxTurns, systemPromptFile: opts.systemPromptFile }));
@@ -3798,13 +3799,21 @@ async function runParallelVerifierReview(
  * unchanged: a drain signal during a continuation leg is honoured the
  * way it is during a first leg (the dispatcher finishes the current
  * dispatch, resume legs included, then exits).
+ *
+ * Codex (approved 2026-10-05): a Codex run stopped by its wall clock gets
+ * the same legs under the same rules, resuming its own thread through
+ * `codex exec resume`. Each leg has its own wall clock with wait credit.
+ * A run never switches runner on continuation.
  */
 export async function maybeResumeExhaustedRun(
   first: StreamResult,
   config: SpawnConfig,
   ctx: DispatchContext,
 ): Promise<StreamResult> {
-  if (config.runner === "codex" || first.runner === "codex") return first;
+  // A run never switches runner on continuation: a Codex thread id must
+  // never reach Claude's resume path, nor a Claude session id Codex's.
+  const isCodex = first.runner === "codex";
+  if (isCodex !== (config.runner === "codex")) return first;
   if (!first.isError) return first;
   const maxLegs = parseResumeLegs(process.env.PYRY_RESUME_LEGS);
   if (maxLegs === 0) return first;
@@ -3813,6 +3822,10 @@ export async function maybeResumeExhaustedRun(
   let legsUsed = 0;
   while (
     current.isError &&
+    // Codex continues only when the wall clock stopped it. A blocked run, an
+    // idle stall or a Codex error keeps its own path even if the wall clock
+    // also fired while the kill was landing.
+    (!isCodex || current.terminalReason === "timeout") &&
     shouldAttemptResume({
       terminalReason: current.terminalReason,
       timedOut: current.timedOut,
@@ -3829,7 +3842,7 @@ export async function maybeResumeExhaustedRun(
     ctx.deps.writeLog(
       ctx.logFile,
       "RESUME",
-      `Leg: ${legNumber}/${maxLegs}\nSession: ${current.sessionId}\nReason: ${reason}\nFresh budget: ${config.maxTurns} turns / ${config.timeoutMs / 60_000}min`,
+      `Leg: ${legNumber}/${maxLegs}\nSession: ${current.sessionId}\nReason: ${reason}\nFresh budget: ${isCodex ? "" : `${config.maxTurns} turns / `}${config.timeoutMs / 60_000}min`,
     );
     console.log(`   🔁 Resume leg ${legNumber}/${maxLegs} — continuing session ${current.sessionId} after ${reason}`);
 
