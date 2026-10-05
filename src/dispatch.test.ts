@@ -9116,7 +9116,7 @@ test("effort trial reaches both runners and records the actual selection without
     await withStageSet("builder", async () => {
       for (const runner of ["claude", "codex"]) {
         process.env.PYRY_AGENT_RUNNER = runner;
-        for (const [name, expected] of [["refiner", "medium"], ["builder", "medium"], ["verifier", "high"], ["documentation", "low"]]) {
+        for (const [name, expected] of [["refiner", "medium"], ["builder", "high"], ["verifier", "high"], ["documentation", "low"]]) {
           const agent = builderAgent(name);
           const { ctx, calls } = makeTestContext({
             agent,
@@ -10863,41 +10863,71 @@ describe("builder answers the verifier's findings (#1747)", () => {
     });
   }
 
-  describe("the runner file's rework entry", () => {
+  describe("the builder's runner and effort on a rework after a FAIL", () => {
     async function withRunnerFile(content: string, fn: () => Promise<void>) {
       const dir = mkdtempSync(join(tmpdir(), "runner-file-"));
-      const prior = process.env.PYRY_RUNNER_FILE;
+      const keys = ["PYRY_RUNNER_FILE", "PYRY_CODEX_EFFORT", "PYRY_CODEX_MODEL", "PYRY_EFFORT_POLICY"] as const;
+      const prior = Object.fromEntries(keys.map(k => [k, process.env[k]]));
+      for (const k of keys) delete process.env[k];
       process.env.PYRY_RUNNER_FILE = join(dir, "runner.json");
       writeFileSync(process.env.PYRY_RUNNER_FILE, content);
       try { await fn(); } finally {
-        if (prior === undefined) delete process.env.PYRY_RUNNER_FILE; else process.env.PYRY_RUNNER_FILE = prior;
+        for (const k of keys) {
+          if (prior[k] === undefined) delete process.env[k]; else process.env[k] = prior[k];
+        }
         rmSync(dir, { recursive: true, force: true });
       }
     }
-    async function runnerFor(opts: Parameters<typeof fixture>[0]) {
+    async function spawnFor(opts: Parameters<typeof fixture>[0]) {
       const f = fixture(opts);
-      let runner: string | undefined;
+      let config: { runner?: string; model: string; effort: string } | undefined;
       const inner = f.deps.runClaudeStreaming;
-      f.deps.runClaudeStreaming = async (config) => { runner = config.runner; return inner(config); };
+      f.deps.runClaudeStreaming = async (c) => { config = c; return inner(c); };
       await f.run();
-      return runner;
+      const log = f.calls.logs.find(l => l.section === "DISPATCH")?.content ?? "";
+      return { runner: config?.runner, model: config?.model, effort: config?.effort, log };
     }
-    const FILE = '{"runner":"codex","rework":{"builder":"claude"}}';
 
-    test("a builder rework after a FAIL runs on the rework runner", async () => {
-      await withRunnerFile(FILE, async () => assert.equal(await runnerFor({}), "claude"));
-    });
+    for (const runner of ["claude", "codex"] as const) {
+      test(`on ${runner}, a rework after a FAIL runs at xhigh on the same runner and model, and logs why`, async () => {
+        await withRunnerFile(`{"runner":"${runner}"}`, async () => {
+          const first = await spawnFor({ labels: [] });
+          const rework = await spawnFor({});
+          assert.equal(first.effort, "high");
+          assert.equal(rework.effort, "xhigh");
+          assert.equal(rework.runner, runner);
+          assert.equal(rework.model, first.model);
+          assert.ok(first.log.includes("Effort: high\n"));
+          assert.match(first.log, /Effort reason: builder, not a rework after a verifier FAIL/);
+          assert.ok(rework.log.includes("Effort: xhigh\n"));
+          assert.match(rework.log, /Effort reason: builder rework after a verifier FAIL/);
+        });
+      });
+    }
 
-    test("a first attempt, a rework after a PASS, and the verifier stay on the file's runner", async () => {
-      await withRunnerFile(FILE, async () => {
-        assert.equal(await runnerFor({ labels: [] }), "codex");
-        assert.equal(await runnerFor({ last: lastFile("PASS") }), "codex");
-        assert.equal(await runnerFor({ agent: "verifier", labels: [] }), "codex");
+    test("a rework after a PASS or on an abandoned verdict stays at high", async () => {
+      await withRunnerFile('{"runner":"codex"}', async () => {
+        assert.equal((await spawnFor({ last: lastFile("PASS") })).effort, "high");
+        assert.equal((await spawnFor({ ancestor: 1 })).effort, "high");
       });
     });
 
-    test("a file with no rework entry picks the same runner as before", async () => {
-      await withRunnerFile('{"runner":"codex"}', async () => assert.equal(await runnerFor({}), "codex"));
+    test("an old rework entry in the runner file no longer switches the runner", async () => {
+      await withRunnerFile('{"runner":"codex","rework":{"builder":"claude"}}', async () => {
+        const rework = await spawnFor({});
+        assert.equal(rework.runner, "codex");
+        assert.equal(rework.model, "gpt-6.1-sol");
+        assert.equal(rework.effort, "xhigh");
+      });
+    });
+
+    test("PYRY_CODEX_EFFORT does not override the builder, and the log says so", async () => {
+      await withRunnerFile('{"runner":"codex"}', async () => {
+        process.env.PYRY_CODEX_EFFORT = "medium";
+        const rework = await spawnFor({});
+        assert.equal(rework.effort, "xhigh");
+        assert.match(rework.log, /overrides PYRY_CODEX_EFFORT=medium/);
+      });
     });
   });
 

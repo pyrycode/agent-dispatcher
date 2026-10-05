@@ -411,18 +411,16 @@ So the runner can also come from a JSON file that the dispatcher reads again
 before every agent spawn:
 
 ```json
-{"runner": "codex", "roles": {"verifier": "claude"}, "rework": {"builder": "claude"}}
+{"runner": "codex", "roles": {"verifier": "claude"}}
 ```
 
-- **Keys:** all are optional. A role entry beats `runner`, and `runner` beats
+- **Keys:** both are optional. A role entry beats `runner`, and `runner` beats
   `PYRY_AGENT_RUNNER`, which stays the fallback when the file is absent.
-- **Rework after a FAIL:** a `rework` entry, such as `"rework": {"builder": "claude"}`,
-  picks the runner for the builder's rework after a verifier FAIL only: the run
-  that gets the FAIL's findings to answer. It beats the role entry there. A first
-  attempt and a rework for any other reason ignore it. On mobile #1786 on
-  2026-10-05 the Codex builder could not fix three real bugs the verifier found,
-  which a Claude pass then fixed at once. The health checks before dispatch still
-  run with the role's own runner.
+- **No runner switch on rework:** a `rework` key, which briefly picked another
+  runner for the builder's rework after a verifier FAIL, is now read and ignored,
+  so an old file still loads. The builder keeps the runner and model in settings
+  and that rework runs at a higher effort instead: see
+  [Builder effort](#builder-effort).
 - **Location:** `<agents repo>/runner.json` by default. `PYRY_RUNNER_FILE` points
   elsewhere, and an empty value turns the file off.
 - **Startup:** a broken file fails startup, like a bad `PYRY_AGENT_RUNNER`. Codex
@@ -440,12 +438,26 @@ Codex uses `gpt-6.1-sol` by default and inherits the operator's configured effor
 Optional `PYRY_CODEX_MODEL` and `PYRY_CODEX_EFFORT` select Codex-specific overrides;
 Claude stage model names and effort overrides are never passed to Codex.
 The optional role-risk policy below selects effort for both runners instead.
+The builder is the exception to both: see [Builder effort](#builder-effort).
 At startup the dispatcher pins the Codex executable from PATH. On macOS it also
 checks the ChatGPT app bundle when the terminal PATH does not expose its CLI.
 `PYRY_CODEX_BIN` overrides discovery. An invalid override or missing executable
 stops startup before ticket selection or labels are changed.
 The same stage set, ticket prompts, worktrees, deterministic gates and post-run
 checks apply. Product tests that exercise real Claude continue to exercise Claude.
+
+### Builder effort
+
+The builder runs at `high` effort, and at `xhigh` on its rework after a verifier
+FAIL: the run that gets the FAIL's findings to answer. This holds for Claude and
+Codex alike, and beats `PYRY_CODEX_EFFORT`, the role-risk policy below and any
+effort set on the agent, which all still apply to the other roles. A rework for
+any other reason, such as a PASS last verdict or a FAIL on a commit the branch no
+longer has, stays at `high`. The DISPATCH log's effort reason says which case
+applied and names any setting it overrode. `gpt-6.1-sol` accepts `xhigh`, checked
+on Codex CLI 0.159.2 on 2026-10-05. Chosen on 2026-10-05 in place of switching the
+rework to another runner, after the Codex builder on mobile #1786 could not fix
+three real bugs the verifier found.
 
 ### Optional role and risk effort trial
 
@@ -454,11 +466,11 @@ four-role builder pipeline into task-dependent effort. It works with Claude and
 Codex. Other consumers retain their settings. Model choices, turn limits,
 timeouts and acceptance gates do not change. An explicit `PYRY_CODEX_EFFORT`
 still overrides the trial for Codex. Leave that override unset to measure the policy.
+The builder is outside the trial: see [Builder effort](#builder-effort).
 
 | Role | Routine ticket | Elevated risk | No valid assessment |
 | --- | --- | --- | --- |
 | Refiner | medium | high | medium |
-| Builder | medium | high | high |
 | Verifier | high | high | high |
 | Documentation | low | medium | medium |
 

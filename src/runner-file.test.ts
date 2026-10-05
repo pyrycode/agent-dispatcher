@@ -38,21 +38,16 @@ describe("runner file", () => {
     assert.equal(env.select("verifier"), "claude");
   });
 
-  test("a rework entry applies only to a rework after a verifier FAIL, and beats a role entry there", () => {
-    assert.deepEqual(parseRunnerFile('{"runner":"codex","rework":{"builder":"claude"}}'),
-      { runner: "codex", rework: { builder: "claude" } });
-    assert.throws(() => parseRunnerFile('{"rework":{"builder":"opus"}}'), /rework role "builder"/);
-    assert.throws(() => parseRunnerFile('{"rework":"claude"}'), /"rework" must be an object/);
-    const { select } = selector({}, '{"runner":"codex","roles":{"builder":"codex"},"rework":{"builder":"claude"}}');
-    assert.equal(select("builder"), "codex", "a first attempt stays on the role's runner");
-    assert.equal(select("builder", { reworkAfterFail: false }), "codex");
-    assert.equal(select("builder", { reworkAfterFail: true }), "claude");
-    assert.equal(select("verifier", { reworkAfterFail: true }), "codex", "a role with no rework entry falls through");
-  });
-
-  test("a file without a rework entry behaves as before on a rework", () => {
-    const { select } = selector({ PYRY_AGENT_RUNNER: "claude" }, '{"runner":"codex"}');
-    assert.equal(select("builder", { reworkAfterFail: true }), "codex");
+  test("an old rework entry is read without error and changes nothing", () => {
+    for (const rework of ['{"builder":"claude"}', '{"builder":"opus"}', '"claude"']) {
+      const text = `{"runner":"codex","rework":${rework}}`;
+      assert.deepEqual(parseRunnerFile(text), { runner: "codex" });
+      assert.doesNotThrow(() => loadRunnerFileStrict("/a/runner.json", () => text));
+      const { select, warnings } = selector({}, text);
+      assert.equal(select("builder"), "codex");
+      assert.deepEqual(warnings, []);
+    }
+    assert.deepEqual([...runnersInUse(parseRunnerFile('{"runner":"codex","rework":{"builder":"claude"}}'), "codex")], ["codex"]);
   });
 
   test("a path function is read at every spawn", () => {
@@ -110,7 +105,6 @@ describe("runner file", () => {
     assert.equal(loadRunnerFileStrict(null), null);
     assert.deepEqual([...runnersInUse({ roles: { verifier: "codex" } }, "claude")].sort(), ["claude", "codex"]);
     assert.deepEqual([...runnersInUse(null, "codex")], ["codex"]);
-    assert.deepEqual([...runnersInUse({ runner: "codex", rework: { builder: "claude" } }, "codex")].sort(), ["claude", "codex"]);
   });
 
   test("the path defaults beside the agents repo, can be moved, and can be turned off", () => {
