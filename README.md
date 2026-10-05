@@ -296,6 +296,8 @@ Android consumers can emit JUnit XML with `PYRY_REAL_CLAUDE_GATE_FORMAT=junit-xm
 
 For `junit-xml` the `{{TESTS}}` filter is not a regex. It is a single-quoted, comma-separated `pkg.Class#method` list, the shape Android's instrumentation `class` argument takes, so the baseline command must hand it to a runner that selects tests by that list. A name that is not a plain class and method, such as a parameterised `method[0]`, refuses the whole filter.
 
+For `playwright-json` the filter is a single-quoted regex for Playwright's `-g`, such as `npx playwright test --reporter=json -g {{TESTS}}`. The reader names a test by its file, describe titles and test title joined with ` › `. Playwright matches `-g` against the same path joined by spaces, with the project name and tags in between, so each part is escaped and the parts are joined with `.*`. Matching more than the named tests only re-runs extra tests, since results are compared by full name. A name holding a single quote or a control character, such as a newline, refuses the whole filter. Before 2026-10-05 the Go rule refused every Playwright name, because of the space and the `›`, so pyrycode-desktop's live gate never re-ran or compared a failure (agent-dispatcher#132).
+
 The baseline command currently uses Go test filters. Leave it unset for JUnit consumers until their command supports that filtering contract. Without it, failed tests route to rework without automatic retry or base comparison.
 
 A bare `make e2e-realclaude` target will **not** work. Without `-json` it prints nothing per-test on success, only a package summary, so executed tests cannot be counted — and the executed-test count is the whole guard. This is a contract, not a detail.
