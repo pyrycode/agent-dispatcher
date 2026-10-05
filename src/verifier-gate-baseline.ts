@@ -6,8 +6,8 @@
 // fail only under full-suite load it cannot tell: a focused re-run passes on
 // main and on the branch, so the failure looks like the branch's. On
 // 2026-10-04 and 2026-10-05 pyrycode-mobile #1747 failed four verifier passes
-// that way and tripped the rework breaker, while main itself failed 38 of
-// 1211 device tests in the main sweep (pyrycode-mobile #1809).
+// that way and tripped the rework breaker. #1735 looped the same way on a
+// scenario that failed only in the full suite.
 //
 // So a gate with a known output format has its failing test names read
 // before the verifier spawns. A name that also failed in the latest main
@@ -41,8 +41,7 @@ export interface VerifierGateFormat {
  * format name, or an object with `format` and an optional `baseline`
  * template:
  *
- *   {"python3 scripts/android-test-gate.py ui":
- *     {"format": "junit-xml", "baseline": "python3 scripts/android-test-gate.py ui --tests {{TESTS}}"}}
+ *   {"make test-ui": {"format": "junit-xml", "baseline": "make test-ui TESTS={{TESTS}}"}}
  *
  * JSON rather than another `;` list because gate commands carry `;`, spaces
  * and quotes of their own. Unset or empty yields no formats. Anything that

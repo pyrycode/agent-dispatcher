@@ -9512,8 +9512,8 @@ describe("no-result exit keeps Claude's stderr (pyrycode-mobile #1340, 2026-10-0
 
 describe("pre-verifier gates — failures already on main (#123)", () => {
   // 2026-10-04/05, pyrycode-mobile: #1747 failed four verifier passes over
-  // device tests that failed only under full-suite load, while the main sweep
-  // was failing 38 of 1211 of the same tests (#1809). A red gate with an
+  // device tests that failed only under full-suite load, a failure a focused
+  // re-run on main cannot reproduce. A red gate with an
   // output format now has its failures read against main before the verifier
   // spawns; a gate without one behaves exactly as before.
   const logsDir = resolve(TEST_AGENTS_REPO_ROOT, "logs");
