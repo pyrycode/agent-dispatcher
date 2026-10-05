@@ -92,7 +92,7 @@ import {
   type MainSweepOutcome,
   type MainSweepState,
 } from "./main-sweep.js";
-import { recordFlakyTests } from "./flaky-tickets.js";
+import { recordFlakyTests, type FlakyTicketClient } from "./flaky-tickets.js";
 import { recordInheritedTests } from "./inherited-tickets.js";
 import {
   decideVerifierGateReuse,
@@ -107,6 +107,7 @@ import {
   buildBaselineRecordComment,
   describeBaselineEntry,
   parseVerifierGateFormats,
+  splitByRerun,
   splitBySweep,
   unlistedBaselineEntries,
   type BaselineEntry,
@@ -2080,6 +2081,11 @@ export interface DispatchClient {
    *  Throws on fetch failure (the caller leaves the ticket for the next
    *  cycle). */
   countMarkerComments(issueNumber: number, marker: string): Promise<number>;
+  /** Shared flaky-test tickets: the pre-verifier gates record a failure that
+   *  passed on a same-tree re-run through `recordFlakyTests`. */
+  listOpenIssuesWithLabel: FlakyTicketClient["listOpenIssuesWithLabel"];
+  createIssue: FlakyTicketClient["createIssue"];
+  addItemToProject: FlakyTicketClient["addItemToProject"];
 }
 
 // IO surface every phase function depends on. Threading it through
@@ -4780,8 +4786,9 @@ export const VERIFIER_GATE_TIMEOUT_MS =
 export const VERIFIER_GATE_TAIL_CAP = 4000;
 
 export interface VerifierGatesOutcome {
-  /** True when no gate is left red. A gate whose every failure also fails
-   *  on main counts as passed here; `baseline` says which. */
+  /** True when no gate is left red. A gate whose every failure passed on a
+   *  same-tree re-run or also fails on main counts as passed here;
+   *  `baseline` says which. */
   ok: boolean;
   /** The first failing gate command, or null when all passed. */
   failedGate: string | null;
@@ -4865,10 +4872,14 @@ export async function runVerifierGates(opts: {
       }
       if (assessment !== null) baseline.push(assessment);
     }
-    if (assessment !== null && assessment.remaining.length === 0 && assessment.baseline.length > 0) {
-      summary.push(
-        `✗ ${gate} (${verdict}; all ${assessment.baseline.length} failing test(s) also fail on main, so it counts as green)`,
-      );
+    if (assessment !== null && assessment.remaining.length === 0 && assessment.baseline.length + assessment.flaky.length > 0) {
+      const { flaky, baseline: onMain } = assessment;
+      const why = flaky.length === 0
+        ? `all ${onMain.length} failing test(s) also fail on main`
+        : onMain.length === 0
+          ? `all ${flaky.length} failing test(s) passed on a same-tree re-run`
+          : `${flaky.length} failing test(s) passed on a same-tree re-run and ${onMain.length} also fail on main`;
+      summary.push(`✗ ${gate} (${verdict}; ${why}, so it counts as green)`);
       continue;
     }
     summary.push(`${failed ? "✗" : "✓"} ${gate} (${verdict})`);
@@ -4902,15 +4913,67 @@ function readMainSweepState(ctx: DispatchContext): MainSweepState {
 }
 
 /**
+ * Re-run a red verifier gate's failing names once in the SAME worktree,
+ * before any check against main (#133). Mirrors `runBranchRerun`: the same
+ * filter and template as the base re-run, only the tree differs. Returns
+ * every name the re-run saw pass, or null with a reason when it told
+ * nothing (no filter, timed out, unreadable, executed nothing), which
+ * excuses nothing. Never throws.
+ */
+async function rerunVerifierGateFailures(
+  ctx: DispatchContext,
+  failedNames: readonly string[],
+  commandTemplate: string,
+  format: GateOutputFormat,
+): Promise<{ passed: string[] | null; skipReason: string | null; outputPath: string }> {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const outputPath = resolve(LOGS_DIR, `${stamp}_verifier-gate-rerun_#${ctx.item.issueNumber}.log`);
+  const skip = (skipReason: string) => ({ passed: null, skipReason, outputPath });
+  const filter = buildBaselineFilter(failedNames, format);
+  if (filter === null) return skip("could not build a safe test filter from the failing names");
+  const command = buildBaselineCommand(commandTemplate, filter);
+  if (command === null) return skip(`the baseline command has no ${BASELINE_TESTS_PLACEHOLDER} placeholder`);
+  try {
+    console.log(`   🔁 Verifier gate: re-running ${failedNames.length} failing test(s) in the same worktree…`);
+    const outcome = await ctx.deps.spawnGate({
+      command,
+      cwd: ctx.agentCwd,
+      env: buildGateSpawnEnv(process.env),
+      timeoutMs: VERIFIER_GATE_TIMEOUT_MS,
+      stdoutPath: outputPath,
+      stderrPath: outputPath.replace(/\.log$/, ".stderr.log"),
+    });
+    if (outcome.timedOut) return skip("the re-run hit the outer timeout, so its result is a truncated prefix");
+    let raw: string;
+    try {
+      raw = String(ctx.deps.readFileSync(outputPath, "utf-8"));
+    } catch (e: any) {
+      return skip(`could not read the re-run's output back: ${e?.message ?? e}`);
+    }
+    const tally = parseGateOutput(raw, format);
+    if (tally.recognizedLines === 0) return skip("the re-run produced no readable test events");
+    // A re-run that SKIPPED the tests proves nothing; accepting it would excuse every failure.
+    if (tally.executed === 0) return skip(`the re-run executed nothing (${tally.skipped} skipped)`);
+    return { passed: tally.passedNames, skipReason: null, outputPath };
+  } catch (e: any) {
+    return skip(`the re-run failed unexpectedly: ${e?.message ?? e}`);
+  }
+}
+
+/**
  * Read a red verifier gate's failures against main, before the verifier is
  * spawned (see verifier-gate-baseline.ts for why).
  *
  * 1. The gate's stdout, parsed with its configured format. A red that cannot
  *    be pinned on named tests returns null and stays red.
- * 2. The latest main sweep's failures, when its commit is an ancestor of
+ * 2. With a baseline template, the failing names re-run once in this same
+ *    worktree (#133). A name seen passing is flaky and goes on its shared
+ *    flaky-test ticket; the rest go on. A re-run that tells nothing excuses
+ *    nothing.
+ * 3. The latest main sweep's failures, when its commit is an ancestor of
  *    this worktree's HEAD, the branch merged with the default branch. Any
  *    doubt about that, or no recorded sweep, uses no sweep.
- * 3. What remains is re-run alone on the default-branch commit merged into
+ * 4. What remains is re-run alone on the default-branch commit merged into
  *    this worktree, through the real-claude gate's base re-run, when the gate
  *    has a baseline template. A name that fails there too is baseline; one
  *    that passes or goes unreported stays the ticket's.
@@ -4936,7 +4999,33 @@ async function assessVerifierGateRed(
     cwd: ctx.agentCwd, encoding: "utf-8", stdio: "pipe", timeout: 30_000,
   })).trim();
 
-  const sweep = readMainSweepState(ctx).failures;
+  let flaky: string[] = [];
+  let toJudge = failed;
+  let rerunSkipReason: string | null = "the gate has no baseline template";
+  if (spec.baselineCommand !== null) {
+    const rerun = await rerunVerifierGateFailures(ctx, failed, spec.baselineCommand, spec.format);
+    ({ flaky, remaining: toJudge } = splitByRerun(failed, rerun.passed));
+    rerunSkipReason = rerun.skipReason;
+    if (flaky.length > 0) {
+      const tickets = await recordFlakyTests(ctx.client, flaky, {
+        gatedIssue: ctx.item.issueNumber,
+        at: new Date().toISOString(),
+        verifierGate: {
+          gate,
+          commit: mergedWorktreeHead(ctx)?.commit ?? null,
+          outputPath: stdoutPath,
+          rerunOutputPath: rerun.outputPath,
+        },
+      });
+      for (const { name, issue } of tickets.filed) console.log(`   🎫 Filed #${issue} in Backlog for flaky ${name}`);
+      for (const { name, issue } of tickets.commented) console.log(`   💬 Flaky ${name} recorded on #${issue}`);
+      if (tickets.untracked.length > 0) {
+        console.warn(`   ⚠️  Flaky test(s) with no ticket this run: ${tickets.untracked.join(", ")}`);
+      }
+    }
+  }
+
+  const sweep = toJudge.length > 0 ? readMainSweepState(ctx).failures : null;
   let sweepIsAncestor: boolean | null = null;
   if (sweep !== null) {
     try {
@@ -4947,7 +5036,7 @@ async function assessVerifierGateRed(
       sweepIsAncestor = e?.status === 1 ? false : null;
     }
   }
-  const bySweep = splitBySweep(failed, sweep, sweepIsAncestor);
+  const bySweep = splitBySweep(toJudge, sweep, sweepIsAncestor);
   const baseline: BaselineEntry[] = bySweep.baseline.map((name) => ({ name, source: "main-sweep", sha: sweep!.sha }));
   let remaining = bySweep.remaining;
   let baseSkipReason: string | null = null;
@@ -4987,10 +5076,11 @@ async function assessVerifierGateRed(
     }
   }
   console.log(
-    `   🧪 \`${gate}\`: ${failed.length} failing test(s), ${baseline.length} also failing on main, ${remaining.length} left for the verifier` +
+    `   🧪 \`${gate}\`: ${failed.length} failing test(s), ${flaky.length} flaky, ${baseline.length} also failing on main, ${remaining.length} left for the verifier` +
+    (rerunSkipReason ? ` (no same-tree re-run: ${rerunSkipReason})` : "") +
     (baseSkipReason ? ` (no base re-run: ${baseSkipReason})` : ""),
   );
-  return { gate, baseline, remaining, baseSkipReason };
+  return { gate, flaky, baseline, remaining, baseSkipReason, rerunSkipReason };
 }
 
 /**
@@ -5052,6 +5142,22 @@ function remainingNoteLines(result: VerifierGatesOutcome): string[] {
     `Judge only these remaining failures of \`${own.gate}\`, which do not fail on main:`,
     "",
     ...own.remaining.map((name) => `- \`${name}\``),
+  ];
+}
+
+/** Prompt lines listing the failures that passed on the same-tree re-run. */
+function flakyNoteLines(assessments: readonly GateBaselineAssessment[]): string[] {
+  const entries = assessments.flatMap((a) => a.flaky.map((name) => `- \`${name}\`, gate \`${a.gate}\``));
+  if (entries.length === 0) return [];
+  return [
+    "",
+    "### Flaky failures, not this ticket's",
+    "",
+    "The dispatcher re-ran these failing tests once in this worktree before spawning you, and each passed. They are flaky, not this ticket's:",
+    "",
+    ...entries,
+    "",
+    "Each is recorded on its shared flaky-test ticket. Do not route them to the builder, file them again, or spend turns re-running them.",
   ];
 }
 
@@ -5163,11 +5269,12 @@ function readReusableGatePass(
  *   no gate runs, and the green note says whose results they are. See
  *   verifier-gate-reuse.ts; `PYRY_VERIFIER_GATE_REUSE=0` turns it off.
  * - **Red only with failures main already has** → a gate with an output
- *   format in `PYRY_VERIFIER_GATE_FORMATS` has its failing names read
- *   against the latest ancestor main sweep and a base-commit re-run first
- *   (`assessVerifierGateRed`). Those names go on the main sweep's open
- *   ticket and into the note as not this ticket's. When none remain, the
- *   gate counts as green and the next gate runs. See
+ *   format in `PYRY_VERIFIER_GATE_FORMATS` has its failing names re-run
+ *   once in this worktree, then read against the latest ancestor main
+ *   sweep and a base-commit re-run (`assessVerifierGateRed`). Flaky names
+ *   go on their shared flaky-test tickets, main's on the main sweep's open
+ *   ticket, and both into the note as not this ticket's. When none remain,
+ *   the gate counts as green and the next gate runs. See
  *   verifier-gate-baseline.ts.
  */
 export async function maybeRunPreSpawnGates(
@@ -5249,6 +5356,8 @@ export async function maybeRunPreSpawnGates(
     deps: ctx.deps,
   });
   const baselineLog = result.baseline.flatMap((a) => [
+    ...a.flaky.map((name) => `  ${a.gate}: \`${name}\` (passed on the same-tree re-run, flaky)`),
+    ...(a.rerunSkipReason ? [`  ${a.gate}: no same-tree re-run, ${a.rerunSkipReason}`] : []),
     ...a.baseline.map((entry) => `  ${a.gate}: ${describeBaselineEntry(entry)}`),
     ...(a.baseSkipReason ? [`  ${a.gate}: no base re-run, ${a.baseSkipReason}`] : []),
   ]);
@@ -5256,15 +5365,21 @@ export async function maybeRunPreSpawnGates(
   const baselineTicket = await recordBaselineOnMainFailureTicket(ctx, result.baseline);
 
   if (result.ok && result.baseline.length > 0) {
-    // Every red failure also fails on main: green for the verdict, but not a
-    // full pass, so nothing is recorded for reuse.
-    console.log(`   ✅ Pre-${agent.name} gates green once failures already on main are set aside`);
+    // Every red failure was flaky or also fails on main: green for the
+    // verdict, but not a full pass, so nothing is recorded for reuse.
+    const anyFlaky = result.baseline.some((a) => a.flaky.length > 0);
+    const anyMain = result.baseline.some((a) => a.baseline.length > 0);
+    const setAside = anyFlaky && anyMain
+      ? "failures that passed on a re-run or also fail on main"
+      : anyFlaky ? "failures that passed on a re-run" : "failures that also fail on main";
+    console.log(`   ✅ Pre-${agent.name} gates green once ${setAside} are set aside`);
     return {
       promptNote: [
         greenNote(
           "The dispatcher ran the fork's deterministic gates in this worktree before spawning you. Every gate passed " +
-          "apart from failures that also fail on main, so the gates count as green for your verdict:",
+          `apart from ${setAside}, so the gates count as green for your verdict:`,
         ),
+        ...flakyNoteLines(result.baseline),
         ...baselineNoteLines(result.baseline, baselineTicket),
       ].join("\n"),
     };
@@ -5317,6 +5432,7 @@ export async function maybeRunPreSpawnGates(
     "```",
     "",
     "Triage this failure before reviewing: determine whether it is caused by this ticket's changes or already present on the merge base, then route per your triage contract (bounce vs advance). The dispatcher deliberately did not apply any rework label — that call is yours.",
+    ...flakyNoteLines(result.baseline),
     ...baselineNoteLines(result.baseline, baselineTicket),
     ...remainingNoteLines(result),
   ].join("\n");

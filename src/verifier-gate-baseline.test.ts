@@ -6,6 +6,7 @@ import {
   attributableFailures,
   buildBaselineRecordComment,
   parseVerifierGateFormats,
+  splitByRerun,
   splitBySweep,
   unlistedBaselineEntries,
   type BaselineEntry,
@@ -121,5 +122,17 @@ describe("recording baseline names on the main-failure ticket", () => {
     assert.ok(body.includes(`merged commit \`${B}\``));
     assert.match(body, /- `p\.A#x` \(failed in the main sweep on `aaaaaaaaaaaa`\), gate `python3 gate\.py ui`/);
     assert.match(body, /- `p\.A#y` \(failed when re-run alone on the base commit `bbbbbbbbbbbb`\)/);
+  });
+});
+
+describe("same-tree re-run split (#133)", () => {
+  test("only a name seen passing on the re-run is flaky", () => {
+    assert.deepEqual(splitByRerun(["p.A#x", "p.A#y", "p.A#z"], ["p.A#y", "p.B#other"]), {
+      flaky: ["p.A#y"], remaining: ["p.A#x", "p.A#z"],
+    });
+  });
+
+  test("a re-run that told nothing excuses nothing", () => {
+    assert.deepEqual(splitByRerun(["p.A#x"], null), { flaky: [], remaining: ["p.A#x"] });
   });
 });
