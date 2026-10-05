@@ -245,6 +245,13 @@ describe("classifyBlockedRun — missing tools and environment retry, everything
     assert.equal(classifyBlockedRun(text, { approvalRejected: true }).transient, false);
   });
 
+  test("a reviewer that failed to decide retries, before the approval word vetoes it (#121)", () => {
+    const text = blocked("Automatic approval review did not approve the build command; stopping as required.");
+    assert.equal(classifyBlockedRun(text).transient, false, "the summary alone parks");
+    assert.deepEqual(classifyBlockedRun(text, { approvalReviewFailed: true }), { transient: true, signature: "approval review failed" });
+    assert.equal(classifyBlockedRun(text, { approvalReviewFailed: true, approvalRejected: true }).transient, false, "a rejection wins");
+  });
+
   test("the transport allowlist never reads a blocked summary, and blocked wording never reaches it", () => {
     // A block that mentions a dropped connection is still the agent's own stop.
     assert.equal(classifyBlockedRun(blocked("connection reset; reviewer rejected required action")).transient, false);

@@ -90,6 +90,9 @@ import {
   extractFamilyDispatchCount,
   extractMergeAttemptCount,
   extractReworkCount,
+  extractReworkOtherCount,
+  decideReworkBreaker,
+  resolveReworkLoopCap,
   FAMILY_BREAKER_COMMENT_MARKER,
   FAMILY_BREAKER_LABEL,
   FAMILY_DISPATCH_COMMENT_MARKER,
@@ -127,8 +130,10 @@ import { mapParentChain } from "./github.js";
 import {
   decideBranchSetup,
   decideCodegraphSymlink,
+  decideOwnWorktreeReuse,
   describeHeldWorktrees,
   findWorktreesForBranch,
+  isWorktreeLocked,
   resolveAgentsRepoRoot,
   resolveAgentsRepoRootWithEnv,
   resolveDefaultBranch,
@@ -1735,6 +1740,11 @@ describe("decideDoneCleanup", () => {
     assert.ok(stripped.has("rework-count:2"));
   });
 
+  test("rework-other:N is stripped too, so a re-opened ticket starts both counters fresh", () => {
+    const c = decideDoneCleanup([{ id: "i1", issueNumber: 22, labels: ["rework-count:1", "rework-other:3", "size:s"] }]);
+    assert.deepEqual(c[0]?.labelsToStrip, ["rework-count:1", "rework-other:3"]);
+  });
+
   test("idempotent: ticket with no pipeline labels → no cleanup entry", () => {
     // Cleanup runs every poll cycle; the second run on a ticket already
     // cleaned in cycle 1 must be a no-op (no entry in the result), not a
@@ -1984,11 +1994,54 @@ describe("extractReworkCount", () => {
     assert.equal(extractReworkCount(["rework-count:-1"]), 0);
   });
 
-  test("REWORK_LOOP_THRESHOLD is 3 (locked default)", () => {
-    // Adjusting the threshold is a deliberate policy change. This test
-    // makes the default explicit and forces an update to the test if
-    // the constant changes — discussion-required, not silent drift.
-    assert.equal(REWORK_LOOP_THRESHOLD, 3);
+  test("REWORK_LOOP_THRESHOLD is 6 (locked default hard cap on builder reworks)", () => {
+    // Adjusting the cap is a deliberate policy change. This test makes the
+    // default explicit and forces an update to the test if the constant
+    // changes — discussion-required, not silent drift. It was 3 and counted
+    // every rework route until agent-dispatcher#122 (2026-10-05): now only
+    // builder reworks count, a repeated verifier finding parks at once, and
+    // the count is the backstop for steady progress that never converges.
+    assert.equal(REWORK_LOOP_THRESHOLD, 6);
+  });
+});
+
+describe("extractReworkOtherCount", () => {
+  test("reads rework-other:N with the same defensive shape as extractReworkCount", () => {
+    assert.equal(extractReworkOtherCount([]), 0);
+    assert.equal(extractReworkOtherCount(["rework-count:4"]), 0, "the builder counter is a different counter");
+    assert.equal(extractReworkOtherCount(["rework-other:2", "rework-other:5"]), 5);
+    assert.equal(extractReworkOtherCount(["rework-other:abc", "rework-other:", "rework-other:-1"]), 0);
+  });
+});
+
+describe("resolveReworkLoopCap — PYRY_BUILDER_REWORK_CAP parsing", () => {
+  test("unset, zero, negatives and garbage keep the default; a positive integer is honoured", () => {
+    for (const raw of [undefined, "", "0", "-2", "lots"]) {
+      assert.equal(resolveReworkLoopCap(raw), REWORK_LOOP_THRESHOLD, String(raw));
+    }
+    assert.equal(resolveReworkLoopCap("10"), 10);
+    assert.equal(resolveReworkLoopCap("1"), 1);
+  });
+});
+
+describe("decideReworkBreaker", () => {
+  const base = { counted: true, reworkCount: 0, hardCap: 6, repeatedKeys: [] as string[] };
+
+  test("a rework that is not the builder's never parks, whatever the counts", () => {
+    assert.deepEqual(decideReworkBreaker({ ...base, counted: false, reworkCount: 99, repeatedKeys: ["a.kt → A"] }), { park: false });
+  });
+
+  test("a repeated finding parks at once, naming the keys, whatever the count", () => {
+    assert.deepEqual(
+      decideReworkBreaker({ ...base, reworkCount: 1, repeatedKeys: ["a.kt → A"] }),
+      { park: true, rule: "repeat", keys: ["a.kt → A"] },
+    );
+  });
+
+  test("with no repeat, the route that would pass the cap parks, the ones before it do not", () => {
+    assert.deepEqual(decideReworkBreaker({ ...base, reworkCount: 5 }), { park: false }, "the sixth rework still routes");
+    assert.deepEqual(decideReworkBreaker({ ...base, reworkCount: 6 }), { park: true, rule: "cap", cap: 6 });
+    assert.deepEqual(decideReworkBreaker({ ...base, reworkCount: 2, hardCap: 2 }), { park: true, rule: "cap", cap: 2 });
   });
 });
 
@@ -3413,6 +3466,76 @@ describe("describeHeldWorktrees", () => {
     }]);
     assert.match(text, /- `\/w\/locked-7` could not be removed: fatal: cannot remove a locked working tree;$/m);
     assert.doesNotMatch(text, /uncommitted/);
+  });
+});
+
+describe("isWorktreeLocked", () => {
+  const porcelain = [
+    "worktree /w/builder-1", "HEAD a", "branch refs/heads/feature/1", "locked", "",
+    "worktree /w/builder-2", "HEAD b", "branch refs/heads/feature/2", "",
+    "worktree /w/builder-3", "HEAD c", "branch refs/heads/feature/3", "locked reason here", "",
+  ].join("\n");
+
+  test("a bare or reasoned locked line counts, other records do not", () => {
+    assert.equal(isWorktreeLocked(porcelain, "/w/builder-1"), true);
+    assert.equal(isWorktreeLocked(porcelain, "/w/builder-2"), false);
+    assert.equal(isWorktreeLocked(porcelain, "/w/builder-3"), true);
+    assert.equal(isWorktreeLocked(porcelain, "/w/missing"), false);
+  });
+});
+
+describe("decideOwnWorktreeReuse", () => {
+  // pyrycode-mobile #1603 and #1727, 2026-10-05: the next run failed on its
+  // own previous run's worktree and a person committed the leftovers.
+  const own = "/w/.pyrycode-worktrees/pyrycode-mobile/builder-1603";
+  const dirtyHeld = [{ path: own, error: `fatal: '${own}' contains modified or untracked files, use --force to delete it` }];
+  const base = {
+    ownPath: own,
+    held: dirtyHeld,
+    branchAction: "reuse-local-already-synced" as const,
+    locked: false,
+    operationInProgress: false,
+    gitStatusOutput: " M app/Foo.kt\n",
+  };
+
+  test("own path, dirty, branch in sync → reuse and commit the leftovers", () => {
+    assert.deepEqual(decideOwnWorktreeReuse(base), { reuse: true, commitLeftovers: true });
+  });
+
+  test("own path, dirty, branch never pushed → reuse and commit", () => {
+    assert.deepEqual(decideOwnWorktreeReuse({ ...base, branchAction: "reuse-local-no-remote" }), { reuse: true, commitLeftovers: true });
+  });
+
+  test("own path, clean, local commits ahead of origin → reuse without a commit", () => {
+    assert.deepEqual(
+      decideOwnWorktreeReuse({ ...base, held: [{ path: own, error: "" }], branchAction: "abort-local-strictly-ahead", gitStatusOutput: "" }),
+      { reuse: true, commitLeftovers: false },
+    );
+  });
+
+  test("own path, dirty, ahead of origin → reuse and commit", () => {
+    assert.deepEqual(decideOwnWorktreeReuse({ ...base, branchAction: "abort-local-strictly-ahead" }), { reuse: true, commitLeftovers: true });
+  });
+
+  test("another path holds the branch, alone or beside the own one → refused", () => {
+    assert.equal(decideOwnWorktreeReuse({ ...base, held: [{ path: "/w/verifier-1603", error: "x" }] }).reuse, false);
+    assert.equal(decideOwnWorktreeReuse({ ...base, held: [...dirtyHeld, { path: "/home/me/checkout", error: "x" }] }).reuse, false);
+    assert.equal(decideOwnWorktreeReuse({ ...base, held: [] }).reuse, false);
+  });
+
+  test("locked, unreadable or mid-operation → refused", () => {
+    assert.equal(decideOwnWorktreeReuse({ ...base, locked: true }).reuse, false);
+    assert.equal(decideOwnWorktreeReuse({ ...base, gitStatusOutput: null }).reuse, false);
+    assert.equal(decideOwnWorktreeReuse({ ...base, operationInProgress: true }).reuse, false);
+  });
+
+  test("clean and in sync → refused, the normal cleanup handles it", () => {
+    assert.equal(decideOwnWorktreeReuse({ ...base, gitStatusOutput: "  \n" }).reuse, false);
+  });
+
+  test("diverged or behind origin → refused", () => {
+    assert.equal(decideOwnWorktreeReuse({ ...base, branchAction: "abort-local-diverged" }).reuse, false);
+    assert.equal(decideOwnWorktreeReuse({ ...base, branchAction: "fast-forward-from-origin" }).reuse, false);
   });
 });
 

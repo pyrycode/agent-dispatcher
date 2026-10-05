@@ -1,6 +1,6 @@
 import { type ChildProcess, execSync, spawn, spawnSync } from "node:child_process";
 import { readFileSync, existsSync, writeFileSync, mkdirSync, mkdtempSync, rmdirSync, appendFileSync, readdirSync, createWriteStream, statSync, symlinkSync, unlinkSync, openSync, closeSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { resolve, dirname, basename } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
@@ -8,6 +8,7 @@ import { config } from "dotenv";
 import { DispatchPool, candidateKey, excludeInFlight, freeSeats, resolvePollIntervalMs } from "./dispatch-pool.js";
 import { countVerdictsSince, parseVerdictArtifacts, pickVerdictPr, shouldFlagMissingVerdict } from "./verdict-guard.js";
 import { countOpenPrs, shouldFlagMissingPr } from "./pr-guard.js";
+import { PENDING_VERDICT_PREFIX, decideVerdictRecovery, handoffMarker, isVerdictPublishFailure, parsePendingVerdictState, parsePrVerdictView, parseVerdictHandoff, serializePendingVerdictState, verdictHandoffNote, type HandoffParse, type PendingVerdictState, type VerdictPrLookup } from "./verdict-handoff.js";
 import { resolveImportOnlyMerge } from "./merge-resolve.js";
 import { FINAL_MERGE_HANDOFF_MARKER, FINAL_MERGE_HANDOFF_MAX, MERGE_HANDOFF_LABEL, checkMergeResolution, decideConflictRoute, decideFinalMergeRoute, findMergeCommit, mergeHandoffNote, mergeResolutionComment, mergeResolutionSection, readPendingMerge, type PendingMerge, type ResolutionNote } from "./merge-handoff.js";
 
@@ -121,6 +122,7 @@ import {
   decidePostRunLabels,
   extractMergeAttemptCount,
   extractReworkCount,
+  extractReworkOtherCount,
   extractReworkTarget,
   isMergeConflictError,
   isPipelineLabel,
@@ -147,6 +149,7 @@ import {
   STRANDED_WIP_SWEPT_MARKER,
   decideFamilyBreaker,
   resolveFamilyDispatchLimit,
+  resolveReworkLoopCap,
   resolveFamilyRoot,
   collectOffBoardFamilyRoots,
   resolveFamilyTally,
@@ -158,11 +161,16 @@ import {
   decideBaselineAdjustedVerdict,
 } from "./pipeline-decisions.js";
 import {
+  type BranchSetupAction,
   decideBranchSetup,
   decideCodegraphSymlink,
+  decideOwnWorktreeReuse,
   describeHeldWorktrees,
   findWorktreesForBranch,
   type HeldWorktree,
+  IN_PROGRESS_GIT_PATHS,
+  isWorktreeLocked,
+  type OwnWorktreeReuse,
   resolveAgentsRepoRootWithEnv,
   resolveDefaultBranch,
   resolveTargetRepoRoot,
@@ -174,6 +182,7 @@ import {
   runRealClaudeGate,
   runRealClaudeGateExecution,
   runReworkRouting,
+  type ReworkRoutingOptions,
   type RealClaudeGateRunner,
 } from "./reconcile.js";
 import {
@@ -418,6 +427,26 @@ const REAL_CLAUDE_GATE_SELECTION: GateSelectionConfig | null = (() => {
 const FAMILY_DISPATCH_LIMIT = resolveFamilyDispatchLimit(process.env.PYRY_FAMILY_DISPATCH_LIMIT);
 
 /**
+ * Rework breaker inputs (agent-dispatcher#122). The hard cap on builder
+ * reworks, default REWORK_LOOP_THRESHOLD (6), and the pull request read the
+ * repeat rule compares verdicts from: the ticket's open PR on
+ * `feature/<n>`, picked as the verdict guard picks it. A throw or a null
+ * leaves the count rule in charge. See `runReworkRouting`.
+ */
+const REWORK_ROUTING_OPTIONS: ReworkRoutingOptions = {
+  hardCap: resolveReworkLoopCap(process.env.PYRY_BUILDER_REWORK_CAP),
+  readPrVerdicts: async (issueNumber) => {
+    const prJson = execSync(
+      `gh pr list --head "feature/${issueNumber}" --state open --json number,isDraft`,
+      { cwd: repoRoot, encoding: "utf-8", timeout: 15_000 },
+    ).trim();
+    const pr = pickVerdictPr(prJson);
+    if (pr === null) return null;
+    return execSync(`gh pr view ${pr} --json reviews,comments`, { cwd: repoRoot, encoding: "utf-8", timeout: 15_000 });
+  },
+};
+
+/**
  * How many times one cycle re-runs selection after the family breaker
  * drops candidates. The breaker only drops, so without re-selection a
  * parked family at the head of a column consumes the whole concurrency
@@ -543,6 +572,11 @@ export interface StreamResult {
    * `error:<agent>:permission_denied` label + tailored salvage comment.
    */
   hadPermissionDenial: boolean;
+  /** Codex only: its automatic approval reviewer failed to decide (its own
+   *  model at capacity, or its deadline passed) rather than rejecting. Set
+   *  from Codex's own output, never the agent's summary. A blocked run with
+   *  this set and no rejection retries (#121). */
+  approvalReviewFailed?: boolean;
   /** True when the run ended with no tool use after its most recent
    *  denial: the agent stopped there rather than carrying on. A clean
    *  exit with this set routes to the permission-denied path. */
@@ -1287,7 +1321,9 @@ export type RefinementMode = "create-from-inbox" | "rework" | "refine";
 /**
  * Decide the `## Mode` for a po/refiner dispatch from the item alone.
  *
- * The routed-back signal is `rework-count:N`. `runReworkRouting` strips
+ * The routed-back signal is `rework-count:N`, or `rework-other:N` for a
+ * route that was not the code owner's rework (since #122, every route to
+ * po/refiner). `runReworkRouting` strips
  * the `needs-rework:<agent>` trigger BEFORE the target is dispatched
  * (`shouldSkipDispatch` blocks the target while it is still attached), so
  * the trigger itself is never on the item at prompt time. The counter is:
@@ -1315,6 +1351,7 @@ export function decideRefinementMode(
   if (item.issueNumber <= 0) return "create-from-inbox";
   const routedBack =
     extractReworkCount(item.labels) > 0 ||
+    extractReworkOtherCount(item.labels) > 0 ||
     item.labels.some(l => extractReworkTarget(l) === agentName);
   return routedBack ? "rework" : "refine";
 }
@@ -1335,8 +1372,11 @@ export function buildModeSection(
     case "create-from-inbox":
       return "\n## Mode\ncreate-from-inbox — raw user request, draft a structured GitHub issue.";
     case "rework": {
-      const count = extractReworkCount(item.labels);
-      const evidence = count > 0 ? ` (ticket carries \`rework-count:${count}\`)` : "";
+      const counters = ([
+        ["rework-count:", extractReworkCount(item.labels)],
+        ["rework-other:", extractReworkOtherCount(item.labels)],
+      ] as const).filter(([, n]) => n > 0).map(([prefix, n]) => `\`${prefix}${n}\``);
+      const evidence = counters.length > 0 ? ` (ticket carries ${counters.join(", ")})` : "";
       const reason = commentsIncluded
         ? "Read the previous agent comments above for the rework reason."
         : `No ticket comments are included above, so this prompt carries no rework reason. Check \`gh issue view ${item.issueNumber} --comments\` before assuming one.`;
@@ -1345,7 +1385,7 @@ export function buildModeSection(
     case "refine":
       // "Treat it as" rather than "this is": a human re-queue or a ticket
       // re-opened after Done-cleanup looks the same from the labels.
-      return `\n## Mode\nrefine — existing ${agent.column} ticket, not a rework. No agent has routed it back (no \`rework-count\` label), so treat this as a first refinement; there is no rework reason to look for.`;
+      return `\n## Mode\nrefine — existing ${agent.column} ticket, not a rework. No agent has routed it back (no \`rework-count\` or \`rework-other\` label), so treat this as a first refinement; there is no rework reason to look for.`;
   }
 }
 
@@ -2331,7 +2371,34 @@ export type DispatchContext = {
    *  the agent, and `handlePostRun` checks the result before pushing. See
    *  merge-handoff.ts. */
   pendingMerge?: PendingMerge;
+  /** Where a verdict run saves its finished verdict before posting it, for
+   *  agents marked `requiresVerdict`. Outside the worktree so it outlives
+   *  teardown. See verdict-handoff.ts. */
+  verdictHandoffPath?: string;
 };
+
+/**
+ * Folder for verdict handoff files. Both runners' agents already write
+ * GitHub body files under `~/.codex/publish/<repository>/`, the folder the
+ * pipeline helper reads, so the handoff sits beside them where neither
+ * runner needs a new permission. `PYRY_VERDICT_HANDOFF_DIR` overrides it.
+ * Read per dispatch, like the runner file.
+ */
+export function verdictHandoffDir(): string {
+  const override = (process.env.PYRY_VERDICT_HANDOFF_DIR ?? "").trim();
+  return override !== "" ? resolve(override) : resolve(homedir(), ".codex/publish", basename(resolve(repoRoot)), "verdict-handoff");
+}
+
+/** One file per agent and ticket. The dispatcher empties it before each run. */
+export function verdictHandoffPath(agentName: string, issueNumber: number): string {
+  return resolve(verdictHandoffDir(), `${agentName}-${issueNumber}.md`);
+}
+
+/** Where the dispatcher keeps a verdict waiting for GitHub between cycles.
+ *  Its own logs folder, out of the agents' reach. */
+export function pendingVerdictStatePath(agentName: string, issueNumber: number): string {
+  return resolve(LOGS_DIR, `verdict-pending-${agentName}-${issueNumber}.json`);
+}
 
 /**
  * Path of a dispatcher-owned worktree. Every board's dispatcher shares the
@@ -2369,6 +2436,7 @@ export function makeDispatchContext(
     startTime: Date.now(),
     startTs: new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }),
     deps,
+    ...(agent.requiresVerdict && item.issueNumber > 0 ? { verdictHandoffPath: verdictHandoffPath(agent.name, item.issueNumber) } : {}),
   };
 }
 
@@ -2406,7 +2474,8 @@ export async function dispatchToAgent(
   const gates = parallelReview ? { promptNote: "" } : await maybeRunPreSpawnGates(ctx);
 
   const mergeNote = ctx.pendingMerge ? mergeHandoffNote(defaultBranch, ctx.pendingMerge.paths) : "";
-  const spawn = await prepareAgentSpawn(ctx, gates.promptNote + mergeNote);
+  const handoffNote = prepareVerdictHandoff(ctx);
+  const spawn = await prepareAgentSpawn(ctx, gates.promptNote + mergeNote + handoffNote);
   if (!spawn.ok) return;
 
   // streamResult is declared outside the try so handleDispatchError
@@ -2428,6 +2497,28 @@ export async function dispatchToAgent(
     const postRun = await handlePostRun(streamResult, ctx, saferSalvaged);
     if (!postRun.ok) return;
   } catch (error: any) {
+    // A verdict run whose only failure was GitHub refusing the verdict:
+    // publish the saved verdict and carry on as a success, or hold the
+    // ticket for the next cycle. Anything else falls through and parks as
+    // before. See verdict-handoff.ts (agent-dispatcher#118).
+    const recovered = ctx.verdictHandoffPath && streamResult && !saferSalvaged
+      ? await recoverSavedVerdict(ctx, error?.message ?? "", streamResult.hadPermissionDenial)
+      : null;
+    if (recovered?.kind === "posted") {
+      const postRun = await handlePostRun({
+        ...streamResult!,
+        isError: false,
+        terminalReason: "stop",
+        output: `The agent's own GitHub write failed; the dispatcher posted its saved verdict.\n\n${streamResult!.output}`,
+      }, ctx, false, recovered.labels);
+      if (!postRun.ok) return;
+      await cleanupAfterDispatch(ctx);
+      return;
+    }
+    if (recovered?.kind === "pending") {
+      await cleanupAfterDispatch(ctx);
+      return;
+    }
     const preserveBlockedWork = streamResult?.runner === "codex"
       && ["codex_blocked", "needs_refinement"].includes(streamResult.terminalReason) && ctx.useWorktree;
     if (preserveBlockedWork) error.message += `\nWorktree preserved for recovery: ${ctx.worktreeDir}`;
@@ -2648,11 +2739,15 @@ export async function handleDispatchError(
     //
     // A blocked Codex run is the agent's own judgement, so the transport
     // allowlist never reads it. Only a stated missing tool, MCP server or
-    // environment variable retries (classifyBlockedRun, 2026-10-04); a
+    // environment variable retries (classifyBlockedRun, 2026-10-04), and so
+    // does a block after the approval reviewer failed to decide (#121); a
     // rejected action and every other block still park at once.
     const terminalReason = streamResult?.terminalReason ?? "";
     const { transient, signature } = terminalReason === "codex_blocked"
-      ? classifyBlockedRun(classifyText, { approvalRejected: streamResult?.hadPermissionDenial === true })
+      ? classifyBlockedRun(classifyText, {
+        approvalRejected: streamResult?.hadPermissionDenial === true,
+        approvalReviewFailed: streamResult?.approvalReviewFailed === true,
+      })
       : terminalReason === "needs_refinement"
         ? { transient: false, signature: "" }
         : classifyAgentError(classifyText, { terminalReason: streamResult?.terminalReason });
@@ -2818,8 +2913,15 @@ export async function setupBranchAndWorktree(
   // none, so nothing above depends on the old order. The two integrity
   // aborts skip the cleanup and leave every worktree in place for triage,
   // as they did before.
+  //
+  // One exception to the integrity abort: local is ahead of origin only
+  // because this agent's own previous run left commits in its own worktree.
+  // That worktree is kept (not removed), the other blocking ones are cleaned
+  // as usual, and the reuse decision below picks it up (#119).
   const aborting = branchAction === "abort-local-strictly-ahead" || branchAction === "abort-local-diverged";
-  const heldWorktrees = aborting ? [] : removeBlockingWorktrees(ctx);
+  const keepOwn = branchAction === "abort-local-strictly-ahead" && ownWorktreeHoldsBranch(ctx);
+  const heldWorktrees = aborting && !keepOwn ? [] : removeBlockingWorktrees(ctx, { keepOwn });
+  const ownReuse = decideOwnReuse(ctx, heldWorktrees, branchAction);
 
   try {
     switch (branchAction) {
@@ -2847,6 +2949,11 @@ export async function setupBranchAndWorktree(
         break;
       case "abort-local-strictly-ahead":
       case "abort-local-diverged": {
+        // The own previous run's unpushed commits: continue from them.
+        if (ownReuse.reuse) {
+          console.log(`   📌 Local ${branchName} is ahead of origin with ${agent.name}'s own unpushed work; continuing from it`);
+          break;
+        }
         // Both are local-vs-origin integrity aborts, but the safe operator
         // action is opposite, so the message must not conflate them.
         //   strictly-ahead: origin is an ancestor of local. Local has real
@@ -2912,12 +3019,21 @@ export async function setupBranchAndWorktree(
     return { ok: false };
   }
 
+  // Continue in the agent's own preserved worktree when the decision allows
+  // it, committing what the previous run left. See decideOwnWorktreeReuse.
+  if (ownReuse.reuse) {
+    const reused = await reuseOwnWorktree(ctx, ownReuse.commitLeftovers);
+    if (!reused) return { ok: false };
+  }
+
   // Create worktree from the feature branch. Stale and orphan worktrees
   // were removed before the branch setup above.
   try {
-    mkdirSync(dirname(worktreeDir), { recursive: true });
-    execSync(`git worktree add "${worktreeDir}" ${branchName}`, { cwd: repoRoot, stdio: "pipe" });
-    console.log(`   🌳 Created worktree at ${worktreeDir}`);
+    if (!ownReuse.reuse) {
+      mkdirSync(dirname(worktreeDir), { recursive: true });
+      execSync(`git worktree add "${worktreeDir}" ${branchName}`, { cwd: repoRoot, stdio: "pipe" });
+      console.log(`   🌳 Created worktree at ${worktreeDir}`);
+    }
 
     // Symlink the canonical repo's codegraph index into the worktree.
     // `.codegraph/` is gitignored and lives outside `.git/`, so
@@ -3051,18 +3167,24 @@ export async function setupBranchAndWorktree(
 // branch. Only `git worktree remove` without --force: a worktree with
 // uncommitted changes stays and keeps blocking the branch on purpose. Those
 // are returned so the error comment can name them.
-function removeBlockingWorktrees(ctx: DispatchContext): HeldWorktree[] {
+//
+// `keepOwn` skips the removal of the same-path worktree, which is then
+// reported as held, so its previous run's commits can be continued from
+// (#119).
+function removeBlockingWorktrees(ctx: DispatchContext, opts: { keepOwn?: boolean } = {}): HeldWorktree[] {
   const { branchName, worktreeDir } = ctx;
   const { execSync } = ctx.deps;
   const errorText = (e: any): string => e?.stderr?.toString?.().trim() || e?.message || String(e);
   const held: HeldWorktree[] = [];
 
   let samePathError = "";
-  try {
-    execSync(`git worktree remove "${worktreeDir}"`, { cwd: repoRoot, stdio: "pipe" });
-  } catch (e) {
-    // Usually "is not a working tree": nothing was there.
-    samePathError = errorText(e);
+  if (!opts.keepOwn) {
+    try {
+      execSync(`git worktree remove "${worktreeDir}"`, { cwd: repoRoot, stdio: "pipe" });
+    } catch (e) {
+      // Usually "is not a working tree": nothing was there.
+      samePathError = errorText(e);
+    }
   }
 
   try {
@@ -3088,6 +3210,109 @@ function removeBlockingWorktrees(ctx: DispatchContext): HeldWorktree[] {
     console.warn(`   ⚠️  Failed to inspect worktrees for ${branchName}: ${e}`);
   }
   return held;
+}
+
+/** `git worktree list --porcelain`, or "" when it cannot be read. */
+function readWorktreeList(ctx: DispatchContext): string {
+  try {
+    return String(ctx.deps.execSync(`git worktree list --porcelain`, { cwd: repoRoot, encoding: "utf-8", timeout: 15_000 }));
+  } catch {
+    return "";
+  }
+}
+
+/** True when the agent's own worktree path has the ticket's branch checked out. */
+function ownWorktreeHoldsBranch(ctx: DispatchContext): boolean {
+  return findWorktreesForBranch(readWorktreeList(ctx), ctx.branchName).includes(ctx.worktreeDir);
+}
+
+// Gather what decideOwnWorktreeReuse needs about the worktrees still holding
+// the branch after the cleanup. Only reads; a failed read refuses the reuse.
+function decideOwnReuse(ctx: DispatchContext, held: HeldWorktree[], branchAction: BranchSetupAction): OwnWorktreeReuse {
+  const { worktreeDir } = ctx;
+  const { execSync, existsSync } = ctx.deps;
+  if (held.length !== 1 || held[0]!.path !== worktreeDir) {
+    return decideOwnWorktreeReuse({ ownPath: worktreeDir, held, branchAction, locked: false, operationInProgress: false, gitStatusOutput: null });
+  }
+  let gitStatusOutput: string | null = null;
+  let operationInProgress = true;
+  try {
+    gitStatusOutput = String(execSync(`git status --porcelain`, { cwd: worktreeDir, encoding: "utf-8", stdio: "pipe", timeout: 15_000 }));
+    const paths = String(execSync(
+      `git rev-parse ${IN_PROGRESS_GIT_PATHS.map(p => `--git-path ${p}`).join(" ")}`,
+      { cwd: worktreeDir, encoding: "utf-8", stdio: "pipe", timeout: 15_000 },
+    )).split("\n").map(l => l.trim()).filter(Boolean);
+    operationInProgress = paths.some(p => existsSync(resolve(worktreeDir, p)));
+  } catch (e) {
+    console.warn(`   ⚠️  Could not inspect the held worktree ${worktreeDir}: ${e}`);
+  }
+  const decision = decideOwnWorktreeReuse({
+    ownPath: worktreeDir,
+    held,
+    branchAction,
+    locked: isWorktreeLocked(readWorktreeList(ctx), worktreeDir),
+    operationInProgress,
+    gitStatusOutput,
+  });
+  if (!decision.reuse) console.log(`   ⏸️  Not reusing ${worktreeDir}: ${decision.reason}`);
+  return decision;
+}
+
+// Continue in the agent's own preserved worktree (#119). Commits what the
+// previous run left uncommitted as one wip commit, the shape
+// salvagePartialWork uses, and says so on the ticket. The commit is not
+// pushed here: the pre-run merge push or the end-of-run push carries it.
+//
+// Returns false after parking the ticket when the commit fails. Nothing is
+// discarded either way; the worktree stays as it is.
+async function reuseOwnWorktree(ctx: DispatchContext, commitLeftovers: boolean): Promise<boolean> {
+  const { agent, item, client, branchName, worktreeDir } = ctx;
+  const { execSync, spawnSync } = ctx.deps;
+  let sha = "";
+  if (commitLeftovers) {
+    try {
+      execSync(`git add -A`, { cwd: worktreeDir, stdio: "pipe", timeout: 15_000 });
+      const commit = spawnSync(
+        "git",
+        [
+          "commit",
+          "-m", `wip(${agent.name}): partial work from an interrupted run (#${item.issueNumber})`,
+          "-m", `Auto-committed by the dispatcher before the next ${agent.name} run continued in the same worktree. Unfinished; that run continues from here.`,
+        ],
+        { cwd: worktreeDir, stdio: "pipe", timeout: 15_000 },
+      );
+      if (commit.status !== 0) {
+        throw new Error(`git commit failed: ${commit.stderr?.toString() || commit.stdout?.toString() || "unknown"}`);
+      }
+    } catch (e) {
+      console.error(`   ❌ Failed to commit the previous run's leftovers in ${worktreeDir}: ${e}`);
+      await client.addComment(
+        item.issueNumber,
+        `## ⚠️ Dispatch Error: ${agent.name}\n\n` +
+        `The previous ${agent.name} run left uncommitted changes in its worktree \`${worktreeDir}\`. ` +
+        `The dispatcher tried to commit them so this run could continue from them, and the commit failed. ` +
+        `Nothing was discarded. Commit or save the changes there, then retry.\n\n\`\`\`\n${e}\n\`\`\``,
+      );
+      try { await client.addLabel(item.issueNumber, `error:${agent.name}`); } catch {}
+      return false;
+    }
+    try {
+      sha = String(execSync(`git rev-parse --short HEAD`, { cwd: worktreeDir, encoding: "utf-8", timeout: 15_000 })).trim();
+    } catch { /* cosmetic */ }
+  }
+  console.log(`   ♻️  Reusing ${agent.name}'s own worktree at ${worktreeDir}${commitLeftovers ? `; leftovers committed${sha ? ` as ${sha}` : ""}` : ""}`);
+  const what = commitLeftovers
+    ? `left uncommitted changes in its worktree. The dispatcher committed them${sha ? ` as \`${sha}\`` : ""}`
+    : `left commits on \`${branchName}\` that origin does not have yet`;
+  try {
+    await client.addComment(
+      item.issueNumber,
+      `## ♻️ Continuing from the previous run's work\n\n` +
+      `The previous ${agent.name} run on this ticket ${what}, and this run continues from them in the same worktree. ` +
+      `They reach origin with this run's pushes.`,
+    );
+  } catch (e) { console.warn(`   ⚠️  Failed to post the worktree-reuse comment: ${e}`); }
+  return true;
 }
 
 /** HEAD of a worktree, or "" when it cannot be read. */
@@ -3846,6 +4071,169 @@ export async function salvagePartialWork(
   }
 }
 
+// --------- Verdict handoff (agent-dispatcher#118) ---------
+//
+// The decisions are in verdict-handoff.ts; these functions do the file
+// reads, the `gh` reads and the GitHub writes around them.
+
+/** What `recoverSavedVerdict` did with a failed verdict run. Null: nothing,
+ *  the run is handled exactly as before. */
+export type VerdictRecoveryOutcome =
+  | { kind: "posted"; labels: string[] }
+  | { kind: "pending" }
+  | null;
+
+/**
+ * Empty the run's handoff file and return the prompt note that names it.
+ * Emptying it first means a verdict saved by an earlier run can never be
+ * read as this run's. A failure here only costs the recovery: the agent
+ * cannot save its verdict, and a failed post parks as before.
+ */
+function prepareVerdictHandoff(ctx: DispatchContext): string {
+  const path = ctx.verdictHandoffPath;
+  if (!path) return "";
+  try {
+    ctx.deps.mkdirSync(dirname(path), { recursive: true });
+    ctx.deps.writeFileSync(path, "");
+  } catch (e) {
+    console.warn(`   ⚠️  Could not prepare the verdict handoff file ${path}: ${e}`);
+  }
+  return verdictHandoffNote(path);
+}
+
+/** Find the ticket's PR and read its head and every review and comment. */
+function lookupVerdictPr(
+  execSyncFn: DispatchDeps["execSync"],
+  opts: { branch: string; pr: number | null; cwd: string },
+): VerdictPrLookup {
+  try {
+    let pr = opts.pr;
+    if (pr === null) {
+      const listJson = execSyncFn(
+        `gh pr list --head ${opts.branch} --state open --json number,isDraft`,
+        { cwd: opts.cwd, stdio: "pipe" },
+      ).toString().trim();
+      pr = pickVerdictPr(listJson);
+      if (pr === null) return { kind: "none" };
+    }
+    const viewJson = execSyncFn(
+      `gh pr view ${pr} --json headRefOid,state,reviews,comments`,
+      { cwd: opts.cwd, stdio: "pipe" },
+    ).toString();
+    return { kind: "found", number: pr, view: parsePrVerdictView(viewJson) };
+  } catch {
+    return { kind: "unreadable" };
+  }
+}
+
+/**
+ * Post a saved verdict on its PR and apply its labels to the ticket. The
+ * marker line ties the comment to its run, so a later attempt can tell that
+ * a post GitHub reported as failed was stored after all.
+ */
+async function publishSavedVerdict(
+  client: DispatchClient,
+  state: PendingVerdictState,
+  pr: number,
+  alreadyPosted: boolean,
+): Promise<{ ok: true } | { ok: false; why: string }> {
+  const marker = handoffMarker({ agent: state.agent, issueNumber: state.issueNumber, startedAtMs: state.startedAtMs });
+  if (!alreadyPosted) {
+    try {
+      await client.addComment(pr, `${state.handoff.body}\n\n${marker}`);
+    } catch (e) {
+      return { ok: false, why: `posting the verdict on PR #${pr} failed: ${e}` };
+    }
+  }
+  for (const label of state.handoff.labels) {
+    try {
+      await client.addLabel(state.issueNumber, label);
+    } catch (e) {
+      return { ok: false, why: `adding ${label} failed: ${e}` };
+    }
+  }
+  return { ok: true };
+}
+
+/**
+ * Keep a saved verdict for the next cycle: the state file first, since it
+ * is what the retry needs, then the label that stops a re-dispatch. Null
+ * when the state cannot be written, so the run parks rather than claiming
+ * a retry nothing will perform.
+ */
+async function holdPendingVerdict(ctx: DispatchContext, state: PendingVerdictState, why: string): Promise<VerdictRecoveryOutcome> {
+  const { agent, item, client, logFile } = ctx;
+  const statePath = pendingVerdictStatePath(agent.name, item.issueNumber);
+  try {
+    ctx.deps.mkdirSync(dirname(statePath), { recursive: true });
+    ctx.deps.writeFileSync(statePath, serializePendingVerdictState(state));
+  } catch (e) {
+    ctx.deps.writeLog(logFile, "VERDICT_HANDOFF_UNUSED", `could not keep the saved verdict for a retry (${e}); parking`);
+    return null;
+  }
+  const label = `${PENDING_VERDICT_PREFIX}${agent.name}`;
+  try {
+    await client.addLabel(item.issueNumber, label);
+  } catch (e) {
+    console.warn(`   ⚠️  Could not add ${label} to #${item.issueNumber} (${e}); the next cycle may dispatch ${agent.name} again`);
+  }
+  ctx.deps.writeLog(logFile, "VERDICT_PENDING", `${why}. Saved verdict kept at ${statePath}; the dispatcher retries each cycle.`);
+  console.warn(`   ⏸️  #${item.issueNumber} ${agent.name} verdict saved but not posted (${why}); retrying next cycle`);
+  await ctx.deps.notifyDiscord(
+    `⏸️ **${agent.name}** finished #${item.issueNumber} but its verdict could not be posted (${why.slice(0, 200)}). ` +
+    `The dispatcher saved it and retries each cycle. No action needed unless this persists.`,
+  );
+  return { kind: "pending" };
+}
+
+/**
+ * The run's own attempt to recover a verdict the agent could not post.
+ * Applies only to a `requiresVerdict` agent whose failure text says a GitHub
+ * write failed. Everything else returns null and is handled as before.
+ */
+async function recoverSavedVerdict(
+  ctx: DispatchContext,
+  failureText: string,
+  approvalRejected: boolean,
+): Promise<VerdictRecoveryOutcome> {
+  const { agent, item, logFile, startTime, verdictHandoffPath: path } = ctx;
+  if (!path || !agent.requiresVerdict || item.issueNumber <= 0) return null;
+  if (!isVerdictPublishFailure(failureText, { approvalRejected })) return null;
+
+  let handoff: HandoffParse | null = null;
+  try {
+    handoff = parseVerdictHandoff(String(ctx.deps.readFileSync(path, "utf-8")));
+  } catch {
+    handoff = null;
+  }
+  const pr = lookupVerdictPr(ctx.deps.execSync, { branch: ctx.branchName, pr: null, cwd: ctx.agentCwd });
+  const marker = handoffMarker({ agent: agent.name, issueNumber: item.issueNumber, startedAtMs: startTime });
+  const decision = decideVerdictRecovery({ handoff, pr, startedAtMs: startTime, firstAttempt: true, marker });
+  if (decision.kind === "park") {
+    ctx.deps.writeLog(logFile, "VERDICT_HANDOFF_UNUSED", decision.reason);
+    console.warn(`   ⚠️  ${agent.name} could not post its verdict and the dispatcher will not post it either: ${decision.reason}`);
+    return null;
+  }
+  // The decision parks a missing or incomplete handoff; this narrows the type.
+  if (handoff === null || !handoff.ok) return null;
+
+  const state: PendingVerdictState = {
+    agent: agent.name,
+    issueNumber: item.issueNumber,
+    pr: pr.kind === "found" ? pr.number : null,
+    startedAtMs: startTime,
+    handoff: handoff.handoff,
+  };
+  if (decision.kind === "wait") return holdPendingVerdict(ctx, state, "the pull request could not be read");
+
+  const published = await publishSavedVerdict(ctx.client, state, decision.pr, decision.kind === "already-posted");
+  if (!published.ok) return holdPendingVerdict(ctx, state, published.why);
+
+  ctx.deps.writeLog(logFile, "VERDICT_POSTED_BY_DISPATCHER", `${handoff.handoff.decision} verdict posted on PR #${decision.pr}${handoff.handoff.labels.length > 0 ? `, labels ${handoff.handoff.labels.join(", ")}` : ""}`);
+  console.log(`   📮 ${agent.name}'s GitHub write failed; posted its saved ${handoff.handoff.decision} verdict on PR #${decision.pr}`);
+  return { kind: "posted", labels: handoff.handoff.labels };
+}
+
 // Post-run side-effect chain after a successful (or successfully-salvaged)
 // claude invocation: usage logging, safety-net commit, push, empty-branch
 // guard, post-success labeling via `decidePostRunLabels`, completion
@@ -3859,6 +4247,9 @@ export async function handlePostRun(
   streamResult: StreamResult,
   ctx: DispatchContext,
   saferSalvaged: boolean,
+  /** Labels the dispatcher itself just applied (a recovered verdict's), added
+   *  to the post-run read so a failed read cannot lose a FAIL's rework label. */
+  appliedLabels: readonly string[] = [],
 ): Promise<{ ok: true } | { ok: false }> {
   const { agent, item, client, agentCwd, useWorktree, branchName, logFile, startTime } = ctx;
   const { execSync, spawnSync, notifyDiscord } = ctx.deps;
@@ -4046,6 +4437,7 @@ export async function handlePostRun(
     } catch (e) {
       console.warn(`   ⚠️  Failed to check post-run labels: ${e}`);
     }
+    postLabels = [...new Set([...postLabels, ...appliedLabels])];
   }
 
   // Empty-branch guard: agents that are supposed to produce commits
@@ -4180,7 +4572,18 @@ export async function handlePostRun(
       const detail = e?.stderr?.toString?.() ?? e?.message ?? String(e);
       console.warn(`   ⚠️  Verdict guard skipped (could not read the PR): ${detail.slice(0, 300)}`);
     }
-    if (shouldFlagMissingVerdict(agent, postLabels, verdicts)) {
+    // A clean exit that says the verdict post failed, with a finished
+    // verdict saved: publish it instead of parking. Claude runs end this
+    // way where Codex runs block. See verdict-handoff.ts.
+    let recovered: VerdictRecoveryOutcome = null;
+    if (shouldFlagMissingVerdict(agent, postLabels, verdicts) && ctx.verdictHandoffPath) {
+      recovered = await recoverSavedVerdict(ctx, output, streamResult.hadPermissionDenial);
+      if (recovered?.kind === "pending") return { ok: true };
+      // The labels the dispatcher just applied, so a FAIL routes as a rework
+      // without another read that could fail.
+      if (recovered?.kind === "posted") postLabels = [...new Set([...postLabels, ...recovered.labels])];
+    }
+    if (recovered === null && shouldFlagMissingVerdict(agent, postLabels, verdicts)) {
       console.error(`   ❌ ${agent.name} ended without a verdict — nothing posted on the PR since the run started and no rework label. Treating as error:${agent.name}.`);
       try {
         await client.addLabel(item.issueNumber, `error:${agent.name}`);
@@ -5191,6 +5594,111 @@ export async function runStrandedWipSweep(
   // without this the swept ticket stays invisible until the next poll.
   // Same idiom as `runReworkRouting` and `runAutoAdvance`.
   if (stripped) client.clearItemsCache();
+}
+
+/**
+ * Retry the saved verdicts that `recoverSavedVerdict` could not post because
+ * GitHub was still refusing writes (agent-dispatcher#118).
+ *
+ * For each `pending-verdict:<agent>` ticket on the cached board snapshot:
+ * read the saved state, re-check the PR, post the verdict unless this run's
+ * marker shows an earlier attempt landed, and apply its labels. Success
+ * swaps the label for `pending-done:<agent>`, so `runPendingDoneFinalize`,
+ * which runs next, adds `done:<agent>` on a PASS exactly as a normal post-run
+ * would, and leaves a FAIL's rework label to `runReworkRouting`. A GitHub
+ * failure changes nothing and the next cycle tries again. A lost state file,
+ * a moved head or a closed PR parks the ticket as `error:<agent>`.
+ */
+export async function runPendingVerdictPublish(
+  client: DispatchClient,
+  deps: Pick<DispatchDeps, "execSync" | "readFileSync" | "notifyDiscord"> = DEFAULT_DEPS,
+): Promise<void> {
+  let items: ProjectItem[];
+  try {
+    items = await client.getAllProjectItems();
+  } catch (error: any) {
+    console.error(`Error fetching board for pending-verdict publish: ${error.message}`);
+    return;
+  }
+
+  let mutated = false;
+  for (const item of items) {
+    for (const label of item.labels) {
+      if (!label.startsWith(PENDING_VERDICT_PREFIX)) continue;
+      const agentName = label.slice(PENDING_VERDICT_PREFIX.length);
+      let state: PendingVerdictState | null = null;
+      try {
+        state = parsePendingVerdictState(String(deps.readFileSync(pendingVerdictStatePath(agentName, item.issueNumber), "utf-8")));
+      } catch {
+        state = null;
+      }
+      if (state === null || state.agent !== agentName || state.issueNumber !== item.issueNumber) {
+        await parkPendingVerdict(client, deps, item, agentName, label, "the saved verdict could not be read back from the dispatcher's logs folder");
+        mutated = true;
+        continue;
+      }
+
+      const marker = handoffMarker({ agent: agentName, issueNumber: item.issueNumber, startedAtMs: state.startedAtMs });
+      const pr = lookupVerdictPr(deps.execSync, { branch: `feature/${item.issueNumber}`, pr: state.pr, cwd: repoRoot });
+      const decision = decideVerdictRecovery({
+        handoff: { ok: true, handoff: state.handoff }, pr, startedAtMs: state.startedAtMs, firstAttempt: false, marker,
+      });
+      if (decision.kind === "wait") {
+        console.warn(`   ⏸️  Pending verdict on #${item.issueNumber}: the pull request could not be read; retrying next cycle`);
+        continue;
+      }
+      if (decision.kind === "park") {
+        await parkPendingVerdict(client, deps, item, agentName, label, decision.reason);
+        mutated = true;
+        continue;
+      }
+
+      const published = await publishSavedVerdict(client, { ...state, pr: decision.pr }, decision.pr, decision.kind === "already-posted");
+      if (!published.ok) {
+        console.warn(`   ⏸️  Pending verdict on #${item.issueNumber}: ${published.why}; retrying next cycle`);
+        continue;
+      }
+      // pending-done first, so the ticket is never without a label that
+      // stops a re-dispatch of the agent.
+      try {
+        await client.addLabel(item.issueNumber, `${PENDING_DONE_PREFIX}${agentName}`);
+        await client.removeLabel(item.issueNumber, label);
+        mutated = true;
+      } catch (e) {
+        console.warn(`   ⚠️  Pending verdict on #${item.issueNumber}: posted, but swapping ${label} for ${PENDING_DONE_PREFIX}${agentName} failed (${e}); finishing next cycle`);
+        continue;
+      }
+      console.log(`   📮 Pending verdict: posted ${agentName}'s saved ${state.handoff.decision} verdict for #${item.issueNumber} on PR #${decision.pr}`);
+      await deps.notifyDiscord(`📮 **${agentName}** verdict for #${item.issueNumber} (${state.handoff.decision}) posted by the dispatcher on PR #${decision.pr} once GitHub accepted it.`);
+    }
+  }
+
+  // Same idiom as runPendingDoneFinalize: the next sub-step reads the
+  // cached snapshot and must see the new pending-done label.
+  if (mutated) client.clearItemsCache();
+}
+
+/** Park a pending verdict the dispatcher cannot safely post. */
+async function parkPendingVerdict(
+  client: DispatchClient,
+  deps: Pick<DispatchDeps, "notifyDiscord">,
+  item: ProjectItem,
+  agentName: string,
+  pendingLabel: string,
+  reason: string,
+): Promise<void> {
+  console.warn(`   ❌ Pending verdict on #${item.issueNumber} parked: ${reason}`);
+  try { await client.addLabel(item.issueNumber, `error:${agentName}`); } catch {}
+  try {
+    await client.addComment(
+      item.issueNumber,
+      `## ⚠️ Agent Error: ${agentName}\n\n` +
+      `The ${agentName} agent finished its review but could not post the verdict, and the dispatcher held the saved verdict to post once GitHub recovered. ` +
+      `It will not post it: ${reason}.\n\nManual intervention required.`,
+    );
+  } catch {}
+  try { await client.removeLabel(item.issueNumber, pendingLabel); } catch {}
+  await deps.notifyDiscord(`❌ **${agentName}** saved verdict for #${item.issueNumber} not posted: ${reason}. Manual intervention required.`);
 }
 
 /**
@@ -7786,6 +8294,7 @@ export async function pollLoop(): Promise<void> {
     }
   }
   console.log(`   Family breaker: ${FAMILY_DISPATCH_LIMIT} dispatches per ticket family (PYRY_FAMILY_DISPATCH_LIMIT)`);
+  console.log(`   Rework breaker: ${REWORK_ROUTING_OPTIONS.hardCap} builder reworks, or a repeated verifier finding (PYRY_BUILDER_REWORK_CAP)`);
   console.log(
     `   Required environment: ${REQUIRED_ENV_NAMES.length > 0 ? REQUIRED_ENV_NAMES.join(", ") : "none declared"} (PYRY_REQUIRED_ENV)`,
   );
@@ -7989,8 +8498,9 @@ export async function pollLoop(): Promise<void> {
       client, notifyDiscord, STRANDED_WIP_MIN_AGE_MS, Date.now(),
       gateRun === null ? pool.keys() : new Set([...pool.keys(), `real-claude-gate#${gateRun.issue}`]),
     );
+    await runPendingVerdictPublish(client);
     await runPendingDoneFinalize(client);
-    await runReworkRouting(client);
+    await runReworkRouting(client, REWORK_ROUTING_OPTIONS);
     await runRealClaudeGate(client);
     // Run the live gate for one parked ticket, here and only here.
     //
@@ -8202,8 +8712,9 @@ export async function pollLoop(): Promise<void> {
     // dispatched (catches tickets advanced/closed by humans or label
     // changes between cycles).
     await runClosedSweep(client);
+    await runPendingVerdictPublish(client);
     await runPendingDoneFinalize(client);
-    await runReworkRouting(client);
+    await runReworkRouting(client, REWORK_ROUTING_OPTIONS);
     await runRealClaudeGate(client);
     await runAutoAdvance(client, MAX_CONCURRENT, pool.size);
     await runDoneCleanup(client);

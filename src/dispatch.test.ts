@@ -52,6 +52,9 @@ import {
   runDoneCleanup,
   runStrandedWipSweep,
   runPendingDoneFinalize,
+  runPendingVerdictPublish,
+  verdictHandoffPath,
+  pendingVerdictStatePath,
   salvagePartialWork,
   strandedWipMinAgeMs,
   runFamilyBreaker,
@@ -101,10 +104,12 @@ import {
   STRANDED_WIP_OBSERVED_MARKER,
   STRANDED_WIP_SWEPT_MARKER,
   tallyFamilyComments,
+  shouldSkipDispatch,
 } from "./pipeline-decisions.js";
 import { AGENTS } from "./types.js";
 import { AgentRunStoppedError, idleStallMessage, noResultErrorMessage, ResourceExhaustedError, timeoutFor } from "./agent-runtime.js";
 import { resolveAgentsRepoRoot, resolveTargetRepoRoot } from "./worktree.js";
+import { CodexStreamAdapter } from "./agent-runner.js";
 
 // Importing dispatch.ts loads the fork's .env, so a fork running this suite
 // from its installed copy (bin/pyry-test) handed the tests its own stage set
@@ -1457,6 +1462,239 @@ describe("setupBranchAndWorktree — coverage edges", () => {
   });
 });
 
+// pyrycode-mobile #1603 and #1727, 2026-10-05: a run stopped with work left
+// in its own worktree, and the next run on the ticket failed with "Failed to
+// create git worktree" until a person committed the leftovers. The next run
+// now continues in that worktree when it is the agent's own.
+describe("setupBranchAndWorktree — reusing the agent's own preserved worktree", () => {
+  const builder = { name: "builder", column: "In Development", claudeMdPath: "builder/CLAUDE.md" };
+  const probe = (n: number, agent: Partial<AgentConfig> = {}) =>
+    makeTestContext({ item: { issueNumber: n }, agent }).ctx.worktreeDir;
+  const dirtyRefusal = (path: string) => () =>
+    execError({ stderr: `fatal: '${path}' contains modified or untracked files, use --force to delete it` });
+  const porcelainFor = (path: string, branch: string, extra = "") => () =>
+    `worktree ${path}\nHEAD abc\nbranch refs/heads/${branch}\n${extra}\n`;
+  // Real git refuses to add a worktree whose branch is checked out elsewhere.
+  const addRefused = (path: string) => () =>
+    execError({ stderr: `fatal: 'feature/x' is already used by worktree at '${path}'` });
+  function synced(n: number): Record<string, ExecHandler> {
+    return {
+      [`git rev-parse --verify feature/${n}`]: () => "",
+      [`git rev-parse --verify origin/feature/${n}`]: () => "",
+      [`git rev-parse origin/feature/${n}`]: () => "synced\n",
+      [`git rev-parse feature/${n}`]: () => "synced\n",
+    };
+  }
+  function strictlyAhead(n: number): Record<string, ExecHandler> {
+    return {
+      [`git rev-parse --verify feature/${n}`]: () => "",
+      [`git rev-parse --verify origin/feature/${n}`]: () => "",
+      [`git rev-parse origin/feature/${n}`]: () => "origin-sha\n",
+      [`git rev-parse feature/${n}`]: () => "local-sha\n",
+      [`git merge-base --is-ancestor feature/${n} origin/feature/${n}`]: () => execError({ stderr: "" }),
+    };
+  }
+  const wipCommits = (calls: CallLog) =>
+    calls.spawn.filter(c => c.cmd === "git" && c.args[0] === "commit");
+  const errorComments = (client: MockGitHubClient) =>
+    client.comments.filter(c => /Dispatch Error/.test(c.body));
+
+  test("own path, branch in sync, uncommitted changes → one wip commit before the pre-run merge, a comment names it, no error", async () => {
+    const own = probe(1603, builder);
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 1603 },
+      agent: builder,
+      mockOptions: {
+        execImpls: {
+          ...synced(1603),
+          [`git worktree remove "${own}"`]: dirtyRefusal(own),
+          "git worktree list --porcelain": porcelainFor(own, "feature/1603"),
+          "git status --porcelain": () => " M app/Foo.kt\n?? app/Bar.kt\n",
+          "git rev-parse --short HEAD": () => "fc640d1\n",
+          "git worktree add": addRefused(own),
+        },
+      },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: true });
+    assert.deepEqual(client.addLabelCalls, [], "no error:<agent> label");
+    assert.deepEqual(errorComments(client), [], "no Dispatch Error comment");
+    assert.ok(!calls.exec.some(c => c.cmd.includes("git worktree add")), "the held worktree is reused, not re-added");
+    assert.ok(!calls.exec.some(c => c.cmd.includes("--force")), "never force-removed");
+
+    const commits = wipCommits(calls);
+    assert.equal(commits.length, 1, "exactly one commit");
+    assert.equal(commits[0]!.opts?.cwd, ctx.worktreeDir);
+    assert.ok(commits[0]!.args.includes("wip(builder): partial work from an interrupted run (#1603)"));
+    const addIdx = calls.exec.findIndex(c => c.cmd === "git add -A" && c.opts?.cwd === ctx.worktreeDir);
+    assert.ok(addIdx >= 0, "the leftovers are staged in the worktree");
+
+    // The commit lands before the pre-run merge of main.
+    const commitAt = calls.exec.findIndex(c => c.cmd === "git rev-parse --short HEAD");
+    const mergeAt = calls.exec.findIndex(c => c.cmd.includes("merge main --no-edit"));
+    assert.ok(addIdx < mergeAt && commitAt < mergeAt, "wip commit before the pre-run merge");
+    assert.equal(calls.exec[mergeAt]!.opts?.cwd, ctx.worktreeDir);
+    // Pushed with the run's normal pushes, never on its own.
+    assert.ok(!calls.exec.slice(0, mergeAt).some(c => c.cmd.startsWith("git push")), "no separate push of the wip commit");
+
+    const notes = client.comments.filter(c => /fc640d1/.test(c.body));
+    assert.equal(notes.length, 1, "one comment names the commit");
+    assert.match(notes[0]!.body, /continues from/);
+  });
+
+  test("own path, clean, local commits ahead of origin → reused without a new commit, no integrity abort", async () => {
+    const own = probe(1727);
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 1727 },
+      mockOptions: {
+        execImpls: {
+          ...strictlyAhead(1727),
+          "git worktree list --porcelain": porcelainFor(own, "feature/1727"),
+          "git worktree add": addRefused(own),
+        },
+      },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: true });
+    assert.deepEqual(client.addLabelCalls, []);
+    assert.deepEqual(errorComments(client), []);
+    assert.equal(wipCommits(calls).length, 0, "nothing to commit");
+    assert.ok(!calls.exec.some(c => c.cmd === `git worktree remove "${own}"`), "the own worktree is kept for reuse");
+    assert.ok(!calls.exec.some(c => c.cmd.includes("git worktree add")));
+    assert.ok(calls.exec.some(c => c.cmd.includes("merge main --no-edit") && c.opts?.cwd === own), "the normal pre-run merge runs in it");
+  });
+
+  test("own path, dirty, local commits ahead of origin → reused, leftovers committed", async () => {
+    const own = probe(1728);
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 1728 },
+      mockOptions: {
+        execImpls: {
+          ...strictlyAhead(1728),
+          "git worktree list --porcelain": porcelainFor(own, "feature/1728"),
+          "git status --porcelain": () => " M a.kt\n",
+          "git worktree add": addRefused(own),
+        },
+      },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: true });
+    assert.deepEqual(client.addLabelCalls, []);
+    assert.equal(wipCommits(calls).length, 1);
+    assert.ok(ctx.worktreeDir === own);
+  });
+
+  test("a different path holds the branch → fails exactly as today, naming it", async () => {
+    const other = "/tmp/.pyrycode-worktrees/repo/verifier-1604";
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 1604 },
+      mockOptions: {
+        execImpls: {
+          ...synced(1604),
+          "git worktree list --porcelain": porcelainFor(other, "feature/1604"),
+          [`git worktree remove "${other}"`]: dirtyRefusal(other),
+          "git status --porcelain": () => " M a.kt\n",
+          "git worktree add": addRefused(other),
+        },
+      },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: false });
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1604, label: "error:developer" }]);
+    assert.equal(client.comments.length, 1);
+    assert.match(client.comments[0]!.body, /Failed to create git worktree/);
+    assert.ok(client.comments[0]!.body.includes(`- \`${other}\` has uncommitted changes`));
+    assert.equal(wipCommits(calls).length, 0);
+  });
+
+  test("own path on a different branch → fails exactly as today", async () => {
+    const own = probe(1605);
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 1605 },
+      mockOptions: {
+        execImpls: {
+          ...synced(1605),
+          [`git worktree remove "${own}"`]: dirtyRefusal(own),
+          "git worktree list --porcelain": porcelainFor(own, "feature/9999"),
+          "git status --porcelain": () => " M a.kt\n",
+          "git worktree add": () => execError({ stderr: `fatal: '${own}' already exists` }),
+        },
+      },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: false });
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1605, label: "error:developer" }]);
+    assert.match(client.comments[0]!.body, /Failed to create git worktree/);
+    assert.equal(wipCommits(calls).length, 0);
+  });
+
+  for (const state of ["MERGE_HEAD", "rebase-merge"]) {
+    test(`own path with ${state} in progress → fails exactly as today, naming it`, async () => {
+      const own = probe(1606);
+      const gitDir = "/tmp/repo/.git/worktrees/developer-1606";
+      const { ctx, client, calls } = makeTestContext({
+        item: { issueNumber: 1606 },
+        mockOptions: {
+          execImpls: {
+            ...synced(1606),
+            [`git worktree remove "${own}"`]: dirtyRefusal(own),
+            "git worktree list --porcelain": porcelainFor(own, "feature/1606"),
+            "git status --porcelain": () => "UU a.kt\n",
+            "git rev-parse --git-path": () =>
+              ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"].map(p => `${gitDir}/${p}`).join("\n") + "\n",
+            "git worktree add": addRefused(own),
+          },
+          fsMap: { [`${gitDir}/${state}`]: "" },
+        },
+      });
+
+      const result = await setupBranchAndWorktree(ctx);
+
+      assert.deepEqual(result, { ok: false });
+      assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1606, label: "error:developer" }]);
+      assert.equal(client.comments.length, 1);
+      assert.match(client.comments[0]!.body, /Failed to create git worktree/);
+      assert.ok(client.comments[0]!.body.includes(`- \`${own}\` has uncommitted changes`));
+      assert.equal(wipCommits(calls).length, 0);
+      assert.ok(!calls.exec.some(c => c.cmd === "git add -A"), "nothing staged");
+    });
+  }
+
+  test("own path held but the wip commit fails → parks with the commit error, nothing discarded", async () => {
+    const own = probe(1607);
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 1607 },
+      mockOptions: {
+        execImpls: {
+          ...synced(1607),
+          [`git worktree remove "${own}"`]: dirtyRefusal(own),
+          "git worktree list --porcelain": porcelainFor(own, "feature/1607"),
+          "git status --porcelain": () => " M a.kt\n",
+        },
+        spawnImpls: { "git commit": () => ({ status: 1, stderr: "pre-commit hook failed" }) },
+      },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: false });
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1607, label: "error:developer" }]);
+    assert.match(client.comments[0]!.body, /pre-commit hook failed/);
+    assert.ok(!calls.exec.some(c => c.cmd.includes("merge main --no-edit")), "no merge over uncommitted leftovers");
+    assert.ok(!calls.exec.some(c => /--force|reset --hard|checkout -- |git clean/.test(c.cmd)));
+  });
+});
+
 // pyrycode-mobile #1340, 2026-10-02: the verifier crashed after the pre-run
 // merge of main, the merge commit was only ever pushed at the end of a run,
 // and the next dispatch refused with abort-local-strictly-ahead. The merge is
@@ -2005,16 +2243,22 @@ describe("decideRefinementMode", () => {
     }
   });
 
+  test("rework-other:N left by the router → rework (a route to the refiner counts there since #122)", () => {
+    assert.equal(decideRefinementMode("refiner", { issueNumber: 50, labels: ["size:M", "rework-other:1"] }), "rework");
+  });
+
   test("the labels a real route leaves behind read as rework", () => {
     // What the target sees after `decideReworkRoutes` + the counter bump:
-    // trigger and done:/wip:/error: trail stripped, counter added.
+    // trigger and done:/wip:/error: trail stripped, counter added. A route
+    // to the refiner is not the builder's rework, so it counts on
+    // rework-other (#122).
     const before = ["size:M", "done:refiner", "done:builder", "needs-rework:refiner"];
     const [route] = decideReworkRoutes(
       new Map([["refiner", "Backlog"], ["builder", "In Development"]]),
       new Map([["In Development", [{ id: "PVTI_1", issueNumber: 60, labels: before }]]]),
     );
-    const after = [...before.filter(l => !route.labelsToStrip.includes(l)), "rework-count:1"];
-    assert.deepEqual(after, ["size:M", "rework-count:1"]);
+    const after = [...before.filter(l => !route.labelsToStrip.includes(l)), "rework-other:1"];
+    assert.deepEqual(after, ["size:M", "rework-other:1"]);
     assert.equal(decideRefinementMode("refiner", { issueNumber: 60, labels: after }), "rework");
   });
 
@@ -2079,6 +2323,13 @@ describe("buildModeSection", () => {
       "\n## Mode\nrework — existing ticket routed back (ticket carries `rework-count:2`). " +
         "Read the previous agent comments above for the rework reason.",
     );
+  });
+
+  test("rework cites every counter the ticket carries", () => {
+    const section = buildModeSection(refiner, { issueNumber: 83, labels: ["rework-other:1"] }, true);
+    assert.match(section!, /^\n## Mode\nrework — existing ticket routed back \(ticket carries `rework-other:1`\)\./);
+    const both = buildModeSection(refiner, { issueNumber: 84, labels: ["rework-count:2", "rework-other:1"] }, true);
+    assert.match(both!, /\(ticket carries `rework-count:2`, `rework-other:1`\)/);
   });
 
   test("rework without comments does not point at a section that is not there", () => {
@@ -8771,6 +9022,132 @@ describe("Codex blocked on a missing tool or variable — auto-retry", () => {
   });
 });
 
+// pyrycode-mobile #1582 and #1655, 2026-10-05: Codex's automatic approval
+// reviewer could not decide, by its own model's capacity or by its deadline,
+// and said plainly that this was not a rejection. The agent stopped blocked,
+// its summary named the approval, and the ticket parked. A retry would very
+// likely pass the review. A genuine rejection (#1727, #1766) keeps parking.
+describe("Codex approval reviewer failed to decide — auto-retry (#121)", () => {
+  const capacityForm = "2026-10-05T07:12:01Z ERROR codex_core::tools::router: Automatic approval review failed: Selected model is at capacity. Please try a different model. " +
+    "The action was not executed because automatic approval review could not be completed. This is a review failure, not a determination that the action is unsafe.";
+  const deadlineForm = "2026-10-05T08:40:13Z ERROR codex_core::tools::router: The automatic permission approval review did not finish before its deadline. " +
+    "Do not assume the action is unsafe based on the timeout alone. You may retry once, or ask the user for guidance or explicit approval.";
+  const rejection = "This action was rejected due to unacceptable risk.";
+  const blockedSummary = "Automatic approval review did not approve `./gradlew spotlessCheck`, so I stopped as the role requires. Implementation is finished and uncommitted.";
+  const builder = { name: "builder", column: "In Development", claudeMdPath: "builder/CLAUDE.md" };
+
+  function blockedRun(opts: { stderr?: string; itemText?: string; summary?: string } = {}): StreamResult {
+    const a = new CodexStreamAdapter();
+    a.accept({ type: "thread.started", thread_id: "codex-thread" });
+    a.accept({ type: "turn.started" });
+    if (opts.itemText) a.accept({ type: "item.completed", item: { type: "command_execution", aggregated_output: opts.itemText } });
+    a.accept({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ status: "blocked", summary: opts.summary ?? blockedSummary }) } });
+    a.accept({ type: "turn.completed", usage: {} });
+    return a.finish(0, false, 1000, opts.stderr ?? "");
+  }
+
+  async function handle(result: StreamResult, labels: string[] = []) {
+    const { ctx, client, calls } = makeTestContext({ item: { issueNumber: 1582, labels }, agent: builder });
+    let error: any;
+    try { await handleAgentResultErrors(result, ctx); } catch (e) { error = e; }
+    assert.ok(error, "a blocked run always throws to the error path");
+    await handleDispatchError(error, ctx, result);
+    return { client, calls, labels: client.addLabelCalls.map(c => c.label) };
+  }
+
+  for (const [name, stderr] of [["capacity", capacityForm], ["deadline", deadlineForm]] as const) {
+    test(`${name}-form reviewer failure on stderr → transient, auto-retry marker and comment, no error:builder`, async () => {
+      const result = blockedRun({ stderr });
+      assert.equal(result.terminalReason, "codex_blocked");
+      assert.equal(result.approvalReviewFailed, true);
+      assert.equal(result.hadPermissionDenial, false);
+      const { client, calls, labels } = await handle(result);
+      assert.deepEqual(labels, ["error-retry-count:1"]);
+      assert.ok(!labels.includes("error:builder"));
+      assert.ok(client.comments.some(c => c.body.includes("<!-- pyry-auto-retry -->") && c.body.includes("approval review failed")));
+      assert.match(calls.discord[0] ?? "", /auto-retry 1\/4 scheduled/);
+    });
+  }
+
+  test("the reviewer failure in a non-message Codex item counts the same as on stderr", async () => {
+    const result = blockedRun({ itemText: deadlineForm });
+    assert.equal(result.approvalReviewFailed, true);
+    assert.deepEqual((await handle(result)).labels, ["error-retry-count:1"]);
+  });
+
+  for (const [name, opts] of [
+    ["rejection on stderr alone", { stderr: rejection }],
+    ["rejection in an item alone", { itemText: rejection }],
+    ["rejection beside a capacity-form failure", { stderr: `${capacityForm}\n${rejection}` }],
+    ["rejection item beside a deadline-form stderr line", { itemText: rejection, stderr: deadlineForm }],
+  ] as const) {
+    test(`${name} → parks exactly as today`, async () => {
+      const result = blockedRun(opts);
+      assert.equal(result.hadPermissionDenial, true);
+      const { labels } = await handle(result);
+      assert.ok(labels.includes("error:builder"));
+      assert.ok(!labels.some(l => l.startsWith("error-retry-count:")));
+    });
+  }
+
+  test("the agent's own summary naming a reviewer failure, with no Codex event or stderr line, parks as today", async () => {
+    const result = blockedRun({ summary: "Automatic approval review could not be completed. This is a review failure, not a determination that the action is unsafe." });
+    assert.equal(result.approvalReviewFailed, false);
+    const { labels } = await handle(result);
+    assert.ok(labels.includes("error:builder"));
+    assert.ok(!labels.some(l => l.startsWith("error-retry-count:")));
+  });
+
+  test("after RETRY_MAX_ATTEMPTS reviewer failures the ticket parks", async () => {
+    const { client, labels } = await handle(blockedRun({ stderr: capacityForm }), ["error-retry-count:4"]);
+    assert.ok(labels.includes("error:builder"));
+    assert.ok(client.comments.some(c => c.body.includes("Transient retries exhausted")));
+  });
+
+  test("end to end: the blocked run's worktree is preserved, and the retry run continues in it", async () => {
+    const n = 1655;
+    const own = makeTestContext({ item: { issueNumber: n }, agent: builder }).ctx.worktreeDir;
+
+    // Run 1: blocked by a reviewer deadline with work left uncommitted.
+    const client1 = new MockGitHubClient({ status: { [n]: "In Development" }, labels: { [n]: [] } });
+    let spawnIndex = 0;
+    const run1 = makeMockDeps({
+      execImpls: fullHappyExecImpls(`feature/${n}`),
+      fsMap: { [claudeMdAbsPath("builder/CLAUDE.md")]: "role" },
+      streamResult: () => { spawnIndex = run1.calls.exec.length; return blockedRun({ stderr: deadlineForm }); },
+    });
+    await dispatchToAgent(makeAgentConfig(builder), makeProjectItem({ issueNumber: n }), client1, run1.deps);
+    assert.ok(client1.addLabelCalls.some(c => c.label === "error-retry-count:1"));
+    assert.ok(!client1.addLabelCalls.some(c => c.label === "error:builder"));
+    assert.ok(!run1.calls.exec.slice(spawnIndex).some(c => c.cmd.includes("git worktree remove")), "the worktree is preserved");
+    assert.ok(!run1.calls.exec.slice(spawnIndex).some(c => c.cmd.includes("git add") || c.cmd.includes("git push")), "nothing salvaged");
+
+    // Run 2: the backoff elapsed and the retry dispatches the same ticket.
+    const client2 = new MockGitHubClient({ status: { [n]: "In Development" }, labels: { [n]: ["error-retry-count:1"] } });
+    const run2 = makeMockDeps({
+      execImpls: {
+        [`git rev-parse --verify feature/${n}`]: () => "",
+        [`git rev-parse --verify origin/feature/${n}`]: () => "",
+        [`git rev-parse origin/feature/${n}`]: () => "synced\n",
+        [`git rev-parse feature/${n}`]: () => "synced\n",
+        [`git worktree remove "${own}"`]: () => execError({ stderr: `fatal: '${own}' contains modified or untracked files, use --force to delete it` }),
+        "git worktree list --porcelain": () => `worktree ${own}\nHEAD abc\nbranch refs/heads/feature/${n}\n\n`,
+        "git worktree add": () => execError({ stderr: `fatal: 'feature/${n}' is already used by worktree at '${own}'` }),
+        "git status --porcelain": () => " M app/Foo.kt\n",
+        "git rev-parse --short HEAD": () => "7b78746\n",
+      },
+      fsMap: { [claudeMdAbsPath("builder/CLAUDE.md")]: "role" },
+      streamResult: () => blockedRun({ stderr: rejection }),
+    });
+    await dispatchToAgent(makeAgentConfig(builder), makeProjectItem({ issueNumber: n, labels: ["error-retry-count:1"] }), client2, run2.deps);
+    assert.equal(run2.calls.claudeStreams, 1, "the retry run reached the agent");
+    assert.ok(run2.calls.spawn.some(c => c.cmd === "git" && c.args.includes(`wip(builder): partial work from an interrupted run (#${n})`)));
+    assert.ok(client2.comments.some(c => c.body.includes("7b78746")));
+    assert.ok(!client2.comments.some(c => /Dispatch Error/.test(c.body)));
+    assert.ok(!run2.calls.exec.some(c => c.cmd.includes("git worktree add")));
+  });
+});
+
 describe("runEnvPreflight — a required variable missing from the dispatcher holds dispatch (2026-10-04)", () => {
   test("holds and notifies once while the same variable stays missing", async () => {
     const state: EnvPreflightState = { announced: null };
@@ -9720,5 +10097,246 @@ describe("pre-verifier gates — failures already on main (#123)", () => {
     const { result, calls } = await runGates(1755, { uiOutput: "FAILURE: Build failed with an exception." });
     assert.match(result.promptNote, /TRIAGE MODE/);
     assert.ok(!calls.exec.some((e) => e.cmd.includes("merge-base")));
+  });
+});
+
+// =====================================================================
+// Verdict handoff: the dispatcher posts a finished verdict itself when the
+// agent's GitHub write fails (agent-dispatcher#118)
+// =====================================================================
+//
+// 2026-10-03, Mobile #1677 / PR #1680: a Codex verifier finished with PASS,
+// GitHub answered the verdict post with HTTP 503, the run ended blocked and
+// the ticket sat parked as error:verifier for nine hours.
+
+describe("verdict handoff (#118)", () => {
+  const SHA = "0123456789abcdef0123456789abcdef01234567";
+  const MOVED = "fedcba9876543210fedcba9876543210fedcba98";
+  const ISSUE = 1677;
+  const PR = 1680;
+  const publishBlock = "Review finished with PASS and no findings, but publishing the verdict comment failed with GitHub HTTP 503 and a GraphQL timeout. The verdict is saved in the handoff file.";
+  const handoffFile = (decision: "PASS" | "FAIL", labels = "") =>
+    `decision: ${decision}\ncommit: ${SHA}\nlabels: ${labels}\n---\n## Verifier Review: #${ISSUE}\n\n**Decision: ${decision}**\n`;
+
+  function fixture(opts: {
+    handoff?: string | null;
+    head?: string;
+    stream?: Partial<StreamResult>;
+  } = {}) {
+    const client = new MockGitHubClient({
+      status: { [ISSUE]: "In Code Review" },
+      items: [{ issueNumber: ISSUE, status: "In Code Review", labels: [], state: "OPEN" }],
+    });
+    const fsMap: Record<string, string> = { [claudeMdAbsPath("verifier/CLAUDE.md")]: "role" };
+    if (opts.handoff !== null) fsMap[verdictHandoffPath("verifier", ISSUE)] = opts.handoff ?? handoffFile("PASS");
+    let head = opts.head ?? SHA;
+    let prReadable = true;
+    const prComments = () => client.comments.filter(c => c.issueNumber === PR);
+    const { deps, calls } = makeMockDeps({
+      execImpls: {
+        ...fullHappyExecImpls(`feature/${ISSUE}`),
+        [`gh pr list --head feature/${ISSUE} --state open --json number,isDraft`]: () =>
+          prReadable ? JSON.stringify([{ number: PR, isDraft: false }]) : execError({ stderr: "HTTP 503" }),
+        [`gh pr view ${PR}`]: () => prReadable
+          ? JSON.stringify({
+            headRefOid: head, state: "OPEN", reviews: [],
+            comments: prComments().map(c => ({ createdAt: c.postedAt.toISOString(), body: c.body })),
+          })
+          : execError({ stderr: "HTTP 503" }),
+      },
+      fsMap,
+      streamResult: () => streamResult({
+        runner: "codex", isError: true, terminalReason: "codex_blocked", sessionId: "codex-thread",
+        output: publishBlock, ...opts.stream,
+      }),
+    });
+    // The mock filesystem records writes without applying them; the sweep
+    // reads the pending state the dispatch wrote.
+    const sweepDeps: DispatchDeps = {
+      ...deps,
+      readFileSync: ((path: string, enc?: any) => {
+        const written = [...calls.fs].reverse().find(f => f.kind === "write" && f.path === String(path));
+        return written ? written.content : deps.readFileSync(path, enc);
+      }) as DispatchDeps["readFileSync"],
+    };
+    const run = () => withStageSet("builder", () => withVerifierGates("", () =>
+      dispatchToAgent(builderAgent("verifier"), makeProjectItem({ issueNumber: ISSUE, status: "In Code Review" }), client, deps)));
+    const sweep = () => withStageSet("builder", async () => {
+      await runPendingVerdictPublish(client, sweepDeps);
+      await runPendingDoneFinalize(client);
+    });
+    return {
+      client, calls, run, sweep, prComments,
+      moveHead: (sha: string) => { head = sha; },
+      setPrReadable: (v: boolean) => { prReadable = v; },
+      labels: () => client.labelsByIssue.get(ISSUE) ?? [],
+    };
+  }
+
+  const parkedAsToday = (f: ReturnType<typeof fixture>) => {
+    assert.ok(f.labels().includes("error:verifier"), "parks with error:verifier");
+    assert.ok(f.client.comments.some(c => c.issueNumber === ISSUE && c.body.includes("## ⚠️ Agent Error: verifier")));
+    assert.equal(f.prComments().length, 0, "nothing posted on the PR");
+    assert.ok(!f.labels().some(l => l.startsWith("done:") || l.startsWith("pending-")));
+  };
+
+  test("the prompt names the handoff file, and the dispatcher empties it before the run", async () => {
+    const f = fixture();
+    await f.run();
+    const path = verdictHandoffPath("verifier", ISSUE);
+    assert.ok(f.calls.fs.some(c => c.kind === "write" && c.path === path && c.content === ""), "emptied before spawn");
+    const prompt = f.calls.fs.find(c => c.kind === "write" && c.path.endsWith(`.prompt-${ISSUE}.txt`));
+    assert.ok(prompt?.content?.includes(path), "prompt names the handoff path");
+    assert.match(prompt!.content!, /Verdict handoff/);
+  });
+
+  test("PASS blocked on a GitHub publish failure: body posted once, done:verifier, no error label or Agent Error comment", async () => {
+    const f = fixture();
+    await f.run();
+    assert.equal(f.prComments().length, 1, "the saved body is posted once on the PR");
+    assert.match(f.prComments()[0]!.body, /^## Verifier Review: #1677/);
+    assert.match(f.prComments()[0]!.body, /pyry-verdict-handoff agent=verifier issue=1677/);
+    assert.ok(f.labels().includes("done:verifier"));
+    assert.ok(!f.client.addLabelCalls.some(c => c.label.startsWith("error:")));
+    assert.ok(!f.client.comments.some(c => c.body.includes("Agent Error")));
+    assert.ok(!f.labels().some(l => l.startsWith("pending-")));
+  });
+
+  test("FAIL: body posted, needs-rework:builder added, routed to the builder as a normal rework", async () => {
+    const f = fixture({ handoff: handoffFile("FAIL", "needs-rework:builder") });
+    await f.run();
+    assert.equal(f.prComments().length, 1);
+    assert.match(f.prComments()[0]!.body, /\*\*Decision: FAIL\*\*/);
+    assert.ok(f.labels().includes("needs-rework:builder"));
+    assert.ok(!f.labels().includes("done:verifier"), "a FAIL never adds done:verifier");
+    assert.ok(!f.labels().some(l => l.startsWith("error:")));
+    assert.ok(f.client.comments.some(c => c.issueNumber === ISSUE && c.body.includes("rework by **builder**")));
+    // The rework router's input: the ticket now reads as a builder rework.
+    const routes = decideReworkRoutes(
+      resolveStageSet("builder").columnByAgent,
+      new Map([["In Code Review", [{ ...makeProjectItem({ issueNumber: ISSUE, status: "In Code Review" }), labels: f.labels() }]]]),
+    );
+    assert.equal(routes[0]?.toColumn, "In Development");
+    assert.equal(routes[0]?.triggerLabel, "needs-rework:builder");
+  });
+
+  test("a Claude run that exits cleanly saying the post failed is recovered the same way", async () => {
+    const f = fixture({ stream: { runner: "claude", isError: false, terminalReason: "stop", output: "Verdict ready, but gh pr comment failed with HTTP 502 from GitHub. Saved to the handoff file." } });
+    await f.run();
+    assert.equal(f.prComments().length, 1);
+    assert.ok(f.labels().includes("done:verifier"));
+    assert.ok(!f.labels().some(l => l.startsWith("error:")));
+  });
+
+  describe("the dispatcher's own post fails too", () => {
+    for (const earlierLanded of [true, false]) {
+      test(`pending marker, no re-dispatch, next cycle completes it${earlierLanded ? " without a duplicate when the failed post actually landed" : ""}`, async () => {
+        const f = fixture();
+        f.client.failures.addComment = new Error("HTTP 503");
+        await f.run();
+        assert.ok(f.labels().includes("pending-verdict:verifier"), "held with a pending marker");
+        assert.ok(!f.labels().some(l => l.startsWith("error:") || l.startsWith("done:")));
+        assert.ok(shouldSkipDispatch(f.labels(), "verifier"), "the pending marker stops a re-dispatch");
+        assert.ok(f.calls.fs.some(c => c.kind === "write" && c.path === pendingVerdictStatePath("verifier", ISSUE)));
+        // MockGitHubClient records a comment before throwing: that is a
+        // write GitHub reported as failed but stored.
+        if (!earlierLanded) f.client.comments = f.client.comments.filter(c => c.issueNumber !== PR);
+
+        if (!earlierLanded) {
+          // Still down next cycle: nothing changes.
+          await f.sweep();
+          assert.ok(f.labels().includes("pending-verdict:verifier"));
+        }
+
+        delete f.client.failures.addComment;
+        await f.sweep();
+        assert.equal(f.prComments().length, 1, "exactly one verdict on the PR");
+        assert.ok(f.labels().includes("done:verifier"));
+        assert.ok(!f.labels().some(l => l.startsWith("pending-") || l.startsWith("error:")));
+      });
+    }
+
+    test("an unreadable PR on the first attempt waits instead of parking, and posts once it reads", async () => {
+      const f = fixture();
+      f.setPrReadable(false);
+      await f.run();
+      assert.ok(f.labels().includes("pending-verdict:verifier"));
+      assert.ok(!f.labels().some(l => l.startsWith("error:")));
+      f.setPrReadable(true);
+      await f.sweep();
+      assert.equal(f.prComments().length, 1);
+      assert.ok(f.labels().includes("done:verifier"));
+    });
+
+    test("a FAIL completed on a later cycle leaves the rework label and no done label", async () => {
+      const f = fixture({ handoff: handoffFile("FAIL", "needs-rework:builder") });
+      f.client.failures.addComment = new Error("HTTP 503");
+      await f.run();
+      f.client.comments = f.client.comments.filter(c => c.issueNumber !== PR);
+      delete f.client.failures.addComment;
+      await f.sweep();
+      assert.equal(f.prComments().length, 1);
+      assert.ok(f.labels().includes("needs-rework:builder"));
+      assert.ok(!f.labels().some(l => l.startsWith("done:") || l.startsWith("pending-")));
+    });
+
+    test("the head moving while it waits parks the ticket on the next cycle", async () => {
+      const f = fixture();
+      f.client.failures.addComment = new Error("HTTP 503");
+      await f.run();
+      f.client.comments = f.client.comments.filter(c => c.issueNumber !== PR);
+      delete f.client.failures.addComment;
+      f.moveHead(MOVED);
+      await f.sweep();
+      assert.ok(f.labels().includes("error:verifier"));
+      assert.ok(!f.labels().includes("pending-verdict:verifier"));
+      assert.equal(f.prComments().length, 0);
+      assert.ok(f.client.comments.some(c => c.issueNumber === ISSUE && /head moved/.test(c.body)));
+    });
+
+    test("a lost pending state parks instead of waiting forever", async () => {
+      const client = new MockGitHubClient({
+        items: [{ issueNumber: ISSUE, status: "In Code Review", labels: ["pending-verdict:verifier"], state: "OPEN" }],
+      });
+      const { deps } = makeMockDeps({});
+      await withStageSet("builder", () => runPendingVerdictPublish(client, deps));
+      const labels = client.labelsByIssue.get(ISSUE) ?? [];
+      assert.ok(labels.includes("error:verifier"));
+      assert.ok(!labels.includes("pending-verdict:verifier"));
+    });
+  });
+
+  describe("parks as error:<agent> exactly as today", () => {
+    test("the reviewed commit differs from the PR head", async () => {
+      const f = fixture({ head: MOVED });
+      await f.run();
+      parkedAsToday(f);
+    });
+
+    test("no handoff file was saved", async () => {
+      const f = fixture({ handoff: null });
+      await f.run();
+      parkedAsToday(f);
+    });
+
+    test("the handoff is incomplete", async () => {
+      for (const handoff of ["", `decision: PASS\n---\n## Verifier Review`, handoffFile("FAIL")]) {
+        const f = fixture({ handoff });
+        await f.run();
+        parkedAsToday(f);
+      }
+    });
+
+    test("the block is not about publishing", async () => {
+      const f = fixture({ stream: { output: "The review needs a human decision on whether the new layout is intended." } });
+      await f.run();
+      parkedAsToday(f);
+    });
+
+    test("an approval rejection, even beside publish wording", async () => {
+      const f = fixture({ stream: { hadPermissionDenial: true } });
+      await f.run();
+      parkedAsToday(f);
+    });
   });
 });

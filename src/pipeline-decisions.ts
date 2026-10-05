@@ -1082,9 +1082,9 @@ export interface DoneCleanup {
  *
  * Strips:
  *   - any `done:`/`wip:`/`error:`/`needs-rework:` label (`isPipelineLabel`)
- *   - any `rework-count:N` label (counter — reset so a re-opened ticket
- *     starts fresh rather than carrying stale rounds toward the loop
- *     threshold)
+ *   - any `rework-count:N` or `rework-other:N` label (counters — reset so
+ *     a re-opened ticket starts fresh rather than carrying stale rounds
+ *     toward the loop cap)
  *   - any `family-dispatches:N` convenience counter (the durable family
  *     tally lives in the root's marker comments, so the board copy can
  *     go; a family whose root reaches Done and later re-opens should not
@@ -1127,6 +1127,7 @@ export function decideDoneCleanup(
       l => l !== FAMILY_BREAKER_LABEL
         && (isPipelineLabel(l)
           || l.startsWith("rework-count:")
+          || l.startsWith(REWORK_OTHER_PREFIX)
           || l.startsWith(ERROR_RETRY_COUNT_PREFIX)
           || l.startsWith(FAMILY_DISPATCH_COUNT_PREFIX)),
     );
@@ -1787,12 +1788,16 @@ export function decideFamilyBreaker(opts: {
 //   pending-done:<agent> — agent succeeded but the post-run column read
 //                          failed; the next board read finishes the
 //                          decision (see decidePendingDoneFinalizations)
+//   pending-verdict:<agent> — agent finished a verdict GitHub would not
+//                          take; the dispatcher posts the saved verdict on
+//                          a later cycle (see verdict-handoff.ts)
 export const PIPELINE_LABEL_PREFIXES = [
   "done:",
   "needs-rework:",
   "wip:",
   "error:",
   "pending-done:",
+  "pending-verdict:",
 ] as const;
 
 export const PENDING_DONE_PREFIX = "pending-done:";
@@ -1972,19 +1977,50 @@ export function extractReworkTarget(label: string): string | null {
 // --------- Rework loop circuit-breaker ---------
 
 /**
- * Number of rework rounds a single ticket can absorb before the dispatcher
- * halts dispatch and adds `error:rework-loop`. Adjusting this is a
- * deliberate policy change — see the test in lib.test.ts that locks the
- * default to 3.
+ * Hard cap on builder reworks: a ticket whose `rework-count:N` has reached
+ * this many is parked with `error:rework-loop` instead of being sent back
+ * again, so the route that would pass the cap parks. Overridden per fork by
+ * `PYRY_BUILDER_REWORK_CAP` (`resolveReworkLoopCap`). Adjusting the default
+ * is a deliberate policy change — see the test in lib.test.ts that locks it
+ * to 6.
  *
- * Why 3: the typical legitimate rework cycle is one round (agent finds
- * issue, routes back, fix lands, advances). A second round means the
- * fix wasn't right. A third round is unusual but defensible. A fourth
- * round is the loop pattern Pyrycode #41 hit (6 dispatches, ~$4
- * burned, dev agent self-halted by intelligence rather than structure).
- * Halting at 3 catches genuine loops well before they accumulate cost.
+ * Only reworks routed to the code owner count (`needs-rework:builder` in the
+ * builder set, `needs-rework:developer` in classic). Every other rework route
+ * bumps `rework-other:N`, which never trips the breaker, and merge handoffs
+ * and blocker waits count nothing. On a verifier → builder route a
+ * `[MUST FIX]` finding repeated across the last two FAIL verdicts parks at
+ * once, whatever the count (`findRepeatedMustFix`); the cap is the backstop
+ * for steady progress that never converges. See `decideReworkBreaker`.
+ *
+ * Why the change (agent-dispatcher#122, 2026-10-05): until then every rework
+ * route counted and the breaker parked at 3. Mobile #1782 was parked while
+ * the verifier named different defects each round and the builder fixed
+ * each set; once restarted the next round passed. #1735 and #1797 reached
+ * the limit on documentation-to-verifier routes, not builder defects. A real
+ * loop is the same finding raised again, which the count alone cannot see.
+ * The original reason for a breaker stands: Pyrycode #41 hit 6
+ * dev↔architect rounds before the dev agent self-halted by intelligence
+ * rather than structure.
  */
-export const REWORK_LOOP_THRESHOLD = 3;
+export const REWORK_LOOP_THRESHOLD = 6;
+
+/** Counter for rework routes that are not the code owner's. Never trips the
+ *  breaker; kept so a ticket shows how often it bounced. */
+export const REWORK_OTHER_PREFIX = "rework-other:";
+
+/** Max of every `<prefix>N` label; malformed or negative values read as 0. */
+function maxCounterLabel(labels: string[], prefix: string): number {
+  let max = 0;
+  for (const label of labels) {
+    if (!label.startsWith(prefix)) continue;
+    const tail = label.slice(prefix.length);
+    if (tail.length === 0) continue;
+    const n = parseInt(tail, 10);
+    if (isNaN(n) || n < 0) continue;
+    if (n > max) max = n;
+  }
+  return max;
+}
 
 /**
  * Read the current rework count from a ticket's labels. Looks for any
@@ -1997,17 +2033,47 @@ export const REWORK_LOOP_THRESHOLD = 3;
  * treating them as 0. Negative values are treated as invalid.
  */
 export function extractReworkCount(labels: string[]): number {
-  const prefix = "rework-count:";
-  let max = 0;
-  for (const label of labels) {
-    if (!label.startsWith(prefix)) continue;
-    const tail = label.slice(prefix.length);
-    if (tail.length === 0) continue;
-    const n = parseInt(tail, 10);
-    if (isNaN(n) || n < 0) continue;
-    if (n > max) max = n;
-  }
-  return max;
+  return maxCounterLabel(labels, "rework-count:");
+}
+
+/** `rework-other:N`, read the same way as `extractReworkCount`. */
+export function extractReworkOtherCount(labels: string[]): number {
+  return maxCounterLabel(labels, REWORK_OTHER_PREFIX);
+}
+
+/**
+ * Parse `PYRY_BUILDER_REWORK_CAP`. Unset, zero, negative or garbage keeps
+ * `REWORK_LOOP_THRESHOLD`: a cap of 0 would park every builder rework.
+ */
+export function resolveReworkLoopCap(raw: string | undefined): number {
+  if (!raw) return REWORK_LOOP_THRESHOLD;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : REWORK_LOOP_THRESHOLD;
+}
+
+export type ReworkBreakerDecision =
+  | { park: false }
+  | { park: true; rule: "repeat"; keys: string[] }
+  | { park: true; rule: "cap"; cap: number };
+
+/**
+ * The rework breaker for one route. `counted` is whether the route is the
+ * code owner's rework; anything else never parks. A repeated verifier finding
+ * parks at once and wins over the cap, so the comment can name it. Otherwise
+ * the route parks when the ticket already has `hardCap` builder reworks.
+ * `repeatedKeys` is empty when the verdicts were not read, could not be read
+ * or did not parse, which leaves the count rule alone in charge.
+ */
+export function decideReworkBreaker(input: {
+  counted: boolean;
+  reworkCount: number;
+  hardCap: number;
+  repeatedKeys: readonly string[];
+}): ReworkBreakerDecision {
+  if (!input.counted) return { park: false };
+  if (input.repeatedKeys.length > 0) return { park: true, rule: "repeat", keys: [...input.repeatedKeys] };
+  if (input.reworkCount >= input.hardCap) return { park: true, rule: "cap", cap: input.hardCap };
+  return { park: false };
 }
 
 /**
@@ -2330,15 +2396,25 @@ export const BLOCKED_NEVER_RETRY = /\bapproval\b|unacceptable risk|permission de
  * errors. A tool that stays missing parks at the cap, as before, about 75
  * minutes later instead of at once.
  *
+ * One more kind retries: Codex's automatic approval reviewer failed to
+ * decide, because its own model was at capacity or it missed its deadline,
+ * and Codex said this is not a rejection (`approvalReviewFailed`,
+ * pyrycode-mobile #1582 and #1655, 2026-10-05). A rejection alongside it
+ * still parks.
+ *
  * Separate from `classifyAgentError` because a blocked summary is the agent's
  * own prose. The transport allowlist must never read it: a blocked summary
  * mentioning "connection reset" is still a block (see dispatch.test.ts).
  */
 export function classifyBlockedRun(
   text: string | null | undefined,
-  opts?: { approvalRejected?: boolean },
+  opts?: { approvalRejected?: boolean; approvalReviewFailed?: boolean },
 ): { transient: boolean; signature: string } {
-  if (!text || opts?.approvalRejected) return { transient: false, signature: "" };
+  if (opts?.approvalRejected) return { transient: false, signature: "" };
+  // Before BLOCKED_NEVER_RETRY: the summary of such a block always says
+  // "approval". The flag comes from Codex's own words, not the summary.
+  if (opts?.approvalReviewFailed) return { transient: true, signature: "approval review failed" };
+  if (!text) return { transient: false, signature: "" };
   if (BLOCKED_NEVER_RETRY.test(text)) return { transient: false, signature: "" };
   for (const entry of BLOCKED_RETRY_PATTERNS) {
     if (entry.pattern.test(text)) return { transient: true, signature: entry.signature };
