@@ -602,3 +602,11 @@ Before the next run, the dispatcher moves such a leftover aside to a
 `stale-<name>-<stamp>` sibling with `git worktree move`, keeping every file,
 and then creates a fresh worktree. After a run, removal stays ordinary, so a
 finished run's captures remain at their path for the implementation role.
+
+## Builder live-test account
+
+`PYRY_DEV_AGENTS_TOKEN` is an optional `op://Automation/Service Account Auth Token: Dev Agents/credential` reference resolved at dispatcher start. It must identify the separate service account that can read only the Dev agents vault. Never configure it with the Automation account token.
+
+The spawn scrubber removes both account variables. For builders alone, it maps this restricted token to `OP_SERVICE_ACCOUNT_TOKEN`. Other roles receive neither account. The non-secret `PYRY_AGENT_SHELL_ENV` filter still refuses secret names. Codex builders inherit the restricted account through a names-only shell allowlist, never through a secret value in arguments.
+
+Mobile's `scripts/android-test-gate.py live --tests "Class#method"` fetches its own child login. Go and Desktop repairs use `python3 "$AGENTS_REPO_PATH/dispatcher/scripts/live-claude-gate.py" go --tests "^TestName$"` or `desktop --spec e2e/real-name.spec.ts --tests "test title"`. Run from the product worktree. Build Desktop first. These launchers fetch `op://Dev agents/Claude long term token/password` with the restricted account and remove account credentials from test children. Missing access is an environment error. A zero-test run fails. Record the executed and passed counts. Full-suite runs remain dispatcher work.

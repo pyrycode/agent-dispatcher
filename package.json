@@ -9,7 +9,7 @@
     "watch": "tsx --watch src/dispatch-bin.ts",
     "test": "tsx --test src/*.test.ts src/eval/*.test.ts",
     "typecheck": "tsc --noEmit -p .",
-    "test:helpers": "python3 -m unittest discover -s codex-helpers -p 'test_*.py'",
+    "test:helpers": "python3 -m unittest discover -s codex-helpers -p 'test_*.py' && python3 -m unittest discover -s scripts -p 'test_*.py'",
     "eval:report": "tsx src/eval/report.ts",
     "drain": "pkill -TERM -f 'tsx.*src/dispatch-bin\\.ts' && echo 'SIGTERM sent — dispatcher will exit after current dispatch completes.'"
   },

@@ -115,6 +115,8 @@ export function buildCodexInvocation(opts: {
   cwd: string; role: string; model: string; effort: string; bin?: string; agentsRepoPath?: string; sourceReview?: boolean;
   /** Non-secret settings for tool commands, from `resolveAgentShellEnv`. */
   shellEnv?: Readonly<Record<string, string>>;
+  /** Names-only inheritance for the builder's restricted live-test account. */
+  builderLiveTests?: boolean;
 }): { bin: string; args: string[] } {
   // The read-only source reviewer runs with --ignore-user-config, so the
   // user's core-only shell policy does not apply to it and it builds
@@ -149,6 +151,17 @@ export function buildCodexInvocation(opts: {
       // The fork's PYRY_AGENT_SHELL_ENV allowlist, the same way: named,
       // non-secret settings such as ANDROID_HOME, never the whole env.
       ...shellEnv.flatMap(([name, value]) => ["-c", `shell_environment_policy.set.${name}=${JSON.stringify(value)}`]),
+      // A value in `set` would put the secret in argv and logs. Inherit only
+      // core shell names, explicit non-secret settings and the restricted
+      // account. The spawn scrubber removed Automation before this point.
+      ...(!opts.sourceReview && opts.builderLiveTests ? [
+        "-c", 'shell_environment_policy.inherit="all"',
+        "-c", "shell_environment_policy.ignore_default_excludes=true",
+        "-c", `shell_environment_policy.include_only=${JSON.stringify([
+          "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_*", "TERM", "TMPDIR", "TMP", "TEMP",
+          "AGENTS_REPO_PATH", ...shellEnv.map(([name]) => name), "OP_SERVICE_ACCOUNT_TOKEN",
+        ])}`,
+      ] : []),
       ...(opts.model ? ["--model", opts.model] : []),
       ...(opts.effort ? ["-c", `model_reasoning_effort=${JSON.stringify(opts.effort)}`] : []),
       "-",

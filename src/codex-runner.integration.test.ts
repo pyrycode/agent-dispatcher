@@ -4,6 +4,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runClaudeStreaming } from "./dispatch.js";
+import { agentSpawnEnv } from "./agent-runtime.js";
 
 // Exercise the real detached child, stdin, JSONL buffering and close handlers.
 // This executable never contacts a model, repository or board.
@@ -15,7 +16,7 @@ process.stdin.on('data', chunk => { input += chunk; });
 process.stdin.on('end', async () => {
   fs.writeFileSync('observed.json', JSON.stringify({
     argv: process.argv.slice(2), input, cwd: process.cwd(), pid: process.pid,
-    credentialKeys: Object.keys(process.env).filter(key => /^(ANTHROPIC_|CLAUDE_CODE_)/.test(key) || key === 'CLAUDE_CONFIG_DIR'),
+    credentialKeys: Object.keys(process.env).filter(key => /^(ANTHROPIC_|CLAUDE_CODE_)/.test(key) || key === 'CLAUDE_CONFIG_DIR' || key === 'OP_SERVICE_ACCOUNT_TOKEN' || key === 'PYRY_DEV_AGENTS_TOKEN'),
     ordinary: process.env.TEST_ORDINARY
   }));
   if (process.env.TEST_MODE === 'agents-path') {
@@ -299,4 +300,24 @@ test("Codex grace still stops at the hard ceiling", { timeout: 30000 }, async t 
   assert.equal(result.isError, true);
   assert.ok(Date.now() - start < 9000, "stopped at the ceiling, not after the command reported its wait");
   assert.match(readFileSync(f.options.logFile, "utf8"), /hard ceiling reached/);
+});
+
+
+test("builder account travels in environment only, no other role gets it", async t => {
+  for (const role of ["builder", "verifier", "refiner", "documentation"]) {
+    const f = fixture(t, "normal");
+    const result = await runClaudeStreaming({ ...f.options, env: agentSpawnEnv({
+      ...f.options.env, OP_SERVICE_ACCOUNT_TOKEN: "automation-fixture", PYRY_DEV_AGENTS_TOKEN: "restricted-fixture",
+    }, role) });
+    assert.equal(result.isError, false);
+    const observed = JSON.parse(readFileSync(join(f.dir, "observed.json"), "utf8"));
+    assert.deepEqual(observed.credentialKeys, role === "builder" ? ["OP_SERVICE_ACCOUNT_TOKEN"] : []);
+    const args = observed.argv.join(" ");
+    assert.equal(args.includes("restricted-fixture"), false);
+    assert.equal(args.includes("automation-fixture"), false);
+    assert.equal(args.includes("shell_environment_policy.include_only="), role === "builder");
+    const log = readFileSync(f.options.logFile, "utf8");
+    assert.equal(log.includes("restricted-fixture"), false);
+    assert.equal(log.includes("automation-fixture"), false);
+  }
 });
