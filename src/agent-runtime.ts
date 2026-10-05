@@ -774,6 +774,8 @@ export const SPAWN_ENV_DENYLIST: ReadonlySet<string> = new Set([
   "DISCORD_WEBHOOK_URL",
   "PYRY_MAX_CONCURRENT",
   "TARGET_REPO_PATH",
+  "OP_SERVICE_ACCOUNT_TOKEN", // Automation account: never hand it to agents.
+  "PYRY_DEV_AGENTS_TOKEN", // Explicit builder-only exception below.
 ]);
 
 /**
@@ -787,6 +789,19 @@ export function scrubSpawnEnv(parentEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     out[key] = value;
   }
   return out;
+}
+
+/**
+ * The sole secret exception: builders may fetch a live-test login through
+ * the restricted Dev Agents account. The Automation account is always
+ * scrubbed first. No other role receives either service-account token.
+ * Keep this separate from the non-secret PYRY_AGENT_SHELL_ENV allowlist.
+ */
+export function agentSpawnEnv(parentEnv: NodeJS.ProcessEnv, role: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...scrubSpawnEnv(parentEnv), CLAUDE_CODE_ENTRYPOINT: role };
+  const token = parentEnv.PYRY_DEV_AGENTS_TOKEN;
+  if (role === "builder" && token?.trim()) env.OP_SERVICE_ACCOUNT_TOKEN = token;
+  return env;
 }
 
 // --------- Spawn retry on transient resource exhaustion ---------

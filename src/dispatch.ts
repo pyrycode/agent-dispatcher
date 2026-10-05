@@ -65,6 +65,7 @@ import {
   ResourceExhaustedError,
   retrySpawnOnTransientError,
   scrubSpawnEnv,
+  agentSpawnEnv,
   shouldAttemptSafeSalvage,
   shouldUseWorktree,
   findReadyPrNumber,
@@ -806,7 +807,8 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
       ({ bin, args } = buildCodexInvocation({ cwd: opts.cwd, role: readFileSync(opts.systemPromptFile, "utf8") + (opts.sourceReview ? "" : CODEX_ROLE_GUIDANCE), model: opts.model, effort: opts.effort, bin: opts.env.PYRY_CODEX_BIN, agentsRepoPath: opts.env.AGENTS_REPO_PATH, sourceReview: opts.sourceReview,
         // Resolved from the env Codex itself gets, so nothing withheld from
         // Codex can come back through the allowlist.
-        shellEnv: resolveAgentShellEnv(codexChildEnv(opts.env)) }));
+        shellEnv: resolveAgentShellEnv(codexChildEnv(opts.env)),
+        builderLiveTests: opts.env.CLAUDE_CODE_ENTRYPOINT === "builder" && Boolean(opts.env.OP_SERVICE_ACCOUNT_TOKEN?.trim()) }));
     } else if (opts.sourceReview) {
       if (!opts.sourceReviewRoot) throw new Error("Claude source review requires an explicit source root");
       ({ bin, args } = buildClaudeSourceReviewInvocation({ root: opts.sourceReviewRoot, model: opts.model, effort: opts.effort, maxTurns: opts.maxTurns, systemPromptFile: opts.systemPromptFile }));
@@ -3312,7 +3314,7 @@ export async function prepareAgentSpawn(
       // before handing the env to the spawned agent — claude has its own
       // gh-auth credential store and doesn't need ours. See
       // `SPAWN_ENV_DENYLIST` in lib.ts for the full list + rationale.
-      env: { ...scrubSpawnEnv(process.env), CLAUDE_CODE_ENTRYPOINT: agent.name } as NodeJS.ProcessEnv,
+      env: agentSpawnEnv(process.env, agent.name),
     },
   };
 }
