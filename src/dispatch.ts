@@ -8,7 +8,7 @@ import { config } from "dotenv";
 import { DispatchPool, candidateKey, excludeInFlight, freeSeats, resolvePollIntervalMs } from "./dispatch-pool.js";
 import { countVerdictsSince, parseVerdictArtifacts, pickVerdictPr, shouldFlagMissingVerdict } from "./verdict-guard.js";
 import { countOpenPrs, shouldFlagMissingPr } from "./pr-guard.js";
-import { PENDING_VERDICT_PREFIX, decideVerdictRecovery, handoffMarker, isVerdictPublishFailure, parsePendingVerdictState, parsePrVerdictView, parseVerdictHandoff, serializePendingVerdictState, verdictHandoffNote, type HandoffParse, type PendingVerdictState, type VerdictPrLookup } from "./verdict-handoff.js";
+import { PENDING_VERDICT_PREFIX, REREVIEW_PATCH_CAP, decideVerdictRecovery, handoffMarker, isVerdictPublishFailure, parseLastVerdict, parsePendingVerdictState, parsePrVerdictView, parseVerdictHandoff, reReviewNote, serializeLastVerdict, serializePendingVerdictState, verdictHandoffNote, type HandoffParse, type PendingVerdictState, type VerdictHandoff, type VerdictPrLookup } from "./verdict-handoff.js";
 import { resolveImportOnlyMerge } from "./merge-resolve.js";
 import { FINAL_MERGE_HANDOFF_MARKER, FINAL_MERGE_HANDOFF_MAX, MERGE_HANDOFF_LABEL, checkMergeResolution, decideConflictRoute, decideFinalMergeRoute, findMergeCommit, mergeHandoffNote, mergeResolutionComment, mergeResolutionSection, readPendingMerge, type PendingMerge, type ResolutionNote } from "./merge-handoff.js";
 
@@ -2400,6 +2400,12 @@ export function pendingVerdictStatePath(agentName: string, issueNumber: number):
   return resolve(LOGS_DIR, `verdict-pending-${agentName}-${issueNumber}.json`);
 }
 
+/** Where the dispatcher keeps the ticket's last complete verdict, for the
+ *  next re-review (#135). Its own logs folder, like the pending state. */
+export function lastVerdictPath(agentName: string, issueNumber: number): string {
+  return resolve(LOGS_DIR, `verdict-last-${agentName}-${issueNumber}.json`);
+}
+
 /**
  * Path of a dispatcher-owned worktree. Every board's dispatcher shares the
  * `.pyrycode-worktrees` folder beside its repository, and ticket numbers
@@ -2474,8 +2480,9 @@ export async function dispatchToAgent(
   const gates = parallelReview ? { promptNote: "" } : await maybeRunPreSpawnGates(ctx);
 
   const mergeNote = ctx.pendingMerge ? mergeHandoffNote(defaultBranch, ctx.pendingMerge.paths) : "";
+  const reReview = prepareReReviewNote(ctx);
   const handoffNote = prepareVerdictHandoff(ctx);
-  const spawn = await prepareAgentSpawn(ctx, gates.promptNote + mergeNote + handoffNote);
+  const spawn = await prepareAgentSpawn(ctx, gates.promptNote + mergeNote + reReview + handoffNote);
   if (!spawn.ok) return;
 
   // streamResult is declared outside the try so handleDispatchError
@@ -2484,7 +2491,7 @@ export async function dispatchToAgent(
   let saferSalvaged = false;
   try {
     streamResult = parallelReview
-      ? await runParallelVerifierReview(ctx, spawn)
+      ? await runParallelVerifierReview(ctx, spawn, reReview !== "")
       : await ctx.deps.runClaudeStreaming(spawn.config);
     // Budget-exhausted runs may get a same-session continuation leg
     // (PYRY_RESUME_LEGS, default 1) before any salvage. A success comes
@@ -3581,6 +3588,8 @@ export function finalReviewBudgetMs(timeoutMs: number, sourceReviewMs: number): 
 async function runParallelVerifierReview(
   ctx: DispatchContext,
   spawn: { config: SpawnConfig; promptText: string; systemPrompt: string },
+  /** The prompt carries a re-review section (#135). */
+  reReview = false,
 ): Promise<StreamResult> {
   const { config, promptText } = spawn;
   const sourcePromptFile = config.promptFile + ".source.txt";
@@ -3605,7 +3614,9 @@ async function runParallelVerifierReview(
   const criteria = ctx.deps.existsSync(criteriaPath) ? ctx.deps.readFileSync(criteriaPath, "utf-8") : null;
   const sourceInstructions = [
     "You are the first of two reviewers on this pull request. Automated checks are running at the same time. Your job is to find the problems in this change so the final verifier can confirm them and publish one verdict.",
-    "You are done when every changed section has been judged with enough of the surrounding code to know whether it is correct. Read as much context as each change needs. You do not need to read every affected file from end to end. Review the entire diff on rework too, together with the local plan and the repository instructions.",
+    "You are done when every changed section has been judged with enough of the surrounding code to know whether it is correct. Read as much context as each change needs. You do not need to read every affected file from end to end. " + (reReview
+      ? "The prompt has a Re-review after FAIL section: check each finding of the previous verdict and review the commits since it, together with the local plan and the repository instructions. Review the rest of the diff only when that section says the change is broad."
+      : "Review the entire diff on rework too, together with the local plan and the repository instructions."),
     `The source worktree is ${JSON.stringify(ctx.agentCwd)}. Your working directory is isolated. ` + (isClaude
       ? "The complete merge-base diff is supplied in the prompt. Use Read, Glob and Grep to inspect files. Read large files in ranges with an offset and limit."
       : `Use git -C with this absolute path and compare against ${JSON.stringify(defaultBranch)} using the merge base. Command output longer than about 10000 tokens is cut in the middle, so read large files one range at a time, for example with sed -n, and reread any range that came back cut.`),
@@ -4099,6 +4110,75 @@ function prepareVerdictHandoff(ctx: DispatchContext): string {
     console.warn(`   ⚠️  Could not prepare the verdict handoff file ${path}: ${e}`);
   }
   return verdictHandoffNote(path);
+}
+
+/** Keep a complete verdict as the ticket's last one (#135). A failure only
+ *  costs the next re-review its narrowing. */
+function writeLastVerdict(
+  deps: Pick<DispatchDeps, "mkdirSync" | "writeFileSync">,
+  agentName: string,
+  issueNumber: number,
+  handoff: VerdictHandoff,
+): void {
+  const path = lastVerdictPath(agentName, issueNumber);
+  try {
+    deps.mkdirSync(dirname(path), { recursive: true });
+    deps.writeFileSync(path, serializeLastVerdict(handoff, new Date().toISOString()));
+  } catch (e) {
+    console.warn(`   ⚠️  Could not keep the last verdict for #${issueNumber} at ${path}: ${e}`);
+  }
+}
+
+/** After a verdict run that ended with a verdict: copy a complete handoff to
+ *  the ticket's last verdict. Missing or incomplete leaves the old one. */
+function recordLastVerdict(ctx: DispatchContext): void {
+  const path = ctx.verdictHandoffPath;
+  if (!path) return;
+  let handoff: HandoffParse;
+  try {
+    handoff = parseVerdictHandoff(String(ctx.deps.readFileSync(path, "utf-8")));
+  } catch {
+    return;
+  }
+  if (handoff.ok) writeLastVerdict(ctx.deps, ctx.agent.name, ctx.item.issueNumber, handoff.handoff);
+}
+
+/**
+ * The re-review section for a verifier dispatch (#135), or "" for a full
+ * review. Applies when the ticket's last verdict is a FAIL whose reviewed
+ * commit is an ancestor of the pushed feature branch head. The head is
+ * `origin/<branch>`, not the worktree HEAD, which may carry a fresh merge
+ * of the default branch. `--no-merges` keeps main's changes out of the log.
+ * Any git failure means no section.
+ */
+function prepareReReviewNote(ctx: DispatchContext): string {
+  const { agent, item } = ctx;
+  if (item.issueNumber <= 0 || !ctx.useWorktree) return "";
+  if (activeStageSet().preSpawnGate?.agentNames.has(agent.name) !== true) return "";
+  let last: ReturnType<typeof parseLastVerdict>;
+  try {
+    last = parseLastVerdict(String(ctx.deps.readFileSync(lastVerdictPath(agent.name, item.issueNumber), "utf-8")));
+  } catch {
+    return "";
+  }
+  if (last === null || last.decision !== "FAIL") return "";
+  const git = (args: string[]): string | null => {
+    const r = ctx.deps.spawnSync("git", args, { cwd: ctx.agentCwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+    return r.error || r.status !== 0 ? null : String(r.stdout ?? "");
+  };
+  const head = git(["rev-parse", "--verify", `origin/${ctx.branchName}^{commit}`])?.trim().toLowerCase() ?? "";
+  if (!/^[0-9a-f]{40}$/.test(head)) return "";
+  if (git(["merge-base", "--is-ancestor", last.commit, head]) === null) return "";
+  const range = `${last.commit}..${head}`;
+  const patch = git(["log", "-p", "--no-merges", "--no-ext-diff", range]);
+  if (patch === null) return "";
+  let stat: string | null = null;
+  if (patch.length > REREVIEW_PATCH_CAP) {
+    stat = git(["log", "--no-merges", "--stat", "--format=%h %s", range]);
+    if (stat === null) return "";
+  }
+  console.log(`   🔁 Re-review after FAIL on ${last.commit.slice(0, 12)}: ${stat === null ? "narrowed to the commits since" : "broad change, full review"}`);
+  return reReviewNote({ body: last.body, reviewed: last.commit, head, patch: stat === null ? patch : null, stat });
 }
 
 /** Find the ticket's PR and read its head and every review and comment. */
@@ -4607,6 +4687,7 @@ export async function handlePostRun(
       }
       return { ok: false };
     }
+    recordLastVerdict(ctx);
   }
 
   // Post-success labeling
@@ -5611,7 +5692,7 @@ export async function runStrandedWipSweep(
  */
 export async function runPendingVerdictPublish(
   client: DispatchClient,
-  deps: Pick<DispatchDeps, "execSync" | "readFileSync" | "notifyDiscord"> = DEFAULT_DEPS,
+  deps: Pick<DispatchDeps, "execSync" | "readFileSync" | "writeFileSync" | "mkdirSync" | "notifyDiscord"> = DEFAULT_DEPS,
 ): Promise<void> {
   let items: ProjectItem[];
   try {
@@ -5658,6 +5739,7 @@ export async function runPendingVerdictPublish(
         console.warn(`   ⏸️  Pending verdict on #${item.issueNumber}: ${published.why}; retrying next cycle`);
         continue;
       }
+      writeLastVerdict(deps, agentName, item.issueNumber, state.handoff);
       // pending-done first, so the ticket is never without a label that
       // stops a re-dispatch of the agent.
       try {
