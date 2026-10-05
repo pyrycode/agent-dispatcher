@@ -23,10 +23,11 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { homedir, tmpdir } from "node:os";
 
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -55,6 +56,8 @@ import {
   runPendingDoneFinalize,
   runPendingVerdictPublish,
   verdictHandoffPath,
+  verdictHandoffDir,
+  installedHelperHome,
   pendingVerdictStatePath,
   lastVerdictPath,
   reworkAnswersPath,
@@ -11155,5 +11158,88 @@ describe("re-review after FAIL (#135)", () => {
         });
       });
     }
+  });
+});
+
+describe("verdict handoff lands where the pipeline helper accepts it (desktop #1721)", () => {
+  const helpers = fileURLToPath(new URL("../codex-helpers/", import.meta.url));
+  /** Run Python against codex-helpers: the installer's own render, or the rendered helper's body check. */
+  const python = (code: string, ...args: string[]) => spawnSync("python3", ["-c", code, ...args], { encoding: "utf8" });
+  const LOAD = "import importlib.machinery, importlib.util, sys\n" +
+    "def load(path, name):\n" +
+    "    loader = importlib.machinery.SourceFileLoader(name, path)\n" +
+    "    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))\n" +
+    "    loader.exec_module(module)\n" +
+    "    return module\n";
+
+  /** A container-like machine: the dispatcher's home has no helper; the
+   *  installer's home, as written into the helper, has one. */
+  function machine(t: any, pipeline = "pyrycode-desktop") {
+    // Real paths: the helper refuses to follow a link, and macOS's tmp is one.
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "helper-home-")));
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    const running = join(root, "home", "agent");
+    const installed = join(root, "Users", "juhanailmoniemi");
+    mkdirSync(running, { recursive: true });
+    mkdirSync(join(installed, ".codex", "bin"), { recursive: true });
+    const helper = join(installed, ".codex", "bin", `${pipeline}-pipeline-action`);
+    const rendered = python(LOAD + "from pathlib import Path\n" +
+      "install = load(sys.argv[1] + 'install', 'install')\n" +
+      "Path(sys.argv[2]).write_text(install.render(sys.argv[3], Path(sys.argv[4])))\n", helpers, helper, pipeline, installed);
+    assert.equal(rendered.status, 0, rendered.stderr);
+    return { root, running, installed, helper };
+  }
+
+  /** The rendered helper's own body-file check on `path`. */
+  function helperReads(helper: string, path: string) {
+    return python(LOAD + "m = load(sys.argv[1], 'helper')\n" +
+      "try:\n    print(m.body(sys.argv[2]), end='')\nexcept ValueError as e:\n    print(e, file=sys.stderr); sys.exit(1)\n", helper, path);
+  }
+
+  test("the installed helper's home wins over the dispatcher's own, and the helper accepts the handoff there", (t) => {
+    const m = machine(t);
+    const home = installedHelperHome("pyrycode-desktop", [m.running, m.installed]);
+    assert.equal(home, m.installed);
+    const handoff = resolve(home!, ".codex/publish", "pyrycode-desktop", "verdict-handoff", "verifier-1721.md");
+    mkdirSync(dirname(handoff), { recursive: true });
+    writeFileSync(handoff, "decision: PASS\n---\nverdict\n");
+    const read = helperReads(m.helper, handoff);
+    assert.equal(read.status, 0, read.stderr);
+    assert.match(read.stdout, /decision: PASS/);
+
+    // The old folder, under the dispatcher's own home, is what #1721's helper refused.
+    const old = resolve(m.running, ".codex/publish", "pyrycode-desktop", "verdict-handoff", "verifier-1721.md");
+    mkdirSync(dirname(old), { recursive: true });
+    writeFileSync(old, "decision: PASS\n");
+    const refused = helperReads(m.helper, old);
+    assert.notEqual(refused.status, 0);
+    assert.match(refused.stderr, /Body must be inside .*\/Users\/juhanailmoniemi\/\.codex\/publish\/pyrycode-desktop/);
+  });
+
+  test("a helper for another pipeline, or one naming another home, is not used", (t) => {
+    const m = machine(t, "pyrycode-mobile");
+    assert.equal(installedHelperHome("pyrycode-desktop", [m.running, m.installed]), null);
+    const moved = join(m.root, "elsewhere");
+    mkdirSync(join(moved, ".codex", "bin"), { recursive: true });
+    writeFileSync(join(moved, ".codex", "bin", "pyrycode-mobile-pipeline-action"), readFileSync(m.helper, "utf8"));
+    assert.equal(installedHelperHome("pyrycode-mobile", [moved]), null, "a copy whose written home is not where it lives");
+    assert.equal(installedHelperHome("pyrycode-mobile", [moved, m.installed]), m.installed);
+    const source = readFileSync(join(helpers, "pipeline-action"), "utf8");
+    assert.equal(installedHelperHome("pyrycode-mobile", ["/Users/juhanailmoniemi"], () => source), null, "the uninstalled source has no home");
+  });
+
+  test("verdictHandoffDir uses the helper's home, falls back to the dispatcher's, and keeps the override", (t) => {
+    const saved = process.env.PYRY_VERDICT_HANDOFF_DIR;
+    t.after(() => { if (saved === undefined) delete process.env.PYRY_VERDICT_HANDOFF_DIR; else process.env.PYRY_VERDICT_HANDOFF_DIR = saved; });
+    delete process.env.PYRY_VERDICT_HANDOFF_DIR;
+    // This test run's target repository name; the helper must be for that pipeline.
+    const repo = basename(dirname(verdictHandoffDir([])));
+    const m = machine(t);
+    const text = readFileSync(m.helper, "utf8").replace("PIPELINE = 'pyrycode-desktop'", `PIPELINE = ${JSON.stringify(repo).replace(/"/g, "'")}`);
+    writeFileSync(join(m.installed, ".codex", "bin", `${repo}-pipeline-action`), text);
+    assert.equal(verdictHandoffDir([m.running, m.installed]), resolve(m.installed, ".codex/publish", repo, "verdict-handoff"));
+    assert.equal(verdictHandoffDir([m.running]), resolve(homedir(), ".codex/publish", repo, "verdict-handoff"));
+    process.env.PYRY_VERDICT_HANDOFF_DIR = join(m.root, "override");
+    assert.equal(verdictHandoffDir([m.running, m.installed]), join(m.root, "override"));
   });
 });
