@@ -44,6 +44,9 @@ test("Codex builder uses names-only narrow inheritance and secret names stay rej
   const names = args.find(arg => arg.startsWith("shell_environment_policy.include_only="))!;
   assert.ok(names.includes("OP_SERVICE_ACCOUNT_TOKEN"));
   assert.ok(names.includes("ANDROID_HOME"));
+  assert.ok(names.includes("GH_TOKEN"), "container publishing login must survive the builder override");
+  assert.ok(names.includes("DISPLAY"), "Desktop live tests need the container display");
+  assert.ok(names.includes("PLAYWRIGHT_BROWSERS_PATH"), "Desktop uses the image's browser cache");
   assert.ok(!names.includes("PYRY_DEV_AGENTS_TOKEN"));
   assert.ok(!names.includes("CLAUDE_CODE_OAUTH_TOKEN"));
   assert.ok(!names.includes("GITHUB_TOKEN"));
