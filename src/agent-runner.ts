@@ -111,6 +111,20 @@ export function resolveAgentShellEnv(env: NodeJS.ProcessEnv, opts: {
   return out;
 }
 
+/**
+ * The only names a Codex builder with live tests inherits into its tool
+ * commands (`shell_environment_policy.include_only`). `LC_*` is a pattern.
+ * Shared with the pre-dispatch health check, so a name dropped here fails
+ * the check in the same way it fails the run (agent-dispatcher#131).
+ */
+export function builderLiveInheritedNames(shellEnvNames: readonly string[]): string[] {
+  return [
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_*", "TERM", "TMPDIR", "TMP", "TEMP",
+    "GH_TOKEN", "DISPLAY", "PLAYWRIGHT_BROWSERS_PATH",
+    "AGENTS_REPO_PATH", ...shellEnvNames, "OP_SERVICE_ACCOUNT_TOKEN",
+  ];
+}
+
 export function buildCodexInvocation(opts: {
   cwd: string; role: string; model: string; effort: string; bin?: string; agentsRepoPath?: string; sourceReview?: boolean;
   /** Non-secret settings for tool commands, from `resolveAgentShellEnv`. */
@@ -159,11 +173,7 @@ export function buildCodexInvocation(opts: {
       ...(!opts.sourceReview && opts.builderLiveTests ? [
         "-c", 'shell_environment_policy.inherit="all"',
         "-c", "shell_environment_policy.ignore_default_excludes=true",
-        "-c", `shell_environment_policy.include_only=${JSON.stringify([
-          "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_*", "TERM", "TMPDIR", "TMP", "TEMP",
-          "GH_TOKEN", "DISPLAY", "PLAYWRIGHT_BROWSERS_PATH",
-          "AGENTS_REPO_PATH", ...shellEnv.map(([name]) => name), "OP_SERVICE_ACCOUNT_TOKEN",
-        ])}`,
+        "-c", `shell_environment_policy.include_only=${JSON.stringify(builderLiveInheritedNames(shellEnv.map(([name]) => name)))}`,
       ] : []),
       ...(opts.model ? ["--model", opts.model] : []),
       ...(opts.effort ? ["-c", `model_reasoning_effort=${JSON.stringify(opts.effort)}`] : []),

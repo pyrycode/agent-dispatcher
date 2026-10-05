@@ -94,6 +94,7 @@ import {
 } from "./main-sweep.js";
 import { recordFlakyTests } from "./flaky-tickets.js";
 import { recordInheritedTests } from "./inherited-tickets.js";
+import { dropStillHeld, HealthChecker, type HealthEnvFor, healthEnvForAgent, holdUnhealthyCandidates, liveGateHealthFailures, newHealthNoticeState, parseHealthCacheMs, parseHealthChecks } from "./health-check.js";
 import {
   decideVerifierGateReuse,
   hashGateList,
@@ -288,6 +289,14 @@ const salvageGates = parseSalvageGates(process.env.SALVAGE_GATES);
 // dispatcher's own environment, nothing that needs it starts: no agent
 // dispatch, no live gate, no main sweep. See `runEnvPreflight`.
 const REQUIRED_ENV_NAMES = parseRequiredEnv(process.env.PYRY_REQUIRED_ENV);
+
+// Pre-dispatch health checks from `PYRY_HEALTH_<CHECK>_CMD` (GitHub login,
+// Figma MCP tools, live-test login, test daemon version). None by default,
+// which makes the check a no-op. A failed check holds the ticket for the
+// cycle without an error or a count. See health-check.ts
+// (agent-dispatcher#131).
+const HEALTH_CHECKS = parseHealthChecks(process.env);
+const HEALTH_CACHE_MS = parseHealthCacheMs(process.env.PYRY_HEALTH_CACHE_MS);
 
 // Auto-curation of the memory index (opt-in). When the lesson floor — the part
 // the deterministic trim cannot reduce — crosses the watermark, the dispatcher
@@ -8314,6 +8323,12 @@ export async function pollLoop(): Promise<void> {
   }
   // The missing set the preflight last announced, so it notifies once.
   const envPreflight: EnvPreflightState = { announced: null };
+  console.log(HEALTH_CHECKS.length > 0
+    ? `   Health checks: ${HEALTH_CHECKS.map((c) => `${c.name} for ${c.roles === "all" ? "all roles" : [...c.roles].join("/")}` +
+      `${c.liveGate ? " and the live gate" : ""}`).join("; ")}, cached ${formatMinutes(HEALTH_CACHE_MS)} (PYRY_HEALTH_*)`
+    : `   Health checks: none (PYRY_HEALTH_*)`);
+  const healthChecker = new HealthChecker({ cwd: repoRoot, ttlMs: HEALTH_CACHE_MS });
+  const healthNotices = newHealthNoticeState();
 
   // Real-claude gate execution. Null when PYRY_REAL_CLAUDE_GATE_CMD is unset,
   // which makes the whole step a no-op and leaves gated tickets parked for an
@@ -8532,7 +8547,12 @@ export async function pollLoop(): Promise<void> {
       state: envPreflight,
       notify: notifyDiscord,
     })).length > 0;
-    const gateRunner = envHeld ? null : realClaudeGateRunner;
+    // The live-login and daemon health checks guard the live gate too. A
+    // failure skips the gate this cycle; its tickets keep waiting.
+    const gateHealthFailures = envHeld || realClaudeGateRunner === null ? [] : await liveGateHealthFailures({
+      checks: HEALTH_CHECKS, checker: healthChecker, env: buildGateSpawnEnv(process.env), notify: notifyDiscord, state: healthNotices,
+    });
+    const gateRunner = envHeld || gateHealthFailures.length > 0 ? null : realClaudeGateRunner;
     let gateHeld = false;
     if (!REAL_CLAUDE_GATE_BACKGROUND) {
       gateHeld = await runRealClaudeGateExecution(
@@ -8638,28 +8658,50 @@ export async function pollLoop(): Promise<void> {
       }
     }
 
+    // Tickets already held by a health check that still fails stay out of
+    // selection, so they do not take a seat every cycle (agent-dispatcher#131).
+    const healthEnvFor: HealthEnvFor = (role, check) => healthEnvForAgent(process.env, role, selectRunner(role), check.scope);
+    const stillHeld = envHeld ? { itemsByColumn, held: 0 } : await dropStillHeld({
+      itemsByColumn, pollOrder, checks: HEALTH_CHECKS, checker: healthChecker, envFor: healthEnvFor,
+      notify: notifyDiscord, state: healthNotices,
+    });
+
     // Family circuit breaker: between selection and prep, before any
     // wip:<agent> write or worktree creation. See selectPastParkedFamilies.
     const seats = freeSeats(MAX_CONCURRENT, pool.size);
     const { candidates: selected, tallies: familyTallies } = envHeld
       ? { candidates: [], tallies: new Map<number, number>() }
       : await selectPastParkedFamilies({
-        itemsByColumn,
+        itemsByColumn: stillHeld.itemsByColumn,
         pollOrder,
         maxConcurrent: seats,
         rootLabelsByIssue,
         client,
       });
-    const candidates = gateHeld && !REAL_CLAUDE_GATE_BACKGROUND
+    const selectedCandidates = gateHeld && !REAL_CLAUDE_GATE_BACKGROUND
       ? []
       : holdVerifiersDuringSweep(excludeInFlight(selected, pool.keys()), sweepRun !== null || gateHoldsVerifiers);
+    // Pre-dispatch health checks, after selection and before any wip label,
+    // family counter or worktree: a held ticket is simply not dispatched
+    // this cycle (agent-dispatcher#131).
+    const health = await holdUnhealthyCandidates({
+      candidates: selectedCandidates,
+      checks: HEALTH_CHECKS,
+      checker: healthChecker,
+      envFor: healthEnvFor,
+      client,
+      notify: notifyDiscord,
+      state: healthNotices,
+      recheckMs: HEALTH_CACHE_MS,
+    });
+    const candidates = health.dispatch;
     dispatched = candidates.length > 0;
 
     // Edge-triggered "board drained" ping: fire once when the board goes from
     // busy to nothing-left-to-dispatch, so the operator knows the agents are
     // done or stuck and it's time to look. A held gate is not a drained board.
     // A board held by the environment preflight is not drained either.
-    const drain = decideDrainNotification({ hasCandidates: dispatched || gateHeld || gateRun !== null || envHeld, activeWork, armed: sawActiveWork });
+    const drain = decideDrainNotification({ hasCandidates: dispatched || gateHeld || gateRun !== null || envHeld || health.held.length > 0 || stillHeld.held > 0, activeWork, armed: sawActiveWork });
     sawActiveWork = drain.armed;
     if (drain.notify) {
       await notifyDiscord(`📭 **${process.env.GITHUB_REPO}**: no tickets left to dispatch. Everything is done, blocked, or parked for review.`);
