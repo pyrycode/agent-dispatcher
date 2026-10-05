@@ -9521,7 +9521,7 @@ describe("runEnvPreflight — a required variable missing from the dispatcher ho
     assert.match(src, /itemsByColumn: stillHeld\.itemsByColumn,/, "selection skips tickets still held");
     assert.match(src, /const candidates = health\.dispatch;/, "only healthy candidates are dispatched");
     const held = src.indexOf("const health = await holdUnhealthyCandidates(");
-    const prep = src.indexOf("await runPreDispatchPrep(candidates, client");
+    const prep = src.indexOf("prep: (cs) => runPreDispatchPrep(cs, client");
     assert.ok(held > 0 && prep > held, "the check runs before any wip label or family count");
   });
 });
