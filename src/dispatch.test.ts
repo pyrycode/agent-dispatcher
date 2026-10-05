@@ -55,6 +55,7 @@ import {
   runPendingVerdictPublish,
   verdictHandoffPath,
   pendingVerdictStatePath,
+  lastVerdictPath,
   salvagePartialWork,
   strandedWipMinAgeMs,
   runFamilyBreaker,
@@ -10368,5 +10369,191 @@ describe("verdict handoff (#118)", () => {
       await f.run();
       parkedAsToday(f);
     });
+  });
+});
+
+describe("re-review after FAIL (#135)", () => {
+  const REVIEWED = "0123456789abcdef0123456789abcdef01234567";
+  const HEAD = "fedcba9876543210fedcba9876543210fedcba98";
+  const ISSUE = 1700;
+  const PR = 1701;
+  const FINDINGS = "1. Null check missing in Foo.kt";
+  const PATCH = "commit 1111111\n    fix the null check\n+if (x != null) run(x)";
+  const lastFile = (decision: "PASS" | "FAIL", commit = REVIEWED) => JSON.stringify({
+    decision, commit, labels: decision === "FAIL" ? ["needs-rework:builder"] : [],
+    body: `## Verifier Review: #${ISSUE}\n\n**Decision: ${decision}**\n\n${FINDINGS}`,
+    recordedAt: "2026-10-05T09:00:00.000Z",
+  });
+  const handoffFile = (decision: "PASS" | "FAIL", labels = "") =>
+    `decision: ${decision}\ncommit: ${HEAD}\nlabels: ${labels}\n---\n## Verifier Review: #${ISSUE}\n\n**Decision: ${decision}**\n`;
+
+  function fixture(opts: {
+    last?: string | null;
+    handoff?: string | null;
+    head?: "ok" | "error";
+    ancestor?: number;
+    log?: "ok" | "error";
+    patch?: string;
+  } = {}) {
+    const client = new MockGitHubClient({
+      status: { [ISSUE]: "In Code Review" },
+      items: [{ issueNumber: ISSUE, status: "In Code Review", labels: [], state: "OPEN" }],
+    });
+    const fsMap: Record<string, string> = { [claudeMdAbsPath("verifier/CLAUDE.md")]: "role" };
+    if (opts.last !== null) fsMap[lastVerdictPath("verifier", ISSUE)] = opts.last ?? lastFile("FAIL");
+    if (opts.handoff != null) fsMap[verdictHandoffPath("verifier", ISSUE)] = opts.handoff;
+    const { deps, calls } = makeMockDeps({
+      execImpls: fullHappyExecImpls(`feature/${ISSUE}`),
+      spawnImpls: {
+        [`git rev-parse --verify origin/feature/${ISSUE}^{commit}`]: () =>
+          opts.head === "error" ? { status: 128, stderr: "fatal: bad revision" } : { status: 0, stdout: `${HEAD}\n` },
+        [`git merge-base --is-ancestor ${REVIEWED} ${HEAD}`]: () => opts.ancestor ?? 0,
+        "git log -p --no-merges": () => opts.log === "error" ? { status: 128, stderr: "fatal" } : { status: 0, stdout: opts.patch ?? PATCH },
+        "git log --no-merges --stat": () => ({ status: 0, stdout: "1111111 fix the null check\n Foo.kt | 2 +-" }),
+      },
+      fsMap,
+      streamResult: () => streamResult({ output: "Verdict posted" }),
+    });
+    const run = () => withStageSet("builder", () => withVerifierGates("", () =>
+      dispatchToAgent(builderAgent("verifier"), makeProjectItem({ issueNumber: ISSUE, status: "In Code Review" }), client, deps)));
+    const prompt = () => calls.fs.filter(c => c.kind === "write" && c.path.endsWith(`.prompt-${ISSUE}.txt`)).at(-1)?.content ?? "";
+    const lastWrites = () => calls.fs.filter(c => c.kind === "write" && c.path === lastVerdictPath("verifier", ISSUE));
+    return { client, deps, calls, run, prompt, lastWrites };
+  }
+
+  describe("keeping the last verdict", () => {
+    test("a completed verifier run with a complete FAIL handoff writes the last-verdict file", async () => {
+      const f = fixture({ last: null, handoff: handoffFile("FAIL", "needs-rework:builder") });
+      await f.run();
+      assert.equal(f.lastWrites().length, 1);
+      const saved = JSON.parse(f.lastWrites()[0]!.content!);
+      assert.equal(saved.decision, "FAIL");
+      assert.equal(saved.commit, HEAD);
+      assert.deepEqual(saved.labels, ["needs-rework:builder"]);
+      assert.match(saved.body, /\*\*Decision: FAIL\*\*/);
+      assert.ok(!Number.isNaN(Date.parse(saved.recordedAt)));
+    });
+
+    test("a PASS overwrites the previous FAIL", async () => {
+      const f = fixture({ last: lastFile("FAIL"), handoff: handoffFile("PASS") });
+      await f.run();
+      assert.equal(f.lastWrites().length, 1);
+      assert.equal(JSON.parse(f.lastWrites()[0]!.content!).decision, "PASS");
+    });
+
+    test("an incomplete or missing handoff leaves the previous file alone", async () => {
+      for (const handoff of [null, "", `decision: FAIL\ncommit: ${HEAD}\n---\nbody`]) {
+        const f = fixture({ last: lastFile("FAIL"), handoff });
+        await f.run();
+        assert.equal(f.lastWrites().length, 0, JSON.stringify(handoff));
+      }
+    });
+
+    test("a verdict the dispatcher posts later from the pending sweep is recorded too", async () => {
+      const handoff = { decision: "FAIL" as const, commit: HEAD, labels: ["needs-rework:builder"], body: "## Verifier Review\n\n" + FINDINGS };
+      const client = new MockGitHubClient({
+        items: [{ issueNumber: ISSUE, status: "In Code Review", labels: ["pending-verdict:verifier"], state: "OPEN" }],
+      });
+      const { deps, calls } = makeMockDeps({
+        execImpls: {
+          [`gh pr list --head feature/${ISSUE}`]: () => JSON.stringify([{ number: PR, isDraft: false }]),
+          [`gh pr view ${PR}`]: () => JSON.stringify({ headRefOid: HEAD, state: "OPEN", reviews: [], comments: [] }),
+        },
+        fsMap: {
+          [pendingVerdictStatePath("verifier", ISSUE)]: JSON.stringify({ agent: "verifier", issueNumber: ISSUE, pr: PR, startedAtMs: 1, handoff }),
+        },
+      });
+      await withStageSet("builder", () => runPendingVerdictPublish(client, deps));
+      assert.ok(client.comments.some(c => c.issueNumber === PR), "the verdict was posted");
+      const writes = calls.fs.filter(c => c.kind === "write" && c.path === lastVerdictPath("verifier", ISSUE));
+      assert.equal(writes.length, 1);
+      const saved = JSON.parse(writes[0]!.content!);
+      assert.equal(saved.decision, "FAIL");
+      assert.equal(saved.body, handoff.body);
+    });
+  });
+
+  describe("the re-review section", () => {
+    test("a FAIL whose commit is an ancestor of the branch head adds the findings, both commits and the non-merge patch", async () => {
+      const f = fixture();
+      await f.run();
+      const prompt = f.prompt();
+      assert.match(prompt, /## Re-review after FAIL/);
+      assert.match(prompt, /----- BEGIN PREVIOUS VERDICT -----[\s\S]*1\. Null check missing in Foo\.kt[\s\S]*----- END PREVIOUS VERDICT -----/);
+      assert.ok(prompt.includes(REVIEWED) && prompt.includes(HEAD), "both commits named");
+      assert.ok(prompt.includes(PATCH), "the patch is included");
+      const log = f.calls.spawn.find(c => c.cmd === "git" && c.args.includes("-p"));
+      assert.ok(log?.args.includes("--no-merges"));
+      assert.ok(log?.args.includes(`${REVIEWED}..${HEAD}`), "the range runs from the reviewed commit to the branch head, not the merged worktree HEAD");
+      // The handoff note still follows, and the section comes before it.
+      assert.ok(prompt.indexOf("## Re-review after FAIL") < prompt.indexOf("## Verdict handoff"));
+    });
+
+    test("a patch over the cap gives the stat and the broad-change line instead", async () => {
+      const f = fixture({ patch: "+x\n".repeat(30_000) });
+      await f.run();
+      const prompt = f.prompt();
+      assert.match(prompt, /## Re-review after FAIL/);
+      assert.match(prompt, /The change is broad, so a full review of the whole diff applies/);
+      assert.match(prompt, /Foo\.kt \| 2 \+-/);
+      assert.doesNotMatch(prompt, /BEGIN COMMITS/);
+    });
+
+    const none: Array<[string, Parameters<typeof fixture>[0]]> = [
+      ["a PASS last verdict", { last: lastFile("PASS") }],
+      ["a non-ancestor commit, as after a force-push", { ancestor: 1 }],
+      ["a missing last-verdict file", { last: null }],
+      ["a damaged last-verdict file", { last: "{" }],
+      ["the branch head cannot be read", { head: "error" }],
+      ["the ancestry check errors", { ancestor: 128 }],
+      ["git log fails", { log: "error" }],
+    ];
+    for (const [name, opts] of none) {
+      test(`no section for ${name}`, async () => {
+        const f = fixture(opts);
+        await f.run();
+        assert.ok(f.prompt().includes("## Verdict handoff"), "the run still went ahead");
+        assert.doesNotMatch(f.prompt(), /Re-review after FAIL/);
+      });
+    }
+
+    test("an agent outside the verifier gate set gets no section", async () => {
+      const f = fixture();
+      await withStageSet("classic", () => withVerifierGates("", () =>
+        dispatchToAgent(builderAgent("verifier"), makeProjectItem({ issueNumber: ISSUE, status: "In Code Review" }), f.client, f.deps)));
+      assert.doesNotMatch(f.prompt(), /Re-review after FAIL/);
+    });
+  });
+
+  describe("parallel review", () => {
+    async function withParallel(fn: () => Promise<void>) {
+      const prior = process.env.PYRY_VERIFIER_PARALLEL_REVIEW;
+      process.env.PYRY_VERIFIER_PARALLEL_REVIEW = "1";
+      try { await withStageSet("builder", () => withVerifierGates("make check", fn)); }
+      finally {
+        if (prior === undefined) delete process.env.PYRY_VERIFIER_PARALLEL_REVIEW; else process.env.PYRY_VERIFIER_PARALLEL_REVIEW = prior;
+      }
+    }
+    for (const reReview of [true, false]) {
+      test(`the source reviewer ${reReview ? "gets the section and a narrowed brief" : "keeps the whole-diff brief without a section"}`, async () => {
+        await withParallel(async () => {
+          const f = fixture(reReview ? {} : { last: lastFile("PASS") });
+          f.deps.runClaudeStreaming = async opts => streamResult({ output: opts.sourceReview ? "Complete report" : "Final verdict" });
+          await dispatchToAgent(builderAgent("verifier"), makeProjectItem({ issueNumber: ISSUE, status: "In Code Review" }), f.client, f.deps);
+          const sourcePrompt = f.calls.fs.filter(x => x.kind === "write" && x.path.endsWith(".source.txt")).at(-1)!.content!;
+          const brief = f.calls.fs.filter(x => x.kind === "write" && x.path.endsWith(".source-system.txt")).at(-1)!.content!;
+          if (reReview) {
+            assert.match(sourcePrompt, /## Re-review after FAIL/);
+            assert.ok(sourcePrompt.includes(PATCH));
+            assert.doesNotMatch(brief, /Review the entire diff on rework too/);
+            assert.match(brief, /check each finding of the previous verdict and review the commits since it/);
+            assert.match(brief, /Review the rest of the diff only when that section says the change is broad/);
+          } else {
+            assert.doesNotMatch(sourcePrompt, /Re-review after FAIL/);
+            assert.match(brief, /Review the entire diff on rework too/);
+          }
+        });
+      });
+    }
   });
 });
