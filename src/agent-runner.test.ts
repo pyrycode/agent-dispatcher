@@ -5,9 +5,12 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { agentShellEnvNameProblem, buildCodexInvocation, CodexStreamAdapter, failedMcpCallLogLine, formatRunCost, MCP_FAILURE_LOG_CAP, resolveAgentShellEnv, resumeCommand, resolveAgentRunner, resolveCodexExecutable } from "./agent-runner.js";
+import { agentShellEnvNameProblem, buildCodexInvocation, codexRefusalText, codexRouterMessages, CodexStreamAdapter, failedMcpCallLogLine, formatRunCost, MCP_FAILURE_LOG_CAP, resolveAgentShellEnv, resumeCommand, resolveAgentRunner, resolveCodexExecutable } from "./agent-runner.js";
 import { advanceCodexIdleWatchdogState, initIdleWatchdogState, runStopKind, shouldFireIdleWatchdog, type IdleWatchdogState } from "./agent-runtime.js";
 import { classifyAgentError } from "./pipeline-decisions.js";
+
+/** Real Codex approval shapes; see the fixture's "source". */
+const signals = JSON.parse(readFileSync(new URL("./fixtures/codex-approval-signals.json", import.meta.url), "utf8")) as Record<string, any>;
 
 describe("runner selection", () => {
   test("Claude stays the default and unknown runners fail closed", () => {
@@ -238,15 +241,14 @@ test("an open-blocker wait is a distinct handoff, while approval rejection remai
   adapter.accept({type:"turn.completed", usage:{}});
   assert.equal(adapter.finish(0, false, 1).terminalReason, "waiting_on_blocker");
   assert.equal(adapter.finish(0, false, 1).isError, false);
-  adapter.accept({type:"item.completed", item:{type:"command_execution", aggregated_output:"This action was rejected due to unacceptable risk."}});
-  const rejected = adapter.finish(0, false, 1);
+  const rejected = adapter.finish(0, false, 1, signals.stderr.rejected1766);
   assert.equal(rejected.terminalReason, "codex_blocked");
   assert.equal(rejected.isError, true);
 });
 
 test("an approval rejection cannot be converted into a refinement request", () => {
   const adapter = new CodexStreamAdapter();
-  adapter.accept({type:"item.completed", item:{type:"command_execution", aggregated_output:'CreateProcess Rejected("This action was rejected due to unacceptable risk.")'}});
+  adapter.accept(signals.relayedByTool);
   adapter.accept({type:"item.completed", item:{type:"agent_message", text:JSON.stringify({status:"needs_refinement", summary:"Try routing through dispatcher"})}});
   adapter.accept({type:"turn.completed", usage:{}});
   const result = adapter.finish(0, false, 1);
@@ -257,11 +259,85 @@ test("an approval rejection cannot be converted into a refinement request", () =
 
 test("approval rejection on stderr also blocks refinement", () => {
   const adapter = new CodexStreamAdapter();
+  adapter.accept(signals.declinedCommand1766);
   adapter.accept({type:"item.completed", item:{type:"agent_message", text:JSON.stringify({status:"needs_refinement", summary:"Scope conflict"})}});
   adapter.accept({type:"turn.completed", usage:{}});
-  const result = adapter.finish(0, false, 1, "This action was rejected due to unacceptable risk");
+  const result = adapter.finish(0, false, 1, signals.stderr.rejected1766);
   assert.equal(result.terminalReason, "codex_blocked");
   assert.equal(result.isError, true);
+});
+
+describe("only Codex's own refusal counts as an approval rejection (desktop #1726)", () => {
+  const passed = JSON.stringify({ status: "completed", summary: "Published PASS verdict" });
+  function run(items: Record<string, any>[], stderr = "") {
+    const adapter = new CodexStreamAdapter();
+    adapter.accept({ type: "turn.started" });
+    for (const item of items) adapter.accept(item);
+    adapter.accept({ type: "item.completed", item: { type: "agent_message", text: passed } });
+    adapter.accept({ type: "turn.completed", usage: {} });
+    return adapter.finish(0, false, 1, stderr);
+  }
+
+  test("a command whose output quotes the rejection sentence does not reject a passing run", () => {
+    const result = run([signals.grep1726]);
+    assert.equal(result.hadPermissionDenial, false);
+    assert.equal(result.isError, false);
+    assert.equal(result.terminalReason, "stop");
+    assert.equal(result.output, "Published PASS verdict");
+  });
+
+  test("nor does a failed command, or a completed MCP call, that prints it or the reviewer-failure words", () => {
+    const failed = structuredClone(signals.grep1726);
+    failed.item.exit_code = 1;
+    failed.item.status = "failed";
+    failed.item.aggregated_output += "The automatic permission approval review did not finish before its deadline.\n";
+    const mcp = { type: "item.completed", item: { type: "mcp_tool_call", server: "qmd", tool: "get", arguments: {},
+      result: { content: [{ type: "text", text: "This action was rejected due to unacceptable risk.\nAutomatic approval review failed: x" }], structured_content: null },
+      error: null, status: "completed" } };
+    const result = run([failed, mcp]);
+    assert.equal(result.hadPermissionDenial, false);
+    assert.equal(result.approvalReviewFailed, false);
+    assert.equal(result.isError, false);
+  });
+
+  test("stderr counts only Codex's router message, not other text that carries the sentence", () => {
+    const patchError = "2026-10-05T14:40:00.000000Z ERROR codex_core::tools::router: error=apply_patch verification failed: Failed to find expected lines in src/agent-runner.ts:\n" +
+      "    this.approvalRejected ||= /This action was rejected due to unacceptable risk/.test(stderr);";
+    const result = run([], `${patchError}\nThis action was rejected due to unacceptable risk.\n${signals.stderr.unrelated1655}`);
+    assert.equal(result.hadPermissionDenial, false);
+    assert.equal(result.approvalReviewFailed, false);
+    assert.equal(result.isError, false);
+  });
+
+  test("a genuine shell rejection on stderr still blocks, beside its declined item", () => {
+    const result = run([signals.declinedCommand1766], signals.stderr.rejected1766);
+    assert.equal(result.hadPermissionDenial, true);
+    assert.equal(result.terminalReason, "codex_blocked");
+    assert.equal(result.output, "Automatic approval review rejected an action. Operator review required.");
+  });
+
+  test("a genuine rejection Codex or a tool reports in a failed MCP item still blocks", () => {
+    const codex = { type: "item.completed", item: { type: "mcp_tool_call", server: "codegraph", tool: "codegraph_context", arguments: {},
+      result: null, error: { message: signals.relayedByTool.item.result.content[0].text }, status: "failed" } };
+    for (const item of [codex, signals.relayedByTool]) assert.equal(run([item]).hadPermissionDenial, true);
+  });
+
+  test("a declined item carrying Codex's refusal counts, as codex-rs writes it for a refused tool call", () => {
+    const declined = structuredClone(signals.declinedCommand1766);
+    declined.item.aggregated_output = signals.relayedByTool.item.result.content[0].text;
+    assert.equal(run([declined]).hadPermissionDenial, true);
+  });
+
+  test("the extractors return only Codex's text", () => {
+    assert.equal(codexRefusalText(signals.grep1726.item), "");
+    assert.equal(codexRefusalText(signals.declinedCommand1766.item), "");
+    assert.equal(codexRefusalText({ type: "agent_message", text: "This action was rejected due to unacceptable risk." }), "");
+    assert.match(codexRefusalText(signals.relayedByTool.item), /^This action was rejected/);
+    assert.deepEqual(codexRouterMessages(signals.stderr.unrelated1655), ["Failed to create unified exec process: No such file or directory (os error 2)\\\")\" }"]);
+    assert.match(codexRouterMessages(signals.stderr.rejected1766)[0], /^This action was rejected due to unacceptable risk\.\\\\nReason: Applying Spotless/);
+    assert.match(codexRouterMessages(signals.stderr.capacity1582)[0], /^Automatic approval review failed: Selected model is at capacity/);
+    assert.match(codexRouterMessages(signals.stderr.deadline1655)[0], /^The automatic permission approval review did not finish before its deadline/);
+  });
 });
 
 describe("Codex idle watchdog — recorded event sequences", () => {
@@ -357,8 +433,8 @@ describe("Codex idle watchdog — recorded event sequences", () => {
     blocked.accept({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ status: "blocked", summary: "Rejected" }) } });
     assert.equal(blocked.finish(null, false, 1, "", IDLE).terminalReason, "codex_blocked");
     const rejected = new CodexStreamAdapter();
-    rejected.accept({ type: "item.completed", item: { type: "command_execution", aggregated_output: "This action was rejected due to unacceptable risk" } });
-    assert.equal(rejected.finish(null, false, 1, "", IDLE).terminalReason, "codex_blocked");
+    rejected.accept(signals.declinedCommand1766);
+    assert.equal(rejected.finish(null, false, 1, signals.stderr.rejected1766, IDLE).terminalReason, "codex_blocked");
   });
 
   test("without a stall the adapter reports as before", () => {

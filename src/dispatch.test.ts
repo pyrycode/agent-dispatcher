@@ -9307,19 +9307,25 @@ describe("Codex approval reviewer failure on an MCP tool call (#1783)", () => {
 });
 
 describe("Codex approval reviewer failed to decide — auto-retry (#121)", () => {
-  const capacityForm = "2026-10-05T07:12:01Z ERROR codex_core::tools::router: Automatic approval review failed: Selected model is at capacity. Please try a different model. " +
-    "The action was not executed because automatic approval review could not be completed. This is a review failure, not a determination that the action is unsafe.";
-  const deadlineForm = "2026-10-05T08:40:13Z ERROR codex_core::tools::router: The automatic permission approval review did not finish before its deadline. " +
-    "Do not assume the action is unsafe based on the timeout alone. You may retry once, or ask the user for guidance or explicit approval.";
-  const rejection = "This action was rejected due to unacceptable risk.";
+  // Real stderr lines from the mobile run logs and real item shapes; see the fixture.
+  const signals = JSON.parse(readFileSync(new URL("./fixtures/codex-approval-signals.json", import.meta.url), "utf8")) as Record<string, any>;
+  const capacityForm: string = signals.stderr.capacity1582;
+  const deadlineForm: string = signals.stderr.deadline1655;
+  const rejection: string = signals.stderr.rejected1766;
+  // codex-rs reports a refused MCP call in the item's error (mobile #1783);
+  // a review that missed its deadline sends Codex's timeout text the same way.
+  const mcpRefusal = (message: string) => ({ type: "item.completed", item: { type: "mcp_tool_call", server: "codegraph", tool: "codegraph_context",
+    arguments: {}, result: null, error: { message }, status: "failed" } });
+  const deadlineItem = mcpRefusal("The automatic permission approval review did not finish before its deadline. Do not assume the action is unsafe based on the timeout alone. You may retry once, or ask the user for guidance or explicit approval.");
+  const rejectionItem = signals.relayedByTool;
   const blockedSummary = "Automatic approval review did not approve `./gradlew spotlessCheck`, so I stopped as the role requires. Implementation is finished and uncommitted.";
   const builder = { name: "builder", column: "In Development", claudeMdPath: "builder/CLAUDE.md" };
 
-  function blockedRun(opts: { stderr?: string; itemText?: string; summary?: string } = {}): StreamResult {
+  function blockedRun(opts: { stderr?: string; item?: Record<string, any>; summary?: string } = {}): StreamResult {
     const a = new CodexStreamAdapter();
     a.accept({ type: "thread.started", thread_id: "codex-thread" });
     a.accept({ type: "turn.started" });
-    if (opts.itemText) a.accept({ type: "item.completed", item: { type: "command_execution", aggregated_output: opts.itemText } });
+    if (opts.item) a.accept(opts.item);
     a.accept({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ status: "blocked", summary: opts.summary ?? blockedSummary }) } });
     a.accept({ type: "turn.completed", usage: {} });
     return a.finish(0, false, 1000, opts.stderr ?? "");
@@ -9349,16 +9355,16 @@ describe("Codex approval reviewer failed to decide — auto-retry (#121)", () =>
   }
 
   test("the reviewer failure in a non-message Codex item counts the same as on stderr", async () => {
-    const result = blockedRun({ itemText: deadlineForm });
+    const result = blockedRun({ item: deadlineItem });
     assert.equal(result.approvalReviewFailed, true);
     assert.deepEqual((await handle(result)).labels, ["error-retry-count:1"]);
   });
 
   for (const [name, opts] of [
     ["rejection on stderr alone", { stderr: rejection }],
-    ["rejection in an item alone", { itemText: rejection }],
+    ["rejection in an item alone", { item: rejectionItem }],
     ["rejection beside a capacity-form failure", { stderr: `${capacityForm}\n${rejection}` }],
-    ["rejection item beside a deadline-form stderr line", { itemText: rejection, stderr: deadlineForm }],
+    ["rejection item beside a deadline-form stderr line", { item: rejectionItem, stderr: deadlineForm }],
   ] as const) {
     test(`${name} → parks exactly as today`, async () => {
       const result = blockedRun(opts);
@@ -9368,6 +9374,22 @@ describe("Codex approval reviewer failed to decide — auto-retry (#121)", () =>
       assert.ok(!labels.some(l => l.startsWith("error-retry-count:")));
     });
   }
+
+  test("a passing verifier whose command printed the rejection sentence is not parked (desktop #1726)", async () => {
+    const a = new CodexStreamAdapter();
+    a.accept({ type: "thread.started", thread_id: "codex-thread" });
+    a.accept({ type: "turn.started" });
+    a.accept(signals.grep1726);
+    a.accept({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ status: "completed", summary: "Published PASS verdict on PR #1769." }) } });
+    a.accept({ type: "turn.completed", usage: {} });
+    const result = a.finish(0, false, 1000, "");
+    assert.equal(result.isError, false);
+    assert.equal(result.hadPermissionDenial, false);
+    const { ctx, client } = makeTestContext({ item: { issueNumber: 1726 }, agent: { name: "verifier", column: "In Code Review", claudeMdPath: "verifier/CLAUDE.md" } });
+    await handleAgentResultErrors(result, ctx);
+    assert.ok(!client.addLabelCalls.some(c => c.label.startsWith("error:")));
+    assert.ok(!client.comments.some(c => c.body.includes("Automatic approval review rejected")));
+  });
 
   test("the agent's own summary naming a reviewer failure, with no Codex event or stderr line, parks as today", async () => {
     const result = blockedRun({ summary: "Automatic approval review could not be completed. This is a review failure, not a determination that the action is unsafe." });
