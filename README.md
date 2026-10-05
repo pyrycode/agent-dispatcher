@@ -217,6 +217,21 @@ and never posted twice. A moved head, a missing or incomplete file, a closed PR,
 approval rejection or a block about anything else parks as before. Mobile #1677
 spent nine hours parked on a GitHub outage of minutes before this.
 
+**Re-review after FAIL.** After a verdict run that ends with a complete handoff
+file, or a saved verdict the dispatcher posts itself, the dispatcher keeps the
+verdict in its logs folder as `verdict-last-<agent>-<issue>.json`. An incomplete or
+missing file leaves the previous one in place. When the stage set's verifier is
+dispatched again, the last verdict is a FAIL and its reviewed commit is an ancestor
+of `origin/feature/<issue>`, the prompt gets a `## Re-review after FAIL` section. It
+holds the previous verdict, fenced as data, the reviewed commit, the branch head and
+`git log -p --no-merges` between them, so merges from main add nothing. The
+verifier checks each prior finding, reviews the new commits, and reviews the rest of
+the diff only when the change is broad. Over 60000 characters of patch, the section
+gives the per-commit file stat instead and says a full review applies. A PASS, a
+reviewed commit that is not an ancestor, as after a force-push, a missing file or a
+git error gives no section and a full review. With parallel review on, the source
+reviewer gets the same section and the same narrowed brief.
+
 The two model phases share the verifier's wall-clock budget, but gate time is not
 charged to it. The final verifier gets the budget the source review left, and
 never less than half of it, however long the gates took. Each gate stays bounded

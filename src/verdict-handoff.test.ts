@@ -4,9 +4,13 @@ import {
   decideVerdictRecovery,
   handoffMarker,
   isVerdictPublishFailure,
+  parseLastVerdict,
   parsePendingVerdictState,
   parsePrVerdictView,
   parseVerdictHandoff,
+  REREVIEW_HEADING,
+  reReviewNote,
+  serializeLastVerdict,
   serializePendingVerdictState,
   verdictLanded,
   type VerdictHandoff,
@@ -209,5 +213,47 @@ describe("pending verdict state", () => {
     assert.equal(parsePendingVerdictState("{"), null);
     assert.equal(parsePendingVerdictState(JSON.stringify({ ...state, handoff: { ...handoff, decision: "MAYBE" } })), null);
     assert.equal(parsePendingVerdictState(JSON.stringify({ ...state, pr: "x" })), null);
+  });
+});
+
+describe("last verdict (#135)", () => {
+  const handoff: VerdictHandoff = { decision: "FAIL", commit: SHA, labels: ["needs-rework:builder"], body: "## Verifier Review\n\n1. Missing null check in Foo.kt" };
+
+  test("round-trips with its record time, and a damaged file reads as null", () => {
+    const text = serializeLastVerdict(handoff, "2026-10-05T10:00:00.000Z");
+    assert.deepEqual(parseLastVerdict(text), { ...handoff, recordedAt: "2026-10-05T10:00:00.000Z" });
+    assert.equal(parseLastVerdict("{"), null);
+    assert.equal(parseLastVerdict(""), null);
+    assert.equal(parseLastVerdict(JSON.stringify({ ...JSON.parse(text), commit: "abc" })), null);
+    assert.equal(parseLastVerdict(JSON.stringify({ ...JSON.parse(text), recordedAt: 5 })), null);
+  });
+});
+
+describe("reReviewNote (#135)", () => {
+  const body = "## Verifier Review\n\n1. Missing null check in Foo.kt";
+
+  test("a narrow change carries the findings as data, both commits and the patch", () => {
+    const note = reReviewNote({ body, reviewed: SHA, head: OTHER, patch: "commit abc\n+fixed()", stat: null });
+    assert.ok(note.includes(REREVIEW_HEADING));
+    assert.match(note, /----- BEGIN PREVIOUS VERDICT -----\n## Verifier Review\n\n1\. Missing null check in Foo\.kt\n----- END PREVIOUS VERDICT -----/);
+    assert.ok(note.includes(SHA) && note.includes(OTHER));
+    assert.match(note, /----- BEGIN COMMITS -----\ncommit abc\n\+fixed\(\)\n----- END COMMITS -----/);
+    assert.match(note, /Check that each finding in the previous verdict is fixed/);
+    assert.match(note, /Review the commits since the reviewed commit/);
+    assert.match(note, /only when the change is broad/);
+    assert.doesNotMatch(note, /The change is broad/);
+  });
+
+  test("a broad change gives the stat and the broad-change line instead of the patch", () => {
+    const note = reReviewNote({ body, reviewed: SHA, head: OTHER, patch: null, stat: "abc fix\n Foo.kt | 3 ++-" });
+    assert.match(note, /The change is broad, so a full review of the whole diff applies/);
+    assert.match(note, /Foo\.kt \| 3 \+\+-/);
+    assert.doesNotMatch(note, /BEGIN COMMITS/);
+    assert.match(note, /BEGIN PREVIOUS VERDICT/);
+  });
+
+  test("an empty patch says there are no new commits", () => {
+    const note = reReviewNote({ body, reviewed: SHA, head: SHA, patch: "", stat: null });
+    assert.match(note, /No commits other than merges since the reviewed commit/);
   });
 });
