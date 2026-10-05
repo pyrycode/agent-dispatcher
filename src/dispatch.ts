@@ -2416,7 +2416,7 @@ export type DispatchContext = {
    *  teardown. See verdict-handoff.ts. */
   verdictHandoffPath?: string;
   /** Set by `prepareReworkFindingsNote` when this is the builder's rework
-   *  after a verifier FAIL, so the runner file's `rework` entry applies. */
+   *  after a verifier FAIL, which runs at a higher effort (effort-policy.ts). */
   reworkAfterFail?: boolean;
 };
 
@@ -3432,7 +3432,7 @@ export async function prepareAgentSpawn(
   const { agent, item, client, agentCwd, useWorktree, worktreeDir, branchName, logFile } = ctx;
   const { execSync, readFileSync, writeFileSync, buildPromptForAgent, runCommand } = ctx.deps;
 
-  const runner = selectRunner(agent.name, { reworkAfterFail: ctx.reworkAfterFail === true });
+  const runner = selectRunner(agent.name);
   // The runner file can switch to Codex while the dispatcher runs. Startup
   // pins the executable only for runners in use then, so pin it on first use.
   if (runner === "codex" && !process.env.PYRY_CODEX_BIN) process.env.PYRY_CODEX_BIN = resolveCodexExecutable(process.env);
@@ -3584,7 +3584,7 @@ export async function prepareAgentSpawn(
   const timeoutLabel = `${timeoutMs / 60_000}min`;
 
   const model = runner === "codex" ? process.env.PYRY_CODEX_MODEL ?? "gpt-6.1-sol" : agent.model ?? "opus";
-  const effort = resolveEffort({ agent, item, runner, env: process.env, stageSet: stageSet.name });
+  const effort = resolveEffort({ agent, item, runner, env: process.env, stageSet: stageSet.name, reworkAfterFail: ctx.reworkAfterFail === true });
 
   ctx.deps.writeLog(logFile, "DISPATCH", `Agent: ${agent.name}\nTicket: #${item.issueNumber} — ${item.title}\nBranch: ${branchName}\nWorktree: ${useWorktree ? worktreeDir : `none (PO on ${defaultBranch})`}\nRunner: ${runner}\nModel: ${model}\nEffort policy: ${effort.policy}\nEffort: ${effort.effort || "inherited"}\nEffort reason: ${effort.reason}\nMax turns: ${runner === "codex" ? "not supported; wall-clock budget only" : maxTurns}\nTimeout: ${timeoutLabel}\nTool policy: ${runner === "codex" ? "Codex workspace sandbox and automatic review" : allowedTools}`);
   ctx.deps.writeLog(logFile, "PROMPT", prompt);
@@ -4248,8 +4248,8 @@ function prepareReReviewNote(ctx: DispatchContext): string {
  * so a verdict on an abandoned branch is never answered. Empties the
  * answers file first, so the re-review reads only this run's answers. Any
  * failure before the answers file means no section, and the rework runs as
- * before. A qualifying rework also sets `ctx.reworkAfterFail`, which picks
- * the runner file's `rework` entry for the spawn.
+ * before. A qualifying rework also sets `ctx.reworkAfterFail`, which raises
+ * the builder's effort for the spawn.
  */
 function prepareReworkFindingsNote(ctx: DispatchContext): string {
   const { agent, item } = ctx;

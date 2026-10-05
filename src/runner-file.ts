@@ -8,17 +8,16 @@ import { resolveAgentRunner, type AgentRunner } from "./agent-runner.js";
  * drain can wait most of an hour for running agents; Claude and Codex
  * allowances also run out at different times. So the choice is live.
  *
- *   {"runner": "codex", "roles": {"verifier": "claude"}, "rework": {"builder": "claude"}}
+ *   {"runner": "codex", "roles": {"verifier": "claude"}}
  *
- * Every key is optional. A role entry beats `runner`, and `runner` beats
+ * Both keys are optional. A role entry beats `runner`, and `runner` beats
  * PYRY_AGENT_RUNNER, which stays the fallback when the file is absent.
  *
- * A `rework` entry beats them all, but only for the builder's rework after
- * a verifier FAIL: the run that gets the FAIL's findings to answer (see
- * `prepareReworkFindingsNote` in dispatch.ts). A first attempt, or a rework
- * for any other reason, ignores it. On mobile #1786 on 2026-10-05 the Codex
- * builder could not fix three real bugs the verifier found, which a Claude
- * pass then fixed at once.
+ * A `rework` key is read and ignored. From 2026-10-05 it switched the
+ * builder's rework after a verifier FAIL to another runner; the same day the
+ * owner chose to keep the builder on the runner and model in settings and
+ * raise that rework's effort instead (effort-policy.ts). Ignoring the key,
+ * rather than rejecting it as unknown, keeps an old file from failing startup.
  *
  * Default path: <agents repo>/runner.json. PYRY_RUNNER_FILE overrides it; an
  * empty value turns the file off.
@@ -26,22 +25,9 @@ import { resolveAgentRunner, type AgentRunner } from "./agent-runner.js";
  * A resumed run keeps the runner its session started on, because the choice
  * is made once per spawn and carried in the spawn's config.
  */
-export type RunnerFile = { runner?: AgentRunner; roles?: Record<string, AgentRunner>; rework?: Record<string, AgentRunner> };
-
-/** What the dispatcher knows about this spawn beyond the role. */
-export type SpawnKind = { reworkAfterFail?: boolean };
+export type RunnerFile = { runner?: AgentRunner; roles?: Record<string, AgentRunner> };
 
 const isRunner = (value: unknown): value is AgentRunner => value === "claude" || value === "codex";
-
-function parseRoleMap(key: "roles" | "rework", value: unknown): Record<string, AgentRunner> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error(`runner file: "${key}" must be an object of role name to runner`);
-  const roles: Record<string, AgentRunner> = {};
-  for (const [role, runner] of Object.entries(value)) {
-    if (!isRunner(runner)) throw new Error(`runner file: ${key === "roles" ? "role" : "rework role"} "${role}" must be "claude" or "codex", got ${JSON.stringify(runner)}`);
-    roles[role] = runner;
-  }
-  return roles;
-}
 
 /** Strict, so a misspelt key cannot silently leave the previous runner in place. */
 export function parseRunnerFile(text: string): RunnerFile {
@@ -53,10 +39,16 @@ export function parseRunnerFile(text: string): RunnerFile {
     if (key === "runner") {
       if (!isRunner(value)) throw new Error(`runner file: "runner" must be "claude" or "codex", got ${JSON.stringify(value)}`);
       file.runner = value;
-    } else if (key === "roles" || key === "rework") {
-      file[key] = parseRoleMap(key, value);
-    } else {
-      throw new Error(`runner file: unknown key "${key}"; expected "runner", "roles" and "rework"`);
+    } else if (key === "roles") {
+      if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error('runner file: "roles" must be an object of role name to runner');
+      const roles: Record<string, AgentRunner> = {};
+      for (const [role, runner] of Object.entries(value)) {
+        if (!isRunner(runner)) throw new Error(`runner file: role "${role}" must be "claude" or "codex", got ${JSON.stringify(runner)}`);
+        roles[role] = runner;
+      }
+      file.roles = roles;
+    } else if (key !== "rework") {
+      throw new Error(`runner file: unknown key "${key}"; expected "runner" and "roles"`);
     }
   }
   return file;
@@ -72,7 +64,6 @@ export function runnerFilePath(env: NodeJS.ProcessEnv, agentsRepoRoot: string): 
 export function runnersInUse(file: RunnerFile | null, fallback: AgentRunner): Set<AgentRunner> {
   const all = new Set<AgentRunner>([file?.runner ?? fallback]);
   for (const runner of Object.values(file?.roles ?? {})) all.add(runner);
-  for (const runner of Object.values(file?.rework ?? {})) all.add(runner);
   return all;
 }
 
@@ -109,12 +100,12 @@ export function createRunnerSelector(opts: {
   env: NodeJS.ProcessEnv;
   read?: (path: string) => string;
   warn?: (message: string) => void;
-}): (role: string, kind?: SpawnKind) => AgentRunner {
+}): (role: string) => AgentRunner {
   const read = opts.read ?? ((p: string) => readFileSync(p, "utf8"));
   const warn = opts.warn ?? ((message: string) => console.warn(message));
   let lastGood: RunnerFile | null = null;
   let lastError = "";
-  return (role: string, kind: SpawnKind = {}) => {
+  return (role: string) => {
     const fallback = resolveAgentRunner(opts.env);
     const outcome = readRunnerFile(typeof opts.path === "function" ? opts.path() : opts.path, read);
     let file: RunnerFile | null;
@@ -129,6 +120,6 @@ export function createRunnerSelector(opts: {
       file = outcome.kind === "ok" ? outcome.file : null;
       lastGood = file;
     }
-    return (kind.reworkAfterFail ? file?.rework?.[role] : undefined) ?? file?.roles?.[role] ?? file?.runner ?? fallback;
+    return file?.roles?.[role] ?? file?.runner ?? fallback;
   };
 }

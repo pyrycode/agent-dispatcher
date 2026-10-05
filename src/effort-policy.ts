@@ -37,16 +37,39 @@ function assessedRisk(body: string): "routine" | "elevated" | "unknown" {
   return risk === "routine" || risk === "elevated" ? risk : "unknown";
 }
 
+/**
+ * The builder's effort is fixed, with either runner: high on a normal run,
+ * xhigh on its rework after a verifier FAIL, the run that gets the FAIL's
+ * findings to answer. It beats PYRY_CODEX_EFFORT, role-risk-v1 and the
+ * agent's own setting, which still apply to every other role. Chosen by the
+ * owner on 2026-10-05, in place of switching the rework to another runner:
+ * the builder keeps the runner and model in settings and thinks harder on
+ * the run that has real bugs to fix.
+ */
+function builderEffortReason(opts: { runner: AgentRunner; env: NodeJS.ProcessEnv; policy: string; reworkAfterFail: boolean }): string {
+  const ignored: string[] = [];
+  if (opts.runner === "codex" && opts.env.PYRY_CODEX_EFFORT) ignored.push(`PYRY_CODEX_EFFORT=${opts.env.PYRY_CODEX_EFFORT}`);
+  if (opts.policy !== "off") ignored.push(opts.policy);
+  return (opts.reworkAfterFail ? "builder rework after a verifier FAIL" : "builder, not a rework after a verifier FAIL")
+    + (ignored.length ? `; overrides ${ignored.join(" and ")}` : "");
+}
+
 export function resolveEffort(opts: {
   agent: AgentConfig;
   item: Pick<ProjectItem, "body" | "labels">;
   runner: AgentRunner;
   env: NodeJS.ProcessEnv;
   stageSet: string;
+  /** The builder's rework after a verifier FAIL (`prepareReworkFindingsNote` in dispatch.ts). */
+  reworkAfterFail?: boolean;
 }): { effort: string; policy: string; reason: string } {
   const { agent, item, runner, env, stageSet } = opts;
   validateEffortPolicy(env.PYRY_EFFORT_POLICY, stageSet);
   const policy = env.PYRY_EFFORT_POLICY === "role-risk-v1" ? "role-risk-v1" : "off";
+  if (agent.name === "builder") {
+    const reworkAfterFail = opts.reworkAfterFail === true;
+    return { effort: reworkAfterFail ? "xhigh" : "high", policy, reason: builderEffortReason({ runner, env, policy, reworkAfterFail }) };
+  }
   if (runner === "codex" && env.PYRY_CODEX_EFFORT) {
     return { effort: env.PYRY_CODEX_EFFORT, policy, reason: "explicit PYRY_CODEX_EFFORT override" };
   }
@@ -59,7 +82,6 @@ export function resolveEffort(opts: {
   const reason = security ? "security-sensitive label" : `ticket assessment: ${risk}`;
   switch (agent.name) {
     case "refiner": return { effort: risk === "elevated" ? "high" : "medium", policy, reason };
-    case "builder": return { effort: risk === "routine" ? "medium" : "high", policy, reason };
     case "verifier": return { effort: "high", policy, reason: `independent verification; ${reason}` };
     case "documentation": return { effort: risk === "routine" ? "low" : "medium", policy, reason };
     default: throw new Error(`No role-risk-v1 effort policy for ${agent.name}`);
