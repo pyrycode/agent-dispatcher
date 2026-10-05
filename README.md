@@ -461,7 +461,10 @@ the dispatcher environment" on #1631. Checked against all 23 distinct blocked
 summaries in the Mobile, Desktop and pyrycode logs, it matched five: these three
 and two of the same kind. It matched none of the eighteen that need a person. A summary naming an approval, a human,
 a maintainer, a decision or a denied permission always parks, and so does any run
-where the approval reviewer rejected an action.
+where the approval reviewer rejected an action. The retry never discards or
+salvages the blocked run's work: when that run left uncommitted edits or unpushed
+commits, the retry continues from them in the same worktree (see "Reusing the
+agent's own preserved worktree" above).
 
 A block after Codex's approval reviewer failed to decide also retries, on the same
 backoff and cap. Codex says so in its own output, on stderr or in a tool item:
@@ -471,10 +474,11 @@ determination that the action is unsafe" when the reviewer's model was at capaci
 its deadline" (mobile #1655). The dispatcher matches only that Codex output, never
 the agent's summary, which always mentions the approval. A genuine rejection, "This
 action was rejected due to unacceptable risk", still parks, even beside a reviewer
-failure. The retry never discards or
-salvages the blocked run's work: when that run left uncommitted edits or unpushed
-commits, the retry continues from them in the same worktree (see "Reusing the
-agent's own preserved worktree" above).
+failure.
+
+A Codex turn that fails with "Selected model is at capacity. Please try a different
+model." takes the capped API retry, like "Unable to verify model access right
+now". Five mobile tickets parked on it on 2026-10-05.
 
 A builder may instead return `status: needs_refinement` for a planning problem.
 The dispatcher posts its explanation on the assigned issue and adds
