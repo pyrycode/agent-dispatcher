@@ -9509,3 +9509,216 @@ describe("no-result exit keeps Claude's stderr (pyrycode-mobile #1340, 2026-10-0
     assert.ok(client.addLabelCalls.some(c => c.label === "error:verifier"), "still parks: the tail adds evidence, not a retry");
   });
 });
+
+describe("pre-verifier gates — failures already on main (#123)", () => {
+  // 2026-10-04/05, pyrycode-mobile: #1747 failed four verifier passes over
+  // device tests that failed only under full-suite load, while the main sweep
+  // was failing 38 of 1211 of the same tests (#1809). A red gate with an
+  // output format now has its failures read against main before the verifier
+  // spawns; a gate without one behaves exactly as before.
+  const logsDir = resolve(TEST_AGENTS_REPO_ROOT, "logs");
+  const UI = "python3 scripts/android-test-gate.py ui";
+  const SWEEP_SHA = "a".repeat(40);
+  const BASE_SHA = "b".repeat(40);
+  const X = "de.pyryco.mobile.ui.ArchiveTest#archive";
+  const Y = "de.pyryco.mobile.ui.HomeTest#focus";
+  const Z = "de.pyryco.mobile.ui.NewTest#broken";
+  const W = "de.pyryco.mobile.ui.OwnTest#regressed";
+  const FORMATS = JSON.stringify({ [UI]: { format: "junit-xml", baseline: `${UI} --tests {{TESTS}}` } });
+
+  const junit = (failed: string[], passed: string[] = []) => {
+    const tc = (name: string, body: string) => {
+      const [cls, method] = name.split("#");
+      return `<testcase classname="${cls}" name="${method}">${body}</testcase>`;
+    };
+    return `<testsuite name="ui" tests="${failed.length + passed.length}" failures="${failed.length}">` +
+      failed.map((n) => tc(n, '<failure message="boom"/>')).join("") + passed.map((n) => tc(n, "")).join("") +
+      "</testsuite>";
+  };
+  const sweepState = (over: object = {}) => JSON.stringify({
+    lastSha: SWEEP_SHA, lastGoodSha: null, openIssue: 1809,
+    failures: { sha: SWEEP_SHA, names: [X, Y] }, reportedNames: [X, Y], ...over,
+  });
+  const ticketView = (comments: string[] = []) => JSON.stringify({
+    state: "OPEN", body: `## Failing tests\n\n- \`${X}\`\n- \`${Y}\``, comments: comments.map((body) => ({ body })),
+  });
+  const execs = (opts: { ancestor?: boolean | "unknown"; ticket?: string } = {}): Record<string, ExecHandler> => ({
+    "git merge-base --is-ancestor": () =>
+      opts.ancestor === false ? execError({ status: 1 }) : opts.ancestor === "unknown" ? execError({ status: 128 }) : "",
+    "git merge-base HEAD": () => `${BASE_SHA}\n`,
+    "gh issue view 1809": () => opts.ticket ?? ticketView(),
+  });
+  const gateLog = (n: number, i: number) => resolve(logsDir, `verifier-gate_#${n}_${i}.log`);
+  const stateFile = resolve(logsDir, "main-sweep-state.json");
+  /** A red UI gate: exit 1 for the gate itself; the base re-run's own exit is irrelevant. */
+  const uiRed = (req: GateSpawnRequest): GateSpawnOutcome =>
+    req.command === UI ? { exitCode: 1, timedOut: false, spawnError: null } : { exitCode: 0, timedOut: false, spawnError: null };
+
+  async function withFormats<T>(value: string | undefined, fn: () => Promise<T>): Promise<T> {
+    const prior = process.env.PYRY_VERIFIER_GATE_FORMATS;
+    if (value === undefined) delete process.env.PYRY_VERIFIER_GATE_FORMATS;
+    else process.env.PYRY_VERIFIER_GATE_FORMATS = value;
+    try {
+      return await fn();
+    } finally {
+      if (prior === undefined) delete process.env.PYRY_VERIFIER_GATE_FORMATS;
+      else process.env.PYRY_VERIFIER_GATE_FORMATS = prior;
+    }
+  }
+
+  /** Runs the pre-spawn gate step for ticket `n`, with the base re-run's stdout served from `baseOutput`. */
+  async function runGates(n: number, opts: {
+    gates?: string;
+    formats?: string;
+    uiOutput: string;
+    state?: string | null;
+    exec?: Record<string, ExecHandler>;
+    baseOutput?: string;
+  }) {
+    return withStageSet("builder", () => withVerifierGates(opts.gates ?? `make check;${UI}`, () => withFormats("formats" in opts ? opts.formats : FORMATS, async () => {
+      const fsMap: Record<string, string> = { [gateLog(n, 2)]: opts.uiOutput };
+      if (opts.state !== null) fsMap[stateFile] = opts.state ?? sweepState();
+      const { deps, calls } = makeMockDeps({ execImpls: opts.exec ?? execs(), fsMap, gateImpl: uiRed });
+      const read = deps.readFileSync;
+      deps.readFileSync = ((path: any, ...rest: any[]) =>
+        /verifier-gate-base_#\d+\.log$/.test(String(path)) && opts.baseOutput !== undefined
+          ? opts.baseOutput
+          : (read as any)(path, ...rest)) as typeof deps.readFileSync;
+      const { ctx, client } = makeTestContext({ agent: builderAgent("verifier"), item: { issueNumber: n }, deps, calls });
+      const result = await maybeRunPreSpawnGates(ctx);
+      return { result, calls, client };
+    })));
+  }
+  const baseRuns = (calls: CallLog) => calls.gates.filter((g) => g.command.includes("--tests"));
+
+  test("a red UI gate whose failures all failed in the ancestor main sweep spawns the verifier green, and the run ends without rework", async () => {
+    await withStageSet("builder", () => withVerifierGates(`make check;${UI};make lint`, () => withFormats(FORMATS, async () => {
+      const claudeMd = claudeMdAbsPath("verifier/CLAUDE.md");
+      const client = new MockGitHubClient({ status: { 1747: "In Code Review" }, labels: { 1747: [] } });
+      const { deps, calls } = makeMockDeps({
+        execImpls: { ...fullHappyExecImpls("feature/1747"), ...execs() },
+        fsMap: { [claudeMd]: "verifier system prompt", [gateLog(1747, 2)]: junit([X, Y], [Z]), [stateFile]: sweepState() },
+        gateImpl: uiRed,
+      });
+
+      await dispatchToAgent(builderAgent("verifier"), makeProjectItem({ issueNumber: 1747 }), client, deps);
+
+      assert.deepEqual(calls.gates.map((g) => g.command), ["make check", UI, "make lint"], "the gates after the excused one still run");
+      assert.equal(baseRuns(calls).length, 0, "every failure was matched by the sweep, so nothing re-runs on the base");
+      assert.ok(calls.exec.some((e) => e.cmd.includes(`git merge-base --is-ancestor ${SWEEP_SHA} HEAD`)), "the sweep's commit is checked against the merged tree");
+      assert.equal(calls.claudeStreams, 1);
+      const prompt = calls.fs.find((f) => f.kind === "write" && f.path.endsWith(".prompt-1747.txt"))!.content!;
+      assert.ok(!prompt.includes("TRIAGE MODE"), "the gate counts as green for the verdict");
+      assert.match(prompt, /## Deterministic gates/);
+      assert.match(prompt, /count as green for your verdict/);
+      assert.match(prompt, /### Failures already on main, not this ticket's/);
+      assert.ok(prompt.includes(`\`${X}\` (failed in the main sweep on \`${SWEEP_SHA.slice(0, 12)}\`)`));
+      assert.ok(prompt.includes(`\`${Y}\``));
+      assert.match(prompt, /recorded on #1809/);
+      assert.ok(client.addLabelCalls.some((c) => c.label === "done:verifier"));
+      assert.ok(!client.addLabelCalls.some((c) => c.label.startsWith("needs-rework:")), "no rework label");
+      assert.ok(!client.addLabelCalls.some((c) => c.label.startsWith("rework-count:")), "no rework count");
+      assert.equal(client.comments.filter((c) => c.issueNumber === 1809).length, 0, "#1809 already lists both names");
+      assert.match(loggedText(calls), /all 2 failing test\(s\) also fail on main, so it counts as green/);
+      assert.ok(
+        !calls.fs.some((f) => f.kind === "write" && f.path.endsWith("verifier-gate_#1747.pass.json")),
+        "an excused gate is not a full pass, so nothing is recorded for reuse",
+      );
+    })));
+  });
+
+  test("a failure absent from the sweep that also fails on the base commit is baseline; one that passes there stays the ticket's", async () => {
+    const { result, calls, client } = await runGates(1748, {
+      uiOutput: junit([X, Z, W]),
+      baseOutput: junit([Z], [W]),
+    });
+
+    const runs = baseRuns(calls);
+    assert.equal(runs.length, 1, "one focused re-run of the names the sweep did not cover");
+    assert.equal(runs[0]!.command, `${UI} --tests '${Z},${W}'`);
+    assert.match(runs[0]!.cwd, /verifier-gate-base-1748$/);
+    assert.ok(calls.exec.some((e) => e.cmd.includes("git worktree add --detach") && e.cmd.endsWith(BASE_SHA)), "the re-run is on the base commit");
+
+    const note = result.promptNote;
+    assert.match(note, /TRIAGE MODE/, "W fails only on the branch, so the gate stays red");
+    assert.ok(note.includes(`\`${X}\` (failed in the main sweep`));
+    assert.ok(note.includes(`\`${Z}\` (failed when re-run alone on the base commit \`${BASE_SHA.slice(0, 12)}\`)`));
+    assert.match(note, new RegExp(`Judge only these remaining failures of \`${UI.replace(/\./g, "\\.")}\`[^]*- \`${W}\``));
+    assert.ok(!note.includes(`\`${W}\` (failed`), "W is not marked as baseline");
+
+    // Recorded on the open main-failure ticket: Z is new there, X is already listed.
+    const recorded = client.comments.filter((c) => c.issueNumber === 1809);
+    assert.equal(recorded.length, 1);
+    assert.match(recorded[0]!.body, /## Main failures seen by #1748/);
+    assert.ok(recorded[0]!.body.includes(`\`${Z}\``));
+    assert.ok(!recorded[0]!.body.includes(`\`${X}\``), "no duplicate entry for a name already listed");
+    assert.ok(!recorded[0]!.body.includes(`\`${W}\``));
+  });
+
+  test("when the base commit fails every remaining name, the gate counts as green", async () => {
+    const { result, calls, client } = await runGates(1749, {
+      uiOutput: junit([Z]),
+      state: sweepState({ failures: { sha: SWEEP_SHA, names: [] } }),
+      baseOutput: junit([Z]),
+    });
+    assert.equal(baseRuns(calls).length, 1);
+    assert.ok(!result.promptNote.includes("TRIAGE MODE"));
+    assert.match(result.promptNote, /count as green for your verdict/);
+    assert.equal(client.comments.filter((c) => c.issueNumber === 1809).length, 1);
+  });
+
+  test("a base re-run that cannot be read excuses nothing", async () => {
+    const { result } = await runGates(1750, { uiOutput: junit([Z]), baseOutput: "BUILD FAILED" });
+    assert.match(result.promptNote, /TRIAGE MODE/);
+    assert.ok(!result.promptNote.includes("Failures already on main"));
+  });
+
+  for (const [label, ancestor] of [["not an ancestor", false], ["of unknown ancestry", "unknown"]] as const) {
+    test(`a sweep on a main commit ${label} of the merged tree is not used as a baseline`, async () => {
+      const { result, client } = await runGates(1751, {
+        formats: JSON.stringify({ [UI]: "junit-xml" }), // no base template: only the sweep could excuse
+        uiOutput: junit([X]),
+        exec: execs({ ancestor }),
+      });
+      assert.match(result.promptNote, /TRIAGE MODE/);
+      assert.ok(!result.promptNote.includes("Failures already on main"), "X is not marked as baseline");
+      assert.equal(client.comments.length, 0);
+    });
+  }
+
+  test("a sweep state without a recorded commit is not used as a baseline", async () => {
+    const { result, calls } = await runGates(1752, {
+      formats: JSON.stringify({ [UI]: "junit-xml" }),
+      uiOutput: junit([X]),
+      state: JSON.stringify({ lastSha: SWEEP_SHA, lastGoodSha: null, openIssue: 1809 }),
+    });
+    assert.match(result.promptNote, /TRIAGE MODE/);
+    assert.ok(!calls.exec.some((e) => e.cmd.includes("--is-ancestor")));
+  });
+
+  test("a name the main-failure ticket already lists in a comment is not recorded again", async () => {
+    const { result, client } = await runGates(1753, {
+      uiOutput: junit([Z]),
+      state: sweepState({ failures: { sha: SWEEP_SHA, names: [] } }),
+      baseOutput: junit([Z]),
+      exec: execs({ ticket: ticketView([`## Main failures seen by #1700\n\n- \`${Z}\` (failed when re-run alone on the base commit)`]) }),
+    });
+    assert.match(result.promptNote, /recorded on #1809/);
+    assert.equal(client.comments.length, 0);
+  });
+
+  test("without PYRY_VERIFIER_GATE_FORMATS a red gate behaves exactly as before", async () => {
+    const { result, calls, client } = await runGates(1754, { formats: undefined, uiOutput: junit([X, Y]) });
+    assert.match(result.promptNote, /TRIAGE MODE/);
+    assert.ok(!result.promptNote.includes("Failures already on main"));
+    assert.ok(!calls.exec.some((e) => e.cmd.includes("merge-base") || e.cmd.includes("gh issue view")));
+    assert.ok(!calls.fs.some((f) => f.path === stateFile), "the sweep state is not even read");
+    assert.equal(client.comments.length, 0);
+  });
+
+  test("a red gate whose output names no failure stays red and reads no baseline", async () => {
+    const { result, calls } = await runGates(1755, { uiOutput: "FAILURE: Build failed with an exception." });
+    assert.match(result.promptNote, /TRIAGE MODE/);
+    assert.ok(!calls.exec.some((e) => e.cmd.includes("merge-base")));
+  });
+});

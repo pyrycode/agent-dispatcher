@@ -51,9 +51,24 @@ export interface MainSweepState {
   lastGoodSha: string | null;
   /** The ticket filed for the current failure, so a repeat failure does not file another. */
   openIssue: number | null;
+  /**
+   * The failing tests of the last sweep that ran, and the main commit it ran
+   * on. Empty names after a pass. A verifier gate sets aside a failure listed
+   * here, but only when this commit is in the gated branch's merged tree, so
+   * a missing record means no sweep is used as a baseline.
+   */
+  failures: { sha: string; names: string[] } | null;
+  /**
+   * The failure set last written to `openIssue`, by the ticket itself or an
+   * update comment. A later failed sweep comments only when its set differs.
+   * Null when nothing was recorded, as for a ticket filed before this field.
+   */
+  reportedNames: string[] | null;
 }
 
-export const EMPTY_MAIN_SWEEP_STATE: MainSweepState = { lastSha: null, lastGoodSha: null, openIssue: null };
+export const EMPTY_MAIN_SWEEP_STATE: MainSweepState = {
+  lastSha: null, lastGoodSha: null, openIssue: null, failures: null, reportedNames: null,
+};
 
 /** Tolerates a missing or damaged file: the worst case is one extra sweep. */
 export function parseMainSweepState(raw: string | null): MainSweepState {
@@ -62,10 +77,18 @@ export function parseMainSweepState(raw: string | null): MainSweepState {
     const parsed = JSON.parse(raw);
     const sha = (v: unknown) => (typeof v === "string" && /^[0-9a-f]{7,40}$/.test(v) ? v : null);
     const issue = parsed?.openIssue;
+    const names = (v: unknown) =>
+      Array.isArray(v) && v.every((n) => typeof n === "string") ? [...v] as string[] : null;
+    const failureSha = sha(parsed?.failures?.sha);
+    const failureNames = names(parsed?.failures?.names);
     return {
       lastSha: sha(parsed?.lastSha),
       lastGoodSha: sha(parsed?.lastGoodSha),
       openIssue: Number.isInteger(issue) && issue > 0 ? issue : null,
+      // Both halves or neither: names without the commit they failed on
+      // cannot be checked against a branch.
+      failures: failureSha !== null && failureNames !== null ? { sha: failureSha, names: failureNames } : null,
+      reportedNames: names(parsed?.reportedNames),
     };
   } catch {
     return { ...EMPTY_MAIN_SWEEP_STATE };
@@ -210,9 +233,67 @@ export function buildMainSweepIssue(input: {
   lines.push(
     "Reproduce with the command above on main. Decide per failing test whether the code regressed or the test " +
     "only behaves differently in the in-depth environment, and fix whichever it is. The sweep files no further " +
-    "ticket while this one is open, and runs again when main changes.",
+    "ticket while this one is open, and runs again when main changes. When a later sweep fails a different set " +
+    "of tests, it comments the new set here.",
   );
   return { title, body: lines.join("\n") };
+}
+
+/**
+ * Whether a failed sweep should comment its failure set on the still-open
+ * ticket. Only a sweep that named its failures has a set to record, and only
+ * a set that differs from the one last recorded is worth a comment. Until
+ * 2026-10-05 a repeat failure posted nothing at all: pyrycode-mobile #1046,
+ * filed for three failures, stayed open while the sweeps grew to 38, and no
+ * ticket named them until one was filed by hand.
+ */
+export function shouldCommentSweepFailures(
+  reportedNames: readonly string[] | null,
+  failedNames: readonly string[],
+): boolean {
+  if (failedNames.length === 0) return false;
+  if (reportedNames === null) return true;
+  const now = new Set(failedNames);
+  const before = new Set(reportedNames);
+  return now.size !== before.size || [...now].some((name) => !before.has(name));
+}
+
+/** The comment a failed sweep posts on the still-open ticket when its failure set changed. */
+export function buildMainSweepUpdateComment(input: {
+  head: string;
+  reportedNames: readonly string[] | null;
+  outcome: MainSweepOutcome;
+}): string {
+  const names = [...new Set(input.outcome.failedNames)];
+  const before = input.reportedNames === null ? null : new Set(input.reportedNames);
+  const now = new Set(names);
+  const lines: string[] = [];
+  lines.push("## Main sweep failures changed");
+  lines.push("");
+  lines.push(
+    `The main sweep failed again on \`${input.head}\`, with ${names.length} failing test(s). ` +
+    (before === null
+      ? "No failure set was recorded on this ticket before, so this is the full current set."
+      : "That set differs from the one last recorded on this ticket."),
+  );
+  lines.push("");
+  if (before !== null) {
+    const added = names.filter((name) => !before.has(name));
+    const gone = [...before].filter((name) => !now.has(name));
+    lines.push(`- Newly failing: ${added.length}`);
+    lines.push(`- No longer failing: ${gone.length}`);
+    for (const name of gone.slice(0, MAX_LISTED_FAILURES)) lines.push(`  - \`${name}\``);
+    if (gone.length > MAX_LISTED_FAILURES) lines.push(`  - ... and ${gone.length - MAX_LISTED_FAILURES} more`);
+    lines.push("");
+  }
+  lines.push("## Failing tests");
+  lines.push("");
+  // Listed in full, unlike the ticket body: verifier gates look names up here
+  // to avoid recording one twice.
+  for (const name of names) lines.push(`- \`${name}\``);
+  lines.push("");
+  lines.push(`Output on the dispatcher host: \`${input.outcome.stdoutPath}\` and \`${input.outcome.stderrPath}\``);
+  return lines.join("\n");
 }
 
 /** The last `maxLines` lines of `text`, capped at `maxChars`, for a ticket body. */
