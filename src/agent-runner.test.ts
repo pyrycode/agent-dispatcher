@@ -45,6 +45,13 @@ describe("Codex invocation", () => {
     assert.ok(!spec.args.some(arg => arg.startsWith("shell_environment_policy.set.AGENTS_REPO_PATH=")), "an absent path must not overwrite user configuration");
     for (const forbidden of ["--model", "--max-turns", "--allowedTools", "--dangerously-bypass-approvals-and-sandbox", "--full-auto"]) assert.ok(!spec.args.includes(forbidden));
   });
+  test("a continuation leg resumes the thread with every flag re-passed before the subcommand", () => {
+    const fresh = buildCodexInvocation({ cwd: "/repo", role: "role", model: "m", effort: "high", agentsRepoPath: "/agents" });
+    const resumed = buildCodexInvocation({ cwd: "/repo", role: "role", model: "m", effort: "high", agentsRepoPath: "/agents", resumeThreadId: "thread-1" });
+    // `codex exec resume` takes no --cd or --approve-for-me of its own, so the
+    // exec-level flags stay in front of it and the prompt still comes on stdin.
+    assert.deepEqual(resumed.args, [...fresh.args.slice(0, -1), "resume", "thread-1", "-"]);
+  });
   test("uses only explicitly selected Codex model and effort", () => {
     const spec = buildCodexInvocation({cwd:"/repo",role:"role",model:"chosen-model",effort:"high"});
     assert.equal(spec.args[spec.args.indexOf("--model")+1],"chosen-model");
