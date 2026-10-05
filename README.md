@@ -466,6 +466,16 @@ salvages the blocked run's work: when that run left uncommitted edits or unpushe
 commits, the retry continues from them in the same worktree (see "Reusing the
 agent's own preserved worktree" above).
 
+A block after Codex's approval reviewer failed to decide also retries, on the same
+backoff and cap. Codex says so in its own output, on stderr or in a tool item:
+"automatic approval review could not be completed. This is a review failure, not a
+determination that the action is unsafe" when the reviewer's model was at capacity
+(mobile #1582), or "The automatic permission approval review did not finish before
+its deadline" (mobile #1655). The dispatcher matches only that Codex output, never
+the agent's summary, which always mentions the approval. A genuine rejection, "This
+action was rejected due to unacceptable risk", still parks, even beside a reviewer
+failure.
+
 A Codex turn that fails with "Selected model is at capacity. Please try a different
 model." takes the capped API retry, like "Unable to verify model access right
 now". Five mobile tickets parked on it on 2026-10-05.
