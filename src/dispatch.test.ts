@@ -8667,6 +8667,187 @@ describe("pre-verifier gates — reusing a pass on the same files (2026-10-02, #
     assert.equal(calls.gates.length, 1);
     assert.equal(passWrites(calls, 1508).length, 0);
   });
+
+  describe("a rework that changed only documentation (#134)", () => {
+    // A FAIL over a missing section in the plan sends the builder to edit
+    // one Markdown file, and the next pass reran every gate on unchanged
+    // code. When everything that changed since the green run is
+    // documentation, the code gates are reused and only the documentation
+    // gates run again.
+    const NEW_HEAD = "d".repeat(40);
+    const NEW_TREE = "f".repeat(40);
+    const GATES2 = "make check;make docs";
+    const twoGatePass = (n: number, overrides: Partial<VerifierGatePass> = {}) => recorded(n, {
+      gatesHash: hashGateList(["make check", "make docs"]),
+      gates: ["make check", "make docs"],
+      summary: ["✓ make check (exit 0)", "✓ make docs (exit 0)"],
+      logPaths: gateLogs(n, 2),
+      ...overrides,
+    });
+    /** HEAD moved to NEW_HEAD; `git diff --name-only` answers `diff`. */
+    const movedImpls = (diff: string | Error): Record<string, ExecHandler> => ({
+      ...headImpls(NEW_HEAD, NEW_TREE),
+      "git diff --name-only": () => diff,
+    });
+    const gitDiffs = (calls: CallLog) => calls.exec.filter((e) => e.cmd.includes("git diff --name-only"));
+
+    async function withDocsEnv<T>(env: { paths?: string; gates?: string }, fn: () => Promise<T>): Promise<T> {
+      const prior = { paths: process.env.PYRY_VERIFIER_DOCS_PATHS, gates: process.env.PYRY_VERIFIER_DOCS_GATES };
+      const set = (key: string, value: string | undefined) => {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      };
+      set("PYRY_VERIFIER_DOCS_PATHS", env.paths);
+      set("PYRY_VERIFIER_DOCS_GATES", env.gates);
+      try {
+        return await fn();
+      } finally {
+        set("PYRY_VERIFIER_DOCS_PATHS", prior.paths);
+        set("PYRY_VERIFIER_DOCS_GATES", prior.gates);
+      }
+    }
+
+    test("only docs/ changed, no documentation gates: no gate runs, the note lists the files, a pass is recorded for this tree", async () => {
+      const prior = twoGatePass(1520);
+      const { result, calls } = await withDocsEnv({}, () => runGates(
+        1520,
+        { execImpls: movedImpls("docs/specs/architecture/1520.md\ndocs/knowledge/INDEX.md\n"), fsMap: fsWith(1520, prior, gateLogs(1520, 2)) },
+        GATES2,
+      ));
+      assert.equal(calls.gates.length, 0, "no gate runs");
+      const diffs = gitDiffs(calls);
+      assert.equal(diffs.length, 1);
+      assert.match(diffs[0]!.cmd, /git diff --name-only c{40} HEAD/, "diffed from the commit the pass ran on");
+      const note = result.promptNote;
+      assert.match(note, /## Deterministic gates/);
+      assert.ok(!note.includes("TRIAGE MODE"));
+      assert.match(note, /code gates were reused because only these documentation files changed since the green run at commit `c{40}`/);
+      assert.match(note, /- `docs\/specs\/architecture\/1520\.md`/);
+      assert.match(note, /- `docs\/knowledge\/INDEX\.md`/);
+      assert.match(note, /- `make check`/);
+      assert.match(note, /Check only the documentation files listed above against the open findings\. Do not review the code again\./);
+      assert.match(loggedText(calls), /only documentation changed since/);
+      const writes = passWrites(calls, 1520);
+      assert.equal(writes.length, 1, "a new pass is recorded for the current tree");
+      const written = JSON.parse(writes[0]!.content!) as VerifierGatePass;
+      assert.equal(written.tree, NEW_TREE);
+      assert.equal(written.commit, NEW_HEAD);
+      assert.equal(written.passedAt, prior.passedAt, "the code gates' evidence keeps its age");
+      assert.deepEqual(written.summary, prior.summary);
+      assert.deepEqual(written.logPaths, prior.logPaths, "the reused logs are still the evidence");
+    });
+
+    test("the documentation gates in PYRY_VERIFIER_DOCS_GATES run alone, on their own log numbers", async () => {
+      const prior = twoGatePass(1521);
+      const { result, calls } = await withDocsEnv({ gates: "make docs" }, () => runGates(
+        1521,
+        { execImpls: movedImpls("docs/specs/architecture/1521.md\n"), fsMap: fsWith(1521, prior, gateLogs(1521, 2)) },
+        GATES2,
+      ));
+      assert.deepEqual(calls.gates.map((g) => g.command), ["make docs"], "only the documentation gate runs");
+      assert.equal(calls.gates[0]!.stdoutPath, gateLogs(1521, 2)[2], "it writes its own log, not the reused code gate's");
+      assert.match(result.promptNote, /code gates were reused/);
+      assert.match(result.promptNote, /documentation gates ran again on this worktree and passed:\n\n- `make docs`/);
+      const written = JSON.parse(passWrites(calls, 1521)[0]!.content!) as VerifierGatePass;
+      assert.equal(written.tree, NEW_TREE);
+      assert.deepEqual(written.summary, ["✓ make check (exit 0)", "✓ make docs (exit 0)"]);
+      assert.deepEqual(written.logPaths, gateLogs(1521, 2));
+    });
+
+    test("a red documentation gate goes to TRIAGE MODE and records nothing", async () => {
+      const { result, calls } = await withDocsEnv({ gates: "make docs" }, () => runGates(
+        1522,
+        {
+          execImpls: movedImpls("docs/specs/architecture/1522.md\n"),
+          fsMap: fsWith(1522, twoGatePass(1522), gateLogs(1522, 2)),
+          gateImpl: () => ({ exitCode: 1, timedOut: false, spawnError: null }),
+        },
+        GATES2,
+      ));
+      assert.deepEqual(calls.gates.map((g) => g.command), ["make docs"]);
+      assert.match(result.promptNote, /TRIAGE MODE/);
+      assert.match(result.promptNote, /Failing gate: `make docs`/);
+      assert.equal(passWrites(calls, 1522).length, 0);
+    });
+
+    test("one changed path outside the documentation globs runs every gate", async () => {
+      const { result, calls } = await withDocsEnv({ gates: "make docs" }, () => runGates(
+        1523,
+        { execImpls: movedImpls("docs/specs/architecture/1523.md\nsrc/main.ts\n"), fsMap: fsWith(1523, twoGatePass(1523), gateLogs(1523, 2)) },
+        GATES2,
+      ));
+      assert.deepEqual(calls.gates.map((g) => g.command), ["make check", "make docs"]);
+      assert.ok(!result.promptNote.includes("reused"));
+    });
+
+    test("PYRY_VERIFIER_DOCS_PATHS widens what counts as documentation", async () => {
+      const { calls } = await withDocsEnv({ paths: "docs/**,*.md" }, () => runGates(
+        1524,
+        { execImpls: movedImpls("README.md\n"), fsMap: fsWith(1524, twoGatePass(1524), gateLogs(1524, 2)) },
+        GATES2,
+      ));
+      assert.equal(calls.gates.length, 0);
+    });
+
+    test("a pass commit git cannot resolve, or a failing git diff, runs every gate", async () => {
+      const unknown = await withDocsEnv({}, () => runGates(
+        1525,
+        {
+          execImpls: movedImpls(new Error("fatal: bad object cccccccc")),
+          fsMap: fsWith(1525, twoGatePass(1525), gateLogs(1525, 2)),
+        },
+        GATES2,
+      ));
+      assert.equal(unknown.calls.gates.length, 2);
+      assert.ok(!unknown.result.promptNote.includes("reused"));
+
+      const garbled = await withDocsEnv({}, () => runGates(
+        1526,
+        { execImpls: movedImpls("docs/a.md\n"), fsMap: fsWith(1526, twoGatePass(1526, { commit: "HEAD; rm -rf /" }), gateLogs(1526, 2)) },
+        GATES2,
+      ));
+      assert.equal(garbled.calls.gates.length, 2, "a commit that is not a SHA is never handed to git");
+      assert.equal(gitDiffs(garbled.calls).length, 0);
+    });
+
+    test("an expired pass, a changed gate list or a missing gate log is not reused for a docs-only change", async () => {
+      const stale = twoGatePass(1527, { passedAt: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString() });
+      const expired = await withDocsEnv({}, () => runGates(
+        1527, { execImpls: movedImpls("docs/a.md\n"), fsMap: fsWith(1527, stale, gateLogs(1527, 2)) }, GATES2,
+      ));
+      assert.equal(expired.calls.gates.length, 2);
+
+      const changed = await withDocsEnv({}, () => runGates(
+        1528, { execImpls: movedImpls("docs/a.md\n"), fsMap: fsWith(1528, twoGatePass(1528), gateLogs(1528, 2)) }, "make check;make docs;make build",
+      ));
+      assert.equal(changed.calls.gates.length, 3);
+
+      const missing = await withDocsEnv({}, () => runGates(
+        1529, { execImpls: movedImpls("docs/a.md\n"), fsMap: fsWith(1529, twoGatePass(1529), gateLogs(1529, 1)) }, GATES2,
+      ));
+      assert.equal(missing.calls.gates.length, 2);
+
+      for (const run of [expired, changed, missing]) {
+        assert.ok(!run.result.promptNote.includes("reused"));
+        assert.equal(gitDiffs(run.calls).length, 0, "git is not asked once the pass is ruled out");
+      }
+    });
+
+    test("PYRY_VERIFIER_GATE_REUSE=0 turns docs-only reuse off too", async () => {
+      const prior = process.env.PYRY_VERIFIER_GATE_REUSE;
+      process.env.PYRY_VERIFIER_GATE_REUSE = "0";
+      try {
+        const { calls } = await withDocsEnv({}, () => runGates(
+          1530, { execImpls: movedImpls("docs/a.md\n"), fsMap: fsWith(1530, twoGatePass(1530), gateLogs(1530, 2)) }, GATES2,
+        ));
+        assert.equal(calls.gates.length, 2);
+        assert.equal(gitDiffs(calls).length, 0);
+      } finally {
+        if (prior === undefined) delete process.env.PYRY_VERIFIER_GATE_REUSE;
+        else process.env.PYRY_VERIFIER_GATE_REUSE = prior;
+      }
+    });
+  });
 });
 
 describe("stage-set threading tripwires (source assertions)", () => {
