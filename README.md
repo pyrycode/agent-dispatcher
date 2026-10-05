@@ -197,6 +197,23 @@ After both phases settle, a normal verifier receives the complete source finding
 and green or red gate evidence. It validates findings, finishes deferred Figma and
 live-evidence checks, performs any red-gate triage, then publishes the verdict.
 
+**Verdict handoff.** A run that rules on a PR, an agent marked `requiresVerdict`,
+is told a handoff file in its prompt. It writes its finished verdict there before
+posting: a header with `decision: PASS` or `FAIL`, `commit:` with the full SHA of the
+PR head it reviewed, `labels:` with the labels the verdict adds, then a `---` line
+and the comment body. The file lives in `~/.codex/publish/<repository>/verdict-handoff/`,
+beside the GitHub body files both runners already write, or in `PYRY_VERDICT_HANDOFF_DIR`.
+The dispatcher empties it before each run. When the run then fails or blocks because a
+GitHub write failed, nothing was posted on the PR since the run began, the file is
+complete and the PR head still equals the reviewed commit, the dispatcher posts the
+body, applies the labels and finishes the run as a success. A FAIL routes back to the
+builder as a normal rework. If GitHub still refuses the write, the ticket gets
+`pending-verdict:<agent>`, which stops a re-dispatch, and each cycle tries again;
+a write GitHub reported as failed but stored is recognised by a hidden marker line
+and never posted twice. A moved head, a missing or incomplete file, a closed PR, an
+approval rejection or a block about anything else parks as before. Mobile #1677
+spent nine hours parked on a GitHub outage of minutes before this.
+
 The two model phases share the verifier's wall-clock budget, but gate time is not
 charged to it. The final verifier gets the budget the source review left, and
 never less than half of it, however long the gates took. Each gate stays bounded
