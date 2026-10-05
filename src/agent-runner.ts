@@ -172,6 +172,15 @@ export function buildCodexInvocation(opts: {
   };
 }
 
+/**
+ * Codex's own words when its automatic approval reviewer could not decide,
+ * as opposed to rejecting. Seen on the `codex_core::tools::router` ERROR line
+ * on stderr, pyrycode-mobile 2026-10-05: #1582 (the reviewer's model was at
+ * capacity) and #1655 (the review missed its deadline). Matched only on
+ * Codex's output, never on the agent's summary.
+ */
+const APPROVAL_REVIEW_FAILED = /automatic approval review could not be completed|This is a review failure, not a determination that the action is unsafe|automatic permission approval review did not finish before its deadline/i;
+
 /** Native Codex JSONL is not Claude stream-json. A process exit alone is not success. */
 export class CodexStreamAdapter {
   private sessionId = "";
@@ -179,6 +188,7 @@ export class CodexStreamAdapter {
   private errorText = "";
   private failed = false;
   private approvalRejected = false;
+  private approvalReviewFailed = false;
   private completed = false;
   private turns = 0;
   private usage: Record<string, unknown> = {};
@@ -191,8 +201,10 @@ export class CodexStreamAdapter {
       case "item.completed":
         // Tool denial evidence is sticky. A later outcome must not route the
         // rejected action through the dispatcher instead.
-        if (event.item?.type !== "agent_message" && /This action was rejected due to unacceptable risk/.test(JSON.stringify(event.item ?? {}))) {
-          this.approvalRejected = true;
+        if (event.item?.type !== "agent_message") {
+          const itemText = JSON.stringify(event.item ?? {});
+          if (/This action was rejected due to unacceptable risk/.test(itemText)) this.approvalRejected = true;
+          if (APPROVAL_REVIEW_FAILED.test(itemText)) this.approvalReviewFailed = true;
         }
         if (event.item?.type === "agent_message" && typeof event.item.text === "string") {
           this.lastText = event.item.text;
@@ -237,12 +249,18 @@ export class CodexStreamAdapter {
       if ((parsed.status === "completed" || parsed.status === "blocked" || parsed.status === "needs_refinement" || parsed.status === "waiting_on_blocker") && typeof parsed.summary === "string" && parsed.summary.trim()) outcome = parsed;
     } catch { /* Missing or malformed task outcome fails closed. */ }
     this.approvalRejected ||= /This action was rejected due to unacceptable risk/.test(stderr);
+    this.approvalReviewFailed ||= APPROVAL_REVIEW_FAILED.test(stderr);
     const blocked = this.approvalRejected || outcome?.status === "blocked";
     const isError = timedOut || idleStalled || code !== 0 || this.failed || !this.completed || !outcome || blocked;
     // Codex reports this temporary access-check outage as a generic failed turn.
     // Map the observed server failure to the existing capped API retry path.
     // A disconnect alone can also mean permanent model denial, so keep it narrow.
-    const temporaryModelAccessFailure = this.failed && /^stream disconnected before completion: Unable to verify model access right now\.\s*Please retry\.?$/i.test(this.errorText.trim());
+    // "Selected model is at capacity" is the same kind of temporary outage:
+    // five pyrycode-mobile tickets parked on it on 2026-10-05, and a plain
+    // retry minutes later cleared it (#120). Anchored to the full message.
+    const temporaryModelAccessFailure = this.failed && (
+      /^stream disconnected before completion: Unable to verify model access right now\.\s*Please retry\.?$/i.test(this.errorText.trim())
+      || /^Selected model is at capacity\.\s*Please try a different model\.?$/i.test(this.errorText.trim()));
     // The stall is the cause even when the wall clock also fired meanwhile.
     const terminalReason = blocked ? "codex_blocked" : idleStalled ? IDLE_STALL_REASON : timedOut ? "timeout"
       : isError ? (temporaryModelAccessFailure ? "api_error" : "codex_error")
@@ -261,7 +279,8 @@ export class CodexStreamAdapter {
       // all human-facing cost reports say unavailable, not a measured zero.
       totalCostUsd: 0, durationMs, usage: this.usage, terminalReason,
       rawResult: { is_error: isError, subtype: isError ? terminalReason : "success", result: isError ? failure : outcome!.summary },
-      hadPermissionDenial: this.approvalRejected, stoppedAtDenial: false, deniedOpContent: null,
+      hadPermissionDenial: this.approvalRejected, approvalReviewFailed: this.approvalReviewFailed,
+      stoppedAtDenial: false, deniedOpContent: null,
       lastAssistantText: this.lastText || null, timedOut,
     };
   }
