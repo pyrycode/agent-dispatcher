@@ -125,7 +125,7 @@ Optional:
 | `PYRY_BUDGET_SCALE` | `1` | Multiplier on every agent's turn cap and wall-clock timeout, for a fork whose tickets or model need a different budget without changing the others. Timeouts round to whole minutes. Unset, empty, non-numeric, zero or negative keeps `1`. Mobile runs `1.5` since 2026-09-23, after moving to Opus 5.5 and raising its ticket ceiling to 1600 lines. Printed in the startup banner. |
 | `PYRY_REQUIRED_ENV` | — | Comma- or space-separated names of environment variables this fork cannot work without, such as `ANDROID_HOME`. Checked every cycle against the dispatcher's own environment. While one is unset or blank, no agent is dispatched and neither the live gate nor the main sweep starts, a warning is logged and one Discord message is sent. Board upkeep, rework routing and merges carry on. Restart the dispatcher with the variable set to resume. Unset requires nothing. Added after mobile #1631 parked on 2026-10-03, when a restart lost `ANDROID_HOME` and the builder found Gradle could not locate the SDK. Printed in the startup banner. |
 | `PYRY_AGENT_SHELL_ENV` | — | Codex runner only. Comma- or space-separated names of non-secret settings that Codex agents' shell commands should see, such as `ANDROID_HOME`. The user's Codex config inherits only core variables into tool commands, so without this a builder cannot see what the fork's `.env` supplies. Each listed name that is set and not blank in the environment Codex gets is passed as its own `-c shell_environment_policy.set.NAME=...` override, the same way `AGENTS_REPO_PATH` is. A name that looks secret, containing `KEY`, `SECRET`, `TOKEN`, `PASSWORD`, `PASSWD`, `CREDENTIAL`, `AUTH` or `PRIVATE` or starting with `OP_` in any case, or that is not an upper-case variable name, is skipped with one warning per dispatcher process. The read-only preliminary source review gets none of them: it ignores the user config, so the core-only policy does not apply to it, and it builds nothing. Unset passes nothing. The Claude runner needs nothing, since its shells inherit the environment. Printed in the startup banner. Mobile #1631 parked on 2026-10-03 on "ANDROID_HOME is missing from the dispatcher environment". |
-| `PYRY_BUILDER_REWORK_CAP` | `6` | Rework breaker: how many times a ticket can be sent back to the code owner, `needs-rework:builder` in the builder set, before the next route parks it under `error:rework-loop`. Reworks routed to any other agent count on a separate `rework-other:N` label that never parks. On a verifier route to the builder, a `[MUST FIX]` finding with the same `path → Symbol` in the last two FAIL verdicts parks at once, whatever the count; the parking comment says which rule fired. Zero, negative or garbage keeps `6`. Was a flat 3 on every rework route until 2026-10-05 (agent-dispatcher#122). Printed in the startup banner. |
+| `PYRY_BUILDER_REWORK_CAP` | `6` | Rework breaker: how many times a ticket can be sent back to the code owner, `needs-rework:builder` in the builder set, before the next route parks it under `error:rework-loop`. Reworks routed to any other agent count on a separate `rework-other:N` label that never parks. On a verifier route to the builder, a `[MUST FIX]` finding with the same `path → Symbol` in the last two FAIL verdicts parks at once, whatever the count, when the two findings also read alike: their normalised word sets must overlap by at least 0.3 Jaccard similarity, so a different defect in the same function is not a repeat (agent-dispatcher#130); the parking comment says which rule fired. Zero, negative or garbage keeps `6`. Was a flat 3 on every rework route until 2026-10-05 (agent-dispatcher#122). Printed in the startup banner. |
 | `PYRY_FAMILY_DISPATCH_LIMIT` | `24` | Family circuit breaker: dispatch budget per ticket family before the whole lineage is parked under `error:family-breaker` on its root. Per-family resume via a reset comment on the root; this knob is the global fallback. See above. |
 | `OWNER_TYPE` | `user` | `user` or `organization` for GitHub Project owner |
 | `PYRY_REAL_CLAUDE_GATE_CMD` | — | Shell command that runs the fork's live-claude suite. **Empty disables the gate entirely** and gated tickets park for an operator. See below. |
@@ -175,6 +175,8 @@ The advance chain is Backlog → In Development → In Code Review → In Docume
 
 In the classic set this feature is entirely inert (locked by test): no gate runs, no env is read.
 
+**Gate report for the documentation agent.** The documentation agent's prompt gets a `## Gate report` section built from the dispatcher's own logs. It lists the ticket's recorded verifier gate pass, with its time, commit and each gate's line. It gives the executed, passed, failed and skipped counts of every verifier gate with a format in `PYRY_VERIFIER_GATE_FORMATS`, and of the newest real-claude gate output, read with `PYRY_REAL_CLAUDE_GATE_FORMAT`. For each test the issue body or the plan names, it gives the result in each of those runs: passed, failed, skipped or not run. A test counts as named when its method, the part after `#`, the last ` › ` segment or the last Go name segment, appears there as a whole word. A `Class#method` or Go `TestName` the text mentions is listed even when no log has it. A run whose log is missing or unreadable, or that has no format, is listed with no per-test counts, never as passed. With nothing to report the section says so in one line. No other agent gets it. Added after 11 of 15 pyrycode-mobile documentation send-backs in the week to 2026-10-05 asked for evidence the agent could not see (#136).
+
 **Parallel source review.** With `PYRY_VERIFIER_PARALLEL_REVIEW=1`, a Claude or Codex
 verifier starts its complete source review while the configured gates run. This
 preliminary phase uses an empty temporary working directory and ignores user
@@ -219,6 +221,21 @@ a write GitHub reported as failed but stored is recognised by a hidden marker li
 and never posted twice. A moved head, a missing or incomplete file, a closed PR, an
 approval rejection or a block about anything else parks as before. Mobile #1677
 spent nine hours parked on a GitHub outage of minutes before this.
+
+**Re-review after FAIL.** After a verdict run that ends with a complete handoff
+file, or a saved verdict the dispatcher posts itself, the dispatcher keeps the
+verdict in its logs folder as `verdict-last-<agent>-<issue>.json`. An incomplete or
+missing file leaves the previous one in place. When the stage set's verifier is
+dispatched again, the last verdict is a FAIL and its reviewed commit is an ancestor
+of `origin/feature/<issue>`, the prompt gets a `## Re-review after FAIL` section. It
+holds the previous verdict, fenced as data, the reviewed commit, the branch head and
+`git log -p --no-merges` between them, so merges from main add nothing. The
+verifier checks each prior finding, reviews the new commits, and reviews the rest of
+the diff only when the change is broad. Over 60000 characters of patch, the section
+gives the per-commit file stat instead and says a full review applies. A PASS, a
+reviewed commit that is not an ancestor, as after a force-push, a missing file or a
+git error gives no section and a full review. With parallel review on, the source
+reviewer gets the same section and the same narrowed brief.
 
 The two model phases share the verifier's wall-clock budget, but gate time is not
 charged to it. The final verifier gets the budget the source review left, and
@@ -298,6 +315,8 @@ PYRY_REAL_CLAUDE_GATE_MIN_EXECUTED=150
 Android consumers can emit JUnit XML with `PYRY_REAL_CLAUDE_GATE_FORMAT=junit-xml`. The command must write only XML to stdout and send build logs to stderr. Both `<testsuite>` and `<testsuites>` roots are accepted. The reader counts named test cases, excludes skips, preserves failures across duplicate reports, and rejects malformed reports or missing cases advertised by the suite. Mobile's wrapper additionally requires freshly generated device reports and forces the test task to execute.
 
 For `junit-xml` the `{{TESTS}}` filter is not a regex. It is a single-quoted, comma-separated `pkg.Class#method` list, the shape Android's instrumentation `class` argument takes, so the baseline command must hand it to a runner that selects tests by that list. A name that is not a plain class and method, such as a parameterised `method[0]`, refuses the whole filter.
+
+For `playwright-json` the filter is a single-quoted regex for Playwright's `-g`, such as `npx playwright test --reporter=json -g {{TESTS}}`. The reader names a test by its file, describe titles and test title joined with ` › `. Playwright matches `-g` against the same path joined by spaces, with the project name and tags in between, so each part is escaped and the parts are joined with `.*`. Matching more than the named tests only re-runs extra tests, since results are compared by full name. A name holding a single quote or a control character, such as a newline, refuses the whole filter. Before 2026-10-05 the Go rule refused every Playwright name, because of the space and the `›`, so pyrycode-desktop's live gate never re-ran or compared a failure (agent-dispatcher#132).
 
 The baseline command currently uses Go test filters. Leave it unset for JUnit consumers until their command supports that filtering contract. Without it, failed tests route to rework without automatic retry or base comparison.
 
