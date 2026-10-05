@@ -144,11 +144,16 @@ import {
   FAMILY_DISPATCH_RESET_MARKER,
 } from "./pipeline-decisions.js";
 import {
+  type BranchSetupAction,
   decideBranchSetup,
   decideCodegraphSymlink,
+  decideOwnWorktreeReuse,
   describeHeldWorktrees,
   findWorktreesForBranch,
   type HeldWorktree,
+  IN_PROGRESS_GIT_PATHS,
+  isWorktreeLocked,
+  type OwnWorktreeReuse,
   resolveAgentsRepoRootWithEnv,
   resolveDefaultBranch,
   resolveTargetRepoRoot,
@@ -2804,8 +2809,15 @@ export async function setupBranchAndWorktree(
   // none, so nothing above depends on the old order. The two integrity
   // aborts skip the cleanup and leave every worktree in place for triage,
   // as they did before.
+  //
+  // One exception to the integrity abort: local is ahead of origin only
+  // because this agent's own previous run left commits in its own worktree.
+  // That worktree is kept (not removed), the other blocking ones are cleaned
+  // as usual, and the reuse decision below picks it up (#119).
   const aborting = branchAction === "abort-local-strictly-ahead" || branchAction === "abort-local-diverged";
-  const heldWorktrees = aborting ? [] : removeBlockingWorktrees(ctx);
+  const keepOwn = branchAction === "abort-local-strictly-ahead" && ownWorktreeHoldsBranch(ctx);
+  const heldWorktrees = aborting && !keepOwn ? [] : removeBlockingWorktrees(ctx, { keepOwn });
+  const ownReuse = decideOwnReuse(ctx, heldWorktrees, branchAction);
 
   try {
     switch (branchAction) {
@@ -2833,6 +2845,11 @@ export async function setupBranchAndWorktree(
         break;
       case "abort-local-strictly-ahead":
       case "abort-local-diverged": {
+        // The own previous run's unpushed commits: continue from them.
+        if (ownReuse.reuse) {
+          console.log(`   📌 Local ${branchName} is ahead of origin with ${agent.name}'s own unpushed work; continuing from it`);
+          break;
+        }
         // Both are local-vs-origin integrity aborts, but the safe operator
         // action is opposite, so the message must not conflate them.
         //   strictly-ahead: origin is an ancestor of local. Local has real
@@ -2898,12 +2915,21 @@ export async function setupBranchAndWorktree(
     return { ok: false };
   }
 
+  // Continue in the agent's own preserved worktree when the decision allows
+  // it, committing what the previous run left. See decideOwnWorktreeReuse.
+  if (ownReuse.reuse) {
+    const reused = await reuseOwnWorktree(ctx, ownReuse.commitLeftovers);
+    if (!reused) return { ok: false };
+  }
+
   // Create worktree from the feature branch. Stale and orphan worktrees
   // were removed before the branch setup above.
   try {
-    mkdirSync(dirname(worktreeDir), { recursive: true });
-    execSync(`git worktree add "${worktreeDir}" ${branchName}`, { cwd: repoRoot, stdio: "pipe" });
-    console.log(`   🌳 Created worktree at ${worktreeDir}`);
+    if (!ownReuse.reuse) {
+      mkdirSync(dirname(worktreeDir), { recursive: true });
+      execSync(`git worktree add "${worktreeDir}" ${branchName}`, { cwd: repoRoot, stdio: "pipe" });
+      console.log(`   🌳 Created worktree at ${worktreeDir}`);
+    }
 
     // Symlink the canonical repo's codegraph index into the worktree.
     // `.codegraph/` is gitignored and lives outside `.git/`, so
@@ -3037,18 +3063,24 @@ export async function setupBranchAndWorktree(
 // branch. Only `git worktree remove` without --force: a worktree with
 // uncommitted changes stays and keeps blocking the branch on purpose. Those
 // are returned so the error comment can name them.
-function removeBlockingWorktrees(ctx: DispatchContext): HeldWorktree[] {
+//
+// `keepOwn` skips the removal of the same-path worktree, which is then
+// reported as held, so its previous run's commits can be continued from
+// (#119).
+function removeBlockingWorktrees(ctx: DispatchContext, opts: { keepOwn?: boolean } = {}): HeldWorktree[] {
   const { branchName, worktreeDir } = ctx;
   const { execSync } = ctx.deps;
   const errorText = (e: any): string => e?.stderr?.toString?.().trim() || e?.message || String(e);
   const held: HeldWorktree[] = [];
 
   let samePathError = "";
-  try {
-    execSync(`git worktree remove "${worktreeDir}"`, { cwd: repoRoot, stdio: "pipe" });
-  } catch (e) {
-    // Usually "is not a working tree": nothing was there.
-    samePathError = errorText(e);
+  if (!opts.keepOwn) {
+    try {
+      execSync(`git worktree remove "${worktreeDir}"`, { cwd: repoRoot, stdio: "pipe" });
+    } catch (e) {
+      // Usually "is not a working tree": nothing was there.
+      samePathError = errorText(e);
+    }
   }
 
   try {
@@ -3074,6 +3106,109 @@ function removeBlockingWorktrees(ctx: DispatchContext): HeldWorktree[] {
     console.warn(`   ⚠️  Failed to inspect worktrees for ${branchName}: ${e}`);
   }
   return held;
+}
+
+/** `git worktree list --porcelain`, or "" when it cannot be read. */
+function readWorktreeList(ctx: DispatchContext): string {
+  try {
+    return String(ctx.deps.execSync(`git worktree list --porcelain`, { cwd: repoRoot, encoding: "utf-8", timeout: 15_000 }));
+  } catch {
+    return "";
+  }
+}
+
+/** True when the agent's own worktree path has the ticket's branch checked out. */
+function ownWorktreeHoldsBranch(ctx: DispatchContext): boolean {
+  return findWorktreesForBranch(readWorktreeList(ctx), ctx.branchName).includes(ctx.worktreeDir);
+}
+
+// Gather what decideOwnWorktreeReuse needs about the worktrees still holding
+// the branch after the cleanup. Only reads; a failed read refuses the reuse.
+function decideOwnReuse(ctx: DispatchContext, held: HeldWorktree[], branchAction: BranchSetupAction): OwnWorktreeReuse {
+  const { worktreeDir } = ctx;
+  const { execSync, existsSync } = ctx.deps;
+  if (held.length !== 1 || held[0]!.path !== worktreeDir) {
+    return decideOwnWorktreeReuse({ ownPath: worktreeDir, held, branchAction, locked: false, operationInProgress: false, gitStatusOutput: null });
+  }
+  let gitStatusOutput: string | null = null;
+  let operationInProgress = true;
+  try {
+    gitStatusOutput = String(execSync(`git status --porcelain`, { cwd: worktreeDir, encoding: "utf-8", stdio: "pipe", timeout: 15_000 }));
+    const paths = String(execSync(
+      `git rev-parse ${IN_PROGRESS_GIT_PATHS.map(p => `--git-path ${p}`).join(" ")}`,
+      { cwd: worktreeDir, encoding: "utf-8", stdio: "pipe", timeout: 15_000 },
+    )).split("\n").map(l => l.trim()).filter(Boolean);
+    operationInProgress = paths.some(p => existsSync(resolve(worktreeDir, p)));
+  } catch (e) {
+    console.warn(`   ⚠️  Could not inspect the held worktree ${worktreeDir}: ${e}`);
+  }
+  const decision = decideOwnWorktreeReuse({
+    ownPath: worktreeDir,
+    held,
+    branchAction,
+    locked: isWorktreeLocked(readWorktreeList(ctx), worktreeDir),
+    operationInProgress,
+    gitStatusOutput,
+  });
+  if (!decision.reuse) console.log(`   ⏸️  Not reusing ${worktreeDir}: ${decision.reason}`);
+  return decision;
+}
+
+// Continue in the agent's own preserved worktree (#119). Commits what the
+// previous run left uncommitted as one wip commit, the shape
+// salvagePartialWork uses, and says so on the ticket. The commit is not
+// pushed here: the pre-run merge push or the end-of-run push carries it.
+//
+// Returns false after parking the ticket when the commit fails. Nothing is
+// discarded either way; the worktree stays as it is.
+async function reuseOwnWorktree(ctx: DispatchContext, commitLeftovers: boolean): Promise<boolean> {
+  const { agent, item, client, branchName, worktreeDir } = ctx;
+  const { execSync, spawnSync } = ctx.deps;
+  let sha = "";
+  if (commitLeftovers) {
+    try {
+      execSync(`git add -A`, { cwd: worktreeDir, stdio: "pipe", timeout: 15_000 });
+      const commit = spawnSync(
+        "git",
+        [
+          "commit",
+          "-m", `wip(${agent.name}): partial work from an interrupted run (#${item.issueNumber})`,
+          "-m", `Auto-committed by the dispatcher before the next ${agent.name} run continued in the same worktree. Unfinished; that run continues from here.`,
+        ],
+        { cwd: worktreeDir, stdio: "pipe", timeout: 15_000 },
+      );
+      if (commit.status !== 0) {
+        throw new Error(`git commit failed: ${commit.stderr?.toString() || commit.stdout?.toString() || "unknown"}`);
+      }
+    } catch (e) {
+      console.error(`   ❌ Failed to commit the previous run's leftovers in ${worktreeDir}: ${e}`);
+      await client.addComment(
+        item.issueNumber,
+        `## ⚠️ Dispatch Error: ${agent.name}\n\n` +
+        `The previous ${agent.name} run left uncommitted changes in its worktree \`${worktreeDir}\`. ` +
+        `The dispatcher tried to commit them so this run could continue from them, and the commit failed. ` +
+        `Nothing was discarded. Commit or save the changes there, then retry.\n\n\`\`\`\n${e}\n\`\`\``,
+      );
+      try { await client.addLabel(item.issueNumber, `error:${agent.name}`); } catch {}
+      return false;
+    }
+    try {
+      sha = String(execSync(`git rev-parse --short HEAD`, { cwd: worktreeDir, encoding: "utf-8", timeout: 15_000 })).trim();
+    } catch { /* cosmetic */ }
+  }
+  console.log(`   ♻️  Reusing ${agent.name}'s own worktree at ${worktreeDir}${commitLeftovers ? `; leftovers committed${sha ? ` as ${sha}` : ""}` : ""}`);
+  const what = commitLeftovers
+    ? `left uncommitted changes in its worktree. The dispatcher committed them${sha ? ` as \`${sha}\`` : ""}`
+    : `left commits on \`${branchName}\` that origin does not have yet`;
+  try {
+    await client.addComment(
+      item.issueNumber,
+      `## ♻️ Continuing from the previous run's work\n\n` +
+      `The previous ${agent.name} run on this ticket ${what}, and this run continues from them in the same worktree. ` +
+      `They reach origin with this run's pushes.`,
+    );
+  } catch (e) { console.warn(`   ⚠️  Failed to post the worktree-reuse comment: ${e}`); }
+  return true;
 }
 
 /** HEAD of a worktree, or "" when it cannot be read. */

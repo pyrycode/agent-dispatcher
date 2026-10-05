@@ -127,8 +127,10 @@ import { mapParentChain } from "./github.js";
 import {
   decideBranchSetup,
   decideCodegraphSymlink,
+  decideOwnWorktreeReuse,
   describeHeldWorktrees,
   findWorktreesForBranch,
+  isWorktreeLocked,
   resolveAgentsRepoRoot,
   resolveAgentsRepoRootWithEnv,
   resolveDefaultBranch,
@@ -3413,6 +3415,76 @@ describe("describeHeldWorktrees", () => {
     }]);
     assert.match(text, /- `\/w\/locked-7` could not be removed: fatal: cannot remove a locked working tree;$/m);
     assert.doesNotMatch(text, /uncommitted/);
+  });
+});
+
+describe("isWorktreeLocked", () => {
+  const porcelain = [
+    "worktree /w/builder-1", "HEAD a", "branch refs/heads/feature/1", "locked", "",
+    "worktree /w/builder-2", "HEAD b", "branch refs/heads/feature/2", "",
+    "worktree /w/builder-3", "HEAD c", "branch refs/heads/feature/3", "locked reason here", "",
+  ].join("\n");
+
+  test("a bare or reasoned locked line counts, other records do not", () => {
+    assert.equal(isWorktreeLocked(porcelain, "/w/builder-1"), true);
+    assert.equal(isWorktreeLocked(porcelain, "/w/builder-2"), false);
+    assert.equal(isWorktreeLocked(porcelain, "/w/builder-3"), true);
+    assert.equal(isWorktreeLocked(porcelain, "/w/missing"), false);
+  });
+});
+
+describe("decideOwnWorktreeReuse", () => {
+  // pyrycode-mobile #1603 and #1727, 2026-10-05: the next run failed on its
+  // own previous run's worktree and a person committed the leftovers.
+  const own = "/w/.pyrycode-worktrees/pyrycode-mobile/builder-1603";
+  const dirtyHeld = [{ path: own, error: `fatal: '${own}' contains modified or untracked files, use --force to delete it` }];
+  const base = {
+    ownPath: own,
+    held: dirtyHeld,
+    branchAction: "reuse-local-already-synced" as const,
+    locked: false,
+    operationInProgress: false,
+    gitStatusOutput: " M app/Foo.kt\n",
+  };
+
+  test("own path, dirty, branch in sync → reuse and commit the leftovers", () => {
+    assert.deepEqual(decideOwnWorktreeReuse(base), { reuse: true, commitLeftovers: true });
+  });
+
+  test("own path, dirty, branch never pushed → reuse and commit", () => {
+    assert.deepEqual(decideOwnWorktreeReuse({ ...base, branchAction: "reuse-local-no-remote" }), { reuse: true, commitLeftovers: true });
+  });
+
+  test("own path, clean, local commits ahead of origin → reuse without a commit", () => {
+    assert.deepEqual(
+      decideOwnWorktreeReuse({ ...base, held: [{ path: own, error: "" }], branchAction: "abort-local-strictly-ahead", gitStatusOutput: "" }),
+      { reuse: true, commitLeftovers: false },
+    );
+  });
+
+  test("own path, dirty, ahead of origin → reuse and commit", () => {
+    assert.deepEqual(decideOwnWorktreeReuse({ ...base, branchAction: "abort-local-strictly-ahead" }), { reuse: true, commitLeftovers: true });
+  });
+
+  test("another path holds the branch, alone or beside the own one → refused", () => {
+    assert.equal(decideOwnWorktreeReuse({ ...base, held: [{ path: "/w/verifier-1603", error: "x" }] }).reuse, false);
+    assert.equal(decideOwnWorktreeReuse({ ...base, held: [...dirtyHeld, { path: "/home/me/checkout", error: "x" }] }).reuse, false);
+    assert.equal(decideOwnWorktreeReuse({ ...base, held: [] }).reuse, false);
+  });
+
+  test("locked, unreadable or mid-operation → refused", () => {
+    assert.equal(decideOwnWorktreeReuse({ ...base, locked: true }).reuse, false);
+    assert.equal(decideOwnWorktreeReuse({ ...base, gitStatusOutput: null }).reuse, false);
+    assert.equal(decideOwnWorktreeReuse({ ...base, operationInProgress: true }).reuse, false);
+  });
+
+  test("clean and in sync → refused, the normal cleanup handles it", () => {
+    assert.equal(decideOwnWorktreeReuse({ ...base, gitStatusOutput: "  \n" }).reuse, false);
+  });
+
+  test("diverged or behind origin → refused", () => {
+    assert.equal(decideOwnWorktreeReuse({ ...base, branchAction: "abort-local-diverged" }).reuse, false);
+    assert.equal(decideOwnWorktreeReuse({ ...base, branchAction: "fast-forward-from-origin" }).reuse, false);
   });
 });
 
