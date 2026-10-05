@@ -152,13 +152,16 @@ export function buildCodexInvocation(opts: {
       // non-secret settings such as ANDROID_HOME, never the whole env.
       ...shellEnv.flatMap(([name, value]) => ["-c", `shell_environment_policy.set.${name}=${JSON.stringify(value)}`]),
       // A value in `set` would put the secret in argv and logs. Inherit only
-      // core shell names, explicit non-secret settings and the restricted
-      // account. The spawn scrubber removed Automation before this point.
+      // core shell names, existing container publishing/display settings,
+      // explicit non-secret settings and the restricted account. GH_TOKEN
+      // already belongs to agent environments; GITHUB_TOKEN and Automation
+      // were removed by the spawn scrubber before this point.
       ...(!opts.sourceReview && opts.builderLiveTests ? [
         "-c", 'shell_environment_policy.inherit="all"',
         "-c", "shell_environment_policy.ignore_default_excludes=true",
         "-c", `shell_environment_policy.include_only=${JSON.stringify([
           "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_*", "TERM", "TMPDIR", "TMP", "TEMP",
+          "GH_TOKEN", "DISPLAY", "PLAYWRIGHT_BROWSERS_PATH",
           "AGENTS_REPO_PATH", ...shellEnv.map(([name]) => name), "OP_SERVICE_ACCOUNT_TOKEN",
         ])}`,
       ] : []),
