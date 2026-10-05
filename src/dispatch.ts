@@ -8,7 +8,7 @@ import { config } from "dotenv";
 import { DispatchPool, candidateKey, excludeInFlight, freeSeats, resolvePollIntervalMs } from "./dispatch-pool.js";
 import { countVerdictsSince, parseVerdictArtifacts, pickVerdictPr, shouldFlagMissingVerdict } from "./verdict-guard.js";
 import { countOpenPrs, shouldFlagMissingPr } from "./pr-guard.js";
-import { PENDING_VERDICT_PREFIX, REREVIEW_PATCH_CAP, decideVerdictRecovery, handoffMarker, isVerdictPublishFailure, parseLastVerdict, parsePendingVerdictState, parsePrVerdictView, parseVerdictHandoff, reReviewNote, serializeLastVerdict, serializePendingVerdictState, verdictHandoffNote, type HandoffParse, type PendingVerdictState, type VerdictHandoff, type VerdictPrLookup } from "./verdict-handoff.js";
+import { PENDING_VERDICT_PREFIX, REREVIEW_PATCH_CAP, decideVerdictRecovery, extractVerdictFindings, reworkFindingsNote, handoffMarker, isVerdictPublishFailure, parseLastVerdict, parsePendingVerdictState, parsePrVerdictView, parseVerdictHandoff, reReviewNote, serializeLastVerdict, serializePendingVerdictState, verdictHandoffNote, type HandoffParse, type PendingVerdictState, type VerdictHandoff, type VerdictPrLookup } from "./verdict-handoff.js";
 import { resolveImportOnlyMerge } from "./merge-resolve.js";
 import { gateReportSection } from "./gate-report.js";
 import { FINAL_MERGE_HANDOFF_MARKER, FINAL_MERGE_HANDOFF_MAX, MERGE_HANDOFF_LABEL, checkMergeResolution, decideConflictRoute, decideFinalMergeRoute, findMergeCommit, mergeHandoffNote, mergeResolutionComment, mergeResolutionSection, readPendingMerge, type PendingMerge, type ResolutionNote } from "./merge-handoff.js";
@@ -2443,6 +2443,14 @@ export function lastVerdictPath(agentName: string, issueNumber: number): string 
   return resolve(LOGS_DIR, `verdict-last-${agentName}-${issueNumber}.json`);
 }
 
+/** Where a builder rework answers a verifier FAIL's findings (#1747). Named
+ *  after the verdict's reviewed commit, so the re-review of that verdict
+ *  reads the answers given to it. Beside the verdict handoff, in the
+ *  publishing folder both runners' agents can already write to. */
+export function reworkAnswersPath(issueNumber: number, reviewedCommit: string): string {
+  return resolve(verdictHandoffDir(), `rework-answers-${issueNumber}-${reviewedCommit.slice(0, 12)}.md`);
+}
+
 /**
  * Path of a dispatcher-owned worktree. Every board's dispatcher shares the
  * `.pyrycode-worktrees` folder beside its repository, and ticket numbers
@@ -2519,7 +2527,8 @@ export async function dispatchToAgent(
   const mergeNote = ctx.pendingMerge ? mergeHandoffNote(defaultBranch, ctx.pendingMerge.paths) : "";
   const reReview = prepareReReviewNote(ctx);
   const handoffNote = prepareVerdictHandoff(ctx);
-  const spawn = await prepareAgentSpawn(ctx, gates.promptNote + mergeNote + reReview + handoffNote);
+  const findingsNote = prepareReworkFindingsNote(ctx);
+  const spawn = await prepareAgentSpawn(ctx, gates.promptNote + mergeNote + reReview + handoffNote + findingsNote);
   if (!spawn.ok) return;
 
   // streamResult is declared outside the try so handleDispatchError
@@ -4214,8 +4223,55 @@ function prepareReReviewNote(ctx: DispatchContext): string {
     stat = git(["log", "--no-merges", "--stat", "--format=%h %s", range]);
     if (stat === null) return "";
   }
-  console.log(`   🔁 Re-review after FAIL on ${last.commit.slice(0, 12)}: ${stat === null ? "narrowed to the commits since" : "broad change, full review"}`);
-  return reReviewNote({ body: last.body, reviewed: last.commit, head, patch: stat === null ? patch : null, stat });
+  let answers: string | null = null;
+  try {
+    answers = String(ctx.deps.readFileSync(reworkAnswersPath(item.issueNumber, last.commit), "utf-8"));
+  } catch { /* no answers: the note says so */ }
+  console.log(`   🔁 Re-review after FAIL on ${last.commit.slice(0, 12)}: ${stat === null ? "narrowed to the commits since" : "broad change, full review"}; builder answers ${answers?.trim() ? "found" : "missing"}`);
+  return reReviewNote({
+    body: last.body, reviewed: last.commit, head, patch: stat === null ? patch : null, stat,
+    answers: { text: answers, findings: extractVerdictFindings(last.body).length },
+  });
+}
+
+/**
+ * The builder's section for a rework after a verifier FAIL (#1747), or "".
+ * Applies to the agent that opens the PR, on a reworked ticket, when the
+ * verdict agent's last verdict is a FAIL whose reviewed commit is an
+ * ancestor of the pushed feature branch, the same test the re-review uses,
+ * so a verdict on an abandoned branch is never answered. Empties the
+ * answers file first, so the re-review reads only this run's answers. Any
+ * failure means no section, and the rework runs as before.
+ */
+function prepareReworkFindingsNote(ctx: DispatchContext): string {
+  const { agent, item } = ctx;
+  if (item.issueNumber <= 0 || !ctx.useWorktree || !agent.opensPr) return "";
+  if (extractReworkCount(item.labels) <= 0) return "";
+  const reviewer = activeStageSet().agents.find((a) => a.requiresVerdict);
+  if (!reviewer) return "";
+  let last: ReturnType<typeof parseLastVerdict>;
+  try {
+    last = parseLastVerdict(String(ctx.deps.readFileSync(lastVerdictPath(reviewer.name, item.issueNumber), "utf-8")));
+  } catch {
+    return "";
+  }
+  if (last === null || last.decision !== "FAIL") return "";
+  const git = (args: string[]) => ctx.deps.spawnSync("git", args, { cwd: ctx.agentCwd, encoding: "utf8" });
+  const headRun = git(["rev-parse", "--verify", `origin/${ctx.branchName}^{commit}`]);
+  const head = headRun.error || headRun.status !== 0 ? "" : String(headRun.stdout ?? "").trim().toLowerCase();
+  if (!/^[0-9a-f]{40}$/.test(head)) return "";
+  const ancestor = git(["merge-base", "--is-ancestor", last.commit, head]);
+  if (ancestor.error || ancestor.status !== 0) return "";
+  const answersPath = reworkAnswersPath(item.issueNumber, last.commit);
+  try {
+    ctx.deps.mkdirSync(dirname(answersPath), { recursive: true });
+    ctx.deps.writeFileSync(answersPath, "");
+  } catch (e) {
+    console.warn(`   ⚠️  Could not prepare the rework answers file ${answersPath}: ${e}`);
+    return "";
+  }
+  console.log(`   📝 Rework after a ${reviewer.name} FAIL on ${last.commit.slice(0, 12)}: ${extractVerdictFindings(last.body).length} finding(s) to answer`);
+  return reworkFindingsNote({ body: last.body, reviewed: last.commit, answersPath });
 }
 
 /** Find the ticket's PR and read its head and every review and comment. */

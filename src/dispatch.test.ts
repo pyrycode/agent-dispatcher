@@ -56,6 +56,7 @@ import {
   verdictHandoffPath,
   pendingVerdictStatePath,
   lastVerdictPath,
+  reworkAnswersPath,
   salvagePartialWork,
   strandedWipMinAgeMs,
   runFamilyBreaker,
@@ -10705,6 +10706,103 @@ describe("verdict handoff (#118)", () => {
       await f.run();
       parkedAsToday(f);
     });
+  });
+});
+
+describe("builder answers the verifier's findings (#1747)", () => {
+  const REVIEWED = "0123456789abcdef0123456789abcdef01234567";
+  const HEAD = "fedcba9876543210fedcba9876543210fedcba98";
+  const ISSUE = 1747;
+  const VERDICT = [
+    `## Verifier Review: #${ISSUE}`,
+    "",
+    "**Decision: FAIL**",
+    "",
+    "### Findings",
+    "- [MUST FIX] `ThreadScreen.kt` → `ThreadScreen`: a pasted image that is too large still shows the snackbar",
+    "- [SHOULD FIX] `ThreadScreenTest.kt` → `pasteErrors`: cover the unreadable paste",
+    "- [NIT] `Strings.kt`: typo",
+  ].join("\n");
+  const lastFile = (decision: "PASS" | "FAIL") => JSON.stringify({
+    decision, commit: REVIEWED, labels: decision === "FAIL" ? ["needs-rework:builder"] : [],
+    body: VERDICT.replace("FAIL", decision), recordedAt: "2026-10-05T14:05:22.000Z",
+  });
+
+  function fixture(opts: { agent?: "builder" | "verifier"; last?: string | null; labels?: string[]; ancestor?: number; answers?: string | null } = {}) {
+    const agent = opts.agent ?? "builder";
+    const status = agent === "builder" ? "In Development" : "In Code Review";
+    const labels = opts.labels ?? ["rework-count:1"];
+    const client = new MockGitHubClient({
+      status: { [ISSUE]: status },
+      items: [{ issueNumber: ISSUE, status, labels, state: "OPEN" }],
+    });
+    const fsMap: Record<string, string> = {
+      [claudeMdAbsPath("builder/CLAUDE.md")]: "role",
+      [claudeMdAbsPath("verifier/CLAUDE.md")]: "role",
+    };
+    if (opts.last !== null) fsMap[lastVerdictPath("verifier", ISSUE)] = opts.last ?? lastFile("FAIL");
+    if (opts.answers != null) fsMap[reworkAnswersPath(ISSUE, REVIEWED)] = opts.answers;
+    const { deps, calls } = makeMockDeps({
+      execImpls: fullHappyExecImpls(`feature/${ISSUE}`),
+      spawnImpls: {
+        [`git rev-parse --verify origin/feature/${ISSUE}^{commit}`]: () => ({ status: 0, stdout: `${HEAD}\n` }),
+        [`git merge-base --is-ancestor ${REVIEWED} ${HEAD}`]: () => opts.ancestor ?? 0,
+        "git log -p --no-merges": () => ({ status: 0, stdout: "commit 1111111\n+queued()" }),
+      },
+      fsMap,
+      streamResult: () => streamResult({ output: "done" }),
+    });
+    const run = () => withStageSet("builder", () => withVerifierGates("", () =>
+      dispatchToAgent(builderAgent(agent), makeProjectItem({ issueNumber: ISSUE, status, labels }), client, deps)));
+    const prompt = () => calls.fs.filter(c => c.kind === "write" && c.path.endsWith(`.prompt-${ISSUE}.txt`)).at(-1)?.content ?? "";
+    const answerWrites = () => calls.fs.filter(c => c.kind === "write" && c.path === reworkAnswersPath(ISSUE, REVIEWED));
+    return { run, prompt, answerWrites, calls };
+  }
+
+  test("a builder rework after a FAIL gets the numbered findings and an emptied answers file", async () => {
+    const f = fixture({ answers: "1. Fixed in old: stale answer from an earlier attempt" });
+    await f.run();
+    const prompt = f.prompt();
+    assert.match(prompt, /## Verifier findings to answer/);
+    assert.match(prompt, /1\. \[MUST FIX\] `ThreadScreen\.kt` → `ThreadScreen`: a pasted image/);
+    assert.match(prompt, /2\. \[SHOULD FIX\] `ThreadScreenTest\.kt`/);
+    assert.doesNotMatch(prompt, /3\. \[NIT\]/);
+    assert.ok(prompt.includes(reworkAnswersPath(ISSUE, REVIEWED)), "the prompt names the answers file");
+    assert.equal(f.answerWrites()[0]?.content, "", "the answers file is emptied before the run");
+  });
+
+  const none: Array<[string, Parameters<typeof fixture>[0]]> = [
+    ["a first build, with no rework count", { labels: [] }],
+    ["a PASS last verdict", { last: lastFile("PASS") }],
+    ["no last verdict", { last: null }],
+    ["a verdict on a commit the branch no longer has", { ancestor: 1 }],
+  ];
+  for (const [name, opts] of none) {
+    test(`no section for ${name}`, async () => {
+      const f = fixture(opts);
+      await f.run();
+      assert.ok(f.prompt() !== "", "the run still went ahead");
+      assert.doesNotMatch(f.prompt(), /Verifier findings to answer/);
+      assert.equal(f.answerWrites().length, 0);
+    });
+  }
+
+  test("the verifier's re-review reads the builder's answers first", async () => {
+    const f = fixture({ agent: "verifier", labels: [], answers: "1. Fixed in 1111111: the paste route queues its pill\n" });
+    await f.run();
+    const prompt = f.prompt();
+    assert.match(prompt, /## Re-review after FAIL/);
+    assert.match(prompt, /Read the builder's answers below first/);
+    assert.match(prompt, /----- BEGIN BUILDER ANSWERS -----\n1\. Fixed in 1111111: the paste route queues its pill\n----- END BUILDER ANSWERS -----/);
+    assert.match(prompt, /It gave no answer to finding 2\./);
+    assert.ok(prompt.indexOf("BEGIN BUILDER ANSWERS") < prompt.indexOf("BEGIN PREVIOUS VERDICT"));
+    assert.doesNotMatch(prompt, /Verifier findings to answer/, "the verifier is not asked to answer");
+  });
+
+  test("a re-review with no answers file says the builder left none", async () => {
+    const f = fixture({ agent: "verifier", labels: [], answers: null });
+    await f.run();
+    assert.match(f.prompt(), /The builder left no answers to these findings/);
   });
 });
 
