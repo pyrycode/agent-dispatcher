@@ -1,6 +1,11 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
+  answeredFindingNumbers,
+  extractVerdictFindings,
+  REWORK_FINDINGS_HEADING,
+  reworkFindingsNote,
   decideVerdictRecovery,
   handoffMarker,
   isVerdictPublishFailure,
@@ -255,5 +260,92 @@ describe("reReviewNote (#135)", () => {
   test("an empty patch says there are no new commits", () => {
     const note = reReviewNote({ body, reviewed: SHA, head: SHA, patch: "", stat: null });
     assert.match(note, /No commits other than merges since the reviewed commit/);
+  });
+});
+
+describe("builder answers to a verifier FAIL (#1747)", () => {
+  // The three verifier comments on pyrycode-mobile PR #1755 for #1747, verbatim.
+  const verdicts = (JSON.parse(readFileSync(new URL("./fixtures/mobile-1755-verdicts.json", import.meta.url), "utf8")) as {
+    comments: { createdAt: string; body: string }[];
+  }).comments;
+  const at = (time: string) => verdicts.find((c) => c.createdAt.includes(time))!.body;
+
+  test("a real verdict's MUST FIX and SHOULD FIX findings, in order, without the NIT", () => {
+    const first = extractVerdictFindings(at("10:18"));
+    assert.equal(first.length, 4);
+    assert.match(first[0]!, /^\[MUST FIX\] `app\/src\/main\/java\/de\/pyryco\/mobile\/ui\/conversations\/thread\/ThreadScreen\.kt` → `ThreadScreen`/);
+    assert.match(first[3]!, /^\[SHOULD FIX\] .*MarkdownReaderScreenTest\.kt/);
+    // The 14:05 verdict is the one whose paste route the builder never answered.
+    const last = extractVerdictFindings(at("14:05"));
+    assert.equal(last.length, 1, "the NIT is not asked for");
+    assert.match(last[0]!, /^\[MUST FIX\] .*ThreadScreen\.kt/);
+  });
+
+  test("an indented continuation stays with its finding; a blank line, a heading or the next item ends it", () => {
+    const body = [
+      "### Findings",
+      "- [MUST FIX] `A.kt` → `a`: first line",
+      "  second line of the same finding",
+      "- [NIT] `B.kt`: not asked for",
+      "  its continuation is dropped too",
+      "* [should fix] `C.kt` → `c`: lower case tag",
+      "",
+      "### Summary",
+      "- [MUST FIX] `D.kt` → `d`: after a heading",
+    ].join("\n");
+    assert.deepEqual(extractVerdictFindings(body), [
+      "[MUST FIX] `A.kt` → `a`: first line\nsecond line of the same finding",
+      "[should fix] `C.kt` → `c`: lower case tag",
+      "[MUST FIX] `D.kt` → `d`: after a heading",
+    ]);
+    assert.deepEqual(extractVerdictFindings("## Verifier Review\n\n1. Missing null check"), []);
+  });
+
+  test("the builder's section numbers the findings and names the answers file and both answer forms", () => {
+    const note = reworkFindingsNote({ body: at("10:18"), reviewed: SHA, answersPath: "/p/rework-answers-1747-0123.md" });
+    assert.ok(note.includes(REWORK_FINDINGS_HEADING));
+    assert.ok(note.includes(SHA));
+    assert.match(note, /Its 4 findings are numbered below/);
+    assert.match(note, /write your answers to `\/p\/rework-answers-1747-0123\.md`/);
+    assert.match(note, /Fixed in <short SHA>/);
+    assert.match(note, /Not fixed: <the reason>/);
+    assert.match(note, /final summary, under `Verifier findings`/);
+    assert.match(note, /----- BEGIN FINDINGS -----\n1\. \[MUST FIX\][\s\S]*\n2\. \[MUST FIX\][\s\S]*\n3\. \[MUST FIX\][\s\S]*\n4\. \[SHOULD FIX\][\s\S]*----- END FINDINGS -----/);
+  });
+
+  test("a verdict without tagged findings is given whole, and the builder numbers them", () => {
+    const body = "## Verifier Review\n\nThe gate is red: `FooTest` fails.";
+    const note = reworkFindingsNote({ body, reviewed: SHA, answersPath: "/p/a.md" });
+    assert.match(note, /number them yourself/);
+    assert.match(note, /----- BEGIN FINDINGS -----\n## Verifier Review\n\nThe gate is red: `FooTest` fails\.\n----- END FINDINGS -----/);
+  });
+
+  test("answered numbers are read from numbered lines only", () => {
+    const answers = "1. Fixed in abc1234: queued the paste error\n- 3) Not fixed: out of scope, filed #1800\nSome prose 2. not an answer\n4.";
+    assert.deepEqual([...answeredFindingNumbers(answers)].sort(), [1, 3]);
+  });
+
+  test("the re-review puts the builder's answers before the previous verdict and names unanswered findings", () => {
+    const note = reReviewNote({
+      body: at("10:18"), reviewed: SHA, head: OTHER, patch: "+x", stat: null,
+      answers: { text: "1. Fixed in abc1234: one queue\n2. Not fixed: the gate failure is inherited, see #1809\n", findings: 4 },
+    });
+    assert.match(note, /1\. Read the builder's answers below first/);
+    assert.match(note, /----- BEGIN BUILDER ANSWERS -----\n1\. Fixed in abc1234: one queue\n2\. Not fixed: the gate failure is inherited, see #1809\n----- END BUILDER ANSWERS -----/);
+    assert.match(note, /It gave no answer to findings 3, 4\./);
+    assert.ok(note.indexOf("BEGIN BUILDER ANSWERS") < note.indexOf("BEGIN PREVIOUS VERDICT"));
+  });
+
+  test("the re-review says when the builder left no answers", () => {
+    for (const text of [null, "", "  \n"]) {
+      const note = reReviewNote({ body: "b", reviewed: SHA, head: OTHER, patch: "", stat: null, answers: { text, findings: 2 } });
+      assert.match(note, /The builder left no answers to these findings\. Check every one yourself\./);
+      assert.doesNotMatch(note, /BEGIN BUILDER ANSWERS/);
+    }
+  });
+
+  test("every finding answered names none as missing", () => {
+    const note = reReviewNote({ body: "b", reviewed: SHA, head: OTHER, patch: "", stat: null, answers: { text: "1. Fixed in a: x\n2. Fixed in b: y", findings: 2 } });
+    assert.doesNotMatch(note, /gave no answer/);
   });
 });

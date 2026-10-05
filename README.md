@@ -243,6 +243,19 @@ reviewed commit that is not an ancestor, as after a force-push, a missing file o
 git error gives no section and a full review. With parallel review on, the source
 reviewer gets the same section and the same narrowed brief.
 
+**The builder answers each finding.** When the PR-opening agent is dispatched on a
+reworked ticket and the verdict agent's last verdict is a FAIL on an ancestor of
+`origin/feature/<issue>`, its prompt gets a `## Verifier findings to answer`
+section. It lists the verdict's `[MUST FIX]` and `[SHOULD FIX]` findings as a
+numbered list, or the whole verdict when it has no tagged findings, and names an
+answers file, `rework-answers-<issue>-<commit>.md` beside the verdict handoff. The
+dispatcher empties that file first. The builder writes one line per finding,
+`<n>. Fixed in <sha>: ...` or `<n>. Not fixed: <reason>`, and repeats the list in
+its final summary. The next re-review section shows those answers before the
+previous verdict, names any finding left unanswered, and tells the verifier to read
+them first and check each claim. Mobile #1747 on 2026-10-05 got the same finding
+twice with no word from the builder on it.
+
 The two model phases share the verifier's wall-clock budget, but gate time is not
 charged to it. The final verifier gets the budget the source review left, and
 never less than half of it, however long the gates took. Each gate stays bounded
