@@ -145,3 +145,107 @@ export function decideVerifierGateReuse(opts: {
   }
   return { reuse: true, pass };
 }
+
+// Docs-only reuse (#134). A rework that changes only documentation or the
+// plan changes the tree, so the exact match above misses, and every gate
+// ran again on unchanged code: about 13 minutes on pyrycode-mobile for a
+// one-file Markdown fix. When every file that differs between the recorded
+// pass's commit and the current HEAD is documentation, the code gates'
+// results stand and only the documentation gates run again. The age, gate
+// list and log checks still apply.
+
+/** Globs counted as documentation when `PYRY_VERIFIER_DOCS_PATHS` is unset.
+ *  Covers the plan under `docs/specs/architecture/`. */
+export const DEFAULT_VERIFIER_DOCS_PATHS: readonly string[] = ["docs/**"];
+
+/** `PYRY_VERIFIER_DOCS_PATHS`: comma-separated path globs. Unset means
+ *  `docs/**`. Empty means no path counts as documentation. */
+export function parseVerifierDocsPaths(envValue: string | undefined): string[] {
+  if (envValue === undefined) return [...DEFAULT_VERIFIER_DOCS_PATHS];
+  return envValue.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+}
+
+/** `PYRY_VERIFIER_DOCS_GATES`: gate commands, written exactly as in
+ *  `PYRY_VERIFIER_GATES` and separated by `;`, that still run on a
+ *  docs-only change. Unset or empty means none. */
+export function parseVerifierDocsGates(envValue: string | undefined): string[] {
+  return (envValue ?? "").split(";").map((s) => s.trim()).filter((s) => s.length > 0);
+}
+
+/** Whether a repo-relative path matches any glob. `**` spans folders,
+ *  `*` stays inside one, everything else is literal. */
+export function matchesDocsPath(path: string, globs: readonly string[]): boolean {
+  return globs.some((glob) => {
+    let re = "";
+    for (let i = 0; i < glob.length; i++) {
+      if (glob.startsWith("**/", i)) {
+        re += "(?:.*/)?";
+        i += 2;
+      } else if (glob.startsWith("**", i)) {
+        re += ".*";
+        i += 1;
+      } else if (glob[i] === "*") {
+        re += "[^/]*";
+      } else {
+        re += glob[i]!.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
+      }
+    }
+    return new RegExp(`^${re}$`).test(path);
+  });
+}
+
+export type DocsOnlyGateReuseDecision =
+  | {
+    reuse: true;
+    pass: VerifierGatePass;
+    /** The files that changed since the pass, all documentation. */
+    files: string[];
+    /** The documentation gates to run again, in gate-list order. */
+    rerun: string[];
+  }
+  | {
+    reuse: false;
+    reason:
+      | Extract<VerifierGateReuseDecision, { reuse: false }>["reason"]
+      | "same-tree"
+      | "diff-failed"
+      | "code-changed";
+  };
+
+/**
+ * Whether a recorded pass on a different tree stands in for the code gates,
+ * because only documentation changed since it. Every check of
+ * `decideVerifierGateReuse` except the tree match applies first, and only
+ * then is `changedFiles` asked for the files between the pass's commit and
+ * HEAD, so a ruled-out pass costs no git call. A failed or empty diff, or
+ * any path outside `docsPaths`, is no reuse.
+ */
+export function decideDocsOnlyGateReuse(opts: {
+  pass: VerifierGatePass | null;
+  issueNumber: number;
+  tree: string;
+  gates: readonly string[];
+  gatesHash: string;
+  nowMs: number;
+  logExists: (path: string) => boolean;
+  docsPaths: readonly string[];
+  docsGates: readonly string[];
+  /** Files changed between `fromCommit` and HEAD, or null on any error. */
+  changedFiles: (fromCommit: string) => string[] | null;
+}): DocsOnlyGateReuseDecision {
+  const { pass } = opts;
+  if (opts.tree === "") return { reuse: false, reason: "tree-changed" };
+  if (pass !== null && pass.tree === opts.tree) return { reuse: false, reason: "same-tree" };
+  // The exact-match checks, with the tree taken as matching.
+  const base = decideVerifierGateReuse({ ...opts, tree: pass?.tree || opts.tree });
+  if (!base.reuse) return base;
+  const files = opts.changedFiles(base.pass.commit);
+  if (files === null || files.length === 0) return { reuse: false, reason: "diff-failed" };
+  if (!files.every((f) => matchesDocsPath(f, opts.docsPaths))) return { reuse: false, reason: "code-changed" };
+  return {
+    reuse: true,
+    pass: base.pass,
+    files,
+    rerun: opts.gates.filter((g) => opts.docsGates.includes(g)),
+  };
+}

@@ -2,8 +2,12 @@ import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  decideDocsOnlyGateReuse,
   decideVerifierGateReuse,
   hashGateList,
+  matchesDocsPath,
+  parseVerifierDocsGates,
+  parseVerifierDocsPaths,
   parseVerifierGatePass,
   VERIFIER_GATE_REUSE_MAX_AGE_MS,
   verifierGatePassFileName,
@@ -139,5 +143,136 @@ describe("verifier gate reuse — a pass on the same files is not paid for twice
 
   test("the pass file sits beside the gate logs, one per issue", () => {
     assert.equal(verifierGatePassFileName(1340), "verifier-gate_#1340.pass.json");
+  });
+});
+
+describe("verifier gate reuse — a docs-only change since the green run (#134)", () => {
+  const NEW_TREE = "f".repeat(40);
+  const DOCS_GATE = "python3 scripts/docs-guard.py";
+  const ALL = [...GATES, DOCS_GATE];
+  const full = (overrides: Partial<VerifierGatePass> = {}) => pass({
+    gatesHash: hashGateList(ALL),
+    gates: ALL,
+    summary: ALL.map((g) => `✓ ${g} (exit 0)`),
+    ...overrides,
+  });
+
+  function decideDocs(overrides: {
+    pass?: VerifierGatePass | null;
+    tree?: string;
+    gatesHash?: string;
+    nowMs?: number;
+    existing?: readonly string[];
+    files?: string[] | null;
+    docsPaths?: string[];
+    docsGates?: string[];
+  } = {}) {
+    const existing = new Set(overrides.existing ?? LOGS);
+    const asked: string[] = [];
+    const decision = decideDocsOnlyGateReuse({
+      pass: overrides.pass === undefined ? full() : overrides.pass,
+      issueNumber: 1340,
+      tree: overrides.tree ?? NEW_TREE,
+      gates: ALL,
+      gatesHash: overrides.gatesHash ?? hashGateList(ALL),
+      nowMs: overrides.nowMs ?? NOW,
+      logExists: (p) => existing.has(p),
+      docsPaths: overrides.docsPaths ?? ["docs/**"],
+      docsGates: overrides.docsGates ?? [],
+      changedFiles: (from) => {
+        asked.push(from);
+        return overrides.files === undefined ? ["docs/specs/architecture/1340.md"] : overrides.files;
+      },
+    });
+    return { decision, asked };
+  }
+
+  test("only files under docs/ changed → reuse, nothing reruns without docs gates, the files come back", () => {
+    const { decision, asked } = decideDocs({ files: ["docs/specs/architecture/1340.md", "docs/knowledge/INDEX.md"] });
+    assert.deepEqual(asked, [COMMIT], "the diff base is the commit the pass ran on");
+    assert.equal(decision.reuse, true);
+    if (decision.reuse) {
+      assert.deepEqual(decision.files, ["docs/specs/architecture/1340.md", "docs/knowledge/INDEX.md"]);
+      assert.deepEqual(decision.rerun, []);
+      assert.equal(decision.pass.commit, COMMIT);
+    }
+  });
+
+  test("the documentation gates in the gate list rerun, in gate-list order; one not in the list is ignored", () => {
+    const { decision } = decideDocs({ docsGates: ["not a gate", DOCS_GATE] });
+    assert.equal(decision.reuse, true);
+    if (decision.reuse) assert.deepEqual(decision.rerun, [DOCS_GATE]);
+  });
+
+  test("one changed path outside the documentation globs → no reuse", () => {
+    assert.deepEqual(
+      decideDocs({ files: ["docs/specs/architecture/1340.md", "app/src/main/Foo.kt"] }).decision,
+      { reuse: false, reason: "code-changed" },
+    );
+  });
+
+  test("a failed or empty diff → no reuse", () => {
+    assert.deepEqual(decideDocs({ files: null }).decision, { reuse: false, reason: "diff-failed" });
+    assert.deepEqual(decideDocs({ files: [] }).decision, { reuse: false, reason: "diff-failed" });
+  });
+
+  test("the same tree is the exact match's business, not this one's", () => {
+    const { decision, asked } = decideDocs({ tree: TREE });
+    assert.deepEqual(decision, { reuse: false, reason: "same-tree" });
+    assert.deepEqual(asked, []);
+  });
+
+  test("expired, changed gate list, missing log or no record → no reuse, and git is not asked", () => {
+    const old = full({ passedAt: new Date(NOW - VERIFIER_GATE_REUSE_MAX_AGE_MS).toISOString() });
+    for (const [overrides, reason] of [
+      [{ pass: old }, "expired"],
+      [{ gatesHash: hashGateList(GATES) }, "gates-changed"],
+      [{ existing: [LOGS[0]!] }, "log-missing"],
+      [{ pass: null }, "no-record"],
+      [{ pass: full({ issueNumber: 1341 }) }, "other-issue"],
+    ] as const) {
+      const { decision, asked } = decideDocs(overrides);
+      assert.deepEqual(decision, { reuse: false, reason });
+      assert.deepEqual(asked, [], `no diff for ${reason}`);
+    }
+  });
+
+  test("an unknown current tree never reuses", () => {
+    assert.deepEqual(decideDocs({ tree: "" }).decision, { reuse: false, reason: "tree-changed" });
+  });
+
+  test("an empty documentation glob list counts nothing as documentation", () => {
+    assert.deepEqual(decideDocs({ docsPaths: [] }).decision, { reuse: false, reason: "code-changed" });
+  });
+
+  test("matchesDocsPath: ** spans folders, * stays inside one", () => {
+    assert.equal(matchesDocsPath("docs/a.md", ["docs/**"]), true);
+    assert.equal(matchesDocsPath("docs/specs/architecture/1340.md", ["docs/**"]), true);
+    assert.equal(matchesDocsPath("src/docs/a.md", ["docs/**"]), false);
+    assert.equal(matchesDocsPath("docsx/a.md", ["docs/**"]), false);
+    assert.equal(matchesDocsPath("docs/a.md", ["docs/*"]), true);
+    assert.equal(matchesDocsPath("docs/specs/a.md", ["docs/*"]), false);
+    assert.equal(matchesDocsPath("README.md", ["*.md"]), true);
+    assert.equal(matchesDocsPath("app/README.md", ["*.md"]), false);
+    assert.equal(matchesDocsPath("app/README.md", ["**/*.md"]), true);
+    assert.equal(matchesDocsPath("README.md", ["**/*.md"]), true);
+    assert.equal(matchesDocsPath("CHANGELOG.md", ["docs/**", "CHANGELOG.md"]), true);
+    assert.equal(matchesDocsPath("docs/a+b(1).md", ["docs/a+b(1).md"]), true, "regex characters are literal");
+    assert.equal(matchesDocsPath("docs/aXb.md", ["docs/a.b.md"]), false);
+  });
+
+  test("PYRY_VERIFIER_DOCS_PATHS: docs/** by default, comma-separated globs when set", () => {
+    assert.deepEqual(parseVerifierDocsPaths(undefined), ["docs/**"]);
+    assert.deepEqual(parseVerifierDocsPaths("docs/**, *.md ,,"), ["docs/**", "*.md"]);
+    assert.deepEqual(parseVerifierDocsPaths(""), []);
+  });
+
+  test("PYRY_VERIFIER_DOCS_GATES: none by default, ;-separated gate commands when set", () => {
+    assert.deepEqual(parseVerifierDocsGates(undefined), []);
+    assert.deepEqual(parseVerifierDocsGates(""), []);
+    assert.deepEqual(parseVerifierDocsGates(" python3 scripts/docs-guard.py ; make lint-docs;"), [
+      "python3 scripts/docs-guard.py",
+      "make lint-docs",
+    ]);
   });
 });
