@@ -263,7 +263,7 @@ config({ path: resolve(agentsRepoRoot, ".env") });
 // The agent runner, Claude or Codex, is read before every spawn from the
 // fork's runner file, falling back to PYRY_AGENT_RUNNER (runner-file.ts).
 // Created after the .env load so PYRY_RUNNER_FILE and the fallback apply.
-const selectRunner = createRunnerSelector({ path: runnerFilePath(process.env, agentsRepoRoot), env: process.env });
+const selectRunner = createRunnerSelector({ path: () => runnerFilePath(process.env, agentsRepoRoot), env: process.env });
 
 // The target repo — where code lives and agents work.
 // Falls through to resolveTargetRepoRoot (parent of agents/) when unset, so
@@ -2412,6 +2412,9 @@ export type DispatchContext = {
    *  agents marked `requiresVerdict`. Outside the worktree so it outlives
    *  teardown. See verdict-handoff.ts. */
   verdictHandoffPath?: string;
+  /** Set by `prepareReworkFindingsNote` when this is the builder's rework
+   *  after a verifier FAIL, so the runner file's `rework` entry applies. */
+  reworkAfterFail?: boolean;
 };
 
 /**
@@ -3426,7 +3429,7 @@ export async function prepareAgentSpawn(
   const { agent, item, client, agentCwd, useWorktree, worktreeDir, branchName, logFile } = ctx;
   const { execSync, readFileSync, writeFileSync, buildPromptForAgent, runCommand } = ctx.deps;
 
-  const runner = selectRunner(agent.name);
+  const runner = selectRunner(agent.name, { reworkAfterFail: ctx.reworkAfterFail === true });
   // The runner file can switch to Codex while the dispatcher runs. Startup
   // pins the executable only for runners in use then, so pin it on first use.
   if (runner === "codex" && !process.env.PYRY_CODEX_BIN) process.env.PYRY_CODEX_BIN = resolveCodexExecutable(process.env);
@@ -3584,7 +3587,7 @@ export async function prepareAgentSpawn(
   ctx.deps.writeLog(logFile, "PROMPT", prompt);
   ctx.deps.writeLog(logFile, "SYSTEM PROMPT", systemPrompt);
 
-  console.log(`   Running ${runner === "codex" ? "Codex" : "Claude Code"} as ${agent.name} (${runner === "codex" ? `${timeoutLabel} wall-clock budget` : `max ${maxTurns} turns`})...`);
+  console.log(`   Running ${runner === "codex" ? "Codex" : "Claude Code"} as ${agent.name}${ctx.reworkAfterFail ? ", a rework after a verifier FAIL" : ""} (${runner === "codex" ? `${timeoutLabel} wall-clock budget` : `max ${maxTurns} turns`})...`);
   console.log(`   📝 Log: ${logFile}`);
 
   return {
@@ -4241,7 +4244,9 @@ function prepareReReviewNote(ctx: DispatchContext): string {
  * ancestor of the pushed feature branch, the same test the re-review uses,
  * so a verdict on an abandoned branch is never answered. Empties the
  * answers file first, so the re-review reads only this run's answers. Any
- * failure means no section, and the rework runs as before.
+ * failure before the answers file means no section, and the rework runs as
+ * before. A qualifying rework also sets `ctx.reworkAfterFail`, which picks
+ * the runner file's `rework` entry for the spawn.
  */
 function prepareReworkFindingsNote(ctx: DispatchContext): string {
   const { agent, item } = ctx;
@@ -4262,6 +4267,7 @@ function prepareReworkFindingsNote(ctx: DispatchContext): string {
   if (!/^[0-9a-f]{40}$/.test(head)) return "";
   const ancestor = git(["merge-base", "--is-ancestor", last.commit, head]);
   if (ancestor.error || ancestor.status !== 0) return "";
+  ctx.reworkAfterFail = true;
   const answersPath = reworkAnswersPath(item.issueNumber, last.commit);
   try {
     ctx.deps.mkdirSync(dirname(answersPath), { recursive: true });

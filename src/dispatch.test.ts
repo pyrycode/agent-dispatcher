@@ -23,10 +23,10 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -10756,7 +10756,7 @@ describe("builder answers the verifier's findings (#1747)", () => {
       dispatchToAgent(builderAgent(agent), makeProjectItem({ issueNumber: ISSUE, status, labels }), client, deps)));
     const prompt = () => calls.fs.filter(c => c.kind === "write" && c.path.endsWith(`.prompt-${ISSUE}.txt`)).at(-1)?.content ?? "";
     const answerWrites = () => calls.fs.filter(c => c.kind === "write" && c.path === reworkAnswersPath(ISSUE, REVIEWED));
-    return { run, prompt, answerWrites, calls };
+    return { run, prompt, answerWrites, calls, deps };
   }
 
   test("a builder rework after a FAIL gets the numbered findings and an emptied answers file", async () => {
@@ -10786,6 +10786,44 @@ describe("builder answers the verifier's findings (#1747)", () => {
       assert.equal(f.answerWrites().length, 0);
     });
   }
+
+  describe("the runner file's rework entry", () => {
+    async function withRunnerFile(content: string, fn: () => Promise<void>) {
+      const dir = mkdtempSync(join(tmpdir(), "runner-file-"));
+      const prior = process.env.PYRY_RUNNER_FILE;
+      process.env.PYRY_RUNNER_FILE = join(dir, "runner.json");
+      writeFileSync(process.env.PYRY_RUNNER_FILE, content);
+      try { await fn(); } finally {
+        if (prior === undefined) delete process.env.PYRY_RUNNER_FILE; else process.env.PYRY_RUNNER_FILE = prior;
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+    async function runnerFor(opts: Parameters<typeof fixture>[0]) {
+      const f = fixture(opts);
+      let runner: string | undefined;
+      const inner = f.deps.runClaudeStreaming;
+      f.deps.runClaudeStreaming = async (config) => { runner = config.runner; return inner(config); };
+      await f.run();
+      return runner;
+    }
+    const FILE = '{"runner":"codex","rework":{"builder":"claude"}}';
+
+    test("a builder rework after a FAIL runs on the rework runner", async () => {
+      await withRunnerFile(FILE, async () => assert.equal(await runnerFor({}), "claude"));
+    });
+
+    test("a first attempt, a rework after a PASS, and the verifier stay on the file's runner", async () => {
+      await withRunnerFile(FILE, async () => {
+        assert.equal(await runnerFor({ labels: [] }), "codex");
+        assert.equal(await runnerFor({ last: lastFile("PASS") }), "codex");
+        assert.equal(await runnerFor({ agent: "verifier", labels: [] }), "codex");
+      });
+    });
+
+    test("a file with no rework entry picks the same runner as before", async () => {
+      await withRunnerFile('{"runner":"codex"}', async () => assert.equal(await runnerFor({}), "codex"));
+    });
+  });
 
   test("the verifier's re-review reads the builder's answers first", async () => {
     const f = fixture({ agent: "verifier", labels: [], answers: "1. Fixed in 1111111: the paste route queues its pill\n" });

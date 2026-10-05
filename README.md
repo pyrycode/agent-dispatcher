@@ -411,11 +411,18 @@ So the runner can also come from a JSON file that the dispatcher reads again
 before every agent spawn:
 
 ```json
-{"runner": "codex", "roles": {"verifier": "claude"}}
+{"runner": "codex", "roles": {"verifier": "claude"}, "rework": {"builder": "claude"}}
 ```
 
-- **Keys:** both are optional. A role entry beats `runner`, and `runner` beats
+- **Keys:** all are optional. A role entry beats `runner`, and `runner` beats
   `PYRY_AGENT_RUNNER`, which stays the fallback when the file is absent.
+- **Rework after a FAIL:** a `rework` entry, such as `"rework": {"builder": "claude"}`,
+  picks the runner for the builder's rework after a verifier FAIL only: the run
+  that gets the FAIL's findings to answer. It beats the role entry there. A first
+  attempt and a rework for any other reason ignore it. On mobile #1786 on
+  2026-10-05 the Codex builder could not fix three real bugs the verifier found,
+  which a Claude pass then fixed at once. The health checks before dispatch still
+  run with the role's own runner.
 - **Location:** `<agents repo>/runner.json` by default. `PYRY_RUNNER_FILE` points
   elsewhere, and an empty value turns the file off.
 - **Startup:** a broken file fails startup, like a bad `PYRY_AGENT_RUNNER`. Codex
