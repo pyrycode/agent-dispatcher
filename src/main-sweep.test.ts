@@ -6,10 +6,12 @@ import {
   DEFAULT_MAIN_SWEEP_EVERY,
   DEFAULT_MAIN_SWEEP_TIMEOUT_MS,
   buildMainSweepIssue,
+  buildMainSweepUpdateComment,
   decideMainSweep,
   holdVerifiersDuringSweep,
   parseMainSweepState,
   resolveMainSweepConfig,
+  shouldCommentSweepFailures,
   tailLines,
   type MainSweepConfig,
   type MainSweepOutcome,
@@ -60,15 +62,30 @@ describe("main sweep config", () => {
 
 describe("main sweep state file", () => {
   test("missing or damaged reads as empty", () => {
-    const empty = { lastSha: null, lastGoodSha: null, openIssue: null };
+    const empty = { lastSha: null, lastGoodSha: null, openIssue: null, failures: null, reportedNames: null };
     assert.deepEqual(parseMainSweepState(null), empty);
     assert.deepEqual(parseMainSweepState("{not json"), empty);
     assert.deepEqual(parseMainSweepState(JSON.stringify({ lastSha: "; rm -rf /", openIssue: -3 })), empty);
   });
 
   test("round-trips valid fields", () => {
-    const state = { lastSha: A, lastGoodSha: B, openIssue: 944 };
+    const state = {
+      lastSha: A, lastGoodSha: B, openIssue: 944,
+      failures: { sha: A, names: ["p.C#a"] }, reportedNames: ["p.C#a", "p.C#b"],
+    };
     assert.deepEqual(parseMainSweepState(JSON.stringify(state)), state);
+  });
+
+  test("a file from before the failure fields reads with none recorded", () => {
+    assert.deepEqual(parseMainSweepState(JSON.stringify({ lastSha: A, lastGoodSha: B, openIssue: 1046 })), {
+      lastSha: A, lastGoodSha: B, openIssue: 1046, failures: null, reportedNames: null,
+    });
+  });
+
+  test("failures without a usable commit are dropped, so no sweep stands as a baseline", () => {
+    for (const failures of [{ names: ["p.C#a"] }, { sha: "main", names: ["p.C#a"] }, { sha: A, names: "p.C#a" }]) {
+      assert.equal(parseMainSweepState(JSON.stringify({ lastSha: A, failures })).failures, null);
+    }
   });
 });
 
@@ -122,6 +139,31 @@ describe("main sweep ticket", () => {
     assert.equal(title, "In-depth test run could not run on main at ccccccc");
     assert.match(body, /No earlier sweep passed/);
     assert.match(body, /Run error: could not create the sweep worktree: boom/);
+  });
+
+  test("a failed sweep comments only a named failure set that differs from the one recorded", () => {
+    assert.equal(shouldCommentSweepFailures(["p.C#a"], ["p.C#a"]), false, "same set");
+    assert.equal(shouldCommentSweepFailures(["p.C#a", "p.C#b"], ["p.C#b", "p.C#a"]), false, "order does not matter");
+    assert.equal(shouldCommentSweepFailures(["p.C#a"], ["p.C#a", "p.C#b"]), true, "a new failure");
+    assert.equal(shouldCommentSweepFailures(["p.C#a", "p.C#b"], ["p.C#a"]), true, "a fixed failure");
+    assert.equal(shouldCommentSweepFailures(null, ["p.C#a"]), true, "nothing recorded yet");
+    assert.equal(shouldCommentSweepFailures(["p.C#a"], []), false, "a run that named nothing has no set");
+  });
+
+  test("the update comment lists the full set and what changed since the last record", () => {
+    const body = buildMainSweepUpdateComment({
+      head: C,
+      reportedNames: ["p.C#a", "p.C#gone"],
+      outcome: outcome({ failedNames: ["p.C#a", "p.C#new"] }),
+    });
+    assert.match(body, /## Main sweep failures changed/);
+    assert.match(body, new RegExp(`failed again on \`${C}\`, with 2 failing test`));
+    assert.match(body, /Newly failing: 1/);
+    assert.match(body, /No longer failing: 1\n  - `p\.C#gone`/);
+    assert.match(body, /- `p\.C#a`\n- `p\.C#new`/);
+    const first = buildMainSweepUpdateComment({ head: C, reportedNames: null, outcome: outcome({ failedNames: ["p.C#a"] }) });
+    assert.match(first, /No failure set was recorded on this ticket before/);
+    assert.ok(!first.includes("Newly failing"));
   });
 
   test("tailLines keeps the end", () => {
@@ -214,11 +256,17 @@ describe("runMainSweepCycle", () => {
     issueState?: string;
     result?: MainSweepOutcome;
     createFails?: boolean;
+    commentFails?: boolean;
   } = {}) {
     const written: string[] = [];
     const runs: string[] = [];
     const board: string[] = [];
+    const comments: { issue: number; body: string }[] = [];
     const client: MainSweepClient = {
+      addComment: async (issue, body) => {
+        if (opts.commentFails) throw new Error("502");
+        comments.push({ issue, body });
+      },
       createIssue: async (title) => {
         if (opts.createFails) throw new Error("403");
         board.push(`create ${title}`);
@@ -255,7 +303,7 @@ describe("runMainSweepCycle", () => {
         run: (sha) => { runs.push(sha); return new Promise((r) => { release = r; }); },
       },
     });
-    return { cycle, start, release: (o: MainSweepOutcome) => release(o), runs, board, written, lastState };
+    return { cycle, start, release: (o: MainSweepOutcome) => release(o), runs, board, comments, written, lastState };
   }
 
   test("off when not configured", async () => {
@@ -268,7 +316,9 @@ describe("runMainSweepCycle", () => {
     const d = await h.cycle(true);
     assert.equal(d.run, true);
     assert.deepEqual(h.runs, [C]);
-    assert.deepEqual(h.lastState(), { lastSha: C, lastGoodSha: C, openIssue: null });
+    assert.deepEqual(h.lastState(), {
+      lastSha: C, lastGoodSha: C, openIssue: null, failures: { sha: C, names: [] }, reportedNames: null,
+    });
     assert.deepEqual(h.board, []);
   });
 
@@ -286,17 +336,86 @@ describe("runMainSweepCycle", () => {
   });
 
   test("a failure files one Backlog ticket and remembers it", async () => {
-    const h = harness({ state: { lastSha: A, lastGoodSha: A, openIssue: null }, result: outcome() });
+    const h = harness({ state: { lastSha: A, lastGoodSha: A, openIssue: null }, result: outcome({ failedNames: ["p.C#a"] }) });
     await h.cycle(true);
     assert.deepEqual(h.board, ["create In-depth test run failed on main at ccccccc", "add", "status Backlog"]);
-    assert.deepEqual(h.lastState(), { lastSha: C, lastGoodSha: A, openIssue: 950 });
+    assert.deepEqual(h.lastState(), {
+      lastSha: C, lastGoodSha: A, openIssue: 950, failures: { sha: C, names: ["p.C#a"] }, reportedNames: ["p.C#a"],
+    });
+    assert.deepEqual(h.comments, []);
   });
 
   test("a repeat failure files nothing while the earlier ticket is open", async () => {
     const h = harness({ state: { lastSha: A, lastGoodSha: A, openIssue: 950 }, result: outcome(), issueState: "OPEN" });
     await h.cycle(true);
     assert.deepEqual(h.board, []);
-    assert.deepEqual(h.lastState(), { lastSha: C, lastGoodSha: A, openIssue: 950 });
+    assert.deepEqual(h.comments, [], "a failure that named no tests has no set to record");
+    assert.deepEqual(h.lastState(), {
+      lastSha: C, lastGoodSha: A, openIssue: 950, failures: { sha: C, names: [] }, reportedNames: null,
+    });
+  });
+
+  test("a repeat failure with a changed set comments it on the open ticket and stores it", async () => {
+    // pyrycode-mobile #1046 was filed for three failures on 2026-09-24 and
+    // stayed open while the sweeps grew to 38; nothing named the new ones.
+    const h = harness({
+      state: { lastSha: A, lastGoodSha: A, openIssue: 1046, reportedNames: ["p.C#a"] },
+      result: outcome({ failedNames: ["p.C#a", "p.C#b"] }),
+      issueState: "OPEN",
+    });
+    await h.cycle(true);
+    assert.deepEqual(h.board, [], "still no second ticket");
+    assert.equal(h.comments.length, 1);
+    assert.equal(h.comments[0]!.issue, 1046);
+    assert.match(h.comments[0]!.body, /- `p\.C#b`/);
+    assert.deepEqual(h.lastState().reportedNames, ["p.C#a", "p.C#b"]);
+    assert.deepEqual(h.lastState().failures, { sha: C, names: ["p.C#a", "p.C#b"] });
+  });
+
+  test("a repeat failure with the same set posts nothing", async () => {
+    const h = harness({
+      state: { lastSha: A, lastGoodSha: A, openIssue: 1046, reportedNames: ["p.C#b", "p.C#a"] },
+      result: outcome({ failedNames: ["p.C#a", "p.C#b"] }),
+      issueState: "OPEN",
+    });
+    await h.cycle(true);
+    assert.deepEqual(h.comments, []);
+    assert.deepEqual(h.board, []);
+    assert.deepEqual(h.lastState().reportedNames, ["p.C#b", "p.C#a"]);
+  });
+
+  test("a ticket filed before the set was stored gets the current set once", async () => {
+    const h = harness({
+      state: { lastSha: A, lastGoodSha: A, openIssue: 1046 },
+      result: outcome({ failedNames: ["p.C#a"] }),
+      issueState: "OPEN",
+    });
+    await h.cycle(true);
+    assert.equal(h.comments.length, 1);
+    assert.deepEqual(h.lastState().reportedNames, ["p.C#a"]);
+  });
+
+  test("a comment that fails leaves the stored set alone, so the next sweep tries again", async () => {
+    const h = harness({
+      state: { lastSha: A, lastGoodSha: A, openIssue: 1046, reportedNames: ["p.C#a"] },
+      result: outcome({ failedNames: ["p.C#b"] }),
+      issueState: "OPEN",
+      commentFails: true,
+    });
+    await h.cycle(true);
+    assert.deepEqual(h.lastState().reportedNames, ["p.C#a"]);
+    assert.deepEqual(h.lastState().failures, { sha: C, names: ["p.C#b"] });
+  });
+
+  test("a sweep that could not run keeps the last recorded failures", async () => {
+    const h = harness({
+      state: { lastSha: A, lastGoodSha: B, openIssue: 1046, failures: { sha: A, names: ["p.C#a"] }, reportedNames: ["p.C#a"] },
+      result: outcome({ exitCode: null, runError: "could not create the sweep worktree: boom" }),
+      issueState: "OPEN",
+    });
+    await h.cycle(true);
+    assert.deepEqual(h.lastState().failures, { sha: A, names: ["p.C#a"] });
+    assert.deepEqual(h.comments, []);
   });
 
   test("a failure after the earlier ticket closed files a new one", async () => {
@@ -308,7 +427,9 @@ describe("runMainSweepCycle", () => {
   test("a board write that fails still records the sweep, so it does not rerun every cycle", async () => {
     const h = harness({ state: { lastSha: A, lastGoodSha: A, openIssue: null }, result: outcome(), createFails: true });
     await h.cycle(true);
-    assert.deepEqual(h.lastState(), { lastSha: C, lastGoodSha: A, openIssue: null });
+    assert.deepEqual(h.lastState(), {
+      lastSha: C, lastGoodSha: A, openIssue: null, failures: { sha: C, names: [] }, reportedNames: null,
+    });
   });
 
   test("start returns while the sweep is still running, and records it when it ends", async () => {
@@ -320,7 +441,9 @@ describe("runMainSweepCycle", () => {
     assert.deepEqual(h.written, []);
     h.release(outcome({ passed: true, exitCode: 0 }));
     await finished;
-    assert.deepEqual(h.lastState(), { lastSha: C, lastGoodSha: C, openIssue: null });
+    assert.deepEqual(h.lastState(), {
+      lastSha: C, lastGoodSha: C, openIssue: null, failures: { sha: C, names: [] }, reportedNames: null,
+    });
   });
 
   test("start hands back no run when the decision is not to sweep", async () => {

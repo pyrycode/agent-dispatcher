@@ -80,10 +80,12 @@ import {
 import { selectDispatches } from "./dispatch-selection.js";
 import {
   buildMainSweepIssue,
+  buildMainSweepUpdateComment,
   decideMainSweep,
   holdVerifiersDuringSweep,
   parseMainSweepState,
   resolveMainSweepConfig,
+  shouldCommentSweepFailures,
   tailLines,
   type MainSweepConfig,
   type MainSweepDecision,
@@ -100,6 +102,17 @@ import {
   verifierGateReuseEnabled,
   type VerifierGatePass,
 } from "./verifier-gate-reuse.js";
+import {
+  attributableFailures,
+  buildBaselineRecordComment,
+  describeBaselineEntry,
+  parseVerifierGateFormats,
+  splitBySweep,
+  unlistedBaselineEntries,
+  type BaselineEntry,
+  type GateBaselineAssessment,
+  type VerifierGateFormat,
+} from "./verifier-gate-baseline.js";
 import { activeStageSet } from "./stage-sets.js";
 import { resolveEffort } from "./effort-policy.js";
 import {
@@ -145,6 +158,7 @@ import {
   FAMILY_DISPATCH_COMMENT_MARKER,
   FAMILY_DISPATCH_COUNT_PREFIX,
   FAMILY_DISPATCH_RESET_MARKER,
+  decideBaselineAdjustedVerdict,
 } from "./pipeline-decisions.js";
 import {
   type BranchSetupAction,
@@ -4766,6 +4780,8 @@ export const VERIFIER_GATE_TIMEOUT_MS =
 export const VERIFIER_GATE_TAIL_CAP = 4000;
 
 export interface VerifierGatesOutcome {
+  /** True when no gate is left red. A gate whose every failure also fails
+   *  on main counts as passed here; `baseline` says which. */
   ok: boolean;
   /** The first failing gate command, or null when all passed. */
   failedGate: string | null;
@@ -4777,6 +4793,10 @@ export interface VerifierGatesOutcome {
   /** The stdout and stderr log of every executed gate, in run order. A
    *  recorded pass names them as its evidence (verifier-gate-reuse.ts). */
   logPaths: string[];
+  /** Every red gate read against the baseline, in run order: gates excused
+   *  because all their failures also fail on main, then the failing gate's
+   *  own reading when there was one. Empty when nothing was read. */
+  baseline: GateBaselineAssessment[];
 }
 
 /**
@@ -4800,11 +4820,19 @@ export async function runVerifierGates(opts: {
   issueNumber: number;
   /** Overridable for tests; defaults to the module-level logs dir. */
   logsDir?: string;
+  /**
+   * Reads a red gate's failures against main (`assessVerifierGateRed`).
+   * Null leaves the gate red. An assessment with nothing remaining excuses
+   * the gate, and the run goes on to the next one. Only asked for a gate
+   * that ran to an exit code.
+   */
+  assessRed?: (red: { gate: string; stdoutPath: string }) => Promise<GateBaselineAssessment | null>;
   deps: Pick<DispatchDeps, "spawnGate" | "readFileSync">;
 }): Promise<VerifierGatesOutcome> {
   const logsDir = opts.logsDir ?? LOGS_DIR;
   const summary: string[] = [];
   const logPaths: string[] = [];
+  const baseline: GateBaselineAssessment[] = [];
   for (let i = 0; i < opts.gates.length; i++) {
     const gate = opts.gates[i]!;
     const stdoutPath = resolve(logsDir, `verifier-gate_#${opts.issueNumber}_${i + 1}.log`);
@@ -4827,6 +4855,22 @@ export async function runVerifierGates(opts: {
         ? `timed out after ${VERIFIER_GATE_TIMEOUT_MS / 60_000}min` +
           (outcome.waitCreditMs ? ` plus ${formatMinutes(outcome.waitCreditMs)} credited for waiting` : "")
         : `exit ${outcome.exitCode}`;
+    let assessment: GateBaselineAssessment | null = null;
+    if (failed && opts.assessRed && outcome.spawnError === null && !outcome.timedOut) {
+      try {
+        assessment = await opts.assessRed({ gate, stdoutPath });
+      } catch (e: any) {
+        // Never fail the failure path: an unreadable baseline leaves the gate red.
+        console.warn(`   ⚠️  Could not read \`${gate}\` against main, so it stays red: ${e?.message ?? e}`);
+      }
+      if (assessment !== null) baseline.push(assessment);
+    }
+    if (assessment !== null && assessment.remaining.length === 0 && assessment.baseline.length > 0) {
+      summary.push(
+        `✗ ${gate} (${verdict}; all ${assessment.baseline.length} failing test(s) also fail on main, so it counts as green)`,
+      );
+      continue;
+    }
     summary.push(`${failed ? "✗" : "✓"} ${gate} (${verdict})`);
     if (failed) {
       const readTail = (path: string): string => {
@@ -4842,10 +4886,191 @@ export async function runVerifierGates(opts: {
       const outputTail = combined.length > VERIFIER_GATE_TAIL_CAP
         ? combined.slice(-VERIFIER_GATE_TAIL_CAP)
         : combined;
-      return { ok: false, failedGate: gate, outputTail, summary, logPaths };
+      return { ok: false, failedGate: gate, outputTail, summary, logPaths, baseline };
     }
   }
-  return { ok: true, failedGate: null, outputTail: "", summary, logPaths };
+  return { ok: true, failedGate: null, outputTail: "", summary, logPaths, baseline };
+}
+
+/** Same name and directory as the sweep runner's state file. */
+function readMainSweepState(ctx: DispatchContext): MainSweepState {
+  let raw: string | null = null;
+  try {
+    raw = String(ctx.deps.readFileSync(resolve(LOGS_DIR, MAIN_SWEEP_STATE_FILE), "utf-8"));
+  } catch {}
+  return parseMainSweepState(raw);
+}
+
+/**
+ * Read a red verifier gate's failures against main, before the verifier is
+ * spawned (see verifier-gate-baseline.ts for why).
+ *
+ * 1. The gate's stdout, parsed with its configured format. A red that cannot
+ *    be pinned on named tests returns null and stays red.
+ * 2. The latest main sweep's failures, when its commit is an ancestor of
+ *    this worktree's HEAD, the branch merged with the default branch. Any
+ *    doubt about that, or no recorded sweep, uses no sweep.
+ * 3. What remains is re-run alone on the default-branch commit merged into
+ *    this worktree, through the real-claude gate's base re-run, when the gate
+ *    has a baseline template. A name that fails there too is baseline; one
+ *    that passes or goes unreported stays the ticket's.
+ */
+async function assessVerifierGateRed(
+  ctx: DispatchContext,
+  gate: string,
+  spec: VerifierGateFormat,
+  stdoutPath: string,
+): Promise<GateBaselineAssessment | null> {
+  let raw: string;
+  try {
+    raw = String(ctx.deps.readFileSync(stdoutPath, "utf-8"));
+  } catch {
+    return null;
+  }
+  const failed = attributableFailures(parseGateOutput(raw, spec.format));
+  if (failed === null) {
+    console.log(`   🧪 \`${gate}\` failed without naming every failure in its ${spec.format} output; left to the verifier`);
+    return null;
+  }
+  const git = (args: string): string => String(ctx.deps.execSync(`git ${args}`, {
+    cwd: ctx.agentCwd, encoding: "utf-8", stdio: "pipe", timeout: 30_000,
+  })).trim();
+
+  const sweep = readMainSweepState(ctx).failures;
+  let sweepIsAncestor: boolean | null = null;
+  if (sweep !== null) {
+    try {
+      git(`merge-base --is-ancestor ${sweep.sha} HEAD`);
+      sweepIsAncestor = true;
+    } catch (e: any) {
+      // Exit 1 is a plain no; anything else (an unknown commit) is no answer.
+      sweepIsAncestor = e?.status === 1 ? false : null;
+    }
+  }
+  const bySweep = splitBySweep(failed, sweep, sweepIsAncestor);
+  const baseline: BaselineEntry[] = bySweep.baseline.map((name) => ({ name, source: "main-sweep", sha: sweep!.sha }));
+  let remaining = bySweep.remaining;
+  let baseSkipReason: string | null = null;
+
+  if (remaining.length > 0 && spec.baselineCommand === null) {
+    baseSkipReason = "the gate has no baseline template";
+  } else if (remaining.length > 0 && spec.baselineCommand !== null) {
+    let baseSha: string | null = null;
+    try {
+      const v = git(`merge-base HEAD ${defaultBranch}`);
+      if (/^[0-9a-f]{40,64}$/.test(v)) baseSha = v;
+    } catch {}
+    if (baseSha === null) {
+      baseSkipReason = `could not resolve the ${defaultBranch} commit merged into this worktree`;
+    } else {
+      const run = await runFailuresOnBase({
+        failedNames: remaining,
+        baselineCommand: spec.baselineCommand,
+        baseSha,
+        format: spec.format,
+        timeoutMs: VERIFIER_GATE_TIMEOUT_MS,
+        issueNumber: ctx.item.issueNumber,
+        targetRepo: repoRoot,
+        logsDir: LOGS_DIR,
+        stamp: new Date().toISOString().replace(/[:.]/g, "-"),
+        label: "verifier-gate-base",
+        who: "Verifier gate",
+        deps: ctx.deps,
+      });
+      // Same partition as the real-claude gate: null base failures excuse nothing.
+      const split = decideBaselineAdjustedVerdict({
+        verdict: "fail", branchFailures: remaining, baselineFailures: run.failures, reason: `\`${gate}\` failed`,
+      });
+      baseline.push(...split.preExisting.map((name): BaselineEntry => ({ name, source: "base-commit", sha: baseSha! })));
+      remaining = split.introduced;
+      baseSkipReason = run.skipReason;
+    }
+  }
+  console.log(
+    `   🧪 \`${gate}\`: ${failed.length} failing test(s), ${baseline.length} also failing on main, ${remaining.length} left for the verifier` +
+    (baseSkipReason ? ` (no base re-run: ${baseSkipReason})` : ""),
+  );
+  return { gate, baseline, remaining, baseSkipReason };
+}
+
+/**
+ * Record baseline failures on the open main-failure ticket, the one the
+ * main sweep filed, so they reach whoever fixes main instead of the builder.
+ * A name the ticket already lists is not recorded again. Returns the ticket
+ * number when every name is on it afterwards, else null; never throws.
+ */
+async function recordBaselineOnMainFailureTicket(
+  ctx: DispatchContext,
+  assessments: readonly GateBaselineAssessment[],
+): Promise<number | null> {
+  const entries = assessments.flatMap((a) => a.baseline.map((entry) => ({ gate: a.gate, entry })));
+  if (entries.length === 0) return null;
+  const issue = readMainSweepState(ctx).openIssue;
+  if (issue === null) {
+    console.log(`   🧾 No open main-failure ticket; the ${entries.length} baseline failure(s) stay in the verifier's note only`);
+    return null;
+  }
+  let view: { state?: string; body?: string; comments?: { body?: string }[] };
+  try {
+    view = JSON.parse(String(ctx.deps.execSync(`gh issue view ${issue} --json state,body,comments`, {
+      cwd: repoRoot, encoding: "utf-8", stdio: "pipe", timeout: 60_000,
+    })));
+  } catch (e: any) {
+    console.warn(`   ⚠️  Could not read main-failure ticket #${issue}, so the baseline failures are not recorded: ${e?.message ?? e}`);
+    return null;
+  }
+  if (view.state !== "OPEN") {
+    console.log(`   🧾 Main-failure ticket #${issue} is not open; the baseline failures are not recorded`);
+    return null;
+  }
+  const texts = [view.body ?? "", ...(view.comments ?? []).map((c) => c?.body ?? "")];
+  const fresh = new Set(unlistedBaselineEntries(entries.map((e) => e.entry), texts));
+  if (fresh.size === 0) {
+    console.log(`   🧾 Main-failure ticket #${issue} already lists every baseline failure`);
+    return issue;
+  }
+  try {
+    await ctx.client.addComment(issue, buildBaselineRecordComment({
+      gatedIssue: ctx.item.issueNumber,
+      commit: mergedWorktreeHead(ctx)?.commit ?? null,
+      entries: entries.filter((e) => fresh.has(e.entry)),
+    }));
+    console.log(`   🧾 Recorded ${fresh.size} baseline failure(s) on main-failure ticket #${issue}`);
+    return issue;
+  } catch (e: any) {
+    console.warn(`   ⚠️  Could not record the baseline failures on #${issue}: ${e?.message ?? e}`);
+    return null;
+  }
+}
+
+/** Prompt lines naming the failing gate's failures that are still the ticket's. */
+function remainingNoteLines(result: VerifierGatesOutcome): string[] {
+  const own = result.baseline.find((a) => a.gate === result.failedGate && a.remaining.length > 0);
+  if (!own) return [];
+  return [
+    "",
+    `Judge only these remaining failures of \`${own.gate}\`, which do not fail on main:`,
+    "",
+    ...own.remaining.map((name) => `- \`${name}\``),
+  ];
+}
+
+/** Prompt lines listing the failures set aside as main's. */
+function baselineNoteLines(assessments: readonly GateBaselineAssessment[], ticket: number | null): string[] {
+  const entries = assessments.flatMap((a) => a.baseline.map((entry) => `- ${describeBaselineEntry(entry)}, gate \`${a.gate}\``));
+  if (entries.length === 0) return [];
+  return [
+    "",
+    "### Failures already on main, not this ticket's",
+    "",
+    "The dispatcher checked these failing tests against main before spawning you. Each also fails on main, so it is not this ticket's:",
+    "",
+    ...entries,
+    "",
+    ticket !== null
+      ? `They are recorded on #${ticket}, the open main-failure ticket. Do not route them to the builder, file them again, or spend turns re-running them.`
+      : "No open main-failure ticket holds them. Do not route them to the builder or spend turns re-running them.",
+  ];
 }
 
 /**
@@ -4937,6 +5162,13 @@ function readReusableGatePass(
  *   merged tree with the same gate list in the last 24 hours is reused:
  *   no gate runs, and the green note says whose results they are. See
  *   verifier-gate-reuse.ts; `PYRY_VERIFIER_GATE_REUSE=0` turns it off.
+ * - **Red only with failures main already has** → a gate with an output
+ *   format in `PYRY_VERIFIER_GATE_FORMATS` has its failing names read
+ *   against the latest ancestor main sweep and a base-commit re-run first
+ *   (`assessVerifierGateRed`). Those names go on the main sweep's open
+ *   ticket and into the note as not this ticket's. When none remain, the
+ *   gate counts as green and the next gate runs. See
+ *   verifier-gate-baseline.ts.
  */
 export async function maybeRunPreSpawnGates(
   ctx: DispatchContext,
@@ -4996,14 +5228,47 @@ export async function maybeRunPreSpawnGates(
     }
   }
 
+  // A gate with an output format (PYRY_VERIFIER_GATE_FORMATS) has a red read
+  // against main first; see assessVerifierGateRed. No format, no reading. A
+  // conflicted merge left for the agent has no commit to compare with main.
+  const { formats, errors: formatErrors } = parseVerifierGateFormats(process.env.PYRY_VERIFIER_GATE_FORMATS);
+  for (const error of formatErrors) console.warn(`   ⚠️  ${error}`);
+  const assessRed = formats.size > 0 && !ctx.pendingMerge
+    ? async (red: { gate: string; stdoutPath: string }) => {
+      const spec = formats.get(red.gate);
+      return spec ? assessVerifierGateRed(ctx, red.gate, spec, red.stdoutPath) : null;
+    }
+    : undefined;
+
   console.log(`   🧪 Pre-${agent.name} gates (${gates.length}): ${gates.map((g) => `\`${g}\``).join(", ")}`);
   const result = await runVerifierGates({
     gates,
     cwd: agentCwd,
     issueNumber: item.issueNumber,
+    assessRed,
     deps: ctx.deps,
   });
-  ctx.deps.writeLog(logFile, "GATES", result.summary.join("\n"));
+  const baselineLog = result.baseline.flatMap((a) => [
+    ...a.baseline.map((entry) => `  ${a.gate}: ${describeBaselineEntry(entry)}`),
+    ...(a.baseSkipReason ? [`  ${a.gate}: no base re-run, ${a.baseSkipReason}`] : []),
+  ]);
+  ctx.deps.writeLog(logFile, "GATES", [...result.summary, ...baselineLog].join("\n"));
+  const baselineTicket = await recordBaselineOnMainFailureTicket(ctx, result.baseline);
+
+  if (result.ok && result.baseline.length > 0) {
+    // Every red failure also fails on main: green for the verdict, but not a
+    // full pass, so nothing is recorded for reuse.
+    console.log(`   ✅ Pre-${agent.name} gates green once failures already on main are set aside`);
+    return {
+      promptNote: [
+        greenNote(
+          "The dispatcher ran the fork's deterministic gates in this worktree before spawning you. Every gate passed " +
+          "apart from failures that also fail on main, so the gates count as green for your verdict:",
+        ),
+        ...baselineNoteLines(result.baseline, baselineTicket),
+      ].join("\n"),
+    };
+  }
 
   if (result.ok) {
     console.log(`   ✅ Pre-${agent.name} gates green`);
@@ -5052,6 +5317,8 @@ export async function maybeRunPreSpawnGates(
     "```",
     "",
     "Triage this failure before reviewing: determine whether it is caused by this ticket's changes or already present on the merge base, then route per your triage contract (bounce vs advance). The dispatcher deliberately did not apply any rework label — that call is yours.",
+    ...baselineNoteLines(result.baseline, baselineTicket),
+    ...remainingNoteLines(result),
   ].join("\n");
   return { promptNote };
 }
@@ -6185,23 +6452,53 @@ async function runBaselineComparison(opts: {
   stamp: string;
   deps: GateRunnerDeps;
 }): Promise<void> {
-  const { report, deps, targetRepo } = opts;
+  const { report } = opts;
+  const result = await runFailuresOnBase({ ...opts, label: "real-claude-gate-base", who: "Real-claude gate" });
+  if (result.outputPath !== null) report.baselineOutputPath = result.outputPath;
+  report.baselineFailures = result.failures;
+  report.baselineSkipReason = result.skipReason;
+}
+
+/**
+ * Re-run named failing tests alone on `baseSha`, in a detached worktree of
+ * the target repo, and return the ones that fail there. Shared by the
+ * real-claude gate's base comparison and the verifier gates' baseline.
+ *
+ * Never throws. `failures` is null whenever nothing trustworthy came back,
+ * with `skipReason` saying why: no safe filter, no placeholder, no worktree,
+ * a timeout, unreadable output, or a run that executed nothing. Callers read
+ * null as "nothing known", which keeps the failures on the branch.
+ */
+async function runFailuresOnBase(opts: {
+  failedNames: readonly string[];
+  baselineCommand: string;
+  baseSha: string;
+  format: GateOutputFormat;
+  timeoutMs: number;
+  issueNumber: number;
+  targetRepo: string;
+  logsDir: string;
+  stamp: string;
+  /** Worktree and log name prefix, e.g. `real-claude-gate-base`. */
+  label: string;
+  /** Log prefix naming the caller. */
+  who: string;
+  deps: Pick<GateRunnerDeps, "execSync" | "spawnGate" | "readFileSync">;
+}): Promise<{ failures: string[] | null; skipReason: string | null; outputPath: string | null }> {
+  const { deps, targetRepo } = opts;
+  const skip = (skipReason: string, outputPath: string | null = null) => ({ failures: null, skipReason, outputPath });
 
   const filter = buildBaselineFilter(opts.failedNames, opts.format);
   if (filter === null) {
-    report.baselineSkipReason =
-      "could not build a safe test filter from the failing names, so no comparison was attempted";
-    return;
+    return skip("could not build a safe test filter from the failing names, so no comparison was attempted");
   }
   const command = buildBaselineCommand(opts.baselineCommand, filter);
   if (command === null) {
-    report.baselineSkipReason =
-      `the baseline command has no ${BASELINE_TESTS_PLACEHOLDER} placeholder, so it would have re-run the whole suite`;
-    return;
+    return skip(`the baseline command has no ${BASELINE_TESTS_PLACEHOLDER} placeholder, so it would have re-run the whole suite`);
   }
-  const worktreeDir = worktreePath(targetRepo, `real-claude-gate-base-${opts.issueNumber}`);
-  const stdoutPath = resolve(opts.logsDir, `${opts.stamp}_real-claude-gate-base_#${opts.issueNumber}.log`);
-  const stderrPath = resolve(opts.logsDir, `${opts.stamp}_real-claude-gate-base_#${opts.issueNumber}.stderr.log`);
+  const worktreeDir = worktreePath(targetRepo, `${opts.label}-${opts.issueNumber}`);
+  const stdoutPath = resolve(opts.logsDir, `${opts.stamp}_${opts.label}_#${opts.issueNumber}.log`);
+  const stderrPath = resolve(opts.logsDir, `${opts.stamp}_${opts.label}_#${opts.issueNumber}.stderr.log`);
 
   const removeWorktree = () => {
     try { deps.execSync(`git worktree remove "${worktreeDir}"`, { cwd: targetRepo, stdio: "pipe" }); } catch {}
@@ -6215,12 +6512,11 @@ async function runBaselineComparison(opts: {
     });
   } catch (e: any) {
     removeWorktree();
-    report.baselineSkipReason = `could not create the base worktree: ${e?.message ?? e}`;
-    return;
+    return skip(`could not create the base worktree: ${e?.message ?? e}`);
   }
 
   try {
-    console.log(`   🔎 Real-claude gate: re-running ${opts.failedNames.length} failing test(s) against the base commit…`);
+    console.log(`   🔎 ${opts.who}: re-running ${opts.failedNames.length} failing test(s) against the base commit…`);
     const outcome = await deps.spawnGate({
       command,
       cwd: worktreeDir,
@@ -6229,39 +6525,35 @@ async function runBaselineComparison(opts: {
       stdoutPath,
       stderrPath,
     });
-    report.baselineOutputPath = stdoutPath;
 
     if (outcome.timedOut) {
-      report.baselineSkipReason = "the base re-run hit the outer timeout, so its result is a truncated prefix";
-      return;
+      return skip("the base re-run hit the outer timeout, so its result is a truncated prefix", stdoutPath);
     }
 
     let raw: string;
     try {
       raw = deps.readFileSync(stdoutPath, "utf-8").toString();
     } catch (e: any) {
-      report.baselineSkipReason = `could not read the base re-run's output back: ${e?.message ?? e}`;
-      return;
+      return skip(`could not read the base re-run's output back: ${e?.message ?? e}`, stdoutPath);
     }
 
     const baseTally = parseGateOutput(raw, opts.format);
     if (baseTally.recognizedLines === 0) {
-      report.baselineSkipReason = "the base re-run produced no readable test events";
-      return;
+      return skip("the base re-run produced no readable test events", stdoutPath);
     }
     // A base run where the tests SKIPPED tells us nothing. It is the same
     // false green the whole gate exists to reject, and accepting it here
     // would exonerate every branch by default.
     if (baseTally.executed === 0) {
-      report.baselineSkipReason =
-        `the base re-run executed nothing (${baseTally.skipped} skipped), so it cannot exonerate or convict anything`;
-      return;
+      return skip(
+        `the base re-run executed nothing (${baseTally.skipped} skipped), so it cannot exonerate or convict anything`,
+        stdoutPath,
+      );
     }
 
-    report.baselineFailures = baseTally.failedNames;
-    report.baselineSkipReason = null;
+    return { failures: baseTally.failedNames, skipReason: null, outputPath: stdoutPath };
   } catch (e: any) {
-    report.baselineSkipReason = `the base re-run failed unexpectedly: ${e?.message ?? e}`;
+    return skip(`the base re-run failed unexpectedly: ${e?.message ?? e}`);
   } finally {
     removeWorktree();
   }
@@ -6464,6 +6756,7 @@ export async function runMainSweep(opts: {
 
 /** Narrow client for the sweep's board writes; `GitHubProjectClient` satisfies it. */
 export interface MainSweepClient {
+  addComment(issueNumber: number, body: string): Promise<void>;
   createIssue(title: string, body: string, labels?: string[]): Promise<{ number: number; nodeId: string; url: string }>;
   addItemToProject(issueNodeId: string): Promise<string>;
   updateItemStatus(itemId: string, newStatus: string): Promise<void>;
@@ -6576,11 +6869,15 @@ async function recordMainSweep(r: {
 }): Promise<void> {
   const { opts, config, deps, git, targetRepo, state, head, outcome } = r;
   const next: MainSweepState = { ...state, lastSha: head };
+  // What main fails at this commit, for the verifier gates' baseline. A run
+  // that could not start says nothing about main, so it keeps the last record.
+  if (outcome.runError === null) next.failures = { sha: head, names: [...new Set(outcome.failedNames)] };
 
   if (outcome.passed) {
     console.log(`   ✅ Main sweep passed on ${head.slice(0, 7)} in ${Math.round(outcome.durationMs / 1000)}s`);
     next.lastGoodSha = head;
     next.openIssue = null;
+    next.reportedNames = null;
     deps.writeState(JSON.stringify(next, null, 2) + "\n");
     return;
   }
@@ -6601,6 +6898,20 @@ async function recordMainSweep(r: {
   }
   if (stillOpen) {
     console.warn(`   ↪️  Ticket #${state.openIssue} for the earlier sweep failure is still open; not filing another`);
+    // Keep that ticket naming what fails now, without a comment per sweep.
+    if (shouldCommentSweepFailures(state.reportedNames, outcome.failedNames)) {
+      try {
+        await opts.client.addComment(
+          state.openIssue!,
+          buildMainSweepUpdateComment({ head, reportedNames: state.reportedNames, outcome }),
+        );
+        next.reportedNames = [...new Set(outcome.failedNames)];
+        console.warn(`   🎫 Commented the changed failure set (${next.reportedNames.length} test(s)) on #${state.openIssue}`);
+      } catch (e: any) {
+        // The stored set stays as it was, so the next failed sweep tries again.
+        console.error(`   ❌ Could not comment the changed failure set on #${state.openIssue}: ${e?.message ?? e}`);
+      }
+    }
   } else {
     let mergeSubjects: string[] = [];
     if (state.lastGoodSha !== null) {
@@ -6616,6 +6927,7 @@ async function recordMainSweep(r: {
       const itemId = await opts.client.addItemToProject(issue.nodeId);
       await opts.client.updateItemStatus(itemId, "Backlog");
       next.openIssue = issue.number;
+      next.reportedNames = [...new Set(outcome.failedNames)];
       console.warn(`   🎫 Filed #${issue.number} in Backlog for the sweep failure`);
     } catch (e: any) {
       // Recorded as swept anyway: rerunning the whole suite every cycle to
