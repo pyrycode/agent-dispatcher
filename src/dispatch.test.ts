@@ -9600,6 +9600,36 @@ describe("buildPromptForAgent — merge resolution to review", () => {
   });
 });
 
+// The documentation agent gets the dispatcher's gate report (#136); no other
+// agent does. A ticket with no logs gets the short "not available" form.
+describe("buildPromptForAgent — gate report", () => {
+  const item = makeProjectItem({ issueNumber: 990136 });
+  const specRoot = resolve(tmpdir(), "no-spec-root-for-gate-report");
+  async function prompt(set: string, name: string) {
+    const agent = resolveStageSet(set).agents.find(a => a.name === name)!;
+    const saved = process.env.PYRY_VERIFIER_GATE_FORMATS;
+    delete process.env.PYRY_VERIFIER_GATE_FORMATS;
+    try {
+      return await withStageSet(set, () => DEFAULT_DEPS.buildPromptForAgent(agent, item, specRoot, new MockGitHubClient()));
+    } finally {
+      if (saved !== undefined) process.env.PYRY_VERIFIER_GATE_FORMATS = saved;
+    }
+  }
+
+  test("the documentation agent gets the section, saying when no report is available", async () => {
+    for (const set of ["classic", "builder"]) {
+      const text = await prompt(set, "documentation");
+      assert.match(text, /\n## Gate report\nNo gate report is available for this ticket/, set);
+    }
+  });
+
+  test("other agents get no section", async () => {
+    for (const [set, name] of [["classic", "developer"], ["classic", "architect"], ["builder", "builder"]] as const) {
+      assert.doesNotMatch(await prompt(set, name), /## Gate report/, `${set}/${name}`);
+    }
+  });
+});
+
 describe("worktreePath", () => {
   test("gives each repository its own folder, so equal ticket numbers cannot collide", () => {
     const mobile = worktreePath("/w/pyrycode-mobile", "builder-1348");
