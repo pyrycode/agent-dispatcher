@@ -10,14 +10,18 @@
 // scenario that failed only in the full suite.
 //
 // So a gate with a known output format has its failing test names read
-// before the verifier spawns. A name that also failed in the latest main
+// before the verifier spawns. When the gate has a re-run template, its
+// failures are first re-run once in the same worktree, as the real-claude
+// gate does (#133). A name seen passing there is flaky: it goes on its
+// shared flaky-test ticket and is not the ticket's. A name that also failed in the latest main
 // sweep is a baseline failure, but only when the sweep ran on a main commit
 // the branch's merged tree contains: a sweep newer than the branch's merge of
 // main may describe code the branch has never seen. The remaining names are
 // re-run alone on the base commit, as the real-claude gate's baseline run
 // does, and the ones that fail there are baseline too. Baseline names go to
 // the open main-failure ticket, not the builder. When none remain, the gate
-// counts as green for the verdict.
+// counts as green for the verdict, whether the names were flaky, baseline
+// or both.
 //
 // The format is opt-in per gate (`PYRY_VERIFIER_GATE_FORMATS`). A gate
 // without one behaves exactly as before.
@@ -124,6 +128,24 @@ export function splitBySweep(
   };
 }
 
+/**
+ * Split a red gate's failures by its same-tree re-run. `rerunPassed` is every
+ * name the re-run saw pass, or null when the re-run told nothing (no filter,
+ * timed out, unreadable, nothing executed), which excuses nothing. Only a
+ * name seen passing is flaky; one the re-run did not report stays failing.
+ */
+export function splitByRerun(
+  failedNames: readonly string[],
+  rerunPassed: readonly string[] | null,
+): { flaky: string[]; remaining: string[] } {
+  if (rerunPassed === null) return { flaky: [], remaining: [...failedNames] };
+  const passed = new Set(rerunPassed);
+  return {
+    flaky: failedNames.filter((name) => passed.has(name)),
+    remaining: failedNames.filter((name) => !passed.has(name)),
+  };
+}
+
 /** Why a failure was set aside. */
 export type BaselineSource = "main-sweep" | "base-commit";
 
@@ -137,11 +159,15 @@ export interface BaselineEntry {
 /** One red gate, read against the baseline. */
 export interface GateBaselineAssessment {
   gate: string;
+  /** Failures that passed on the same-tree re-run: flaky, not the ticket's. */
+  flaky: string[];
   baseline: BaselineEntry[];
   /** Failures still the ticket's. Empty means the gate counts as green. */
   remaining: string[];
   /** Why the base re-run did not happen, when it did not; for the log. */
   baseSkipReason: string | null;
+  /** Why the same-tree re-run told nothing, when it did not run or could not be read; for the log. */
+  rerunSkipReason: string | null;
 }
 
 /** A one-line description of an entry, for the note, the log and the ticket. */

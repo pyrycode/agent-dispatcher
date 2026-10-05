@@ -91,6 +91,7 @@ import {
   type EnvPreflightState,
 } from "./dispatch.js";
 import { formatGateEvidenceComment } from "./gate-output.js";
+import { flakyMarker } from "./flaky-tickets.js";
 import { FINAL_MERGE_HANDOFF_MARKER, MERGE_RESOLUTION_NOTE_MARKER, mergeResolutionComment } from "./merge-handoff.js";
 import { runReworkRouting } from "./reconcile.js";
 import { hashGateList, type VerifierGatePass } from "./verifier-gate-reuse.js";
@@ -689,6 +690,25 @@ export class MockGitHubClient implements DispatchClient {
       if (c.issueNumber === issueNumber) stream.push({ body: c.body });
     }
     return tallyFamilyComments(stream);
+  }
+
+  /** Open issues per label, for the flaky-test ticket lookup. */
+  openIssuesByLabel: Map<string, { number: number; body: string }[]> = new Map();
+  createdIssues: { title: string; body: string; labels: string[] }[] = [];
+  nextIssueNumber = 5000;
+
+  async listOpenIssuesWithLabel(label: string): Promise<{ number: number; body: string }[]> {
+    return [...(this.openIssuesByLabel.get(label) ?? [])];
+  }
+
+  async createIssue(title: string, body: string, labels: string[] = []): Promise<{ number: number; nodeId: string; url: string }> {
+    this.createdIssues.push({ title, body, labels });
+    const number = this.nextIssueNumber++;
+    return { number, nodeId: `node-${number}`, url: `https://example.test/${number}` };
+  }
+
+  async addItemToProject(issueNodeId: string): Promise<string> {
+    return `item-${issueNodeId}`;
   }
 }
 
@@ -10163,22 +10183,29 @@ describe("pre-verifier gates — failures already on main (#123)", () => {
     state?: string | null;
     exec?: Record<string, ExecHandler>;
     baseOutput?: string;
+    /** The same-tree re-run's stdout (#133). Unset reads as a missing file. */
+    rerunOutput?: string;
+    gateImpl?: (req: GateSpawnRequest) => GateSpawnOutcome;
   }) {
     return withStageSet("builder", () => withVerifierGates(opts.gates ?? `make check;${UI}`, () => withFormats("formats" in opts ? opts.formats : FORMATS, async () => {
       const fsMap: Record<string, string> = { [gateLog(n, 2)]: opts.uiOutput };
       if (opts.state !== null) fsMap[stateFile] = opts.state ?? sweepState();
-      const { deps, calls } = makeMockDeps({ execImpls: opts.exec ?? execs(), fsMap, gateImpl: uiRed });
+      const { deps, calls } = makeMockDeps({ execImpls: opts.exec ?? execs(), fsMap, gateImpl: opts.gateImpl ?? uiRed });
       const read = deps.readFileSync;
       deps.readFileSync = ((path: any, ...rest: any[]) =>
         /verifier-gate-base_#\d+\.log$/.test(String(path)) && opts.baseOutput !== undefined
           ? opts.baseOutput
-          : (read as any)(path, ...rest)) as typeof deps.readFileSync;
+          : /verifier-gate-rerun_#\d+\.log$/.test(String(path)) && opts.rerunOutput !== undefined
+            ? opts.rerunOutput
+            : (read as any)(path, ...rest)) as typeof deps.readFileSync;
       const { ctx, client } = makeTestContext({ agent: builderAgent("verifier"), item: { issueNumber: n }, deps, calls });
       const result = await maybeRunPreSpawnGates(ctx);
-      return { result, calls, client };
+      return { result, calls, client, ctx };
     })));
   }
-  const baseRuns = (calls: CallLog) => calls.gates.filter((g) => g.command.includes("--tests"));
+  const baseRuns = (calls: CallLog) => calls.gates.filter((g) => g.command.includes("--tests") && /verifier-gate-base-/.test(g.cwd));
+  /** Focused re-runs in the gated worktree itself (#133). */
+  const rerunRuns = (calls: CallLog) => calls.gates.filter((g) => g.command.includes("--tests") && !/verifier-gate-base-/.test(g.cwd));
 
   test("a red UI gate whose failures all failed in the ancestor main sweep spawns the verifier green, and the run ends without rework", async () => {
     await withStageSet("builder", () => withVerifierGates(`make check;${UI};make lint`, () => withFormats(FORMATS, async () => {
@@ -10192,7 +10219,12 @@ describe("pre-verifier gates — failures already on main (#123)", () => {
 
       await dispatchToAgent(builderAgent("verifier"), makeProjectItem({ issueNumber: 1747 }), client, deps);
 
-      assert.deepEqual(calls.gates.map((g) => g.command), ["make check", UI, "make lint"], "the gates after the excused one still run");
+      assert.deepEqual(
+        calls.gates.filter((g) => !g.command.includes("--tests")).map((g) => g.command),
+        ["make check", UI, "make lint"],
+        "the gates after the excused one still run",
+      );
+      assert.equal(rerunRuns(calls).length, 1, "the same-tree re-run (#133) comes first; unreadable here, so it excuses nothing");
       assert.equal(baseRuns(calls).length, 0, "every failure was matched by the sweep, so nothing re-runs on the base");
       assert.ok(calls.exec.some((e) => e.cmd.includes(`git merge-base --is-ancestor ${SWEEP_SHA} HEAD`)), "the sweep's commit is checked against the merged tree");
       assert.equal(calls.claudeStreams, 1);
@@ -10309,6 +10341,120 @@ describe("pre-verifier gates — failures already on main (#123)", () => {
     const { result, calls } = await runGates(1755, { uiOutput: "FAILURE: Build failed with an exception." });
     assert.match(result.promptNote, /TRIAGE MODE/);
     assert.ok(!calls.exec.some((e) => e.cmd.includes("merge-base")));
+  });
+
+  describe("same-tree re-run before the main checks (#133)", () => {
+    // 7 days to 2026-10-05: flakes caused 10 verifier FAILs on pyrycode-mobile
+    // and 3 on pyrycode-desktop, each a builder lap that changed nothing. A
+    // red gate's failures are now re-run once in the same worktree first; a
+    // name seen passing there is flaky, not the ticket's.
+    const noSweep = () => sweepState({ failures: { sha: SWEEP_SHA, names: [] } });
+    const skippedOnly = (name: string) => {
+      const [cls, method] = name.split("#");
+      return `<testsuite name="ui" tests="1" skipped="1"><testcase classname="${cls}" name="${method}"><skipped/></testcase></testsuite>`;
+    };
+
+    test("a red gate whose only failure passes on the re-run counts as green, is listed as flaky, gets a flaky ticket, and the next gate runs", async () => {
+      const { result, calls, client, ctx } = await runGates(1760, {
+        gates: `make check;${UI};make lint`,
+        uiOutput: junit([Z]),
+        state: noSweep(),
+        rerunOutput: junit([], [Z]),
+      });
+
+      assert.deepEqual(
+        calls.gates.filter((g) => !g.command.includes("--tests")).map((g) => g.command),
+        ["make check", UI, "make lint"],
+        "the gate after the excused one still runs",
+      );
+      const reruns = rerunRuns(calls);
+      assert.equal(reruns.length, 1);
+      assert.equal(reruns[0]!.command, `${UI} --tests '${Z}'`);
+      assert.equal(reruns[0]!.cwd, ctx.agentCwd, "the re-run is in the gated worktree itself");
+      assert.equal(baseRuns(calls).length, 0, "nothing is left for the base commit");
+
+      const note = result.promptNote;
+      assert.ok(!note.includes("TRIAGE MODE"));
+      assert.match(note, /count as green for your verdict/);
+      assert.match(note, /### Flaky failures, not this ticket's/);
+      assert.ok(note.includes(`- \`${Z}\`, gate \`${UI}\``));
+      assert.ok(!note.includes("Failures already on main"));
+
+      assert.equal(client.createdIssues.length, 1, "recordFlakyTests filed one ticket for the flaky name");
+      const filed = client.createdIssues[0]!;
+      assert.ok(filed.labels.includes("flaky-test"));
+      assert.ok(filed.body.includes(flakyMarker(Z)));
+      assert.ok(filed.body.includes(`\`${UI}\``), "the ticket names the gate command");
+      assert.ok(filed.body.includes(gateLog(1760, 2)), "and its log");
+      assert.match(loggedText(calls), /1 failing test\(s\) passed on a same-tree re-run, so it counts as green/);
+      assert.ok(
+        !calls.fs.some((f) => f.kind === "write" && f.path.endsWith("verifier-gate_#1760.pass.json")),
+        "an excused gate is not a full pass, so nothing is recorded for reuse",
+      );
+    });
+
+    test("a name that fails again on the re-run goes on to the sweep and base checks, and stays the ticket's when neither excuses it", async () => {
+      const { result, calls, client } = await runGates(1761, {
+        uiOutput: junit([X, W]),
+        rerunOutput: junit([X, W]),
+        baseOutput: junit([], [W]),
+      });
+
+      assert.equal(rerunRuns(calls)[0]!.command, `${UI} --tests '${X},${W}'`);
+      const base = baseRuns(calls);
+      assert.equal(base.length, 1, "W, not in the sweep, is re-run on the base");
+      assert.equal(base[0]!.command, `${UI} --tests '${W}'`);
+
+      const note = result.promptNote;
+      assert.match(note, /TRIAGE MODE/);
+      assert.ok(note.includes(`\`${X}\` (failed in the main sweep`));
+      assert.match(note, new RegExp(`Judge only these remaining failures[^]*- \`${W}\``));
+      assert.ok(!note.includes("Flaky failures"));
+      assert.equal(client.createdIssues.length, 0, "no flaky ticket");
+    });
+
+    test("a flaky name and a baseline name together count as green, and the note lists both", async () => {
+      const { result, client } = await runGates(1762, {
+        uiOutput: junit([X, Z]),
+        rerunOutput: junit([X], [Z]),
+      });
+
+      const note = result.promptNote;
+      assert.ok(!note.includes("TRIAGE MODE"));
+      assert.match(note, /count as green for your verdict/);
+      assert.ok(note.includes(`\`${X}\` (failed in the main sweep`));
+      assert.match(note, /### Flaky failures, not this ticket's[^]*- `de\.pyryco\.mobile\.ui\.NewTest#broken`/);
+      assert.deepEqual(client.createdIssues.map((i) => i.body.includes(flakyMarker(Z))), [true], "only Z is flaky");
+    });
+
+    const unknown: [string, Partial<Parameters<typeof runGates>[1]>][] = [
+      ["executes nothing", { rerunOutput: skippedOnly(Z) }],
+      ["times out", {
+        rerunOutput: junit([], [Z]),
+        gateImpl: (req) => req.command === UI
+          ? { exitCode: 1, timedOut: false, spawnError: null }
+          : req.command.includes("--tests") && !/verifier-gate-base-/.test(req.cwd)
+            ? { exitCode: null, timedOut: true, spawnError: null }
+            : { exitCode: 0, timedOut: false, spawnError: null },
+      }],
+      ["cannot be read", { rerunOutput: "BUILD FAILED" }],
+      ["has no template", { formats: JSON.stringify({ [UI]: "junit-xml" }), rerunOutput: junit([], [Z]) }],
+    ];
+    for (const [label, over] of unknown) {
+      test(`a re-run that ${label} leaves every failure with the ticket`, async () => {
+        const { result, calls, client } = await runGates(1763, {
+          uiOutput: junit([Z]),
+          state: noSweep(),
+          baseOutput: junit([], [Z]),
+          ...over,
+        });
+        if (label === "has no template") assert.equal(rerunRuns(calls).length, 0, "nothing to re-run with");
+        assert.match(result.promptNote, /TRIAGE MODE/);
+        assert.ok(!result.promptNote.includes("Flaky failures"));
+        assert.match(result.promptNote, new RegExp(`Judge only these remaining failures[^]*- \`${Z}\``), "Z stays the ticket's");
+        assert.equal(client.createdIssues.length, 0);
+      });
+    }
   });
 });
 

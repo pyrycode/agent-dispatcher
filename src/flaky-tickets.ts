@@ -11,6 +11,10 @@
 // So each flaky test gets a ticket the first time, found again later by a
 // marker in its body, and each later flake adds a comment to it. The ticket
 // builds up a count and a list of runs instead of a pile of duplicates.
+//
+// The verifier gates re-run a red gate's failures the same way (#133) and
+// record their flakes on the same per-test tickets. A verifier gate run has
+// no GateRunReport, so it brings its own run lines.
 
 import type { GateRunReport } from "./gate-output.js";
 
@@ -42,6 +46,29 @@ export interface FlakyRunContext {
   at: string;
 }
 
+/** A pre-verifier gate run that saw a flake. */
+export interface VerifierGateRun {
+  /** The gate command, as configured. */
+  gate: string;
+  /** The gated worktree's merged HEAD, or null when it could not be read. */
+  commit: string | null;
+  /** The gate's own stdout log. */
+  outputPath: string;
+  /** The same-tree re-run's stdout log. */
+  rerunOutputPath: string;
+}
+
+export interface VerifierGateFlakyContext {
+  /** The ticket whose verifier gate saw the flake. */
+  gatedIssue: number;
+  verifierGate: VerifierGateRun;
+  /** ISO timestamp of the run, for the ticket text. */
+  at: string;
+}
+
+/** Either gate's run: the real-claude gate's report, or a verifier gate's own lines. */
+export type FlakyTicketContext = FlakyRunContext | VerifierGateFlakyContext;
+
 export interface FlakyTicketResult {
   filed: { name: string; issue: number }[];
   commented: { name: string; issue: number }[];
@@ -72,7 +99,16 @@ export function shortTestName(name: string): string {
   return go?.index === undefined ? name : name.slice(go.index + 1);
 }
 
-function runLines(ctx: FlakyRunContext): string[] {
+function runLines(ctx: FlakyTicketContext): string[] {
+  if ("verifierGate" in ctx) {
+    const g = ctx.verifierGate;
+    const at = g.commit === null ? "in its merged worktree" : `on merged commit \`${g.commit.slice(0, 10)}\``;
+    return [
+      `- Verifier gate run for #${ctx.gatedIssue} at ${ctx.at}`,
+      `- Gate \`${g.gate}\` ${at}`,
+      `- Full output: \`${g.outputPath}\`, re-run output: \`${g.rerunOutputPath}\``,
+    ];
+  }
   const r = ctx.report;
   return [
     `- Gate run for #${ctx.gatedIssue} at ${ctx.at}`,
@@ -81,17 +117,22 @@ function runLines(ctx: FlakyRunContext): string[] {
   ];
 }
 
-export function buildFlakyTestIssue(name: string, ctx: FlakyRunContext): { title: string; body: string } {
+export function buildFlakyTestIssue(name: string, ctx: FlakyTicketContext): { title: string; body: string } {
+  const verifier = "verifierGate" in ctx;
   const body = [
     "## User Story",
     "",
-    `As the maintainer, I want \`${name}\` to pass reliably in the live gate, so that its flakes stop costing ` +
-      "re-runs and cannot hide a real failure.",
+    `As the maintainer, I want \`${name}\` to pass reliably in the ${verifier ? "verifier gates" : "live gate"}, ` +
+      "so that its flakes stop costing re-runs and cannot hide a real failure.",
     "",
     "## Context",
     "",
-    "The real-claude gate saw this test fail, then pass when re-run on the same merged tree. The gated ticket " +
-      "went through, because the failure was not its branch's. The dispatcher filed this ticket and adds a " +
+    (verifier
+      ? `A verifier gate saw this test fail, then pass when re-run in the same worktree. The gated ticket was ` +
+        "not blamed for it, because the failure was not its branch's."
+      : "The real-claude gate saw this test fail, then pass when re-run on the same merged tree. The gated ticket " +
+        "went through, because the failure was not its branch's.") +
+      " The dispatcher filed this ticket and adds a " +
       "comment here each time the test flakes again, so the comments are the occurrence count.",
     "",
     "First seen:",
@@ -106,10 +147,10 @@ export function buildFlakyTestIssue(name: string, ctx: FlakyRunContext): { title
     "",
     flakyMarker(name),
   ].join("\n");
-  return { title: `flaky live test: ${shortTestName(name)}`, body };
+  return { title: `flaky ${verifier ? "" : "live "}test: ${shortTestName(name)}`, body };
 }
 
-export function buildFlakyRecurrenceComment(name: string, ctx: FlakyRunContext): string {
+export function buildFlakyRecurrenceComment(name: string, ctx: FlakyTicketContext): string {
   return [
     `## Flaked again`,
     "",
@@ -127,7 +168,7 @@ export function buildFlakyRecurrenceComment(name: string, ctx: FlakyRunContext):
 export async function recordFlakyTests(
   client: FlakyTicketClient,
   flaky: readonly string[],
-  ctx: FlakyRunContext,
+  ctx: FlakyTicketContext,
 ): Promise<FlakyTicketResult> {
   const result: FlakyTicketResult = { filed: [], commented: [], untracked: [] };
   const names = [...new Set(flaky)];
