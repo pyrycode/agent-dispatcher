@@ -124,3 +124,39 @@ export class DispatchPool {
     await Promise.allSettled([...this.running.values()]);
   }
 }
+
+/**
+ * The cycle's last step before agents start: prepare the board for the
+ * selected candidates, then launch each one into the pool. Returns how many
+ * were launched.
+ *
+ * Launches nothing once the dispatcher is draining. The loop's own drain
+ * check sits at the top of a cycle, and a cycle spends many seconds on
+ * board upkeep before it selects, so a stop signal landing in between used
+ * to start a fresh run anyway: builder#1724 on the desktop board on
+ * 2026-10-05, eight seconds after the signal. The check comes before the
+ * board writes, so a skipped candidate keeps its labels and is picked up as
+ * before after the restart. A signal arriving during those writes, a few
+ * seconds at most, still lets the run start; the drain then waits for it.
+ */
+export async function launchCandidates<C extends { agent: { name: string }; item: { issueNumber: number } }>(opts: {
+  candidates: readonly C[];
+  pool: Pick<DispatchPool, "launch">;
+  /** True once the dispatcher got its stop signal. */
+  draining: () => boolean;
+  /** Board writes that claim the candidates, such as the running label. */
+  prep: (candidates: readonly C[]) => Promise<void>;
+  run: (candidate: C) => Promise<unknown>;
+}): Promise<number> {
+  const { candidates, pool, prep, run } = opts;
+  if (candidates.length === 0) return 0;
+  if (opts.draining()) {
+    console.log(`   🚦 Drain: not starting ${candidates.map((c) => candidateKey(c.agent.name, c.item.issueNumber)).join(", ")}`);
+    return 0;
+  }
+  await prep(candidates);
+  for (const c of candidates) {
+    pool.launch(candidateKey(c.agent.name, c.item.issueNumber), () => run(c));
+  }
+  return candidates.length;
+}

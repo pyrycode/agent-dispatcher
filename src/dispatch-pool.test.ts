@@ -1,7 +1,7 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 
-import { DEFAULT_POLL_INTERVAL_MS, DispatchPool, candidateKey, excludeInFlight, freeSeats, resolvePollIntervalMs } from "./dispatch-pool.js";
+import { DEFAULT_POLL_INTERVAL_MS, DispatchPool, candidateKey, excludeInFlight, freeSeats, launchCandidates, resolvePollIntervalMs } from "./dispatch-pool.js";
 
 function deferred<T = void>() {
   let resolve!: (v: T) => void;
@@ -101,5 +101,57 @@ describe("dispatch pool — seats refill as runs settle (2026-09-22)", () => {
     pool.launch("builder#7", () => never.promise);
     assert.throws(() => pool.launch("builder#7", () => never.promise), /already in flight/);
     never.resolve();
+  });
+});
+
+describe("launchCandidates — no new run once draining (2026-10-05)", () => {
+  const builder = { agent: { name: "builder" }, item: { issueNumber: 1724 } };
+
+  // Desktop board on pyrybox, 2026-10-05: the stop signal landed at
+  // 21:49:52 while a cycle was already past its top-of-loop drain check.
+  // Eight seconds later that cycle selected a builder rework and started
+  // it beside the one run still in flight.
+  test("a stop signal that arrives mid-cycle launches nothing and leaves the board untouched", async () => {
+    const pool = new DispatchPool();
+    const inFlight = deferred();
+    pool.launch("verifier#1700", () => inFlight.promise);
+
+    let prepped = 0;
+    let ran = 0;
+    const launched = await launchCandidates({
+      candidates: [builder],
+      pool,
+      draining: () => true,
+      prep: async () => { prepped++; },
+      run: async () => { ran++; },
+    });
+    await tick();
+
+    assert.equal(launched, 0);
+    assert.equal(prepped, 0, "no running label or family counter is written for a run that will not start");
+    assert.equal(ran, 0);
+    assert.deepEqual([...pool.keys()], ["verifier#1700"], "only the run already in flight stays");
+    inFlight.resolve();
+    await pool.drain();
+  });
+
+  test("without a stop signal every candidate is prepared and launched", async () => {
+    const pool = new DispatchPool();
+    const runs = [deferred(), deferred()];
+    const candidates = [builder, { agent: { name: "verifier" }, item: { issueNumber: 1725 } }];
+    const prepared: number[] = [];
+    const launched = await launchCandidates({
+      candidates,
+      pool,
+      draining: () => false,
+      prep: async (cs) => { prepared.push(...cs.map((c) => c.item.issueNumber)); },
+      run: (c) => runs[candidates.indexOf(c)]!.promise,
+    });
+
+    assert.equal(launched, 2);
+    assert.deepEqual(prepared, [1724, 1725]);
+    assert.deepEqual([...pool.keys()], ["builder#1724", "verifier#1725"]);
+    for (const r of runs) r.resolve();
+    await pool.drain();
   });
 });

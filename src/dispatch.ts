@@ -5,7 +5,7 @@ import { resolve, dirname, basename } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { config } from "dotenv";
-import { DispatchPool, candidateKey, excludeInFlight, freeSeats, resolvePollIntervalMs } from "./dispatch-pool.js";
+import { DispatchPool, excludeInFlight, freeSeats, launchCandidates, resolvePollIntervalMs } from "./dispatch-pool.js";
 import { countVerdictsSince, parseVerdictArtifacts, pickVerdictPr, shouldFlagMissingVerdict } from "./verdict-guard.js";
 import { countOpenPrs, shouldFlagMissingPr } from "./pr-guard.js";
 import { PENDING_VERDICT_PREFIX, REREVIEW_PATCH_CAP, decideVerdictRecovery, extractVerdictFindings, reworkFindingsNote, handoffMarker, isVerdictPublishFailure, parseLastVerdict, parsePendingVerdictState, parsePrVerdictView, parseVerdictHandoff, reReviewNote, serializeLastVerdict, serializePendingVerdictState, verdictHandoffNote, type HandoffParse, type PendingVerdictState, type VerdictHandoff, type VerdictPrLookup } from "./verdict-handoff.js";
@@ -9153,20 +9153,24 @@ export async function pollLoop(): Promise<void> {
       await notifyDiscord(`📭 **${process.env.GITHUB_REPO}**: no tickets left to dispatch. Everything is done, blocked, or parked for review.`);
     }
 
-    if (candidates.length > 0) {
+    if (candidates.length > 0 && !drainMode) {
       console.log(`   🚦 Dispatching ${candidates.length} agent(s) this cycle (${pool.size} in flight, cap ${MAX_CONCURRENT}): ${candidates.map(c => `${c.agent.name}#${c.item.issueNumber}`).join(", ")}`);
     }
 
     // Pre-dispatch mutations + concurrent dispatch — both extracted to
     // testable helpers below pollLoop. See `runPreDispatchPrep` and
     // `runConcurrentDispatches` for invariants.
-    await runPreDispatchPrep(candidates, client, { tallies: familyTallies, rootLabelsByIssue });
     // Launch without awaiting: each run is its own pool entry and frees its
     // seat the moment it settles. The driver keeps its per-run isolation and
-    // wip cleanup; the pool only watches for the end.
-    for (const c of candidates) {
-      pool.launch(candidateKey(c.agent.name, c.item.issueNumber), () => runConcurrentDispatches([c], client));
-    }
+    // wip cleanup; the pool only watches for the end. Nothing launches once
+    // a stop signal has arrived, even mid-cycle; see `launchCandidates`.
+    await launchCandidates({
+      candidates,
+      pool,
+      draining: () => drainMode,
+      prep: (cs) => runPreDispatchPrep(cs, client, { tallies: familyTallies, rootLabelsByIssue }),
+      run: (c) => runConcurrentDispatches([c], client),
+    });
 
     // Drop the snapshot the agents just invalidated.
     //
