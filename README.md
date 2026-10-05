@@ -466,6 +466,10 @@ salvages the blocked run's work: when that run left uncommitted edits or unpushe
 commits, the retry continues from them in the same worktree (see "Reusing the
 agent's own preserved worktree" above).
 
+A Codex turn that fails with "Selected model is at capacity. Please try a different
+model." takes the capped API retry, like "Unable to verify model access right
+now". Five mobile tickets parked on it on 2026-10-05.
+
 A builder may instead return `status: needs_refinement` for a planning problem.
 The dispatcher posts its explanation on the assigned issue and adds
 `needs-rework:refiner`. The existing rework router moves it back to refinement.

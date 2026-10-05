@@ -242,7 +242,12 @@ export class CodexStreamAdapter {
     // Codex reports this temporary access-check outage as a generic failed turn.
     // Map the observed server failure to the existing capped API retry path.
     // A disconnect alone can also mean permanent model denial, so keep it narrow.
-    const temporaryModelAccessFailure = this.failed && /^stream disconnected before completion: Unable to verify model access right now\.\s*Please retry\.?$/i.test(this.errorText.trim());
+    // "Selected model is at capacity" is the same kind of temporary outage:
+    // five pyrycode-mobile tickets parked on it on 2026-10-05, and a plain
+    // retry minutes later cleared it (#120). Anchored to the full message.
+    const temporaryModelAccessFailure = this.failed && (
+      /^stream disconnected before completion: Unable to verify model access right now\.\s*Please retry\.?$/i.test(this.errorText.trim())
+      || /^Selected model is at capacity\.\s*Please try a different model\.?$/i.test(this.errorText.trim()));
     // The stall is the cause even when the wall clock also fired meanwhile.
     const terminalReason = blocked ? "codex_blocked" : idleStalled ? IDLE_STALL_REASON : timedOut ? "timeout"
       : isError ? (temporaryModelAccessFailure ? "api_error" : "codex_error")

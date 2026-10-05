@@ -8,6 +8,7 @@ import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  handleAgentResultErrors,
   handleDispatchError,
   holdBackoffWaiters,
   DEFAULT_DEPS,
@@ -17,6 +18,7 @@ import {
 } from "./dispatch.js";
 import { ResourceExhaustedError } from "./agent-runtime.js";
 import { CodexStreamAdapter } from "./agent-runner.js";
+import { classifyAgentError, RETRY_MAX_ATTEMPTS } from "./pipeline-decisions.js";
 import { AGENTS, type ProjectItem } from "./types.js";
 
 const RETRY_MARKER = "<!-- pyry-auto-retry -->";
@@ -441,5 +443,94 @@ describe("Codex temporary model-access failure, desktop #1351", () => {
     adapter.accept({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ status: "completed", summary: "Finished" }) } });
     adapter.accept({ type: "turn.completed", usage: {} });
     assert.equal(adapter.finish(0, false, 43000).isError, false);
+  });
+});
+
+// pyrycode-mobile, 2026-10-05: five tickets (#1588, #1727, #1603, #1674,
+// #1761) parked on Codex's "Selected model is at capacity" failed turn, which
+// a plain retry minutes later clears. It now takes the capped API retry.
+describe("Codex model at capacity (#120)", () => {
+  const capacity = "Selected model is at capacity. Please try a different model.";
+
+  function capacityRun(): StreamResult {
+    const adapter = new CodexStreamAdapter();
+    adapter.accept({ type: "thread.started", thread_id: "mobile-1603" });
+    adapter.accept({ type: "turn.started" });
+    adapter.accept({ type: "turn.failed", error: { message: capacity } });
+    return adapter.finish(1, false, 16 * 60_000);
+  }
+
+  // The error the dispatcher really hands to handleDispatchError for a failed
+  // Codex turn, built by the same code path.
+  async function dispatchError(result: StreamResult, ctx: DispatchContext): Promise<Error> {
+    try {
+      await handleAgentResultErrors(result, ctx);
+    } catch (e) {
+      return e as Error;
+    }
+    throw new Error("expected handleAgentResultErrors to throw");
+  }
+
+  test("a failed turn with the capacity message finishes as api_error and classifies transient", () => {
+    const result = capacityRun();
+    assert.equal(result.isError, true);
+    assert.equal(result.terminalReason, "api_error");
+    assert.equal(result.output, capacity);
+    assert.equal(classifyAgentError(result.output, { terminalReason: result.terminalReason }).transient, true);
+  });
+
+  test("the dispatch schedules the capped retry: counter, auto-retry comment, no error label or Agent Error comment", async () => {
+    const result = capacityRun();
+    const client = new FakeClient();
+    const discord: string[] = [];
+    const ctx = makeCtx(makeItem({ issueNumber: 1603 }), client, discord);
+    await handleDispatchError(await dispatchError(result, ctx), ctx, result);
+    assert.ok(client.labels().includes("error-retry-count:1"));
+    assert.ok(client.comments.some(c => c.body.includes(RETRY_MARKER)), "auto-retry comment");
+    assert.ok(!client.labels().includes("error:developer"));
+    assert.ok(!client.comments.some(c => /Agent Error/.test(c.body)));
+    assert.ok(discord.some(m => m.includes(`auto-retry 1/${RETRY_MAX_ATTEMPTS}`)));
+  });
+
+  test("capacity text inside a blocked summary parks, never this path", async () => {
+    const adapter = new CodexStreamAdapter();
+    adapter.accept({ type: "turn.started" });
+    adapter.accept({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ status: "blocked", summary: capacity }) } });
+    adapter.accept({ type: "turn.completed", usage: {} });
+    const result = adapter.finish(0, false, 1000);
+    assert.equal(result.terminalReason, "codex_blocked");
+    const client = new FakeClient();
+    const ctx = makeCtx(makeItem({ issueNumber: 1761 }), client, []);
+    await handleDispatchError(await dispatchError(result, ctx), ctx, result);
+    assert.ok(client.labels().includes("error:developer"));
+    assert.ok(!client.labels().some(l => l.startsWith("error-retry-count:")));
+  });
+
+  test("capacity text as agent message text with a successful turn is a success", () => {
+    const adapter = new CodexStreamAdapter();
+    adapter.accept({ type: "turn.started" });
+    adapter.accept({ type: "item.completed", item: { type: "agent_message", text: capacity } });
+    adapter.accept({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ status: "completed", summary: "Done" }) } });
+    adapter.accept({ type: "turn.completed", usage: {} });
+    const result = adapter.finish(0, false, 1000);
+    assert.equal(result.isError, false);
+    assert.equal(result.terminalReason, "stop");
+  });
+
+  test("the capacity text with extra words around it is not matched", () => {
+    const adapter = new CodexStreamAdapter();
+    adapter.accept({ type: "turn.started" });
+    adapter.accept({ type: "turn.failed", error: { message: `Model denied. ${capacity}` } });
+    assert.equal(adapter.finish(1, false, 1000).terminalReason, "codex_error");
+  });
+
+  test(`after ${RETRY_MAX_ATTEMPTS} capacity failures the ticket parks as today`, async () => {
+    const result = capacityRun();
+    const client = new FakeClient();
+    const ctx = makeCtx(makeItem({ issueNumber: 1674, labels: [`error-retry-count:${RETRY_MAX_ATTEMPTS}`] }), client, []);
+    await handleDispatchError(await dispatchError(result, ctx), ctx, result);
+    assert.ok(client.labels().includes("error:developer"));
+    assert.ok(client.comments.some(c => c.body.includes("Transient retries exhausted")));
+    assert.ok(!client.labels().some(l => l.startsWith("error-retry-count:")));
   });
 });
