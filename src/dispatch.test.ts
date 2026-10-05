@@ -1457,6 +1457,239 @@ describe("setupBranchAndWorktree — coverage edges", () => {
   });
 });
 
+// pyrycode-mobile #1603 and #1727, 2026-10-05: a run stopped with work left
+// in its own worktree, and the next run on the ticket failed with "Failed to
+// create git worktree" until a person committed the leftovers. The next run
+// now continues in that worktree when it is the agent's own.
+describe("setupBranchAndWorktree — reusing the agent's own preserved worktree", () => {
+  const builder = { name: "builder", column: "In Development", claudeMdPath: "builder/CLAUDE.md" };
+  const probe = (n: number, agent: Partial<AgentConfig> = {}) =>
+    makeTestContext({ item: { issueNumber: n }, agent }).ctx.worktreeDir;
+  const dirtyRefusal = (path: string) => () =>
+    execError({ stderr: `fatal: '${path}' contains modified or untracked files, use --force to delete it` });
+  const porcelainFor = (path: string, branch: string, extra = "") => () =>
+    `worktree ${path}\nHEAD abc\nbranch refs/heads/${branch}\n${extra}\n`;
+  // Real git refuses to add a worktree whose branch is checked out elsewhere.
+  const addRefused = (path: string) => () =>
+    execError({ stderr: `fatal: 'feature/x' is already used by worktree at '${path}'` });
+  function synced(n: number): Record<string, ExecHandler> {
+    return {
+      [`git rev-parse --verify feature/${n}`]: () => "",
+      [`git rev-parse --verify origin/feature/${n}`]: () => "",
+      [`git rev-parse origin/feature/${n}`]: () => "synced\n",
+      [`git rev-parse feature/${n}`]: () => "synced\n",
+    };
+  }
+  function strictlyAhead(n: number): Record<string, ExecHandler> {
+    return {
+      [`git rev-parse --verify feature/${n}`]: () => "",
+      [`git rev-parse --verify origin/feature/${n}`]: () => "",
+      [`git rev-parse origin/feature/${n}`]: () => "origin-sha\n",
+      [`git rev-parse feature/${n}`]: () => "local-sha\n",
+      [`git merge-base --is-ancestor feature/${n} origin/feature/${n}`]: () => execError({ stderr: "" }),
+    };
+  }
+  const wipCommits = (calls: CallLog) =>
+    calls.spawn.filter(c => c.cmd === "git" && c.args[0] === "commit");
+  const errorComments = (client: MockGitHubClient) =>
+    client.comments.filter(c => /Dispatch Error/.test(c.body));
+
+  test("own path, branch in sync, uncommitted changes → one wip commit before the pre-run merge, a comment names it, no error", async () => {
+    const own = probe(1603, builder);
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 1603 },
+      agent: builder,
+      mockOptions: {
+        execImpls: {
+          ...synced(1603),
+          [`git worktree remove "${own}"`]: dirtyRefusal(own),
+          "git worktree list --porcelain": porcelainFor(own, "feature/1603"),
+          "git status --porcelain": () => " M app/Foo.kt\n?? app/Bar.kt\n",
+          "git rev-parse --short HEAD": () => "fc640d1\n",
+          "git worktree add": addRefused(own),
+        },
+      },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: true });
+    assert.deepEqual(client.addLabelCalls, [], "no error:<agent> label");
+    assert.deepEqual(errorComments(client), [], "no Dispatch Error comment");
+    assert.ok(!calls.exec.some(c => c.cmd.includes("git worktree add")), "the held worktree is reused, not re-added");
+    assert.ok(!calls.exec.some(c => c.cmd.includes("--force")), "never force-removed");
+
+    const commits = wipCommits(calls);
+    assert.equal(commits.length, 1, "exactly one commit");
+    assert.equal(commits[0]!.opts?.cwd, ctx.worktreeDir);
+    assert.ok(commits[0]!.args.includes("wip(builder): partial work from an interrupted run (#1603)"));
+    const addIdx = calls.exec.findIndex(c => c.cmd === "git add -A" && c.opts?.cwd === ctx.worktreeDir);
+    assert.ok(addIdx >= 0, "the leftovers are staged in the worktree");
+
+    // The commit lands before the pre-run merge of main.
+    const commitAt = calls.exec.findIndex(c => c.cmd === "git rev-parse --short HEAD");
+    const mergeAt = calls.exec.findIndex(c => c.cmd.includes("merge main --no-edit"));
+    assert.ok(addIdx < mergeAt && commitAt < mergeAt, "wip commit before the pre-run merge");
+    assert.equal(calls.exec[mergeAt]!.opts?.cwd, ctx.worktreeDir);
+    // Pushed with the run's normal pushes, never on its own.
+    assert.ok(!calls.exec.slice(0, mergeAt).some(c => c.cmd.startsWith("git push")), "no separate push of the wip commit");
+
+    const notes = client.comments.filter(c => /fc640d1/.test(c.body));
+    assert.equal(notes.length, 1, "one comment names the commit");
+    assert.match(notes[0]!.body, /continues from/);
+  });
+
+  test("own path, clean, local commits ahead of origin → reused without a new commit, no integrity abort", async () => {
+    const own = probe(1727);
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 1727 },
+      mockOptions: {
+        execImpls: {
+          ...strictlyAhead(1727),
+          "git worktree list --porcelain": porcelainFor(own, "feature/1727"),
+          "git worktree add": addRefused(own),
+        },
+      },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: true });
+    assert.deepEqual(client.addLabelCalls, []);
+    assert.deepEqual(errorComments(client), []);
+    assert.equal(wipCommits(calls).length, 0, "nothing to commit");
+    assert.ok(!calls.exec.some(c => c.cmd === `git worktree remove "${own}"`), "the own worktree is kept for reuse");
+    assert.ok(!calls.exec.some(c => c.cmd.includes("git worktree add")));
+    assert.ok(calls.exec.some(c => c.cmd.includes("merge main --no-edit") && c.opts?.cwd === own), "the normal pre-run merge runs in it");
+  });
+
+  test("own path, dirty, local commits ahead of origin → reused, leftovers committed", async () => {
+    const own = probe(1728);
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 1728 },
+      mockOptions: {
+        execImpls: {
+          ...strictlyAhead(1728),
+          "git worktree list --porcelain": porcelainFor(own, "feature/1728"),
+          "git status --porcelain": () => " M a.kt\n",
+          "git worktree add": addRefused(own),
+        },
+      },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: true });
+    assert.deepEqual(client.addLabelCalls, []);
+    assert.equal(wipCommits(calls).length, 1);
+    assert.ok(ctx.worktreeDir === own);
+  });
+
+  test("a different path holds the branch → fails exactly as today, naming it", async () => {
+    const other = "/tmp/.pyrycode-worktrees/repo/verifier-1604";
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 1604 },
+      mockOptions: {
+        execImpls: {
+          ...synced(1604),
+          "git worktree list --porcelain": porcelainFor(other, "feature/1604"),
+          [`git worktree remove "${other}"`]: dirtyRefusal(other),
+          "git status --porcelain": () => " M a.kt\n",
+          "git worktree add": addRefused(other),
+        },
+      },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: false });
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1604, label: "error:developer" }]);
+    assert.equal(client.comments.length, 1);
+    assert.match(client.comments[0]!.body, /Failed to create git worktree/);
+    assert.ok(client.comments[0]!.body.includes(`- \`${other}\` has uncommitted changes`));
+    assert.equal(wipCommits(calls).length, 0);
+  });
+
+  test("own path on a different branch → fails exactly as today", async () => {
+    const own = probe(1605);
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 1605 },
+      mockOptions: {
+        execImpls: {
+          ...synced(1605),
+          [`git worktree remove "${own}"`]: dirtyRefusal(own),
+          "git worktree list --porcelain": porcelainFor(own, "feature/9999"),
+          "git status --porcelain": () => " M a.kt\n",
+          "git worktree add": () => execError({ stderr: `fatal: '${own}' already exists` }),
+        },
+      },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: false });
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1605, label: "error:developer" }]);
+    assert.match(client.comments[0]!.body, /Failed to create git worktree/);
+    assert.equal(wipCommits(calls).length, 0);
+  });
+
+  for (const state of ["MERGE_HEAD", "rebase-merge"]) {
+    test(`own path with ${state} in progress → fails exactly as today, naming it`, async () => {
+      const own = probe(1606);
+      const gitDir = "/tmp/repo/.git/worktrees/developer-1606";
+      const { ctx, client, calls } = makeTestContext({
+        item: { issueNumber: 1606 },
+        mockOptions: {
+          execImpls: {
+            ...synced(1606),
+            [`git worktree remove "${own}"`]: dirtyRefusal(own),
+            "git worktree list --porcelain": porcelainFor(own, "feature/1606"),
+            "git status --porcelain": () => "UU a.kt\n",
+            "git rev-parse --git-path": () =>
+              ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"].map(p => `${gitDir}/${p}`).join("\n") + "\n",
+            "git worktree add": addRefused(own),
+          },
+          fsMap: { [`${gitDir}/${state}`]: "" },
+        },
+      });
+
+      const result = await setupBranchAndWorktree(ctx);
+
+      assert.deepEqual(result, { ok: false });
+      assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1606, label: "error:developer" }]);
+      assert.equal(client.comments.length, 1);
+      assert.match(client.comments[0]!.body, /Failed to create git worktree/);
+      assert.ok(client.comments[0]!.body.includes(`- \`${own}\` has uncommitted changes`));
+      assert.equal(wipCommits(calls).length, 0);
+      assert.ok(!calls.exec.some(c => c.cmd === "git add -A"), "nothing staged");
+    });
+  }
+
+  test("own path held but the wip commit fails → parks with the commit error, nothing discarded", async () => {
+    const own = probe(1607);
+    const { ctx, client, calls } = makeTestContext({
+      item: { issueNumber: 1607 },
+      mockOptions: {
+        execImpls: {
+          ...synced(1607),
+          [`git worktree remove "${own}"`]: dirtyRefusal(own),
+          "git worktree list --porcelain": porcelainFor(own, "feature/1607"),
+          "git status --porcelain": () => " M a.kt\n",
+        },
+        spawnImpls: { "git commit": () => ({ status: 1, stderr: "pre-commit hook failed" }) },
+      },
+    });
+
+    const result = await setupBranchAndWorktree(ctx);
+
+    assert.deepEqual(result, { ok: false });
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1607, label: "error:developer" }]);
+    assert.match(client.comments[0]!.body, /pre-commit hook failed/);
+    assert.ok(!calls.exec.some(c => c.cmd.includes("merge main --no-edit")), "no merge over uncommitted leftovers");
+    assert.ok(!calls.exec.some(c => /--force|reset --hard|checkout -- |git clean/.test(c.cmd)));
+  });
+});
+
 // pyrycode-mobile #1340, 2026-10-02: the verifier crashed after the pre-run
 // merge of main, the merge commit was only ever pushed at the end of a run,
 // and the next dispatch refused with abort-local-strictly-ahead. The merge is

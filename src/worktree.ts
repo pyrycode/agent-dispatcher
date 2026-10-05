@@ -263,6 +263,77 @@ export function describeHeldWorktrees(branchName: string, held: HeldWorktree[]):
     `The dispatcher never force-removes a worktree, so nothing there was lost. Save or discard its changes, remove it, then retry.`;
 }
 
+/**
+ * True when the porcelain record for `path` carries a `locked` line, meaning
+ * someone ran `git worktree lock` on it on purpose.
+ */
+export function isWorktreeLocked(porcelainOutput: string, path: string): boolean {
+  let currentPath: string | null = null;
+  for (const rawLine of porcelainOutput.split("\n")) {
+    const line = rawLine.trimEnd();
+    if (line === "") { currentPath = null; continue; }
+    if (line.startsWith("worktree ")) { currentPath = line.slice("worktree ".length); continue; }
+    if (currentPath === path && (line === "locked" || line.startsWith("locked "))) return true;
+  }
+  return false;
+}
+
+/** The git state files that mean a merge, rebase, cherry-pick or revert is
+ *  unfinished. Read with `git rev-parse --git-path <name>` in the worktree. */
+export const IN_PROGRESS_GIT_PATHS = ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"] as const;
+
+export type OwnWorktreeReuse =
+  | { reuse: true; commitLeftovers: boolean }
+  | { reuse: false; reason: string };
+
+/**
+ * Decide whether the next run on a ticket may continue in the worktree its
+ * own previous run left behind, instead of failing to create a new one.
+ *
+ * Why. A run that stops with uncommitted work keeps its worktree: a blocked
+ * Codex run is preserved for recovery, and the cleanup never force-removes a
+ * dirty tree. The next run on the ticket then failed before the agent
+ * started, because the branch was still checked out there, and a person had
+ * to commit the leftovers by hand. pyrycode-mobile #1603 and #1727,
+ * 2026-10-05: in both, the held worktree was the dispatcher's own path for
+ * the same agent and ticket, on the same branch.
+ *
+ * Reuse only when all hold:
+ * - after the normal cleanup, the one worktree still holding the branch is
+ *   this agent's own path. Another role's worktree or a person's checkout
+ *   keeps today's refusal.
+ * - it is not locked, its status could be read, and no merge, rebase,
+ *   cherry-pick or revert is unfinished in it.
+ * - there is something to continue from: uncommitted changes, or local
+ *   commits origin lacks (`abort-local-strictly-ahead`). A diverged branch
+ *   or one origin moved ahead of keeps today's handling.
+ *
+ * `gitStatusOutput` is `git status --porcelain` in the worktree, or null
+ * when it could not be read. Pure; the caller does the I/O.
+ */
+export function decideOwnWorktreeReuse(opts: {
+  ownPath: string;
+  /** Worktrees still holding the branch after the cleanup. */
+  held: readonly HeldWorktree[];
+  branchAction: BranchSetupAction;
+  locked: boolean;
+  operationInProgress: boolean;
+  gitStatusOutput: string | null;
+}): OwnWorktreeReuse {
+  if (opts.held.length !== 1 || opts.held[0]!.path !== opts.ownPath) {
+    return { reuse: false, reason: "the branch is not held by this agent's own worktree alone" };
+  }
+  if (opts.locked) return { reuse: false, reason: "the worktree is locked" };
+  if (opts.gitStatusOutput === null) return { reuse: false, reason: "could not read the worktree's status" };
+  if (opts.operationInProgress) return { reuse: false, reason: "a merge, rebase, cherry-pick or revert is unfinished in it" };
+  const dirty = shouldAutoCommit(opts.gitStatusOutput);
+  if (opts.branchAction === "abort-local-strictly-ahead") return { reuse: true, commitLeftovers: dirty };
+  if (opts.branchAction === "reuse-local-no-remote" || opts.branchAction === "reuse-local-already-synced") {
+    return dirty ? { reuse: true, commitLeftovers: true } : { reuse: false, reason: "nothing to continue from" };
+  }
+  return { reuse: false, reason: `branch setup action ${opts.branchAction}` };
+}
+
 // --------- Path resolution ---------
 
 /**
