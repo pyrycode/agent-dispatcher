@@ -461,7 +461,17 @@ the dispatcher environment" on #1631. Checked against all 23 distinct blocked
 summaries in the Mobile, Desktop and pyrycode logs, it matched five: these three
 and two of the same kind. It matched none of the eighteen that need a person. A summary naming an approval, a human,
 a maintainer, a decision or a denied permission always parks, and so does any run
-where the approval reviewer rejected an action. The retry never discards or
+where the approval reviewer rejected an action.
+
+A block after Codex's approval reviewer failed to decide also retries, on the same
+backoff and cap. Codex says so in its own output, on stderr or in a tool item:
+"automatic approval review could not be completed. This is a review failure, not a
+determination that the action is unsafe" when the reviewer's model was at capacity
+(mobile #1582), or "The automatic permission approval review did not finish before
+its deadline" (mobile #1655). The dispatcher matches only that Codex output, never
+the agent's summary, which always mentions the approval. A genuine rejection, "This
+action was rejected due to unacceptable risk", still parks, even beside a reviewer
+failure. The retry never discards or
 salvages the blocked run's work: when that run left uncommitted edits or unpushed
 commits, the retry continues from them in the same worktree (see "Reusing the
 agent's own preserved worktree" above).

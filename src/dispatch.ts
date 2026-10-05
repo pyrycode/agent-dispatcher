@@ -534,6 +534,11 @@ export interface StreamResult {
    * `error:<agent>:permission_denied` label + tailored salvage comment.
    */
   hadPermissionDenial: boolean;
+  /** Codex only: its automatic approval reviewer failed to decide (its own
+   *  model at capacity, or its deadline passed) rather than rejecting. Set
+   *  from Codex's own output, never the agent's summary. A blocked run with
+   *  this set and no rejection retries (#121). */
+  approvalReviewFailed?: boolean;
   /** True when the run ended with no tool use after its most recent
    *  denial: the agent stopped there rather than carrying on. A clean
    *  exit with this set routes to the permission-denied path. */
@@ -2639,11 +2644,15 @@ export async function handleDispatchError(
     //
     // A blocked Codex run is the agent's own judgement, so the transport
     // allowlist never reads it. Only a stated missing tool, MCP server or
-    // environment variable retries (classifyBlockedRun, 2026-10-04); a
+    // environment variable retries (classifyBlockedRun, 2026-10-04), and so
+    // does a block after the approval reviewer failed to decide (#121); a
     // rejected action and every other block still park at once.
     const terminalReason = streamResult?.terminalReason ?? "";
     const { transient, signature } = terminalReason === "codex_blocked"
-      ? classifyBlockedRun(classifyText, { approvalRejected: streamResult?.hadPermissionDenial === true })
+      ? classifyBlockedRun(classifyText, {
+        approvalRejected: streamResult?.hadPermissionDenial === true,
+        approvalReviewFailed: streamResult?.approvalReviewFailed === true,
+      })
       : terminalReason === "needs_refinement"
         ? { transient: false, signature: "" }
         : classifyAgentError(classifyText, { terminalReason: streamResult?.terminalReason });
