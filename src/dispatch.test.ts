@@ -2243,16 +2243,22 @@ describe("decideRefinementMode", () => {
     }
   });
 
+  test("rework-other:N left by the router → rework (a route to the refiner counts there since #122)", () => {
+    assert.equal(decideRefinementMode("refiner", { issueNumber: 50, labels: ["size:M", "rework-other:1"] }), "rework");
+  });
+
   test("the labels a real route leaves behind read as rework", () => {
     // What the target sees after `decideReworkRoutes` + the counter bump:
-    // trigger and done:/wip:/error: trail stripped, counter added.
+    // trigger and done:/wip:/error: trail stripped, counter added. A route
+    // to the refiner is not the builder's rework, so it counts on
+    // rework-other (#122).
     const before = ["size:M", "done:refiner", "done:builder", "needs-rework:refiner"];
     const [route] = decideReworkRoutes(
       new Map([["refiner", "Backlog"], ["builder", "In Development"]]),
       new Map([["In Development", [{ id: "PVTI_1", issueNumber: 60, labels: before }]]]),
     );
-    const after = [...before.filter(l => !route.labelsToStrip.includes(l)), "rework-count:1"];
-    assert.deepEqual(after, ["size:M", "rework-count:1"]);
+    const after = [...before.filter(l => !route.labelsToStrip.includes(l)), "rework-other:1"];
+    assert.deepEqual(after, ["size:M", "rework-other:1"]);
     assert.equal(decideRefinementMode("refiner", { issueNumber: 60, labels: after }), "rework");
   });
 
@@ -2317,6 +2323,13 @@ describe("buildModeSection", () => {
       "\n## Mode\nrework — existing ticket routed back (ticket carries `rework-count:2`). " +
         "Read the previous agent comments above for the rework reason.",
     );
+  });
+
+  test("rework cites every counter the ticket carries", () => {
+    const section = buildModeSection(refiner, { issueNumber: 83, labels: ["rework-other:1"] }, true);
+    assert.match(section!, /^\n## Mode\nrework — existing ticket routed back \(ticket carries `rework-other:1`\)\./);
+    const both = buildModeSection(refiner, { issueNumber: 84, labels: ["rework-count:2", "rework-other:1"] }, true);
+    assert.match(both!, /\(ticket carries `rework-count:2`, `rework-other:1`\)/);
   });
 
   test("rework without comments does not point at a section that is not there", () => {
