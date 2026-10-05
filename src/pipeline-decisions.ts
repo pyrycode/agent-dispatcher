@@ -2334,15 +2334,25 @@ export const BLOCKED_NEVER_RETRY = /\bapproval\b|unacceptable risk|permission de
  * errors. A tool that stays missing parks at the cap, as before, about 75
  * minutes later instead of at once.
  *
+ * One more kind retries: Codex's automatic approval reviewer failed to
+ * decide, because its own model was at capacity or it missed its deadline,
+ * and Codex said this is not a rejection (`approvalReviewFailed`,
+ * pyrycode-mobile #1582 and #1655, 2026-10-05). A rejection alongside it
+ * still parks.
+ *
  * Separate from `classifyAgentError` because a blocked summary is the agent's
  * own prose. The transport allowlist must never read it: a blocked summary
  * mentioning "connection reset" is still a block (see dispatch.test.ts).
  */
 export function classifyBlockedRun(
   text: string | null | undefined,
-  opts?: { approvalRejected?: boolean },
+  opts?: { approvalRejected?: boolean; approvalReviewFailed?: boolean },
 ): { transient: boolean; signature: string } {
-  if (!text || opts?.approvalRejected) return { transient: false, signature: "" };
+  if (opts?.approvalRejected) return { transient: false, signature: "" };
+  // Before BLOCKED_NEVER_RETRY: the summary of such a block always says
+  // "approval". The flag comes from Codex's own words, not the summary.
+  if (opts?.approvalReviewFailed) return { transient: true, signature: "approval review failed" };
+  if (!text) return { transient: false, signature: "" };
   if (BLOCKED_NEVER_RETRY.test(text)) return { transient: false, signature: "" };
   for (const entry of BLOCKED_RETRY_PATTERNS) {
     if (entry.pattern.test(text)) return { transient: true, signature: entry.signature };

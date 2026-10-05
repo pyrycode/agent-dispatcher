@@ -25,6 +25,14 @@ A `needs-rework:<agent>` naming an agent the active stage set does not run parks
 
 Each dispatch creates a fresh `git worktree` under `.<target>-worktrees/<agent>-<issue#>/`. Concurrent dispatches don't interfere; failures leave the worktree as evidence for triage; `git worktree remove --force` cleans up.
 
+**Reusing the agent's own preserved worktree.** A run that stops with work left in its worktree keeps it: a blocked Codex run is preserved for recovery, and cleanup never force-removes a dirty tree. When the same agent is dispatched on the same ticket again, the dispatcher continues in that worktree instead of failing to create a new one, if all of these hold:
+
+- after the normal cleanup, the only worktree with `feature/<n>` checked out is this agent's own path, `<agent>-<n>`;
+- it is on that branch, not locked, and has no merge, rebase, cherry-pick or revert in progress;
+- it has uncommitted changes, or local commits origin lacks.
+
+Uncommitted changes are committed as one `wip(<agent>): partial work from an interrupted run (#<n>)` commit. Then the normal pre-run merge of the default branch and the normal run follow. One comment on the ticket names the commit. The commit is not pushed on its own; the run's normal pushes carry it. In every other case the dispatch fails as before and the comment names the worktree that holds the branch: another role's worktree, a person's checkout, a different branch or an unfinished merge or rebase. Reuse happens only when something else dispatches the ticket again, such as a person removing `error:<agent>` or an automatic retry. It never re-dispatches a parked ticket by itself. Added after pyrycode-mobile #1603 and #1727 on 2026-10-05, where a person had to commit the leftovers before the next run could start.
+
 ### Resume-in-place
 
 Before any salvage, a run that exhausted its budget — the `max_turns` turn cap or the dispatcher's wall-clock timeout — gets up to `PYRY_RESUME_LEGS` continuation legs (default 1; `0` disables the feature and restores the pre-resume behaviour byte-for-byte). A continuation leg resumes the **same claude session** via `claude --resume <session-id>` with a fresh budget, inside the same dispatch and the same worktree, with every flag re-passed (they do not carry over on resume). Session ids are captured from the stream's init frame, so even a killed run that never emitted a result frame stays resumable. Most budget exhaustions are "ran out mid-task", not "stuck" — one fresh budget converts most of those human-triage interruptions into automatic completions. If the final leg is still exhausted, the salvage paths below run unchanged, keyed on the original run's result. Permission denials never resume; they keep their own salvage.
@@ -472,7 +480,22 @@ and two of the same kind. It matched none of the eighteen that need a person. A 
 a maintainer, a decision or a denied permission always parks, and so does any run
 where the approval reviewer rejected an action. The retry never discards or
 salvages the blocked run's work: when that run left uncommitted edits or unpushed
-commits, the retry refuses to start over them and parks, saying why.
+commits, the retry continues from them in the same worktree (see "Reusing the
+agent's own preserved worktree" above).
+
+A block after Codex's approval reviewer failed to decide also retries, on the same
+backoff and cap. Codex says so in its own output, on stderr or in a tool item:
+"automatic approval review could not be completed. This is a review failure, not a
+determination that the action is unsafe" when the reviewer's model was at capacity
+(mobile #1582), or "The automatic permission approval review did not finish before
+its deadline" (mobile #1655). The dispatcher matches only that Codex output, never
+the agent's summary, which always mentions the approval. A genuine rejection, "This
+action was rejected due to unacceptable risk", still parks, even beside a reviewer
+failure.
+
+A Codex turn that fails with "Selected model is at capacity. Please try a different
+model." takes the capped API retry, like "Unable to verify model access right
+now". Five mobile tickets parked on it on 2026-10-05.
 
 A builder may instead return `status: needs_refinement` for a planning problem.
 The dispatcher posts its explanation on the assigned issue and adds
@@ -608,7 +631,8 @@ Edit them here and run `codex-helpers/install` on the dispatcher host; see
 
 The dispatcher uses ordinary Git worktree removal. Dirty or locked worktrees stay
 at their existing paths. A retained worktree can block the next run of that branch;
-resolve and commit its work before retrying. Startup never force-removes it.
+resolve and commit its work before retrying. The exception is the same agent's own
+worktree for the same ticket, which the next run continues in (see "Worktree isolation"). Startup never force-removes it.
 Cleanup reports local changes in the main checkout without discarding tracked edits
 or deleting untracked files. This also applies to live-gate and baseline worktrees.
 A preserved path is evidence to inspect, not permission to force-delete it.
