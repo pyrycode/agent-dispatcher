@@ -116,7 +116,7 @@ import {
   shouldSkipDispatch,
 } from "./pipeline-decisions.js";
 import { AGENTS } from "./types.js";
-import { AgentRunStoppedError, buildResumePrompt, idleStallMessage, noResultErrorMessage, ResourceExhaustedError, timeoutFor } from "./agent-runtime.js";
+import { AgentRunFailedError, AgentRunStoppedError, buildResumePrompt, idleStallMessage, noResultErrorMessage, ResourceExhaustedError, timeoutFor } from "./agent-runtime.js";
 import { resolveAgentsRepoRoot, resolveTargetRepoRoot } from "./worktree.js";
 import { CodexStreamAdapter, TOOL_UNAVAILABLE_REASON } from "./agent-runner.js";
 
@@ -2628,6 +2628,37 @@ describe("handleAgentResultErrors", () => {
     assert.ok(ghPrCreate!.args.includes("--draft"), "salvage PR must be a DRAFT");
     // Salvage comment posted to the issue.
     assert.ok(client.comments.some(c => /Salvaged from `max_turns`/.test(c.body)));
+  });
+
+  test("the draft PR's 'Last messages' block holds the agent's own last output, not the empty result text (#16)", async () => {
+    const { ctx, calls } = makeTestContext({
+      item: { issueNumber: 445 },
+      mockOptions: { execImpls: { "gh pr list --head": () => "[]", "git status --porcelain": () => "M new.go\n" } },
+    });
+
+    // A max_turns result frame carries no `result` text: output is "".
+    await handleAgentResultErrors(
+      streamResult({ isError: true, terminalReason: "max_turns", numTurns: 71, output: "", agentOutputTail: "Tests pass; drafting the commit.\n[Bash] go test ./..." }),
+      ctx,
+    );
+
+    const body = String(calls.spawn.find(s => s.cmd === "gh" && s.args.includes("create"))?.input ?? "");
+    assert.match(body, /\*\*Last messages from the agent \(may include unresolved findings\):\*\*\n\n```\nTests pass; drafting the commit\.\n\[Bash\] go test \.\/\.\.\.\n```/);
+  });
+
+  test("the draft PR's 'Last messages' block falls back to the last assistant text, then says the agent wrote none", async () => {
+    for (const [over, expected] of [
+      [{ lastAssistantText: "Still chasing the transport_test flake." }, "Still chasing the transport_test flake."],
+      [{}, "(the agent wrote no text before it stopped)"],
+    ] as const) {
+      const { ctx, calls } = makeTestContext({
+        item: { issueNumber: 446 },
+        mockOptions: { execImpls: { "gh pr list --head": () => "[]", "git status --porcelain": () => "M new.go\n" } },
+      });
+      await handleAgentResultErrors(streamResult({ isError: true, terminalReason: "max_turns", output: "", ...over }), ctx);
+      const body = String(calls.spawn.find(s => s.cmd === "gh" && s.args.includes("create"))?.input ?? "");
+      assert.ok(body.includes("```\n" + expected + "\n```"), expected);
+    }
   });
 
   test("gh pr list fails → SALVAGE_GH_FAILED warn, falls through; throws when neither salvage applies", async () => {
@@ -8112,6 +8143,40 @@ describe("maybeResumeExhaustedRun — same-dispatch continuation leg", () => {
     });
   });
 
+  test("still exhausted: salvage gets the original result, but with the last leg's agent output", async () => {
+    await withResumeLegs(undefined, async () => {
+      const { ctx } = makeTestContext({
+        mockOptions: {
+          streamResult: () => streamResult({ isError: true, terminalReason: "max_turns", sessionId: "sess-first", numTurns: 135, agentOutputTail: "leg two: rerunning the gate" }),
+        },
+      });
+      const first = { ...EXHAUSTED_MAX_TURNS(), agentOutputTail: "leg one: writing tests" };
+
+      const result = await maybeResumeExhaustedRun(first, makeSpawnConfig(ctx.logFile), ctx);
+
+      assert.equal(result.agentOutputTail, "leg two: rerunning the gate");
+      assert.equal(result.numTurns, first.numTurns, "every other field is the original first leg's");
+      assert.equal(result.output, first.output);
+      assert.equal(result.terminalReason, "max_turns");
+    });
+  });
+
+  test("a continuation leg rejected with the agent's output hands that output on", async () => {
+    await withResumeLegs(undefined, async () => {
+      const { ctx } = makeTestContext({
+        mockOptions: {
+          streamResult: () => { throw new AgentRunStoppedError("Agent timed out after 1500s", "timeout", "leg two: stuck in connectedAndroidTest"); },
+        },
+      });
+      const first = EXHAUSTED_MAX_TURNS();
+
+      const result = await maybeResumeExhaustedRun(first, makeSpawnConfig(ctx.logFile), ctx);
+
+      assert.equal(result.agentOutputTail, "leg two: stuck in connectedAndroidTest");
+      assert.equal(result.terminalReason, first.terminalReason);
+    });
+  });
+
   test("a continuation leg that throws is swallowed and the original result falls through to salvage", async () => {
     await withResumeLegs(undefined, async () => {
       const { ctx, calls } = makeTestContext({
@@ -10545,17 +10610,81 @@ describe("partial-work salvage — stopped run with an existing PR (mobile #1430
     assert.ok(calls.logs.some(l => l.section === "PARTIAL_SALVAGE_SKIPPED" && /nothing to save/.test(l.content)));
   });
 
-  test("skipped when the branch has no PR (the draft-PR salvage owns that case)", async () => {
+  test("no PR on the branch: the reject door never reaches the draft-PR salvage, so the branch is pushed and no PR is opened (#18)", async () => {
     const { agent, item, client, deps, calls } = stoppedRun({
       issue: 1438,
+      agent: { name: "developer" },
       stop: { reject: new AgentRunStoppedError("Agent timed out after 2280s", "timeout") },
       exec: { "gh pr list --head": () => "[]", "git status --porcelain": () => " M a.md\n" },
     });
 
     await dispatchToAgent(agent, item, client, deps);
 
+    assert.equal(commitOf(calls)?.args[2], "wip(developer): partial work from a timed-out run (#1438)");
+    assert.deepEqual(pushOf(calls)?.args, ["push", "-u", "origin", "feature/1438"]);
+    assert.ok(!calls.spawn.some(c => c.cmd === "gh" && c.args.includes("create")), "no PR is opened");
+    assert.ok(!client.addLabelCalls.some(c => c.label === "error:max_turns_salvaged"));
+    const saved = client.comments.find(c => /Partial work saved/.test(c.body))?.body ?? "";
+    assert.match(saved, /pushed them to `feature\/1438`, so nothing is lost/);
+    assert.doesNotMatch(saved, /\(PR #/);
+    assert.ok(client.addLabelCalls.some(c => c.label === "error:developer"), "the timeout still parks");
+  });
+
+  test("a crash with no result frame (pyrycode-mobile #1340 shape) saves a builder's work and the comment shows the agent's last output", async () => {
+    const tail = "All tests pass. Committing the fix.\n[Bash] git commit -m 'fix(thread): close the prompt'";
+    const { agent, item, client, deps, calls } = stoppedRun({
+      issue: 1440,
+      agent: { name: "builder", column: "In Development", claudeMdPath: "builder/CLAUDE.md", producesCommits: true },
+      stop: { reject: new AgentRunFailedError(noResultErrorMessage(1, "Error: socket hang up\n"), tail) },
+      exec: { "gh pr list --head": () => PR_JSON, "git status --porcelain": () => " M app/src/Thread.kt\n" },
+    });
+
+    await dispatchToAgent(agent, item, client, deps);
+
+    assert.equal(commitOf(calls)?.args[2], "wip(builder): partial work from a run that ended in an error (#1440)");
+    assert.ok(pushOf(calls), "pushed to the branch");
+    assert.ok(client.comments.some(c => /Partial work saved/.test(c.body) && /The builder run ended in an error/.test(c.body)));
+    const park = client.comments.find(c => /Agent Error: builder/.test(c.body))?.body ?? "";
+    assert.match(park, /Claude CLI exited with code 1, no result message received/);
+    assert.match(park, /\*\*Last output from the agent\*\* \(its messages and tool calls, newest last\):\n\n```\nAll tests pass\. Committing the fix\.\n\[Bash\] git commit/);
+    assert.ok(client.addLabelCalls.some(c => c.label === "error:builder"));
+    assert.ok(cleanupRan(calls.exec), "teardown runs after a successful push");
+  });
+
+  test("a Codex error result with commits origin lacks → pushed without a new commit", async () => {
+    const { agent, item, client, deps, calls } = stoppedRun({
+      issue: 1441,
+      agent: { name: "builder", column: "In Development", claudeMdPath: "builder/CLAUDE.md", producesCommits: true },
+      stop: { result: streamResult({
+        runner: "codex", isError: true, terminalReason: "codex_error",
+        output: "Codex exited with code 1 without a successful completed task outcome",
+        agentOutputTail: "Running the device gate.\n[shell] /bin/zsh -lc 'python3 scripts/android-test-gate.py ui'",
+      }) },
+      exec: { "gh pr list --head": () => PR_JSON, "git status --porcelain": () => "", "git rev-list --count origin/feature/1441..HEAD": () => "1\n" },
+    });
+
+    await dispatchToAgent(agent, item, client, deps);
+
+    assert.equal(commitOf(calls), undefined);
+    assert.ok(pushOf(calls));
+    assert.ok(client.comments.some(c => /found local commits origin did not have/.test(c.body)));
+    const park = client.comments.find(c => /Agent Error: builder/.test(c.body))?.body ?? "";
+    assert.match(park, /\[shell\] \/bin\/zsh -lc 'python3 scripts\/android-test-gate\.py ui'/);
+  });
+
+  test("a blocked Codex run is still never pushed, whatever ended it", async () => {
+    const { agent, item, client, deps, calls } = stoppedRun({
+      issue: 1442,
+      agent: { name: "builder", column: "In Development", claudeMdPath: "builder/CLAUDE.md", producesCommits: true },
+      stop: { result: streamResult({ runner: "codex", isError: true, terminalReason: "codex_blocked", output: "A required commit was rejected." }) },
+      exec: { "gh pr list --head": () => PR_JSON, "git status --porcelain": () => " M a.kt\n" },
+    });
+
+    await dispatchToAgent(agent, item, client, deps);
+
+    assert.equal(commitOf(calls), undefined);
     assert.equal(pushOf(calls), undefined);
-    assert.ok(calls.logs.some(l => l.section === "PARTIAL_SALVAGE_SKIPPED" && /no open pull request/.test(l.content)));
+    assert.ok(!client.comments.some(c => /Partial work/.test(c.body)));
   });
 
   test("push failure → comment names the kept worktree, and the teardown is skipped", async () => {
@@ -10575,6 +10704,58 @@ describe("partial-work salvage — stopped run with an existing PR (mobile #1430
     assert.ok(calls.logs.some(l => l.section === "PARTIAL_SALVAGE_PUSH_FAILED" && /non-fast-forward/.test(l.content)));
     assert.ok(client.addLabelCalls.some(c => c.label === "error:documentation"), "the error path still runs");
     assert.ok(!cleanupRan(calls.exec), "the worktree holding the only copy is not torn down");
+  });
+});
+
+describe("the error comment shows the agent's own last output (agent-dispatcher #16)", () => {
+  const block = (body: string, heading: RegExp) => {
+    const at = body.search(heading);
+    if (at < 0) return null;
+    const open = body.indexOf("```\n", at) + 4;
+    return body.slice(open, body.indexOf("\n```", open));
+  };
+
+  test("from the result: its own block after the error, before the debug hint", async () => {
+    const { ctx, client } = makeTestContext({ agent: { name: "documentation" }, item: { issueNumber: 1430 } });
+    const result = streamResult({ isError: true, timedOut: true, sessionId: "sess-1430", agentOutputTail: "Now updating the catalog.\n[Edit] docs/knowledge/CATALOG.md" });
+
+    await handleDispatchError(new Error("Agent error (unknown). Ran 38m 0s (timeout 38min)."), ctx, result);
+
+    const body = client.comments.find(c => /Agent Error: documentation/.test(c.body))?.body ?? "";
+    assert.equal(block(body, /Last output from the agent/), "Now updating the catalog.\n[Edit] docs/knowledge/CATALOG.md");
+    assert.ok(body.indexOf("Agent error (unknown)") < body.indexOf("Last output from the agent"));
+    assert.ok(body.indexOf("Last output from the agent") < body.indexOf("**Debug**"));
+  });
+
+  test("from the runner's rejection when no result came back", async () => {
+    const { ctx, client } = makeTestContext({ agent: { name: "documentation" }, item: { issueNumber: 1431 } });
+    const err = new AgentRunStoppedError("Agent timed out after 2280s", "timeout", "Running the docs size check.\n[Bash] python3 scripts/docs-size.py");
+
+    await handleDispatchError(err, ctx, null);
+
+    const body = client.comments.find(c => /Agent Error: documentation/.test(c.body))?.body ?? "";
+    assert.match(body, /```\nAgent timed out after 2280s\n```/);
+    assert.equal(block(body, /Last output from the agent/), "Running the docs size check.\n[Bash] python3 scripts/docs-size.py");
+  });
+
+  test("no section when the agent wrote nothing", async () => {
+    const { ctx, client } = makeTestContext({ agent: { name: "verifier", producesCommits: false }, item: { issueNumber: 1432 } });
+
+    await handleDispatchError(new AgentRunFailedError(noResultErrorMessage(1, "")), ctx, null);
+
+    const body = client.comments.find(c => /Agent Error: verifier/.test(c.body))?.body ?? "";
+    assert.ok(body.length > 0);
+    assert.doesNotMatch(body, /Last output from the agent/);
+  });
+
+  test("the agent's words never make a crash retry: classification reads only the error message", async () => {
+    const { ctx, client } = makeTestContext({ agent: { name: "verifier", producesCommits: false }, item: { issueNumber: 1433 } });
+    const err = new AgentRunFailedError(noResultErrorMessage(1, ""), "The API answered 529 overloaded and a socket hang up earlier; retrying.");
+
+    await handleDispatchError(err, ctx, null);
+
+    assert.ok(client.addLabelCalls.some(c => c.label === "error:verifier"), "parks for a human");
+    assert.ok(!client.comments.some(c => /Auto-retry scheduled/.test(c.body)));
   });
 });
 

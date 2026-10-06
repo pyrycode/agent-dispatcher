@@ -28,7 +28,12 @@
 // change and still build. When the owner's run ends, the merge must be
 // committed with main inside it, no conflict markers may remain in the
 // conflicted files, and every non-blank line main added to those files since
-// the merge base must still be in them. Lines compare trimmed, because a
+// the merge base must still be in them as the merge commit left them. The
+// check reads the merge commit, not the branch tip: a later commit in the
+// same run may rewrite main's lines on purpose, and is reviewed like any
+// other change. Pyrycode-desktop #1731 on 2026-10-06 fixed a reviewer's
+// finding after the merge, and the tip-based check parked it for a hand
+// merge. Lines compare trimmed, because a
 // resolution may re-indent main's lines under new code (#808 wrapped the
 // block #805 had just edited). Failing any of these parks the ticket with
 // nothing pushed and the worktree kept.
@@ -382,16 +387,22 @@ export function checkMergeResolution(cwd: string, pending: PendingMerge, deps: M
   } catch {
     problems.push(`The branch no longer contains \`${pending.mainSha.slice(0, 7)}\`, the main commit that was merged.`);
   }
+  // Judge the merge commit, not the branch tip: a later commit may change
+  // main's lines on purpose (pyrycode-desktop #1731). Without a merge commit
+  // to read, the tip is all there is.
+  const merge = findMergeCommit(cwd, pending, deps) ?? "HEAD";
 
   for (const path of pending.paths) {
-    const result = fileAt(deps, cwd, "HEAD", path);
-    // The branch had deleted this file before the merge, and it stays deleted.
-    if (result === null && fileAt(deps, cwd, pending.headSha, path) === null) continue;
-    const text = result ?? "";
-    if (hasConflictMarkers(text)) {
+    const result = fileAt(deps, cwd, merge, path);
+    // Markers must be gone from the merge and from what gets pushed.
+    const tip = merge === "HEAD" ? result : fileAt(deps, cwd, "HEAD", path);
+    if (hasConflictMarkers(result ?? "") || hasConflictMarkers(tip ?? "")) {
       problems.push(`\`${path}\` still has conflict markers.`);
       continue;
     }
+    // The branch had deleted this file before the merge, and it stays deleted.
+    if (result === null && fileAt(deps, cwd, pending.headSha, path) === null) continue;
+    const text = result ?? "";
     let diff: string;
     try {
       diff = run(deps, `git diff -U0 ${pending.baseSha} ${pending.mainSha} -- ${shellQuote(path)}`, cwd);
