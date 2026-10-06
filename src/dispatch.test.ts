@@ -114,7 +114,7 @@ import {
   shouldSkipDispatch,
 } from "./pipeline-decisions.js";
 import { AGENTS } from "./types.js";
-import { AgentRunStoppedError, idleStallMessage, noResultErrorMessage, ResourceExhaustedError, timeoutFor } from "./agent-runtime.js";
+import { AgentRunStoppedError, buildResumePrompt, idleStallMessage, noResultErrorMessage, ResourceExhaustedError, timeoutFor } from "./agent-runtime.js";
 import { resolveAgentsRepoRoot, resolveTargetRepoRoot } from "./worktree.js";
 import { CodexStreamAdapter } from "./agent-runner.js";
 
@@ -9071,13 +9071,99 @@ describe("selectPastParkedFamilies — a parked family must not starve the board
   });
 });
 
-// Codex thread identifiers must never be handed to Claude's resume path.
-test("Codex timeout keeps salvage result without a Claude continuation", async () => {
-  const { ctx, calls } = makeTestContext({});
-  const first = streamResult({ runner: "codex", isError: true, timedOut: true, sessionId: "codex-thread" });
-  const result = await maybeResumeExhaustedRun(first, makeSpawnConfig(ctx.logFile, { runner: "codex" }), ctx);
-  assert.equal(result, first);
-  assert.equal(calls.claudeStreams, 0);
+// A Codex run stopped by the wall clock gets the same continuation as
+// Claude, resuming its own thread through Codex. Approved 2026-10-05.
+describe("maybeResumeExhaustedRun — Codex continuation leg", () => {
+  const CODEX_TIMED_OUT = (): StreamResult => streamResult({
+    runner: "codex", costKnown: false, isError: true, timedOut: true, terminalReason: "timeout",
+    sessionId: "codex-thread", numTurns: 3, durationMs: 600_000, waitCreditMs: 120_000,
+    usage: { input_tokens: 1000, output_tokens: 200 },
+  });
+
+  test("a timed-out Codex run resumes its own thread through Codex, with the wall-clock prompt", async () => {
+    await withResumeLegs(undefined, async () => {
+      const seen: any[] = [];
+      const { ctx, calls } = makeTestContext({
+        item: { issueNumber: 970 },
+        mockOptions: {
+          streamResult: (opts: any) => {
+            seen.push(opts);
+            return streamResult({ runner: "codex", costKnown: false, isError: false, terminalReason: "stop",
+              sessionId: "codex-thread", numTurns: 2, durationMs: 100_000, output: "finished", waitCreditMs: 30_000 });
+          },
+        },
+      });
+      const first = CODEX_TIMED_OUT();
+      const config = makeSpawnConfig(ctx.logFile, { runner: "codex", model: "gpt-6.1-sol", effort: "" });
+
+      const result = await maybeResumeExhaustedRun(first, config, ctx);
+
+      assert.equal(calls.claudeStreams, 1);
+      assert.equal(seen[0].runner, "codex", "a run never switches runner on continuation");
+      assert.equal(seen[0].resumeSessionId, "codex-thread");
+      assert.equal(seen[0].timeoutMs, config.timeoutMs, "fresh wall-clock budget, same as Claude");
+      assert.equal(seen[0].cwd, config.cwd);
+      const promptWrite = calls.fs.find((f) => f.kind === "write" && f.path === seen[0].promptFile);
+      assert.ok(promptWrite, "continuation prompt written before the leg");
+      assert.equal(promptWrite!.content, buildResumePrompt("timeout"));
+      assert.match(loggedText(calls), /Reason: timeout/);
+      assert.equal(result.isError, false);
+      assert.equal(result.runner, "codex");
+      assert.equal(result.output, "finished");
+      assert.equal(result.numTurns, 5);
+      assert.equal(result.waitCreditMs, 150_000, "wait credit from both legs");
+    });
+  });
+
+  test("a Codex continuation that also runs out falls through to salvage with the original result", async () => {
+    await withResumeLegs(undefined, async () => {
+      const { ctx, calls } = makeTestContext({
+        mockOptions: { streamResult: () => CODEX_TIMED_OUT() },
+      });
+      const first = CODEX_TIMED_OUT();
+
+      const result = await maybeResumeExhaustedRun(first, makeSpawnConfig(ctx.logFile, { runner: "codex" }), ctx);
+
+      assert.equal(calls.claudeStreams, 1, "one continuation leg, the same count limit as Claude");
+      assert.equal(result, first);
+      assert.match(loggedText(calls), /RESUME_EXHAUSTED/);
+    });
+  });
+
+  test("a blocked or idle-stalled Codex run never resumes, even when the wall clock also fired", async () => {
+    await withResumeLegs("3", async () => {
+      for (const terminalReason of ["codex_blocked", "idle_stall", "codex_error"]) {
+        const { ctx, calls } = makeTestContext();
+        const first = { ...CODEX_TIMED_OUT(), terminalReason };
+        const result = await maybeResumeExhaustedRun(first, makeSpawnConfig(ctx.logFile, { runner: "codex" }), ctx);
+        assert.equal(result, first, terminalReason);
+        assert.equal(calls.claudeStreams, 0, terminalReason);
+      }
+    });
+  });
+
+  test("a later Codex leg that ends blocked is not resumed again", async () => {
+    await withResumeLegs("3", async () => {
+      const { ctx, calls } = makeTestContext({
+        mockOptions: { streamResult: () => ({ ...CODEX_TIMED_OUT(), terminalReason: "codex_blocked" }) },
+      });
+      const first = CODEX_TIMED_OUT();
+      const result = await maybeResumeExhaustedRun(first, makeSpawnConfig(ctx.logFile, { runner: "codex" }), ctx);
+      assert.equal(calls.claudeStreams, 1);
+      assert.equal(result, first);
+    });
+  });
+
+  // Codex thread identifiers must never be handed to Claude's resume path.
+  test("a Codex thread is never resumed through a Claude spawn config", async () => {
+    await withResumeLegs(undefined, async () => {
+      const { ctx, calls } = makeTestContext();
+      const first = CODEX_TIMED_OUT();
+      const result = await maybeResumeExhaustedRun(first, makeSpawnConfig(ctx.logFile), ctx);
+      assert.equal(result, first);
+      assert.equal(calls.claudeStreams, 0);
+    });
+  });
 });
 
 test("Codex spawn selection does not inherit Claude model overrides", async () => {

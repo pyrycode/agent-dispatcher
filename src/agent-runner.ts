@@ -131,6 +131,8 @@ export function buildCodexInvocation(opts: {
   shellEnv?: Readonly<Record<string, string>>;
   /** Names-only inheritance for the builder's restricted live-test account. */
   builderLiveTests?: boolean;
+  /** Continuation leg: resume this Codex thread instead of starting one. */
+  resumeThreadId?: string;
 }): { bin: string; args: string[] } {
   // The read-only source reviewer runs with --ignore-user-config, so the
   // user's core-only shell policy does not apply to it and it builds
@@ -177,6 +179,10 @@ export function buildCodexInvocation(opts: {
       ] : []),
       ...(opts.model ? ["--model", opts.model] : []),
       ...(opts.effort ? ["-c", `model_reasoning_effort=${JSON.stringify(opts.effort)}`] : []),
+      // `codex exec resume` has no --cd or --approve-for-me of its own, so
+      // every flag above stays in front of the subcommand. Checked against
+      // codex-cli 0.159.2 on 2026-10-05, including a thread killed mid-command.
+      ...(opts.resumeThreadId ? ["resume", opts.resumeThreadId] : []),
       "-",
     ],
   };
@@ -413,7 +419,7 @@ export function codexChildEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 
 export const CODEX_ROLE_GUIDANCE = `
 This dispatch uses Codex. Apply the role instructions above with these runtime adaptations:
-- The Codex model defaults to GPT-6 Sol, with optional dispatcher model and effort overrides. Effort otherwise comes from Codex configuration. Claude model names and max-turn counts do not apply. The dispatcher enforces a wall-clock budget. There is no automatic continuation for Codex.
+- The Codex model defaults to GPT-6 Sol, with optional dispatcher model and effort overrides. Effort otherwise comes from Codex configuration. Claude model names and max-turn counts do not apply. The dispatcher enforces a wall-clock budget. A run stopped by it may be resumed once in the same thread.
 - Use available Codex tools. Claude MCP names and tool allowlists do not configure Codex. If a named search tool is unavailable, use repository files and command-line search.
 - Stay within this role's allowed files and assigned ticket. Git commits, pushes, and GitHub changes explicitly required by the assigned role are part of the task. Do not change unrelated tickets, host credentials, or sandbox policy.
 - Ordinary sandbox restrictions can be escalated through automatic approval review. If the reviewer rejects a necessary action, stop and report status blocked. Do not work around rejection.

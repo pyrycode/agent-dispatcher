@@ -10,6 +10,9 @@ import { agentSpawnEnv } from "./agent-runtime.js";
 // This executable never contacts a model, repository or board.
 const executable = `#!${process.execPath}
 const fs = require('node:fs');
+// Installed before anything else, so a slow start on a loaded host cannot
+// let the dispatcher's SIGTERM land before the fixture ignores it.
+if (process.env.TEST_MODE === 'timeout') process.on('SIGTERM', () => fs.writeFileSync('term-received', 'yes'));
 let input = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', chunk => { input += chunk; });
@@ -41,7 +44,6 @@ process.stdin.on('end', async () => {
     {type:'turn.completed', usage:{input_tokens:100, cached_input_tokens:60, output_tokens:12}}
   ];
   if (process.env.TEST_MODE === 'timeout') {
-    process.on('SIGTERM', () => fs.writeFileSync('term-received', 'yes'));
     process.stdout.write(JSON.stringify(events[0]) + '\\n');
     setInterval(() => {}, 1000);
     return;
@@ -216,16 +218,19 @@ test("Codex exit zero without terminal event cannot advance the task", async t =
   assert.equal(result.isError, true);
 });
 
-test("Codex timeout preserves thread and kills a process that ignores SIGTERM", { timeout: 10000 }, async t => {
+test("Codex timeout preserves thread and kills a process that ignores SIGTERM", { timeout: 20000 }, async t => {
   const f = fixture(t, "timeout");
   const start = Date.now();
-  const result = await runClaudeStreaming({ ...f.options, timeoutMs: 700 });
+  // 700 ms used to be shorter than the fake's own start under a loaded
+  // full-suite run: the SIGTERM landed before the fake printed its thread,
+  // so the run had no thread id and the fake never saw the signal.
+  const result = await runClaudeStreaming({ ...f.options, timeoutMs: 3000 });
   assert.equal(result.isError, true);
   assert.equal(result.timedOut, true);
   assert.equal(result.terminalReason, "timeout");
   assert.equal(result.sessionId, "fixture-thread");
   assert.ok(existsSync(join(f.dir, "term-received")), "fixture must install its handler and observe SIGTERM before SIGKILL");
-  assert.ok(Date.now() - start < 8000, "SIGKILL must bound an ignored SIGTERM");
+  assert.ok(Date.now() - start < 15000, "SIGKILL must bound an ignored SIGTERM");
   const { pid } = JSON.parse(readFileSync(join(f.dir, "observed.json"), "utf8"));
   assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
 });
@@ -277,6 +282,21 @@ test("Codex command running past the budget gets a grace, and a wait it reports 
   const log = readFileSync(f.options.logFile, "utf8");
   assert.match(log, /GRACE/);
   assert.match(log, /WAIT CREDIT/);
+});
+
+test("Codex continuation leg resumes the thread on stdin and still earns wait credit", { timeout: 30000 }, async t => {
+  withEnv(t, { PYRY_TIMEOUT_CEILING_FACTOR: "10" });
+  const f = fixture(t, "grace-credit");
+  const result = await runClaudeStreaming({ ...f.options, timeoutMs: 4000, resumeSessionId: "fixture-thread" });
+  const observed = JSON.parse(readFileSync(join(f.dir, "observed.json"), "utf8"));
+  assert.deepEqual(observed.argv.slice(-3), ["resume", "fixture-thread", "-"]);
+  assert.ok(observed.argv.includes("--approve-for-me"));
+  assert.equal(observed.argv[observed.argv.indexOf("--cd") + 1], f.dir);
+  assert.equal(observed.input, f.prompt);
+  assert.equal(result.runner, "codex");
+  assert.equal(result.isError, false, result.output);
+  assert.equal(result.sessionId, "fixture-thread");
+  assert.ok((result.waitCreditMs ?? 0) >= 4000, `credit ${result.waitCreditMs}`);
 });
 
 test("Codex grace ends when the command finishes without showing a wait", { timeout: 30000 }, async t => {
