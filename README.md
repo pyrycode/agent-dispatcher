@@ -737,6 +737,11 @@ than twenty runs, each after the agent had spent its budget finding out
   dispatch is recorded. One comment names the failed check and its exit
   status. One Discord message goes out when a check starts failing, and one
   when it passes again.
+- **Checked at startup.** The dispatcher runs every check once before its
+  first cycle, for each role it guards and for the live gate. It logs one
+  `Startup health check passed` line naming the checks, or one
+  `Startup health check failed` line per failing check, naming the check,
+  its setting and the runs it holds. The first cycle reuses those results.
 - **Re-checked on later cycles.** While the check still fails, the held
   ticket is left out of selection so other work gets its seat. Once it
   passes, the label comes off and the agent starts.

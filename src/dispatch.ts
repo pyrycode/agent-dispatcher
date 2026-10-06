@@ -96,7 +96,7 @@ import {
 } from "./main-sweep.js";
 import { recordFlakyTests, type FlakyTicketClient } from "./flaky-tickets.js";
 import { recordInheritedTests } from "./inherited-tickets.js";
-import { dropStillHeld, HealthChecker, type HealthEnvFor, healthEnvForAgent, holdUnhealthyCandidates, liveGateHealthFailures, newHealthNoticeState, parseHealthCacheMs, parseHealthChecks } from "./health-check.js";
+import { dropStillHeld, HealthChecker, type HealthEnvFor, healthEnvForAgent, holdUnhealthyCandidates, liveGateHealthFailures, newHealthNoticeState, parseHealthCacheMs, parseHealthChecks, startupHealthCheck } from "./health-check.js";
 import {
   decideDocsOnlyGateReuse,
   decideVerifierGateReuse,
@@ -8885,6 +8885,17 @@ export async function pollLoop(): Promise<void> {
             ? ", runs in the background holding only verifiers"
             : ", runs in the background beside every agent"),
   );
+  // Run the health checks once now and say whether they passed, rather than
+  // only listing them. Cached, so the first cycle reuses the results.
+  await startupHealthCheck({
+    checks: HEALTH_CHECKS,
+    checker: healthChecker,
+    roles: pollOrder.map((a) => a.name),
+    envFor: (role, check) => healthEnvForAgent(process.env, role, selectRunner(role), check.scope),
+    liveGateEnv: realClaudeGateRunner === null ? null : buildGateSpawnEnv(process.env),
+    notify: notifyDiscord,
+    state: healthNotices,
+  });
 
   // Main sweep: the fork's in-depth command against main, when idle or every N
   // merges. Null when PYRY_MAIN_SWEEP_CMD is unset. See runMainSweepCycle.
