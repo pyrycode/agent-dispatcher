@@ -158,3 +158,98 @@ test("a runner that reads its prompt on stdin gets the prompt file itself, even 
   const result = await run;
   assert.equal(result.output, "file:review this diff");
 });
+
+// Wait credit for Claude runs (wait-credit.ts). The fixture runs one Bash
+// call from boot for COMMAND_MS, past the dispatcher's 4 s budget, then
+// returns its result: a device wait as long as the call, or a plain build
+// line. It answers as both `pyry` (a first leg) and `claude` (a
+// continuation leg, which resumes through the `claude` binary).
+const WAIT_FIXTURE = `#!${process.execPath}
+const out = (m) => process.stdout.write(JSON.stringify(m) + "\\n");
+const mode = process.env.MODE;
+const commandMs = Number(process.env.COMMAND_MS || 6000);
+out({ type: "system", subtype: "init", session_id: "sess-wait" });
+out({ type: "assistant", message: { content: [{ type: "tool_use", id: "toolu_gate", name: "Bash", input: { command: "python3 scripts/android-test-gate.py scripted send-now 2>&1", timeout: 600000 } }] } });
+setTimeout(() => {
+  const content = mode === "grace-credit"
+    ? "Android gate: device held by live from /w since x; waiting up to 2700s\\nAndroid gate: device free after " + commandMs / 1000 + "s waiting\\nAndroid gate: 1 executed; process exit 0\\n"
+    : "BUILD SUCCESSFUL\\n";
+  out({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "toolu_gate", content }] } });
+  setTimeout(() => {
+    out({ type: "result", subtype: "success", is_error: false, num_turns: 2, result: "done", session_id: "sess-wait", terminal_reason: "completed" });
+  }, mode === "grace-credit" ? 0 : 1500);
+}, commandMs);
+`;
+
+function waitFixture(t: { after: (fn: () => void) => void }, mode: string, ceilingFactor: string, resumeSessionId?: string) {
+  const root = mkdtempSync(join(tmpdir(), "claude-wait-test-"));
+  const saved = Object.fromEntries(["PYRY_AGENT_IDLE_TIMEOUT_MINUTES", "PYRY_USE_LEGACY_CLAUDE", "PYRY_TIMEOUT_CEILING_FACTOR", "PYRY_TIMEOUT_GRACE_MINUTES"]
+    .map(k => [k, process.env[k]]));
+  process.env.PYRY_AGENT_IDLE_TIMEOUT_MINUTES = "10";
+  process.env.PYRY_TIMEOUT_CEILING_FACTOR = ceilingFactor;
+  delete process.env.PYRY_USE_LEGACY_CLAUDE;
+  delete process.env.PYRY_TIMEOUT_GRACE_MINUTES;
+  t.after(() => {
+    rmSync(root, { recursive: true, force: true });
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  });
+  for (const bin of ["pyry", "claude"]) {
+    writeFileSync(join(root, bin), WAIT_FIXTURE);
+    chmodSync(join(root, bin), 0o755);
+  }
+  writeFileSync(join(root, "prompt.txt"), "do the thing");
+  writeFileSync(join(root, "system.txt"), "role");
+  const logFile = join(root, "run.log");
+  const run = runClaudeStreaming({
+    runner: "claude", cwd: root, promptFile: join(root, "prompt.txt"), systemPromptFile: join(root, "system.txt"),
+    model: "fixture-model", effort: "high", maxTurns: 10, allowedTools: "Bash", disallowedTools: "",
+    timeoutMs: 4000, logFile, env: { PATH: root + ":" + process.env.PATH, MODE: mode }, resumeSessionId,
+  });
+  return { run, logFile };
+}
+
+test("Claude Bash call running past the budget gets a grace, and a wait it reports buys the time to finish", { timeout: 30000 }, async t => {
+  // Margins are wide because the fake can take seconds to boot on a loaded
+  // host: its Bash call starts inside the 4 s budget, then returns 6 s after
+  // boot showing a 6 s device wait, which moves the deadline to about 10 s,
+  // past its result.
+  const { run, logFile } = waitFixture(t, "grace-credit", "10");
+  const result = await run;
+  assert.equal(result.isError, false, result.output);
+  assert.equal(result.timedOut, false);
+  assert.equal(result.output, "done");
+  assert.ok((result.waitCreditMs ?? 0) >= 4000, `credit ${result.waitCreditMs}`);
+  const log = readFileSync(logFile, "utf8");
+  assert.match(log, /GRACE/);
+  assert.match(log, /WAIT CREDIT/);
+});
+
+test("Claude continuation leg earns wait credit on its own clock", { timeout: 30000 }, async t => {
+  const { run, logFile } = waitFixture(t, "grace-credit", "10", "sess-wait");
+  const result = await run;
+  assert.equal(result.isError, false, result.output);
+  assert.equal(result.sessionId, "sess-wait");
+  assert.ok((result.waitCreditMs ?? 0) >= 4000, `credit ${result.waitCreditMs}`);
+  assert.match(readFileSync(logFile, "utf8"), /WAIT CREDIT/);
+});
+
+test("Claude grace ends when the Bash call returns without showing a wait", { timeout: 30000 }, async t => {
+  // The fake would report success 1.5 s after its Bash result; the kill lands first.
+  const { run, logFile } = waitFixture(t, "grace-no-credit", "10");
+  await assert.rejects(run, (err: Error) => {
+    assert.match(err.message, /timed out/);
+    return true;
+  });
+  assert.match(readFileSync(logFile, "utf8"), /the command the grace waited for has finished/);
+});
+
+test("Claude grace still stops at the hard ceiling", { timeout: 30000 }, async t => {
+  // A 5 s ceiling on a 4 s budget; the Bash call would report only 6 s after boot.
+  const start = Date.now();
+  const { run, logFile } = waitFixture(t, "grace-credit", "1.25");
+  await assert.rejects(run, /timed out/);
+  assert.ok(Date.now() - start < 9000, "stopped at the ceiling, not after the call reported its wait");
+  assert.match(readFileSync(logFile, "utf8"), /hard ceiling reached/);
+});

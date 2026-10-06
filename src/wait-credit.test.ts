@@ -1,6 +1,7 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  advanceClaudeRunClock,
   advanceGateWaitState,
   advanceRunClock,
   decideRunClock,
@@ -350,6 +351,105 @@ describe("Codex runs — deadline, grace and ceiling", () => {
 
   test("grace 0 turns only the grace off", () => {
     const clock = replay(fresh({ graceMs: 0 }), [[T0 + 65 * MIN, started("gate")]]);
+    assert.deepEqual(decideRunClock(clock, T0 + BUDGET), { kind: "stop", reason: "deadline" });
+  });
+});
+
+// Claude stream-json messages, in the shape both `claude -p` and `pyry
+// agent-run` write them: an assistant message with `tool_use` blocks, then a
+// user message with the matching `tool_result` blocks.
+const toolUse = (id: string, name = "Bash", command = "true") =>
+  ({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id, name, input: { command } }] } });
+const toolResult = (id: string, content: unknown = "") =>
+  ({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content, is_error: false }] } });
+
+function replayClaude(clock: RunClock, events: Array<[number, unknown]>): RunClock {
+  for (const [time, event] of events) clock = advanceClaudeRunClock(clock, event, time);
+  return clock;
+}
+
+describe("Claude runs — credit from Bash tool results", () => {
+  const T0 = at("21:11:00");
+  const BUDGET = 70 * MIN;
+  const fresh = (opts: Partial<{ ceilingFactor: number; graceMs: number }> = {}) =>
+    initRunClock({ startedAt: T0, budgetMs: BUDGET, ceilingFactor: opts.ceilingFactor ?? 2, graceMs: opts.graceMs ?? 20 * MIN });
+
+  test("a device gate run in the foreground is credited the wait its result shows", () => {
+    // Mobile #1783's Claude builder, 2026-10-05: `python3
+    // scripts/android-test-gate.py scripted send-now 2>&1` with a 600 s
+    // Bash timeout.
+    const clock = replayClaude(fresh(), [
+      [T0 + 2 * MIN, toolUse("toolu_gate", "Bash", "python3 scripts/android-test-gate.py scripted send-now 2>&1")],
+      [T0 + 9 * MIN, toolResult("toolu_gate", `${DEVICE_HELD}\n${deviceFree(300)}\nAndroid gate: 1 executed; process exit 0`)],
+    ]);
+    assert.equal(runClockCreditMs(clock), 300 * S);
+    assert.equal(runClockDeadline(clock), T0 + BUDGET + 300 * S);
+  });
+
+  test("result content as text blocks is read too", () => {
+    const clock = replayClaude(fresh(), [
+      [T0 + 1 * MIN, toolUse("toolu_gradle", "Bash", "./gradlew check")],
+      [T0 + 21 * MIN, toolResult("toolu_gradle", [{ type: "text", text: "> Configure project" }, { type: "text", text: `${slotGot(600)}\nBUILD SUCCESSFUL` }])],
+    ]);
+    assert.equal(runClockCreditMs(clock), 600 * S);
+  });
+
+  test("a claim longer than the Bash call ran is cut to the call, and a repeated line counts once", () => {
+    let clock = replayClaude(fresh(), [
+      [T0 + 10 * MIN, toolUse("a", "Bash", "tail -5 gate.log")],
+      [T0 + 12 * MIN, toolResult("a", deviceFree(1200))],
+    ]);
+    assert.equal(runClockCreditMs(clock), 2 * MIN);
+    clock = replayClaude(clock, [[T0 + 20 * MIN, toolUse("b", "Bash", "sleep 300; tail -5 gate.log")], [T0 + 25 * MIN, toolResult("b", deviceFree(1200))]]);
+    assert.equal(runClockCreditMs(clock), 2 * MIN);
+  });
+
+  test("only Bash results count: other tools never run commands", () => {
+    const clock = replayClaude(fresh(), [
+      [T0 + 1 * MIN, toolUse("r", "Read", "scripts/android-test-gate.py")],
+      [T0 + 1 * MIN, toolUse("m", "mcp__figma__get_screenshot")],
+      [T0 + 30 * MIN, toolResult("r", deviceFree(1200))],
+      [T0 + 30 * MIN, toolResult("m", slotGot(1200))],
+      [T0 + 31 * MIN, { type: "assistant", message: { content: [{ type: "text", text: deviceFree(1200) }] } }],
+    ]);
+    assert.equal(clock.running.size, 0);
+    assert.equal(runClockCreditMs(clock), 0);
+  });
+
+  test("a Bash call moved to the background stops counting when its result returns", () => {
+    // Claude's shell answers at once for `run_in_background` and when a
+    // foreground command passes its timeout. The command's later output,
+    // read some other way, earns only the time a Bash call was open.
+    const clock = replayClaude(fresh(), [
+      [T0 + 1 * MIN, toolUse("bg", "Bash", "python3 scripts/android-test-gate.py scripted all")],
+      [T0 + 11 * MIN, toolResult("bg", "Command running in background with ID: b1")],
+      [T0 + 40 * MIN, toolUse("peek", "Bash", "cat /tmp/out.log")],
+      [T0 + 40 * MIN, toolResult("peek", deviceFree(1500))],
+    ]);
+    assert.equal(runClockCreditMs(clock), 0);
+  });
+
+  test("a Bash call running at the deadline gets the grace, and the wait it shows buys the time back", () => {
+    let clock = replayClaude(fresh(), [[T0 + 62 * MIN, toolUse("gate", "Bash", "python3 scripts/android-test-gate.py scripted send-now 2>&1")]]);
+    assert.deepEqual(decideRunClock(clock, T0 + BUDGET), { kind: "run", checkAt: T0 + 90 * MIN, grace: true });
+    clock = replayClaude(clock, [[T0 + 72 * MIN, toolResult("gate", `${DEVICE_HELD}\n${deviceFree(540)}`)]]);
+    assert.equal(runClockCreditMs(clock), 540 * S);
+    assert.deepEqual(decideRunClock(clock, T0 + 72 * MIN), { kind: "run", checkAt: T0 + 79 * MIN, grace: false });
+  });
+
+  test("nothing passes the hard ceiling, and ceiling factor 1 is the old plain wall clock", () => {
+    let clock = replayClaude(fresh(), [
+      [T0 + 1 * MIN, toolUse("long")],
+      [T0 + 139 * MIN, toolResult("long", `${deviceFree(4000)}\n${slotGot(4000)}`)],
+    ]);
+    assert.equal(runClockDeadline(clock), T0 + 140 * MIN);
+    assert.deepEqual(decideRunClock(clock, T0 + 140 * MIN), { kind: "stop", reason: "ceiling" });
+    clock = replayClaude(fresh({ ceilingFactor: 1 }), [
+      [T0 + 10 * MIN, toolUse("gate")],
+      [T0 + 30 * MIN, toolResult("gate", deviceFree(1200))],
+      [T0 + 65 * MIN, toolUse("gradle")],
+    ]);
+    assert.equal(runClockDeadline(clock), T0 + BUDGET);
     assert.deepEqual(decideRunClock(clock, T0 + BUDGET), { kind: "stop", reason: "deadline" });
   });
 });
