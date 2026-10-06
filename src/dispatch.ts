@@ -47,11 +47,18 @@ import {
   parseIdleTimeoutMs,
   shouldFireIdleWatchdog,
   IDLE_STALL_REASON,
+  AgentRunFailedError,
   AgentRunStoppedError,
+  advanceClaudeAgentOutput,
+  advanceCodexAgentOutput,
+  agentOutputForMessage,
+  agentOutputOf,
   canSalvagePartialWork,
+  codeBlockTail,
   decidePartialWorkSalvage,
-  runStopKind,
-  type RunStopKind,
+  runFailureKind,
+  type RunFailureKind,
+  AGENT_OUTPUT_MESSAGE_CHARS,
   appendStderrTail,
   noResultErrorMessage,
   scrubCredentials,
@@ -605,6 +612,11 @@ export interface StreamResult {
    *  Captures the agent's intent for the diagnostic comment. Null when
    *  no text was emitted (rare). */
   lastAssistantText: string | null;
+  /** The agent's own last messages and tool calls, newest last, scrubbed
+   *  and ready for a code block (`agentOutputForMessage`). Shown in the
+   *  error comment and the draft-PR salvage body. Absent or "" when the
+   *  agent wrote nothing. */
+  agentOutputTail?: string;
   /**
    * True when the dispatcher fired its own wall-clock SIGTERM at this
    * agent. This is the dispatcher's record of what IT did, and it is the
@@ -989,6 +1001,10 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
     // state-machine semantics.
     let denialState = initPermissionDenialState();
     let forceExitTimer: NodeJS.Timeout | null = null;
+    // The agent's own last messages and tool calls, for the error comment
+    // when the run fails (agent-dispatcher #16, #18).
+    let agentOutput: readonly string[] = [];
+    const agentOutputTail = () => agentOutputForMessage(agentOutput);
 
     // Agent wall clock (wait-credit.ts), both runners. Time a command spent
     // waiting for the Android device hold or a Gradle build place is credited
@@ -1115,6 +1131,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
             idleState = isCodex ? advanceCodexIdleWatchdogState(idleState, msg, Date.now())
               : advanceIdleWatchdogState(idleState, msg, Date.now());
           }
+          agentOutput = isCodex ? advanceCodexAgentOutput(agentOutput, msg) : advanceClaudeAgentOutput(agentOutput, msg);
           if (codex) {
             codex.accept(msg);
             logStreamMessage(opts.logFile, msg);
@@ -1182,6 +1199,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
       if (buffer.trim()) {
         try {
           const msg = JSON.parse(buffer);
+          agentOutput = isCodex ? advanceCodexAgentOutput(agentOutput, msg) : advanceClaudeAgentOutput(agentOutput, msg);
           if (codex) codex.accept(msg);
           initSessionId = captureSessionId(initSessionId, msg);
           logStreamMessage(opts.logFile, msg);
@@ -1201,6 +1219,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
       if (codex) {
         const finished = codex.finish(code, timedOut, Date.now() - startedAt, stderrTail, idleStalled ? idleMs : 0);
         finished.waitCreditMs = runClockCreditMs(clock);
+        finished.agentOutputTail = agentOutputTail();
         if (finished.isError) logStderrTail();
         resolve(finished);
         return;
@@ -1242,6 +1261,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
           stoppedAtDenial: denialState.stoppedAtDenial,
           deniedOpContent: denialState.deniedContent,
           lastAssistantText: denialState.lastAssistantText,
+          agentOutputTail: agentOutputTail(),
           timedOut,
           ...claudeWaitCredit(),
         });
@@ -1268,6 +1288,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
           stoppedAtDenial: denialState.stoppedAtDenial,
           deniedOpContent: denialState.deniedContent,
           lastAssistantText: denialState.lastAssistantText,
+          agentOutputTail: agentOutputTail(),
           timedOut,
           ...claudeWaitCredit(),
         });
@@ -1275,17 +1296,18 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
         logStderrTail();
         // Checked before the wall clock: the stall is the cause even when
         // the backstop also fired while the kill was landing.
-        reject(new AgentRunStoppedError(idleStallMessage(idleMs), "idle_stall"));
+        reject(new AgentRunStoppedError(idleStallMessage(idleMs), "idle_stall", agentOutputTail()));
       } else if (timedOut) {
         logStderrTail();
         const credit = runClockCreditMs(clock);
         reject(new AgentRunStoppedError(`Agent timed out after ${opts.timeoutMs / 1000}s` +
-          (credit > 0 ? ` plus ${Math.round(credit / 1000)}s credited for waiting on the device or a build place` : ""), "timeout"));
+          (credit > 0 ? ` plus ${Math.round(credit / 1000)}s credited for waiting on the device or a build place` : ""), "timeout", agentOutputTail()));
       } else {
         logStderrTail();
         // The scrubbed stderr tail rides in the message, so the ticket's
-        // error comment shows why the CLI died (pyrycode-mobile #1340).
-        reject(new Error(noResultErrorMessage(code, stderrTail)));
+        // error comment shows why the CLI died (pyrycode-mobile #1340),
+        // and the agent's own last output rides beside it.
+        reject(new AgentRunFailedError(noResultErrorMessage(code, stderrTail), agentOutputTail()));
       }
     });
 
@@ -1778,7 +1800,12 @@ async function attemptSaferSalvage(opts: {
       throw new Error(`git push failed: ${pushResult.stderr?.toString() || "unknown"}`);
     }
 
-    const tail = (opts.streamResult.output || "").slice(-2500);
+    // The result frame's `result` text is empty on a max_turns result and
+    // absent from a killed run, so this block was empty on every salvage
+    // (agent-dispatcher #16). The runner's own record comes first.
+    const tail = opts.streamResult.agentOutputTail
+      || codeBlockTail(opts.streamResult.lastAssistantText || opts.streamResult.output || "", AGENT_OUTPUT_MESSAGE_CHARS)
+      || "(the agent wrote no text before it stopped)";
     // Name the budget that actually ran out. The label stays
     // `error:max_turns_salvaged` for wiring reasons, so this is the only
     // place a triaging human learns which door the run exited through —
@@ -2653,12 +2680,13 @@ export async function dispatchToAgent(
     const preserveBlockedWork = streamResult?.runner === "codex"
       && ["codex_blocked", "needs_refinement"].includes(streamResult.terminalReason) && ctx.useWorktree;
     if (preserveBlockedWork) error.message += `\nWorktree preserved for recovery: ${ctx.worktreeDir}`;
-    // A run the dispatcher stopped (wall clock or idle stall) on a branch
-    // that already has a PR: push its leftovers BEFORE the error path and
-    // the worktree teardown, then let the error continue as before. See
-    // `decidePartialWorkSalvage` for the incidents (mobile #1430, #1332).
-    const stopKind = saferSalvaged || preserveBlockedWork ? null : runStopKind(error, streamResult);
-    const partial = stopKind ? await salvagePartialWork(ctx, stopKind) : { keepWorktree: false };
+    // A run that failed (wall clock, idle stall, crash or error result):
+    // push its leftovers BEFORE the error path and the worktree teardown,
+    // then let the error continue as before. See `decidePartialWorkSalvage`
+    // for the incidents (mobile #1430, #1332, #1340) and `runFailureKind`
+    // for the policy stops it never touches.
+    const failureKind = saferSalvaged || preserveBlockedWork ? null : runFailureKind(error, streamResult);
+    const partial = failureKind ? await salvagePartialWork(ctx, failureKind) : { keepWorktree: false };
     await handleDispatchError(error, ctx, streamResult);
     // A rejected commit can leave useful edits. Never erase them or use
     // automatic salvage to work around an approval rejection.
@@ -2810,6 +2838,19 @@ async function scheduleTransientRetry(opts: {
   return { kind: "retry", attempt: newAttempt };
 }
 
+/**
+ * The error comment's section with the agent's own last messages and tool
+ * calls, or "" when there are none (agent-dispatcher #16). Kept out of the
+ * error message itself: the retry classifier reads that message, and the
+ * agent's words could match a transient signature.
+ */
+function agentOutputSection(error: unknown, streamResult: StreamResult | null): string {
+  const tail = agentOutputOf(error, streamResult);
+  return tail
+    ? `\n\n**Last output from the agent** (its messages and tool calls, newest last):\n\n\`\`\`\n${tail}\n\`\`\``
+    : "";
+}
+
 // Outer catch-block body for dispatchToAgent. Logs the error, posts
 // `error:<agent>` label + diagnostic comment + Discord notify. The
 // session-id resume hint is the load-bearing piece for JSONL-replay
@@ -2919,7 +2960,7 @@ export async function handleDispatchError(
           `**Operator action:** investigate process pressure on the host ` +
           `(\`ps -ef | wc -l\`, \`ulimit -u\`, look for orphaned \`claude\` / \`pyry\` processes). ` +
           `The ticket will re-queue on the next pickup cycle once \`${errorLabel}\` is removed.`
-        : `## ⚠️ Agent Error: ${agent.name}\n\nThe ${agent.name} agent encountered an error:\n\n\`\`\`\n${error.message.slice(-2000)}\n\`\`\`${sessionId !== "unknown" ? `\n\n**Debug**: \`${resumeCommand({ runner: streamResult?.runner, sessionId })}\`` : ""}${unrecordedRetry ? `\n\nThe error was a transient one the dispatcher would normally retry, but neither the retry counter nor the retry marker comment could be written — GitHub was refusing writes at the time. A retry nothing recorded would re-run every cycle with no backoff and no cap, so the ticket is parked instead. Strip \`${errorLabel}\` to re-queue it once GitHub is healthy.` : ""}\n\nManual intervention required.`;
+        : `## ⚠️ Agent Error: ${agent.name}\n\nThe ${agent.name} agent encountered an error:\n\n\`\`\`\n${error.message.slice(-2000)}\n\`\`\`${agentOutputSection(error, streamResult)}${sessionId !== "unknown" ? `\n\n**Debug**: \`${resumeCommand({ runner: streamResult?.runner, sessionId })}\`` : ""}${unrecordedRetry ? `\n\nThe error was a transient one the dispatcher would normally retry, but neither the retry counter nor the retry marker comment could be written — GitHub was refusing writes at the time. A retry nothing recorded would re-run every cycle with no backoff and no cap, so the ticket is parked instead. Strip \`${errorLabel}\` to re-queue it once GitHub is healthy.` : ""}\n\nManual intervention required.`;
       await client.addComment(item.issueNumber, commentBody);
     } catch {}
   }
@@ -3787,6 +3828,12 @@ async function runParallelVerifierReview(
   return mergeLegResults(source, final);
 }
 
+/** The first leg's result with the newest leg's agent output, so the
+ *  error comment shows where the run actually stopped. */
+function withLatestAgentOutput(first: StreamResult, tail: string | undefined): StreamResult {
+  return tail && tail !== first.agentOutputTail ? { ...first, agentOutputTail: tail } : first;
+}
+
 /**
  * Same-dispatch resume-in-place: the continuation leg. Sits between the
  * first spawn and `handleAgentResultErrors`. When the run ended by
@@ -3890,7 +3937,7 @@ export async function maybeResumeExhaustedRun(
         `Resume leg ${legNumber} failed: ${e?.message ?? e}\nFalling through to the original error path.`,
       );
       console.warn(`   ⚠️  Resume leg ${legNumber} failed (${e?.message ?? e}) — falling back to the original result`);
-      return first;
+      return withLatestAgentOutput(first, agentOutputOf(e, null) || current.agentOutputTail);
     }
     legsUsed += 1;
     current = mergeLegResults(current, leg);
@@ -3905,7 +3952,7 @@ export async function maybeResumeExhaustedRun(
       );
       console.log(`   ⚠️  Still exhausted after ${legsUsed} resume leg(s) — salvage runs on the original result`);
     }
-    return first;
+    return withLatestAgentOutput(first, current.agentOutputTail);
   }
   return current;
 }
@@ -4102,12 +4149,13 @@ function openPrNumbersFor(ctx: DispatchContext): number[] | null {
 }
 
 /**
- * Commit and push what a stopped run left in its worktree to the branch's
- * existing pull request, and say so on the ticket. Runs from
- * `dispatchToAgent`'s catch, BEFORE `handleDispatchError` and the
- * worktree teardown, for a run that ended by wall-clock timeout or idle
- * stall. Decision in `decidePartialWorkSalvage` (agent-runtime.ts), which
- * also carries the incidents.
+ * Commit and push what a failed run left in its worktree to its branch,
+ * and say so on the ticket. Runs from `dispatchToAgent`'s catch, BEFORE
+ * `handleDispatchError` and the worktree teardown, for a run that ended
+ * by wall-clock timeout, idle stall, crash or error result
+ * (`runFailureKind`). The branch's pull request, if it has one, is named
+ * in the comment; none is opened. Decision in `decidePartialWorkSalvage`
+ * (agent-runtime.ts), which also carries the incidents.
  *
  * It never changes how the failure itself is handled: an idle stall still
  * goes to the transient retry, a timeout still parks under
@@ -4121,7 +4169,7 @@ function openPrNumbersFor(ctx: DispatchContext): number[] | null {
  */
 export async function salvagePartialWork(
   ctx: DispatchContext,
-  stopKind: RunStopKind,
+  stopKind: RunFailureKind,
 ): Promise<{ keepWorktree: boolean }> {
   const { agent, item, client, agentCwd, branchName, logFile, useWorktree } = ctx;
   const { execSync, spawnSync } = ctx.deps;
@@ -4130,11 +4178,11 @@ export async function salvagePartialWork(
   }
   const stopped = stopKind === "timeout"
     ? "hit its wall-clock limit"
-    : "stalled (its stream went silent with no tool running)";
+    : stopKind === "idle_stall"
+      ? "stalled (its stream went silent with no tool running)"
+      : "ended in an error";
   try {
-    const prLookup = openPrNumbersFor(ctx);
-    const prNumbers = prLookup ?? [];
-    const openPrCount = prLookup === null ? -1 : prLookup.length;
+    const prNumbers = openPrNumbersFor(ctx) ?? [];
     const gitStatusOutput = String(execSync(`git status --porcelain`, { cwd: agentCwd, encoding: "utf-8", timeout: 15_000 }));
     // `-q --verify` prints MERGE_HEAD's sha when a merge is in progress
     // and exits 1 with no output when none is.
@@ -4157,7 +4205,7 @@ export async function salvagePartialWork(
       : [];
 
     const decision = decidePartialWorkSalvage({
-      openPrCount, gitStatusOutput, commitsAheadOfOrigin, mergeInProgress, mergeCheckProblems,
+      gitStatusOutput, commitsAheadOfOrigin, mergeInProgress, mergeCheckProblems,
     });
     if (!decision.salvage) {
       ctx.deps.writeLog(logFile, "PARTIAL_SALVAGE_SKIPPED", `${stopKind}: ${decision.reason}`);
@@ -4168,7 +4216,8 @@ export async function salvagePartialWork(
     const dirty = gitStatusOutput.trim().length > 0;
     if (dirty) {
       execSync(`git add -A`, { cwd: agentCwd, stdio: "pipe", timeout: 15_000 });
-      const runShape = stopKind === "timeout" ? "a timed-out run" : "a stalled run";
+      const runShape = stopKind === "timeout" ? "a timed-out run"
+        : stopKind === "idle_stall" ? "a stalled run" : "a run that ended in an error";
       const commit = spawnSync(
         "git",
         [

@@ -1307,10 +1307,33 @@ export function idleWatchdogTickMs(idleMs: number): number {
   return Math.min(30_000, Math.max(1_000, Math.round(idleMs / 10)));
 }
 
-// --------- Partial-work salvage for runs that already have a PR ---------
+// --------- Partial-work salvage for failed runs ---------
 
 /** How a run was stopped by the dispatcher rather than finishing. */
 export type RunStopKind = "timeout" | "idle_stall";
+
+/**
+ * How a failed agent run ended, for partial-work salvage: stopped by the
+ * dispatcher (`RunStopKind`), or `error` for every other failure of the
+ * run itself, such as a CLI crash with no result frame, an API error or
+ * a turn budget the draft-PR salvage could not save.
+ */
+export type RunFailureKind = RunStopKind | "error";
+
+/**
+ * The runner's rejection when a run ended without a result frame. It
+ * carries the agent's own last output (`agentOutputTail`, from
+ * {@link agentOutputForMessage}), because a rejected run hands the
+ * orchestrator no StreamResult to read it from. The message is the same
+ * text the plain `Error` it replaces had, so retry classification reads
+ * the same.
+ */
+export class AgentRunFailedError extends Error {
+  constructor(message: string, readonly agentOutputTail = "") {
+    super(message);
+    this.name = "AgentRunFailedError";
+  }
+}
 
 /**
  * The runner's rejection when the dispatcher itself stopped the run and no
@@ -1324,12 +1347,15 @@ export type RunStopKind = "timeout" | "idle_stall";
  * and #1332 (2026-10-01) both failed with "Agent timed out after 2280s"
  * here, never reaching `handleAgentResultErrors` at all.
  */
-export class AgentRunStoppedError extends Error {
-  constructor(message: string, readonly kind: RunStopKind) {
-    super(message);
+export class AgentRunStoppedError extends AgentRunFailedError {
+  constructor(message: string, readonly kind: RunStopKind, agentOutputTail = "") {
+    super(message, agentOutputTail);
     this.name = "AgentRunStoppedError";
   }
 }
+
+/** Terminal reasons that are policy stops, never salvaged automatically. */
+const POLICY_STOP_REASONS = ["codex_blocked", "needs_refinement", "waiting_on_blocker"];
 
 /**
  * Which stop, if any, ended this run. Both doors count: the runner's
@@ -1351,10 +1377,35 @@ export function runStopKind(
 ): RunStopKind | null {
   if (error instanceof AgentRunStoppedError) return error.kind;
   if (!streamResult || !streamResult.isError || streamResult.hadPermissionDenial) return null;
-  if (["codex_blocked", "needs_refinement", "waiting_on_blocker"].includes(streamResult.terminalReason)) return null;
+  if (POLICY_STOP_REASONS.includes(streamResult.terminalReason)) return null;
   if (streamResult.terminalReason === IDLE_STALL_REASON) return "idle_stall";
   if (streamResult.timedOut) return "timeout";
   return null;
+}
+
+/**
+ * How a failed run ended, or null when its work must not be saved for it.
+ * A dispatcher stop keeps its kind from {@link runStopKind}. Any other
+ * failure of the run itself is `error`: the runner rejected with no result
+ * (a CLI crash, as on pyrycode-mobile #1340), or the result is an error.
+ *
+ * Null, as in `runStopKind`, for a permission denial and a Codex blocked,
+ * refinement or blocker-wait outcome, whose work could repeat a refused
+ * action. Also null for a spawn that never started, and for a run that
+ * succeeded but whose post-run step threw: the agent finished, so there
+ * is no interrupted work.
+ */
+export function runFailureKind(
+  error: unknown,
+  streamResult: Parameters<typeof runStopKind>[1],
+): RunFailureKind | null {
+  const stop = runStopKind(error, streamResult);
+  if (stop) return stop;
+  if (error instanceof ResourceExhaustedError) return null;
+  if (!streamResult) return "error";
+  if (!streamResult.isError || streamResult.hadPermissionDenial) return null;
+  if (POLICY_STOP_REASONS.includes(streamResult.terminalReason)) return null;
+  return "error";
 }
 
 /**
@@ -1365,7 +1416,7 @@ export function runStopKind(
  * refiner/PO carry `false`, so their worktree is never pushed for them.
  */
 export function canSalvagePartialWork(opts: {
-  stopKind: RunStopKind | null;
+  stopKind: RunFailureKind | null;
   agent: Pick<AgentConfig, "producesCommits">;
   useWorktree: boolean;
   issueNumber: number;
@@ -1374,7 +1425,7 @@ export function canSalvagePartialWork(opts: {
 }
 
 /**
- * Whether to commit and push a stopped run's leftovers to its branch.
+ * Whether to commit and push a failed run's leftovers to its branch.
  *
  * Why. The draft-PR salvage (`shouldAttemptSafeSalvage`) only covers a
  * branch with no pull request yet, because it opens one. Every rework,
@@ -1386,9 +1437,16 @@ export function canSalvagePartialWork(opts: {
  * ahead of origin". Pushing to the existing branch fixes both; the PR
  * already exists, so nothing new is opened and nothing auto-advances.
  *
+ * A branch with no PR is pushed too, without opening one (2026-10-06,
+ * agent-dispatcher #18). Only a budget-exhausted result reaches the
+ * draft-PR salvage, and only when the salvage gates pass. A crash, a
+ * timeout through the runner's reject door, or a red gate left the work
+ * in the worktree, and unpushed commits made the next setup abort as
+ * "local ahead of origin" until a person pushed them, as on
+ * pyrycode-mobile #1340. Pushing a feature branch opens nothing and
+ * advances nothing; the ticket still parks or retries as before.
+ *
  * Gates, all required:
- * - an open PR on the branch (`openPrCount > 0`; -1 means the lookup
- *   failed, which skips);
  * - no merge in progress (`MERGE_HEAD`), and a merge handed to this run
  *   passed `checkMergeResolution`, so conflict markers are never pushed;
  * - something to save: uncommitted changes, or local commits origin lacks.
@@ -1396,7 +1454,6 @@ export function canSalvagePartialWork(opts: {
  * Pure; the caller (`salvagePartialWork` in dispatch.ts) does the I/O.
  */
 export function decidePartialWorkSalvage(opts: {
-  openPrCount: number;
   gitStatusOutput: string;
   /** `git rev-list --count origin/<branch>..HEAD`; -1 when unknown. */
   commitsAheadOfOrigin: number;
@@ -1404,8 +1461,6 @@ export function decidePartialWorkSalvage(opts: {
   /** `checkMergeResolution` problems for a merge handed to this run; empty otherwise. */
   mergeCheckProblems: readonly string[];
 }): { salvage: true } | { salvage: false; reason: string } {
-  if (opts.openPrCount < 0) return { salvage: false, reason: "could not look up the branch's pull request" };
-  if (opts.openPrCount === 0) return { salvage: false, reason: "no open pull request on the branch" };
   if (opts.mergeInProgress) return { salvage: false, reason: "a merge is still in progress (MERGE_HEAD)" };
   if (opts.mergeCheckProblems.length > 0) {
     return { salvage: false, reason: `the merge handed to this run failed its check: ${opts.mergeCheckProblems.join(" ")}` };
@@ -1479,7 +1534,119 @@ export function scrubCredentials(text: string): string {
  * close that block early, so those become quotes. "" when there is none.
  */
 export function stderrForMessage(tail: string, max = STDERR_MESSAGE_CHARS): string {
-  return scrubCredentials(tail).slice(-max).replace(/`{3,}/g, "'''").trim();
+  return codeBlockTail(tail, max);
+}
+
+/**
+ * The scrubbed last `max` characters of `text`, safe inside a comment's
+ * code block: a run of three or more backticks would close the block
+ * early, so those become quotes. "" when there is nothing.
+ */
+export function codeBlockTail(text: string, max: number): string {
+  return scrubCredentials(text).slice(-max).replace(/`{3,}/g, "'''").trim();
+}
+
+// --------- Agent output tail: the agent's own last messages ---------
+
+/**
+ * What the agent itself last said and did, kept for the error comment.
+ *
+ * Why. A failed run's error comment held only the dispatcher's error line,
+ * plus the CLI's stderr after a crash. Nothing the agent wrote reached the
+ * ticket, so pyrycode-mobile #1340's verifier (exit code 1 after 21
+ * minutes) and #1430's documentation run (timed out after 38 minutes) left
+ * nothing to explain where they were. The draft-PR salvage body's "Last
+ * messages from the agent" block was empty every time (agent-dispatcher
+ * #16): it read the result frame's `result` text, which a `max_turns`
+ * result does not carry and a killed run never sends.
+ *
+ * Each runner keeps its last AGENT_OUTPUT_ENTRIES entries: every text
+ * message, and a one-line note of every tool call, so a run killed inside
+ * a long command shows which command it was. Tool results are never kept;
+ * they are not the agent's words and can be large.
+ */
+export const AGENT_OUTPUT_ENTRIES = 12;
+/** How much of the joined entries goes into a comment or PR body. */
+export const AGENT_OUTPUT_MESSAGE_CHARS = 2000;
+/** Longest single text message kept, its last part. */
+const AGENT_TEXT_ENTRY_CHARS = 1200;
+/** Longest one-line tool call note kept. */
+const AGENT_TOOL_ENTRY_CHARS = 200;
+
+/** Add one entry, keeping only the last `max`. Blank entries are dropped. */
+export function appendAgentOutput(entries: readonly string[], entry: string, max = AGENT_OUTPUT_ENTRIES): readonly string[] {
+  const trimmed = entry.trim();
+  if (!trimmed) return entries;
+  return [...entries, trimmed].slice(-max);
+}
+
+function textEntry(text: string): string {
+  return text.trim().slice(-AGENT_TEXT_ENTRY_CHARS);
+}
+
+/** `[name] detail` on one line: a command or a file path when the input has
+ *  one, else the input as JSON. */
+function toolEntry(name: string, detail: string): string {
+  const line = `[${name}] ${detail}`.replace(/\s+/g, " ").trim();
+  return line.length > AGENT_TOOL_ENTRY_CHARS ? `${line.slice(0, AGENT_TOOL_ENTRY_CHARS)}…` : line;
+}
+
+/** Claude stream-json: an `assistant` message's text and tool_use blocks. */
+export function advanceClaudeAgentOutput(entries: readonly string[], msg: unknown): readonly string[] {
+  const m = msg as { type?: unknown; message?: { content?: unknown } } | null;
+  if (!m || m.type !== "assistant" || !Array.isArray(m.message?.content)) return entries;
+  let out = entries;
+  for (const block of m.message!.content as Array<Record<string, unknown> | null>) {
+    if (block?.type === "text" && typeof block.text === "string") {
+      out = appendAgentOutput(out, textEntry(block.text));
+    } else if (block?.type === "tool_use") {
+      const input = (block.input ?? {}) as Record<string, unknown>;
+      const detail = typeof input.command === "string" ? input.command
+        : typeof input.file_path === "string" ? input.file_path
+        : JSON.stringify(input);
+      out = appendAgentOutput(out, toolEntry(String(block.name ?? "tool"), detail));
+    }
+  }
+  return out;
+}
+
+/** Codex JSONL: agent messages, and the start of each command, MCP call and
+ *  file change. A command is noted when it starts, so a run killed while it
+ *  ran still shows it. */
+export function advanceCodexAgentOutput(entries: readonly string[], event: unknown): readonly string[] {
+  const e = event as { type?: unknown; item?: Record<string, unknown> } | null;
+  const item = e?.item;
+  if (!item) return entries;
+  if (e!.type === "item.completed" && item.type === "agent_message" && typeof item.text === "string") {
+    return appendAgentOutput(entries, textEntry(item.text));
+  }
+  if (e!.type === "item.started" && item.type === "command_execution" && typeof item.command === "string") {
+    return appendAgentOutput(entries, toolEntry("shell", item.command));
+  }
+  if (e!.type === "item.started" && item.type === "mcp_tool_call") {
+    return appendAgentOutput(entries, toolEntry(`${String(item.server ?? "?")}.${String(item.tool ?? "?")}`, ""));
+  }
+  if (e!.type === "item.completed" && item.type === "file_change" && Array.isArray(item.changes)) {
+    const paths = (item.changes as Array<{ path?: unknown } | null>)
+      .map((c) => (typeof c?.path === "string" ? c.path : "")).filter(Boolean);
+    return paths.length > 0 ? appendAgentOutput(entries, toolEntry("edit", paths.join(", "))) : entries;
+  }
+  return entries;
+}
+
+/** The kept entries, newest last, ready for a code block. "" when none. */
+export function agentOutputForMessage(entries: readonly string[], max = AGENT_OUTPUT_MESSAGE_CHARS): string {
+  return codeBlockTail(entries.join("\n"), max);
+}
+
+/**
+ * The agent's own last output for a failed run's comment: the result's
+ * tail when the run returned one, else the tail the runner's rejection
+ * carried. "" when neither has any.
+ */
+export function agentOutputOf(error: unknown, streamResult: { agentOutputTail?: string } | null): string {
+  if (streamResult?.agentOutputTail) return streamResult.agentOutputTail;
+  return error instanceof AgentRunFailedError ? error.agentOutputTail : "";
 }
 
 /** Opens the stderr section that {@link noResultErrorMessage} appends. */

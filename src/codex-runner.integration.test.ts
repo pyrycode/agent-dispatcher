@@ -68,6 +68,10 @@ process.stdin.on('end', async () => {
   if (process.env.TEST_MODE === 'blocked') events[2].item.text = JSON.stringify({status:'blocked', summary:'Required action rejected by review'});
   if (process.env.TEST_MODE === 'unicode') events[2].item.text = JSON.stringify({status:'completed', summary:'Fixture café finished'});
   if (process.env.TEST_MODE === 'missing-terminal') events.pop();
+  if (process.env.TEST_MODE === 'work-then-fail') events.splice(2, 2,
+    {type:'item.completed', item:{id:'m0', type:'agent_message', text:'Running the device gate.'}},
+    {type:'item.started', item:{id:'g', type:'command_execution', command:'./gradlew check', aggregated_output:'', exit_code:null, status:'in_progress'}},
+    {type:'turn.failed', error:{message:'stream disconnected before completion'}});
   const output = events.map(event => JSON.stringify(event)).join('\\n');
   if (process.env.TEST_MODE === 'unicode') {
     const bytes = Buffer.from(output);
@@ -187,6 +191,13 @@ test("Codex nonzero process exit cannot become success after a completed turn", 
   assert.equal(result.isError, true);
   assert.equal(result.terminalReason, "codex_error");
   assert.match(result.output, /code 7/);
+});
+
+test("a failed Codex run carries the agent's own last messages and commands (#16)", async t => {
+  const result = await runClaudeStreaming(fixture(t, "work-then-fail").options);
+  assert.equal(result.isError, true);
+  assert.equal(result.terminalReason, "codex_error");
+  assert.equal(result.agentOutputTail, "Running the device gate.\n[shell] ./gradlew check");
 });
 
 test("Codex UTF-8 summary split within a character survives stdout buffering", async t => {
