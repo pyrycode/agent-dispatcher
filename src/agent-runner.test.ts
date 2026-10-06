@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { agentShellEnvNameProblem, buildCodexInvocation, codexRefusalText, codexRouterMessages, CodexStreamAdapter, failedMcpCallLogLine, formatRunCost, MCP_FAILURE_LOG_CAP, MCP_STARTUP_RETRIES, MCP_STARTUP_RETRY_WAIT_MS, resolveAgentShellEnv, resumeCommand, resolveAgentRunner, resolveCodexExecutable, retryRequiredMcpStartup } from "./agent-runner.js";
+import { agentShellEnvNameProblem, buildCodexInvocation, codexRefusalText, codexRouterMessages, CodexStreamAdapter, failedMcpCallLogLine, formatRunCost, MCP_FAILURE_LOG_CAP, MCP_STARTUP_RETRIES, MCP_STARTUP_RETRY_WAIT_MS, resolveAgentShellEnv, resumeCommand, resolveAgentRunner, resolveCodexExecutable, retryRequiredMcpStartup, TOOL_UNAVAILABLE_REASON, unavailableToolName } from "./agent-runner.js";
 import { advanceCodexIdleWatchdogState, initIdleWatchdogState, runStopKind, shouldFireIdleWatchdog, type IdleWatchdogState } from "./agent-runtime.js";
 import { classifyAgentError } from "./pipeline-decisions.js";
 
@@ -520,5 +520,99 @@ describe("required MCP startup retry", () => {
     }, { sleep: async () => {} });
     assert.equal(runs, 1);
     assert.equal(result.isError, true);
+  });
+});
+
+// 11 Pyrycode Mobile runs, 3 to 6 October 2026, started without the Figma
+// plugin's tools. Codex printed nothing, and each agent stopped as blocked
+// within a minute. The agent now ends with a fixed stop line instead.
+describe("TOOL_UNAVAILABLE stop line retry", () => {
+  const summary = "Required Figma tools get_design_context and get_screenshot are unavailable. No files changed.\nTOOL_UNAVAILABLE: figma";
+  const codexBlocked = (text = summary) => {
+    const codex = new CodexStreamAdapter();
+    codex.accept({ type: "thread.started", thread_id: "t" });
+    codex.accept({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ status: "blocked", summary: text }) } });
+    codex.accept({ type: "turn.completed", usage: {} });
+    return codex.finish(0, false, 10);
+  };
+  const codexDone = () => {
+    const codex = new CodexStreamAdapter();
+    codex.accept({ type: "thread.started", thread_id: "t" });
+    codex.accept({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ status: "completed", summary: "done" }) } });
+    codex.accept({ type: "turn.completed", usage: {} });
+    return codex.finish(0, false, 10);
+  };
+  const claudeStopped = () => ({
+    ...codexDone(), runner: "claude" as const, isError: false, terminalReason: "stop",
+    output: "The Figma plugin tools are not in my tool list, so I stopped.\n\nTOOL_UNAVAILABLE: figma\n",
+  });
+  const run = { output: "", timedOut: false, hadPermissionDenial: false };
+
+  test("only the last non-blank line counts, with or without backticks", () => {
+    assert.equal(unavailableToolName({ ...run, output: "Stopped.\nTOOL_UNAVAILABLE: figma" }), "figma");
+    assert.equal(unavailableToolName({ ...run, output: "Stopped.\n`TOOL_UNAVAILABLE: codegraph`\n\n" }), "codegraph");
+    assert.equal(unavailableToolName({ ...run, output: "TOOL_UNAVAILABLE: figma\nThen I carried on and finished." }), null);
+    assert.equal(unavailableToolName({ ...run, output: "The rule says to print TOOL_UNAVAILABLE: figma" }), null);
+    assert.equal(unavailableToolName({ ...run, output: "TOOL_UNAVAILABLE:" }), null);
+  });
+
+  test("a timed-out run or a permission denial never counts", () => {
+    const output = "TOOL_UNAVAILABLE: figma";
+    assert.equal(unavailableToolName({ ...run, output, timedOut: true }), null);
+    assert.equal(unavailableToolName({ ...run, output, hadPermissionDenial: true }), null);
+  });
+
+  test("a blocked Codex run ending on the line is retried inside the run until the tools are there", async () => {
+    const results = [codexBlocked(), codexBlocked(), codexDone()];
+    const waits: number[] = [];
+    const logs: string[] = [];
+    let runs = 0;
+    const result = await retryRequiredMcpStartup(async () => results[runs++], { sleep: async ms => { waits.push(ms); }, log: m => logs.push(m) });
+    assert.equal(runs, 3);
+    assert.equal(result.isError, false);
+    assert.deepEqual(waits, [MCP_STARTUP_RETRY_WAIT_MS, MCP_STARTUP_RETRY_WAIT_MS]);
+    assert.match(logs[0], /TOOL_UNAVAILABLE: figma: retry 1\/3/);
+  });
+
+  test("a Claude run ending on the line retries the same way", async () => {
+    const results = [claudeStopped(), { ...claudeStopped(), output: "Finished the ticket." }];
+    let runs = 0;
+    const result = await retryRequiredMcpStartup(async () => results[runs++], { sleep: async () => {} });
+    assert.equal(runs, 2);
+    assert.equal(result.output, "Finished the ticket.");
+  });
+
+  for (const [runner, make] of [["Codex", codexBlocked], ["Claude", claudeStopped]] as const) {
+    test(`${runner}: after the last retry it parks as an error naming the server`, async () => {
+      let runs = 0;
+      const result = await retryRequiredMcpStartup(async () => { runs++; return make(); }, { sleep: async () => {} });
+      assert.equal(runs, MCP_STARTUP_RETRIES + 1);
+      assert.equal(result.isError, true);
+      assert.equal(result.terminalReason, TOOL_UNAVAILABLE_REASON);
+      assert.match(result.output, /^Required MCP server or plugin unavailable: figma\. The agent stopped with "TOOL_UNAVAILABLE: figma" on all 4 tries, 15 seconds apart\./);
+      assert.match(result.output, /TOOL_UNAVAILABLE: figma$/m);
+    });
+  }
+
+  test("a block without the line is not retried here", async () => {
+    let runs = 0;
+    const result = await retryRequiredMcpStartup(async () => { runs++; return codexBlocked("Required Figma tools are unavailable in this session."); }, { sleep: async () => {} });
+    assert.equal(runs, 1);
+    assert.equal(result.terminalReason, "codex_blocked");
+  });
+
+  test("an approval rejection is not retried, whatever the summary says", async () => {
+    let runs = 0;
+    const result = await retryRequiredMcpStartup(async () => {
+      runs++;
+      const codex = new CodexStreamAdapter();
+      codex.accept({ type: "item.completed", item: { type: "command_execution", status: "declined", aggregated_output: "This action was rejected due to unacceptable risk." } });
+      codex.accept({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ status: "blocked", summary }) } });
+      codex.accept({ type: "turn.completed", usage: {} });
+      return codex.finish(0, false, 10);
+    }, { sleep: async () => {} });
+    assert.equal(runs, 1);
+    assert.equal(result.hadPermissionDenial, true);
+    assert.equal(result.terminalReason, "codex_blocked");
   });
 });

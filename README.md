@@ -558,6 +558,20 @@ salvages the blocked run's work: when that run left uncommitted edits or unpushe
 commits, the retry continues from them in the same worktree (see "Reusing the
 agent's own preserved worktree" above).
 
+A missing MCP server is retried sooner, inside the same dispatch, on either
+runner. Two cases count. Codex refuses to start because a server marked
+`required = true` failed to connect. Or the agent ends its output with the
+fixed stop line `TOOL_UNAVAILABLE: <server or plugin name>`, which each agents
+repo's `docs/working-practice.md` tells it to print when a tool it needs from
+an MCP server or plugin is missing or will not connect. Under Codex the line
+ends the blocked summary. Only the last non-blank line counts, and never on a
+timed-out run or a permission denial. Either case gets up to 3 more tries, 15
+seconds apart. If the stop line survives the last try, the ticket parks with
+`error:<agent>` and a comment naming the server, with no backoff retry. Added
+after 11 Pyrycode Mobile runs from 3 to 6 October 2026 started without the
+Figma plugin's tools while Codex printed nothing, and each agent stopped as
+blocked within a minute.
+
 A block after Codex's approval reviewer failed to decide also retries, on the same
 backoff and cap. Codex says so in its own output, on stderr or in a tool item:
 "automatic approval review could not be completed. This is a review failure, not a

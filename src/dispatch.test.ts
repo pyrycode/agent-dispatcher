@@ -118,7 +118,7 @@ import {
 import { AGENTS } from "./types.js";
 import { AgentRunStoppedError, buildResumePrompt, idleStallMessage, noResultErrorMessage, ResourceExhaustedError, timeoutFor } from "./agent-runtime.js";
 import { resolveAgentsRepoRoot, resolveTargetRepoRoot } from "./worktree.js";
-import { CodexStreamAdapter } from "./agent-runner.js";
+import { CodexStreamAdapter, TOOL_UNAVAILABLE_REASON } from "./agent-runner.js";
 
 // Importing dispatch.ts loads the fork's .env, so a fork running this suite
 // from its installed copy (bin/pyry-test) handed the tests its own stage set
@@ -9374,6 +9374,29 @@ describe("Codex blocked on a missing tool or variable — auto-retry", () => {
     assert.ok(!client.addLabelCalls.some(c => c.label === "done:developer"));
     assert.ok(!calls.exec.slice(spawnIndex).some(c => c.cmd.includes("git add") || c.cmd.includes("git push")));
   });
+});
+
+// The agent's TOOL_UNAVAILABLE stop line is retried inside the run
+// (retryRequiredMcpStartup). A result still ending on it after the last try
+// arrives as TOOL_UNAVAILABLE_REASON and parks at once, naming the server.
+test("a tool still unavailable after the in-run retries parks with the server named, no backoff retry", async () => {
+  const client = new MockGitHubClient({ status: { 1603: "In Development" }, labels: { 1603: [] } });
+  let spawnIndex = 0;
+  const { deps, calls } = makeMockDeps({
+    execImpls: fullHappyExecImpls("feature/1603"),
+    fsMap: { [claudeMdAbsPath("developer/CLAUDE.md")]: "role" },
+    streamResult: () => {
+      spawnIndex = calls.exec.length;
+      return streamResult({ runner: "codex", isError: true, terminalReason: TOOL_UNAVAILABLE_REASON, sessionId: "codex-thread",
+        output: "Required MCP server or plugin unavailable: figma. The agent stopped with \"TOOL_UNAVAILABLE: figma\" on all 4 tries, 15 seconds apart.\n\nThe Figma server did not connect: fetch failed.\nTOOL_UNAVAILABLE: figma" });
+    },
+  });
+  await dispatchToAgent(makeAgentConfig({}), makeProjectItem({ issueNumber: 1603 }), client, deps);
+  assert.ok(client.addLabelCalls.some(c => c.label === "error:developer"));
+  assert.ok(!client.addLabelCalls.some(c => c.label.startsWith("error-retry-count:")), "already retried inside the run; \"fetch failed\" in the agent's text is not a transport error");
+  const park = client.comments.find(c => c.body.includes("Agent Error"))?.body ?? "";
+  assert.match(park, /```\nRequired MCP server or plugin unavailable: figma\./, "the reason leads the comment");
+  assert.ok(!calls.exec.slice(spawnIndex).some(c => c.cmd.includes("git add") || c.cmd.includes("git push")), "nothing salvaged");
 });
 
 // pyrycode-mobile #1582 and #1655, 2026-10-05: Codex's automatic approval

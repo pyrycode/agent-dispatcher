@@ -28,7 +28,7 @@ import {
   runClockDeadline,
   type RunClock,
 } from "./wait-credit.js";
-import { buildClaudeSourceReviewInvocation, buildCodexInvocation, codexChildEnv, CODEX_ROLE_GUIDANCE, CodexStreamAdapter, failedMcpCallLogLine, formatRunCost, resolveAgentShellEnv, resumeCommand, resolveAgentRunner, resolveCodexExecutable, retryRequiredMcpStartup, type AgentRunner } from "./agent-runner.js";
+import { buildClaudeSourceReviewInvocation, buildCodexInvocation, codexChildEnv, CODEX_ROLE_GUIDANCE, CodexStreamAdapter, failedMcpCallLogLine, formatRunCost, resolveAgentShellEnv, resumeCommand, resolveAgentRunner, resolveCodexExecutable, retryRequiredMcpStartup, TOOL_UNAVAILABLE_REASON, type AgentRunner } from "./agent-runner.js";
 import { createRunnerSelector, runnerFilePath } from "./runner-file.js";
 
 import { GitHubProjectClient } from "./github.js";
@@ -1318,7 +1318,8 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
  * unchanged. Persistent retryable failures throw `ResourceExhaustedError`,
  * which `handleDispatchError` maps to a distinct
  * `error:<agent>:resource_exhausted` label. A Codex run whose required
- * MCP server failed to start is retried a few times too, see
+ * MCP server failed to start, or a run that ended on the agent's
+ * `TOOL_UNAVAILABLE` stop line, is retried a few times too, see
  * `retryRequiredMcpStartup`.
  */
 export async function runClaudeStreaming(opts: RunClaudeOpts): Promise<StreamResult> {
@@ -2878,7 +2879,8 @@ export async function handleDispatchError(
         approvalRejected: streamResult?.hadPermissionDenial === true,
         approvalReviewFailed: streamResult?.approvalReviewFailed === true,
       })
-      : terminalReason === "needs_refinement"
+      // A missing tool was already retried inside the run.
+      : terminalReason === "needs_refinement" || terminalReason === TOOL_UNAVAILABLE_REASON
         ? { transient: false, signature: "" }
         : classifyAgentError(classifyText, { terminalReason: streamResult?.terminalReason });
     if (transient) {
@@ -3934,6 +3936,12 @@ export async function handleAgentResultErrors(
   ctx: DispatchContext,
 ): Promise<boolean> {
   if (!streamResult.isError && !streamResult.stoppedAtDenial) return false;
+  // A tool still missing after the in-run retries parks with the reason
+  // `retryRequiredMcpStartup` wrote. The agent stopped at once, so there is
+  // nothing to salvage.
+  if (streamResult.terminalReason === TOOL_UNAVAILABLE_REASON) {
+    throw new Error(streamResult.output.slice(0, 2000));
+  }
   // A blocked task is never salvaged automatically, including a shutdown
   // timeout after its final outcome. Salvage could repeat a rejected action.
   if (streamResult.runner === "codex" && streamResult.terminalReason === "codex_blocked") {
