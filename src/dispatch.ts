@@ -28,7 +28,7 @@ import {
   runClockDeadline,
   type RunClock,
 } from "./wait-credit.js";
-import { buildClaudeSourceReviewInvocation, buildCodexInvocation, codexChildEnv, CODEX_ROLE_GUIDANCE, CodexStreamAdapter, failedMcpCallLogLine, formatRunCost, resolveAgentShellEnv, resumeCommand, resolveAgentRunner, resolveCodexExecutable, type AgentRunner } from "./agent-runner.js";
+import { buildClaudeSourceReviewInvocation, buildCodexInvocation, codexChildEnv, CODEX_ROLE_GUIDANCE, CodexStreamAdapter, failedMcpCallLogLine, formatRunCost, resolveAgentShellEnv, resumeCommand, resolveAgentRunner, resolveCodexExecutable, retryRequiredMcpStartup, type AgentRunner } from "./agent-runner.js";
 import { createRunnerSelector, runnerFilePath } from "./runner-file.js";
 
 import { GitHubProjectClient } from "./github.js";
@@ -1317,23 +1317,24 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
  * crash mid-stream) propagate to the caller's existing error path
  * unchanged. Persistent retryable failures throw `ResourceExhaustedError`,
  * which `handleDispatchError` maps to a distinct
- * `error:<agent>:resource_exhausted` label.
+ * `error:<agent>:resource_exhausted` label. A Codex run whose required
+ * MCP server failed to start is retried a few times too, see
+ * `retryRequiredMcpStartup`.
  */
 export async function runClaudeStreaming(opts: RunClaudeOpts): Promise<StreamResult> {
   const sourceCwd = opts.sourceReview ? mkdtempSync(resolve(tmpdir(), "pyry-source-review-")) : null;
   if (sourceCwd) opts = { ...opts, cwd: sourceCwd };
+  const logger = (msg: string) => {
+    const ts = new Date().toLocaleTimeString("en-GB", {
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+    });
+    appendFileSync(opts.logFile, `[${ts}] ♻️  ${msg}\n`);
+    console.log(`   ♻️  ${msg}`);
+  };
   try {
-    return await retrySpawnOnTransientError(
-      () => runClaudeStreamingOnce(opts),
-      {
-        logger: (msg: string) => {
-          const ts = new Date().toLocaleTimeString("en-GB", {
-            hour: "2-digit", minute: "2-digit", second: "2-digit",
-          });
-          appendFileSync(opts.logFile, `[${ts}] ♻️  ${msg}\n`);
-          console.log(`   ♻️  ${msg}`);
-        },
-      },
+    return await retryRequiredMcpStartup(
+      () => retrySpawnOnTransientError(() => runClaudeStreamingOnce(opts), { logger }),
+      { log: logger },
     );
   } finally {
     // Empty by design. Never recursively delete anything an agent wrote.

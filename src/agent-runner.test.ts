@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { agentShellEnvNameProblem, buildCodexInvocation, codexRefusalText, codexRouterMessages, CodexStreamAdapter, failedMcpCallLogLine, formatRunCost, MCP_FAILURE_LOG_CAP, resolveAgentShellEnv, resumeCommand, resolveAgentRunner, resolveCodexExecutable } from "./agent-runner.js";
+import { agentShellEnvNameProblem, buildCodexInvocation, codexRefusalText, codexRouterMessages, CodexStreamAdapter, failedMcpCallLogLine, formatRunCost, MCP_FAILURE_LOG_CAP, MCP_STARTUP_RETRIES, MCP_STARTUP_RETRY_WAIT_MS, resolveAgentShellEnv, resumeCommand, resolveAgentRunner, resolveCodexExecutable, retryRequiredMcpStartup } from "./agent-runner.js";
 import { advanceCodexIdleWatchdogState, initIdleWatchdogState, runStopKind, shouldFireIdleWatchdog, type IdleWatchdogState } from "./agent-runtime.js";
 import { classifyAgentError } from "./pipeline-decisions.js";
 
@@ -475,5 +475,50 @@ describe("failed MCP call log line (#1783)", () => {
     assert.match(failedMcpCallLogLine(item)!, /x…\(truncated\)$/);
     const secret = { ...items.codexRefused.item, error: { message: "auth failed for ghp_abcdefghijklmnopqrstuvwxyz0123456789" } };
     assert.doesNotMatch(failedMcpCallLogLine(secret)!, /ghp_abcdefghijklmnopqrstuvwxyz0123456789/);
+  });
+});
+
+describe("required MCP startup retry", () => {
+  const mcpFailure = () => {
+    const codex = new CodexStreamAdapter();
+    codex.accept({ type: "error", message: "required MCP servers failed to initialize: figma: request timed out" });
+    return codex.finish(1, false, 10);
+  };
+  const success = () => {
+    const codex = new CodexStreamAdapter();
+    codex.accept({ type: "thread.started", thread_id: "t" });
+    codex.accept({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ status: "completed", summary: "done" }) } });
+    codex.accept({ type: "turn.completed", usage: {} });
+    return codex.finish(0, false, 10);
+  };
+
+  test("a failed Figma connection is retried inside the run until it connects", async () => {
+    const results = [mcpFailure(), mcpFailure(), success()];
+    const waits: number[] = [];
+    let runs = 0;
+    const result = await retryRequiredMcpStartup(async () => results[runs++], { sleep: async ms => { waits.push(ms); } });
+    assert.equal(runs, 3);
+    assert.equal(result.isError, false);
+    assert.deepEqual(waits, [MCP_STARTUP_RETRY_WAIT_MS, MCP_STARTUP_RETRY_WAIT_MS]);
+  });
+
+  test("after the last retry the failure still parks as an agent error", async () => {
+    let runs = 0;
+    const result = await retryRequiredMcpStartup(async () => { runs++; return mcpFailure(); }, { sleep: async () => {} });
+    assert.equal(runs, MCP_STARTUP_RETRIES + 1);
+    assert.equal(result.terminalReason, "codex_error");
+    assert.match(result.output, /required MCP servers failed to initialize: figma/);
+  });
+
+  test("any other Codex error is not retried", async () => {
+    let runs = 0;
+    const result = await retryRequiredMcpStartup(async () => {
+      runs++;
+      const codex = new CodexStreamAdapter();
+      codex.accept({ type: "error", message: "something else broke" });
+      return codex.finish(1, false, 10);
+    }, { sleep: async () => {} });
+    assert.equal(runs, 1);
+    assert.equal(result.isError, true);
   });
 });
