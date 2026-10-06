@@ -16,6 +16,7 @@ import {
   parseHealthCacheMs,
   parseHealthChecks,
   runHealthCommand,
+  startupHealthCheck,
   type CommandOutcome,
   type CommandRunner,
 } from "./health-check.js";
@@ -312,5 +313,65 @@ describe("pre-dispatch health check (agent-dispatcher#131)", () => {
     assert.equal(out.held, 0);
     const none = await dropStillHeld({ itemsByColumn, ...args, checks: [] });
     assert.equal(none.itemsByColumn, itemsByColumn);
+  });
+});
+
+// The startup banner listed the checks, but nothing said whether they
+// passed: a pass was silent and a failure surfaced only when a ticket was
+// held. The checks now run once at startup and say which way it went.
+describe("startup health check", () => {
+  const env = {
+    PYRY_HEALTH_GITHUB_CMD: "gh auth status",
+    PYRY_HEALTH_FIGMA_CMD: "figma-check",
+    PYRY_HEALTH_DAEMON_CMD: "pyry --version",
+  };
+
+  test("when every check passes it logs one clear pass line naming them, and the loop reuses the results", async () => {
+    const checks = parseHealthChecks(env);
+    const { run, calls } = fakeRunner({ "gh auth status": ok, "figma-check": ok, "pyry --version": { ...ok, stdout: "pyry 0.34.0\n" } });
+    const checker = new HealthChecker({ run, cwd: "/repo", ttlMs: 60_000 });
+    const lines: string[] = [];
+    const out = await startupHealthCheck({
+      checks, checker, roles: ["documentation", "builder"], envFor: (role) => ({ key: role, env: {} }),
+      liveGateEnv: {}, notify: async () => {}, state: newHealthNoticeState(), log: (l) => lines.push(l),
+    });
+    assert.equal(out.passed, true);
+    assert.equal(lines.length, 1, lines.join("\n"));
+    assert.match(lines[0]!, /Startup health check passed/);
+    for (const title of ["GitHub login", "Figma MCP tools", "Test daemon version"]) assert.ok(lines[0]!.includes(title), title);
+    const before = calls.length;
+    await checker.check(checks[0]!, "builder", {});
+    assert.equal(calls.length, before, "the first cycle reads the startup result from the cache");
+  });
+
+  test("a failing check gets a clear failure line naming it, its setting and who it holds, and is announced once", async () => {
+    const checks = parseHealthChecks(env);
+    const { run } = fakeRunner({ "gh auth status": ok, "figma-check": fail("not logged in"), "pyry --version": { ...ok, stdout: "0.34.0" } });
+    const lines: string[] = [];
+    const notices: string[] = [];
+    const state = newHealthNoticeState();
+    const out = await startupHealthCheck({
+      checks, checker: new HealthChecker({ run, cwd: "/repo", ttlMs: 60_000 }), roles: ["builder", "documentation"],
+      envFor: (role) => ({ key: role, env: {} }), liveGateEnv: null, notify: async (m) => { notices.push(m); }, state, log: (l) => lines.push(l),
+    });
+    assert.equal(out.passed, false);
+    const failed = lines.filter((l) => /Startup health check failed/.test(l));
+    assert.equal(failed.length, 1, lines.join("\n"));
+    assert.match(failed[0]!, /Figma MCP tools \(PYRY_HEALTH_FIGMA_CMD\) for builder runs: exited with status 1: `not logged in`/);
+    assert.ok(!lines.some((l) => /passed/.test(l)), "no pass line when a check failed");
+    assert.equal(notices.length, 1, "one Discord notice, and the loop will not repeat it");
+    assert.ok(state.failing.has("figma|builder"));
+  });
+
+  test("no checks configured logs nothing and runs nothing", async () => {
+    const { run, calls } = fakeRunner({});
+    const lines: string[] = [];
+    const out = await startupHealthCheck({
+      checks: [], checker: new HealthChecker({ run, cwd: "/repo", ttlMs: 60_000 }), roles: ["builder"],
+      envFor: (role) => ({ key: role, env: {} }), liveGateEnv: {}, notify: async () => {}, state: newHealthNoticeState(), log: (l) => lines.push(l),
+    });
+    assert.equal(out.passed, true);
+    assert.deepStrictEqual(lines, []);
+    assert.equal(calls.length, 0);
   });
 });

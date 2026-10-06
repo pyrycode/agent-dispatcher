@@ -9663,6 +9663,14 @@ describe("runEnvPreflight — a required variable missing from the dispatcher ho
     assert.match(src, /if \(mainSweep !== null && mayStartMainSweep\(\{ configured: true, sweepRunning: sweepRun !== null, gateActive, envHeld, draining: drainMode \}\)\)/);
   });
 
+  test("the poll loop runs the health checks once at startup, before its first cycle (source tripwire)", () => {
+    const src = readDispatchSource();
+    const loop = src.indexOf("export async function pollLoop(");
+    const startup = src.indexOf("await startupHealthCheck({", loop);
+    const firstCycle = src.indexOf("while (true) {", loop);
+    assert.ok(loop > 0 && startup > loop && firstCycle > startup, "the startup check runs before the first cycle");
+  });
+
   test("the poll loop runs the health checks between selection and prep (source tripwire, agent-dispatcher#131)", () => {
     const src = readDispatchSource();
     assert.match(src, /itemsByColumn: stillHeld\.itemsByColumn,/, "selection skips tickets still held");

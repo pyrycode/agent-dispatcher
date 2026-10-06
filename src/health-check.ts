@@ -300,6 +300,8 @@ async function runChecks(
   who: string,
   notify: (message: string) => Promise<void>,
   state: HealthNoticeState,
+  /** The caller logs failures itself, as the startup check does. */
+  quiet = false,
 ): Promise<Failure[]> {
   const failures: Failure[] = [];
   for (const check of checks) {
@@ -310,7 +312,7 @@ async function runChecks(
       failures.push({ check, result });
       if (!state.failing.has(key)) {
         state.failing.add(key);
-        console.warn(`   🩺 Health check failed for ${who}: ${check.title} (${check.setting}) ${result.detail}`);
+        if (!quiet) console.warn(`   🩺 Health check failed for ${who}: ${check.title} (${check.setting}) ${result.detail}`);
         await notifySafely(notify,
           `🩺 **${process.env.GITHUB_REPO ?? "dispatcher"}**: ${check.title} check failed for ${who}: ${result.detail}. ` +
           `Those runs are held, not errored, until it passes (\`${check.setting}\`).`);
@@ -439,4 +441,53 @@ export async function liveGateHealthFailures(opts: {
   const checks = checksForLiveGate(opts.checks);
   if (checks.length === 0) return [];
   return runChecks(checks, opts.checker, () => ({ key: "live-gate", env: opts.env }), "the live gate", opts.notify, opts.state);
+}
+
+/**
+ * Run every configured check once at startup and say whether they passed:
+ * one pass line naming the checks, or one failure line per failing check
+ * naming it, its setting and the runs it holds. Before this, a pass was
+ * silent and a failure showed only once a ticket was held. Each check runs
+ * for every role it guards in `roles`, in that role's environment, and for
+ * the live gate when `liveGateEnv` is given. The results are cached, so the
+ * first cycle reuses them, and a failure is announced on Discord once, as
+ * the loop would.
+ */
+export async function startupHealthCheck(opts: {
+  checks: readonly HealthCheck[];
+  checker: HealthChecker;
+  roles: readonly string[];
+  envFor: HealthEnvFor;
+  /** The live gate's environment, or null when the fork has no live gate. */
+  liveGateEnv: NodeJS.ProcessEnv | null;
+  notify: (message: string) => Promise<void>;
+  state: HealthNoticeState;
+  log?: (line: string) => void;
+}): Promise<{ passed: boolean; failures: Array<Failure & { who: string }> }> {
+  const log = opts.log ?? ((line: string) => console.log(line));
+  if (opts.checks.length === 0) return { passed: true, failures: [] };
+  const failures: Array<Failure & { who: string }> = [];
+  const ran = new Set<HealthCheckName>();
+  const runFor = async (checks: readonly HealthCheck[], who: string, envFor: (check: HealthCheck) => { key: string; env: NodeJS.ProcessEnv }) => {
+    for (const f of await runChecks(checks, opts.checker, envFor, who, opts.notify, opts.state, true)) failures.push({ ...f, who });
+    for (const c of checks) ran.add(c.name);
+  };
+  for (const role of opts.roles) {
+    const checks = checksForRole(opts.checks, role);
+    if (checks.length > 0) await runFor(checks, `${role} runs`, (check) => opts.envFor(role, check));
+  }
+  if (opts.liveGateEnv !== null) {
+    const env = opts.liveGateEnv;
+    const checks = checksForLiveGate(opts.checks);
+    if (checks.length > 0) await runFor(checks, "the live gate", () => ({ key: "live-gate", env }));
+  }
+  if (failures.length === 0) {
+    const titles = opts.checks.filter((c) => ran.has(c.name)).map((c) => c.title);
+    if (titles.length > 0) log(`   🩺 Startup health check passed: ${titles.join(", ")}`);
+    return { passed: true, failures };
+  }
+  for (const f of failures) {
+    log(`   🩺 Startup health check failed: ${f.check.title} (${f.check.setting}) for ${f.who}: ${f.result.detail}. ${f.who === "the live gate" ? "The live gate is skipped" : "Those runs are held"} until it passes.`);
+  }
+  return { passed: false, failures };
 }
