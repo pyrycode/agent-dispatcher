@@ -412,12 +412,42 @@ export const MCP_STARTUP_RETRIES = 3;
 /** Wait between those tries. */
 export const MCP_STARTUP_RETRY_WAIT_MS = 15_000;
 
+/** `terminalReason` of a run that kept stopping on `TOOL_UNAVAILABLE` after every retry. */
+export const TOOL_UNAVAILABLE_REASON = "tool_unavailable";
+
+/**
+ * The MCP server or plugin named on an agent's fixed stop line,
+ * `TOOL_UNAVAILABLE: <name>`, or null. The agents repos' shared working
+ * practice tells an agent to stop at once and end with that line when a tool
+ * it needs from an MCP server or plugin is missing or will not connect.
+ * Codex prints nothing when such a server fails to start unless it is marked
+ * required: 11 Pyrycode Mobile runs from 3 to 6 October 2026 started without
+ * the Figma plugin's tools and the agent itself stopped as blocked.
+ *
+ * Only the last non-blank line counts, so a quoted line mid-output does not.
+ * Under Codex that is the last line of the outcome summary. A timed-out run
+ * or one that hit a permission denial never counts.
+ */
+export function unavailableToolName(
+  result: Pick<StreamResult, "output" | "timedOut" | "hadPermissionDenial">,
+): string | null {
+  if (result.timedOut || result.hadPermissionDenial) return null;
+  const last = result.output.split("\n").map(line => line.trim()).filter(Boolean).at(-1) ?? "";
+  return /^`?TOOL_UNAVAILABLE:\s*([^`]*[^`\s])`?$/.exec(last)?.[1] ?? null;
+}
+
 /**
  * Codex refuses to start a run when a server marked `required = true`, such
  * as Figma in the desktop container (pyrycode-agents #113), fails to
  * connect. That parked the ticket as an agent error. A connection that
  * missed once usually connects on the next try, so retry a few times inside
  * the same run before letting the failure through.
+ *
+ * A run of either runner that ends on the `TOOL_UNAVAILABLE` stop line
+ * (`unavailableToolName`) is the same failure noticed by the agent instead,
+ * and retries the same way. When the last try still ends on it, the result
+ * becomes an error with `TOOL_UNAVAILABLE_REASON` and a reason naming the
+ * server, which parks the ticket.
  */
 export async function retryRequiredMcpStartup(
   run: () => Promise<StreamResult>,
@@ -431,8 +461,16 @@ export async function retryRequiredMcpStartup(
     const mcpStartupFailed = result.runner === "codex" && result.isError
       && result.terminalReason === "codex_error"
       && /required MCP servers failed to initialize/i.test(result.output);
-    if (!mcpStartupFailed || attempt > retries) return result;
-    opts.log?.(`required MCP server failed to start: retry ${attempt}/${retries} in ${waitMs}ms`);
+    const tool = mcpStartupFailed ? null : unavailableToolName(result);
+    if (!mcpStartupFailed && tool === null) return result;
+    if (attempt > retries) {
+      if (tool === null) return result;
+      const reason = `Required MCP server or plugin unavailable: ${tool}. The agent stopped with "TOOL_UNAVAILABLE: ${tool}" on all ${attempt} tries, ${waitMs / 1000} seconds apart.`;
+      return { ...result, isError: true, terminalReason: TOOL_UNAVAILABLE_REASON, output: `${reason}\n\n${result.output}` };
+    }
+    opts.log?.(tool === null
+      ? `required MCP server failed to start: retry ${attempt}/${retries} in ${waitMs}ms`
+      : `agent stopped with TOOL_UNAVAILABLE: ${tool}: retry ${attempt}/${retries} in ${waitMs}ms`);
     await sleep(waitMs);
   }
 }
