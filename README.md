@@ -281,6 +281,19 @@ Parallel review does not grant the single-phase automatic continuation budget.
 Their usage is combined. Source-review output has
 its own `.source.log`; the main log records the report and final input.
 
+**When a verifier runs out of time.** A verifier run that ends because its wall
+clock or its turn limit ran out, after any continuation leg, parks under
+`error:verifier` with one comment that says what happened, in place of the
+generic agent error. It names the part that ran out and the budget it had: the
+review, or with review overlap the source review or the final review. It gives
+how long the gates took, which is never charged to the review, and whether a
+green run of every gate is recorded for the next run to reuse, and until when.
+It carries the finished source review's report, cut at 20000 characters. Discord
+gets one line. The ticket still parks, because a review that ran out of its own
+time usually runs out again on a re-run. Added after mobile #1619 lost two
+verifier runs on 2026-10-03 to gates that took the whole hour. Each time a person
+read the logs to learn the gates were green and reusable, then cleared the label.
+
 The verifier serial switch still covers the entire dispatch, so this option does
 not overlap two emulator suites. A separate concurrency cap of two permits a
 builder or refiner beside the verifier. Other consumers remain sequential unless

@@ -4013,6 +4013,194 @@ describe("parallel verifier source review", () => {
   }
 });
 
+// Mobile #1619, 2026-10-03, twice: the gates took the verifier's whole
+// hour, the final review never started, and the ticket got a bare error
+// string. A person read the logs, wrote down that the gates were green and
+// reusable, cleared the label and dispatched again. Gate time is not charged
+// to the review, in either mode, and a verdict run that still runs out of
+// time or turns leaves one comment that says what ran out and what it got
+// through (verifier-out-of-time.ts).
+describe("verifier out of time (mobile #1619)", () => {
+  const MIN = 60_000;
+  async function withVerifier(fn: () => Promise<void>, opts: { runner?: "claude" | "codex"; parallel: boolean }) {
+    const prior = { runner: process.env.PYRY_AGENT_RUNNER, parallel: process.env.PYRY_VERIFIER_PARALLEL_REVIEW };
+    process.env.PYRY_AGENT_RUNNER = opts.runner ?? "codex";
+    process.env.PYRY_VERIFIER_PARALLEL_REVIEW = opts.parallel ? "1" : "0";
+    try { await withStageSet("builder", () => withVerifierGates("make check", fn)); }
+    finally {
+      if (prior.runner === undefined) delete process.env.PYRY_AGENT_RUNNER; else process.env.PYRY_AGENT_RUNNER = prior.runner;
+      if (prior.parallel === undefined) delete process.env.PYRY_VERIFIER_PARALLEL_REVIEW; else process.env.PYRY_VERIFIER_PARALLEL_REVIEW = prior.parallel;
+    }
+  }
+  function fixture(n: number, extra: { execImpls?: Record<string, ExecHandler>; fsMap?: Record<string, string> } = {}) {
+    const client = new MockGitHubClient({ status: { [n]: "In Code Review" }, labels: { [n]: [] } });
+    const { deps, calls } = makeMockDeps({
+      execImpls: { ...fullHappyExecImpls(`feature/${n}`), ...(extra.execImpls ?? {}) },
+      fsMap: { [claudeMdAbsPath("verifier/CLAUDE.md")]: "Review independently", ...(extra.fsMap ?? {}) },
+    });
+    return { client, deps, calls, run: () => dispatchToAgent(builderAgent("verifier"), makeProjectItem({ issueNumber: n }), client, deps) };
+  }
+  /** Run `fn` on a clock the test moves by hand. */
+  async function onClock(fn: (clock: { t0: number; set: (offsetMs: number) => void }) => Promise<void>) {
+    const realNow = Date.now;
+    const t0 = realNow();
+    let now = t0;
+    Date.now = () => now;
+    try { await fn({ t0, set: (offsetMs) => { now = t0 + offsetMs; } }); }
+    finally { Date.now = realNow; }
+  }
+  const timedOutResult = (runner: "claude" | "codex", sessionId: string) =>
+    streamResult({ runner, isError: true, timedOut: true, terminalReason: "timeout", sessionId, output: "", agentOutputTail: "[shell] figma get_screenshot 696:4913\nComparing Figma frames" });
+  /** The one comment the park left, after asserting the run parked and did not advance. */
+  function parkComment(f: ReturnType<typeof fixture>, n: number): string {
+    assert.ok(f.client.addLabelCalls.some(x => x.issueNumber === n && x.label === "error:verifier"));
+    assert.ok(!f.client.addLabelCalls.some(x => x.label === "done:verifier"));
+    const bodies = f.client.comments.filter(c => c.issueNumber === n).map(c => c.body);
+    assert.equal(bodies.length, 1, "one comment on the ticket");
+    assert.doesNotMatch(bodies[0]!, /Agent Error|Manual intervention required/);
+    assert.ok(f.calls.discord.some(m => /ran out of (time|turns) on #\d+ with no verdict/.test(m)));
+    return bodies[0]!;
+  }
+
+  for (const runner of ["codex", "claude"] as const) {
+    test(`${runner}: gates longer than the budget, then the final review runs out of its own time`, async () => {
+      await withVerifier(() => onClock(async (clock) => {
+        const f = fixture(1619);
+        let budget = 0;
+        let finalTimeout = 0;
+        f.deps.spawnGate = async () => {
+          await new Promise<void>(r => setTimeout(r, 5));
+          clock.set(61 * MIN);
+          return { exitCode: 0, timedOut: false, spawnError: null };
+        };
+        f.deps.runClaudeStreaming = async opts => {
+          if (opts.sourceReview) {
+            budget = opts.timeoutMs;
+            await new Promise<void>(r => setImmediate(r));
+            clock.set(4 * MIN);
+            return streamResult({ runner, output: "No MUST FIX findings.\n- NIT: index.md, Failure notice" });
+          }
+          finalTimeout = opts.timeoutMs;
+          clock.set(61 * MIN + finalTimeout);
+          // Claude's runner rejects when the wall clock kills it with no result frame.
+          if (runner === "claude") throw new AgentRunStoppedError(`Agent timed out after ${opts.timeoutMs / 1000}s`, "timeout", "[Bash] figma get_screenshot 696:4913\nComparing Figma frames");
+          return timedOutResult(runner, "final-thread");
+        };
+        await f.run();
+        assert.equal(finalTimeout, budget - 4 * MIN, "an hour of gates costs the final review nothing");
+        const body = parkComment(f, 1619);
+        assert.match(body, /^## ⏱️ Verifier ran out of time/);
+        assert.match(body, new RegExp(`The verifier's final review used its ${Math.round(finalTimeout / MIN)}-minute budget\\. It was stopped before it published a verdict\\.`));
+        assert.match(body, /\*\*Gates:\*\* took 61 minutes\. That time is not charged to the review's budget\./);
+        assert.match(body, /\*\*Source review:\*\* finished in 4 minutes\./);
+        assert.match(body, /<summary>Source review report<\/summary>\n\nNo MUST FIX findings\.\n- NIT: index\.md, Failure notice/);
+        assert.match(body, /remove `error:verifier` to run the verifier again/);
+        assert.match(body, /\*\*Last output from the agent\*\*.*\n\n```\n\[(shell|Bash)\] figma get_screenshot 696:4913\nComparing Figma frames\n```/);
+        if (runner === "codex") assert.match(body, /\*\*Debug\*\*: `codex resume final-thread`/);
+      }), { runner, parallel: true });
+    });
+  }
+
+  test("a source review that runs out of time says the final review never started", async () => {
+    await withVerifier(async () => {
+      const f = fixture(1620);
+      let finalized = false;
+      f.deps.runClaudeStreaming = async opts => {
+        if (opts.sourceReview) return timedOutResult("codex", "source-thread");
+        finalized = true;
+        return streamResult({ runner: "codex" });
+      };
+      await f.run();
+      assert.equal(finalized, false);
+      const minutes = timeoutFor(builderAgent("verifier")) / MIN;
+      assert.match(parkComment(f, 1620), new RegExp(`The verifier's source review used its ${minutes}-minute budget\\. The final review never started, so no verdict was published\\.`));
+    }, { parallel: true });
+  });
+
+  test("Claude: a source review that uses every shared turn leaves the turns comment", async () => {
+    await withVerifier(async () => {
+      const f = fixture(1621);
+      f.deps.runClaudeStreaming = async opts => {
+        if (opts.sourceReview) return streamResult({ output: "Source findings", numTurns: opts.maxTurns });
+        throw new Error("the final review must not start");
+      };
+      await f.run();
+      const body = parkComment(f, 1621);
+      assert.match(body, /^## ⏱️ Verifier ran out of turns/);
+      assert.match(body, /The verifier's source review used the whole turn budget\. The final review never started/);
+      assert.match(body, /Source findings/);
+    }, { runner: "claude", parallel: true });
+  });
+
+  test("serial: gates longer than the budget leave the verifier its whole clock", async () => {
+    await withVerifier(() => onClock(async (clock) => {
+      const f = fixture(1622);
+      let agentTimeout = 0;
+      f.deps.spawnGate = async () => {
+        clock.set(61 * MIN);
+        return { exitCode: 0, timedOut: false, spawnError: null };
+      };
+      f.deps.runClaudeStreaming = async opts => {
+        agentTimeout = opts.timeoutMs;
+        return streamResult({ runner: "codex", output: "Verdict posted" });
+      };
+      await f.run();
+      assert.equal(agentTimeout, timeoutFor(builderAgent("verifier")));
+      assert.ok(!f.client.addLabelCalls.some(x => x.label === "error:verifier"));
+    }), { parallel: false });
+  });
+
+  test("serial: a review that runs out after its continuation leg names the leg and the reusable gate run", async () => {
+    const n = 1623;
+    const HEAD = "c".repeat(40);
+    const TREE = "e".repeat(40);
+    const logsDir = resolve(TEST_AGENTS_REPO_ROOT, "logs");
+    const logPaths = [resolve(logsDir, `verifier-gate_#${n}_1.log`), resolve(logsDir, `verifier-gate_#${n}_1.stderr.log`)];
+    const passedAt = new Date(Date.now() - 60 * MIN).toISOString();
+    const pass: VerifierGatePass = {
+      issueNumber: n, commit: HEAD, tree: TREE, gatesHash: hashGateList(["make check"]), gates: ["make check"],
+      passedAt, summary: ["✓ make check (exit 0)"], logPaths,
+    };
+    await withVerifier(async () => {
+      const f = fixture(n, {
+        execImpls: { "git rev-parse HEAD": () => `${HEAD}\n${TREE}\n` },
+        fsMap: { [resolve(logsDir, `verifier-gate_#${n}.pass.json`)]: JSON.stringify(pass), ...Object.fromEntries(logPaths.map(p => [p, ""])) },
+      });
+      let runs = 0;
+      f.deps.runClaudeStreaming = async opts => {
+        runs++;
+        return timedOutResult("codex", opts.resumeSessionId ?? "review-thread");
+      };
+      await f.run();
+      assert.equal(runs, 2, "the first leg and one continuation leg");
+      assert.equal(f.calls.gates.length, 0, "the recorded pass stood in for the gates");
+      const body = parkComment(f, n);
+      const minutes = timeoutFor(builderAgent("verifier")) / MIN;
+      assert.match(body, new RegExp(`The verifier used its ${minutes}-minute budget and one continuation leg with a fresh budget\\. It was stopped before it published a verdict\\.`));
+      assert.match(body, /\*\*Gates:\*\* took under a minute\./);
+      const until = new Date(Date.parse(passedAt) + 24 * 60 * MIN).toISOString().slice(0, 16).replace("T", " ");
+      assert.ok(body.includes(`every gate passed on commit \`${HEAD.slice(0, 12)}\``), body);
+      assert.ok(body.includes(`starts before ${until} UTC`), body);
+      assert.doesNotMatch(body, /Source review/);
+    }, { parallel: false });
+  });
+
+  test("a builder that runs out of time keeps the ordinary error comment", async () => {
+    await withStageSet("builder", async () => {
+      const client = new MockGitHubClient({ status: { 1624: "In Development" }, labels: { 1624: [] } });
+      const { deps } = makeMockDeps({
+        execImpls: fullHappyExecImpls("feature/1624"),
+        fsMap: { [claudeMdAbsPath("builder/CLAUDE.md")]: "Build it" },
+        streamResult: () => { throw new AgentRunStoppedError("Agent timed out after 2400s", "timeout"); },
+      });
+      await dispatchToAgent(builderAgent("builder"), makeProjectItem({ issueNumber: 1624 }), client, deps);
+      const bodies = client.comments.filter(c => c.issueNumber === 1624).map(c => c.body);
+      assert.ok(bodies.some(b => /## ⚠️ Agent Error: builder/.test(b)));
+      assert.ok(!bodies.some(b => /ran out of time/.test(b)));
+    });
+  });
+});
+
 describe("dispatchToAgent — orchestrator integration", () => {
   test("happy-path full run → setup + spawn + stream + post-run all green; done:<agent> + cleanup runs", async () => {
     const claudeMd = claudeMdAbsPath("developer/CLAUDE.md");
