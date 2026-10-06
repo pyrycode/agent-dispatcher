@@ -127,10 +127,11 @@ export function parseTimeoutCeilingFactor(raw: string | undefined): number {
 }
 
 /**
- * Default grace, in minutes, for a command still running when a Codex run's
- * budget is spent. The device hold and a build place can each hold a command
- * for 20 minutes or more, and Codex reports a command's output only when it
- * finishes, so the run needs the chance to see it.
+ * Default grace, in minutes, for a command still running when a Codex or
+ * Claude run's budget is spent. The device hold and a build place can each
+ * hold a command for 20 minutes or more, and both runners report a
+ * command's output only when it finishes, so the run needs the chance to
+ * see it.
  */
 export const DEFAULT_TIMEOUT_GRACE_MINUTES = 20;
 
@@ -272,22 +273,16 @@ export function initRunClock(opts: { startedAt: number; budgetMs: number; ceilin
   };
 }
 
-/** Advance on one Codex JSONL event. Only command executions matter. Pure. */
-export function advanceRunClock(clock: RunClock, event: unknown, now: number): RunClock {
-  if (!event || typeof event !== "object") return clock;
-  const e = event as Record<string, unknown>;
-  const item = e.item as Record<string, unknown> | undefined;
-  if (!item || item.type !== "command_execution" || typeof item.id !== "string") return clock;
-  const id = item.id;
+/** A command began at `now`. */
+function startCommand(clock: RunClock, id: string, now: number): RunClock {
+  if (clock.running.has(id)) return clock;
+  const running = new Map(clock.running);
+  running.set(id, now);
+  return { ...clock, running };
+}
 
-  if (e.type === "item.started") {
-    if (clock.running.has(id)) return clock;
-    const running = new Map(clock.running);
-    running.set(id, now);
-    return { ...clock, running };
-  }
-  if (e.type !== "item.completed") return clock;
-
+/** A command ended at `now` with `output`; credit any new waits it shows. */
+function finishCommand(clock: RunClock, id: string, output: string, now: number): RunClock {
   let { running, ran, credited, seenWaitLines } = clock;
   const began = running.get(id);
   if (began !== undefined) {
@@ -297,7 +292,6 @@ export function advanceRunClock(clock: RunClock, event: unknown, now: number): R
     ran = mergeIntervals([...ran, [began, now]]);
   }
 
-  const output = typeof item.aggregated_output === "string" ? item.aggregated_output : "";
   let totalMs = 0;
   let seen: Set<string> | null = null;
   for (const wait of finishedWaits(output)) {
@@ -315,6 +309,65 @@ export function advanceRunClock(clock: RunClock, event: unknown, now: number): R
   return { ...clock, running, ran, credited, seenWaitLines };
 }
 
+/** Advance on one Codex JSONL event. Only command executions matter. Pure. */
+export function advanceRunClock(clock: RunClock, event: unknown, now: number): RunClock {
+  if (!event || typeof event !== "object") return clock;
+  const e = event as Record<string, unknown>;
+  const item = e.item as Record<string, unknown> | undefined;
+  if (!item || item.type !== "command_execution" || typeof item.id !== "string") return clock;
+  if (e.type === "item.started") return startCommand(clock, item.id, now);
+  if (e.type !== "item.completed") return clock;
+  return finishCommand(clock, item.id, typeof item.aggregated_output === "string" ? item.aggregated_output : "", now);
+}
+
+// --------- Claude agent runs: Bash tool results ---------
+//
+// Claude's stream-json, from `claude -p` and `pyry agent-run` alike, shows a
+// shell command as a `tool_use` block named `Bash` in an assistant message,
+// and its output as the matching `tool_result` block in a later user
+// message. As with Codex, nothing arrives in between, so the same rule and
+// the same clock apply: a Bash call is a command from its `tool_use` to its
+// `tool_result`.
+//
+// Claude's shell caps a foreground command at ten minutes and moves it to the
+// background past that, or at once when the agent asks. Its result then
+// returns early and the call stops counting, so a wait behind it earns
+// little or nothing, like a Codex wait behind a detached process. Only Bash
+// results are read: other tools run no commands.
+
+function contentBlocks(msg: Record<string, unknown>): Record<string, unknown>[] {
+  const content = (msg.message as Record<string, unknown> | undefined)?.content;
+  return Array.isArray(content) ? content.filter((b): b is Record<string, unknown> => !!b && typeof b === "object") : [];
+}
+
+/** A tool result's text: a plain string, or the text of its text blocks. */
+function toolResultText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((b) => (b && typeof b === "object" && (b as Record<string, unknown>).type === "text" ? (b as Record<string, unknown>).text : null))
+    .filter((t): t is string => typeof t === "string")
+    .join("\n");
+}
+
+/** Advance on one Claude stream-json message. Only Bash calls matter. Pure. */
+export function advanceClaudeRunClock(clock: RunClock, msg: unknown, now: number): RunClock {
+  if (!msg || typeof msg !== "object") return clock;
+  const m = msg as Record<string, unknown>;
+  if (m.type === "assistant") {
+    for (const b of contentBlocks(m)) {
+      if (b.type === "tool_use" && b.name === "Bash" && typeof b.id === "string") clock = startCommand(clock, b.id, now);
+    }
+  } else if (m.type === "user") {
+    for (const b of contentBlocks(m)) {
+      if (b.type === "tool_result" && typeof b.tool_use_id === "string" && clock.running.has(b.tool_use_id)) {
+        clock = finishCommand(clock, b.tool_use_id, toolResultText(b.content), now);
+      }
+    }
+  }
+  return clock;
+}
+
 export function runClockCreditMs(clock: RunClock): number {
   return unionLengthMs(clock.credited);
 }
@@ -329,7 +382,7 @@ export type RunClockDecision =
   | { kind: "stop"; reason: "deadline" | "grace_ended" | "ceiling" };
 
 /**
- * Whether a Codex run may keep going at `now`, and when to ask again.
+ * Whether a Codex or Claude run may keep going at `now`, and when to ask again.
  *
  * Before the deadline it runs. At the deadline, a command that started
  * before it and is still running gets a grace of up to `graceMs` to finish,
