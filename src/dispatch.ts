@@ -5,7 +5,7 @@ import { resolve, dirname, basename } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { config } from "dotenv";
-import { DispatchPool, excludeInFlight, freeSeats, launchCandidates, resolvePollIntervalMs } from "./dispatch-pool.js";
+import { DispatchPool, excludeInFlight, freeSeats, launchCandidates, liveGateRunnerFor, mayStartMainSweep, resolvePollIntervalMs } from "./dispatch-pool.js";
 import { countVerdictsSince, parseVerdictArtifacts, pickVerdictPr, shouldFlagMissingVerdict } from "./verdict-guard.js";
 import { countOpenPrs, shouldFlagMissingPr } from "./pr-guard.js";
 import { PENDING_VERDICT_PREFIX, REREVIEW_PATCH_CAP, decideVerdictRecovery, extractVerdictFindings, reworkFindingsNote, handoffMarker, isVerdictPublishFailure, parseLastVerdict, parsePendingVerdictState, parsePrVerdictView, parseVerdictHandoff, reReviewNote, serializeLastVerdict, serializePendingVerdictState, verdictHandoffNote, type HandoffParse, type PendingVerdictState, type VerdictHandoff, type VerdictPrLookup } from "./verdict-handoff.js";
@@ -7747,82 +7747,140 @@ export async function selectPastParkedFamilies(opts: {
 export async function runPreDispatchPrep(
   candidates: ReadonlyArray<{ agent: AgentConfig; item: ProjectItem }>,
   client: DispatchClient,
-  family?: {
-    /** Per-root tallies from `runFamilyBreaker`'s cycle fetch; advanced
-     *  in place as markers post so same-cycle siblings number correctly. */
-    tallies: Map<number, number>;
-    /** Board-wide label lookup for sweeping stale counters off the root. */
-    rootLabelsByIssue?: ReadonlyMap<number, readonly string[]>;
-  },
+  family?: FamilyAccounting,
 ): Promise<void> {
   for (const { agent, item } of candidates) {
-    const wipLabel = `wip:${agent.name}`;
-    for (const label of item.labels) {
-      if (isPipelineLabelForAgent(label, agent.name)) {
-        try {
-          await client.removeLabel(item.issueNumber, label);
-          console.log(`   🏷️  Removed stale ${label} from #${item.issueNumber}`);
-        } catch {}
-      }
+    await claimForDispatch(agent, item, client);
+    if (family) await countFamilyDispatch(agent, item, client, family);
+  }
+}
+
+/** The tallies `countFamilyDispatch` advances; see `runPreDispatchPrep`. */
+export type FamilyAccounting = {
+  /** Per-root tallies from `runFamilyBreaker`'s cycle fetch; advanced
+   *  in place as markers post so same-cycle siblings number correctly. */
+  tallies: Map<number, number>;
+  /** Board-wide label lookup for sweeping stale counters off the root. */
+  rootLabelsByIssue?: ReadonlyMap<number, readonly string[]>;
+};
+
+/** What `claimForDispatch` changed, so `releaseDispatchClaim` can undo it. */
+export type DispatchClaim = {
+  /** Labels taken off the ticket. */
+  removed: string[];
+  /** Whether `wip:<agent>` was written. */
+  wipAdded: boolean;
+};
+
+/**
+ * The label half of the pre-dispatch prep for one candidate: strip this
+ * agent's stale pipeline labels and the legacy ones, then add `wip:<agent>`.
+ * Returns what changed, so a run that will not start after all can be
+ * released with `releaseDispatchClaim`.
+ */
+export async function claimForDispatch(agent: AgentConfig, item: ProjectItem, client: DispatchClient): Promise<DispatchClaim> {
+  const wipLabel = `wip:${agent.name}`;
+  const removed: string[] = [];
+  for (const label of item.labels) {
+    if (isPipelineLabelForAgent(label, agent.name)) {
+      try {
+        await client.removeLabel(item.issueNumber, label);
+        removed.push(label);
+        console.log(`   🏷️  Removed stale ${label} from #${item.issueNumber}`);
+      } catch {}
     }
-    for (const legacy of ["ready-for-review", "needs-rework"]) {
-      if (item.labels.includes(legacy)) {
-        try {
-          await client.removeLabel(item.issueNumber, legacy);
-          console.log(`   🏷️  Removed legacy ${legacy} from #${item.issueNumber}`);
-        } catch {}
-      }
+  }
+  for (const legacy of ["ready-for-review", "needs-rework"]) {
+    if (item.labels.includes(legacy)) {
+      try {
+        await client.removeLabel(item.issueNumber, legacy);
+        removed.push(legacy);
+        console.log(`   🏷️  Removed legacy ${legacy} from #${item.issueNumber}`);
+      } catch {}
+    }
+  }
+  let wipAdded = false;
+  try {
+    await client.addLabel(item.issueNumber, wipLabel);
+    wipAdded = true;
+    console.log(`   🏷️  Added ${wipLabel} to #${item.issueNumber}`);
+  } catch (e) {
+    // Soft-fail: a dispatch that cannot claim its label still runs, and
+    // that is the right call — refusing to work because bookkeeping failed
+    // would be worse. But it was silent, and a missing wip label means
+    // nothing stops the next cycle dispatching the same ticket again, so
+    // say so.
+    console.warn(`   ⚠️  Failed to add ${wipLabel} to #${item.issueNumber}; dispatching anyway, but nothing marks this ticket as running: ${e}`);
+  }
+  return { removed, wipAdded };
+}
+
+/**
+ * Undo `claimForDispatch` for a run that will not start, because the stop
+ * signal arrived while the claim was being written. The labels it took off
+ * go back and `wip:<agent>` comes off, unless the ticket carried it before,
+ * so the ticket reads exactly as it did and the next start picks it up as
+ * before. A rework keeps its `needs-rework:<agent>`. A write that fails is
+ * logged; a `wip:` label left behind is cleared by the stranded-wip sweep.
+ */
+export async function releaseDispatchClaim(agent: AgentConfig, item: ProjectItem, client: DispatchClient, claim: DispatchClaim): Promise<void> {
+  const wipLabel = `wip:${agent.name}`;
+  for (const label of claim.removed) {
+    if (label === wipLabel) continue;
+    try { await client.addLabel(item.issueNumber, label); } catch (e) {
+      console.warn(`   ⚠️  Could not put ${label} back on #${item.issueNumber} after the stop signal: ${e}`);
+    }
+  }
+  if (claim.wipAdded && !item.labels.includes(wipLabel)) {
+    try { await client.removeLabel(item.issueNumber, wipLabel); } catch (e) {
+      console.warn(`   ⚠️  Could not remove ${wipLabel} from #${item.issueNumber} after the stop signal: ${e}`);
+    }
+  }
+  console.log(`   🚦 Drain: released ${agent.name}#${item.issueNumber}, its labels are as they were`);
+}
+
+/**
+ * The family half of the pre-dispatch prep for one candidate: one marker
+ * comment on the family root and the convenience counter rewritten. A
+ * comment cannot be taken back, so this runs only once the run is certain
+ * to start; see `launchCandidates`.
+ */
+export async function countFamilyDispatch(agent: AgentConfig, item: ProjectItem, client: DispatchClient, family: FamilyAccounting): Promise<void> {
+  const root = resolveFamilyRoot(item);
+  const prior = family.tallies.get(root) ?? 0;
+  const next = prior + 1;
+  try {
+    await client.addComment(
+      root,
+      `${FAMILY_DISPATCH_COMMENT_MARKER}\n` +
+      `🧮 Family dispatch ${next}: **${agent.name}** on #${item.issueNumber} (family root #${root}).`,
+    );
+    family.tallies.set(root, next);
+    // Rewrite the convenience label from the comment-derived tally.
+    // Sweep every stale counter we can see — the snapshot's plus the
+    // one this cycle's previous sibling wrote — so duplicates never
+    // accumulate. All best-effort: the comments are the truth.
+    const knownRootLabels =
+      family.rootLabelsByIssue?.get(root) ??
+      (root === item.issueNumber ? item.labels : []);
+    const stale = new Set(
+      knownRootLabels.filter((l) => l.startsWith(FAMILY_DISPATCH_COUNT_PREFIX)),
+    );
+    if (prior > 0) stale.add(`${FAMILY_DISPATCH_COUNT_PREFIX}${prior}`);
+    stale.delete(`${FAMILY_DISPATCH_COUNT_PREFIX}${next}`);
+    for (const label of stale) {
+      try { await client.removeLabel(root, label); } catch {}
     }
     try {
-      await client.addLabel(item.issueNumber, wipLabel);
-      console.log(`   🏷️  Added ${wipLabel} to #${item.issueNumber}`);
+      await client.addLabel(root, `${FAMILY_DISPATCH_COUNT_PREFIX}${next}`);
     } catch (e) {
-      // Soft-fail: a dispatch that cannot claim its label still runs, and
-      // that is the right call — refusing to work because bookkeeping failed
-      // would be worse. But it was silent, and a missing wip label means
-      // nothing stops the next cycle dispatching the same ticket again, so
-      // say so.
-      console.warn(`   ⚠️  Failed to add ${wipLabel} to #${item.issueNumber}; dispatching anyway, but nothing marks this ticket as running: ${e}`);
+      console.warn(`   ⚠️  Failed to set ${FAMILY_DISPATCH_COUNT_PREFIX}${next} on root #${root} (comments remain the tally): ${e}`);
     }
-
-    if (family) {
-      const root = resolveFamilyRoot(item);
-      const prior = family.tallies.get(root) ?? 0;
-      const next = prior + 1;
-      try {
-        await client.addComment(
-          root,
-          `${FAMILY_DISPATCH_COMMENT_MARKER}\n` +
-          `🧮 Family dispatch ${next}: **${agent.name}** on #${item.issueNumber} (family root #${root}).`,
-        );
-        family.tallies.set(root, next);
-        // Rewrite the convenience label from the comment-derived tally.
-        // Sweep every stale counter we can see — the snapshot's plus the
-        // one this cycle's previous sibling wrote — so duplicates never
-        // accumulate. All best-effort: the comments are the truth.
-        const knownRootLabels =
-          family.rootLabelsByIssue?.get(root) ??
-          (root === item.issueNumber ? item.labels : []);
-        const stale = new Set(
-          knownRootLabels.filter((l) => l.startsWith(FAMILY_DISPATCH_COUNT_PREFIX)),
-        );
-        if (prior > 0) stale.add(`${FAMILY_DISPATCH_COUNT_PREFIX}${prior}`);
-        stale.delete(`${FAMILY_DISPATCH_COUNT_PREFIX}${next}`);
-        for (const label of stale) {
-          try { await client.removeLabel(root, label); } catch {}
-        }
-        try {
-          await client.addLabel(root, `${FAMILY_DISPATCH_COUNT_PREFIX}${next}`);
-        } catch (e) {
-          console.warn(`   ⚠️  Failed to set ${FAMILY_DISPATCH_COUNT_PREFIX}${next} on root #${root} (comments remain the tally): ${e}`);
-        }
-      } catch (e) {
-        console.warn(
-          `   ⚠️  Failed to post family-dispatch marker on root #${root} for ` +
-          `${agent.name}#${item.issueNumber} (missed increment, continuing): ${e}`,
-        );
-      }
-    }
+  } catch (e) {
+    console.warn(
+      `   ⚠️  Failed to post family-dispatch marker on root #${root} for ` +
+      `${agent.name}#${item.issueNumber} (missed increment, continuing): ${e}`,
+    );
   }
 }
 
@@ -9026,10 +9084,14 @@ export async function pollLoop(): Promise<void> {
     })).length > 0;
     // The live-login and daemon health checks guard the live gate too. A
     // failure skips the gate this cycle; its tickets keep waiting.
-    const gateHealthFailures = envHeld || realClaudeGateRunner === null ? [] : await liveGateHealthFailures({
+    // In drain mode the gate starts nothing, so its checks are skipped too.
+    const gateHealthFailures = drainMode || envHeld || realClaudeGateRunner === null ? [] : await liveGateHealthFailures({
       checks: HEALTH_CHECKS, checker: healthChecker, env: buildGateSpawnEnv(process.env), notify: notifyDiscord, state: healthNotices,
     });
-    const gateRunner = envHeld || gateHealthFailures.length > 0 ? null : realClaudeGateRunner;
+    // Read after the checks, so a stop signal that landed during them counts.
+    const gateRunner = liveGateRunnerFor({
+      runner: realClaudeGateRunner, draining: drainMode, envHeld, healthFailures: gateHealthFailures.length,
+    });
     let gateHeld = false;
     if (!REAL_CLAUDE_GATE_BACKGROUND) {
       gateHeld = await runRealClaudeGateExecution(
@@ -9189,17 +9251,20 @@ export async function pollLoop(): Promise<void> {
     }
 
     // Pre-dispatch mutations + concurrent dispatch — both extracted to
-    // testable helpers below pollLoop. See `runPreDispatchPrep` and
-    // `runConcurrentDispatches` for invariants.
+    // testable helpers below pollLoop. See `claimForDispatch`,
+    // `countFamilyDispatch` and `runConcurrentDispatches` for invariants.
     // Launch without awaiting: each run is its own pool entry and frees its
     // seat the moment it settles. The driver keeps its per-run isolation and
     // wip cleanup; the pool only watches for the end. Nothing launches once
-    // a stop signal has arrived, even mid-cycle; see `launchCandidates`.
+    // a stop signal has arrived, even mid-cycle, and a claim the signal
+    // interrupts is undone; see `launchCandidates`.
     await launchCandidates({
       candidates,
       pool,
       draining: () => drainMode,
-      prep: (cs) => runPreDispatchPrep(cs, client, { tallies: familyTallies, rootLabelsByIssue }),
+      claim: (c) => claimForDispatch(c.agent, c.item, client),
+      release: (c, claim) => releaseDispatchClaim(c.agent, c.item, client, claim),
+      commit: (c) => countFamilyDispatch(c.agent, c.item, client, { tallies: familyTallies, rootLabelsByIssue }),
       run: (c) => runConcurrentDispatches([c], client),
     });
 
@@ -9252,8 +9317,8 @@ export async function pollLoop(): Promise<void> {
 
     // In-depth run against main, in the background, never beside a
     // verifier's gates. After the merge so this cycle's merge counts. See
-    // startMainSweepCycle.
-    if (mainSweep !== null && sweepRun === null && !gateActive && !envHeld) {
+    // startMainSweepCycle. Not once the stop signal has arrived.
+    if (mainSweep !== null && mayStartMainSweep({ configured: true, sweepRunning: sweepRun !== null, gateActive, envHeld, draining: drainMode })) {
       const verifierBusy = [...pool.keys()].some((k) => k.startsWith("verifier#")) ||
         [...itemsByColumn.values()].some((items) => items.some((i) => i.labels.includes("wip:verifier")));
       const { finished } = await startMainSweepCycle({
