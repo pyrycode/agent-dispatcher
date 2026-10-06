@@ -222,7 +222,9 @@ beside the GitHub body files both runners already write, or in `PYRY_VERDICT_HAN
 `<home>` is the home folder written into the repository's installed pipeline helper,
 `<home>/.codex/bin/<repository>-pipeline-action`, because the helper accepts body files
 only under that home. The dispatcher looks for the helper in its own home first, then
-in every folder under `/Users` and `/home`, and uses its own home when there is none. In
+in every folder under `/Users`, and uses its own home when there is none. It never lists
+`/home`: on macOS that is an autofs mount that does not answer, and listing it froze the
+dispatcher at its first verifier on 2026-10-06. In
 the pyrycode-agents container the dispatcher runs as `/home/agent`, but the helpers were
 installed on the Mac with `/Users/juhanailmoniemi`. Until 2026-10-05 the handoff went
 under `/home/agent`, and on pyrycode-desktop #1721 the helper refused to post the
