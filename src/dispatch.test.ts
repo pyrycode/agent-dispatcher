@@ -4050,7 +4050,7 @@ describe("verifier out of time (mobile #1619)", () => {
     finally { Date.now = realNow; }
   }
   const timedOutResult = (runner: "claude" | "codex", sessionId: string) =>
-    streamResult({ runner, isError: true, timedOut: true, terminalReason: "timeout", sessionId, output: "Comparing Figma frames" });
+    streamResult({ runner, isError: true, timedOut: true, terminalReason: "timeout", sessionId, output: "", agentOutputTail: "[shell] figma get_screenshot 696:4913\nComparing Figma frames" });
   /** The one comment the park left, after asserting the run parked and did not advance. */
   function parkComment(f: ReturnType<typeof fixture>, n: number): string {
     assert.ok(f.client.addLabelCalls.some(x => x.issueNumber === n && x.label === "error:verifier"));
@@ -4083,7 +4083,7 @@ describe("verifier out of time (mobile #1619)", () => {
           finalTimeout = opts.timeoutMs;
           clock.set(61 * MIN + finalTimeout);
           // Claude's runner rejects when the wall clock kills it with no result frame.
-          if (runner === "claude") throw new AgentRunStoppedError(`Agent timed out after ${opts.timeoutMs / 1000}s`, "timeout");
+          if (runner === "claude") throw new AgentRunStoppedError(`Agent timed out after ${opts.timeoutMs / 1000}s`, "timeout", "[Bash] figma get_screenshot 696:4913\nComparing Figma frames");
           return timedOutResult(runner, "final-thread");
         };
         await f.run();
@@ -4095,6 +4095,7 @@ describe("verifier out of time (mobile #1619)", () => {
         assert.match(body, /\*\*Source review:\*\* finished in 4 minutes\./);
         assert.match(body, /<summary>Source review report<\/summary>\n\nNo MUST FIX findings\.\n- NIT: index\.md, Failure notice/);
         assert.match(body, /remove `error:verifier` to run the verifier again/);
+        assert.match(body, /\*\*Last output from the agent\*\*.*\n\n```\n\[(shell|Bash)\] figma get_screenshot 696:4913\nComparing Figma frames\n```/);
         if (runner === "codex") assert.match(body, /\*\*Debug\*\*: `codex resume final-thread`/);
       }), { runner, parallel: true });
     });

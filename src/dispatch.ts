@@ -2975,6 +2975,7 @@ export async function handleDispatchError(
         fallbackBudgetMs: timeoutFor(agent, item.labels),
         reusableGates: reusableGatesForNextRun(ctx),
         errorLabel,
+        agentOutput: agentOutputOf(error, streamResult),
         resumeHint: sessionId !== "unknown" ? resumeCommand({ runner: streamResult?.runner, sessionId }) : null,
         logFile,
       }));

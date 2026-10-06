@@ -51,6 +51,7 @@ describe("outOfTimeComment", () => {
     fallbackBudgetMs: 60 * MIN,
     reusableGates: null,
     errorLabel: "error:verifier",
+    agentOutput: "",
     resumeHint: null,
     logFile: "/logs/verifier_#1619.log",
   };
@@ -67,7 +68,8 @@ describe("outOfTimeComment", () => {
       ...base,
       progress,
       reusableGates: { commit: "7aced731aaaabbbbccccddddeeeeffff00001111", untilMs: Date.parse("2026-10-04T09:18:00Z") },
-      resumeHint: "codex exec resume thread-1",
+      agentOutput: "[shell] figma get_screenshot 696:4913\nComparing the frames",
+      resumeHint: "codex resume thread-1",
     });
     assert.match(body, /^## ⏱️ Verifier ran out of time\n/);
     assert.match(body, /The verifier's final review used its 56-minute budget\. It was stopped before it published a verdict\. The ticket is parked under `error:verifier`\./);
@@ -76,7 +78,7 @@ describe("outOfTimeComment", () => {
     assert.match(body, /\*\*Source review:\*\* finished in 4 minutes\. Its report is below\./);
     assert.match(body, /\*\*Next step:\*\* remove `error:verifier` to run the verifier again\./);
     assert.match(body, /<details><summary>Source review report<\/summary>\n\nNo MUST FIX findings\.\n- NIT: index\.md, Failure notice\n\n<\/details>/);
-    assert.match(body, /\*\*Debug\*\*: `codex exec resume thread-1`/);
+    assert.match(body, /\*\*Last output from the agent\*\* \(its messages and tool calls, newest last\):\n\n```\n\[shell\] figma get_screenshot 696:4913\nComparing the frames\n```\n\n\*\*Debug\*\*: `codex resume thread-1`$/);
     assert.doesNotMatch(body, /Manual intervention required/);
   });
 
@@ -101,6 +103,7 @@ describe("outOfTimeComment", () => {
     const body = outOfTimeComment({ ...base, progress: undefined });
     assert.match(body, /The verifier used its 60-minute budget\. It was stopped before it published a verdict\./);
     assert.doesNotMatch(body, /Gates:/);
+    assert.doesNotMatch(body, /Last output from the agent|Debug/);
     assert.match(body, /remove `error:verifier`/);
   });
 

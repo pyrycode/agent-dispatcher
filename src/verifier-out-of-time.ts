@@ -113,6 +113,9 @@ export function outOfTimeComment(opts: {
   /** A green run of every gate the next dispatch would reuse, or null. */
   reusableGates: { commit: string; untilMs: number } | null;
   errorLabel: string;
+  /** The agent's own last messages and tool calls, "" when none
+   *  (`agentOutputOf`). Shows where the run was when it stopped. */
+  agentOutput: string;
   /** Command that resumes the stopped session, when one was captured. */
   resumeHint: string | null;
   /** Dispatch log file, named when the report had to be cut. */
@@ -158,6 +161,9 @@ export function outOfTimeComment(opts: {
       "",
       "</details>",
     );
+  }
+  if (opts.agentOutput) {
+    lines.push("", "**Last output from the agent** (its messages and tool calls, newest last):", "", "```", opts.agentOutput, "```");
   }
   if (opts.resumeHint) lines.push("", `**Debug**: \`${opts.resumeHint}\``);
   return lines.join("\n");
