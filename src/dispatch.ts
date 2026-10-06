@@ -2468,14 +2468,19 @@ export function installedHelperHome(
 }
 
 /** Where to look for the installed helpers: the dispatcher's own home, then
- *  every home folder on the machine. */
+ *  every folder under /Users.
+ *
+ *  /Users is a local folder on macOS, and the pyrycode-agents image creates
+ *  /Users/juhanailmoniemi for the helpers it copies from the Mac. /home is
+ *  never listed: on macOS it is an autofs mount that does not answer, and
+ *  listing it froze the dispatcher at its first verifier on 2026-10-06. A
+ *  helper under /home is still found when /home/<user> is the dispatcher's
+ *  own home, as /home/agent is in the container. */
 export function helperHomeCandidates(): string[] {
   const homes = [homedir()];
-  for (const root of ["/Users", "/home"]) {
-    try {
-      for (const name of readdirSync(root)) homes.push(resolve(root, name));
-    } catch { /* no such folder on this system */ }
-  }
+  try {
+    for (const name of readdirSync("/Users")) homes.push(resolve("/Users", name));
+  } catch { /* no such folder on this system */ }
   return [...new Set(homes)];
 }
 

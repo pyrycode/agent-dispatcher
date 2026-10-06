@@ -11359,4 +11359,30 @@ describe("verdict handoff lands where the pipeline helper accepts it (desktop #1
     process.env.PYRY_VERDICT_HANDOFF_DIR = join(m.root, "override");
     assert.equal(verdictHandoffDir([m.running, m.installed]), join(m.root, "override"));
   });
+  // On macOS /home is an autofs mount that never answers a listing, so the
+  // first verifier froze the dispatcher on the Mac on 2026-10-06. The child
+  // process stands in for that mount: listing /home ends it with status 42.
+  test("finding the helper's home never lists /home, which hangs on macOS", (t) => {
+    const dir = mkdtempSync(join(tmpdir(), "no-home-"));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const trip = join(dir, "trip.cjs");
+    writeFileSync(trip,
+      "const fs = require('node:fs');\n" +
+      "const list = fs.readdirSync;\n" +
+      "fs.readdirSync = function (p, ...rest) {\n" +
+      "  if (String(p).replace(/\\/+$/, '') === '/home') { process.stderr.write('listed /home\\n'); process.exit(42); }\n" +
+      "  return list.call(this, p, ...rest);\n" +
+      "};\n" +
+      "require('node:module').syncBuiltinESMExports();\n");
+    const dispatchModule = fileURLToPath(new URL("./dispatch.ts", import.meta.url));
+    const child = spawnSync(process.execPath, [
+      "--require", trip, "--import", "tsx", "--input-type=module", "-e",
+      `const m = await import(${JSON.stringify(dispatchModule)});\n` +
+      "process.stdout.write('\\n' + JSON.stringify({ homes: m.helperHomeCandidates(), dir: m.verdictHandoffDir() }));",
+    ], { encoding: "utf8", timeout: 60_000, env: { ...process.env, PYRY_VERDICT_HANDOFF_DIR: "" } });
+    assert.equal(child.status, 0, child.stderr);
+    // dotenv prints a line of its own first; the result is the last line.
+    const { homes } = JSON.parse(child.stdout.trim().split("\n").at(-1)!);
+    assert.equal(homes[0], homedir(), "the dispatcher's own home comes first");
+  });
 });
