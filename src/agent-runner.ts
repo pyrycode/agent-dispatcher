@@ -407,6 +407,36 @@ export function formatRunCost(result: StreamResult, digits = 2): string {
   return result.costKnown === false ? "cost unavailable" : `$${result.totalCostUsd.toFixed(digits)}`;
 }
 
+/** Extra tries when a required MCP server fails to connect at Codex startup. */
+export const MCP_STARTUP_RETRIES = 3;
+/** Wait between those tries. */
+export const MCP_STARTUP_RETRY_WAIT_MS = 15_000;
+
+/**
+ * Codex refuses to start a run when a server marked `required = true`, such
+ * as Figma in the desktop container (pyrycode-agents #113), fails to
+ * connect. That parked the ticket as an agent error. A connection that
+ * missed once usually connects on the next try, so retry a few times inside
+ * the same run before letting the failure through.
+ */
+export async function retryRequiredMcpStartup(
+  run: () => Promise<StreamResult>,
+  opts: { retries?: number; waitMs?: number; sleep?: (ms: number) => Promise<void>; log?: (msg: string) => void } = {},
+): Promise<StreamResult> {
+  const retries = opts.retries ?? MCP_STARTUP_RETRIES;
+  const waitMs = opts.waitMs ?? MCP_STARTUP_RETRY_WAIT_MS;
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)));
+  for (let attempt = 1; ; attempt++) {
+    const result = await run();
+    const mcpStartupFailed = result.runner === "codex" && result.isError
+      && result.terminalReason === "codex_error"
+      && /required MCP servers failed to initialize/i.test(result.output);
+    if (!mcpStartupFailed || attempt > retries) return result;
+    opts.log?.(`required MCP server failed to start: retry ${attempt}/${retries} in ${waitMs}ms`);
+    await sleep(waitMs);
+  }
+}
+
 export function resumeCommand(result: Pick<StreamResult, "runner" | "sessionId">): string {
   return result.runner === "codex" ? `codex resume ${result.sessionId}` : `claude --resume ${result.sessionId}`;
 }
