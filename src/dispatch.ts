@@ -106,8 +106,10 @@ import {
   parseVerifierGatePass,
   verifierGatePassFileName,
   verifierGateReuseEnabled,
+  VERIFIER_GATE_REUSE_MAX_AGE_MS,
   type VerifierGatePass,
 } from "./verifier-gate-reuse.js";
+import { outOfTimeComment, ReviewBudgetExhaustedError, reviewBudgetStop, type ReviewProgress } from "./verifier-out-of-time.js";
 import {
   attributableFailures,
   buildBaselineRecordComment,
@@ -2434,6 +2436,10 @@ export type DispatchContext = {
   /** Set by `prepareReworkFindingsNote` when this is the builder's rework
    *  after a verifier FAIL, which runs at a higher effort (effort-policy.ts). */
   reworkAfterFail?: boolean;
+  /** What a verdict run got through, kept up to date as its phases run, so
+   *  one that runs out of time can say so on the ticket. See
+   *  verifier-out-of-time.ts. */
+  review?: ReviewProgress;
 };
 
 /**
@@ -2600,7 +2606,9 @@ export async function dispatchToAgent(
   const parallelReview = process.env.PYRY_VERIFIER_PARALLEL_REVIEW === "1"
     && activeStageSet().preSpawnGate?.agentNames.has(agent.name) === true
     && parseVerifierGates(process.env.PYRY_VERIFIER_GATES).length > 0;
+  const gatesStartedAt = Date.now();
   const gates = parallelReview ? { promptNote: "" } : await maybeRunPreSpawnGates(ctx);
+  const gatesMs = gates.promptNote ? Date.now() - gatesStartedAt : undefined;
 
   const mergeNote = ctx.pendingMerge ? mergeHandoffNote(defaultBranch, ctx.pendingMerge.paths) : "";
   const reReview = prepareReReviewNote(ctx);
@@ -2608,6 +2616,11 @@ export async function dispatchToAgent(
   const findingsNote = prepareReworkFindingsNote(ctx);
   const spawn = await prepareAgentSpawn(ctx, gates.promptNote + mergeNote + reReview + handoffNote + findingsNote);
   if (!spawn.ok) return;
+  // The gates ran before the agent's clock started, so the review gets its
+  // whole budget. The overlapped review keeps its own record below.
+  if (agent.requiresVerdict && !parallelReview) {
+    ctx.review = { phase: "review", budgetMs: spawn.config.timeoutMs, ...(gatesMs !== undefined ? { gatesMs } : {}) };
+  }
 
   // streamResult is declared outside the try so handleDispatchError
   // can read its sessionId for the JSONL-replay resume hint.
@@ -2901,6 +2914,35 @@ export async function handleDispatchError(
       // different service from the GitHub API and is often still up.
       unrecordedRetry = outcome.reason === "unrecorded";
     }
+  }
+
+  // A verdict run that ran out of time or turns says so plainly: what ran
+  // out, the gate time it was not charged, the gate results the next run
+  // can reuse and the finished source review. See verifier-out-of-time.ts.
+  const outOfTime = agent.requiresVerdict && item.issueNumber > 0 && !isResourceExhausted && !unrecordedRetry
+    ? reviewBudgetStop(error, streamResult) : null;
+  if (outOfTime !== null) {
+    try {
+      await client.addLabel(item.issueNumber, errorLabel);
+      console.log(`   🏷️  Added ${errorLabel} to #${item.issueNumber} (ran out of ${outOfTime})`);
+    } catch {}
+    try {
+      await client.addComment(item.issueNumber, outOfTimeComment({
+        agentName: agent.name,
+        kind: outOfTime,
+        progress: ctx.review,
+        fallbackBudgetMs: timeoutFor(agent, item.labels),
+        reusableGates: reusableGatesForNextRun(ctx),
+        errorLabel,
+        resumeHint: sessionId !== "unknown" ? resumeCommand({ runner: streamResult?.runner, sessionId }) : null,
+        logFile,
+      }));
+    } catch {}
+    await notifyDiscord(
+      `⏱️ **${agent.name}** ran out of ${outOfTime} on #${item.issueNumber} with no verdict: ${item.title}\n${item.url}\n` +
+      `Remove \`${errorLabel}\` to run it again.`,
+    );
+    return;
   }
 
   if (item.issueNumber > 0) {
@@ -3758,10 +3800,13 @@ async function runParallelVerifierReview(
   console.log("   🔎 Source review running alongside verifier gates; verdict waits for both");
   const sourceStartedAt = Date.now();
   let sourceReviewMs = 0;
+  const progress: ReviewProgress = { phase: "source review", budgetMs: config.timeoutMs };
+  ctx.review = progress;
   const results = await Promise.allSettled([
-    maybeRunPreSpawnGates(ctx),
+    maybeRunPreSpawnGates(ctx)
+      .finally(() => { progress.gatesMs = Date.now() - sourceStartedAt; }),
     ctx.deps.runClaudeStreaming({ ...config, sourceReview: true, sourceReviewRoot: ctx.agentCwd, promptFile: sourcePromptFile, systemPromptFile: sourceSystemFile, logFile: sourceLogFile })
-      .finally(() => { sourceReviewMs = Date.now() - sourceStartedAt; }),
+      .finally(() => { sourceReviewMs = Date.now() - sourceStartedAt; progress.sourceMs = sourceReviewMs; }),
   ]);
   const [gates, review] = results;
   if (gates.status === "rejected") throw gates.reason;
@@ -3769,8 +3814,11 @@ async function runParallelVerifierReview(
   const source = review.value;
   ctx.deps.writeLog(ctx.logFile, "SOURCE REVIEW RESULT", source.output);
   if (source.isError || source.terminalReason !== "stop" || !source.output.trim()) {
-    throw new Error(`Preliminary source review did not complete: ${source.output || source.terminalReason}. No verdict published.`);
+    const detail = `${source.output || source.terminalReason}. No verdict published.`;
+    if (source.timedOut) throw new ReviewBudgetExhaustedError(`Preliminary source review ran out of time: ${detail}`, "time");
+    throw new Error(`Preliminary source review did not complete: ${detail}`);
   }
+  progress.sourceReport = source.output;
   const finalNote = [
     gates.value.promptNote,
     "", "## Completed preliminary source review", "",
@@ -3782,7 +3830,9 @@ async function runParallelVerifierReview(
   ctx.deps.writeLog(ctx.logFile, "FINAL REVIEW INPUT", finalNote);
   const remainingMs = finalReviewBudgetMs(config.timeoutMs, sourceReviewMs);
   const remainingTurns = isClaude ? config.maxTurns - source.numTurns : config.maxTurns;
-  if (remainingTurns <= 0) throw new Error("Verifier turn budget exhausted before final review. No verdict published.");
+  if (remainingTurns <= 0) throw new ReviewBudgetExhaustedError("Verifier turn budget exhausted before final review. No verdict published.", "turns");
+  progress.phase = "final review";
+  progress.budgetMs = remainingMs;
   const final = await ctx.deps.runClaudeStreaming({ ...config, timeoutMs: remainingMs, maxTurns: remainingTurns });
   return mergeLegResults(source, final);
 }
@@ -3896,6 +3946,7 @@ export async function maybeResumeExhaustedRun(
     current = mergeLegResults(current, leg);
   }
 
+  if (ctx.review && legsUsed > 0) ctx.review.legsUsed = legsUsed;
   if (current.isError) {
     if (legsUsed > 0) {
       ctx.deps.writeLog(
@@ -5517,6 +5568,32 @@ function readReusableGatePass(
   if (decision.reuse) return decision.pass;
   console.log(`   🧪 Recorded gate pass for #${issueNumber} not reused (${decision.reason})`);
   return null;
+}
+
+/**
+ * The recorded gate pass the next verifier dispatch would reuse on this
+ * worktree's files, with the time it stops being reusable. Null when there
+ * is none, reuse is off, or anything cannot be read. Only an exact reuse
+ * counts; the out-of-time comment does not promise the docs-only one.
+ */
+function reusableGatesForNextRun(ctx: DispatchContext): { commit: string; untilMs: number } | null {
+  const gates = parseVerifierGates(process.env.PYRY_VERIFIER_GATES);
+  if (gates.length === 0 || !verifierGateReuseEnabled(process.env)) return null;
+  const head = mergedWorktreeHead(ctx);
+  if (head === null) return null;
+  const pass = readRecordedGatePass(ctx, resolve(LOGS_DIR, verifierGatePassFileName(ctx.item.issueNumber)));
+  if (pass === null) return null;
+  const decision = decideVerifierGateReuse({
+    pass,
+    issueNumber: ctx.item.issueNumber,
+    tree: head.tree,
+    gatesHash: hashGateList(gates),
+    nowMs: Date.now(),
+    logExists: (p) => ctx.deps.existsSync(p),
+  });
+  if (!decision.reuse) return null;
+  const passedAtMs = Date.parse(decision.pass.passedAt);
+  return Number.isNaN(passedAtMs) ? null : { commit: decision.pass.commit, untilMs: passedAtMs + VERIFIER_GATE_REUSE_MAX_AGE_MS };
 }
 
 /**
