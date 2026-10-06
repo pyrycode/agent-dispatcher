@@ -66,6 +66,8 @@ import {
   runFamilyBreaker,
   selectPastParkedFamilies,
   runPreDispatchPrep,
+  claimForDispatch,
+  releaseDispatchClaim,
   setupBranchAndWorktree,
   SIGINT_DEBOUNCE_MS,
   SIGINT_FORCE_EXIT_WINDOW_MS,
@@ -7477,6 +7479,34 @@ describe("runFamilyBreaker — veto seam", () => {
 // family-dispatches:N convenience label. Failures are logged and
 // skipped — a missed increment is acceptable, a crashed cycle is not.
 
+describe("claimForDispatch and releaseDispatchClaim — a stop signal during the claim (PR #150 follow-up)", () => {
+  test("releasing a claim puts the ticket's labels back exactly as they were and counts nothing", async () => {
+    const before = ["needs-rework:developer", "error:developer", "ready-for-review", "size:m", "wip:po"];
+    const client = new MockGitHubClient({ labels: { 1724: [...before] } });
+    const item = makeProjectItem({ issueNumber: 1724, parentNumber: 1700, labels: [...before] });
+    const agent = makeAgentConfig({});  // developer
+
+    const claim = await claimForDispatch(agent, item, client);
+    assert.ok(client.labelsByIssue.get(1724)!.includes("wip:developer"), "the claim writes the running label");
+    assert.ok(!client.labelsByIssue.get(1724)!.includes("needs-rework:developer"), "and clears the stage's stale labels");
+
+    await releaseDispatchClaim(agent, item, client, claim);
+    assert.deepEqual([...client.labelsByIssue.get(1724)!].sort(), [...before].sort(), "the rework label the next run needs is back");
+    assert.equal(client.comments.length, 0, "no family dispatch marker is posted by a claim");
+  });
+
+  test("a stale running label of the agent's own is left in place on release", async () => {
+    const before = ["wip:developer", "done:developer"];
+    const client = new MockGitHubClient({ labels: { 1725: [...before] } });
+    const item = makeProjectItem({ issueNumber: 1725, labels: [...before] });
+    const agent = makeAgentConfig({});
+
+    const claim = await claimForDispatch(agent, item, client);
+    await releaseDispatchClaim(agent, item, client, claim);
+    assert.deepEqual([...client.labelsByIssue.get(1725)!].sort(), [...before].sort());
+  });
+});
+
 describe("runPreDispatchPrep — family dispatch accounting", () => {
   const DEV = AGENTS.find(a => a.name === "developer")!;
 
@@ -9627,10 +9657,10 @@ describe("runEnvPreflight — a required variable missing from the dispatcher ho
 
   test("the poll loop holds the live gate, the main sweep and selection on it (source tripwire)", () => {
     const src = readDispatchSource();
-    assert.match(src, /const gateRunner = envHeld \|\| gateHealthFailures\.length > 0 \? null : realClaudeGateRunner;/);
+    assert.match(src, /const gateRunner = liveGateRunnerFor\(\{\s*runner: realClaudeGateRunner, draining: drainMode, envHeld, healthFailures: gateHealthFailures\.length,\s*\}\);/);
     assert.equal((src.match(/^\s+gateRunner,$/gm) ?? []).length, 2, "both gate calls take the held runner");
     assert.match(src, /envHeld\s*\?\s*\{ candidates: \[\], tallies: new Map<number, number>\(\) \}\s*:\s*await selectPastParkedFamilies/);
-    assert.match(src, /if \(mainSweep !== null && sweepRun === null && !gateActive && !envHeld\)/);
+    assert.match(src, /if \(mainSweep !== null && mayStartMainSweep\(\{ configured: true, sweepRunning: sweepRun !== null, gateActive, envHeld, draining: drainMode \}\)\)/);
   });
 
   test("the poll loop runs the health checks between selection and prep (source tripwire, agent-dispatcher#131)", () => {
@@ -9638,7 +9668,7 @@ describe("runEnvPreflight — a required variable missing from the dispatcher ho
     assert.match(src, /itemsByColumn: stillHeld\.itemsByColumn,/, "selection skips tickets still held");
     assert.match(src, /const candidates = health\.dispatch;/, "only healthy candidates are dispatched");
     const held = src.indexOf("const health = await holdUnhealthyCandidates(");
-    const prep = src.indexOf("prep: (cs) => runPreDispatchPrep(cs, client");
+    const prep = src.indexOf("claim: (c) => claimForDispatch(c.agent, c.item, client)");
     assert.ok(held > 0 && prep > held, "the check runs before any wip label or family count");
   });
 });

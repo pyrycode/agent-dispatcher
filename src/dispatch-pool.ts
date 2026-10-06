@@ -126,37 +126,75 @@ export class DispatchPool {
 }
 
 /**
- * The cycle's last step before agents start: prepare the board for the
- * selected candidates, then launch each one into the pool. Returns how many
- * were launched.
+ * The cycle's last step before agents start. For each selected candidate in
+ * turn: claim it on the board, count it, and launch it into the pool.
+ * Returns how many were launched.
  *
  * Launches nothing once the dispatcher is draining. The loop's own drain
  * check sits at the top of a cycle, and a cycle spends many seconds on
  * board upkeep before it selects, so a stop signal landing in between used
  * to start a fresh run anyway: builder#1724 on the desktop board on
- * 2026-10-05, eight seconds after the signal. The check comes before the
- * board writes, so a skipped candidate keeps its labels and is picked up as
- * before after the restart. A signal arriving during those writes, a few
- * seconds at most, still lets the run start; the drain then waits for it.
+ * 2026-10-05, eight seconds after the signal.
+ *
+ * The signal is checked before each candidate's claim, so a skipped
+ * candidate keeps its labels, and again after the claim. A signal that
+ * lands while the claim is being written undoes it with `release`, so the
+ * ticket is never left half-claimed, and nothing after it starts. Only then
+ * does `commit` write what cannot be taken back, the family dispatch
+ * comment, and the run start. A signal during that last write, one comment
+ * and a label, still lets that one run start; the drain then waits for it.
  */
-export async function launchCandidates<C extends { agent: { name: string }; item: { issueNumber: number } }>(opts: {
+export async function launchCandidates<C extends { agent: { name: string }; item: { issueNumber: number } }, Claim = void>(opts: {
   candidates: readonly C[];
   pool: Pick<DispatchPool, "launch">;
   /** True once the dispatcher got its stop signal. */
   draining: () => boolean;
-  /** Board writes that claim the candidates, such as the running label. */
-  prep: (candidates: readonly C[]) => Promise<void>;
+  /** Board writes that claim one candidate, such as the running label.
+   *  Returns what `release` needs to undo them. */
+  claim: (candidate: C) => Promise<Claim>;
+  /** Undo `claim` for a candidate that will not start after all. */
+  release: (candidate: C, claim: Claim) => Promise<void>;
+  /** Writes that cannot be undone, made once the run is certain to start. */
+  commit?: (candidate: C) => Promise<void>;
   run: (candidate: C) => Promise<unknown>;
 }): Promise<number> {
-  const { candidates, pool, prep, run } = opts;
-  if (candidates.length === 0) return 0;
-  if (opts.draining()) {
-    console.log(`   🚦 Drain: not starting ${candidates.map((c) => candidateKey(c.agent.name, c.item.issueNumber)).join(", ")}`);
-    return 0;
-  }
-  await prep(candidates);
-  for (const c of candidates) {
+  const { candidates, pool, run } = opts;
+  const notStarting = (rest: readonly C[]) =>
+    console.log(`   🚦 Drain: not starting ${rest.map((c) => candidateKey(c.agent.name, c.item.issueNumber)).join(", ")}`);
+  let launched = 0;
+  for (const [i, c] of candidates.entries()) {
+    if (opts.draining()) {
+      notStarting(candidates.slice(i));
+      break;
+    }
+    const claim = await opts.claim(c);
+    if (opts.draining()) {
+      await opts.release(c, claim);
+      notStarting(candidates.slice(i));
+      break;
+    }
+    await opts.commit?.(c);
     pool.launch(candidateKey(c.agent.name, c.item.issueNumber), () => run(c));
+    launched++;
   }
-  return candidates.length;
+  return launched;
+}
+
+/**
+ * The runner the live test gate may use this round, or null to skip it. A
+ * missing environment variable or a failing live-gate health check holds it,
+ * and so does the stop signal: in drain mode the gate starts no new run,
+ * like the agents, and the drain waits only for one already going.
+ */
+export function liveGateRunnerFor<R>(opts: { runner: R | null; draining: boolean; envHeld: boolean; healthFailures: number }): R | null {
+  return opts.draining || opts.envHeld || opts.healthFailures > 0 ? null : opts.runner;
+}
+
+/**
+ * Whether the main-branch sweep may start this round: it is configured, not
+ * already running, the live gate is not using the emulator, the environment
+ * is complete, and no stop signal has arrived.
+ */
+export function mayStartMainSweep(opts: { configured: boolean; sweepRunning: boolean; gateActive: boolean; envHeld: boolean; draining: boolean }): boolean {
+  return opts.configured && !opts.sweepRunning && !opts.gateActive && !opts.envHeld && !opts.draining;
 }
