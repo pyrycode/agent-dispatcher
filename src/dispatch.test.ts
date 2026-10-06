@@ -7121,7 +7121,21 @@ describe("runCommandAsync — the real runner", () => {
     assert.equal(out.ok, false);
     const grandchild = Number(readFileSync(pidFile, "utf-8").trim());
     assert.ok(grandchild > 1);
-    assert.throws(() => process.kill(grandchild, 0), /ESRCH/, "the grandchild must be gone");
+    // The grandchild has had the SIGTERM, but it is not gone the moment the
+    // shell's close event fires. It closes its end of the output pipe as it
+    // exits, and its pid stays visible until the system reaps it, a few
+    // milliseconds later on a loaded host. Checking at once failed a few runs
+    // in a thousand under parallel load. Poll for up to 5 s instead, far
+    // short of the 30 s sleep a grandchild left out of the kill would live on.
+    const gone = () => { try { process.kill(grandchild, 0); return false; } catch (e: any) { return e?.code === "ESRCH"; } };
+    const deadline = Date.now() + 5_000;
+    while (!gone() && Date.now() < deadline) await new Promise(r => setTimeout(r, 20));
+    try {
+      assert.ok(gone(), "the grandchild must be gone");
+    } finally {
+      try { process.kill(grandchild, "SIGKILL"); } catch { /* already gone */ }
+      rmSync(pidFile, { force: true });
+    }
   });
 });
 
