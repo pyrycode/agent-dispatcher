@@ -35,7 +35,7 @@ Uncommitted changes are committed as one `wip(<agent>): partial work from an int
 
 ### Resume-in-place
 
-Before any salvage, a run that exhausted its budget — the `max_turns` turn cap or the dispatcher's wall-clock timeout — gets up to `PYRY_RESUME_LEGS` continuation legs (default 1; `0` disables the feature and restores the pre-resume behaviour byte-for-byte). A continuation leg resumes the **same claude session** via `claude --resume <session-id>` with a fresh budget, inside the same dispatch and the same worktree, with every flag re-passed (they do not carry over on resume). Session ids are captured from the stream's init frame, so even a killed run that never emitted a result frame stays resumable. Most budget exhaustions are "ran out mid-task", not "stuck" — one fresh budget converts most of those human-triage interruptions into automatic completions. If the final leg is still exhausted, the salvage paths below run unchanged, keyed on the original run's result. Permission denials never resume; they keep their own salvage.
+Before any salvage, a run that exhausted its budget — the `max_turns` turn cap or the dispatcher's wall-clock timeout — gets up to `PYRY_RESUME_LEGS` continuation legs (default 1; `0` disables the feature and restores the pre-resume behaviour byte-for-byte). A continuation leg resumes the **same claude session** via `claude --resume <session-id>` with a fresh budget, inside the same dispatch and the same worktree, with every flag re-passed (they do not carry over on resume). Session ids are captured from the stream's init frame, so even a killed run that never emitted a result frame stays resumable. Most budget exhaustions are "ran out mid-task", not "stuck" — one fresh budget converts most of those human-triage interruptions into automatic completions. If the final leg is still exhausted, the salvage paths below run unchanged, keyed on the original run's result. Permission denials never resume; they keep their own salvage. Each leg has its own wall clock and earns its own wait credit for the device and build places, and the merged result adds the legs' credit together.
 
 A Codex run stopped by its wall clock gets the same continuation legs under the same rules: it resumes its own thread through `codex exec resume <thread-id>` with every flag re-passed and the same continuation prompt, and keeps its wait credit for the device and build places on each leg. A run never switches runner on continuation. A blocked Codex run, an idle stall or a Codex error never resumes.
 
@@ -122,8 +122,8 @@ Optional:
 | `PYRY_LOG_RETENTION_DAYS` | `30` | Rotate logs older than N days; `0` disables |
 | `PYRY_RESUME_LEGS` | `1` | Resume-in-place: how many same-session continuation legs a budget-exhausted run gets before salvage. `0` disables the feature entirely (byte-identical pre-resume behaviour). See above. |
 | `PYRY_AGENT_IDLE_TIMEOUT_MINUTES` | `10` | Both runners: kill a run whose stream has been silent this long while no tool call is outstanding, and fail it with `idle_stall`, which retries with backoff like any transient error. A running tool, such as a long Gradle test run, never trips it; the wall clock still bounds that. For Codex, a tool call is any item between its `item.started` and `item.completed` events, except a to-do list. Fractions allowed; `0` disables. Added after pyrycode-mobile #1430 sat silent for twenty minutes inside one assistant turn on 2026-10-02, and extended to Codex on 2026-10-04. See "Time limits and waiting". |
-| `PYRY_TIMEOUT_GRACE_MINUTES` | `20` | Codex runner only: when a run's budget is spent while a command it started earlier is still running, wait up to this long for that command to finish before stopping the run, so any wait it reports can be credited. Commands started after the deadline hold nothing. Fractions allowed; `0` disables; garbage keeps the default. See "Time limits and waiting". |
-| `PYRY_TIMEOUT_CEILING_FACTOR` | `2` | Hard ceiling, as a multiple of the normal budget, that wait credit and grace can never take a Codex run or a dispatcher-run gate past. `1` turns all extension off, which is the behaviour before 2026-10-04. Below 1, empty or garbage keeps `2`. See "Time limits and waiting". |
+| `PYRY_TIMEOUT_GRACE_MINUTES` | `20` | Both runners: when a run's budget is spent while a command it started earlier is still running, wait up to this long for that command to finish before stopping the run, so any wait it reports can be credited. Commands started after the deadline hold nothing. Fractions allowed; `0` disables; garbage keeps the default. See "Time limits and waiting". |
+| `PYRY_TIMEOUT_CEILING_FACTOR` | `2` | Hard ceiling, as a multiple of the normal budget, that wait credit and grace can never take an agent run or a dispatcher-run gate past. `1` turns all extension off, which is the behaviour before 2026-10-04. Below 1, empty or garbage keeps `2`. See "Time limits and waiting". |
 | `PYRY_BUDGET_SCALE` | `1` | Multiplier on every agent's turn cap and wall-clock timeout, for a fork whose tickets or model need a different budget without changing the others. Timeouts round to whole minutes. Unset, empty, non-numeric, zero or negative keeps `1`. Mobile runs `1.5` since 2026-09-23, after moving to Opus 5.5 and raising its ticket ceiling to 1600 lines. Printed in the startup banner. |
 | `PYRY_REQUIRED_ENV` | — | Comma- or space-separated names of environment variables this fork cannot work without, such as `ANDROID_HOME`. Checked every cycle against the dispatcher's own environment. While one is unset or blank, no agent is dispatched and neither the live gate nor the main sweep starts, a warning is logged and one Discord message is sent. Board upkeep, rework routing and merges carry on. Restart the dispatcher with the variable set to resume. Unset requires nothing. Added after mobile #1631 parked on 2026-10-03, when a restart lost `ANDROID_HOME` and the builder found Gradle could not locate the SDK. Printed in the startup banner. |
 | `PYRY_AGENT_SHELL_ENV` | — | Codex runner only. Comma- or space-separated names of non-secret settings that Codex agents' shell commands should see, such as `ANDROID_HOME`. The user's Codex config inherits only core variables into tool commands, so without this a builder cannot see what the fork's `.env` supplies. Each listed name that is set and not blank in the environment Codex gets is passed as its own `-c shell_environment_policy.set.NAME=...` override, the same way `AGENTS_REPO_PATH` is. A name that looks secret, containing `KEY`, `SECRET`, `TOKEN`, `PASSWORD`, `PASSWD`, `CREDENTIAL`, `AUTH` or `PRIVATE` or starting with `OP_` in any case, or that is not an upper-case variable name, is skipped with one warning per dispatcher process. The read-only preliminary source review gets none of them: it ignores the user config, so the core-only policy does not apply to it, and it builds nothing. Unset passes nothing. The Claude runner needs nothing, since its shells inherit the environment. Printed in the startup banner. Mobile #1631 parked on 2026-10-03 on "ANDROID_HOME is missing from the dispatcher environment". |
@@ -704,10 +704,19 @@ normal budget, twice by default, so a hung run still ends. With mobile's
 settings, a 60-minute verifier gate can wait the full 45 minutes for the device
 and still have its hour, inside a 120-minute ceiling.
 
-The Claude runner keeps its plain wall clock. No Claude fork runs these queues
-today, and Claude's shell tool caps a foreground command at ten minutes and
-backgrounds longer ones, so a wait rarely finishes inside the command that
-would report it. The stranded running-label sweep is unchanged: it never
+**Claude agent runs.** Claude runs earn the same credit, grace and ceiling,
+from their shell commands. The stream shows a shell command as a `Bash` tool
+call and its output as the matching tool result, once the command ends, so a
+Bash call counts as a running command from the call to its result, and the
+result's text is read like a Codex command's output. Other tools' results are
+never read. Claude's shell caps a foreground command at ten minutes and moves
+it to the background past that, or at once when asked; the call's result then
+returns early and stops counting, so a wait behind a backgrounded command earns
+little or nothing. Until 2026-10-06 Claude kept a plain wall clock, because no
+Claude fork ran these queues. Since 2026-10-05 mobile's builder reworks after a
+failed review run on Claude, and they run the device gate in the foreground.
+
+The stranded running-label sweep is unchanged: it never
 touches a run this dispatcher has in flight, however long it takes.
 
 ## Health check before dispatch

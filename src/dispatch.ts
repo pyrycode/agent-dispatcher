@@ -14,6 +14,7 @@ import { gateReportSection } from "./gate-report.js";
 import { FINAL_MERGE_HANDOFF_MARKER, FINAL_MERGE_HANDOFF_MAX, MERGE_HANDOFF_LABEL, checkMergeResolution, decideConflictRoute, decideFinalMergeRoute, findMergeCommit, mergeHandoffNote, mergeResolutionComment, mergeResolutionSection, readPendingMerge, type PendingMerge, type ResolutionNote } from "./merge-handoff.js";
 
 import {
+  advanceClaudeRunClock,
   advanceGateWaitState,
   advanceRunClock,
   decideRunClock,
@@ -564,9 +565,9 @@ function writeLog(logFile: string, section: string, content: string): void {
 
 export interface StreamResult {
   runner?: AgentRunner;
-  /** Codex only: wall-clock time credited back for waiting on the Android
-   *  device hold or a Gradle build place (wait-credit.ts). Absent or 0 when
-   *  none was. */
+  /** Wall-clock time credited back for waiting on the Android device hold
+   *  or a Gradle build place (wait-credit.ts), from Codex command output or
+   *  Claude Bash results. Absent or 0 when none was. */
   waitCreditMs?: number;
   /** False when the runner does not report monetary cost. */
   costKnown?: boolean;
@@ -989,17 +990,19 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
     let denialState = initPermissionDenialState();
     let forceExitTimer: NodeJS.Timeout | null = null;
 
-    // Codex wall clock (wait-credit.ts). Time a command spent waiting for the
-    // Android device hold or a Gradle build place is credited back once its
-    // output shows it; a command still running when the budget is spent gets
-    // a bounded grace to finish and show it; nothing passes the hard ceiling.
-    // The Claude runner keeps its plain wall clock.
-    let clock: RunClock | null = isCodex ? initRunClock({
+    // Agent wall clock (wait-credit.ts), both runners. Time a command spent
+    // waiting for the Android device hold or a Gradle build place is credited
+    // back once its output shows it: a Codex command execution's output, or a
+    // Claude Bash call's tool result. A command still running when the budget
+    // is spent gets a bounded grace to finish and show it; nothing passes the
+    // hard ceiling. Claude got this on 2026-10-06, once mobile's builder
+    // reworks ran on Claude and ran the device gate in the foreground.
+    let clock: RunClock = initRunClock({
       startedAt,
       budgetMs: opts.timeoutMs,
       ceilingFactor: parseTimeoutCeilingFactor(process.env.PYRY_TIMEOUT_CEILING_FACTOR),
       graceMs: parseTimeoutGraceMs(process.env.PYRY_TIMEOUT_GRACE_MINUTES),
-    }) : null;
+    });
     let graceNoted = false;
     const killForTimeout = (detail: string) => {
       timedOut = true;
@@ -1010,7 +1013,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
       }
     };
     const checkClock = () => {
-      if (!clock || timedOut) return;
+      if (timedOut) return;
       const now = Date.now();
       const decision = decideRunClock(clock, now);
       if (decision.kind === "stop") {
@@ -1029,11 +1032,25 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
       }
       timer = setTimeout(checkClock, Math.max(1000, decision.checkAt - now));
     };
-    let timer: NodeJS.Timeout = isCodex ? setTimeout(checkClock, opts.timeoutMs) : setTimeout(() => {
-      timedOut = true;
-      appendFileSync(opts.logFile, `\n⏰ TIMEOUT — killing agent after ${opts.timeoutMs / 1000}s\n`);
-      killChildPgrp(child, "SIGTERM");
-    }, opts.timeoutMs);
+    let timer: NodeJS.Timeout = setTimeout(checkClock, opts.timeoutMs);
+    /** Feed one stream message to the clock and log any new credit. A
+     *  command finishing past the budget decides now: either its output
+     *  earned more time, or the grace it was given is over. */
+    const advanceClock = (msg: unknown, commandFinished: boolean) => {
+      if (timedOut) return;
+      const before = runClockCreditMs(clock);
+      clock = isCodex ? advanceRunClock(clock, msg, Date.now()) : advanceClaudeRunClock(clock, msg, Date.now());
+      const credit = runClockCreditMs(clock);
+      if (credit > before) {
+        appendFileSync(opts.logFile, `[${new Date().toISOString()}] ⏱️ WAIT CREDIT — +${Math.round((credit - before) / 1000)}s ` +
+          `waiting on the device or a build place (total ${Math.round(credit / 1000)}s); deadline now ` +
+          `${new Date(runClockDeadline(clock)).toISOString()}\n`);
+      }
+      if (commandFinished && Date.now() - startedAt >= opts.timeoutMs) {
+        clearTimeout(timer);
+        checkClock();
+      }
+    };
 
     // Idle watchdog, both runners. Fires when no stream line has arrived for
     // PYRY_AGENT_IDLE_TIMEOUT_MINUTES while no tool call is outstanding, and
@@ -1103,26 +1120,12 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
             logStreamMessage(opts.logFile, msg);
             if (msg.type === "turn.started") codexTurnEnded = false;
             if (msg.type === "turn.completed" || msg.type === "turn.failed") codexTurnEnded = true;
-            if (clock && !timedOut) {
-              const before = runClockCreditMs(clock);
-              clock = advanceRunClock(clock, msg, Date.now());
-              const credit = runClockCreditMs(clock);
-              if (credit > before) {
-                appendFileSync(opts.logFile, `[${new Date().toISOString()}] ⏱️ WAIT CREDIT — +${Math.round((credit - before) / 1000)}s ` +
-                  `waiting on the device or a build place (total ${Math.round(credit / 1000)}s); deadline now ` +
-                  `${new Date(runClockDeadline(clock)).toISOString()}\n`);
-              }
-              // A command finishing past the budget decides now: either its
-              // output earned more time, or the grace it was given is over.
-              if (msg.type === "item.completed" && Date.now() - startedAt >= opts.timeoutMs) {
-                clearTimeout(timer);
-                checkClock();
-              }
-            }
+            advanceClock(msg, msg.type === "item.completed");
             continue;
           }
           initSessionId = captureSessionId(initSessionId, msg);
           logStreamMessage(opts.logFile, msg);
+          advanceClock(msg, msg.type === "user");
           if (msg.type === "result") {
             resultMsg = msg;
             // The run has its outcome. A process that lingers after its
@@ -1197,12 +1200,18 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
 
       if (codex) {
         const finished = codex.finish(code, timedOut, Date.now() - startedAt, stderrTail, idleStalled ? idleMs : 0);
-        if (clock) finished.waitCreditMs = runClockCreditMs(clock);
+        finished.waitCreditMs = runClockCreditMs(clock);
         if (finished.isError) logStderrTail();
         resolve(finished);
         return;
       }
 
+      // Credit only when there was some, so a Claude result without any
+      // keeps its old shape.
+      const claudeWaitCredit = () => {
+        const waitCreditMs = runClockCreditMs(clock);
+        return waitCreditMs > 0 ? { waitCreditMs } : {};
+      };
       if (resultMsg) {
         const r = resultMsg as any;
         // Direct Claude CLI emits subtype/structured_output, unlike pyry's
@@ -1234,6 +1243,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
           deniedOpContent: denialState.deniedContent,
           lastAssistantText: denialState.lastAssistantText,
           timedOut,
+          ...claudeWaitCredit(),
         });
       } else if (denialState.hadPermissionDenial) {
         logStderrTail();
@@ -1259,6 +1269,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
           deniedOpContent: denialState.deniedContent,
           lastAssistantText: denialState.lastAssistantText,
           timedOut,
+          ...claudeWaitCredit(),
         });
       } else if (idleStalled) {
         logStderrTail();
@@ -1267,7 +1278,9 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
         reject(new AgentRunStoppedError(idleStallMessage(idleMs), "idle_stall"));
       } else if (timedOut) {
         logStderrTail();
-        reject(new AgentRunStoppedError(`Agent timed out after ${opts.timeoutMs / 1000}s`, "timeout"));
+        const credit = runClockCreditMs(clock);
+        reject(new AgentRunStoppedError(`Agent timed out after ${opts.timeoutMs / 1000}s` +
+          (credit > 0 ? ` plus ${Math.round(credit / 1000)}s credited for waiting on the device or a build place` : ""), "timeout"));
       } else {
         logStderrTail();
         // The scrubbed stderr tail rides in the message, so the ticket's

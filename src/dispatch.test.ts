@@ -7745,6 +7745,23 @@ describe("maybeResumeExhaustedRun — same-dispatch continuation leg", () => {
     });
   });
 
+  test("a timed-out Claude run with wait credit continues, and the merged result carries both legs' credit", async () => {
+    await withResumeLegs(undefined, async () => {
+      const { ctx, calls } = makeTestContext({
+        mockOptions: {
+          streamResult: () => streamResult({ isError: false, terminalReason: "stop", sessionId: "sess-first", waitCreditMs: 300_000 }),
+        },
+      });
+      const first = streamResult({ isError: true, timedOut: true, terminalReason: "", sessionId: "sess-first", waitCreditMs: 540_000 });
+
+      const result = await maybeResumeExhaustedRun(first, makeSpawnConfig(ctx.logFile), ctx);
+
+      assert.equal(calls.claudeStreams, 1);
+      assert.equal(result.isError, false);
+      assert.equal(result.waitCreditMs, 840_000, "wait credit from both legs");
+    });
+  });
+
   test("the continuation config re-passes every flag, keeps cwd/timeout, and swaps only the prompt", async () => {
     await withResumeLegs(undefined, async () => {
       const seenConfigs: any[] = [];
