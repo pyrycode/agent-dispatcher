@@ -143,16 +143,90 @@ export function findingTextSimilarity(a: string, b: string): number {
  * or either has no parseable key, so the caller falls back to the count rule.
  */
 export function findRepeatedMustFix(artifacts: readonly VerdictArtifact[]): string[] {
+  const [newest, previous] = failVerdictsNewestFirst(artifacts);
+  if (previous === undefined) return [];
+  const prior = extractMustFixFindings(previous).filter((f) => !isBranchInvariantKey(f.key));
+  const repeated = extractMustFixFindings(newest).filter((f) =>
+    !isBranchInvariantKey(f.key) &&
+    prior.some((p) => p.key === f.key && findingTextSimilarity(p.text, f.text) >= REPEAT_FINDING_SIMILARITY));
+  return [...new Set(repeated.map((f) => f.key))];
+}
+
+/** The distinct FAIL verdict bodies, newest first. */
+function failVerdictsNewestFirst(artifacts: readonly VerdictArtifact[]): string[] {
   const fails = artifacts
     .filter((a) => a.body && isFailVerdict(a.body) && Number.isFinite(Date.parse(a.at)))
     .sort((a, b) => Date.parse(b.at) - Date.parse(a.at))
     .map((a) => a.body!.trim());
-  const [newest, previous] = [...new Set(fails)];
-  if (previous === undefined) return [];
-  const prior = extractMustFixFindings(previous);
-  const repeated = extractMustFixFindings(newest).filter((f) =>
-    prior.some((p) => p.key === f.key && findingTextSimilarity(p.text, f.text) >= REPEAT_FINDING_SIMILARITY));
-  return [...new Set(repeated.map((f) => f.key))];
+  return [...new Set(fails)];
+}
+
+/** The newest FAIL verdict's body, or null when the pull request has none. */
+export function newestFailVerdict(artifacts: readonly VerdictArtifact[]): string | null {
+  return failVerdictsNewestFirst(artifacts)[0] ?? null;
+}
+
+// Branch invariants: findings about the branch, not about any source.
+//
+// The verifier's pre-verify gate checks that current `origin/main` is an
+// ancestor of the reviewed head. When main moves between the dispatcher's
+// merge and that check, the verdict FAILs with one finding located at the
+// branch itself, `feature/<n>` → "reviewed HEAD", "branch ancestry", "HEAD
+// integration" and so on. Overnight 2026-10-06 to 2026-10-07 that happened on
+// desktop #1731, #1779, #1818 and #1825: each cost a builder round that only
+// merged main, and on #1825 the same finding in two FAILs running parked the
+// ticket through the repeat rule although every code finding was fixed.
+//
+// A finding like that has no source symbol, and "the same finding again"
+// says only that main moved again, which is not a loop the builder is in.
+// So branch-located keys never count toward the repeat rule, and a FAIL whose
+// only blocking findings are a stale base is settled by the dispatcher
+// merging main itself (reconcile.ts), not by a builder round.
+
+/** A ticket branch, `main` or `HEAD` as a finding's location, in any of the
+ *  forms the verifier writes it. */
+const BRANCH_LOCATION = /^(?:refs\/heads\/|origin\/)?(?:feature\/\d+|main|master|HEAD)$/;
+
+/**
+ * Whether a `path → Symbol` key from `extractMustFixFindings` is located at a
+ * branch rather than a source file: `feature/1825 → reviewed`. Such a finding
+ * is a branch invariant with no source symbol.
+ */
+export function isBranchInvariantKey(key: string): boolean {
+  const path = key.split(" → ")[0].trim();
+  return BRANCH_LOCATION.test(path);
+}
+
+/** `[MUST FIX]`, in the tag form the verifier writes. */
+const MUST_FIX_TAG = /\[MUST FIX\]/i;
+
+/**
+ * Whether one verdict line is a `[MUST FIX]` finding that the branch lacks
+ * current main. The location, the text between the tag and the first arrow,
+ * must be a ticket branch (`feature/<n>`, with or without a `Git branch`
+ * prefix), and the line must say main is missing: it names main together with
+ * ancestry, containment or merging. A finding located at a source file never
+ * qualifies, whatever it says about main.
+ */
+export function isStaleBaseFinding(line: string): boolean {
+  const tag = MUST_FIX_TAG.exec(line);
+  if (!tag) return false;
+  const rest = line.slice(tag.index + tag[0].length);
+  const arrow = rest.search(/→|->/);
+  const location = arrow >= 0 ? rest.slice(0, arrow) : rest.slice(0, 120);
+  if (!/`(?:refs\/heads\/|origin\/)?feature\/\d+`/.test(location)) return false;
+  if (!/\b(?:origin\/)?main\b/i.test(rest)) return false;
+  return /ancestor|contain|merge|behind|lacks|missing/i.test(rest);
+}
+
+/**
+ * The verdict's `[MUST FIX]` lines, and whether every one is a stale base
+ * finding. `staleBaseOnly` is false when there is no `[MUST FIX]` line at all,
+ * so a FAIL with no tagged finding is never read as a stale base.
+ */
+export function staleBaseFindings(body: string): { mustFix: string[]; staleBaseOnly: boolean } {
+  const mustFix = body.split("\n").filter((l) => MUST_FIX_TAG.test(l));
+  return { mustFix, staleBaseOnly: mustFix.length > 0 && mustFix.every(isStaleBaseFinding) };
 }
 
 /** How many artifacts were posted at or after the run started. */

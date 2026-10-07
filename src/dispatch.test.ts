@@ -24,7 +24,7 @@ import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
 
 import { basename, dirname, join, resolve } from "node:path";
@@ -96,7 +96,13 @@ import {
   type StreamResult,
   runEnvPreflight,
   type EnvPreflightState,
+  answerStaleBaseFindings,
+  baseCurrencyNote,
+  recordGateRunMeta,
+  refreshStaleBaseBranch,
 } from "./dispatch.js";
+import { parseGateRunMeta } from "./gate-report.js";
+import { serializeLastVerdict } from "./verdict-handoff.js";
 import { formatGateEvidenceComment } from "./gate-output.js";
 import { flakyMarker } from "./flaky-tickets.js";
 import { FINAL_MERGE_HANDOFF_MARKER, MERGE_RESOLUTION_NOTE_MARKER, mergeResolutionComment } from "./merge-handoff.js";
@@ -11814,5 +11820,261 @@ describe("verdict handoff lands where the pipeline helper accepts it (desktop #1
     // dotenv prints a line of its own first; the result is the last line.
     const { homes } = JSON.parse(child.stdout.trim().split("\n").at(-1)!);
     assert.equal(homes[0], homedir(), "the dispatcher's own home comes first");
+  });
+});
+
+// --------- Merge race (2026-10-07) ---------
+//
+// Main moved between the verifier's setup merge and its pre-verify gate, and
+// four desktop tickets lost a builder round each to a FAIL that only said
+// "merge current main" (#1731, #1779, #1818, #1825). The dispatcher now
+// merges main again right before the gates, and settles a stale base FAIL
+// itself (reconcile.ts) through refreshStaleBaseBranch.
+
+describe("refreshStaleBaseBranch: merges current main into the pushed branch", () => {
+  function sh(cmd: string, cwd: string): string {
+    return execSync(cmd, { cwd, encoding: "utf-8", stdio: "pipe" }).trim();
+  }
+  /** origin with main and feature/1825, a clone as the dispatcher's repo, and main moved on origin since. */
+  function repos() {
+    const root = mkdtempSync(join(tmpdir(), "stale-base-"));
+    const origin = join(root, "origin.git");
+    const work = join(root, "work", "pyrycode-desktop");
+    const other = join(root, "other");
+    sh(`git init -q --bare -b main "${origin}"`, root);
+    for (const dir of [work, other]) {
+      sh(`git clone -q "${origin}" "${dir}"`, root);
+      sh(`git config user.name Test && git config user.email test@example.com`, dir);
+    }
+    writeFileSync(join(work, "a.txt"), "one\ntwo\nthree\n");
+    sh(`git checkout -q -b main && git add a.txt && git commit -q -m base && git push -q origin main`, work);
+    sh(`git checkout -q -b feature/1825 && echo feature > f.txt && git add f.txt && git commit -q -m feature && git push -q -u origin feature/1825 && git checkout -q main`, work);
+    sh(`git fetch -q origin && git checkout -q -b main origin/main && echo moved > m.txt && git add m.txt && git commit -q -m "main moved" && git push -q origin main`, other);
+    return { root, origin, work, other, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+  }
+
+  test("main moved: a merge commit with both parents is pushed to origin/feature/1825 and the worktree is gone", () => {
+    const r = repos();
+    try {
+      const oldHead = sh(`git rev-parse origin/feature/1825`, r.work);
+      const out = refreshStaleBaseBranch({ issueNumber: 1825, repoRoot: r.work, defaultBranch: "main" });
+      assert.equal(out.kind, "merged", JSON.stringify(out));
+      if (out.kind !== "merged") return;
+      const mainSha = sh(`git rev-parse main`, r.other);
+      assert.equal(out.mainSha, mainSha);
+      assert.equal(sh(`git rev-parse refs/heads/feature/1825`, r.origin), out.headSha, "pushed");
+      assert.deepEqual(sh(`git rev-list --parents -n 1 ${out.headSha}`, r.origin).split(" ").slice(1).sort(), [oldHead, mainSha].sort());
+      assert.equal(sh(`git log -1 --format=%s ${out.headSha}`, r.origin), "Merge branch 'main' into feature/1825");
+      assert.equal(sh(`git worktree list`, r.work).split("\n").length, 1, "the dispatcher's worktree was removed");
+      assert.equal(sh(`git rev-parse feature/1825`, r.work), oldHead, "the local branch is left for the next dispatch to fast-forward");
+
+      const again = refreshStaleBaseBranch({ issueNumber: 1825, repoRoot: r.work, defaultBranch: "main" });
+      assert.deepEqual(again, { kind: "current", mainSha, headSha: out.headSha });
+    } finally { r.cleanup(); }
+  });
+
+  test("main that conflicts with the branch merges nothing and names the file", () => {
+    const r = repos();
+    try {
+      sh(`git checkout -q feature/1825 && printf 'one\\nfeature two\\nthree\\n' > a.txt && git commit -q -am "feature edits a" && git push -q origin feature/1825 && git checkout -q main`, r.work);
+      sh(`printf 'one\\nmain two\\nthree\\n' > a.txt && git commit -q -am "main edits a" && git push -q origin main`, r.other);
+      const before = sh(`git rev-parse refs/heads/feature/1825`, r.origin);
+      const out = refreshStaleBaseBranch({ issueNumber: 1825, repoRoot: r.work, defaultBranch: "main" });
+      assert.deepEqual(out, { kind: "conflict", paths: ["a.txt"] });
+      assert.equal(sh(`git rev-parse refs/heads/feature/1825`, r.origin), before, "nothing pushed");
+      assert.equal(sh(`git worktree list`, r.work).split("\n").length, 1);
+    } finally { r.cleanup(); }
+  });
+
+  test("a local branch with commits origin lacks is left alone", () => {
+    const r = repos();
+    try {
+      sh(`git checkout -q feature/1825 && echo local > l.txt && git add l.txt && git commit -q -m unpushed && git checkout -q main`, r.work);
+      const before = sh(`git rev-parse refs/heads/feature/1825`, r.origin);
+      const out = refreshStaleBaseBranch({ issueNumber: 1825, repoRoot: r.work, defaultBranch: "main" });
+      assert.equal(out.kind, "failed");
+      assert.match((out as { reason: string }).reason, /commits origin\/feature\/1825 lacks/);
+      assert.equal(sh(`git rev-parse refs/heads/feature/1825`, r.origin), before);
+    } finally { r.cleanup(); }
+  });
+
+  test("a branch origin does not have is a failure, not a merge", () => {
+    const r = repos();
+    try {
+      const out = refreshStaleBaseBranch({ issueNumber: 4242, repoRoot: r.work, defaultBranch: "main" });
+      assert.equal(out.kind, "failed");
+    } finally { r.cleanup(); }
+  });
+});
+
+describe("answerStaleBaseFindings: the re-review reads why the stale base finding is fixed", () => {
+  const fixture = JSON.parse(readFileSync(new URL("./fixtures/desktop-stale-base-verdicts.json", import.meta.url), "utf8")) as {
+    tickets: Record<string, { comments: Array<{ createdAt: string; body: string }> }>;
+  };
+
+  test("#1825's last FAIL: finding 1 is answered as fixed by the dispatcher's merge", async () => {
+    await withStageSet("builder", async () => {
+      const body = fixture.tickets["1825"].comments[1].body;
+      const commit = "84017318d33f056c02efbc026ab368a415f21a37";
+      const { deps, calls } = makeMockDeps({
+        fsMap: { [lastVerdictPath("verifier", 1825)]: serializeLastVerdict({ decision: "FAIL", commit, labels: ["needs-rework:builder"], body }, "2026-10-07T00:22:16Z") },
+      });
+      answerStaleBaseFindings(1825, { kind: "merged", mainSha: "e94bf2a5aadc057e21828e1ea4ccf7e0e0ff4fc4", headSha: "362f24a647561f7e6071b3a9904d6c3702205a8f" }, deps);
+      const write = calls.fs.find(f => f.kind === "write" && f.path === reworkAnswersPath(1825, commit));
+      assert.ok(write, "answers file written");
+      assert.equal(write!.content, "1. Fixed in 362f24a64756: the dispatcher merged current main (e94bf2a5aadc) into the branch; no source change.\n");
+    });
+  });
+
+  test("no last verdict: nothing is written and nothing throws", async () => {
+    await withStageSet("builder", async () => {
+      const { deps, calls } = makeMockDeps();
+      answerStaleBaseFindings(1825, { kind: "current", mainSha: "a".repeat(40), headSha: "b".repeat(40) }, deps);
+      assert.equal(calls.fs.filter(f => f.kind === "write").length, 0);
+    });
+  });
+});
+
+describe("verifier dispatch merges main again right before its gates", () => {
+  const MAIN = "e94bf2a5aadc057e21828e1ea4ccf7e0e0ff4fc4";
+  const MERGE_MAIN = "git -c merge.conflictStyle=diff3 merge main --no-edit";
+  /** Each `git rev-parse HEAD` reads a new commit, so a merge always moves HEAD. */
+  function headCounter() {
+    let n = 0;
+    return () => `${String(++n).padStart(2, "0")}`.padEnd(40, "c") + "\n";
+  }
+  function deps1825(opts: { ancestor: boolean; conflict?: boolean }) {
+    const claudeMd = claudeMdAbsPath("verifier/CLAUDE.md");
+    let mainMerges = 0;
+    const atFirstGate: { merges: number; pushed: boolean } = { merges: -1, pushed: false };
+    const mocks = makeMockDeps({
+      execImpls: {
+        ...fullHappyExecImpls("feature/1825"),
+        "git rev-parse main": () => MAIN + "\n",
+        "git rev-parse HEAD": headCounter(),
+        [`git merge-base --is-ancestor ${MAIN} HEAD`]: () => (opts.ancestor ? "" : execError({ stderr: "" })),
+        [MERGE_MAIN]: () => {
+          mainMerges++;
+          return opts.conflict && mainMerges === 2 ? execError({ stderr: "CONFLICT (content): Merge conflict in a.txt" }) : "";
+        },
+      },
+      fsMap: { [claudeMd]: "verifier system prompt" },
+      gateImpl: () => {
+        if (atFirstGate.merges < 0) {
+          atFirstGate.merges = mainMerges;
+          atFirstGate.pushed = mocks.calls.exec.some(c => c.cmd === "git push origin feature/1825");
+        }
+        return { exitCode: 0, timedOut: false, spawnError: null };
+      },
+    });
+    return { ...mocks, atFirstGate, mainMerges: () => mainMerges };
+  }
+  const prompt = (calls: ReturnType<typeof makeMockDeps>["calls"]) =>
+    calls.fs.find(f => f.kind === "write" && f.path.endsWith(".prompt-1825.txt"))?.content ?? "";
+
+  test("main moved since setup: merged again and pushed before the first gate, and the prompt names the merged main", async () => {
+    await withStageSet("builder", () => withVerifierGates(undefined, async () => {
+      const { deps, calls, atFirstGate } = deps1825({ ancestor: false });
+      const client = new MockGitHubClient({ status: { 1825: "In Code Review" }, labels: { 1825: [] } });
+      await dispatchToAgent(builderAgent("verifier"), makeProjectItem({ issueNumber: 1825 }), client, deps);
+      assert.equal(atFirstGate.merges, 2, "the setup merge, then the merge before the gates");
+      assert.equal(atFirstGate.pushed, true, "the merge is pushed before any gate runs");
+      const pull = calls.exec.findIndex(c => c.cmd === "git checkout main && git pull");
+      assert.ok(pull >= 0);
+      assert.ok(prompt(calls).includes(baseCurrencyNote("main", MAIN).trim()), prompt(calls).slice(-800));
+    }));
+  });
+
+  test("main unchanged since setup: no second merge, the prompt still names the merged main", async () => {
+    await withStageSet("builder", () => withVerifierGates(undefined, async () => {
+      const { deps, calls, atFirstGate } = deps1825({ ancestor: true });
+      const client = new MockGitHubClient({ status: { 1825: "In Code Review" }, labels: { 1825: [] } });
+      await dispatchToAgent(builderAgent("verifier"), makeProjectItem({ issueNumber: 1825 }), client, deps);
+      assert.equal(atFirstGate.merges, 1);
+      assert.match(prompt(calls), /## Base branch/);
+    }));
+  });
+
+  test("a conflict on the second merge aborts it; the gates judge the setup merge and the prompt claims nothing", async () => {
+    await withStageSet("builder", () => withVerifierGates(undefined, async () => {
+      const { deps, calls, atFirstGate } = deps1825({ ancestor: false, conflict: true });
+      const client = new MockGitHubClient({ status: { 1825: "In Code Review" }, labels: { 1825: [] } });
+      await dispatchToAgent(builderAgent("verifier"), makeProjectItem({ issueNumber: 1825 }), client, deps);
+      assert.equal(atFirstGate.merges, 2);
+      assert.ok(calls.exec.some(c => c.cmd === "git merge --abort"));
+      assert.equal(calls.gates.length > 0, true, "the gates still run");
+      assert.doesNotMatch(prompt(calls), /## Base branch/);
+    }));
+  });
+
+  test("the builder gets no such merge: only the gated agents do", async () => {
+    await withStageSet("builder", () => withVerifierGates(undefined, async () => {
+      const claudeMd = claudeMdAbsPath("builder/CLAUDE.md");
+      const { deps, calls } = makeMockDeps({
+        execImpls: { ...fullHappyExecImpls("feature/1825"), "git rev-parse main": () => MAIN + "\n" },
+        fsMap: { [claudeMd]: "builder system prompt" },
+      });
+      const client = new MockGitHubClient({ status: { 1825: "In Development" }, labels: { 1825: [] } });
+      await dispatchToAgent(builderAgent("builder"), makeProjectItem({ issueNumber: 1825 }), client, deps);
+      assert.ok(!calls.exec.some(c => c.cmd.includes(`merge-base --is-ancestor ${MAIN}`)));
+      assert.doesNotMatch(calls.fs.find(f => f.kind === "write" && f.path.endsWith(".prompt-1825.txt"))?.content ?? "", /## Base branch/);
+    }));
+  });
+
+  test("parallel review: the merge happens before the gates and the source review start", async () => {
+    const prior = { runner: process.env.PYRY_AGENT_RUNNER, parallel: process.env.PYRY_VERIFIER_PARALLEL_REVIEW };
+    process.env.PYRY_AGENT_RUNNER = "codex";
+    process.env.PYRY_VERIFIER_PARALLEL_REVIEW = "1";
+    try {
+      await withStageSet("builder", () => withVerifierGates("make check", async () => {
+        const { deps, calls, atFirstGate, mainMerges } = deps1825({ ancestor: false });
+        let mergesAtSourceStart = -1;
+        deps.runClaudeStreaming = async (o) => {
+          if (o.sourceReview && mergesAtSourceStart < 0) mergesAtSourceStart = mainMerges();
+          return streamResult({ runner: "codex", output: "Published verdict", usage: { input_tokens: 7 } });
+        };
+        const client = new MockGitHubClient({ status: { 1825: "In Code Review" }, labels: { 1825: [] } });
+        await dispatchToAgent(builderAgent("verifier"), makeProjectItem({ issueNumber: 1825 }), client, deps);
+        assert.equal(atFirstGate.merges, 2);
+        assert.equal(mergesAtSourceStart, 2);
+        const finalInput = calls.fs.filter(f => f.kind === "write" && f.path.endsWith(".prompt-1825.txt")).at(-1)?.content ?? "";
+        assert.match(finalInput, /## Base branch/);
+      }));
+    } finally {
+      if (prior.runner === undefined) delete process.env.PYRY_AGENT_RUNNER; else process.env.PYRY_AGENT_RUNNER = prior.runner;
+      if (prior.parallel === undefined) delete process.env.PYRY_VERIFIER_PARALLEL_REVIEW; else process.env.PYRY_VERIFIER_PARALLEL_REVIEW = prior.parallel;
+    }
+  });
+});
+
+describe("recordGateRunMeta: the live gate keeps a run record beside its output", () => {
+  test("writes <output>.meta.log with the tested commits, the outcome and PYRY_BIN", () => {
+    const { deps, calls } = makeMockDeps();
+    const report = {
+      runError: null, timedOut: false, exitCode: 0, tally: null,
+      command: "npx playwright test --config playwright.real-claude.config.ts --reporter=json",
+      branchName: "feature/1818", baseRef: "origin/main",
+      baseSha: "4abcc59eb26217b4a2911edcf30e8386b59faed6", headSha: "7d59fb97d04130eb72da6982d583e2020e2692a9",
+      commitsBehind: 0, durationMs: 420_486, outputPath: "/logs/2026-10-07T02-23-21-880Z_real-claude-gate_#1818.log",
+      outputBytes: 1, baselineFailures: null, baselineSkipReason: null, baselineOutputPath: null,
+      rerunFailures: null, rerunSkipReason: null, rerunOutputPath: null,
+      selection: { mode: "full" as const, reason: "every run" },
+    };
+    recordGateRunMeta(report, deps, { PYRY_BIN: "/usr/local/bin/pyry" });
+    const write = calls.fs.find(f => f.kind === "write");
+    assert.equal(write?.path, "/logs/2026-10-07T02-23-21-880Z_real-claude-gate_#1818.meta.log");
+    const meta = parseGateRunMeta(write!.content!);
+    assert.ok(meta);
+    assert.equal(meta!.headSha, report.headSha);
+    assert.equal(meta!.baseSha, report.baseSha);
+    assert.equal(meta!.selection, "full");
+    assert.equal(meta!.pyryBin, "/usr/local/bin/pyry");
+    assert.equal(meta!.exitCode, 0);
+  });
+
+  test("a report with no output file writes nothing", () => {
+    const { deps, calls } = makeMockDeps();
+    recordGateRunMeta({ outputPath: "(none)" } as any, deps, {});
+    assert.equal(calls.fs.filter(f => f.kind === "write").length, 0);
   });
 });
