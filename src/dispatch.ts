@@ -6,7 +6,7 @@ import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { config } from "dotenv";
 import { DispatchPool, excludeInFlight, freeSeats, launchCandidates, liveGateRunnerFor, mayStartMainSweep, resolvePollIntervalMs } from "./dispatch-pool.js";
-import { countVerdictsSince, parseVerdictArtifacts, pickVerdictPr, shouldFlagMissingVerdict } from "./verdict-guard.js";
+import { countVerdictsSince, isStaleBaseFinding, parseVerdictArtifacts, pickVerdictPr, shouldFlagMissingVerdict } from "./verdict-guard.js";
 import { countOpenPrs, shouldFlagMissingPr } from "./pr-guard.js";
 import { PENDING_VERDICT_PREFIX, REREVIEW_PATCH_CAP, decideVerdictRecovery, extractVerdictFindings, reworkFindingsNote, handoffMarker, isVerdictPublishFailure, parseLastVerdict, parsePendingVerdictState, parsePrVerdictView, parseVerdictHandoff, reReviewNote, serializeLastVerdict, serializePendingVerdictState, verdictHandoffNote, type HandoffParse, type PendingVerdictState, type VerdictHandoff, type VerdictPrLookup } from "./verdict-handoff.js";
 import { resolveImportOnlyMerge } from "./merge-resolve.js";
@@ -200,6 +200,7 @@ import {
   runReworkRouting,
   type ReworkRoutingOptions,
   type RealClaudeGateRunner,
+  type StaleBaseRefresh,
 } from "./reconcile.js";
 import {
   BASELINE_TESTS_PLACEHOLDER,
@@ -467,6 +468,11 @@ const REWORK_ROUTING_OPTIONS: ReworkRoutingOptions = {
     const pr = pickVerdictPr(prJson);
     if (pr === null) return null;
     return execSync(`gh pr view ${pr} --json reviews,comments`, { cwd: repoRoot, encoding: "utf-8", timeout: 15_000 });
+  },
+  refreshStaleBase: async (issueNumber) => {
+    const outcome = refreshStaleBaseBranch({ issueNumber });
+    if (outcome.kind === "merged" || outcome.kind === "current") answerStaleBaseFindings(issueNumber, outcome);
+    return outcome;
   },
 };
 
@@ -2573,6 +2579,126 @@ export function worktreePath(targetRepo: string, name: string): string {
   return resolve(targetRepo, `../.pyrycode-worktrees/${basename(resolve(targetRepo))}/${name}`);
 }
 
+const FULL_SHA = /^[0-9a-f]{40}$/;
+
+/**
+ * Merge current main into `feature/<n>` and push it, for a verifier FAIL
+ * whose only blocking finding is a stale base (see verdict-guard.ts, branch
+ * invariants, and `settleStaleBase` in reconcile.ts). Runs between agent runs,
+ * when no worktree of the ticket is in use, so it works in a detached
+ * worktree of its own at the pushed head and never touches the local branch:
+ * the next dispatch fast-forwards that from origin as usual.
+ *
+ * Returns `current` when the pushed head already contains `origin/<main>`,
+ * `conflict` (merging nothing) when main conflicts with the branch, and
+ * `failed` for anything that stops it from telling: a fetch or push failure,
+ * a missing branch, or a local branch with commits origin lacks, which a
+ * push from here would leave diverged. Never throws.
+ */
+export function refreshStaleBaseBranch(opts: {
+  issueNumber: number;
+  repoRoot?: string;
+  defaultBranch?: string;
+  deps?: Pick<DispatchDeps, "execSync" | "mkdirSync">;
+}): StaleBaseRefresh {
+  const root = opts.repoRoot ?? repoRoot;
+  const base = opts.defaultBranch ?? defaultBranch;
+  const { execSync: exec, mkdirSync: mkdir } = opts.deps ?? DEFAULT_DEPS;
+  const branch = `feature/${opts.issueNumber}`;
+  const run = (cmd: string, cwd = root, timeout = 120_000): string =>
+    String(exec(cmd, { cwd, encoding: "utf-8", stdio: "pipe", timeout })).trim();
+  const ok = (cmd: string, cwd = root): boolean => {
+    try { exec(cmd, { cwd, stdio: "pipe", timeout: 60_000 }); return true; } catch { return false; }
+  };
+  const failed = (reason: string): StaleBaseRefresh => ({ kind: "failed", reason });
+
+  try {
+    run(`git fetch origin`, root, 300_000);
+  } catch (e: any) {
+    return failed(`git fetch origin failed: ${e?.message ?? e}`);
+  }
+  let mainSha: string;
+  let headSha: string;
+  try {
+    mainSha = run(`git rev-parse origin/${base}`);
+    headSha = run(`git rev-parse origin/${branch}`);
+  } catch (e: any) {
+    return failed(`could not resolve origin/${base} or origin/${branch}: ${e?.message ?? e}`);
+  }
+  if (!FULL_SHA.test(mainSha) || !FULL_SHA.test(headSha)) {
+    return failed(`origin/${base} or origin/${branch} did not resolve to a commit`);
+  }
+  if (ok(`git rev-parse --verify ${branch}`) && !ok(`git merge-base --is-ancestor ${branch} ${headSha}`)) {
+    return failed(`the local ${branch} has commits origin/${branch} lacks`);
+  }
+  if (ok(`git merge-base --is-ancestor ${mainSha} ${headSha}`)) return { kind: "current", mainSha, headSha };
+
+  const wt = worktreePath(root, `stale-base-${opts.issueNumber}`);
+  const removeWorktree = () => {
+    try { exec(`git worktree remove --force "${wt}"`, { cwd: root, stdio: "pipe" }); } catch {}
+    try { exec(`git worktree prune`, { cwd: root, stdio: "pipe" }); } catch {}
+  };
+  removeWorktree();
+  try {
+    mkdir(dirname(wt), { recursive: true });
+    run(`git worktree add --detach "${wt}" ${headSha}`);
+  } catch (e: any) {
+    removeWorktree();
+    return failed(`could not create a worktree at ${headSha.slice(0, 12)}: ${e?.message ?? e}`);
+  }
+  try {
+    try {
+      run(`git -c merge.conflictStyle=diff3 merge ${mainSha} --no-edit -m "Merge branch '${base}' into ${branch}"`, wt);
+    } catch (e: any) {
+      let paths: string[] = [];
+      try { paths = run(`git diff --name-only --diff-filter=U -z`, wt).split("\0").filter(Boolean); } catch {}
+      try { exec(`git merge --abort`, { cwd: wt, stdio: "pipe" }); } catch {}
+      return paths.length > 0 ? { kind: "conflict", paths } : failed(`the merge of ${base} failed: ${e?.message ?? e}`);
+    }
+    const merged = run(`git rev-parse HEAD`, wt);
+    try {
+      run(`git push origin HEAD:refs/heads/${branch}`, wt);
+    } catch (e: any) {
+      return failed(`origin refused the push of the merge: ${e?.stderr?.toString?.().trim() || e?.message || e}`);
+    }
+    return { kind: "merged", mainSha, headSha: merged };
+  } finally {
+    removeWorktree();
+  }
+}
+
+/**
+ * After `refreshStaleBaseBranch` settled a stale base, answer the last FAIL's
+ * stale base findings in the rework answers file, so the verifier's re-review
+ * reads why they are fixed with no builder commit since. Best effort: a
+ * missing or unreadable last verdict leaves the re-review to say no answers
+ * were given, which it then checks itself.
+ */
+export function answerStaleBaseFindings(
+  issueNumber: number,
+  outcome: { kind: "merged" | "current"; mainSha: string; headSha: string },
+  deps: Pick<DispatchDeps, "readFileSync" | "writeFileSync" | "mkdirSync"> = DEFAULT_DEPS,
+): void {
+  const reviewer = activeStageSet().agents.find((a) => a.requiresVerdict);
+  if (!reviewer) return;
+  try {
+    const last = parseLastVerdict(String(deps.readFileSync(lastVerdictPath(reviewer.name, issueNumber), "utf-8")));
+    if (last === null || last.decision !== "FAIL") return;
+    const how = outcome.kind === "merged"
+      ? `the dispatcher merged current main (${outcome.mainSha.slice(0, 12)}) into the branch; no source change`
+      : `the branch already contains current main (${outcome.mainSha.slice(0, 12)}); no source change`;
+    const lines = extractVerdictFindings(last.body)
+      .map((finding, i) => (isStaleBaseFinding(finding) ? `${i + 1}. Fixed in ${outcome.headSha.slice(0, 12)}: ${how}.` : null))
+      .filter((line): line is string => line !== null);
+    if (lines.length === 0) return;
+    const path = reworkAnswersPath(issueNumber, last.commit);
+    deps.mkdirSync(dirname(path), { recursive: true });
+    deps.writeFileSync(path, lines.join("\n") + "\n");
+  } catch (e: any) {
+    console.warn(`   ⚠️  Could not answer the stale base findings for #${issueNumber}: ${e?.message ?? e}`);
+  }
+}
+
 export function makeDispatchContext(
   agent: AgentConfig,
   item: ProjectItem,
@@ -2633,6 +2759,9 @@ export async function dispatchToAgent(
   const parallelReview = process.env.PYRY_VERIFIER_PARALLEL_REVIEW === "1"
     && activeStageSet().preSpawnGate?.agentNames.has(agent.name) === true
     && parseVerifierGates(process.env.PYRY_VERIFIER_GATES).length > 0;
+  // Main may have moved since the setup merge; merge it again right before
+  // the gates. The parallel review does the same as it starts its gates.
+  const baseNote = parallelReview ? "" : refreshBaseBeforeGates(ctx);
   const gatesStartedAt = Date.now();
   const gates = parallelReview ? { promptNote: "" } : await maybeRunPreSpawnGates(ctx);
   const gatesMs = gates.promptNote ? Date.now() - gatesStartedAt : undefined;
@@ -2641,7 +2770,7 @@ export async function dispatchToAgent(
   const reReview = prepareReReviewNote(ctx);
   const handoffNote = prepareVerdictHandoff(ctx);
   const findingsNote = prepareReworkFindingsNote(ctx);
-  const spawn = await prepareAgentSpawn(ctx, gates.promptNote + mergeNote + reReview + handoffNote + findingsNote);
+  const spawn = await prepareAgentSpawn(ctx, gates.promptNote + baseNote + mergeNote + reReview + handoffNote + findingsNote);
   if (!spawn.ok) return;
   // The gates ran before the agent's clock started, so the review gets its
   // whole budget. The overlapped review keeps its own record below.
@@ -3567,6 +3696,76 @@ function pushPreRunMerge(ctx: DispatchContext, remoteExists: boolean, headBefore
   }
 }
 
+/**
+ * Merge `main` into the verifier's worktree again right before its gates run,
+ * when main moved since the setup merge. Returns the prompt note that tells
+ * the verifier main is current at a named commit, or "" when nothing applies
+ * or the merge could not be made.
+ *
+ * The setup merge happens minutes before the gates: the spawn preparation
+ * (code index refresh, docs index) sits in between, and the poll loop keeps
+ * merging finished tickets meanwhile. The fork's pre-verify gate then finds
+ * `origin/main` missing from HEAD and the verifier FAILs the ticket for a
+ * merge nobody's code needed. On desktop #1825 at 03:17 on 2026-10-07 the
+ * setup merge and the auto-merge of #1829 were four seconds apart, and the
+ * gate ran two minutes later. This closes that window to the seconds between
+ * this merge and the first gate.
+ *
+ * Runs only for the agents the stage set gates (the verifier), in their own
+ * worktree, never with a conflicted merge already pending. A conflict here
+ * aborts and leaves the worktree as it was, so the gates judge the branch as
+ * before and the verdict's stale base finding is settled by the rework router.
+ * The merge is pushed at once, like the setup merge (`pushPreRunMerge`).
+ */
+function refreshBaseBeforeGates(ctx: DispatchContext): string {
+  const { agent, item, useWorktree, worktreeDir, branchName } = ctx;
+  if (!useWorktree || item.issueNumber <= 0 || ctx.pendingMerge) return "";
+  if (activeStageSet().preSpawnGate?.agentNames.has(agent.name) !== true) return "";
+  const { execSync: exec } = ctx.deps;
+  try {
+    exec(`git checkout ${defaultBranch} && git pull`, { cwd: repoRoot, stdio: "pipe", timeout: 120_000 });
+  } catch (e: any) {
+    console.warn(`   ⚠️  Could not update ${defaultBranch} before the gates; they judge the setup merge: ${e?.message ?? e}`);
+    return "";
+  }
+  let mainSha = "";
+  try {
+    mainSha = String(exec(`git rev-parse ${defaultBranch}`, { cwd: repoRoot, encoding: "utf-8", stdio: "pipe" })).trim();
+  } catch {}
+  if (!FULL_SHA.test(mainSha)) return "";
+  let current = false;
+  try {
+    exec(`git merge-base --is-ancestor ${mainSha} HEAD`, { cwd: worktreeDir, stdio: "pipe" });
+    current = true;
+  } catch {}
+  if (!current) {
+    const headBefore = readWorktreeHead(exec, worktreeDir);
+    try {
+      exec(`git -c merge.conflictStyle=diff3 merge ${defaultBranch} --no-edit`, { cwd: worktreeDir, stdio: "pipe" });
+    } catch {
+      try { exec(`git merge --abort`, { cwd: worktreeDir, stdio: "pipe" }); } catch {}
+      console.warn(`   ⚠️  ${defaultBranch} moved since setup and merging it again into ${branchName} conflicts; the gates judge the setup merge`);
+      return "";
+    }
+    console.log(`   🔀 ${defaultBranch} moved since setup; merged ${mainSha.slice(0, 12)} into ${branchName} again before the gates`);
+    pushPreRunMerge(ctx, true, headBefore);
+  }
+  return baseCurrencyNote(defaultBranch, mainSha);
+}
+
+/** The verifier's note that main is merged as of a named commit. */
+export function baseCurrencyNote(branch: string, mainSha: string): string {
+  return [
+    "",
+    "",
+    "## Base branch",
+    "",
+    `The dispatcher merged \`${branch}\` at \`${mainSha}\` into this worktree right before the gates ran, and pushed the merge. ` +
+    `Keeping the branch current with \`${branch}\` is the dispatcher's job: it merges \`${branch}\` again before every review and before the final merge. ` +
+    `If \`origin/${branch}\` moves while you review, that is not a finding and not a reason to FAIL. Review the commit in front of you.`,
+  ].join("\n");
+}
+
 type SpawnConfig = Parameters<typeof runClaudeStreaming>[0];
 
 // Build prompt + read agent CLAUDE.md + write prompt files + compute
@@ -3801,6 +4000,9 @@ async function runParallelVerifierReview(
   reReview = false,
 ): Promise<StreamResult> {
   const { config, promptText } = spawn;
+  // Before the source diff is read and the gates start: main may have moved
+  // during the spawn preparation (see refreshBaseBeforeGates).
+  const baseNote = refreshBaseBeforeGates(ctx);
   const sourcePromptFile = config.promptFile + ".source.txt";
   const sourceSystemFile = config.promptFile + ".source-system.txt";
   const sourceLogFile = config.logFile.replace(/\.log$/, ".source.log");
@@ -3862,7 +4064,7 @@ async function runParallelVerifierReview(
   }
   progress.sourceReport = source.output;
   const finalNote = [
-    gates.value.promptNote,
+    gates.value.promptNote + baseNote,
     "", "## Completed preliminary source review", "",
     "Both source review and deterministic gates have finished. Apply your full verifier contract to these findings and the gate evidence.",
     "Use this complete source review rather than repeating it from scratch. Validate findings as needed, finish deferred Figma/live evidence checks, triage any red gate, then publish one verdict containing all findings.",
@@ -9276,6 +9478,16 @@ export async function pollLoop(): Promise<void> {
     const gateHoldsVerifiers = gateActive && REAL_CLAUDE_GATE_HOLD_VERIFIERS;
     await runAutoAdvance(client, MAX_CONCURRENT, pool.size);
     await runDoneCleanup(client);
+    // Merge what is already in Done BEFORE this cycle's dispatches merge main
+    // into their branches. A ticket that reached Done since the last cycle
+    // (a documentation run finishing while the loop waited) used to merge
+    // only at the end of the cycle, seconds after a verifier's setup had
+    // merged main, so that verifier's gates found main moved again: desktop
+    // #1825 at 03:17 on 2026-10-07, with #1829 merged four seconds after the
+    // setup merge. The end-of-cycle pass below stays for tickets that reach
+    // Done during this cycle. With nothing in Done it costs no call.
+    await runParentClose(client);
+    await runAutoMerge(client);
 
     // Concurrency model: WIP=N (default 2 via PYRY_MAX_CONCURRENT env var).
     // Serial within a dependency chain is preserved by `hasOpenBlockers`

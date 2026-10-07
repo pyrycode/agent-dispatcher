@@ -8,8 +8,12 @@ import {
   extractMustFixKeys,
   findRepeatedMustFix,
   findingTextSimilarity,
+  isBranchInvariantKey,
+  isStaleBaseFinding,
+  newestFailVerdict,
   REPEAT_FINDING_SIMILARITY,
   parseVerdictArtifacts,
+  staleBaseFindings,
   pickVerdictPr,
   shouldFlagMissingVerdict,
 } from "./verdict-guard.js";
@@ -204,5 +208,87 @@ describe("repeated verifier finding compares the finding text, not only its loca
       { key: "a.kt → A", text: ", `helper`: second defect" },
     ]);
     assert.deepStrictEqual(extractMustFixKeys(body), ["a.kt → A"]);
+  });
+});
+
+describe("a stale base is a branch invariant, not a repeated finding (merge race, 2026-10-07)", () => {
+  // Verbatim desktop verifier FAILs from the overnight watch. Main moved
+  // between the dispatcher's merge and the pre-verify gate, and the verifier
+  // FAILed with a finding located at the branch: #1825 twice in a row, which
+  // parked it through the repeat rule with every code finding fixed.
+  const fixture = JSON.parse(readFileSync(new URL("./fixtures/desktop-stale-base-verdicts.json", import.meta.url), "utf8")) as {
+    tickets: Record<string, { pr: number; comments: Array<{ createdAt: string; body: string }> }>;
+  };
+  const verdicts = (ticket: number) => fixture.tickets[String(ticket)].comments;
+  const at = (ticket: number, time: string) => {
+    const c = verdicts(ticket).find((x) => x.createdAt.includes(time));
+    assert.ok(c, `fixture has #${ticket}'s ${time} verdict`);
+    return c!;
+  };
+  const artifacts = (...comments: Array<{ createdAt: string; body: string }>) =>
+    parseVerdictArtifacts(JSON.stringify({ comments }));
+
+  test("#1825: the same branch finding in both FAILs is no longer a repeat", () => {
+    const [first, second] = verdicts(1825);
+    assert.ok(extractMustFixKeys(first.body).includes("feature/1825 → reviewed"), "the key the old rule matched on");
+    assert.ok(extractMustFixKeys(second.body).includes("feature/1825 → reviewed"));
+    assert.deepStrictEqual(findRepeatedMustFix(artifacts(first, second)), []);
+  });
+
+  test("a repeated source finding beside a branch finding still repeats", () => {
+    const source = "[MUST FIX] `src/store/a.ts` → `reduce`: the queue order is reversed after a forced delivery";
+    const branch = "[MUST FIX] `feature/9` → reviewed HEAD: it does not contain `origin/main`. Merge current main.";
+    const body = (...f: string[]) => `## Verifier Review: #9\n\n**Decision: FAIL**\n\n### Findings\n${f.map((x) => `- ${x}`).join("\n")}\n`;
+    const comments = artifacts(
+      { createdAt: "2026-10-07T00:00:00Z", body: body(branch, source) },
+      { createdAt: "2026-10-07T01:00:00Z", body: body(branch, source.replace("is reversed", "stays reversed")) },
+    );
+    assert.deepStrictEqual(findRepeatedMustFix(comments), ["src/store/a.ts → reduce"]);
+  });
+
+  test("isBranchInvariantKey: a ticket branch, main or HEAD is a location with no source symbol; a file never is", () => {
+    for (const key of ["feature/1825 → reviewed", "origin/main → HEAD", "HEAD → integration", "refs/heads/feature/7 → x"]) {
+      assert.equal(isBranchInvariantKey(key), true, key);
+    }
+    for (const key of ["src/feature/1825.ts → reviewed", "docs/features/main.md → Main", "feature/foo.ts → x"]) {
+      assert.equal(isBranchInvariantKey(key), false, key);
+    }
+  });
+
+  test("isStaleBaseFinding matches every overnight wording of the stale base finding", () => {
+    const lines = [
+      ...verdicts(1825).flatMap((v) => v.body.split("\n")),
+      ...verdicts(1818).flatMap((v) => v.body.split("\n")),
+      ...verdicts(1779).flatMap((v) => v.body.split("\n")),
+      ...verdicts(1731).flatMap((v) => v.body.split("\n")),
+    ].filter((l) => l.includes("[MUST FIX]"));
+    const stale = lines.filter(isStaleBaseFinding);
+    assert.equal(stale.length, 6, stale.join("\n"));
+    assert.ok(stale.some((l) => l.includes("Git branch `feature/1779`")), "the 'Git branch' prefix form, which has no key");
+    for (const l of stale) assert.match(l, /feature\/\d+/);
+  });
+
+  test("isStaleBaseFinding refuses a source finding that mentions main, and a branch finding about something else", () => {
+    assert.equal(isStaleBaseFinding("- [MUST FIX] `src/main.ts` → `boot`: the merge of main state drops the cursor"), false);
+    assert.equal(isStaleBaseFinding("- [MUST FIX] `feature/12` → PR body: the Closes line is missing"), false);
+    assert.equal(isStaleBaseFinding("- Fixed: `feature/1825` → reviewed HEAD's missing main revision"), false, "not a MUST FIX");
+  });
+
+  test("staleBaseFindings: stale base only on #1825, #1818 and #1779; not when a code finding rides along (#1731)", () => {
+    for (const [ticket, time] of [[1825, "T23:59:59"], [1825, "T00:22:01"], [1818, "T00:49:46"], [1818, "T01:39:19"], [1779, "T22:53:25"]] as const) {
+      assert.equal(staleBaseFindings(at(ticket, time).body).staleBaseOnly, true, `#${ticket} ${time}`);
+    }
+    const mixed = staleBaseFindings(at(1731, "2026-10-06T18:16:58").body);
+    assert.equal(mixed.mustFix.length, 2);
+    assert.equal(mixed.staleBaseOnly, false, "#1731 also had a real ordering defect");
+    assert.equal(staleBaseFindings(at(1818, "T01:17:37").body).staleBaseOnly, false, "a test finding, no stale base");
+    assert.equal(staleBaseFindings("## Verifier Review: #1\n\n**Decision: FAIL**\n\nNo tagged findings.").staleBaseOnly, false);
+  });
+
+  test("newestFailVerdict picks the newest FAIL and skips PASS verdicts and other comments", () => {
+    const [older, newer] = verdicts(1825);
+    const pass = { createdAt: "2026-10-07T00:37:00Z", body: "## Verifier Review: #1825\n\n**Decision: PASS**\n" };
+    assert.equal(newestFailVerdict(artifacts(newer, older, pass)), newer.body.trim());
+    assert.equal(newestFailVerdict(artifacts(pass)), null);
   });
 });
