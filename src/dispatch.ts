@@ -10,7 +10,7 @@ import { countVerdictsSince, isStaleBaseFinding, parseVerdictArtifacts, pickVerd
 import { countOpenPrs, shouldFlagMissingPr } from "./pr-guard.js";
 import { PENDING_VERDICT_PREFIX, REREVIEW_PATCH_CAP, decideVerdictRecovery, extractVerdictFindings, reworkFindingsNote, handoffMarker, isVerdictPublishFailure, parseLastVerdict, parsePendingVerdictState, parsePrVerdictView, parseVerdictHandoff, reReviewNote, serializeLastVerdict, serializePendingVerdictState, verdictHandoffNote, type HandoffParse, type PendingVerdictState, type VerdictHandoff, type VerdictPrLookup } from "./verdict-handoff.js";
 import { resolveImportOnlyMerge } from "./merge-resolve.js";
-import { gateReportSection } from "./gate-report.js";
+import { gateReportSection, gateRunMetaPath, serializeGateRunMeta } from "./gate-report.js";
 import { FINAL_MERGE_HANDOFF_MARKER, FINAL_MERGE_HANDOFF_MAX, MERGE_HANDOFF_LABEL, checkMergeResolution, decideConflictRoute, decideFinalMergeRoute, findMergeCommit, mergeHandoffNote, mergeResolutionComment, mergeResolutionSection, readPendingMerge, type PendingMerge, type ResolutionNote } from "./merge-handoff.js";
 
 import {
@@ -1631,12 +1631,21 @@ async function buildPromptForAgent(
   // The documentation agent records test evidence it cannot otherwise see:
   // the verifier gate results live only in these logs (#136).
   if (agent.name === "documentation" && ticketNum > 0) {
+    // The verifier's last verdict names tests too, in its documentation
+    // handoff, and is often the only place that does (desktop #1818).
+    let verdictText = "";
+    const reviewer = activeStageSet().agents.find((a) => a.requiresVerdict);
+    if (reviewer) {
+      try {
+        verdictText = parseLastVerdict(readFileSync(lastVerdictPath(reviewer.name, ticketNum), "utf-8"))?.body ?? "";
+      } catch { /* no last verdict: the issue and plan still name tests */ }
+    }
     try {
       parts.push(gateReportSection({
         issueNumber: ticketNum,
         logsDir: LOGS_DIR,
         env: process.env,
-        namingText: [item.body, ...planTexts].join("\n"),
+        namingText: [item.body, ...planTexts, verdictText].join("\n"),
       }));
     } catch (e) {
       console.warn(`   ⚠️  Failed to build the gate report for #${ticketNum}: ${e}`);
@@ -7485,15 +7494,38 @@ export function makeRealClaudeGateRunner(): RealClaudeGateRunner | null {
   if (REAL_CLAUDE_GATE_CMD === "") return null;
   if (REAL_CLAUDE_GATE_FORMAT === null) return null; // bad format, already reported
   const format = REAL_CLAUDE_GATE_FORMAT;
-  return ({ issueNumber }) => runRealClaudeGateSuite({
-    issueNumber,
-    command: REAL_CLAUDE_GATE_CMD,
-    baselineCommand: REAL_CLAUDE_GATE_BASELINE_CMD,
-    format,
-    timeoutMs: REAL_CLAUDE_GATE_TIMEOUT_MS,
-    selection: REAL_CLAUDE_GATE_SELECTION,
-    minExecuted: REAL_CLAUDE_GATE_MIN_EXECUTED,
-  });
+  return async ({ issueNumber }) => {
+    const report = await runRealClaudeGateSuite({
+      issueNumber,
+      command: REAL_CLAUDE_GATE_CMD,
+      baselineCommand: REAL_CLAUDE_GATE_BASELINE_CMD,
+      format,
+      timeoutMs: REAL_CLAUDE_GATE_TIMEOUT_MS,
+      selection: REAL_CLAUDE_GATE_SELECTION,
+      minExecuted: REAL_CLAUDE_GATE_MIN_EXECUTED,
+    });
+    recordGateRunMeta(report);
+    return report;
+  };
+}
+
+/**
+ * Keep the run record beside a live gate output: the tested commits and how
+ * the run ended, which the output itself does not hold. The documentation
+ * agent's gate report reads it (gate-report.ts). Best effort: without it the
+ * report says the tested commits are not known there.
+ */
+export function recordGateRunMeta(
+  report: GateRunReport,
+  deps: Pick<DispatchDeps, "writeFileSync"> = DEFAULT_DEPS,
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  if (!report.outputPath.endsWith(".log")) return;
+  try {
+    deps.writeFileSync(gateRunMetaPath(report.outputPath), serializeGateRunMeta(report, env, new Date()));
+  } catch (e: any) {
+    console.warn(`   ⚠️  Could not keep the live gate run record beside ${report.outputPath}: ${e?.message ?? e}`);
+  }
 }
 
 /**

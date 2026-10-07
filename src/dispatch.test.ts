@@ -98,8 +98,10 @@ import {
   type EnvPreflightState,
   answerStaleBaseFindings,
   baseCurrencyNote,
+  recordGateRunMeta,
   refreshStaleBaseBranch,
 } from "./dispatch.js";
+import { parseGateRunMeta } from "./gate-report.js";
 import { serializeLastVerdict } from "./verdict-handoff.js";
 import { formatGateEvidenceComment } from "./gate-output.js";
 import { flakyMarker } from "./flaky-tickets.js";
@@ -12042,5 +12044,37 @@ describe("verifier dispatch merges main again right before its gates", () => {
       if (prior.runner === undefined) delete process.env.PYRY_AGENT_RUNNER; else process.env.PYRY_AGENT_RUNNER = prior.runner;
       if (prior.parallel === undefined) delete process.env.PYRY_VERIFIER_PARALLEL_REVIEW; else process.env.PYRY_VERIFIER_PARALLEL_REVIEW = prior.parallel;
     }
+  });
+});
+
+describe("recordGateRunMeta: the live gate keeps a run record beside its output", () => {
+  test("writes <output>.meta.log with the tested commits, the outcome and PYRY_BIN", () => {
+    const { deps, calls } = makeMockDeps();
+    const report = {
+      runError: null, timedOut: false, exitCode: 0, tally: null,
+      command: "npx playwright test --config playwright.real-claude.config.ts --reporter=json",
+      branchName: "feature/1818", baseRef: "origin/main",
+      baseSha: "4abcc59eb26217b4a2911edcf30e8386b59faed6", headSha: "7d59fb97d04130eb72da6982d583e2020e2692a9",
+      commitsBehind: 0, durationMs: 420_486, outputPath: "/logs/2026-10-07T02-23-21-880Z_real-claude-gate_#1818.log",
+      outputBytes: 1, baselineFailures: null, baselineSkipReason: null, baselineOutputPath: null,
+      rerunFailures: null, rerunSkipReason: null, rerunOutputPath: null,
+      selection: { mode: "full" as const, reason: "every run" },
+    };
+    recordGateRunMeta(report, deps, { PYRY_BIN: "/usr/local/bin/pyry" });
+    const write = calls.fs.find(f => f.kind === "write");
+    assert.equal(write?.path, "/logs/2026-10-07T02-23-21-880Z_real-claude-gate_#1818.meta.log");
+    const meta = parseGateRunMeta(write!.content!);
+    assert.ok(meta);
+    assert.equal(meta!.headSha, report.headSha);
+    assert.equal(meta!.baseSha, report.baseSha);
+    assert.equal(meta!.selection, "full");
+    assert.equal(meta!.pyryBin, "/usr/local/bin/pyry");
+    assert.equal(meta!.exitCode, 0);
+  });
+
+  test("a report with no output file writes nothing", () => {
+    const { deps, calls } = makeMockDeps();
+    recordGateRunMeta({ outputPath: "(none)" } as any, deps, {});
+    assert.equal(calls.fs.filter(f => f.kind === "write").length, 0);
   });
 });
