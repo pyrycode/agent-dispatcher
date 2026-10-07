@@ -305,7 +305,10 @@ export interface ReworkRoute {
   labelsToStrip: string[];
   /** Set when the route is a wait on open blockers rather than a rework:
    *  the ticket stays in `fromColumn` and no rework is counted. Holds the
-   *  open blocker numbers. See `decideReworkRoutes`. */
+   *  open blocker numbers. Two shapes: a refinement bail from past Backlog
+   *  strips only the trigger, and a route back to the ticket's own column
+   *  (a builder parked on a blocker) strips the usual state labels too.
+   *  See `decideReworkRoutes`. */
   waitingOn?: number[];
   /** Set when the route only sends the ticket to its code owner to finish a
    *  merge of the default branch (the ticket carries MERGE_HANDOFF_LABEL).
@@ -345,6 +348,12 @@ export interface ReworkRoute {
  * on 2026-09-22 and 2026-09-23). The route keeps the ticket in its column
  * and strips only the trigger. It holds no seat while blocked, and the same
  * agent picks it up when the blocker closes.
+ *
+ * A route back to the ticket's own column on a ticket with an OPEN blocker
+ * is a wait too: the run that just linked the blocker parked itself there
+ * (the Codex builder's `waiting_on_blocker` ending adds `needs-rework:builder`
+ * in In Development). It strips the usual state labels like any same-column
+ * route, but carries `waitingOn`, so the caller counts nothing.
  *
  * A route on a ticket carrying MERGE_HANDOFF_LABEL is a merge handoff: the
  * dispatcher's merge before a later stage conflicted and sent the ticket to
@@ -408,6 +417,18 @@ export function decideReworkRoutes(
           ),
         ];
 
+        // A ticket sent back to the column it already sits in, while it has
+        // an open blocker, is the run that just parked it on that blocker:
+        // dispatch never picks a blocked ticket, so nothing else can have
+        // added the label. The Codex builder's `waiting_on_blocker` ending
+        // does exactly this (`needs-rework:builder` in In Development, plus
+        // the blocked-by link). It routes as before, so done/wip/error state
+        // is stripped and the ticket stays put, but it is a wait: no rework
+        // is counted and the loop breaker is not consulted. Desktop #1738
+        // and #1766 each gained a rework count this way on 2026-10-05 and
+        // 2026-10-06 with no review failed.
+        const selfWait = targetColumn === fromColumn && openBlockers.length > 0;
+
         routes.push({
           itemId: item.id,
           issueNumber: item.issueNumber,
@@ -416,6 +437,7 @@ export function decideReworkRoutes(
           triggerLabel: label,
           labelsToStrip,
           ...(mergeHandoff ? { mergeHandoff: true as const } : {}),
+          ...(selfWait ? { waitingOn: openBlockers } : {}),
         });
         break; // first valid rework label wins
       }

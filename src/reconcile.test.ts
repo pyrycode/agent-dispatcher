@@ -1544,3 +1544,63 @@ describe("real-claude gate — a branch that conflicts with main goes to its cod
     });
   });
 });
+
+describe("runReworkRouting: a builder parked on a blocker counts no rework (2026-10-07)", () => {
+  test("desktop #1738: stays in In Development at rework-count:1, trigger stripped, no second comment", async () => {
+    await withStageSet("builder", async () => {
+      const item = makeItem({
+        id: "item-1738",
+        issueNumber: 1738,
+        status: "In Development",
+        labels: ["enhancement", "family-dispatches:8", "needs-rework:builder", "rework-count:1"],
+        blockedBy: [{ number: 1796, state: "OPEN" }],
+      });
+      const client = new MockClient([item]);
+
+      await runReworkRouting(client, { readPrVerdicts: async () => { throw new Error("verdicts are not read for a wait"); } });
+
+      assert.deepEqual(client.updateItemStatusCalls, []);
+      assert.deepEqual(client.removeLabelCalls, [{ issueNumber: 1738, label: "needs-rework:builder" }]);
+      assert.deepEqual(client.addLabelCalls, [], "no rework-count:2, no error:rework-loop");
+      assert.deepEqual(client.addCommentCalls, [], "the builder's own 'Waiting on #1796' comment already says it");
+      assert.deepEqual(item.labels, ["enhancement", "family-dispatches:8", "rework-count:1"]);
+    });
+  });
+
+  test("desktop #1766: the first builder run's wait leaves it with no rework count at all", async () => {
+    await withStageSet("builder", async () => {
+      const item = makeItem({
+        id: "item-1766",
+        issueNumber: 1766,
+        status: "In Development",
+        labels: ["security-sensitive", "needs-real-claude", "done:refiner", "family-dispatches:2", "needs-rework:builder"],
+        blockedBy: [{ number: 1785, state: "OPEN" }],
+      });
+      const client = new MockClient([item]);
+
+      await runReworkRouting(client);
+
+      assert.deepEqual(client.addLabelCalls, [], "no rework-count:1");
+      assert.deepEqual(item.labels, ["security-sensitive", "needs-real-claude", "family-dispatches:2"]);
+      assert.ok(!item.labels.some(l => l.startsWith("rework-count:")));
+    });
+  });
+
+  test("a builder wait at the hard cap does not park", async () => {
+    await withStageSet("builder", async () => {
+      const item = makeItem({
+        id: "item-1723",
+        issueNumber: 1723,
+        status: "In Development",
+        labels: ["needs-rework:builder", "rework-count:6"],
+        blockedBy: [{ number: 1766, state: "OPEN" }],
+      });
+      const client = new MockClient([item]);
+
+      await runReworkRouting(client);
+
+      assert.ok(!item.labels.includes("error:rework-loop"));
+      assert.deepEqual(item.labels, ["rework-count:6"]);
+    });
+  });
+});

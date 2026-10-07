@@ -627,9 +627,13 @@ operator review; the dispatcher does not retry the denied action.
 
 A Codex builder may return `status: waiting_on_blocker` after linking an open
 GitHub dependency. The dispatcher reads blockers afresh, posts the wait and
-routes through `needs-rework:refiner`. The existing router leaves the ticket
-in development without adding a rework count. A missing or closed blocker,
-failed run, or approval rejection still becomes an agent error.
+adds `needs-rework:builder`. The router treats a rework label that routes a
+ticket back to the column it already sits in, while the ticket has an open
+blocker, as a wait: it strips the usual state labels, leaves the ticket in
+development, counts no rework and skips the loop breaker. Until 2026-10-07 that
+route counted as a builder rework, so desktop #1738 and #1766 each gained a
+rework count with no review failed. A missing or closed blocker, failed run, or
+approval rejection still becomes an agent error.
 
 Codex has no Claude-style max-turn budget. The existing per-stage wall-clock
 budget applies, with process-group termination and a two-second forced-stop grace

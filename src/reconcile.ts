@@ -46,6 +46,7 @@ import {
   decideUnroutableRework,
   extractReworkCount,
   extractReworkOtherCount,
+  extractReworkTarget,
   REWORK_OTHER_PREFIX,
   isRetryWaiting,
   REWORK_TARGET_ERROR_LABEL,
@@ -258,9 +259,11 @@ export async function runReworkRouting(
   // at the end if any state-changing operation happened.
   let mutated = false;
   for (const route of routes) {
-    // A wait on open blockers: drop the trigger, leave the column and the
-    // counter alone, and skip the loop breaker since nothing was reworked.
-    // A failed strip posts nothing; the label is still there next pass.
+    // A wait on open blockers: drop the trigger (and, for a route back to
+    // the ticket's own column, the usual state labels), leave the column and
+    // the counter alone, and skip the loop breaker since nothing was
+    // reworked. A failed strip posts nothing; the label is still there next
+    // pass.
     if (route.waitingOn?.length) {
       const blockers = route.waitingOn.map(n => `#${n}`).join(", ");
       try {
@@ -270,16 +273,27 @@ export async function runReworkRouting(
         continue;
       }
       mutated = true;
-      try {
-        await client.addComment(
-          route.issueNumber,
-          `## ⏸️ Waiting on ${blockers}\n\n` +
-          `\`${route.triggerLabel}\` arrived with an open blocker, so this is a wait, not a rework. ` +
-          `The ticket stays in ${route.fromColumn} and is picked up again once ${blockers} ` +
-          `${route.waitingOn.length > 1 ? "close" : "closes"}. No refinement run, and the rework count is unchanged.`,
-        );
-      } catch (e) {
-        console.warn(`   ⚠️  Failed to post wait comment on #${route.issueNumber}: ${e}`);
+      for (const label of route.labelsToStrip) {
+        if (label === route.triggerLabel) continue;
+        try { await client.removeLabel(route.issueNumber, label); } catch {}
+      }
+      // A refinement bail gets a comment saying why it did not go to Backlog.
+      // A ticket parked in its own column on a blocker does not: the run
+      // that parked it already posted its own "Waiting on" comment, and a
+      // second one would only repeat it.
+      const parkedInOwnColumn = columnByAgent.get(extractReworkTarget(route.triggerLabel) ?? "") === route.fromColumn;
+      if (!parkedInOwnColumn) {
+        try {
+          await client.addComment(
+            route.issueNumber,
+            `## ⏸️ Waiting on ${blockers}\n\n` +
+            `\`${route.triggerLabel}\` arrived with an open blocker, so this is a wait, not a rework. ` +
+            `The ticket stays in ${route.fromColumn} and is picked up again once ${blockers} ` +
+            `${route.waitingOn.length > 1 ? "close" : "closes"}. No refinement run, and the rework count is unchanged.`,
+          );
+        } catch (e) {
+          console.warn(`   ⚠️  Failed to post wait comment on #${route.issueNumber}: ${e}`);
+        }
       }
       console.log(`   ⏸️  Wait: #${route.issueNumber} stays in ${route.fromColumn} until ${blockers} closes (${route.triggerLabel} dropped, no rework counted)`);
       continue;
