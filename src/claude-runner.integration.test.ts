@@ -228,7 +228,7 @@ function waitFixture(t: { after: (fn: () => void) => void }, mode: string, ceili
   return { run, logFile };
 }
 
-test("Claude Bash call running past the budget gets a grace, and a wait it reports buys the time to finish", { timeout: 30000 }, async t => {
+test("Claude Bash call running past the budget gets a grace, and a wait it reports buys the time to finish", { timeout: 30000, skip: process.env.PYRY_SLOW_TESTS !== "1" }, async t => {
   // Margins are wide because the fake can take seconds to boot on a loaded
   // host: its Bash call starts inside the 4 s budget, then returns 6 s after
   // boot showing a 6 s device wait, which moves the deadline to about 10 s,
@@ -244,7 +244,7 @@ test("Claude Bash call running past the budget gets a grace, and a wait it repor
   assert.match(log, /WAIT CREDIT/);
 });
 
-test("Claude continuation leg earns wait credit on its own clock", { timeout: 30000 }, async t => {
+test("Claude continuation leg earns wait credit on its own clock", { timeout: 30000, skip: process.env.PYRY_SLOW_TESTS !== "1" }, async t => {
   const { run, logFile } = waitFixture(t, "grace-credit", "10", "sess-wait");
   const result = await run;
   assert.equal(result.isError, false, result.output);
@@ -253,7 +253,7 @@ test("Claude continuation leg earns wait credit on its own clock", { timeout: 30
   assert.match(readFileSync(logFile, "utf8"), /WAIT CREDIT/);
 });
 
-test("Claude grace ends when the Bash call returns without showing a wait", { timeout: 30000 }, async t => {
+test("Claude grace ends when the Bash call returns without showing a wait", { timeout: 30000, skip: process.env.PYRY_SLOW_TESTS !== "1" }, async t => {
   // The fake would report success 1.5 s after its Bash result; the kill lands first.
   const { run, logFile } = waitFixture(t, "grace-no-credit", "10");
   await assert.rejects(run, (err: Error) => {
@@ -263,7 +263,7 @@ test("Claude grace ends when the Bash call returns without showing a wait", { ti
   assert.match(readFileSync(logFile, "utf8"), /the command the grace waited for has finished/);
 });
 
-test("Claude grace still stops at the hard ceiling", { timeout: 30000 }, async t => {
+test("Claude grace still stops at the hard ceiling", { timeout: 30000, skip: process.env.PYRY_SLOW_TESTS !== "1" }, async t => {
   // A 5 s ceiling on a 4 s budget; the Bash call would report only 6 s after boot.
   const start = Date.now();
   const { run, logFile } = waitFixture(t, "grace-credit", "1.25");

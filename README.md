@@ -857,3 +857,11 @@ finished run's captures remain at their path for the implementation role.
 The spawn scrubber removes both account variables. For builders alone, it maps this restricted token to `OP_SERVICE_ACCOUNT_TOKEN`. Other roles receive neither account. The non-secret `PYRY_AGENT_SHELL_ENV` filter still refuses secret names. Codex builders inherit the restricted account through a names-only shell allowlist, never through a secret value in arguments. That list preserves the container's existing `GH_TOKEN` publishing login and its `DISPLAY` and `PLAYWRIGHT_BROWSERS_PATH` settings for Desktop tests. It does not pass `GITHUB_TOKEN` or the Automation account.
 
 Mobile's `scripts/android-test-gate.py live --tests "Class#method"` fetches its own child login. Go and Desktop repairs use `python3 "$AGENTS_REPO_PATH/dispatcher/scripts/live-claude-gate.py" go --tests "^TestName$"` or `desktop --spec e2e/real-name.spec.ts --tests "test title"`. Run from the product worktree. Build Desktop first. These launchers fetch `op://Dev agents/Claude long term token/password` with the restricted account and remove account credentials from test children. Missing access is an environment error. A zero-test run fails. Record the executed and passed counts. Full-suite runs remain dispatcher work.
+
+## Full-duration process proofs
+
+`pnpm test` runs policy tests and ordinary fake-process integration tests.
+`pnpm run test:slow` includes 13 real-clock timeout, termination and wait-credit proofs.
+The longer tier retains its existing timing margins for loaded hosts.
+Run it after changes to runner timeouts, process termination or wait-credit accounting.
+The consumer launcher exposes it as `bin/pyry-test --slow`.
