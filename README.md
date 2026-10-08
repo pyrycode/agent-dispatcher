@@ -863,5 +863,7 @@ Mobile's `scripts/android-test-gate.py live --tests "Class#method"` fetches its 
 `pnpm test` runs policy tests and ordinary fake-process integration tests.
 `pnpm run test:slow` includes 13 real-clock timeout, termination and wait-credit proofs.
 The longer tier retains its existing timing margins for loaded hosts.
+Both tiers limit simultaneous test files to four workers so fake child startup
+does not compete with every test file at once.
 Run it after changes to runner timeouts, process termination or wait-credit accounting.
 The consumer launcher exposes it as `bin/pyry-test --slow`.
