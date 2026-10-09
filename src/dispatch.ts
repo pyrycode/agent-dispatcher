@@ -179,7 +179,7 @@ import {
 import {
   type BranchSetupAction,
   decideBranchSetup,
-  decideCodegraphSymlink,
+  decideCodegraphIndexCopy,
   decideOwnWorktreeReuse,
   describeHeldWorktrees,
   findWorktreesForBranch,
@@ -193,6 +193,7 @@ import {
   shouldAutoCommit,
   shouldPushPreRunMerge,
 } from "./worktree.js";
+import { copyCodegraphIndex, isSymlinkPath } from "./codegraph-index.js";
 import {
   runAutoAdvance,
   runRealClaudeGate,
@@ -2206,7 +2207,9 @@ export type DispatchDeps = {
   readFileSync: typeof readFileSync;
   writeFileSync: typeof writeFileSync;
   mkdirSync: typeof mkdirSync;
-  symlinkSync: typeof symlinkSync;
+  /** Copy the canonical `.codegraph/` into a worktree. See `copyCodegraphIndex`. */
+  copyCodegraphIndex: typeof copyCodegraphIndex;
+  isSymlinkPath: typeof isSymlinkPath;
   // dispatch-internal
   runClaudeStreaming: typeof runClaudeStreaming;
   notifyDiscord: (msg: string) => Promise<void>;
@@ -2327,17 +2330,24 @@ export function runCommandAsync(
   });
 }
 
-/** Generous, because the reindex no longer blocks anything while it runs. */
+/** Generous, because the refresh no longer blocks anything while it runs. */
 export const CODEGRAPH_REINDEX_TIMEOUT_MS = 10 * 60_000;
 
 /**
- * Post-merge codegraph reindex that runs in the background, one at a time.
+ * Post-merge codegraph refresh that runs in the background, one at a time.
  *
- * `request` starts `codegraph index -f` and returns at once; the auto-merge
+ * `request` starts `codegraph sync -q` and returns at once; the auto-merge
  * never awaits it. A request while a run is in progress is coalesced: one
  * more run follows the current one, covering every merge that landed
  * meanwhile. Two runs never overlap, so they never fight over the index.
  * A failure only logs; the next merge tries again.
+ *
+ * `sync`, not a full `index -f`: codegraph 1.x syncs reliably and in
+ * place, in seconds, while `index` deletes and rebuilds the database for
+ * minutes, during which a worktree copied from it would get a partial
+ * index. (The 2026-05-09 finding that sync missed changes was 0.x.) A sync
+ * fails with a lock error while a codegraph server serves the canonical
+ * checkout; that server's own watcher keeps the index current then.
  */
 export function createCodegraphReindexer(
   run: CommandRunner,
@@ -2349,7 +2359,7 @@ export function createCodegraphReindexer(
 
   const runOnce = async (repoRoot: string): Promise<void> => {
     try {
-      const out = await run("codegraph", ["index", "-f"], { cwd: repoRoot, timeoutMs });
+      const out = await run("codegraph", ["sync", "-q"], { cwd: repoRoot, timeoutMs });
       if (out.ok) {
         console.log(`   📚 codegraph index refreshed`);
         return;
@@ -2396,7 +2406,8 @@ export const DEFAULT_DEPS: DispatchDeps = {
   readFileSync,
   writeFileSync,
   mkdirSync,
-  symlinkSync,
+  copyCodegraphIndex,
+  isSymlinkPath,
   runClaudeStreaming,
   notifyDiscord,
   buildPromptForAgent,
@@ -3169,7 +3180,7 @@ export async function setupBranchAndWorktree(
   ctx: DispatchContext,
 ): Promise<{ ok: true } | { ok: false }> {
   const { agent, item, client, branchName, worktreeDir, useWorktree } = ctx;
-  const { execSync, mkdirSync, symlinkSync, existsSync } = ctx.deps;
+  const { execSync, mkdirSync, existsSync, copyCodegraphIndex, isSymlinkPath } = ctx.deps;
 
   // PO and issue-0 (manual dispatch) run on the default branch — just pull latest
   if (!useWorktree) {
@@ -3389,32 +3400,33 @@ export async function setupBranchAndWorktree(
       console.log(`   🌳 Created worktree at ${worktreeDir}`);
     }
 
-    // Symlink the canonical repo's codegraph index into the worktree.
-    // `.codegraph/` is gitignored and lives outside `.git/`, so
-    // `git worktree add` won't bring it across — without this link,
-    // agents that try `mcp__codegraph__*` tools find an empty index
-    // (the codegraph MCP server reads from CWD = worktree dir),
-    // silently fall through to grep, and pay tokens for the codegraph
-    // tool surface without getting any of its value. See
-    // `decideCodegraphSymlink` in lib.ts for the decision rules.
+    // Give the worktree its own copy of the canonical codegraph index.
+    // `.codegraph/` is gitignored, so `git worktree add` doesn't bring it
+    // across, and the agent's codegraph server reads the index at its cwd.
+    // A copy rather than a symlink, because a codegraph 1.x server writes
+    // the files it serves into the index it opened: through a link, one
+    // ticket's branch landed in the index every other worktree shares. See
+    // `decideCodegraphIndexCopy` in worktree.ts for the decision rules.
     const codegraphSrc = resolve(repoRoot, ".codegraph");
     const codegraphDst = resolve(worktreeDir, ".codegraph");
-    const cgDecision = decideCodegraphSymlink({
-      sourceExists: existsSync(codegraphSrc),
-      destExists: existsSync(codegraphDst),
+    const cgDecision = decideCodegraphIndexCopy({
+      sourceExists: existsSync(resolve(codegraphSrc, "codegraph.db")),
+      destExists: existsSync(resolve(codegraphDst, "codegraph.db")),
+      destIsSymlink: isSymlinkPath(codegraphDst),
     });
-    if (cgDecision.action === "symlink") {
+    if (cgDecision.action === "copy" || cgDecision.action === "replace-symlink") {
       try {
-        symlinkSync(codegraphSrc, codegraphDst);
-        console.log(`   🔗 Linked .codegraph/ from canonical repo`);
+        copyCodegraphIndex(codegraphSrc, codegraphDst, { replaceSymlink: cgDecision.action === "replace-symlink" });
+        console.log(cgDecision.action === "copy"
+          ? `   🔗 Copied .codegraph/ index from canonical repo`
+          : `   🔗 Replaced the legacy .codegraph/ symlink with a copy of the canonical index`);
       } catch (e) {
-        // Soft-fail: don't abort dispatch over a broken symlink.
-        // Agent runs without codegraph this cycle; operator sees the
-        // warning and can investigate (permission issue, races, etc).
-        console.warn(`   ⚠️  Failed to symlink .codegraph/ into worktree: ${e}`);
+        // Soft-fail: don't abort dispatch over the index. The agent runs
+        // without codegraph this cycle; the operator sees the warning.
+        console.warn(`   ⚠️  Failed to copy .codegraph/ into worktree: ${e}`);
       }
     } else if (cgDecision.reason === "no-source") {
-      console.warn(`   ⚠️  Canonical .codegraph/ index missing at ${codegraphSrc} — agents in this worktree will fall through to grep when they call codegraph_*. Run \`codegraph init -i\` in the repo root to bootstrap.`);
+      console.warn(`   ⚠️  Canonical .codegraph/ index missing at ${codegraphSrc}: agents in this worktree run without codegraph. Run \`codegraph init -y\` in the repo root to bootstrap.`);
     }
   } catch (e) {
     console.error(`   ❌ Failed to create worktree: ${e}`);
@@ -3903,7 +3915,11 @@ export async function prepareAgentSpawn(
   // visible via get_design_context. Write tools (use_figma, generate_diagram) deliberately excluded
   // — agents read Figma, never modify it. Per-agent prescriptions in each fork's <role>/CLAUDE.md
   // gate actual usage.
-  const baseTools = "Bash,Read,Write,Edit,Glob,Grep,TodoWrite,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status,mcp__plugin_context7_context7__resolve-library-id,mcp__plugin_context7_context7__query-docs,mcp__codegraph__codegraph_search,mcp__codegraph__codegraph_callers,mcp__codegraph__codegraph_callees,mcp__codegraph__codegraph_impact,mcp__codegraph__codegraph_node,mcp__codegraph__codegraph_context,mcp__codegraph__codegraph_files,mcp__codegraph__codegraph_status,mcp__plugin_figma_figma__get_design_context,mcp__plugin_figma_figma__get_screenshot,mcp__plugin_figma_figma__get_metadata,mcp__plugin_figma_figma__get_variable_defs,mcp__plugin_figma_figma__search_design_system";
+  const baseTools = "Bash,Read,Write,Edit,Glob,Grep,TodoWrite,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status,mcp__plugin_context7_context7__resolve-library-id,mcp__plugin_context7_context7__query-docs,mcp__codegraph__codegraph_explore,mcp__plugin_figma_figma__get_design_context,mcp__plugin_figma_figma__get_screenshot,mcp__plugin_figma_figma__get_metadata,mcp__plugin_figma_figma__get_variable_defs,mcp__plugin_figma_figma__search_design_system";
+  // codegraph 1.x lists one MCP tool, codegraph_explore; it returns the source, call paths
+  // and blast radius the 0.x search/callers/callees/impact/node/context tools gave
+  // piecemeal. Those names are gone from the server's default surface, and the containers
+  // don't re-enable them (CODEGRAPH_MCP_TOOLS), so they are not granted here.
   // context7 tools carry the plugin prefix (mcp__plugin_context7_context7__*) so the
   // allowlist matches the tool the agent actually loads. The bare mcp__context7__* form
   // never matched, so every context7 call was silently denied (desktop #29, 2026-07-03).

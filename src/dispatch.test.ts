@@ -159,7 +159,7 @@ const TEST_CODEGRAPH_PATH = resolve(TEST_REPO_ROOT, ".codegraph");
 export type CallLog = {
   exec: { cmd: string; opts?: any }[];
   spawn: { cmd: string; args: string[]; opts?: any; input?: string }[];
-  fs: { kind: "exists" | "read" | "write" | "mkdir" | "symlink"; path: string; content?: string; target?: string }[];
+  fs: { kind: "exists" | "read" | "write" | "mkdir" | "codegraph-copy"; path: string; content?: string; target?: string }[];
   client: { method: string; args: any[] }[];
   discord: string[];
   /** Count of `runClaudeStreaming` invocations (not the streamed output). */
@@ -324,9 +324,11 @@ export function makeMockDeps(opts: MockDepsOptions = {}): { deps: DispatchDeps; 
     return undefined;
   }) as unknown as typeof import("node:fs").mkdirSync;
 
-  const mockSymlinkSync = ((target: string, path: string) => {
-    calls.fs.push({ kind: "symlink", path: String(path), target: String(target) });
-  }) as unknown as typeof import("node:fs").symlinkSync;
+  const mockCopyCodegraphIndex = ((src: string, dst: string) => {
+    calls.fs.push({ kind: "codegraph-copy", path: String(dst), target: String(src) });
+  }) as typeof import("./codegraph-index.js").copyCodegraphIndex;
+  // No symlinks in the mock filesystem.
+  const mockIsSymlinkPath = (() => false) as typeof import("./codegraph-index.js").isSymlinkPath;
 
   const defaultStream: StreamResult = {
     output: "agent finished cleanly",
@@ -378,7 +380,8 @@ export function makeMockDeps(opts: MockDepsOptions = {}): { deps: DispatchDeps; 
     readFileSync: mockReadFileSync,
     writeFileSync: mockWriteFileSync,
     mkdirSync: mockMkdirSync,
-    symlinkSync: mockSymlinkSync,
+    copyCodegraphIndex: mockCopyCodegraphIndex,
+    isSymlinkPath: mockIsSymlinkPath,
     runClaudeStreaming: mockRunClaudeStreaming,
     notifyDiscord: mockNotifyDiscord,
     buildPromptForAgent: mockBuildPromptForAgent,
@@ -1444,9 +1447,9 @@ describe("setupBranchAndWorktree — coverage edges", () => {
     assert.ok(!calls.exec.some(c => c.cmd.includes("git worktree add")));
   });
 
-  test("codegraph symlink — source missing → warn, no symlink, still {ok:true}", async () => {
-    // `decideCodegraphSymlink({sourceExists:false, destExists:false})`
-    // returns `skip / no-source` — caller should warn but not fail.
+  test("codegraph index copy: source missing → warn, no copy, still {ok:true}", async () => {
+    // `decideCodegraphIndexCopy({sourceExists:false, ...})` returns
+    // `skip / no-source`: the caller warns but doesn't fail.
     const { ctx, calls } = makeTestContext({
       item: { issueNumber: 115 },
       mockOptions: {
@@ -1464,13 +1467,12 @@ describe("setupBranchAndWorktree — coverage edges", () => {
     const result = await setupBranchAndWorktree(ctx);
 
     assert.deepEqual(result, { ok: true }, "missing codegraph source must not block dispatch");
-    // No symlink should have been issued — the existsSync check on the
-    // source returned false (empty fsMap), so decideCodegraphSymlink
-    // returns skip/no-source.
+    // No copy: the existsSync check on the source database returned
+    // false (empty fsMap), so decideCodegraphIndexCopy returns skip/no-source.
     assert.equal(
-      calls.fs.filter(c => c.kind === "symlink").length,
+      calls.fs.filter(c => c.kind === "codegraph-copy").length,
       0,
-      "no symlinkSync should be invoked when source is missing",
+      "no index copy should be made when the source is missing",
     );
   });
 
@@ -1967,7 +1969,7 @@ describe("prepareAgentSpawn", () => {
     assert.equal(config.timeoutMs, 1_500_000, "developer = 25min");
     // baseTools without Agent (developer doesn't sub-dispatch).
     assert.ok(config.allowedTools.includes("Bash,Read,Write,Edit"));
-    assert.ok(config.allowedTools.includes("mcp__codegraph__"));
+    assert.ok(config.allowedTools.includes("mcp__codegraph__codegraph_explore"));
     assert.ok(
       config.allowedTools.includes("mcp__plugin_context7_context7__resolve-library-id"),
       "context7 must use the plugin tool name so the allowlist matches the loaded tool",
@@ -7235,7 +7237,7 @@ describe("createCodegraphReindexer (post-merge, background, one at a time)", () 
     try { await fn(warnings); } finally { console.warn = origWarn; console.log = origLog; }
   };
 
-  test("runs codegraph index -f at the repo root and returns before it finishes", async () => {
+  test("runs codegraph sync -q at the repo root and returns before it finishes", async () => {
     await withWarnings(async () => {
       const calls: { cmd: string; args: string[]; cwd: string }[] = [];
       const reindexer = createCodegraphReindexer(async (cmd, args, opts) => {
@@ -7244,7 +7246,7 @@ describe("createCodegraphReindexer (post-merge, background, one at a time)", () 
       });
       reindexer.request("/repo");
       await reindexer.whenIdle();
-      assert.deepEqual(calls, [{ cmd: "codegraph", args: ["index", "-f"], cwd: "/repo" }]);
+      assert.deepEqual(calls, [{ cmd: "codegraph", args: ["sync", "-q"], cwd: "/repo" }]);
     });
   });
 
