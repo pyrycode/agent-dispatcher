@@ -229,7 +229,7 @@ test("Codex exit zero without terminal event cannot advance the task", async t =
   assert.equal(result.isError, true);
 });
 
-test("Codex timeout preserves thread and kills a process that ignores SIGTERM", { timeout: 20000 }, async t => {
+test("Codex timeout preserves thread and kills a process that ignores SIGTERM", { timeout: 20000, skip: process.env.PYRY_SLOW_TESTS !== "1" }, async t => {
   const f = fixture(t, "timeout");
   const start = Date.now();
   // 700 ms used to be shorter than the fake's own start under a loaded
@@ -265,7 +265,7 @@ function withEnv(t: { after: (fn: () => void) => void }, vars: Record<string, st
   });
 }
 
-test("Codex idle watchdog stops a silent run as idle_stall, before the wall clock, killing a process that ignores SIGTERM", { timeout: 15000 }, async t => {
+test("Codex idle watchdog stops a silent run as idle_stall, before the wall clock, killing a process that ignores SIGTERM", { timeout: 15000, skip: process.env.PYRY_SLOW_TESTS !== "1" }, async t => {
   withEnv(t, { PYRY_AGENT_IDLE_TIMEOUT_MINUTES: "0.01" });
   const f = fixture(t, "timeout");
   const start = Date.now();
@@ -278,7 +278,7 @@ test("Codex idle watchdog stops a silent run as idle_stall, before the wall cloc
   assert.match(readFileSync(f.options.logFile, "utf8"), /IDLE STALL/);
 });
 
-test("Codex command running past the budget gets a grace, and a wait it reports buys the time to finish", { timeout: 30000 }, async t => {
+test("Codex command running past the budget gets a grace, and a wait it reports buys the time to finish", { timeout: 30000, skip: process.env.PYRY_SLOW_TESTS !== "1" }, async t => {
   // Margins are wide because the fake can take seconds to boot on a loaded
   // host: its command must start inside the 4 s budget, then finishes 6 s
   // after boot showing a 6 s device wait, which moves the deadline to about
@@ -295,7 +295,7 @@ test("Codex command running past the budget gets a grace, and a wait it reports 
   assert.match(log, /WAIT CREDIT/);
 });
 
-test("Codex continuation leg resumes the thread on stdin and still earns wait credit", { timeout: 30000 }, async t => {
+test("Codex continuation leg resumes the thread on stdin and still earns wait credit", { timeout: 30000, skip: process.env.PYRY_SLOW_TESTS !== "1" }, async t => {
   withEnv(t, { PYRY_TIMEOUT_CEILING_FACTOR: "10" });
   const f = fixture(t, "grace-credit");
   const result = await runClaudeStreaming({ ...f.options, timeoutMs: 4000, resumeSessionId: "fixture-thread" });
@@ -310,7 +310,7 @@ test("Codex continuation leg resumes the thread on stdin and still earns wait cr
   assert.ok((result.waitCreditMs ?? 0) >= 4000, `credit ${result.waitCreditMs}`);
 });
 
-test("Codex grace ends when the command finishes without showing a wait", { timeout: 30000 }, async t => {
+test("Codex grace ends when the command finishes without showing a wait", { timeout: 30000, skip: process.env.PYRY_SLOW_TESTS !== "1" }, async t => {
   withEnv(t, { PYRY_TIMEOUT_CEILING_FACTOR: "10" });
   const f = fixture(t, "grace-no-credit");
   const result = await runClaudeStreaming({ ...f.options, timeoutMs: 4000 });
@@ -321,7 +321,7 @@ test("Codex grace ends when the command finishes without showing a wait", { time
   assert.match(readFileSync(f.options.logFile, "utf8"), /the command the grace waited for has finished/);
 });
 
-test("Codex grace still stops at the hard ceiling", { timeout: 30000 }, async t => {
+test("Codex grace still stops at the hard ceiling", { timeout: 30000, skip: process.env.PYRY_SLOW_TESTS !== "1" }, async t => {
   // A 5 s ceiling on a 4 s budget; the command would report only 6 s after boot.
   withEnv(t, { PYRY_TIMEOUT_CEILING_FACTOR: "1.25" });
   const f = fixture(t, "grace-credit");

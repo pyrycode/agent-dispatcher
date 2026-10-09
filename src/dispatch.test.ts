@@ -7455,7 +7455,7 @@ describe("spawnGateCommand — the real spawner", () => {
     assert.equal(readFileSync(stderrPath, "utf-8").trim(), "to-stderr");
   });
 
-  test("waiting for the Android device moves the deadline by the time waited", { timeout: 20_000 }, async (t) => {
+  test("waiting for the Android device moves the deadline by the time waited", { timeout: 20_000, skip: process.env.PYRY_SLOW_TESTS !== "1" }, async (t) => {
     const saved = process.env.PYRY_TIMEOUT_CEILING_FACTOR;
     process.env.PYRY_TIMEOUT_CEILING_FACTOR = "10";
     t.after(() => { if (saved === undefined) delete process.env.PYRY_TIMEOUT_CEILING_FACTOR; else process.env.PYRY_TIMEOUT_CEILING_FACTOR = saved; });
@@ -7474,7 +7474,7 @@ describe("spawnGateCommand — the real spawner", () => {
     assert.equal(readFileSync(tmp("device-wait.log"), "utf-8").trim(), "done");
   });
 
-  test("waiting for a Gradle build place on stdout moves the deadline too", { timeout: 20_000 }, async (t) => {
+  test("waiting for a Gradle build place on stdout moves the deadline too", { timeout: 20_000, skip: process.env.PYRY_SLOW_TESTS !== "1" }, async (t) => {
     const saved = process.env.PYRY_TIMEOUT_CEILING_FACTOR;
     process.env.PYRY_TIMEOUT_CEILING_FACTOR = "10";
     t.after(() => { if (saved === undefined) delete process.env.PYRY_TIMEOUT_CEILING_FACTOR; else process.env.PYRY_TIMEOUT_CEILING_FACTOR = saved; });
@@ -7492,7 +7492,7 @@ describe("spawnGateCommand — the real spawner", () => {
     assert.ok((outcome.waitCreditMs ?? 0) >= 3000, `credit ${outcome.waitCreditMs}`);
   });
 
-  test("a gate still waiting at the hard ceiling is torn down", { timeout: 20_000 }, async (t) => {
+  test("a gate still waiting at the hard ceiling is torn down", { timeout: 20_000, skip: process.env.PYRY_SLOW_TESTS !== "1" }, async (t) => {
     const saved = process.env.PYRY_TIMEOUT_CEILING_FACTOR;
     process.env.PYRY_TIMEOUT_CEILING_FACTOR = "2";
     t.after(() => { if (saved === undefined) delete process.env.PYRY_TIMEOUT_CEILING_FACTOR; else process.env.PYRY_TIMEOUT_CEILING_FACTOR = saved; });
