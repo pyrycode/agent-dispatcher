@@ -850,6 +850,90 @@ Before the next run, the dispatcher moves such a leftover aside to a
 and then creates a fresh worktree. After a run, removal stays ordinary, so a
 finished run's captures remain at their path for the implementation role.
 
+## Recovering a ticket by hand
+
+`scripts/recover-ticket.py` makes a manual recovery repeatable. It needs Python 3
+and a `gh` login with the `project` scope. Every mutating subcommand takes
+`--dry-run` and prints exactly what it would do; run that first.
+
+```bash
+R=dispatcher/scripts/recover-ticket.py
+python3 $R halt pyrycode 3022                 # card to Halted, refused while a wip: label is present
+python3 $R export pyrycode 3022               # patch of unpushed and uncommitted work, read only
+python3 $R clean-local pyrycode 3022 --dry-run
+python3 $R handback pyrycode 3022 --column Backlog --remove-label error:builder --dry-run
+python3 $R port pyrycode 3023 --from feature/3023-dispatch-base --dry-run
+python3 $R family-reset pyrycode 2959 --require-progress-hours 24 --min-gap-hours 24 --dry-run
+python3 $R clear-wip pyrycode 3023 --label wip:builder --min-age-minutes 110 --dry-run
+```
+
+- `halt` moves the card to Halted, which the dispatcher never reads.
+- `export` reads each `<role>-<N>` worktree (in place, or already moved into
+  the recovery folder, or any `--worktree`) and writes
+  `recover-<repo>-<N>-<name>.patch` plus an `.untracked.txt` list. The patch is
+  everything since the worktree's merge base with `origin/feature/<N>` (or
+  `origin/main` when that branch does not exist), committed or not. A worktree
+  stopped in the middle of a merge, rebase, cherry-pick or revert is refused:
+  its HEAD and index are a half-made state. It also lists every local
+  `feature/<N>` and `feature/<N>-<suffix>` branch with its commits ahead of
+  `origin/main` and writes one `recover-<repo>-<N>-branch-<name>.patch` each,
+  since side branches such as `feature/3023-dispatch-base` are where a hand
+  recovery leaves the real work. A patch over `--max-patch-mb` (default 2) is
+  not written and is named in a warning; #3023's first export was an 11.8 MB
+  half merge of another ticket's lineage. Exit 2 when anything was refused or
+  capped.
+- `clean-local` clears the two states that park the next stage after a hand
+  recovery pushed a fresh `feature/<N>`. A local `feature/<N>` that differs
+  from origin and cannot fast-forward ("Local and origin have DIVERGED") is
+  renamed to `preserved/<N>-<stamp>`. The refiner, builder, verifier and
+  documentation worktrees of the ticket ("already exists") are moved, folder
+  and `.git/worktrees` admin dir both, into
+  `<root>/.pyrycode-recovery/<repo>/<N>-<stamp>/`, with a `RECOVERY.txt`.
+  Live-gate worktrees are left to the gate. It refuses while a `wip:` label is
+  present or the ticket's agent log changed in the last 10 minutes.
+- `handback` checks that origin has `feature/<N>`, runs `clean-local`, edits
+  the labels, sets the column and reads the card back. It warns when the
+  column and labels would auto-advance or a label still blocks dispatch.
+  `--column keep` leaves the card in its column, for clearing a stale local
+  state plus its `error:<role>` label.
+- `port` takes the commits in `origin/main..<--from>` whose subject names
+  `(#N)`, the pipeline's commit convention, so another ticket's lineage stays
+  out (`--all-commits` takes every non-merge commit). It makes a `--shared`
+  scratch clone of the dispatcher's checkout, branches `feature/<N>` from a
+  fresh `origin/main`, cherry-picks with `-x`, runs the repo's `checks` from
+  `recover-ticket.json` (Go: `go vet ./...` and `make build`; desktop:
+  `npm ci` and `npm run typecheck`; other repos: none, said so), and pushes a
+  new `feature/<N>`. If origin already has a different `feature/<N>` it stops
+  and never forces. `--dry-run` does the clone, picks and checks for real in a
+  temporary folder it removes, and pushes nothing. Hand back with `handback`.
+- `family-reset` posts the `<!-- family-dispatch-reset -->` comment on a
+  family root and removes `error:family-breaker`. `--require-progress-hours`
+  refuses unless a child or grandchild moved column or closed that recently;
+  `--min-gap-hours` refuses a second reset within that window.
+- `clear-wip` removes a `wip:<role>` label only when the label was added, and
+  no agent log of the ticket written, at least `--min-age-minutes` ago. Use
+  the dispatcher's own "Stranded-wip gate" time from its start log.
+
+Commits made by the script (only `port`, in its scratch clone) need an
+identity. Fresh clones and the dispatcher's checkout on the pyrybox host have
+none, so `port` sets a repo-local `user.name` and `user.email` in its clone
+when they are missing: `git_identity` in `recover-ticket.json`, the identity
+of the dispatcher's own commits, or `--git-name` and `--git-email`. It never
+writes the dispatcher's checkout config, which the containers share.
+
+Nothing is deleted, force pushed or pruned. Never run `git worktree prune`
+from the pyrybox host: the containers write `/work/Projects/...` paths into
+every worktree, so the host sees them all as prunable and a prune drops the
+worktrees of runs in flight. The script maps those paths to the host itself.
+
+Board, project, field and column ids are read live from the board number. The
+repo to board map, the agent roles and the root candidates live in
+`scripts/recover-ticket.json`. The checkout root is `--root`, else
+`$RECOVER_TICKET_ROOT`, else the first that exists of `/work/Projects`,
+`/home/pyry/pyrycode-runtime/work/Projects` and `~/Workspace/Projects`. The
+dispatcher's checkout is `<root>/<repo>` unless `--checkout` says otherwise.
+Tests: `python3 -m unittest discover -s scripts -p 'test_*.py'`.
+
 ## Builder live-test account
 
 `PYRY_DEV_AGENTS_TOKEN` is an optional `op://Automation/xcl7xsu5ppbww3m5gav7wmbt6e/credential` reference resolved at dispatcher start. It must identify the separate service account that can read only the Dev agents vault. Never configure it with the Automation account token.
