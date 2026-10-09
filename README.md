@@ -850,6 +850,52 @@ Before the next run, the dispatcher moves such a leftover aside to a
 and then creates a fresh worktree. After a run, removal stays ordinary, so a
 finished run's captures remain at their path for the implementation role.
 
+## Recovering a ticket by hand
+
+`scripts/recover-ticket.py` makes a manual recovery repeatable. It needs Python 3
+and a `gh` login with the `project` scope. Every mutating subcommand takes
+`--dry-run` and prints exactly what it would do; run that first.
+
+```bash
+R=dispatcher/scripts/recover-ticket.py
+python3 $R halt pyrycode 3022                 # card to Halted, refused while a wip: label is present
+python3 $R export pyrycode 3022               # patch of unpushed and uncommitted work, read only
+python3 $R clean-local pyrycode 3022 --dry-run
+python3 $R handback pyrycode 3022 --column Backlog --remove-label error:builder --dry-run
+```
+
+- `halt` moves the card to Halted, which the dispatcher never reads.
+- `export` reads each `<role>-<N>` worktree (in place, or already moved into
+  the recovery folder, or any `--worktree`) and writes
+  `recover-<repo>-<N>-<name>.patch` plus an `.untracked.txt` list. The patch is
+  everything since the worktree's merge base with `origin/feature/<N>` (or
+  `origin/main` when that branch does not exist), committed or not.
+- `clean-local` clears the two states that park the next stage after a hand
+  recovery pushed a fresh `feature/<N>`. A local `feature/<N>` that differs
+  from origin and cannot fast-forward ("Local and origin have DIVERGED") is
+  renamed to `preserved/<N>-<stamp>`. The refiner, builder, verifier and
+  documentation worktrees of the ticket ("already exists") are moved, folder
+  and `.git/worktrees` admin dir both, into
+  `<root>/.pyrycode-recovery/<repo>/<N>-<stamp>/`, with a `RECOVERY.txt`.
+  Live-gate worktrees are left to the gate. It refuses while a `wip:` label is
+  present or the ticket's agent log changed in the last 10 minutes.
+- `handback` checks that origin has `feature/<N>`, runs `clean-local`, edits
+  the labels, sets the column and reads the card back. It warns when the
+  column and labels would auto-advance or a label still blocks dispatch.
+
+Nothing is deleted, force pushed or pruned. Never run `git worktree prune`
+from the pyrybox host: the containers write `/work/Projects/...` paths into
+every worktree, so the host sees them all as prunable and a prune drops the
+worktrees of runs in flight. The script maps those paths to the host itself.
+
+Board, project, field and column ids are read live from the board number. The
+repo to board map, the agent roles and the root candidates live in
+`scripts/recover-ticket.json`. The checkout root is `--root`, else
+`$RECOVER_TICKET_ROOT`, else the first that exists of `/work/Projects`,
+`/home/pyry/pyrycode-runtime/work/Projects` and `~/Workspace/Projects`. The
+dispatcher's checkout is `<root>/<repo>` unless `--checkout` says otherwise.
+Tests: `python3 -m unittest discover -s scripts -p 'test_*.py'`.
+
 ## Builder live-test account
 
 `PYRY_DEV_AGENTS_TOKEN` is an optional `op://Automation/xcl7xsu5ppbww3m5gav7wmbt6e/credential` reference resolved at dispatcher start. It must identify the separate service account that can read only the Dev agents vault. Never configure it with the Automation account token.

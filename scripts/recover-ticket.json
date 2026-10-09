@@ -1,0 +1,18 @@
+{
+  "owner": "pyrycode",
+  "boards": {
+    "pyrycode": 1,
+    "pyrycode-desktop": 7,
+    "pyrycode-mobile": 5,
+    "pyrycode-relay": 3,
+    "tui-driver": 6
+  },
+  "agent_roles": ["refiner", "builder", "verifier", "documentation"],
+  "logs_dirs": ["{root}/{repo}-agents/logs", "{checkout}/agents/logs"],
+  "container_root": "/work/Projects",
+  "root_candidates": [
+    "/work/Projects",
+    "/home/pyry/pyrycode-runtime/work/Projects",
+    "~/Workspace/Projects"
+  ]
+}
