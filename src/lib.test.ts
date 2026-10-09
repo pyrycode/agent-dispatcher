@@ -138,7 +138,7 @@ import { buildBaselineCommand, buildBaselineFilter, formatGateEvidenceComment, p
 import { mapParentChain } from "./github.js";
 import {
   decideBranchSetup,
-  decideCodegraphSymlink,
+  decideCodegraphIndexCopy,
   decideOwnWorktreeReuse,
   describeHeldWorktrees,
   findWorktreesForBranch,
@@ -3956,50 +3956,54 @@ describe("shouldFlagEmptyBranch", () => {
   });
 });
 
-describe("decideCodegraphSymlink", () => {
-  // Worktrees don't share `.codegraph/` with the canonical repo (it's
-  // gitignored, lives outside `.git/`, and `git worktree add` doesn't
-  // copy untracked dirs). Without a symlink, agents spawned in the
-  // worktree see an empty index and silently fall through to grep.
-  // Soft-fail on missing source — warn the operator but proceed; agents
-  // can still run, they just lose codegraph's value for that ticket.
+describe("decideCodegraphIndexCopy", () => {
+  // Worktrees don't get `.codegraph/` from `git worktree add` (it's
+  // gitignored). Each gets a private copy of the canonical index: a codegraph
+  // 1.x server writes the files it serves into the index it opened, so a
+  // shared index through a symlink took one ticket's branch into every other
+  // worktree's view. Soft-fail on a missing source.
 
-  test("source index exists, no destination yet → symlink (ready)", () => {
+  test("source index exists, no destination yet → copy (ready)", () => {
     assert.deepEqual(
-      decideCodegraphSymlink({ sourceExists: true, destExists: false }),
-      { action: "symlink", reason: "ready" },
+      decideCodegraphIndexCopy({ sourceExists: true, destExists: false, destIsSymlink: false }),
+      { action: "copy", reason: "ready" },
     );
   });
 
-  test("source exists AND destination exists → skip (already-present)", () => {
-    // Idempotency: a re-prep of an existing worktree shouldn't churn the
-    // symlink. Existing dst could be the previous run's symlink or a
-    // real dir an operator dropped in; either way, leave it alone.
+  test("worktree already has its own index → skip (already-present)", () => {
+    // A reused worktree keeps its index; its server catches it up at start.
     assert.deepEqual(
-      decideCodegraphSymlink({ sourceExists: true, destExists: true }),
+      decideCodegraphIndexCopy({ sourceExists: true, destExists: true, destIsSymlink: false }),
       { action: "skip", reason: "already-present" },
     );
   });
 
-  test("source missing → skip (no-source) — caller warns operator", () => {
-    // Index hasn't been bootstrapped in the canonical repo. The
-    // dispatcher should warn (so the operator runs `codegraph init -i`)
-    // but proceed — agents fall through to grep, which is what they
-    // did before codegraph existed.
+  test("legacy symlink from an older dispatcher → replace it with a copy", () => {
+    // destExists is true through the link; the link still has to go, or a
+    // reused worktree's server writes its branch into the shared index.
     assert.deepEqual(
-      decideCodegraphSymlink({ sourceExists: false, destExists: false }),
+      decideCodegraphIndexCopy({ sourceExists: true, destExists: true, destIsSymlink: true }),
+      { action: "replace-symlink", reason: "legacy-symlink" },
+    );
+  });
+
+  test("legacy symlink but no source → skip (no-source), caller warns", () => {
+    assert.deepEqual(
+      decideCodegraphIndexCopy({ sourceExists: false, destExists: false, destIsSymlink: true }),
       { action: "skip", reason: "no-source" },
     );
   });
 
-  test("source missing but destination present → skip (already-present, don't warn)", () => {
-    // Edge case: previous run linked successfully, then someone moved
-    // the canonical index away. Leave the dst alone (it's a stale
-    // symlink, but cleaning it up isn't this function's job) and
-    // don't warn (the present dst hides the staleness from the agent
-    // — that's a separate problem class).
+  test("source missing → skip (no-source), caller warns operator", () => {
     assert.deepEqual(
-      decideCodegraphSymlink({ sourceExists: false, destExists: true }),
+      decideCodegraphIndexCopy({ sourceExists: false, destExists: false, destIsSymlink: false }),
+      { action: "skip", reason: "no-source" },
+    );
+  });
+
+  test("source missing but worktree has its own index → skip (already-present, don't warn)", () => {
+    assert.deepEqual(
+      decideCodegraphIndexCopy({ sourceExists: false, destExists: true, destIsSymlink: false }),
       { action: "skip", reason: "already-present" },
     );
   });

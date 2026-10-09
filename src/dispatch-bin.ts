@@ -130,12 +130,12 @@ const cgHealth = decideCodegraphHealth({
 if (cgHealth.state === "queryable") {
   console.log(`✓ codegraph: ${codegraphPath} indexed and queryable`);
 } else if (cgHealth.state === "missing") {
-  console.warn(`⚠️  codegraph: no index at ${codegraphPath} — agents fall through to grep. Bootstrap with \`cd ${targetRepoRoot} && codegraph init -i\`.`);
+  console.warn(`⚠️  codegraph: no index at ${codegraphPath} — agents fall through to grep. Bootstrap with \`cd ${targetRepoRoot} && codegraph init -y\`.`);
 } else {
   // broken
   console.warn(`⚠️  codegraph: ${codegraphPath} exists but isn't queryable.`);
   console.warn(`    Detail: ${cgHealth.detail.slice(0, 500)}`);
-  console.warn(`    Fix: \`rm ${codegraphPath} && cd ${targetRepoRoot} && codegraph init -i\` (or investigate why status fails — broken symlink, schema mismatch, db corruption, codegraph CLI not on PATH).`);
+  console.warn(`    Fix: \`rm ${codegraphPath} && cd ${targetRepoRoot} && codegraph init -y\` (or investigate why status fails — broken symlink, schema mismatch, db corruption, codegraph CLI not on PATH).`);
 }
 
 // Signal handlers are intentionally installed HERE rather than at

@@ -304,7 +304,7 @@ export function shouldAttemptSafeSalvage(opts: {
  * into one of three operator-facing states:
  *
  * - **missing**: no `.codegraph/` at all. Agents fall through to grep.
- *   Bootstrap recommended (`codegraph init -i` at the target repo root).
+ *   Bootstrap recommended (`codegraph init -y` at the target repo root).
  * - **queryable**: index exists, `codegraph status` agrees. Good to go;
  *   spawned agents will see real symbol data through the worktree
  *   symlink.
