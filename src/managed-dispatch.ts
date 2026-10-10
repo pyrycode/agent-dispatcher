@@ -61,7 +61,7 @@ export class ManagedDispatch {
     if (this.timer) clearInterval(this.timer);
     while (this.syncing) await sleep(20);
     const runs = await this.connection.call<FleetRun[]>("/withdraw", { session: this.session });
-    for (const run of runs) if (!this.running.has(run.id)) await this.finish(run, false);
+    for (const run of runs) if (!this.running.has(run.id)) await this.finish(run, false, true);
     this.pending.clear();
   }
   beginCycle(): void { this.seen.clear(); }
@@ -89,7 +89,7 @@ export class ManagedDispatch {
   async endCycle(): Promise<void> {
     for (const [name, pending] of this.pending) {
       if (this.seen.has(name) || (pending.run && this.running.has(pending.run.id))) continue;
-      if (pending.run) await this.finish(pending.run, false); // Never started: safe to cancel.
+      if (pending.run) await this.finish(pending.run, false, true); // Never started: safe to cancel.
       this.pending.delete(name);
     }
     await this.sync();
@@ -144,8 +144,8 @@ export class ManagedDispatch {
       }
     });
   }
-  private async finish(run: FleetRun, completed = true): Promise<void> {
-    await this.connection.call("/finish", { session: this.session, id: run.id, completed });
+  private async finish(run: FleetRun, completed = true, unused = false): Promise<void> {
+    await this.connection.call("/finish", { session: this.session, id: run.id, completed, unused });
   }
   async authorize(issue: number): Promise<void> {
     await this.connection.call<Claim>("/authorize", { session: this.session, ticket: `${this.project}#${issue}`, runId: currentRun.getStore()?.run.id });

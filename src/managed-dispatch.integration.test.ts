@@ -17,6 +17,31 @@ const url = (server: Server) => {
 };
 const close = (server: Server) => new Promise<void>(resolve => server.close(() => resolve()));
 
+test("a cancelled stale stage offer cannot outrank a higher-priority ticket", async t => {
+  const store = new FleetStore(":memory:", { mac: { heavyLimit: 1, combinedLimit: 1 } });
+  const claimsServer = await serveFleet(store, { mac: "mac-test" }, "admin-test", 0);
+  const manager = new MachineManager({ machine: "mac", heavyLimit: 1, combinedLimit: 1, projects: ["org/core"] }, new FleetClient(url(claimsServer), "mac-test"));
+  const managerServer = await serveManager(manager, { "org/core": "project-test" }, "operator-test", 0);
+  const managed = new ManagedDispatch("org/core", { PYRY_MANAGER_URL: url(managerServer), PYRY_MANAGER_TOKEN: "project-test" });
+  t.after(async () => { await managed.stop(); await close(managerServer); await close(claimsServer); store.close(); });
+  await managed.start();
+  managed.beginCycle();
+  managed.offer(3086, "verifier", "heavy");
+  await managed.endCycle();
+  await manager.tick();
+  await managed.sync();
+  managed.beginCycle();
+  const first = managed.offer(3088, "verifier", "heavy", [], 0);
+  managed.offer(3086, "builder", "medium", [], 1);
+  await managed.endCycle();
+  await manager.tick();
+  await managed.sync();
+  assert.equal(managed.ready(first), true);
+  assert.equal(store.snapshot().claims.some(c => c.ticket === "org/core#3086"), false);
+  await managed.stop();
+  assert.deepEqual(store.snapshot(), { claims: [], runs: [] });
+});
+
 test("real manager grants cover workflow writes and remain occupied until the child group exits", async t => {
   const store = new FleetStore(":memory:", { mac: { heavyLimit: 1, combinedLimit: 1 }, linux: { heavyLimit: 1, combinedLimit: 1 } });
   const claimsServer = await serveFleet(store, { mac: "mac-test", linux: "linux-test" }, "admin-test", 0);

@@ -139,12 +139,23 @@ export class FleetStore {
     });
   }
 
-  finish(machine: string, session: string, id: string, completed = true): void {
+  finish(machine: string, session: string, id: string, completed = true, unused = false): void {
+    if (unused && completed) throw new Error("Unused work cannot be completed");
     this.transaction(() => {
       const run = this.db.prepare("SELECT * FROM fleet_runs WHERE id=?").get(id);
       if (!run || run.machine !== machine || run.session !== session) throw new Error("Run owner mismatch");
+      if (run.finished !== null) return; // Retries cannot revise what actually happened.
       this.db.prepare("DELETE FROM fleet_locks WHERE run_id=?").run(id);
-      this.db.prepare("UPDATE fleet_runs SET finished=?,outcome=? WHERE id=? AND finished IS NULL").run(Date.now(), completed ? "completed" : "cancelled", id);
+      this.db.prepare("UPDATE fleet_runs SET finished=?,outcome=? WHERE id=? AND finished IS NULL").run(Date.now(), unused ? "unused" : completed ? "completed" : "cancelled", id);
+      // An explicitly withdrawn, never-started reservation has no work to own.
+      // Preserve this generation if any actual or uncertain run used it. In
+      // particular, blocked/failed work and offline reservations remain owned.
+      if (unused) {
+        this.db.prepare(`DELETE FROM fleet_claims WHERE ticket=? AND generation=?
+          AND NOT EXISTS (SELECT 1 FROM fleet_runs WHERE ticket=? AND generation=?
+            AND (finished IS NULL OR outcome IS NULL OR outcome!='unused'))`)
+          .run(run.ticket, run.generation, run.ticket, run.generation);
+      }
       // Shared maintenance jobs have no long-lived ticket owner.
       if (String(run.ticket).includes("#@")) {
         this.db.prepare("DELETE FROM fleet_claims WHERE ticket=? AND generation=? AND NOT EXISTS (SELECT 1 FROM fleet_runs WHERE ticket=? AND finished IS NULL)")
