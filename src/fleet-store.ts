@@ -85,9 +85,8 @@ export class FleetStore {
       const request = JSON.parse(String(grant.request)) as StartRequest;
       if (!ticket.startsWith(`${request.project}#`)) throw new Error("Run project mismatch");
       const result = { ticket, machine, generation: randomUUID(), created: Date.now() };
-      // Housekeeping changes stages/labels under the project lock, without
-      // hoarding all ready tickets before the scheduler can prioritise them.
-      if (request.role !== "reconcile") this.db.prepare("INSERT INTO fleet_claims VALUES (?,?,?,?)").run(ticket, machine, result.generation, result.created);
+      // Recording follow-ups and housekeeping must not reserve their future
+      // work. Only start() creates ownership after scheduling admission.
       return result;
     });
   }

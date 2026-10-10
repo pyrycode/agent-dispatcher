@@ -63,6 +63,21 @@ test("drained projects retain blocked claims and reconcile but cannot start a ma
   assert.equal((await manager.grants(mobile, "s")).length, 1);
 });
 
+test("a drained ticket can record follow-ups without making them eligible on its computer", async t => {
+  const { store, client, config } = fixture(); t.after(() => store.close());
+  store.start({ ...offer(mobile, "1", "real-claude-gate"), id: "gate", machine: "hp", session: "s" });
+  const manager = new MachineManager({ ...config, drainingProjects: [mobile] }, client);
+  store.authorize("hp", "s", `${mobile}#2`, "gate");
+  manager.offer(mobile, "s", [offer(mobile, "2", "refiner")]);
+  await manager.tick();
+  assert.deepEqual(await manager.grants(mobile, "s"), []);
+  assert.equal(store.snapshot().claims.some(c => c.ticket === `${mobile}#2`), false);
+  store.finish("hp", "s", "gate");
+  manager.offer(mobile, "s", [offer(mobile, "1", "documentation"), offer(mobile, "2", "refiner")]);
+  await manager.tick();
+  assert.deepEqual((await manager.grants(mobile, "s")).map(r => r.ticket), [`${mobile}#1`]);
+});
+
 test("project drain waits for an in-flight start and denies further starts before returning", async t => {
   const { store, client, config } = fixture(); t.after(() => store.close());
   let release!: () => void, started!: () => void;

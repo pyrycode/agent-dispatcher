@@ -118,6 +118,20 @@ test("workflow cleanup cannot modify another owner or a live run", t => {
   assert.equal(store.authorize("mac", "session-2", "org/mobile#1").machine, "mac");
 });
 
+test("recording follow-ups does not claim their future work", t => {
+  const { store } = fixture(t);
+  store.start({ ...request("gate"), role: "real-claude-gate" });
+  for (const ticket of ["org/mobile#2", "org/mobile#3"]) {
+    assert.equal(store.authorize("mac", "session-1", ticket, "gate").machine, "mac");
+    assert.equal(store.snapshot().claims.some(c => c.ticket === ticket), false);
+  }
+  assert.equal(store.start(request("other-computer", "linux", "org/mobile#2")).ok, true);
+  assert.throws(() => store.authorize("mac", "session-1", "org/mobile#2", "gate"), /another machine/);
+  assert.throws(() => store.authorize("mac", "session-1", "org/other#3", "gate"), /project mismatch/);
+  store.finish("mac", "session-1", "gate");
+  assert.throws(() => store.authorize("mac", "session-1", "org/mobile#3", "gate"), /grant/);
+});
+
 test("role caps hold across machines, independently of their heavy limits", t => {
   const { store } = fixture(t);
   assert.equal(store.start({ ...request("a"), roleLimit: 2 }).ok, true);
