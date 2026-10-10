@@ -4,6 +4,7 @@ import { dirname, resolve } from "node:path";
 import { FleetStore } from "./fleet-store.js";
 import { FleetClient, JsonClient, serveFleet } from "./fleet-http.js";
 import { MachineManager, serveManager } from "./machine-manager.js";
+import { startClaimLabelSync } from "./claim-labels.js";
 
 function secret(name: string): string {
   if (typeof name !== "string" || !name || !process.env[name]) throw new Error(`Missing credential environment variable: ${name}`);
@@ -22,7 +23,8 @@ async function main(): Promise<void> {
     const limits = Object.fromEntries(Object.entries(config.machines).map(([id, value]) => [id, { heavyLimit: (value as any).heavyLimit, combinedLimit: (value as any).combinedLimit }]));
     const store = new FleetStore(database, limits);
     const server = await serveFleet(store, machines, secret(config.operatorTokenEnv), config.port ?? 7430, config.host ?? "127.0.0.1");
-    const close = () => server.close(() => { store.close(); process.exit(0); });
+    const stopLabels = startClaimLabelSync(config.githubLabels, () => store.snapshot().claims);
+    const close = () => { stopLabels(); server.close(() => { store.close(); process.exit(0); }); };
     process.on("SIGTERM", close); process.on("SIGINT", close);
     console.log("Claim service listening", server.address());
     return;
