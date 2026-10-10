@@ -18,9 +18,9 @@ const url = (server: Server) => {
 const close = (server: Server) => new Promise<void>(resolve => server.close(() => resolve()));
 
 test("real manager grants cover workflow writes and remain occupied until the child group exits", async t => {
-  const store = new FleetStore(":memory:", { mac: 1, linux: 1 });
+  const store = new FleetStore(":memory:", { mac: { heavyLimit: 1, combinedLimit: 1 }, linux: { heavyLimit: 1, combinedLimit: 1 } });
   const claimsServer = await serveFleet(store, { mac: "mac-test", linux: "linux-test" }, "admin-test", 0);
-  const manager = new MachineManager({ machine: "mac", heavyLimit: 1, projects: ["org/core"] }, new FleetClient(url(claimsServer), "mac-test"));
+  const manager = new MachineManager({ machine: "mac", heavyLimit: 1, combinedLimit: 1, projects: ["org/core"] }, new FleetClient(url(claimsServer), "mac-test"));
   const managerServer = await serveManager(manager, { "org/core": "project-test" }, "operator-test", 0);
   const managed = new ManagedDispatch("org/core", { PYRY_MANAGER_URL: url(managerServer), PYRY_MANAGER_TOKEN: "project-test" });
   t.after(async () => { await managed.stop(); await close(managerServer); await close(claimsServer); store.close(); });

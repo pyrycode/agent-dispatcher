@@ -8,7 +8,7 @@ const offer = (project: string, n: number, resource: "heavy" | "light" = "heavy"
 });
 const empty: FleetSnapshot = { claims: [], runs: [] };
 const select = (offers: WorkOffer[], state = empty, limit = 1) => scheduleMachine({
-  machine: "mac", limit, projects: ["org/core", "org/mobile"], offers, state,
+  machine: "mac", heavyLimit: limit, combinedLimit: limit, projects: ["org/core", "org/mobile"], offers, state,
 });
 
 test("ready local claims override project priorities", () => {
@@ -32,4 +32,21 @@ test("one ticket and exclusive operation get at most one grant per selection", (
   const a = { ...offer("org/core", 1, "light"), locks: ["org/core:docs"] };
   const b = { ...offer("org/core", 2, "light"), locks: a.locks };
   assert.equal(select([a, b, { ...a, key: "another-stage" }], empty, 2).length, 1);
+});
+
+test("one heavy plus one medium or two mediums fit, and light stays unlimited", () => {
+  const choose = (resources: Array<"heavy" | "medium" | "light">, combinedLimit = 2) => scheduleMachine({
+    machine: "mac", heavyLimit: 1, combinedLimit, projects: ["org/core"], state: empty,
+    offers: resources.map((resource, i) => ({ ...offer("org/core", i + 1), resource })),
+  }).map(o => o.resource);
+  assert.deepEqual(choose(["heavy", "heavy", "medium", "medium", "light"]), ["heavy", "medium", "light"]);
+  assert.deepEqual(choose(["medium", "medium", "medium", "heavy", "light"]), ["medium", "medium", "light"]);
+  assert.deepEqual(choose(["medium", "heavy", "light"], 1), ["medium", "light"]);
+});
+
+test("active medium reservations consume combined capacity after a restart", () => {
+  const state: FleetSnapshot = { ...empty, runs: [1, 2].map(n => ({ ...offer("org/core", n), resource: "medium", id: `r${n}`, machine: "mac", session: "old", generation: "g", created: 1 })) };
+  const selected = scheduleMachine({ machine: "mac", heavyLimit: 1, combinedLimit: 2, projects: ["org/core", "org/mobile"], state,
+    offers: [offer("org/mobile", 3), offer("org/mobile", 4, "light")] });
+  assert.deepEqual(selected.map(o => o.resource), ["light"]);
 });

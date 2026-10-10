@@ -28,3 +28,15 @@ test("ungranted offers follow updated ticket order without changing identity", (
   assert.equal(first.offer.key, next.offer.key);
   assert.equal(next.offer.order, 0);
 });
+
+test("build agents default to medium and refinement to light, with explicit overrides", () => {
+  const env = { PYRY_MANAGER_URL: "http://localhost:1", PYRY_MANAGER_TOKEN: "test" };
+  const managed = new ManagedDispatch("org/core", env);
+  const item = { issueNumber: 1 } as any;
+  for (const [name, resource] of [["builder", "medium"], ["developer", "medium"], ["refiner", "light"], ["po", "light"], ["verifier", "heavy"], ["documentation", "heavy"], ["unknown", "heavy"]]) {
+    assert.equal(managed.agentOffer({ name } as any, item, 0).offer.resource, resource, name);
+  }
+  const override = new ManagedDispatch("org/core", { ...env, PYRY_RESOURCE_CLASSES: '{"builder":"heavy","documentation":"medium"}' });
+  assert.equal(override.agentOffer({ name: "builder" } as any, item, 0).offer.resource, "heavy");
+  assert.equal(override.agentOffer({ name: "documentation" } as any, item, 0).offer.resource, "medium");
+});

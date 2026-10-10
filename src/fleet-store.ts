@@ -3,7 +3,14 @@
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 
-export type ResourceClass = "heavy" | "light";
+export type ResourceClass = "heavy" | "medium" | "light";
+export interface MachineLimits { heavyLimit: number; combinedLimit: number }
+export function validateLimits(limits: MachineLimits): void {
+  if (!limits || !Number.isSafeInteger(limits.heavyLimit) || limits.heavyLimit < 1 ||
+      !Number.isSafeInteger(limits.combinedLimit) || limits.combinedLimit < limits.heavyLimit) {
+    throw new Error("Limits require positive integers with combinedLimit >= heavyLimit");
+  }
+}
 export interface StartRequest {
   id: string;
   machine: string;
@@ -31,7 +38,7 @@ export function validateStart(req: StartRequest): void {
   if (!req.ticket.startsWith(`${req.project}#`) || !/^(?:[1-9]\d*|@[\w.-]+)$/.test(req.ticket.slice(req.project.length + 1))) {
     throw new Error("Invalid ticket");
   }
-  if (req.resource !== "heavy" && req.resource !== "light") throw new Error("Invalid resource class");
+  if (req.resource !== "heavy" && req.resource !== "medium" && req.resource !== "light") throw new Error("Invalid resource class");
   if (req.roleLimit !== undefined && (!Number.isSafeInteger(req.roleLimit) || req.roleLimit < 1)) throw new Error("Invalid role limit");
   if (!Array.isArray(req.locks) || req.locks.length > 16 || req.locks.some(k => typeof k !== "string" || !k.startsWith(`${req.project}:`) || k.length > 300)) {
     throw new Error("Invalid project locks");
@@ -40,8 +47,8 @@ export function validateStart(req: StartRequest): void {
 
 export class FleetStore {
   private readonly db: DatabaseSync;
-  constructor(path: string, private readonly limits: Readonly<Record<string, number>>) {
-    for (const n of Object.values(limits)) if (!Number.isSafeInteger(n) || n < 1) throw new Error("Invalid heavy limit");
+  constructor(path: string, private readonly limits: Readonly<Record<string, MachineLimits>>) {
+    for (const value of Object.values(limits)) validateLimits(value);
     this.db = new DatabaseSync(path);
     this.db.exec(`
       PRAGMA busy_timeout=5000;
@@ -107,9 +114,14 @@ export class FleetStore {
       const claim = this.db.prepare("SELECT * FROM fleet_claims WHERE ticket=?").get(req.ticket);
       if (claim && claim.machine !== req.machine) return { ok: false, reason: "foreign-claim" };
       if (this.db.prepare("SELECT 1 FROM fleet_runs WHERE ticket=? AND finished IS NULL").get(req.ticket)) return { ok: false, reason: "running" };
-      if (req.resource === "heavy") {
-        const row = this.db.prepare("SELECT count(*) AS n FROM fleet_runs WHERE machine=? AND resource='heavy' AND finished IS NULL").get(req.machine)!;
-        if (Number(row.n) >= this.limits[req.machine]) return { ok: false, reason: "capacity" };
+      if (req.resource !== "light") {
+        const row = this.db.prepare(`SELECT
+          count(CASE WHEN resource='heavy' THEN 1 END) AS heavy,
+          count(CASE WHEN resource IN ('heavy','medium') THEN 1 END) AS combined
+          FROM fleet_runs WHERE machine=? AND finished IS NULL`).get(req.machine)!;
+        const limit = this.limits[req.machine];
+        if (Number(row.combined) >= limit.combinedLimit ||
+            (req.resource === "heavy" && Number(row.heavy) >= limit.heavyLimit)) return { ok: false, reason: "capacity" };
       }
       if (req.roleLimit !== undefined) {
         const active = this.db.prepare("SELECT request FROM fleet_runs WHERE finished IS NULL").all();

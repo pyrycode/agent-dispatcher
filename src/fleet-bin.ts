@@ -19,7 +19,7 @@ async function main(): Promise<void> {
     const database = resolve(config.database);
     mkdirSync(dirname(database), { recursive: true, mode: 0o700 });
     const machines = Object.fromEntries(Object.entries(config.machines).map(([id, value]) => [id, secret((value as any).tokenEnv)]));
-    const limits = Object.fromEntries(Object.entries(config.machines).map(([id, value]) => [id, (value as any).heavyLimit]));
+    const limits = Object.fromEntries(Object.entries(config.machines).map(([id, value]) => [id, { heavyLimit: (value as any).heavyLimit, combinedLimit: (value as any).combinedLimit }]));
     const store = new FleetStore(database, limits);
     const server = await serveFleet(store, machines, secret(config.operatorTokenEnv), config.port ?? 7430, config.host ?? "127.0.0.1");
     const close = () => server.close(() => { store.close(); process.exit(0); });
@@ -29,7 +29,7 @@ async function main(): Promise<void> {
   }
   if (command === "manager") {
     const claims = new FleetClient(config.claimsUrl, secret(config.claimsTokenEnv));
-    const manager = new MachineManager({ machine: config.machine, heavyLimit: config.heavyLimit, projects: config.projects.map((p: any) => p.repo) }, claims);
+    const manager = new MachineManager({ machine: config.machine, heavyLimit: config.heavyLimit, combinedLimit: config.combinedLimit, projects: config.projects.map((p: any) => p.repo) }, claims);
     const tokens = Object.fromEntries(config.projects.map((p: any) => [p.repo, secret(p.tokenEnv)]));
     const server = await serveManager(manager, tokens, secret(config.operatorTokenEnv), config.port ?? 7431, config.host ?? "127.0.0.1");
     const timer = setInterval(() => { void manager.tick().catch(e => console.error("Scheduling paused:", e.message)); }, 1000);

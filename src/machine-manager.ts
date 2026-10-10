@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { listen, readJson, tokenMatches, type FleetClient } from "./fleet-http.js";
-import { validateStart, type FleetRun } from "./fleet-store.js";
+import { validateStart, validateLimits, type MachineLimits, type FleetRun } from "./fleet-store.js";
 import { scheduleMachine, type WorkOffer } from "./machine-scheduler.js";
 
-export interface MachineConfig { machine: string; heavyLimit: number; projects: string[] }
+export interface MachineConfig extends MachineLimits { machine: string; projects: string[] }
 type ClaimService = Pick<FleetClient, "snapshot" | "start" | "finish"> & Partial<Pick<FleetClient, "authorize">>;
 interface Offers { session: string; work: WorkOffer[]; at: number }
 export function offerId(machine: string, session: string, offer: WorkOffer): string {
@@ -17,7 +17,8 @@ export class MachineManager {
   private readonly finished = new Set<string>();
   draining = false;
   constructor(readonly config: MachineConfig, readonly claims: ClaimService, private readonly now = Date.now) {
-    if (!config.machine || !Number.isSafeInteger(config.heavyLimit) || config.heavyLimit < 1 || new Set(config.projects).size !== config.projects.length) throw new Error("Invalid machine configuration");
+    validateLimits(config);
+    if (!config.machine || new Set(config.projects).size !== config.projects.length) throw new Error("Invalid machine configuration");
   }
   offer(project: string, session: string, work: WorkOffer[]): void {
     if (!this.config.projects.includes(project) || !session || session.length > 200 || !Array.isArray(work) || work.length > 5000) throw new Error("Invalid offers");
@@ -41,7 +42,7 @@ export class MachineManager {
   private async tickOnce(): Promise<void> {
     const state = await this.claims.snapshot();
     const offers = [...this.offers.values()].filter(o => this.now() - o.at < 180_000).flatMap(o => o.work).filter(o => !this.finished.has(`${o.project}/${o.key}`));
-    const selected = scheduleMachine({ ...this.config, limit: this.config.heavyLimit, offers, state });
+    const selected = scheduleMachine({ ...this.config, offers, state });
     for (const job of selected) {
       if (this.draining) break;
       const current = this.offers.get(job.project);
@@ -67,8 +68,8 @@ export class MachineManager {
   async status() {
     const state = await this.claims.snapshot();
     const available = [...this.offers.values()].filter(o => this.now() - o.at < 180_000).flatMap(o => o.work);
-    const eligible = new Set(scheduleMachine({ ...this.config, limit: this.config.heavyLimit, offers: available, state }).map(o => `${o.project}/${o.key}`));
-    return { machine: this.config.machine, heavyLimit: this.config.heavyLimit, draining: this.draining, ...state,
+    const eligible = new Set(scheduleMachine({ ...this.config, offers: available, state }).map(o => `${o.project}/${o.key}`));
+    return { machine: this.config.machine, heavyLimit: this.config.heavyLimit, combinedLimit: this.config.combinedLimit, draining: this.draining, ...state,
       projects: this.config.projects.map(project => ({ project, lastSeen: this.offers.get(project)?.at ?? null })),
       queue: available.map(o => ({ ticket: o.ticket, role: o.role, resource: o.resource,
         state: this.finished.has(`${o.project}/${o.key}`) ? "already-completed"

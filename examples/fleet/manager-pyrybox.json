@@ -1,8 +1,8 @@
 {
-  "machine": "macbook",
+  "machine": "pyrybox",
   "heavyLimit": 1,
   "claimsUrl": "http://127.0.0.1:7430",
-  "claimsTokenEnv": "FLEET_MACBOOK_TOKEN",
+  "claimsTokenEnv": "FLEET_PYRYBOX_TOKEN",
   "host": "127.0.0.1",
   "port": 7431,
   "operatorTokenEnv": "FLEET_LOCAL_OPERATOR_TOKEN",
@@ -20,5 +20,5 @@
       "tokenEnv": "FLEET_DESKTOP_TOKEN"
     }
   ],
-  "combinedLimit": 1
+  "combinedLimit": 2
 }

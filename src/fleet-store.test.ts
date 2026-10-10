@@ -12,7 +12,7 @@ const request = (id: string, machine = "mac", ticket = "org/mobile#1"): StartReq
 function fixture(t: TestContext) {
   const dir = mkdtempSync(join(tmpdir(), "fleet-store-"));
   const path = join(dir, "claims.sqlite");
-  const store = new FleetStore(path, { mac: 2, linux: 2 });
+  const store = new FleetStore(path, { mac: { heavyLimit: 2, combinedLimit: 2 }, linux: { heavyLimit: 2, combinedLimit: 2 } });
   t.after(() => { store.close(); rmSync(dir, { recursive: true, force: true }); });
   return { store, path };
 }
@@ -20,7 +20,7 @@ function fixture(t: TestContext) {
 test("only one computer owns a ticket, including after reopening the database", t => {
   const { store, path } = fixture(t);
   assert.equal(store.start(request("a")).ok, true);
-  const second = new FleetStore(path, { mac: 2, linux: 2 });
+  const second = new FleetStore(path, { mac: { heavyLimit: 2, combinedLimit: 2 }, linux: { heavyLimit: 2, combinedLimit: 2 } });
   t.after(() => second.close());
   assert.deepEqual(second.start(request("b", "linux")), { ok: false, reason: "foreign-claim" });
   store.finish("mac", "session-1", "a");
@@ -118,4 +118,47 @@ test("board housekeeping never reserves the unclaimed backlog or races a new age
   assert.deepEqual(store.start(request("new", "linux", "org/mobile#2")), { ok: false, reason: "locked" });
   store.finish("mac", "session-1", "housekeeping");
   assert.equal(store.start(request("new", "linux", "org/mobile#2")).ok, true);
+});
+
+test("medium admission obeys the shared combined cap across projects", t => {
+  const store = new FleetStore(":memory:", { mac: { heavyLimit: 1, combinedLimit: 2 } });
+  t.after(() => store.close());
+  assert.equal(store.start(request("heavy")).ok, true);
+  assert.equal(store.start({ ...request("medium", "mac", "org/desktop#2"), resource: "medium" }).ok, true);
+  assert.deepEqual(store.start({ ...request("extra", "mac", "org/core#3"), resource: "medium" }), { ok: false, reason: "capacity" });
+  assert.deepEqual(store.start(request("heavy-2", "mac", "org/core#4")), { ok: false, reason: "capacity" });
+  assert.equal(store.start({ ...request("light", "mac", "org/core#5"), resource: "light" }).ok, true);
+  assert.equal(store.snapshot().claims.length, 3);
+  store.finish("mac", "session-1", "heavy");
+  assert.equal(store.start({ ...request("medium-2", "mac", "org/core#3"), resource: "medium" }).ok, true);
+  assert.deepEqual(store.start(request("heavy-3", "mac", "org/core#6")), { ok: false, reason: "capacity" });
+});
+
+test("Mac combined limit permits either one builder or one verifier", t => {
+  const store = new FleetStore(":memory:", { mac: { heavyLimit: 1, combinedLimit: 1 } });
+  t.after(() => store.close());
+  assert.equal(store.start({ ...request("build"), resource: "medium" }).ok, true);
+  assert.deepEqual(store.start(request("verify", "mac", "org/desktop#2")), { ok: false, reason: "capacity" });
+  store.finish("mac", "session-1", "build");
+  assert.equal(store.start(request("verify", "mac", "org/desktop#2")).ok, true);
+});
+
+test("both capacity limits are explicit positive integers and combined covers heavy", () => {
+  for (const limits of [1, {}, { heavyLimit: 1 }, { heavyLimit: 2, combinedLimit: 1 }, { heavyLimit: 1, combinedLimit: 1.5 }, { heavyLimit: 0, combinedLimit: 2 }]) {
+    assert.throws(() => new FleetStore(":memory:", { mac: limits as any }), /limit/i);
+  }
+});
+
+test("reopening with a lower combined limit keeps medium reservations occupied", t => {
+  const { store, path } = fixture(t);
+  store.start({ ...request("a"), resource: "medium" });
+  store.start({ ...request("b", "mac", "org/desktop#2"), resource: "medium" });
+  const restarted = new FleetStore(path, { mac: { heavyLimit: 1, combinedLimit: 1 } });
+  t.after(() => restarted.close());
+  assert.equal(restarted.snapshot().runs.length, 2);
+  assert.deepEqual(restarted.start(request("new", "mac", "org/core#3")), { ok: false, reason: "capacity" });
+  restarted.finish("mac", "session-1", "a");
+  assert.deepEqual(restarted.start({ ...request("new", "mac", "org/core#3"), resource: "medium" }), { ok: false, reason: "capacity" });
+  restarted.finish("mac", "session-1", "b");
+  assert.equal(restarted.start(request("new", "mac", "org/core#3")).ok, true);
 });

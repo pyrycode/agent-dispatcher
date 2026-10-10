@@ -6,6 +6,9 @@ import type { Claim, FleetRun, FleetSnapshot, ResourceClass } from "./fleet-stor
 import type { WorkOffer } from "./machine-scheduler.js";
 import type { AgentConfig, ProjectItem } from "./types.js";
 
+const DEFAULT_RESOURCE_CLASSES: Readonly<Record<string, ResourceClass>> = {
+  builder: "medium", developer: "medium", refiner: "light", po: "light",
+};
 const currentRun = new AsyncLocalStorage<{ run: FleetRun; groups: Set<number> }>();
 /** Called by the existing spawn sites. Slot release waits for grandchildren too. */
 export function trackManagedChild(pid: number): void { currentRun.getStore()?.groups.add(pid); }
@@ -17,7 +20,7 @@ export function managedGroupAlive(pid: number): boolean {
 export function resourceClasses(raw: string | undefined): Record<string, ResourceClass> {
   if (!raw) return {};
   const parsed = JSON.parse(raw);
-  if (!parsed || Array.isArray(parsed) || typeof parsed !== "object" || Object.values(parsed).some(v => v !== "heavy" && v !== "light")) throw new Error("PYRY_RESOURCE_CLASSES must map role names to heavy or light");
+  if (!parsed || Array.isArray(parsed) || typeof parsed !== "object" || Object.values(parsed).some(v => v !== "heavy" && v !== "medium" && v !== "light")) throw new Error("PYRY_RESOURCE_CLASSES must map role names to heavy, medium or light");
   return parsed;
 }
 
@@ -77,7 +80,7 @@ export class ManagedDispatch {
     return pending;
   }
   agentOffer(agent: AgentConfig, item: ProjectItem, order: number): Pending {
-    const pending = this.offer(item.issueNumber, agent.name, this.classes[agent.name] ?? "heavy",
+    const pending = this.offer(item.issueNumber, agent.name, this.classes[agent.name] ?? DEFAULT_RESOURCE_CLASSES[agent.name] ?? "heavy",
       agent.serial ? [`${this.project}:role:${agent.name}`] : [], order);
     pending.offer.roleLimit = agent.serial ? 1 : agent.maxInFlight;
     return pending;

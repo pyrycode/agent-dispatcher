@@ -9230,7 +9230,7 @@ export async function pollLoop(): Promise<void> {
     const n = parseInt(raw, 10);
     return Number.isFinite(n) && n > 0 ? n : 2;
   })();
-  console.log(managed ? "   Concurrency: shared heavy capacity from the machine manager" : `   Concurrency cap: ${MAX_CONCURRENT} (PYRY_MAX_CONCURRENT)`);
+  console.log(managed ? "   Concurrency: shared heavy and medium capacity from the machine manager" : `   Concurrency cap: ${MAX_CONCURRENT} (PYRY_MAX_CONCURRENT)`);
   {
     const verifier = activeStageSet().agents.find((a) => a.name === "verifier");
     if (verifier) {
