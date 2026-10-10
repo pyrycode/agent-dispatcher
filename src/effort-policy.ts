@@ -66,6 +66,9 @@ export function resolveEffort(opts: {
   const { agent, item, runner, env, stageSet } = opts;
   validateEffortPolicy(env.PYRY_EFFORT_POLICY, stageSet);
   const policy = env.PYRY_EFFORT_POLICY === "role-risk-v1" ? "role-risk-v1" : "off";
+  if ((agent.name === "builder" || agent.name === "developer") && item.labels.includes("orchestrator:fixing")) {
+    return { effort: "xhigh", policy, reason: "orchestrator recovery repair" };
+  }
   if (agent.name === "builder") {
     const reworkAfterFail = opts.reworkAfterFail === true;
     return { effort: reworkAfterFail ? "xhigh" : "high", policy, reason: builderEffortReason({ runner, env, policy, reworkAfterFail }) };

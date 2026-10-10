@@ -105,9 +105,10 @@ apply. Recovery assessments and their repair pipeline are scheduled before ordin
 An unclaimed ticket can be assessed only after normal admission claims it.
 
 The assessment uses the project's configured runner, with an optional `recovery`
-role override in its existing runner file. Codex inherits the configured model and
-effort. Claude uses Sonnet with high effort. It uses the existing restricted source
-reader, with a ten-minute limit and twenty Claude turns. The prompt contains the
+role override in its existing runner file. Codex inherits the configured model.
+Claude uses Sonnet. Both investigate with extra-high effort, independently of
+lower ordinary role settings. It uses the existing restricted source
+reader, with a thirty-minute limit and eighty Claude turns. The prompt contains the
 ticket, its last twelve comments and the tails of its last two agent logs. Local
 source reads are allowed; publishing, file edits, tests and delegation are not.
 A failed reader or invalid response escalates, without a less restricted fallback.
@@ -115,7 +116,9 @@ A failed reader or invalid response escalates, without a less restricted fallbac
 The four possible decisions are:
 
 - `wait`: review is making progress or no intervention is needed. Record the
-  assessment and allow the ordinary workflow to continue.
+  assessment and allow the ordinary workflow to continue. If the same eligible
+  incident remains unresolved, reassess after thirty minutes. This delay persists
+  across restarts. Running workers and deliberate holds still prevent reassessment.
 - `retry`: remove the error on the current failed stage. Code restricts this to
   a recognised stage with no completion label. Existing automatic backoff keeps
   its own budget and is not assessed by this path.
@@ -123,7 +126,8 @@ The four possible decisions are:
   builder or developer. Remove obsolete downstream completion and rework labels.
   Keep the rework count, claim, required live gate and earlier planning evidence.
   The normal code agent receives the brief, reserves capacity separately, makes
-  the repair and returns through the usual review and testing stages.
+  the repair with extra-high effort and returns through the usual review and
+  testing stages. The configured runner and model are retained.
 - `escalate`: record the reason for operator intervention. No workflow state is
   changed.
 
@@ -143,11 +147,21 @@ override Halted or needs-human holds, open blockers, running labels, permission
 denials or family breakers. It cannot accept a failed live gate, reset rework
 counts, mark code reviewed, merge a pull request or restart a dispatcher.
 
-The central ledger permits at most forty assessments and two automatic repair
-handbacks per rolling day across the fleet. A ticket gets at most one automatic
-handback per rolling day. Budget exhaustion escalates the incident. An unchanged
-assessed incident is not assessed again just because a day passed. Normal review
-can still advance, and a changed rework count creates a new assessment.
+The `needs-human:sizing` label is an informational review marker, not an operator
+hold. It does not prevent recovery or remove an assigned repair's priority.
+Assessments must investigate available source and logs before escalating missing
+evidence. Repository defects in build or test infrastructure can return to the
+normal code agent; uncertain workers and denied permissions still need an operator.
+
+There is no fleet-wide daily assessment or repair quota. Normal heavy admission
+and one assessment at a time bound investigation concurrency. Each ticket can
+receive three automatic repair or retry handbacks per rolling twenty-four hours.
+Budget exhaustion escalates that ticket without preventing unrelated recoveries.
+Real escalations and completed handbacks are not replayed on a timer. Wait decisions
+recheck after thirty minutes. Normal review can still advance, and a changed rework
+count creates a new assessment. Previously exhausted fleet quotas and incorrectly
+held sizing markers become eligible again. Genuine escalations and interrupted
+handbacks remain held for inspection.
 
 The decision and repair budget are stored before GitHub writes. A process that
 stops during assessment or handback keeps its reservation. Once that exact run

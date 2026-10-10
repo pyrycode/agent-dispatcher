@@ -6,7 +6,7 @@ import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { config } from "dotenv";
 import { githubPauseMs, freshGitHubRead } from "./github-transport.js";
-import { runRecoveryWork, recoveryHandoff, parseRecoveryDecision, RECOVERY_INSTRUCTIONS, cleanRecoveryLabels } from "./recovery-work.js";
+import { runRecoveryWork, recoveryHandoff, parseRecoveryDecision, RECOVERY_INSTRUCTIONS, RECOVERY_EFFORT, RECOVERY_MAX_TURNS, RECOVERY_TIMEOUT_MS, cleanRecoveryLabels } from "./recovery-work.js";
 import { recoveryLogContext } from "./recovery-context.js";
 import type { RecoveryIncident, RecoveryDecision } from "./fleet-recovery.js";
 import { ManagedDispatch, trackManagedChild } from "./managed-dispatch.js";
@@ -9755,7 +9755,7 @@ export async function pollLoop(): Promise<void> {
                 const result = await runClaudeStreaming({ runner, sourceReview: true, sourceReviewRoot: repoRoot,
                   promptFile, systemPromptFile, cwd: repoRoot, logFile,
                   model: runner === "codex" ? process.env.PYRY_CODEX_MODEL ?? "gpt-6.1-sol" : "sonnet",
-                  effort: runner === "codex" ? process.env.PYRY_CODEX_EFFORT ?? "high" : "high", maxTurns: 20, timeoutMs: 600_000,
+                  effort: RECOVERY_EFFORT, maxTurns: RECOVERY_MAX_TURNS, timeoutMs: RECOVERY_TIMEOUT_MS,
                   allowedTools: "Read,Glob,Grep", disallowedTools: "Bash,Write,Edit,Agent",
                   env: { ...scrubSpawnEnv(process.env), CLAUDE_CODE_ENTRYPOINT: "recovery" } });
                 if (result.isError || result.timedOut || result.hadPermissionDenial) throw new Error("Recovery assessment failed");

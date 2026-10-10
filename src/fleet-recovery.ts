@@ -13,6 +13,12 @@ export interface RecoveryIncident {
   created: number; updated: number; runId: string | null; decision: RecoveryDecision | null;
 }
 
+export const RECOVERY_RECHECK_MS = 30 * 60_000;
+export const RECOVERY_REPAIRS_PER_TICKET = 3;
+export function hasOperatorHold(labels: readonly string[]): boolean {
+  return labels.some(l => l.startsWith("needs-human:") && l !== "needs-human:sizing");
+}
+
 export function validateObservations(project: string, observations: RecoveryObservation[]): void {
   if (!/^[\w.-]+\/[\w.-]+$/.test(project) || !Array.isArray(observations) || observations.length > 5000) throw new Error("Invalid recovery report");
   const seen = new Set<string>();
@@ -29,7 +35,7 @@ export function recoveryFingerprint(o: RecoveryObservation): string {
 }
 export function recoveryTrigger(o: RecoveryObservation): { reason: string; manual: boolean } | null {
   if (o.status === "Done") return null;
-  if (o.status === "Halted" || o.labels.some(l => l.startsWith("needs-human:"))) return { reason: "Explicit operator hold", manual: true };
+  if (o.status === "Halted" || hasOperatorHold(o.labels)) return { reason: "Explicit operator hold", manual: true };
   if (o.labels.some(l => /permission_denied|family-breaker/.test(l))) return { reason: "Permission or family boundary needs an operator", manual: true };
   // These waits already have dedicated bounded recovery. Do not buy another retry budget.
   if (o.blocked || o.labels.some(l => l.startsWith("error-retry-count:") || l.startsWith("health-hold:"))) return null;
@@ -98,8 +104,13 @@ export class RecoveryLedger {
         newAlerts.add(String(old.id));
         continue;
       }
-      if (old && (!trigger || old.fingerprint !== fingerprint)) this.db.prepare("UPDATE fleet_recovery SET present=0, state=CASE WHEN state='queued' THEN 'resolved' ELSE state END, updated=? WHERE id=?").run(this.now(), old.id);
-      if (!trigger || old?.fingerprint === fingerprint || (wip && !trigger.manual)) continue;
+      const legacyLimit = old?.state === "escalated" && ["Explicit operator hold", "Fleet recovery assessment daily limit reached",
+        "Automatic repair budget exhausted: two fleet repairs and one per ticket per day"].includes(String(old.reason));
+      const waited = old?.state === "complete" && old.decision && JSON.parse(String(old.decision)).action === "wait"
+        && this.now() - Number(old.updated) >= RECOVERY_RECHECK_MS;
+      const recheck = (legacyLimit || waited) && trigger && !trigger.manual && !wip;
+      if (old && (!trigger || old.fingerprint !== fingerprint || recheck)) this.db.prepare("UPDATE fleet_recovery SET present=0, updated=CASE WHEN state='queued' THEN ? ELSE updated END, state=CASE WHEN state='queued' THEN 'resolved' ELSE state END WHERE id=?").run(this.now(), old.id);
+      if (!trigger || old?.fingerprint === fingerprint && !recheck || (wip && !trigger.manual)) continue;
       const id = randomUUID();
       this.db.prepare("INSERT INTO fleet_recovery VALUES (?,?,?,?,?,?,?,NULL,NULL,1)").run(id, o.ticket, fingerprint, trigger.reason, trigger.manual ? "escalated" : "queued", this.now(), this.now());
       if (trigger.manual) newAlerts.add(id);
@@ -126,11 +137,6 @@ export class RecoveryLedger {
     // A lost response can retrieve the same attempt, never create another.
     if (incident.runId === runId && incident.state === "assessing") return incident;
     if (incident.state !== "queued") throw new Error("Recovery incident is not queued");
-    const count = this.db.prepare("SELECT count(*) AS n FROM fleet_recovery WHERE run_id IS NOT NULL AND updated>?").get(this.now() - 86400000)!;
-    if (Number(count.n) >= 40) {
-      this.db.prepare("UPDATE fleet_recovery SET state='escalated',reason=?,updated=? WHERE id=?").run("Fleet recovery assessment daily limit reached", this.now(), id);
-      return this.incident(id);
-    }
     this.db.prepare("UPDATE fleet_recovery SET state='assessing', run_id=?, updated=? WHERE id=?").run(runId, this.now(), id);
     return this.incident(id);
   }
@@ -141,8 +147,8 @@ export class RecoveryLedger {
     if (incident.state !== "assessing") throw new Error("Recovery is not being assessed");
     let decision = validateRecoveryDecision(value);
     if (decision.action === "retry" || decision.action === "rework") {
-      const repairs = this.db.prepare("SELECT ticket FROM fleet_recovery WHERE decision IS NOT NULL AND updated>? AND json_extract(decision,'$.action') IN ('retry','rework')").all(this.now() - 86400000);
-      if (repairs.length >= 2 || repairs.some(r => r.ticket === incident.ticket)) decision = { action: "escalate", reason: "Automatic repair budget exhausted: two fleet repairs and one per ticket per day" };
+      const repairs = this.db.prepare("SELECT count(*) AS n FROM fleet_recovery WHERE ticket=? AND decision IS NOT NULL AND updated>? AND json_extract(decision,'$.action') IN ('retry','rework')").get(incident.ticket, this.now() - 86400000)!;
+      if (Number(repairs.n) >= RECOVERY_REPAIRS_PER_TICKET) decision = { action: "escalate", reason: "Automatic repair budget exhausted: three repairs per ticket per rolling day" };
     }
     this.db.prepare("UPDATE fleet_recovery SET state=?, decision=?, updated=? WHERE id=?").run(
       ["retry", "rework"].includes(decision.action) ? "applying" : decision.action === "wait" ? "complete" : "escalated", JSON.stringify(decision), this.now(), id);
