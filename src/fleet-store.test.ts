@@ -50,8 +50,8 @@ test("retries cannot replay a completed start or free a later run", t => {
 
 test("project locks exclude other tickets and computers without claiming losers", t => {
   const { store } = fixture(t);
-  const a = { ...request("a"), locks: ["org/mobile:documentation"] };
-  const b = { ...request("b", "linux", "org/mobile#2"), locks: a.locks };
+  const a = { ...request("a"), resource: "light" as const, role: "documentation", locks: ["org/mobile:role:documentation"] };
+  const b = { ...request("b", "linux", "org/mobile#2"), resource: "light" as const, role: "documentation", locks: a.locks };
   assert.equal(store.start(a).ok, true);
   assert.deepEqual(store.start(b), { ok: false, reason: "locked" });
   assert.equal(store.snapshot().claims.length, 1);

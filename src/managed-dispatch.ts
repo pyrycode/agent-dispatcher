@@ -7,7 +7,7 @@ import type { WorkOffer } from "./machine-scheduler.js";
 import type { AgentConfig, ProjectItem } from "./types.js";
 
 const DEFAULT_RESOURCE_CLASSES: Readonly<Record<string, ResourceClass>> = {
-  builder: "medium", developer: "medium", refiner: "light", po: "light",
+  builder: "medium", developer: "medium", refiner: "light", po: "light", documentation: "light",
 };
 const currentRun = new AsyncLocalStorage<{ run: FleetRun; groups: Set<number> }>();
 /** Called by the existing spawn sites. Slot release waits for grandchildren too. */

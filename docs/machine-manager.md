@@ -8,7 +8,7 @@ The claim service uses SQLite on its own local disk. It grants a ticket and the 
 
 Each manager configuration lists projects in priority order. It considers runnable locally claimed tickets first, oldest claim first. It then considers unclaimed tickets in project order. Within that ordering it uses the dispatcher's ticket priority labels and stage order. Running work is never pre-empted. A blocked or errored ticket stays owned but is absent from eligible offers, so other work can proceed. Strict project priority can starve a lower project if higher projects always have eligible work.
 
-Each role is `heavy`, `medium` or `light`. Build agents default to medium, including the classic developer role. Refinement agents default to light. Verifiers, documentation and unknown roles default to heavy. Explicit role configuration can override these defaults.
+Each role is `heavy`, `medium` or `light`. Build agents default to medium, including the classic developer role. Refinement and documentation agents default to light. Verifiers and unknown roles default to heavy. Documentation keeps its separate one-at-a-time restriction per project board across computers. Explicit role configuration can override these defaults.
 
 Every physical computer has two shared limits: `heavyLimit` bounds heavy jobs, and `combinedLimit` bounds heavy plus medium jobs. Both are required positive integers. The combined limit must be at least the heavy limit. Light work consumes neither limit.
 
@@ -51,11 +51,11 @@ In each consumer's secret environment, set:
 PYRY_MANAGED=1
 PYRY_MANAGER_URL=http://127.0.0.1:7431
 PYRY_MANAGER_TOKEN=op://your-configured-reference
-PYRY_RESOURCE_CLASSES={"refiner":"light","builder":"medium","verifier":"heavy","documentation":"heavy"}
+PYRY_RESOURCE_CLASSES={"refiner":"light","builder":"medium","verifier":"heavy","documentation":"light"}
 PYRY_AUTOCURATE_MEMORY=0
 ```
 
-Medium is an admission class, not a CPU or memory quota. Build agents still need bounded test workers and focused checks; classify a build job as heavy before launch if it needs a full suite. This change does not alter test-runner worker counts. Review the actual role commands before classifying one as light. Keep documentation heavy until its commands have been checked. Its serial restriction is independent of its resource class. Unknown role names default to heavy.
+Medium is an admission class, not a CPU or memory quota. Build agents still need bounded test workers and focused checks; classify a build job as heavy before launch if it needs a full suite. This change does not alter test-runner worker counts. Review the actual role commands before classifying one as light. Documentation is light by default. Its serial restriction is independent of its resource class. Unknown role names default to heavy.
 
 Start each updated consumer with `bin/pyry-start --managed`. The flag survives restart and takes effect after secret loading. A partial manager configuration fails closed. The old `PYRY_MAX_CONCURRENT` limit applies only to independent mode. Mobile skips its pre-launch Gradle formatting check in managed mode because it would run before admission. The builder and verifier retain their admitted checks.
 
