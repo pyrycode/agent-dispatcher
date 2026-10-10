@@ -20,5 +20,6 @@
       "tokenEnv": "FLEET_DESKTOP_TOKEN"
     }
   ],
-  "combinedLimit": 2
+  "combinedLimit": 2,
+  "ticketLimit": 2
 }

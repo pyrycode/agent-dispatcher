@@ -10,6 +10,8 @@ Each manager configuration lists projects in priority order. It considers runnab
 
 A dispatcher can explicitly cancel a reservation it never started, for example after a board stage changes. That cancellation releases a new ticket claim only if no actual or uncertain run has used that ownership generation. Completed, failed and blocked work keeps its claim. Offline reservations still require manual release. A cancelled offer therefore cannot gain priority over work that is ready to run.
 
+Production managers default to `ticketLimit: 2`, shared across all their projects. Active ticket reservations and locally owned tickets with runnable offers count. Blocked, errored and completed claims without offers keep their ownership but do not count. Existing ownership can continue above the limit. Internal maintenance jobs do not count. Light roles remain free of resource limits, but cannot acquire extra tickets past the claim budget. Status reports the configured limit and runnable ticket count.
+
 Each role is `heavy`, `medium` or `light`. Build agents default to medium, including the classic developer role. Refinement and documentation agents default to light. Verifiers and unknown roles default to heavy. Documentation keeps its separate one-at-a-time restriction per project board across computers. Explicit role configuration can override these defaults.
 
 Every physical computer has two shared limits: `heavyLimit` bounds heavy jobs, and `combinedLimit` bounds heavy plus medium jobs. Both are required positive integers. The combined limit must be at least the heavy limit. Light work consumes neither limit.
@@ -17,6 +19,8 @@ Every physical computer has two shared limits: `heavyLimit` bounds heavy jobs, a
 With heavy at 1 and combined at 2, the computer can run one verifier and one builder, or two builders. It cannot run two heavy jobs or three medium jobs. Jobs retain their resource class for their whole run; there is no mid-run upgrade or second reservation. Existing role restrictions such as serial documentation still apply across computers to protect shared files.
 
 Each reservation covers setup, the agent, its pre-verifier tests, retries, cleanup and indexing. Heavy runs consume both counters. Medium runs consume only the combined counter. Merge work, standalone live gates and main checks are always heavy. Background children in the recorded process groups keep the reservation until they exit. Programs that deliberately detach into a different process group are outside that check. Do not use daemonised test runners for managed jobs.
+
+Only admitted runs create claims. Writing follow-up tickets, comments or labels does not claim those tickets. This also prevents a drained computer from turning newly filed follow-ups into owned work.
 
 Housekeeping is a short light job with a project lock. It can advance unclaimed work without retaining ownership of the backlog. New runs wait for that pass. Already running jobs retain their grants. Housekeeping cannot modify another computer's tickets or a ticket with an active run. Shared family marker comments and convenience counters remain cross-owner metadata. Those helpers cannot launch agents or advance ticket stages.
 

@@ -18,9 +18,18 @@ export function acceptsDuringProjectDrain(offer: WorkOffer, machine: string, dra
     || (/#[1-9]\d*$/.test(offer.ticket) && state.claims.some(c => c.ticket === offer.ticket && c.machine === machine));
 }
 
+/** Count runnable ownership, not persistent claims for completed or blocked tickets. */
+export function runnableTickets(machine: string, offers: readonly WorkOffer[], state: FleetSnapshot): Set<string> {
+  const owned = new Set(state.claims.filter(c => c.machine === machine).map(c => c.ticket));
+  return new Set([
+    ...state.runs.filter(r => r.machine === machine).map(r => r.ticket),
+    ...offers.filter(o => owned.has(o.ticket)).map(o => o.ticket),
+  ].filter(ticket => /#[1-9]\d*$/.test(ticket)));
+}
+
 /** Offers are already eligible: blockers, errors and backoff belong to the dispatcher. */
 export function scheduleMachine(opts: {
-  machine: string; projects: readonly string[]; drainingProjects?: readonly string[];
+  machine: string; projects: readonly string[]; drainingProjects?: readonly string[]; ticketLimit?: number;
   offers: readonly WorkOffer[]; state: FleetSnapshot;
 } & MachineLimits): WorkOffer[] {
   const claims = new Map(opts.state.claims.map(c => [c.ticket, c]));
@@ -29,6 +38,8 @@ export function scheduleMachine(opts: {
   const localRuns = opts.state.runs.filter(r => r.machine === opts.machine);
   let heavyPlaces = Math.max(0, opts.heavyLimit - localRuns.filter(r => r.resource === "heavy").length);
   let combinedPlaces = Math.max(0, opts.combinedLimit - localRuns.filter(r => r.resource !== "light").length);
+  const runnable = runnableTickets(opts.machine, opts.offers, opts.state);
+  let ticketPlaces = Math.max(0, (opts.ticketLimit ?? Infinity) - runnable.size);
   const rank = new Map(opts.projects.map((p, i) => [p, i]));
   const ready = opts.offers.filter(o => rank.has(o.project) && (!claims.has(o.ticket) || claims.get(o.ticket)!.machine === opts.machine)
     && acceptsDuringProjectDrain(o, opts.machine, opts.drainingProjects ?? [], opts.state));
@@ -42,10 +53,13 @@ export function scheduleMachine(opts: {
   for (const job of ready) {
     if (active.has(job.ticket) || locks.has(`${job.project}:reconcile`) || job.locks.some(l => locks.has(l))) continue;
     if (job.roleLimit !== undefined && [...opts.state.runs, ...selected].filter(r => r.project === job.project && r.role === job.role).length >= job.roleLimit) continue;
+    const newTicket = /#[1-9]\d*$/.test(job.ticket) && !claims.has(job.ticket);
+    if (newTicket && ticketPlaces === 0) continue;
     if (job.resource !== "light" && combinedPlaces === 0) continue;
     if (job.resource === "heavy" && heavyPlaces === 0) continue;
     if (job.resource === "heavy") heavyPlaces--;
     if (job.resource !== "light") combinedPlaces--;
+    if (newTicket) ticketPlaces--;
     active.add(job.ticket);
     job.locks.forEach(l => locks.add(l));
     selected.push(job);

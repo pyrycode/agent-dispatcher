@@ -9187,6 +9187,7 @@ export async function pollLoop(): Promise<void> {
   client.setListingGapHandler((message) => { void notifyDiscord(message); });
 
   for (;;) {
+    if (drainMode) { await managed?.stop(); return; }
     try { await client.initialize(); break; }
     catch (error) {
       const pause = githubPauseMs(error);

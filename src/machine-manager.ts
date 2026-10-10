@@ -2,9 +2,9 @@ import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { listen, readJson, tokenMatches, type FleetClient } from "./fleet-http.js";
 import { validateStart, validateLimits, type MachineLimits, type FleetRun } from "./fleet-store.js";
-import { scheduleMachine, acceptsDuringProjectDrain, type WorkOffer } from "./machine-scheduler.js";
+import { scheduleMachine, runnableTickets, acceptsDuringProjectDrain, type WorkOffer } from "./machine-scheduler.js";
 
-export interface MachineConfig extends MachineLimits { machine: string; projects: string[]; drainingProjects?: string[] }
+export interface MachineConfig extends MachineLimits { machine: string; projects: string[]; drainingProjects?: string[]; ticketLimit?: number }
 type ClaimService = Pick<FleetClient, "snapshot" | "start" | "finish"> & Partial<Pick<FleetClient, "authorize" | "github">>;
 interface Offers { session: string; work: WorkOffer[]; at: number }
 export function offerId(machine: string, session: string, offer: WorkOffer): string {
@@ -18,6 +18,7 @@ export class MachineManager {
   draining = false;
   constructor(readonly config: MachineConfig, readonly claims: ClaimService, private readonly now = Date.now) {
     validateLimits(config);
+    if (config.ticketLimit !== undefined && (!Number.isSafeInteger(config.ticketLimit) || config.ticketLimit < 1)) throw new Error("Invalid ticket limit");
     if (!config.machine || new Set(config.projects).size !== config.projects.length) throw new Error("Invalid machine configuration");
     if (config.drainingProjects !== undefined && (!Array.isArray(config.drainingProjects) || config.drainingProjects.some(p => !config.projects.includes(p)))) throw new Error("Invalid project drain configuration");
   }
@@ -83,8 +84,9 @@ export class MachineManager {
   async status() {
     const state = await this.claims.snapshot();
     const available = [...this.offers.values()].filter(o => this.now() - o.at < 180_000).flatMap(o => o.work);
-    const eligible = new Set(scheduleMachine({ ...this.config, offers: available, state }).map(o => `${o.project}/${o.key}`));
-    return { machine: this.config.machine, heavyLimit: this.config.heavyLimit, combinedLimit: this.config.combinedLimit, draining: this.draining, drainingProjects: this.config.drainingProjects ?? [], ...state,
+    const runnableOffers = available.filter(o => !this.finished.has(`${o.project}/${o.key}`));
+    const eligible = new Set(scheduleMachine({ ...this.config, offers: runnableOffers, state }).map(o => `${o.project}/${o.key}`));
+    return { machine: this.config.machine, heavyLimit: this.config.heavyLimit, combinedLimit: this.config.combinedLimit, ticketLimit: this.config.ticketLimit ?? null, runnableTicketCount: runnableTickets(this.config.machine, runnableOffers, state).size, draining: this.draining, drainingProjects: this.config.drainingProjects ?? [], ...state,
       projects: this.config.projects.map(project => ({ project, draining: this.config.drainingProjects?.includes(project) ?? false, lastSeen: this.offers.get(project)?.at ?? null })),
       queue: available.map(o => ({ ticket: o.ticket, role: o.role, resource: o.resource,
         state: this.finished.has(`${o.project}/${o.key}`) ? "already-completed"
