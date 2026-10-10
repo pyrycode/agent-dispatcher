@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { RecoveryLedger, recoveryFingerprint, recoveryTrigger, type RecoveryObservation, type RecoveryIncident } from "./fleet-recovery.js";
+import { RecoveryLedger, recoveryFingerprint, recoveryTrigger, RECOVERY_RECHECK_MS, type RecoveryObservation, type RecoveryIncident } from "./fleet-recovery.js";
 import { FleetStore, type StartRequest } from "./fleet-store.js";
 import { FleetClient, JsonClient, serveFleet } from "./fleet-http.js";
 import { MachineManager, serveManager } from "./machine-manager.js";
@@ -55,7 +55,7 @@ test("an incident survives restart and only its admitted owner can assess it", (
   store.close();
 });
 
-test("recurrence is a new event but cannot buy another ticket repair within a day", () => {
+test("recurrence is a new event with a persistent per-ticket repair limit", () => {
   const store = new FleetStore(":memory:", limits);
   const [first] = store.recoveryReport("mac", project, [observation()]);
   store.start(request());
@@ -71,7 +71,7 @@ test("recurrence is a new event but cannot buy another ticket repair within a da
   assert.notEqual(second.id, first.id);
   store.start(request(1, { id: "again" }));
   store.recoveryStep("mac", "session", project, second.id, "again", "begin");
-  assert.equal((store.recoveryStep("mac", "session", project, second.id, "again", "decide", d) as any).action, "escalate");
+  assert.equal((store.recoveryStep("mac", "session", project, second.id, "again", "decide", d) as any).action, "retry");
   store.close();
 });
 
@@ -177,18 +177,93 @@ test("real HTTP admission, durable decision and code-owner handback work togethe
   assert.equal((await operator.call<RecoveryIncident[]>("/recovery/state"))[0].id, incident.id);
 });
 
-test("assessment and repair limits persist and cannot be reset by a fresh report", () => {
+test("unrelated tickets cannot exhaust each other's assessments or repairs", () => {
   const db = new DatabaseSync(":memory:");
   const ledger = new RecoveryLedger(db, () => 100000000);
   const empty = { claims: [], runs: [] };
   for (let n = 1; n <= 41; n++) {
     const incident = ledger.report("mac", project, [observation(n)], empty).find(i => i.ticket === `${project}#${n}`)!;
     const started = ledger.begin(incident.id, `run-${n}`);
-    if (n === 41) { assert.equal(started.state, "escalated"); break; }
+    assert.equal(started.state, "assessing");
     const decision = ledger.decide(incident.id, `run-${n}`, { action: "retry", reason: "Temporary fault cleared" });
-    assert.equal(decision.action, n <= 2 ? "retry" : "escalate");
+    assert.equal(decision.action, "retry");
     ledger.complete(incident.id, `run-${n}`);
   }
+  db.close();
+});
+
+test("sizing review remains informational while real operator holds stay manual", async () => {
+  const current = item(["needs-human:sizing", "error:rework-loop", "done:builder"]);
+  assert.equal(recoveryTrigger(observationFor(project, current))?.manual, false);
+  assert.equal(recoveryTrigger(observation(1, ["needs-human:sizing"])), null);
+  assert.equal(recoveryTrigger(observation(1, ["needs-human:sizing", "needs-human:decision", "error:builder"]))?.manual, true);
+  assert.equal(recoveryPlan(current, { action: "rework", reason: "Repair repeated source provenance defect" }, agents).status, "In Development");
+  current.labels = ["needs-human:sizing", "orchestrator:fixing"];
+  const removed: string[] = [];
+  await cleanRecoveryLabels([current], async (_n, label) => { removed.push(label); });
+  assert.deepEqual(removed, [], "informational sizing must not remove repair priority");
+});
+
+test("waits recheck after a persisted cooldown and never duplicate an active worker", () => {
+  const db = new DatabaseSync(":memory:"); let now = 100000000;
+  let ledger = new RecoveryLedger(db, () => now);
+  const empty = { claims: [], runs: [] };
+  const [first] = ledger.report("mac", project, [observation()], empty);
+  ledger.begin(first.id, "first");
+  ledger.decide(first.id, "first", { action: "wait", reason: "Temporary service outage is resolving" });
+  ledger = new RecoveryLedger(db, () => now);
+  now += RECOVERY_RECHECK_MS - 1;
+  assert.equal(ledger.report("mac", project, [observation()], empty).length, 0);
+  now++;
+  assert.equal(ledger.report("mac", project, [observation()], { claims: [], runs: [{ ...request(), generation: "generation", created: now }] }).length, 0);
+  const [second] = ledger.report("mac", project, [observation()], empty);
+  assert.notEqual(second.id, first.id);
+  assert.equal(second.state, "queued");
+  assert.equal(ledger.report("mac", project, [observation()], empty)[0].id, second.id);
+  ledger.begin(second.id, "second");
+  ledger.decide(second.id, "second", { action: "escalate", reason: "Operator decision required" });
+  now += 86400000;
+  assert.equal(ledger.report("mac", project, [observation()], empty).length, 0, "a real escalation is not an automatic retry");
+  db.close();
+});
+
+test("three repair assignments per ticket survive restart and expire without extending old budgets", () => {
+  const db = new DatabaseSync(":memory:"); let now = 100000000;
+  let ledger = new RecoveryLedger(db, () => now);
+  const empty = { claims: [], runs: [] };
+  for (let n = 1; n <= 4; n++) {
+    const [incident] = ledger.report("mac", project, [observation(1, ["error:builder", `rework-count:${n}`])], empty);
+    ledger.begin(incident.id, `run-${n}`);
+    const decision = ledger.decide(incident.id, `run-${n}`, { action: "rework", reason: "Repair the diagnosed cause" });
+    assert.equal(decision.action, n <= 3 ? "rework" : "escalate");
+    assert.deepEqual(ledger.decide(incident.id, `run-${n}`, { action: "rework", reason: "Lost reply" }), decision);
+    if (n <= 3) ledger.complete(incident.id, `run-${n}`);
+    ledger = new RecoveryLedger(db, () => now);
+  }
+  now += 86400001;
+  const [next] = ledger.report("mac", project, [observation(1, ["error:builder", "rework-count:5"])], empty);
+  ledger.begin(next.id, "next-day");
+  assert.equal(ledger.decide(next.id, "next-day", { action: "rework", reason: "New evidence" }).action, "rework");
+  db.close();
+});
+
+test("a policy upgrade reassesses old safe escalations without overriding manual holds", () => {
+  const db = new DatabaseSync(":memory:");
+  const ledger = new RecoveryLedger(db, () => 100000000);
+  const empty = { claims: [], runs: [] };
+  const [old] = ledger.report("mac", project, [observation(1, ["needs-human:sizing", "error:rework-loop"])], empty);
+  db.prepare("UPDATE fleet_recovery SET state='escalated',reason='Explicit operator hold' WHERE id=?").run(old.id);
+  const [next] = ledger.report("mac", project, [observation(1, ["needs-human:sizing", "error:rework-loop"])], empty);
+  assert.notEqual(next.id, old.id);
+  assert.equal(next.state, "queued");
+  const [held] = ledger.report("mac", project, [observation(2, ["needs-human:decision", "error:builder"])], empty);
+  assert.equal(held.state, "escalated");
+  const [limited] = ledger.report("mac", project, [observation(3)], empty);
+  db.prepare("UPDATE fleet_recovery SET state='escalated',reason='Fleet recovery assessment daily limit reached' WHERE id=?").run(limited.id);
+  assert.equal(ledger.report("mac", project, [observation(3)], empty)[0].state, "queued");
+  const [interrupted] = ledger.report("mac", project, [observation(4)], empty);
+  db.prepare("UPDATE fleet_recovery SET state='escalated',reason='Recovery ended without a confirmed result; inspect before retrying' WHERE id=?").run(interrupted.id);
+  assert.equal(ledger.report("mac", project, [observation(4)], empty).length, 0, "an interrupted handback must not be reopened by the upgrade");
   db.close();
 });
 

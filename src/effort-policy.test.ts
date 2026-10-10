@@ -112,3 +112,14 @@ describe("builder effort", () => {
       "the Codex setting never applied to Claude, so nothing was overridden");
   });
 });
+
+test("orchestrator code repairs use xhigh with either runner despite lower defaults", () => {
+  for (const runner of ["claude", "codex"] as const) {
+    for (const name of ["builder", "developer"]) {
+      const result = resolveEffort({ agent: agent(name, "low"), item: { body: routine, labels: ["orchestrator:fixing"] },
+        runner, env: { PYRY_CODEX_EFFORT: "medium" }, stageSet: name === "builder" ? "builder" : "default" });
+      assert.equal(result.effort, "xhigh");
+      assert.equal(result.reason, "orchestrator recovery repair");
+    }
+  }
+});
