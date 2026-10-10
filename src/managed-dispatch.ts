@@ -5,6 +5,7 @@ import { JsonClient } from "./fleet-http.js";
 import type { Claim, FleetRun, FleetSnapshot, ResourceClass } from "./fleet-store.js";
 import type { WorkOffer } from "./machine-scheduler.js";
 import type { AgentConfig, ProjectItem } from "./types.js";
+import type { RecoveryObservation, RecoveryIncident, RecoveryDecision } from "./fleet-recovery.js";
 
 const DEFAULT_RESOURCE_CLASSES: Readonly<Record<string, ResourceClass>> = {
   builder: "medium", developer: "medium", refiner: "light", po: "light", documentation: "light",
@@ -150,6 +151,15 @@ export class ManagedDispatch {
   async authorize(issue: number): Promise<void> {
     await this.connection.call<Claim>("/authorize", { session: this.session, ticket: `${this.project}#${issue}`, runId: currentRun.getStore()?.run.id });
   }
+  recoveryReport(items: ProjectItem[]): Promise<RecoveryIncident[]> {
+    const observations: RecoveryObservation[] = items.map(i => ({ ticket: `${this.project}#${i.issueNumber}`, status: i.status, labels: i.labels, blocked: i.blockedBy.some(b => b.state === "OPEN") }));
+    return this.connection.call("/recovery/report", { observations });
+  }
+  recoveryStep<T>(step: "begin" | "decide" | "complete", id: string, decision?: RecoveryDecision): Promise<T> {
+    const run = currentRun.getStore()?.run;
+    if (!run || run.role !== "recovery") throw new Error("Recovery needs an admitted run");
+    return this.connection.call(`/recovery/${step}`, { id, session: this.session, runId: run.id, decision });
+  }
   inFlightKeys(): Set<string> {
     return new Set(this.state.runs.filter(r => r.project === this.project).map(r => `${r.role}#${r.ticket.split("#")[1]}`));
   }
@@ -159,7 +169,7 @@ export class ManagedDispatch {
     const createdNumbers = new Map<string, number>();
     const numbers = new Set(["addLabel", "removeLabel", "addComment", "closeIssue", "addBlocker"]);
     const items = new Set(["updateItemStatus", "moveItemToTop"]);
-    const lists = new Set(["getAllProjectItems", "getItemsByStatus", "getClosedItemsNotInDone"]);
+    const lists = new Set(["getAllProjectItems", "getOpenProjectItems", "getItemsByStatus", "getClosedItemsNotInDone"]);
     return new Proxy(base, {
       get: (target, key) => {
         const value = Reflect.get(target, key);

@@ -641,6 +641,11 @@ export class GitHubProjectClient {
     return all.map(stripState);
   }
 
+  async getOpenProjectItems(): Promise<ProjectItem[]> {
+    return (await this.getAllItems()).filter(i => i.state === "OPEN").map(stripState);
+  }
+
+
   /**
    * Return project items whose issue is CLOSED and whose status is NOT
    * "Done". Used by the closed-sweep step to keep the board tidy: tickets

@@ -2,6 +2,7 @@
 // Keep this file on the claim server's local disk, never on a shared filesystem.
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
+import { RecoveryLedger, type RecoveryObservation, type RecoveryDecision } from "./fleet-recovery.js";
 
 export type ResourceClass = "heavy" | "medium" | "light";
 export interface MachineLimits { heavyLimit: number; combinedLimit: number }
@@ -47,6 +48,7 @@ export function validateStart(req: StartRequest): void {
 
 export class FleetStore {
   private readonly db: DatabaseSync;
+  readonly recovery: RecoveryLedger;
   constructor(path: string, private readonly limits: Readonly<Record<string, MachineLimits>>) {
     for (const value of Object.values(limits)) validateLimits(value);
     this.db = new DatabaseSync(path);
@@ -68,8 +70,26 @@ export class FleetStore {
         name TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES fleet_runs(id)
       ) STRICT;
     `);
+    this.recovery = new RecoveryLedger(this.db);
   }
   close(): void { this.db.close(); }
+
+  recoveryReport(machine: string, project: string, observations: RecoveryObservation[]) {
+    if (!Object.hasOwn(this.limits, machine)) throw new Error("Unknown machine");
+    return this.transaction(() => this.recovery.report(machine, project, observations, this.snapshot()));
+  }
+  recoveryStep(machine: string, session: string, project: string, id: string, runId: string, step: "begin" | "decide" | "complete", decision?: RecoveryDecision) {
+    const incident = this.recovery.incident(id);
+    const run = this.snapshot().runs.find(r => r.id === runId);
+    if (!run || run.project !== project || run.ticket !== incident.ticket || run.role !== "recovery" || run.resource !== "heavy") throw new Error("Recovery requires its admitted heavy run");
+    this.authorize(machine, session, incident.ticket, runId);
+    return this.transaction(() => {
+      if (step === "begin") return this.recovery.begin(id, runId);
+      if (step === "decide") return this.recovery.decide(id, runId, decision!);
+      if (step === "complete") { this.recovery.complete(id, runId); return { ok: true }; }
+      throw new Error("Invalid recovery operation");
+    });
+  }
 
   /** Guard small workflow writes too. An active job is writable only by that run. */
   authorize(machine: string, session: string, ticket: string, runId?: string): Claim {
@@ -109,6 +129,10 @@ export class FleetStore {
       }
       if (req.ticket.includes("#@main-sweep-") && this.db.prepare("SELECT 1 FROM fleet_runs WHERE ticket=? AND finished IS NOT NULL AND outcome='completed'").get(req.ticket)) return { ok: false, reason: "finished" };
       if (req.role === "reconcile" && (req.ticket !== `${req.project}#@reconcile` || !req.locks.includes(`${req.project}:reconcile`))) throw new Error("Housekeeping requires the project lock");
+      if (req.role === "recovery") {
+        if (req.resource !== "heavy" || !/#[1-9]\d*$/.test(req.ticket)) throw new Error("Recovery requires a heavy ticket reservation");
+        if (this.db.prepare("SELECT 1 FROM fleet_runs WHERE finished IS NULL AND json_extract(request,'$.role')='recovery'").get()) return { ok: false, reason: "locked" };
+      }
       if (this.db.prepare("SELECT 1 FROM fleet_locks WHERE name=?").get(`${req.project}:reconcile`)) return { ok: false, reason: "locked" };
       const claim = this.db.prepare("SELECT * FROM fleet_claims WHERE ticket=?").get(req.ticket);
       if (claim && claim.machine !== req.machine) return { ok: false, reason: "foreign-claim" };

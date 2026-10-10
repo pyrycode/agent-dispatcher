@@ -16,8 +16,8 @@ function secret(name: string): string {
 }
 async function main(): Promise<void> {
   const [command, configPath, ...args] = process.argv.slice(2);
-  if (!configPath || !["claims", "manager", "status", "drain", "drain-project", "resume-project", "free"].includes(command)) {
-    throw new Error("Usage: fleet-bin.ts claims|manager|status|drain|drain-project|resume-project|free CONFIG [PROJECT | TICKET GENERATION --confirmed-stopped]");
+  if (!configPath || !["claims", "manager", "status", "recovery", "drain", "drain-project", "resume-project", "free"].includes(command)) {
+    throw new Error("Usage: fleet-bin.ts claims|manager|status|recovery|drain|drain-project|resume-project|free CONFIG [PROJECT | TICKET GENERATION --confirmed-stopped]");
   }
   const config = JSON.parse(readFileSync(configPath, "utf8"));
   if (command === "claims") {
@@ -79,6 +79,6 @@ async function main(): Promise<void> {
     await client.call("/project-drain", { project: args[0], draining });
     console.log(draining ? `Draining ${args[0]}: existing owned tickets continue; no new tickets or main sweeps. Saved across manager restarts.` : `Resumed ${args[0]}: new tickets are eligible again.`);
   }
-  else console.log(JSON.stringify(await client.call("/state"), null, 2));
+  else console.log(JSON.stringify(await client.call(command === "recovery" ? "/recovery/state" : "/state"), null, 2));
 }
 main().catch(error => { console.error(error.message); process.exitCode = 1; });

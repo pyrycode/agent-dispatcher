@@ -41,9 +41,19 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
     if (!isAdmin && !machine) return send(401, { error: "Authentication required" });
     try {
       if (req.method === "GET" && req.url === "/state") return send(200, store.snapshot());
+      if (req.method === "GET" && req.url === "/recovery/state") return send(200, store.recovery.list());
       if (req.method === "GET" && req.url === "/github/status" && isAdmin) return send(200, github?.status() ?? { enabled: false });
       if (req.method !== "POST") return send(404, { error: "Unknown operation" });
       const body = await readJson(req);
+      if (req.url === "/recovery/report") {
+        if (!machine) return send(403, { error: "Machine credential required" });
+        return send(200, store.recoveryReport(machine, body.project, body.observations));
+      }
+      if (["/recovery/begin", "/recovery/decide", "/recovery/complete"].includes(req.url ?? "")) {
+        if (!machine) return send(403, { error: "Machine credential required" });
+        return send(200, store.recoveryStep(machine, body.session, body.project, body.id, body.runId,
+          req.url!.split("/")[2] as "begin" | "decide" | "complete", body.decision));
+      }
       if (req.url === "/github") {
         if (!machine || !github) return send(403, { error: "Shared GitHub not configured" });
         return send(200, await github.request(body.project, body.request));
