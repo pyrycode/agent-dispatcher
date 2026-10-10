@@ -21,14 +21,26 @@ export const githubFetch: typeof fetch = async (input, init) => {
   // The central service owns the upstream credential. Never send a local
   // GitHub token to the manager or include it in a shared cache key.
   delete envelope.headers!.authorization;
-  try { return githubResponse(await connection.call<GitHubResponse>("/github", envelope)); }
+  let result: GitHubResponse;
+  try { result = await connection.call<GitHubResponse>("/github", envelope); }
   catch { throw new Error("Shared GitHub unavailable; no direct fallback was attempted"); }
+  // Normalize before REST wrappers or GraphQL parsing discard the status.
+  // Throwing pauses the caller; it must not replay an uncertain mutation.
+  if (result.status >= 500 || result.status === 408) {
+    throw Object.assign(new Error(`Shared GitHub temporarily unavailable (${result.status})`), {
+      status: result.status, headers: result.headers,
+    });
+  }
+  return githubResponse(result);
 };
 
 export function githubPauseMs(error: unknown, now = Date.now()): number | null {
   const message = error instanceof Error ? error.message : String(error);
   if (!/API rate limit|shared GitHub|Shared GitHub/.test(message)) return null;
   const headers = (error as any)?.headers ?? (error as any)?.response?.headers;
+  const retry = headers?.["retry-after"];
+  const retryMs = retry === undefined ? NaN : /^\d+$/.test(retry) ? Number(retry) * 1000 : Date.parse(retry) - now;
+  if (Number.isFinite(retryMs) && retryMs > 0) return Math.min(60_000, Math.max(1000, retryMs));
   const reset = Number(headers?.["x-ratelimit-reset"]) * 1000;
   // Recheck at least once a minute so signals and completed runs are handled.
   return Number.isFinite(reset) && reset > now ? Math.min(60_000, Math.max(1000, reset - now + 5000)) : 60_000;

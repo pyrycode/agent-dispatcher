@@ -39,6 +39,7 @@ export class ManagedDispatch {
   private syncing = false;
   private errorAt = 0;
   private readonly cooldown = new Map<string, number>();
+  private recoveryTickets = new Set<string>();
   draining = false;
 
   constructor(readonly project: string, env: NodeJS.ProcessEnv) {
@@ -66,6 +67,11 @@ export class ManagedDispatch {
     this.pending.clear();
   }
   beginCycle(): void { this.seen.clear(); }
+  setRecoveryTickets(items: readonly ProjectItem[]): void {
+    this.recoveryTickets = new Set(items.filter(i => i.labels.includes("orchestrator:fixing"))
+      .map(i => `${this.project}#${i.issueNumber}`));
+    for (const p of this.pending.values()) if (!p.run) p.offer.recovery = this.recoveryTickets.has(p.offer.ticket);
+  }
   private name(ticket: string, role: string): string { return `${ticket}/${role}`; }
   offer(issue: number | string, role: string, resource: ResourceClass, locks: string[] = [], order = 0): Pending {
     const ticket = `${this.project}#${issue}`;
@@ -77,13 +83,17 @@ export class ManagedDispatch {
       this.pending.set(name, pending);
     }
     // Order is scheduling metadata, not part of the durable run identity.
-    if (!pending.run) pending.offer.order = order;
+    if (!pending.run) {
+      pending.offer.order = order;
+      pending.offer.recovery = this.recoveryTickets.has(ticket);
+    }
     return pending;
   }
   agentOffer(agent: AgentConfig, item: ProjectItem, order: number): Pending {
     const pending = this.offer(item.issueNumber, agent.name, this.classes[agent.name] ?? DEFAULT_RESOURCE_CLASSES[agent.name] ?? "heavy",
       agent.serial ? [`${this.project}:role:${agent.name}`] : [], order);
     pending.offer.roleLimit = agent.serial ? 1 : agent.maxInFlight;
+    if (!pending.run) pending.offer.recovery = item.labels.includes("orchestrator:fixing");
     return pending;
   }
   ready(pending: Pending): boolean { return !this.draining && !!pending.run && !this.running.has(pending.run.id); }

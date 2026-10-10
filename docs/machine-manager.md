@@ -6,7 +6,7 @@ The claim service uses SQLite on its own local disk. It grants a ticket and the 
 
 ## Scheduling
 
-Each manager configuration lists projects in priority order. It considers runnable locally claimed tickets first, oldest claim first. It then considers unclaimed tickets in project order. Within that ordering it uses the dispatcher's ticket priority labels and stage order. Running work is never pre-empted. A blocked or errored ticket stays owned but is absent from eligible offers, so other work can proceed. Strict project priority can starve a lower project if higher projects always have eligible work.
+Each manager configuration lists projects in priority order. Recovery assessments and tickets labelled `orchestrator:fixing` take precedence over ordinary work, regardless of board priority, ticket priority or claim age. Within each group it considers runnable locally claimed tickets first, oldest claim first. It then considers unclaimed tickets in project order. Within that ordering it uses the dispatcher's ticket priority labels and stage order. Running work is never pre-empted. A blocked or errored ticket stays owned but is absent from eligible offers, so other work can proceed. Strict project priority can starve a lower project if higher projects always have eligible work.
 
 A dispatcher can explicitly cancel a reservation it never started, for example after a board stage changes. That cancellation releases a new ticket claim only if no actual or uncertain run has used that ownership generation. Completed, failed and blocked work keeps its claim. Offline reservations still require manual release. A cancelled offer therefore cannot gain priority over work that is ready to run.
 
@@ -77,7 +77,7 @@ Set `PYRY_SHARED_GITHUB=1` in each managed dispatcher's environment. Its existin
 
 Identical in-flight reads across computers share one request. Successful reads are cached. Writes run in order and invalidate cached reads even when their result is uncertain. PR head and merge checks, ticket launch status, launch labels and blockers bypass the cache. A ticket-status check reads that ticket rather than the whole board.
 
-The service tracks REST and GraphQL allowances separately. Quota exhaustion holds upstream requests until reset. Service failure never falls back to each computer calling GitHub directly. Dispatchers retry quota and connection failures without stopping existing agent runs. Existing local verdict and done handoffs retain results for later publication. The service does not automatically replay uncertain mutations.
+The service tracks REST and GraphQL allowances separately. Quota exhaustion holds upstream requests until reset. Service failure never falls back to each computer calling GitHub directly. Dispatchers retry quota and connection failures without stopping existing agent runs. Managed REST and GraphQL responses with HTTP 5xx or 408 are converted to the same temporary-outage pause before response parsing. The polling loop retries automatically, including at startup. It checks again within a minute and honours shorter Retry-After delays. This does not replay uncertain comments or other mutations; interrupted agent publication can still need reconciliation or operator review. Existing local verdict and done handoffs retain results for later publication. The service does not automatically replay uncertain mutations.
 
 Keep the existing local Git authentication for clone, fetch and push. Managed agents must use `gh` for GitHub API operations so they use the shared connection. A separately launched script, watcher, `curl` command or MCP connector does not inherit this route automatically. Configure those callers explicitly before claiming that all automated traffic is centralised.
 
@@ -101,7 +101,7 @@ a new incident. Rework counts of two or more request an assessment, not a repair
 The owning computer offers an assessment as the `recovery` role. It uses normal
 admission and a heavy reservation. Only one assessment runs across the fleet at
 a time. Existing ownership, both capacity limits, project drains and full drains
-apply. An unreachable owner or uncertain reservation is never released by recovery.
+apply. Recovery assessments and their repair pipeline are scheduled before ordinary work across all local projects. Already reserved or running jobs are not interrupted. An unreachable owner or uncertain reservation is never released by recovery.
 An unclaimed ticket can be assessed only after normal admission claims it.
 
 The assessment uses the project's configured runner, with an optional `recovery`
@@ -126,6 +126,16 @@ The four possible decisions are:
   the repair and returns through the usual review and testing stages.
 - `escalate`: record the reason for operator intervention. No workflow state is
   changed.
+
+The issue receives `orchestrator:investigating` while its admitted assessment runs.
+A retry or code-repair handback receives `orchestrator:fixing`. That label remains
+through the repair pipeline and gives each subsequent stage recovery priority.
+It means an orchestrator repair is in progress, including waits between stages.
+It is removed when the ticket reaches Done, is held, encounters another error,
+or its assessment escalates. Investigation labels are removed when assessment
+ends. Owned, idle-ticket reconciliation removes stale labels after an interrupted
+run or failed cleanup. Existing ticket ownership is checked before each write.
+The two labels are created by GitHub on first use, like other workflow labels.
 
 The model only proposes a decision. The wrapper checks current open issue state
 before and after assessment, and validates the proposed handback. It cannot

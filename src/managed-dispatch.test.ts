@@ -32,7 +32,7 @@ test("ungranted offers follow updated ticket order without changing identity", (
 test("build agents default to medium and refinement to light, with explicit overrides", () => {
   const env = { PYRY_MANAGER_URL: "http://localhost:1", PYRY_MANAGER_TOKEN: "test" };
   const managed = new ManagedDispatch("org/core", env);
-  const item = { issueNumber: 1 } as any;
+  const item = { issueNumber: 1, labels: [] } as any;
   for (const [name, resource] of [["builder", "medium"], ["developer", "medium"], ["refiner", "light"], ["po", "light"], ["verifier", "heavy"], ["documentation", "light"], ["unknown", "heavy"]]) {
     assert.equal(managed.agentOffer({ name } as any, item, 0).offer.resource, resource, name);
   }
@@ -44,8 +44,21 @@ test("build agents default to medium and refinement to light, with explicit over
 
 test("documentation is light but retains its board-wide serial restriction", () => {
   const managed = new ManagedDispatch("org/core", { PYRY_MANAGER_URL: "http://localhost:1", PYRY_MANAGER_TOKEN: "test" });
-  const offer = managed.agentOffer({ name: "documentation", serial: true } as any, { issueNumber: 42 } as any, 0).offer;
+  const offer = managed.agentOffer({ name: "documentation", serial: true } as any, { issueNumber: 42, labels: [] } as any, 0).offer;
   assert.equal(offer.resource, "light");
   assert.equal(offer.roleLimit, 1);
   assert.deepEqual(offer.locks, ["org/core:role:documentation"]);
+});
+
+
+test("repair priority follows labels across builder, verification and live-gate offers", () => {
+  const managed = new ManagedDispatch("org/core", {PYRY_MANAGER_URL: "http://localhost:1", PYRY_MANAGER_TOKEN: "test"});
+  const ticket = {issueNumber: 1, labels: ["orchestrator:fixing"]} as any;
+  managed.setRecoveryTickets([ticket]);
+  const gate = managed.offer(1, "real-claude-gate", "heavy");
+  assert.equal(gate.offer.recovery, true);
+  assert.equal(managed.agentOffer({name: "builder"} as any, ticket, 10).offer.recovery, true);
+  assert.equal(managed.agentOffer({name: "verifier"} as any, ticket, 10).offer.recovery, true);
+  managed.setRecoveryTickets([{...ticket, labels: []}]);
+  assert.equal(gate.offer.recovery, false);
 });
