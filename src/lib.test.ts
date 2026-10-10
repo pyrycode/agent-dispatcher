@@ -25,9 +25,17 @@ import {
   STDERR_TAIL_CAP,
   stderrForMessage,
   withoutStderrSection,
+  AgentRunFailedError,
   AgentRunStoppedError,
+  AGENT_OUTPUT_ENTRIES,
+  advanceClaudeAgentOutput,
+  advanceCodexAgentOutput,
+  agentOutputForMessage,
+  agentOutputOf,
+  appendAgentOutput,
   canSalvagePartialWork,
   decidePartialWorkSalvage,
+  runFailureKind,
   runStopKind,
   advanceIdleWatchdogState,
   advancePermissionDenialState,
@@ -130,7 +138,7 @@ import { buildBaselineCommand, buildBaselineFilter, formatGateEvidenceComment, p
 import { mapParentChain } from "./github.js";
 import {
   decideBranchSetup,
-  decideCodegraphSymlink,
+  decideCodegraphIndexCopy,
   decideOwnWorktreeReuse,
   describeHeldWorktrees,
   findWorktreesForBranch,
@@ -3948,50 +3956,54 @@ describe("shouldFlagEmptyBranch", () => {
   });
 });
 
-describe("decideCodegraphSymlink", () => {
-  // Worktrees don't share `.codegraph/` with the canonical repo (it's
-  // gitignored, lives outside `.git/`, and `git worktree add` doesn't
-  // copy untracked dirs). Without a symlink, agents spawned in the
-  // worktree see an empty index and silently fall through to grep.
-  // Soft-fail on missing source — warn the operator but proceed; agents
-  // can still run, they just lose codegraph's value for that ticket.
+describe("decideCodegraphIndexCopy", () => {
+  // Worktrees don't get `.codegraph/` from `git worktree add` (it's
+  // gitignored). Each gets a private copy of the canonical index: a codegraph
+  // 1.x server writes the files it serves into the index it opened, so a
+  // shared index through a symlink took one ticket's branch into every other
+  // worktree's view. Soft-fail on a missing source.
 
-  test("source index exists, no destination yet → symlink (ready)", () => {
+  test("source index exists, no destination yet → copy (ready)", () => {
     assert.deepEqual(
-      decideCodegraphSymlink({ sourceExists: true, destExists: false }),
-      { action: "symlink", reason: "ready" },
+      decideCodegraphIndexCopy({ sourceExists: true, destExists: false, destIsSymlink: false }),
+      { action: "copy", reason: "ready" },
     );
   });
 
-  test("source exists AND destination exists → skip (already-present)", () => {
-    // Idempotency: a re-prep of an existing worktree shouldn't churn the
-    // symlink. Existing dst could be the previous run's symlink or a
-    // real dir an operator dropped in; either way, leave it alone.
+  test("worktree already has its own index → skip (already-present)", () => {
+    // A reused worktree keeps its index; its server catches it up at start.
     assert.deepEqual(
-      decideCodegraphSymlink({ sourceExists: true, destExists: true }),
+      decideCodegraphIndexCopy({ sourceExists: true, destExists: true, destIsSymlink: false }),
       { action: "skip", reason: "already-present" },
     );
   });
 
-  test("source missing → skip (no-source) — caller warns operator", () => {
-    // Index hasn't been bootstrapped in the canonical repo. The
-    // dispatcher should warn (so the operator runs `codegraph init -i`)
-    // but proceed — agents fall through to grep, which is what they
-    // did before codegraph existed.
+  test("legacy symlink from an older dispatcher → replace it with a copy", () => {
+    // destExists is true through the link; the link still has to go, or a
+    // reused worktree's server writes its branch into the shared index.
     assert.deepEqual(
-      decideCodegraphSymlink({ sourceExists: false, destExists: false }),
+      decideCodegraphIndexCopy({ sourceExists: true, destExists: true, destIsSymlink: true }),
+      { action: "replace-symlink", reason: "legacy-symlink" },
+    );
+  });
+
+  test("legacy symlink but no source → skip (no-source), caller warns", () => {
+    assert.deepEqual(
+      decideCodegraphIndexCopy({ sourceExists: false, destExists: false, destIsSymlink: true }),
       { action: "skip", reason: "no-source" },
     );
   });
 
-  test("source missing but destination present → skip (already-present, don't warn)", () => {
-    // Edge case: previous run linked successfully, then someone moved
-    // the canonical index away. Leave the dst alone (it's a stale
-    // symlink, but cleaning it up isn't this function's job) and
-    // don't warn (the present dst hides the staleness from the agent
-    // — that's a separate problem class).
+  test("source missing → skip (no-source), caller warns operator", () => {
     assert.deepEqual(
-      decideCodegraphSymlink({ sourceExists: false, destExists: true }),
+      decideCodegraphIndexCopy({ sourceExists: false, destExists: false, destIsSymlink: false }),
+      { action: "skip", reason: "no-source" },
+    );
+  });
+
+  test("source missing but worktree has its own index → skip (already-present, don't warn)", () => {
+    assert.deepEqual(
+      decideCodegraphIndexCopy({ sourceExists: false, destExists: true, destIsSymlink: false }),
       { action: "skip", reason: "already-present" },
     );
   });
@@ -6501,9 +6513,29 @@ describe("partial-work salvage decisions (mobile #1430, #1332)", () => {
     assert.equal(canSalvagePartialWork({ ...base, issueNumber: 0, agent: dev }), false);
   });
 
-  const ok = { openPrCount: 1, gitStatusOutput: " M a.md\n", commitsAheadOfOrigin: 0, mergeInProgress: false, mergeCheckProblems: [] as string[] };
+  test("runFailureKind: a dispatcher stop keeps its kind; any other failure of the run is an error (#18)", () => {
+    assert.equal(runFailureKind(new AgentRunStoppedError("Agent timed out after 2280s", "timeout"), null), "timeout");
+    assert.equal(runFailureKind(new Error("Agent error (idle_stall)"), result({ terminalReason: "idle_stall" })), "idle_stall");
+    // pyrycode-mobile #1340: the CLI died with no result frame.
+    assert.equal(runFailureKind(new AgentRunFailedError("Claude CLI exited with code 1, no result message received"), null), "error");
+    assert.equal(runFailureKind(new Error("spawn ENOENT"), null), "error");
+    assert.equal(runFailureKind(new Error("x"), result({ terminalReason: "max_turns" })), "error", "a turn budget the draft-PR salvage could not save");
+    assert.equal(runFailureKind(new Error("x"), result({ terminalReason: "codex_error" })), "error");
+    assert.equal(runFailureKind(new Error("x"), result({ terminalReason: "api_error" })), "error");
+  });
 
-  test("decidePartialWorkSalvage: PR + dirty tree, or PR + local commits → salvage", () => {
+  test("runFailureKind: policy stops, a spawn that never ran and a finished run are never salvaged", () => {
+    assert.equal(runFailureKind(new Error("x"), result({ hadPermissionDenial: true })), null, "a denial is a policy stop");
+    for (const reason of ["codex_blocked", "needs_refinement", "waiting_on_blocker"]) {
+      assert.equal(runFailureKind(new Error("x"), result({ terminalReason: reason })), null, reason);
+    }
+    assert.equal(runFailureKind(new ResourceExhaustedError("EAGAIN", 3), null), null, "the agent never started");
+    assert.equal(runFailureKind(new Error("addLabel failed"), result({ isError: false })), null, "the post-run step threw after a success");
+  });
+
+  const ok = { gitStatusOutput: " M a.md\n", commitsAheadOfOrigin: 0, mergeInProgress: false, mergeCheckProblems: [] as string[] };
+
+  test("decidePartialWorkSalvage: dirty tree, or local commits → salvage, with or without a PR", () => {
     assert.deepEqual(decidePartialWorkSalvage(ok), { salvage: true });
     assert.deepEqual(decidePartialWorkSalvage({ ...ok, gitStatusOutput: "", commitsAheadOfOrigin: 2 }), { salvage: true });
   });
@@ -6514,12 +6546,78 @@ describe("partial-work salvage decisions (mobile #1430, #1332)", () => {
       assert.equal(d.salvage, false);
       assert.match((d as { reason: string }).reason, why);
     };
-    refused({ openPrCount: 0 }, /no open pull request/);
-    refused({ openPrCount: -1 }, /could not look up/);
     refused({ mergeInProgress: true }, /MERGE_HEAD/);
     refused({ mergeCheckProblems: ["`a.kt` still has conflict markers."] }, /conflict markers/);
     refused({ gitStatusOutput: "", commitsAheadOfOrigin: 0 }, /nothing to save/);
     refused({ gitStatusOutput: "  \n", commitsAheadOfOrigin: -1 }, /nothing to save/);
+  });
+});
+
+describe("agent output tail for the error comment (agent-dispatcher #16, #18)", () => {
+  const assistant = (...content: unknown[]) => ({ type: "assistant", message: { content } });
+
+  test("Claude: text blocks and one line per tool call, newest last; tool results and thinking are not kept", () => {
+    let out: readonly string[] = [];
+    out = advanceClaudeAgentOutput(out, { type: "system", subtype: "init", session_id: "s" });
+    out = advanceClaudeAgentOutput(out, assistant({ type: "thinking", thinking: "plan" }, { type: "text", text: "Running the full check now." }));
+    out = advanceClaudeAgentOutput(out, assistant({ type: "tool_use", id: "t1", name: "Bash", input: { command: "./gradlew   check\n--info" } }));
+    out = advanceClaudeAgentOutput(out, { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t1", content: "BUILD FAILED" }] } });
+    out = advanceClaudeAgentOutput(out, assistant({ type: "tool_use", id: "t2", name: "Edit", input: { file_path: "app/src/A.kt", old_string: "a", new_string: "b" } }));
+    out = advanceClaudeAgentOutput(out, assistant({ type: "tool_use", id: "t3", name: "Grep", input: { pattern: "foo" } }));
+    assert.deepEqual(out, [
+      "Running the full check now.",
+      "[Bash] ./gradlew check --info",
+      "[Edit] app/src/A.kt",
+      `[Grep] {"pattern":"foo"}`,
+    ]);
+  });
+
+  test("Codex: agent messages, and each command, MCP call and file change as it starts", () => {
+    let out: readonly string[] = [];
+    out = advanceCodexAgentOutput(out, { type: "thread.started", thread_id: "th" });
+    out = advanceCodexAgentOutput(out, { type: "item.completed", item: { id: "m1", type: "agent_message", text: "Checking the gate." } });
+    out = advanceCodexAgentOutput(out, { type: "item.started", item: { id: "c1", type: "command_execution", command: "/bin/zsh -lc './gradlew check'", status: "in_progress" } });
+    out = advanceCodexAgentOutput(out, { type: "item.completed", item: { id: "c1", type: "command_execution", command: "/bin/zsh -lc './gradlew check'", aggregated_output: "BUILD FAILED", status: "completed" } });
+    out = advanceCodexAgentOutput(out, { type: "item.started", item: { id: "p1", type: "mcp_tool_call", server: "figma", tool: "get_screenshot", status: "in_progress" } });
+    out = advanceCodexAgentOutput(out, { type: "item.completed", item: { id: "f1", type: "file_change", changes: [{ path: "a.kt", kind: "update" }, { path: "b.kt", kind: "add" }] } });
+    out = advanceCodexAgentOutput(out, { type: "item.completed", item: { id: "r1", type: "reasoning", text: "hidden" } });
+    assert.deepEqual(out, [
+      "Checking the gate.",
+      "[shell] /bin/zsh -lc './gradlew check'",
+      "[figma.get_screenshot]",
+      "[edit] a.kt, b.kt",
+    ]);
+  });
+
+  test("keeps only the last entries, and a long tool line is cut", () => {
+    let out: readonly string[] = [];
+    for (let i = 0; i < AGENT_OUTPUT_ENTRIES + 5; i++) out = appendAgentOutput(out, `message ${i}`);
+    assert.equal(out.length, AGENT_OUTPUT_ENTRIES);
+    assert.equal(out.at(-1), `message ${AGENT_OUTPUT_ENTRIES + 4}`);
+    assert.equal(appendAgentOutput(out, "   \n"), out, "a blank entry is dropped");
+    const long = advanceClaudeAgentOutput([], assistant({ type: "tool_use", name: "Bash", input: { command: "x".repeat(500) } }));
+    assert.ok(long[0]!.length <= 201 && long[0]!.endsWith("…"));
+  });
+
+  test("the message is scrubbed, capped to its tail and cannot close the comment's code block", () => {
+    const key = "sk-ant-api03-" + "k".repeat(48);
+    const fence = "`".repeat(3);
+    const entries = ["x".repeat(3000), `export KEY=${key}`, `${fence}kotlin\nfun a() {}\n${fence}`];
+    const text = agentOutputForMessage(entries);
+    assert.ok(text.length <= 2000);
+    assert.ok(!text.includes(key), "no credential reaches GitHub");
+    assert.ok(!text.includes(fence));
+    assert.ok(text.endsWith("fun a() {}\n'''"), "newest last");
+    assert.equal(agentOutputForMessage([]), "");
+  });
+
+  test("agentOutputOf: the result's tail first, else the tail the rejection carried", () => {
+    const err = new AgentRunStoppedError("Agent timed out after 2280s", "timeout", "Now updating the catalog.");
+    assert.equal(agentOutputOf(err, null), "Now updating the catalog.");
+    assert.equal(agentOutputOf(new Error("x"), { agentOutputTail: "from the result" }), "from the result");
+    assert.equal(agentOutputOf(err, { agentOutputTail: "" }), "Now updating the catalog.");
+    assert.equal(agentOutputOf(new Error("plain"), null), "");
+    assert.ok(err instanceof AgentRunFailedError && err instanceof Error, "existing instanceof checks still hold");
   });
 });
 

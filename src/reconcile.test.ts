@@ -19,8 +19,12 @@ import {
   runRealClaudeGate,
   runRealClaudeGateExecution,
   runReworkRouting,
+  STALE_BASE_REFRESH_MARKER,
+  STALE_BASE_REFRESH_MAX,
   type ReconcileClient,
+  type StaleBaseRefresh,
 } from "./reconcile.js";
+import { readFileSync } from "node:fs";
 import type { GateRunReport, GateTally } from "./gate-output.js";
 import type { ProjectItem } from "./types.js";
 import { resetActiveStageSetForTests } from "./stage-sets.js";
@@ -1585,6 +1589,229 @@ describe("real-claude gate — a branch that conflicts with main goes to its cod
       assert.equal(item.status, "Inbox");
       assert.ok(item.labels.includes("error:real-claude-gate"));
       assert.ok(!item.labels.includes("merge-handoff"));
+    });
+  });
+});
+
+describe("runReworkRouting: a builder parked on a blocker counts no rework (2026-10-07)", () => {
+  test("desktop #1738: stays in In Development at rework-count:1, trigger stripped, no second comment", async () => {
+    await withStageSet("builder", async () => {
+      const item = makeItem({
+        id: "item-1738",
+        issueNumber: 1738,
+        status: "In Development",
+        labels: ["enhancement", "family-dispatches:8", "needs-rework:builder", "rework-count:1"],
+        blockedBy: [{ number: 1796, state: "OPEN" }],
+      });
+      const client = new MockClient([item]);
+
+      await runReworkRouting(client, { readPrVerdicts: async () => { throw new Error("verdicts are not read for a wait"); } });
+
+      assert.deepEqual(client.updateItemStatusCalls, []);
+      assert.deepEqual(client.removeLabelCalls, [{ issueNumber: 1738, label: "needs-rework:builder" }]);
+      assert.deepEqual(client.addLabelCalls, [], "no rework-count:2, no error:rework-loop");
+      assert.deepEqual(client.addCommentCalls, [], "the builder's own 'Waiting on #1796' comment already says it");
+      assert.deepEqual(item.labels, ["enhancement", "family-dispatches:8", "rework-count:1"]);
+    });
+  });
+
+  test("desktop #1766: the first builder run's wait leaves it with no rework count at all", async () => {
+    await withStageSet("builder", async () => {
+      const item = makeItem({
+        id: "item-1766",
+        issueNumber: 1766,
+        status: "In Development",
+        labels: ["security-sensitive", "needs-real-claude", "done:refiner", "family-dispatches:2", "needs-rework:builder"],
+        blockedBy: [{ number: 1785, state: "OPEN" }],
+      });
+      const client = new MockClient([item]);
+
+      await runReworkRouting(client);
+
+      assert.deepEqual(client.addLabelCalls, [], "no rework-count:1");
+      assert.deepEqual(item.labels, ["security-sensitive", "needs-real-claude", "family-dispatches:2"]);
+      assert.ok(!item.labels.some(l => l.startsWith("rework-count:")));
+    });
+  });
+
+  test("a builder wait at the hard cap does not park", async () => {
+    await withStageSet("builder", async () => {
+      const item = makeItem({
+        id: "item-1723",
+        issueNumber: 1723,
+        status: "In Development",
+        labels: ["needs-rework:builder", "rework-count:6"],
+        blockedBy: [{ number: 1766, state: "OPEN" }],
+      });
+      const client = new MockClient([item]);
+
+      await runReworkRouting(client);
+
+      assert.ok(!item.labels.includes("error:rework-loop"));
+      assert.deepEqual(item.labels, ["rework-count:6"]);
+    });
+  });
+});
+
+describe("runReworkRouting: a stale base FAIL costs no builder round (merge race, 2026-10-07)", () => {
+  const fixture = JSON.parse(readFileSync(new URL("./fixtures/desktop-stale-base-verdicts.json", import.meta.url), "utf8")) as {
+    tickets: Record<string, { comments: Array<{ createdAt: string; body: string }> }>;
+  };
+  const prJson = (ticket: number, upTo?: string) => JSON.stringify({
+    reviews: [],
+    comments: fixture.tickets[String(ticket)].comments.filter(c => upTo === undefined || c.createdAt <= upTo),
+  });
+  const merged: StaleBaseRefresh = { kind: "merged", mainSha: "e94bf2a5aadc057e21828e1ea4ccf7e0e0ff4fc4", headSha: "362f24a647561f7e6071b3a9904d6c3702205a8f" };
+
+  /** #1825 at 00:22:27 UTC, the cycle that parked it with error:rework-loop. */
+  function ticket1825(): ProjectItem {
+    return makeItem({
+      id: "item-1825",
+      issueNumber: 1825,
+      status: "In Code Review",
+      labels: ["done:builder", "enhancement", "needs-rework:builder", "rework-count:1", "security-sensitive"],
+    });
+  }
+
+  test("desktop #1825: main is merged by the dispatcher, the ticket stays for the verifier, uncounted and unparked", async () => {
+    await withStageSet("builder", async () => {
+      const item = ticket1825();
+      const client = new MockClient([item]);
+      const refreshed: number[] = [];
+
+      await runReworkRouting(client, {
+        readPrVerdicts: async () => prJson(1825),
+        refreshStaleBase: async (n) => { refreshed.push(n); return merged; },
+      });
+
+      assert.deepEqual(refreshed, [1825]);
+      assert.deepEqual(client.updateItemStatusCalls, [], "stays in In Code Review");
+      assert.deepEqual(client.addLabelCalls, [], "no rework-count:2 and no error:rework-loop");
+      assert.deepEqual(item.labels, ["done:builder", "enhancement", "rework-count:1", "security-sensitive"]);
+      const comment = client.addCommentCalls.at(-1)?.body ?? "";
+      assert.ok(comment.includes(STALE_BASE_REFRESH_MARKER));
+      assert.match(comment, /Stale base settled by the dispatcher/);
+      assert.match(comment, /e94bf2a5aadc/);
+      assert.doesNotMatch(comment, /Rework loop detected/);
+      assert.equal(client.clearItemsCacheCalls, 1);
+    });
+  });
+
+  test("desktop #1825 on a dispatcher without the refresh: no false park, an ordinary counted rework", async () => {
+    await withStageSet("builder", async () => {
+      const item = ticket1825();
+      const client = new MockClient([item]);
+
+      await runReworkRouting(client, { readPrVerdicts: async () => prJson(1825) });
+
+      assert.ok(!item.labels.includes("error:rework-loop"), "the branch finding is not a repeat");
+      assert.equal(item.status, "In Development");
+      assert.ok(item.labels.includes("rework-count:2"));
+    });
+  });
+
+  test("desktop #1818 at rework-count:2: its stale base FAIL after a real one is settled too", async () => {
+    await withStageSet("builder", async () => {
+      const item = makeItem({
+        id: "item-1818",
+        issueNumber: 1818,
+        status: "In Code Review",
+        labels: ["done:builder", "enhancement", "needs-real-claude", "needs-rework:builder", "rework-count:2", "security-sensitive"],
+      });
+      const client = new MockClient([item]);
+
+      await runReworkRouting(client, { readPrVerdicts: async () => prJson(1818), refreshStaleBase: async () => merged });
+
+      assert.equal(item.status, "In Code Review");
+      assert.ok(item.labels.includes("rework-count:2"), "still 2, not 3");
+      assert.ok(!item.labels.includes("needs-rework:builder"));
+    });
+  });
+
+  test("a branch that already contains main is settled without a merge", async () => {
+    await withStageSet("builder", async () => {
+      const item = ticket1825();
+      const client = new MockClient([item]);
+      await runReworkRouting(client, {
+        readPrVerdicts: async () => prJson(1825),
+        refreshStaleBase: async () => ({ kind: "current", mainSha: merged.mainSha, headSha: merged.headSha }),
+      });
+      assert.equal(item.status, "In Code Review");
+      assert.match(client.addCommentCalls.at(-1)?.body ?? "", /already contains current `main`/);
+      assert.deepEqual(client.addLabelCalls, []);
+    });
+  });
+
+  test("main that conflicts goes to the builder as a merge handoff: moved, labels stripped, nothing counted", async () => {
+    await withStageSet("builder", async () => {
+      const item = ticket1825();
+      const client = new MockClient([item]);
+      await runReworkRouting(client, {
+        readPrVerdicts: async () => prJson(1825),
+        refreshStaleBase: async () => ({ kind: "conflict", paths: ["src/renderer/src/store/conversationListStore.ts"] }),
+      });
+      assert.equal(item.status, "In Development");
+      assert.deepEqual(item.labels, ["enhancement", "rework-count:1", "security-sensitive"], "trigger and done:builder stripped, count untouched");
+      assert.deepEqual(client.addLabelCalls, []);
+      const comment = client.addCommentCalls.at(-1)?.body ?? "";
+      assert.match(comment, /merge conflict sent to the code owner/);
+      assert.ok(comment.includes("conversationListStore.ts"));
+      assert.ok(comment.includes(STALE_BASE_REFRESH_MARKER), "a handoff counts toward the cap");
+    });
+  });
+
+  test("a refresh that fails routes the FAIL as an ordinary rework", async () => {
+    await withStageSet("builder", async () => {
+      const item = ticket1825();
+      const client = new MockClient([item]);
+      await runReworkRouting(client, {
+        readPrVerdicts: async () => prJson(1825),
+        refreshStaleBase: async () => ({ kind: "failed", reason: "git fetch origin failed" }),
+      });
+      assert.equal(item.status, "In Development");
+      assert.ok(item.labels.includes("rework-count:2"));
+      assert.ok(!item.labels.includes("error:rework-loop"));
+    });
+  });
+
+  test(`after ${STALE_BASE_REFRESH_MAX} settlements the next stale base FAIL is an ordinary rework`, async () => {
+    await withStageSet("builder", async () => {
+      const item = ticket1825();
+      const client = new MockClient([item]);
+      client.priorMarkerComments.set(1825, STALE_BASE_REFRESH_MAX);
+      let refreshed = 0;
+      await runReworkRouting(client, { readPrVerdicts: async () => prJson(1825), refreshStaleBase: async () => { refreshed++; return merged; } });
+      assert.equal(refreshed, 0);
+      assert.equal(item.status, "In Development");
+      assert.ok(item.labels.includes("rework-count:2"));
+    });
+  });
+
+  test("a stale base FAIL at the hard cap is settled, not parked", async () => {
+    await withStageSet("builder", async () => {
+      const item = ticket1825();
+      item.labels = item.labels.map(l => (l === "rework-count:1" ? "rework-count:6" : l));
+      const client = new MockClient([item]);
+      await runReworkRouting(client, { readPrVerdicts: async () => prJson(1825), refreshStaleBase: async () => merged });
+      assert.ok(!item.labels.includes("error:rework-loop"));
+      assert.equal(item.status, "In Code Review");
+    });
+  });
+
+  test("desktop #1731: a stale base beside a real defect still goes to the builder, counted", async () => {
+    await withStageSet("builder", async () => {
+      const item = makeItem({
+        id: "item-1731",
+        issueNumber: 1731,
+        status: "In Code Review",
+        labels: ["done:builder", "needs-rework:builder", "rework-count:2"],
+      });
+      const client = new MockClient([item]);
+      let refreshed = 0;
+      await runReworkRouting(client, { readPrVerdicts: async () => prJson(1731), refreshStaleBase: async () => { refreshed++; return merged; } });
+      assert.equal(refreshed, 0);
+      assert.equal(item.status, "In Development");
+      assert.ok(item.labels.includes("rework-count:3"));
     });
   });
 });

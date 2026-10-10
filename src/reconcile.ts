@@ -46,6 +46,7 @@ import {
   decideUnroutableRework,
   extractReworkCount,
   extractReworkOtherCount,
+  extractReworkTarget,
   REWORK_OTHER_PREFIX,
   isRetryWaiting,
   REWORK_TARGET_ERROR_LABEL,
@@ -58,7 +59,7 @@ import {
   decideGateMergeRoute,
 } from "./merge-handoff.js";
 import { selectDispatches } from "./dispatch-selection.js";
-import { findRepeatedMustFix, parseVerdictArtifacts } from "./verdict-guard.js";
+import { findRepeatedMustFix, newestFailVerdict, parseVerdictArtifacts, staleBaseFindings, type VerdictArtifact } from "./verdict-guard.js";
 import { formatGateEvidenceComment, gateRunFloor, type GateRunReport } from "./gate-output.js";
 import type { FlakyRunContext, FlakyTicketResult } from "./flaky-tickets.js";
 import type { InheritedTicketResult } from "./inherited-tickets.js";
@@ -227,7 +228,35 @@ export interface ReworkRoutingOptions {
    *  request, null when it has none. Throws when it cannot be read. Absent,
    *  the repeat rule never fires and the count rule alone applies. */
   readPrVerdicts?: (issueNumber: number) => Promise<string | null>;
+  /** Merge current main into the ticket's branch and push it, for a FAIL
+   *  whose only blocking findings are a stale base. Supplied by dispatch.ts.
+   *  Absent, such a FAIL routes to the builder like any other. */
+  refreshStaleBase?: (issueNumber: number) => Promise<StaleBaseRefresh>;
 }
+
+/**
+ * What `ReworkRoutingOptions.refreshStaleBase` did. `merged` pushed a merge of
+ * main; `current` found the branch already contains current main; `conflict`
+ * merged nothing because main conflicts with the branch; `failed` could not
+ * tell, and the caller routes the FAIL as an ordinary rework.
+ */
+export type StaleBaseRefresh =
+  | { kind: "merged"; mainSha: string; headSha: string }
+  | { kind: "current"; mainSha: string; headSha: string }
+  | { kind: "conflict"; paths: string[] }
+  | { kind: "failed"; reason: string };
+
+/** Marker on every comment the stale base path posts; counted for the cap. */
+export const STALE_BASE_REFRESH_MARKER = "<!-- pyry-stale-base-refresh -->";
+
+/**
+ * How many times the dispatcher settles a stale base FAIL itself on one
+ * ticket before such a FAIL routes to the builder as an ordinary rework.
+ * Main moving under a review is rare once the dispatcher merges it again
+ * right before the gates, so a fourth stale base FAIL on one ticket means
+ * something else is wrong, and the rework cap is the backstop for that.
+ */
+export const STALE_BASE_REFRESH_MAX = 3;
 
 export async function runReworkRouting(
   client: ReconcileClient,
@@ -265,10 +294,12 @@ export async function runReworkRouting(
   // mutations the same way runAutoAdvance does — invalidate the cache
   // at the end if any state-changing operation happened.
   let mutated = false;
-  for (const route of routes) {
-    // A wait on open blockers: drop the trigger, leave the column and the
-    // counter alone, and skip the loop breaker since nothing was reworked.
-    // A failed strip posts nothing; the label is still there next pass.
+  for (let route of routes) {
+    // A wait on open blockers: drop the trigger (and, for a route back to
+    // the ticket's own column, the usual state labels), leave the column and
+    // the counter alone, and skip the loop breaker since nothing was
+    // reworked. A failed strip posts nothing; the label is still there next
+    // pass.
     if (route.waitingOn?.length) {
       const blockers = route.waitingOn.map(n => `#${n}`).join(", ");
       try {
@@ -278,16 +309,27 @@ export async function runReworkRouting(
         continue;
       }
       mutated = true;
-      try {
-        await client.addComment(
-          route.issueNumber,
-          `## ⏸️ Waiting on ${blockers}\n\n` +
-          `\`${route.triggerLabel}\` arrived with an open blocker, so this is a wait, not a rework. ` +
-          `The ticket stays in ${route.fromColumn} and is picked up again once ${blockers} ` +
-          `${route.waitingOn.length > 1 ? "close" : "closes"}. No refinement run, and the rework count is unchanged.`,
-        );
-      } catch (e) {
-        console.warn(`   ⚠️  Failed to post wait comment on #${route.issueNumber}: ${e}`);
+      for (const label of route.labelsToStrip) {
+        if (label === route.triggerLabel) continue;
+        try { await client.removeLabel(route.issueNumber, label); } catch {}
+      }
+      // A refinement bail gets a comment saying why it did not go to Backlog.
+      // A ticket parked in its own column on a blocker does not: the run
+      // that parked it already posted its own "Waiting on" comment, and a
+      // second one would only repeat it.
+      const parkedInOwnColumn = columnByAgent.get(extractReworkTarget(route.triggerLabel) ?? "") === route.fromColumn;
+      if (!parkedInOwnColumn) {
+        try {
+          await client.addComment(
+            route.issueNumber,
+            `## ⏸️ Waiting on ${blockers}\n\n` +
+            `\`${route.triggerLabel}\` arrived with an open blocker, so this is a wait, not a rework. ` +
+            `The ticket stays in ${route.fromColumn} and is picked up again once ${blockers} ` +
+            `${route.waitingOn.length > 1 ? "close" : "closes"}. No refinement run, and the rework count is unchanged.`,
+          );
+        } catch (e) {
+          console.warn(`   ⚠️  Failed to post wait comment on #${route.issueNumber}: ${e}`);
+        }
       }
       console.log(`   ⏸️  Wait: #${route.issueNumber} stays in ${route.fromColumn} until ${blockers} closes (${route.triggerLabel} dropped, no rework counted)`);
       continue;
@@ -298,7 +340,7 @@ export async function runReworkRouting(
     const srcItem = srcItems.find(it => it.id === route.itemId);
     const srcLabels = srcItem?.labels ?? [];
     const currentCount = extractReworkCount(srcLabels);
-    const counted = !route.mergeHandoff && route.triggerLabel === countedLabel;
+    let counted = !route.mergeHandoff && route.triggerLabel === countedLabel;
 
     // Circuit breaker on the code owner's reworks (see REWORK_LOOP_THRESHOLD
     // and decideReworkBreaker): a verifier finding repeated across the last
@@ -317,15 +359,39 @@ export async function runReworkRouting(
     // re-read every cycle too.
     if (counted && srcLabels.includes("error:rework-loop")) continue;
     let repeatedKeys: string[] = [];
+    let artifacts: VerdictArtifact[] | null = null;
     if (counted && verdictColumns.has(route.fromColumn) && options.readPrVerdicts) {
       // An unreadable or unparseable verdict is never a repeat: the count
       // rule decides alone.
       try {
         const json = await options.readPrVerdicts(route.issueNumber);
-        if (json !== null) repeatedKeys = findRepeatedMustFix(parseVerdictArtifacts(json));
+        if (json !== null) {
+          artifacts = parseVerdictArtifacts(json);
+          repeatedKeys = findRepeatedMustFix(artifacts);
+        }
       } catch (e: any) {
         console.warn(`   ⚠️  Could not read verdicts for #${route.issueNumber}; rework breaker uses the count alone: ${e?.message ?? e}`);
       }
+    }
+
+    // A FAIL whose only blocking finding is that the branch lacks current
+    // main costs no builder round: the dispatcher merges main itself and the
+    // verifier reviews again (see verdict-guard.ts, branch invariants).
+    // Before the breaker, because nothing was reworked and the count must
+    // neither rise nor park the ticket.
+    const newestFail = artifacts === null ? null : newestFailVerdict(artifacts);
+    if (counted && newestFail !== null && options.refreshStaleBase && staleBaseFindings(newestFail).staleBaseOnly) {
+      const settled = await settleStaleBase(client, route, options.refreshStaleBase);
+      if (settled === "settled") { mutated = true; continue; }
+      if (settled === "skip") continue;
+      if (settled === "merge-handoff") {
+        // Main conflicts with the branch: the code owner finishes the merge,
+        // exactly as a merge handoff. It moves, and counts nothing.
+        mutated = true;
+        route = { ...route, mergeHandoff: true };
+        counted = false;
+      }
+      // "rework": fall through and route it as an ordinary rework.
     }
     const breaker = decideReworkBreaker({ counted, reworkCount: currentCount, hardCap, repeatedKeys });
     if (breaker.park) {
@@ -434,6 +500,86 @@ export async function runReworkRouting(
   if (mutated) {
     client.clearItemsCache();
   }
+}
+
+/**
+ * Settle a FAIL whose only blocking findings are a stale base, without a
+ * builder round. Returns what the caller does with the route:
+ *
+ * - `settled`: main is merged (or already was), the trigger is stripped, and
+ *   the ticket stays in its column for the verifier to review again.
+ * - `merge-handoff`: main conflicts with the branch, so the route goes to the
+ *   code owner as a merge handoff, which counts nothing.
+ * - `skip`: the trigger could not be stripped after the merge; the next pass
+ *   finds the branch current and finishes it.
+ * - `rework`: the cap is spent, the earlier attempts cannot be counted, or the
+ *   merge could not be tried. The FAIL routes as an ordinary rework.
+ *
+ * Every attempt posts one comment with STALE_BASE_REFRESH_MARKER before the
+ * label change, so a failed write still counts toward the cap.
+ */
+async function settleStaleBase(
+  client: ReconcileClient,
+  route: { issueNumber: number; fromColumn: string; toColumn: string; triggerLabel: string },
+  refresh: (issueNumber: number) => Promise<StaleBaseRefresh>,
+): Promise<"settled" | "merge-handoff" | "skip" | "rework"> {
+  const n = route.issueNumber;
+  let prior: number;
+  try {
+    prior = await client.countMarkerComments(n, STALE_BASE_REFRESH_MARKER);
+  } catch (e: any) {
+    console.warn(`   ⚠️  Stale base on #${n}: could not count earlier refreshes, routing as a rework: ${e?.message ?? e}`);
+    return "rework";
+  }
+  if (prior >= STALE_BASE_REFRESH_MAX) {
+    console.log(`   🔀 Stale base on #${n}: already settled ${prior} times by the dispatcher, routing as a rework`);
+    return "rework";
+  }
+  let outcome: StaleBaseRefresh;
+  try {
+    outcome = await refresh(n);
+  } catch (e: any) {
+    outcome = { kind: "failed", reason: e?.message ?? String(e) };
+  }
+  if (outcome.kind === "failed") {
+    console.warn(`   ⚠️  Stale base on #${n}: could not merge main, routing as a rework: ${outcome.reason}`);
+    return "rework";
+  }
+  const attempt = `Attempt ${prior + 1} of ${STALE_BASE_REFRESH_MAX}.`;
+  if (outcome.kind === "conflict") {
+    const files = outcome.paths.length > 0 ? outcome.paths.map(p => `- \`${p}\``).join("\n") : "- (git did not name the files)";
+    try {
+      await client.addComment(n,
+        `## 🔀 Stale base: merge conflict sent to the code owner\n\n${STALE_BASE_REFRESH_MARKER}\n` +
+        `The verifier's only blocking finding was that the branch lacks current \`main\`. ` +
+        `Merging \`main\` into it conflicts in:\n\n${files}\n\n` +
+        `The ticket goes to ${route.toColumn} only to finish this merge. It does not count as a rework. ${attempt}`);
+    } catch (e) {
+      console.warn(`   ⚠️  Failed to post the stale base handoff comment on #${n}: ${e}`);
+    }
+    console.log(`   🔀 Stale base on #${n}: main conflicts with the branch, handing the merge to ${route.toColumn} (no rework counted)`);
+    return "merge-handoff";
+  }
+  const what = outcome.kind === "merged"
+    ? `The dispatcher merged \`main\` at \`${outcome.mainSha.slice(0, 12)}\` into the branch itself and pushed it as \`${outcome.headSha.slice(0, 12)}\`.`
+    : `The branch already contains current \`main\` (\`${outcome.mainSha.slice(0, 12)}\`) at \`${outcome.headSha.slice(0, 12)}\`, so there was nothing to merge.`;
+  try {
+    await client.addComment(n,
+      `## 🔀 Stale base settled by the dispatcher\n\n${STALE_BASE_REFRESH_MARKER}\n` +
+      `The verifier's only blocking finding was that the branch lacks current \`main\`. ${what} ` +
+      `No builder round is spent and the rework count is unchanged. The ticket stays in ${route.fromColumn}, ` +
+      `and the verifier reviews it again with the gates on the merged tree. ${attempt}`);
+  } catch (e) {
+    console.warn(`   ⚠️  Failed to post the stale base comment on #${n}: ${e}`);
+  }
+  try {
+    await client.removeLabel(n, route.triggerLabel);
+  } catch (e) {
+    console.warn(`   ⚠️  Stale base on #${n}: failed to strip ${route.triggerLabel}, retrying next pass: ${e}`);
+    return "skip";
+  }
+  console.log(`   🔀 Stale base on #${n}: ${outcome.kind === "merged" ? "merged main" : "main already merged"}, ${route.triggerLabel} dropped, verifier runs again (no rework counted)`);
+  return "settled";
 }
 
 // Real-claude gate, part one: park. A ticket whose acceptance needs a live run

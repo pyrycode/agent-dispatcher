@@ -490,6 +490,115 @@ function extractPlaywrightSkipReason(test: any): string {
   return "no reason recorded";
 }
 
+// --------- Per-test details, for the documentation agent's gate report ---------
+
+/** One test of a gate run, with what the runner reported about it. */
+export interface GateTestDetail {
+  /** The qualified name the tally uses for the same test. */
+  name: string;
+  /** `flaky`: failed, then passed on a retry inside the same run (Playwright). */
+  status: "passed" | "failed" | "flaky" | "skipped";
+  /** How many attempts the runner made, when it reports them (Playwright). */
+  attempts?: number;
+  /** Duration of the final attempt in milliseconds, when reported. */
+  durationMs?: number;
+  /** Distinct `daemon-revision` annotation values on the test (Playwright). */
+  daemonRevisions?: string[];
+  /** Why it skipped, for a skipped test. */
+  skipReason?: string;
+}
+
+/**
+ * Every test of a gate artifact with its status and, where the format reports
+ * them, attempts, duration and `daemon-revision` annotations. Null when the
+ * artifact is unreadable. Statuses agree with `parseGateOutput`: Playwright's
+ * `flaky` is a pass there and `flaky` here; Go counts leaves only.
+ */
+export function parseGateTestDetails(raw: string, format: GateOutputFormat): GateTestDetail[] | null {
+  if (format === "playwright-json") return playwrightTestDetails(raw);
+  const tally = parseGateOutput(raw, format);
+  if (tally.recognizedLines === 0) return null;
+  const elapsed = format === "go-json" ? goElapsedByName(raw) : new Map<string, number>();
+  const withTime = (name: string) => (elapsed.has(name) ? { durationMs: elapsed.get(name)! } : {});
+  const skipped = tally.skipReasons.map((entry) => {
+    // Go and JUnit names carry no ": ", so the first one ends the name.
+    const end = entry.indexOf(": ");
+    const name = end < 0 ? entry : entry.slice(0, end);
+    return { name, status: "skipped" as const, skipReason: end < 0 ? "no reason recorded" : entry.slice(end + 2), ...withTime(name) };
+  });
+  return [
+    ...tally.failedNames.map((name) => ({ name, status: "failed" as const, ...withTime(name) })),
+    ...tally.passedNames.map((name) => ({ name, status: "passed" as const, ...withTime(name) })),
+    ...skipped,
+  ];
+}
+
+/** `Elapsed` of each test's terminal `go test -json` event, in milliseconds,
+ *  keyed by the tally's qualified name. */
+function goElapsedByName(raw: string): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed === "" || trimmed[0] !== "{") continue;
+    let event: GoTestEvent & { Elapsed?: number };
+    try { event = JSON.parse(trimmed); } catch { continue; }
+    if (!event || typeof event.Test !== "string" || event.Test === "") continue;
+    if (event.Action !== "pass" && event.Action !== "fail" && event.Action !== "skip") continue;
+    if (typeof event.Elapsed !== "number" || !Number.isFinite(event.Elapsed)) continue;
+    const pkg = event.Package ?? "";
+    out.set(pkg === "" ? event.Test : `${pkg}.${event.Test}`, Math.round(event.Elapsed * 1000));
+  }
+  return out;
+}
+
+function playwrightTestDetails(raw: string): GateTestDetail[] | null {
+  const doc = parseLooseJsonDocument(raw);
+  if (doc === null || typeof doc !== "object" || !Array.isArray((doc as any).suites)) return null;
+  const out: GateTestDetail[] = [];
+  const revisionsOf = (annotations: unknown, into: Set<string>) => {
+    if (!Array.isArray(annotations)) return;
+    for (const a of annotations) {
+      if (a && a.type === "daemon-revision" && typeof a.description === "string" && a.description.trim() !== "") {
+        into.add(a.description.trim());
+      }
+    }
+  };
+  const walk = (suite: any, trail: string[]): void => {
+    if (!suite || typeof suite !== "object") return;
+    const title = typeof suite.title === "string" && suite.title !== "" ? suite.title : null;
+    const nextTrail = title ? [...trail, title] : trail;
+    for (const spec of Array.isArray(suite.specs) ? suite.specs : []) {
+      if (!spec || typeof spec !== "object") continue;
+      const name = [...nextTrail, typeof spec.title === "string" ? spec.title : "(unnamed)"].join(" › ");
+      for (const test of Array.isArray(spec.tests) ? spec.tests : []) {
+        if (!test || typeof test !== "object") continue;
+        const status = test.status === "expected" ? "passed"
+          : test.status === "unexpected" ? "failed"
+          : test.status === "flaky" ? "flaky"
+          : test.status === "skipped" ? "skipped"
+          : null;
+        if (status === null) continue; // same rule as the tally: an unknown outcome is not reported
+        const results = Array.isArray(test.results) ? test.results : [];
+        const last = results[results.length - 1];
+        const revisions = new Set<string>();
+        revisionsOf(test.annotations, revisions);
+        for (const r of results) revisionsOf(r?.annotations, revisions);
+        out.push({
+          name,
+          status,
+          ...(status !== "skipped" && results.length > 0 ? { attempts: results.length } : {}),
+          ...(status !== "skipped" && typeof last?.duration === "number" ? { durationMs: Math.round(last.duration) } : {}),
+          ...(revisions.size > 0 ? { daemonRevisions: [...revisions] } : {}),
+          ...(status === "skipped" ? { skipReason: extractPlaywrightSkipReason(test) } : {}),
+        });
+      }
+    }
+    for (const child of Array.isArray(suite.suites) ? suite.suites : []) walk(child, nextTrail);
+  };
+  for (const suite of (doc as any).suites) walk(suite, []);
+  return out;
+}
+
 // --------- Baseline re-run filter ---------
 
 /**

@@ -6,11 +6,11 @@ import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { config } from "dotenv";
 import { DispatchPool, excludeInFlight, freeSeats, launchCandidates, liveGateRunnerFor, mayStartMainSweep, resolvePollIntervalMs } from "./dispatch-pool.js";
-import { countVerdictsSince, parseVerdictArtifacts, pickVerdictPr, shouldFlagMissingVerdict } from "./verdict-guard.js";
+import { countVerdictsSince, isStaleBaseFinding, parseVerdictArtifacts, pickVerdictPr, shouldFlagMissingVerdict } from "./verdict-guard.js";
 import { countOpenPrs, shouldFlagMissingPr } from "./pr-guard.js";
 import { PENDING_VERDICT_PREFIX, REREVIEW_PATCH_CAP, decideVerdictRecovery, extractVerdictFindings, reworkFindingsNote, handoffMarker, isVerdictPublishFailure, parseLastVerdict, parsePendingVerdictState, parsePrVerdictView, parseVerdictHandoff, reReviewNote, serializeLastVerdict, serializePendingVerdictState, verdictHandoffNote, type HandoffParse, type PendingVerdictState, type VerdictHandoff, type VerdictPrLookup } from "./verdict-handoff.js";
 import { resolveImportOnlyMerge } from "./merge-resolve.js";
-import { gateReportSection } from "./gate-report.js";
+import { gateReportSection, gateRunMetaPath, serializeGateRunMeta } from "./gate-report.js";
 import { FINAL_MERGE_HANDOFF_MARKER, FINAL_MERGE_HANDOFF_MAX, MERGE_HANDOFF_LABEL, checkMergeResolution, decideConflictRoute, decideFinalMergeRoute, findMergeCommit, mergeHandoffNote, mergeResolutionComment, mergeResolutionSection, readPendingMerge, type PendingMerge, type ResolutionNote } from "./merge-handoff.js";
 
 import {
@@ -47,11 +47,18 @@ import {
   parseIdleTimeoutMs,
   shouldFireIdleWatchdog,
   IDLE_STALL_REASON,
+  AgentRunFailedError,
   AgentRunStoppedError,
+  advanceClaudeAgentOutput,
+  advanceCodexAgentOutput,
+  agentOutputForMessage,
+  agentOutputOf,
   canSalvagePartialWork,
+  codeBlockTail,
   decidePartialWorkSalvage,
-  runStopKind,
-  type RunStopKind,
+  runFailureKind,
+  type RunFailureKind,
+  AGENT_OUTPUT_MESSAGE_CHARS,
   appendStderrTail,
   noResultErrorMessage,
   scrubCredentials,
@@ -106,8 +113,10 @@ import {
   parseVerifierGatePass,
   verifierGatePassFileName,
   verifierGateReuseEnabled,
+  VERIFIER_GATE_REUSE_MAX_AGE_MS,
   type VerifierGatePass,
 } from "./verifier-gate-reuse.js";
+import { outOfTimeComment, ReviewBudgetExhaustedError, reviewBudgetStop, type ReviewProgress } from "./verifier-out-of-time.js";
 import {
   attributableFailures,
   buildBaselineRecordComment,
@@ -170,7 +179,7 @@ import {
 import {
   type BranchSetupAction,
   decideBranchSetup,
-  decideCodegraphSymlink,
+  decideCodegraphIndexCopy,
   decideOwnWorktreeReuse,
   describeHeldWorktrees,
   findWorktreesForBranch,
@@ -184,6 +193,7 @@ import {
   shouldAutoCommit,
   shouldPushPreRunMerge,
 } from "./worktree.js";
+import { copyCodegraphIndex, isSymlinkPath } from "./codegraph-index.js";
 import {
   runAutoAdvance,
   runRealClaudeGate,
@@ -191,6 +201,7 @@ import {
   runReworkRouting,
   type ReworkRoutingOptions,
   type RealClaudeGateRunner,
+  type StaleBaseRefresh,
 } from "./reconcile.js";
 import {
   BASELINE_TESTS_PLACEHOLDER,
@@ -459,6 +470,11 @@ const REWORK_ROUTING_OPTIONS: ReworkRoutingOptions = {
     if (pr === null) return null;
     return execSync(`gh pr view ${pr} --json reviews,comments`, { cwd: repoRoot, encoding: "utf-8", timeout: 15_000 });
   },
+  refreshStaleBase: async (issueNumber) => {
+    const outcome = refreshStaleBaseBranch({ issueNumber });
+    if (outcome.kind === "merged" || outcome.kind === "current") answerStaleBaseFindings(issueNumber, outcome);
+    return outcome;
+  },
 };
 
 /**
@@ -605,6 +621,11 @@ export interface StreamResult {
    *  Captures the agent's intent for the diagnostic comment. Null when
    *  no text was emitted (rare). */
   lastAssistantText: string | null;
+  /** The agent's own last messages and tool calls, newest last, scrubbed
+   *  and ready for a code block (`agentOutputForMessage`). Shown in the
+   *  error comment and the draft-PR salvage body. Absent or "" when the
+   *  agent wrote nothing. */
+  agentOutputTail?: string;
   /**
    * True when the dispatcher fired its own wall-clock SIGTERM at this
    * agent. This is the dispatcher's record of what IT did, and it is the
@@ -989,6 +1010,10 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
     // state-machine semantics.
     let denialState = initPermissionDenialState();
     let forceExitTimer: NodeJS.Timeout | null = null;
+    // The agent's own last messages and tool calls, for the error comment
+    // when the run fails (agent-dispatcher #16, #18).
+    let agentOutput: readonly string[] = [];
+    const agentOutputTail = () => agentOutputForMessage(agentOutput);
 
     // Agent wall clock (wait-credit.ts), both runners. Time a command spent
     // waiting for the Android device hold or a Gradle build place is credited
@@ -1115,6 +1140,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
             idleState = isCodex ? advanceCodexIdleWatchdogState(idleState, msg, Date.now())
               : advanceIdleWatchdogState(idleState, msg, Date.now());
           }
+          agentOutput = isCodex ? advanceCodexAgentOutput(agentOutput, msg) : advanceClaudeAgentOutput(agentOutput, msg);
           if (codex) {
             codex.accept(msg);
             logStreamMessage(opts.logFile, msg);
@@ -1182,6 +1208,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
       if (buffer.trim()) {
         try {
           const msg = JSON.parse(buffer);
+          agentOutput = isCodex ? advanceCodexAgentOutput(agentOutput, msg) : advanceClaudeAgentOutput(agentOutput, msg);
           if (codex) codex.accept(msg);
           initSessionId = captureSessionId(initSessionId, msg);
           logStreamMessage(opts.logFile, msg);
@@ -1201,6 +1228,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
       if (codex) {
         const finished = codex.finish(code, timedOut, Date.now() - startedAt, stderrTail, idleStalled ? idleMs : 0);
         finished.waitCreditMs = runClockCreditMs(clock);
+        finished.agentOutputTail = agentOutputTail();
         if (finished.isError) logStderrTail();
         resolve(finished);
         return;
@@ -1242,6 +1270,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
           stoppedAtDenial: denialState.stoppedAtDenial,
           deniedOpContent: denialState.deniedContent,
           lastAssistantText: denialState.lastAssistantText,
+          agentOutputTail: agentOutputTail(),
           timedOut,
           ...claudeWaitCredit(),
         });
@@ -1268,6 +1297,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
           stoppedAtDenial: denialState.stoppedAtDenial,
           deniedOpContent: denialState.deniedContent,
           lastAssistantText: denialState.lastAssistantText,
+          agentOutputTail: agentOutputTail(),
           timedOut,
           ...claudeWaitCredit(),
         });
@@ -1275,17 +1305,18 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
         logStderrTail();
         // Checked before the wall clock: the stall is the cause even when
         // the backstop also fired while the kill was landing.
-        reject(new AgentRunStoppedError(idleStallMessage(idleMs), "idle_stall"));
+        reject(new AgentRunStoppedError(idleStallMessage(idleMs), "idle_stall", agentOutputTail()));
       } else if (timedOut) {
         logStderrTail();
         const credit = runClockCreditMs(clock);
         reject(new AgentRunStoppedError(`Agent timed out after ${opts.timeoutMs / 1000}s` +
-          (credit > 0 ? ` plus ${Math.round(credit / 1000)}s credited for waiting on the device or a build place` : ""), "timeout"));
+          (credit > 0 ? ` plus ${Math.round(credit / 1000)}s credited for waiting on the device or a build place` : ""), "timeout", agentOutputTail()));
       } else {
         logStderrTail();
         // The scrubbed stderr tail rides in the message, so the ticket's
-        // error comment shows why the CLI died (pyrycode-mobile #1340).
-        reject(new Error(noResultErrorMessage(code, stderrTail)));
+        // error comment shows why the CLI died (pyrycode-mobile #1340),
+        // and the agent's own last output rides beside it.
+        reject(new AgentRunFailedError(noResultErrorMessage(code, stderrTail), agentOutputTail()));
       }
     });
 
@@ -1601,12 +1632,21 @@ async function buildPromptForAgent(
   // The documentation agent records test evidence it cannot otherwise see:
   // the verifier gate results live only in these logs (#136).
   if (agent.name === "documentation" && ticketNum > 0) {
+    // The verifier's last verdict names tests too, in its documentation
+    // handoff, and is often the only place that does (desktop #1818).
+    let verdictText = "";
+    const reviewer = activeStageSet().agents.find((a) => a.requiresVerdict);
+    if (reviewer) {
+      try {
+        verdictText = parseLastVerdict(readFileSync(lastVerdictPath(reviewer.name, ticketNum), "utf-8"))?.body ?? "";
+      } catch { /* no last verdict: the issue and plan still name tests */ }
+    }
     try {
       parts.push(gateReportSection({
         issueNumber: ticketNum,
         logsDir: LOGS_DIR,
         env: process.env,
-        namingText: [item.body, ...planTexts].join("\n"),
+        namingText: [item.body, ...planTexts, verdictText].join("\n"),
       }));
     } catch (e) {
       console.warn(`   ⚠️  Failed to build the gate report for #${ticketNum}: ${e}`);
@@ -1778,7 +1818,12 @@ async function attemptSaferSalvage(opts: {
       throw new Error(`git push failed: ${pushResult.stderr?.toString() || "unknown"}`);
     }
 
-    const tail = (opts.streamResult.output || "").slice(-2500);
+    // The result frame's `result` text is empty on a max_turns result and
+    // absent from a killed run, so this block was empty on every salvage
+    // (agent-dispatcher #16). The runner's own record comes first.
+    const tail = opts.streamResult.agentOutputTail
+      || codeBlockTail(opts.streamResult.lastAssistantText || opts.streamResult.output || "", AGENT_OUTPUT_MESSAGE_CHARS)
+      || "(the agent wrote no text before it stopped)";
     // Name the budget that actually ran out. The label stays
     // `error:max_turns_salvaged` for wiring reasons, so this is the only
     // place a triaging human learns which door the run exited through —
@@ -2162,7 +2207,9 @@ export type DispatchDeps = {
   readFileSync: typeof readFileSync;
   writeFileSync: typeof writeFileSync;
   mkdirSync: typeof mkdirSync;
-  symlinkSync: typeof symlinkSync;
+  /** Copy the canonical `.codegraph/` into a worktree. See `copyCodegraphIndex`. */
+  copyCodegraphIndex: typeof copyCodegraphIndex;
+  isSymlinkPath: typeof isSymlinkPath;
   // dispatch-internal
   runClaudeStreaming: typeof runClaudeStreaming;
   notifyDiscord: (msg: string) => Promise<void>;
@@ -2283,17 +2330,24 @@ export function runCommandAsync(
   });
 }
 
-/** Generous, because the reindex no longer blocks anything while it runs. */
+/** Generous, because the refresh no longer blocks anything while it runs. */
 export const CODEGRAPH_REINDEX_TIMEOUT_MS = 10 * 60_000;
 
 /**
- * Post-merge codegraph reindex that runs in the background, one at a time.
+ * Post-merge codegraph refresh that runs in the background, one at a time.
  *
- * `request` starts `codegraph index -f` and returns at once; the auto-merge
+ * `request` starts `codegraph sync -q` and returns at once; the auto-merge
  * never awaits it. A request while a run is in progress is coalesced: one
  * more run follows the current one, covering every merge that landed
  * meanwhile. Two runs never overlap, so they never fight over the index.
  * A failure only logs; the next merge tries again.
+ *
+ * `sync`, not a full `index -f`: codegraph 1.x syncs reliably and in
+ * place, in seconds, while `index` deletes and rebuilds the database for
+ * minutes, during which a worktree copied from it would get a partial
+ * index. (The 2026-05-09 finding that sync missed changes was 0.x.) A sync
+ * fails with a lock error while a codegraph server serves the canonical
+ * checkout; that server's own watcher keeps the index current then.
  */
 export function createCodegraphReindexer(
   run: CommandRunner,
@@ -2305,7 +2359,7 @@ export function createCodegraphReindexer(
 
   const runOnce = async (repoRoot: string): Promise<void> => {
     try {
-      const out = await run("codegraph", ["index", "-f"], { cwd: repoRoot, timeoutMs });
+      const out = await run("codegraph", ["sync", "-q"], { cwd: repoRoot, timeoutMs });
       if (out.ok) {
         console.log(`   📚 codegraph index refreshed`);
         return;
@@ -2352,7 +2406,8 @@ export const DEFAULT_DEPS: DispatchDeps = {
   readFileSync,
   writeFileSync,
   mkdirSync,
-  symlinkSync,
+  copyCodegraphIndex,
+  isSymlinkPath,
   runClaudeStreaming,
   notifyDiscord,
   buildPromptForAgent,
@@ -2434,6 +2489,10 @@ export type DispatchContext = {
   /** Set by `prepareReworkFindingsNote` when this is the builder's rework
    *  after a verifier FAIL, which runs at a higher effort (effort-policy.ts). */
   reworkAfterFail?: boolean;
+  /** What a verdict run got through, kept up to date as its phases run, so
+   *  one that runs out of time can say so on the ticket. See
+   *  verifier-out-of-time.ts. */
+  review?: ReviewProgress;
 };
 
 /**
@@ -2540,6 +2599,126 @@ export function worktreePath(targetRepo: string, name: string): string {
   return resolve(targetRepo, `../.pyrycode-worktrees/${basename(resolve(targetRepo))}/${name}`);
 }
 
+const FULL_SHA = /^[0-9a-f]{40}$/;
+
+/**
+ * Merge current main into `feature/<n>` and push it, for a verifier FAIL
+ * whose only blocking finding is a stale base (see verdict-guard.ts, branch
+ * invariants, and `settleStaleBase` in reconcile.ts). Runs between agent runs,
+ * when no worktree of the ticket is in use, so it works in a detached
+ * worktree of its own at the pushed head and never touches the local branch:
+ * the next dispatch fast-forwards that from origin as usual.
+ *
+ * Returns `current` when the pushed head already contains `origin/<main>`,
+ * `conflict` (merging nothing) when main conflicts with the branch, and
+ * `failed` for anything that stops it from telling: a fetch or push failure,
+ * a missing branch, or a local branch with commits origin lacks, which a
+ * push from here would leave diverged. Never throws.
+ */
+export function refreshStaleBaseBranch(opts: {
+  issueNumber: number;
+  repoRoot?: string;
+  defaultBranch?: string;
+  deps?: Pick<DispatchDeps, "execSync" | "mkdirSync">;
+}): StaleBaseRefresh {
+  const root = opts.repoRoot ?? repoRoot;
+  const base = opts.defaultBranch ?? defaultBranch;
+  const { execSync: exec, mkdirSync: mkdir } = opts.deps ?? DEFAULT_DEPS;
+  const branch = `feature/${opts.issueNumber}`;
+  const run = (cmd: string, cwd = root, timeout = 120_000): string =>
+    String(exec(cmd, { cwd, encoding: "utf-8", stdio: "pipe", timeout })).trim();
+  const ok = (cmd: string, cwd = root): boolean => {
+    try { exec(cmd, { cwd, stdio: "pipe", timeout: 60_000 }); return true; } catch { return false; }
+  };
+  const failed = (reason: string): StaleBaseRefresh => ({ kind: "failed", reason });
+
+  try {
+    run(`git fetch origin`, root, 300_000);
+  } catch (e: any) {
+    return failed(`git fetch origin failed: ${e?.message ?? e}`);
+  }
+  let mainSha: string;
+  let headSha: string;
+  try {
+    mainSha = run(`git rev-parse origin/${base}`);
+    headSha = run(`git rev-parse origin/${branch}`);
+  } catch (e: any) {
+    return failed(`could not resolve origin/${base} or origin/${branch}: ${e?.message ?? e}`);
+  }
+  if (!FULL_SHA.test(mainSha) || !FULL_SHA.test(headSha)) {
+    return failed(`origin/${base} or origin/${branch} did not resolve to a commit`);
+  }
+  if (ok(`git rev-parse --verify ${branch}`) && !ok(`git merge-base --is-ancestor ${branch} ${headSha}`)) {
+    return failed(`the local ${branch} has commits origin/${branch} lacks`);
+  }
+  if (ok(`git merge-base --is-ancestor ${mainSha} ${headSha}`)) return { kind: "current", mainSha, headSha };
+
+  const wt = worktreePath(root, `stale-base-${opts.issueNumber}`);
+  const removeWorktree = () => {
+    try { exec(`git worktree remove --force "${wt}"`, { cwd: root, stdio: "pipe" }); } catch {}
+    try { exec(`git worktree prune`, { cwd: root, stdio: "pipe" }); } catch {}
+  };
+  removeWorktree();
+  try {
+    mkdir(dirname(wt), { recursive: true });
+    run(`git worktree add --detach "${wt}" ${headSha}`);
+  } catch (e: any) {
+    removeWorktree();
+    return failed(`could not create a worktree at ${headSha.slice(0, 12)}: ${e?.message ?? e}`);
+  }
+  try {
+    try {
+      run(`git -c merge.conflictStyle=diff3 merge ${mainSha} --no-edit -m "Merge branch '${base}' into ${branch}"`, wt);
+    } catch (e: any) {
+      let paths: string[] = [];
+      try { paths = run(`git diff --name-only --diff-filter=U -z`, wt).split("\0").filter(Boolean); } catch {}
+      try { exec(`git merge --abort`, { cwd: wt, stdio: "pipe" }); } catch {}
+      return paths.length > 0 ? { kind: "conflict", paths } : failed(`the merge of ${base} failed: ${e?.message ?? e}`);
+    }
+    const merged = run(`git rev-parse HEAD`, wt);
+    try {
+      run(`git push origin HEAD:refs/heads/${branch}`, wt);
+    } catch (e: any) {
+      return failed(`origin refused the push of the merge: ${e?.stderr?.toString?.().trim() || e?.message || e}`);
+    }
+    return { kind: "merged", mainSha, headSha: merged };
+  } finally {
+    removeWorktree();
+  }
+}
+
+/**
+ * After `refreshStaleBaseBranch` settled a stale base, answer the last FAIL's
+ * stale base findings in the rework answers file, so the verifier's re-review
+ * reads why they are fixed with no builder commit since. Best effort: a
+ * missing or unreadable last verdict leaves the re-review to say no answers
+ * were given, which it then checks itself.
+ */
+export function answerStaleBaseFindings(
+  issueNumber: number,
+  outcome: { kind: "merged" | "current"; mainSha: string; headSha: string },
+  deps: Pick<DispatchDeps, "readFileSync" | "writeFileSync" | "mkdirSync"> = DEFAULT_DEPS,
+): void {
+  const reviewer = activeStageSet().agents.find((a) => a.requiresVerdict);
+  if (!reviewer) return;
+  try {
+    const last = parseLastVerdict(String(deps.readFileSync(lastVerdictPath(reviewer.name, issueNumber), "utf-8")));
+    if (last === null || last.decision !== "FAIL") return;
+    const how = outcome.kind === "merged"
+      ? `the dispatcher merged current main (${outcome.mainSha.slice(0, 12)}) into the branch; no source change`
+      : `the branch already contains current main (${outcome.mainSha.slice(0, 12)}); no source change`;
+    const lines = extractVerdictFindings(last.body)
+      .map((finding, i) => (isStaleBaseFinding(finding) ? `${i + 1}. Fixed in ${outcome.headSha.slice(0, 12)}: ${how}.` : null))
+      .filter((line): line is string => line !== null);
+    if (lines.length === 0) return;
+    const path = reworkAnswersPath(issueNumber, last.commit);
+    deps.mkdirSync(dirname(path), { recursive: true });
+    deps.writeFileSync(path, lines.join("\n") + "\n");
+  } catch (e: any) {
+    console.warn(`   ⚠️  Could not answer the stale base findings for #${issueNumber}: ${e?.message ?? e}`);
+  }
+}
+
 export function makeDispatchContext(
   agent: AgentConfig,
   item: ProjectItem,
@@ -2600,14 +2779,24 @@ export async function dispatchToAgent(
   const parallelReview = process.env.PYRY_VERIFIER_PARALLEL_REVIEW === "1"
     && activeStageSet().preSpawnGate?.agentNames.has(agent.name) === true
     && parseVerifierGates(process.env.PYRY_VERIFIER_GATES).length > 0;
+  // Main may have moved since the setup merge; merge it again right before
+  // the gates. The parallel review does the same as it starts its gates.
+  const baseNote = parallelReview ? "" : refreshBaseBeforeGates(ctx);
+  const gatesStartedAt = Date.now();
   const gates = parallelReview ? { promptNote: "" } : await maybeRunPreSpawnGates(ctx);
+  const gatesMs = gates.promptNote ? Date.now() - gatesStartedAt : undefined;
 
   const mergeNote = ctx.pendingMerge ? mergeHandoffNote(defaultBranch, ctx.pendingMerge.paths) : "";
   const reReview = prepareReReviewNote(ctx);
   const handoffNote = prepareVerdictHandoff(ctx);
   const findingsNote = prepareReworkFindingsNote(ctx);
-  const spawn = await prepareAgentSpawn(ctx, gates.promptNote + mergeNote + reReview + handoffNote + findingsNote);
+  const spawn = await prepareAgentSpawn(ctx, gates.promptNote + baseNote + mergeNote + reReview + handoffNote + findingsNote);
   if (!spawn.ok) return;
+  // The gates ran before the agent's clock started, so the review gets its
+  // whole budget. The overlapped review keeps its own record below.
+  if (agent.requiresVerdict && !parallelReview) {
+    ctx.review = { phase: "review", budgetMs: spawn.config.timeoutMs, ...(gatesMs !== undefined ? { gatesMs } : {}) };
+  }
 
   // streamResult is declared outside the try so handleDispatchError
   // can read its sessionId for the JSONL-replay resume hint.
@@ -2653,12 +2842,13 @@ export async function dispatchToAgent(
     const preserveBlockedWork = streamResult?.runner === "codex"
       && ["codex_blocked", "needs_refinement"].includes(streamResult.terminalReason) && ctx.useWorktree;
     if (preserveBlockedWork) error.message += `\nWorktree preserved for recovery: ${ctx.worktreeDir}`;
-    // A run the dispatcher stopped (wall clock or idle stall) on a branch
-    // that already has a PR: push its leftovers BEFORE the error path and
-    // the worktree teardown, then let the error continue as before. See
-    // `decidePartialWorkSalvage` for the incidents (mobile #1430, #1332).
-    const stopKind = saferSalvaged || preserveBlockedWork ? null : runStopKind(error, streamResult);
-    const partial = stopKind ? await salvagePartialWork(ctx, stopKind) : { keepWorktree: false };
+    // A run that failed (wall clock, idle stall, crash or error result):
+    // push its leftovers BEFORE the error path and the worktree teardown,
+    // then let the error continue as before. See `decidePartialWorkSalvage`
+    // for the incidents (mobile #1430, #1332, #1340) and `runFailureKind`
+    // for the policy stops it never touches.
+    const failureKind = saferSalvaged || preserveBlockedWork ? null : runFailureKind(error, streamResult);
+    const partial = failureKind ? await salvagePartialWork(ctx, failureKind) : { keepWorktree: false };
     await handleDispatchError(error, ctx, streamResult);
     // A rejected commit can leave useful edits. Never erase them or use
     // automatic salvage to work around an approval rejection.
@@ -2810,6 +3000,19 @@ async function scheduleTransientRetry(opts: {
   return { kind: "retry", attempt: newAttempt };
 }
 
+/**
+ * The error comment's section with the agent's own last messages and tool
+ * calls, or "" when there are none (agent-dispatcher #16). Kept out of the
+ * error message itself: the retry classifier reads that message, and the
+ * agent's words could match a transient signature.
+ */
+function agentOutputSection(error: unknown, streamResult: StreamResult | null): string {
+  const tail = agentOutputOf(error, streamResult);
+  return tail
+    ? `\n\n**Last output from the agent** (its messages and tool calls, newest last):\n\n\`\`\`\n${tail}\n\`\`\``
+    : "";
+}
+
 // Outer catch-block body for dispatchToAgent. Logs the error, posts
 // `error:<agent>` label + diagnostic comment + Discord notify. The
 // session-id resume hint is the load-bearing piece for JSONL-replay
@@ -2903,6 +3106,36 @@ export async function handleDispatchError(
     }
   }
 
+  // A verdict run that ran out of time or turns says so plainly: what ran
+  // out, the gate time it was not charged, the gate results the next run
+  // can reuse and the finished source review. See verifier-out-of-time.ts.
+  const outOfTime = agent.requiresVerdict && item.issueNumber > 0 && !isResourceExhausted && !unrecordedRetry
+    ? reviewBudgetStop(error, streamResult) : null;
+  if (outOfTime !== null) {
+    try {
+      await client.addLabel(item.issueNumber, errorLabel);
+      console.log(`   🏷️  Added ${errorLabel} to #${item.issueNumber} (ran out of ${outOfTime})`);
+    } catch {}
+    try {
+      await client.addComment(item.issueNumber, outOfTimeComment({
+        agentName: agent.name,
+        kind: outOfTime,
+        progress: ctx.review,
+        fallbackBudgetMs: timeoutFor(agent, item.labels),
+        reusableGates: reusableGatesForNextRun(ctx),
+        errorLabel,
+        agentOutput: agentOutputOf(error, streamResult),
+        resumeHint: sessionId !== "unknown" ? resumeCommand({ runner: streamResult?.runner, sessionId }) : null,
+        logFile,
+      }));
+    } catch {}
+    await notifyDiscord(
+      `⏱️ **${agent.name}** ran out of ${outOfTime} on #${item.issueNumber} with no verdict: ${item.title}\n${item.url}\n` +
+      `Remove \`${errorLabel}\` to run it again.`,
+    );
+    return;
+  }
+
   if (item.issueNumber > 0) {
     try {
       await client.addLabel(item.issueNumber, errorLabel);
@@ -2919,7 +3152,7 @@ export async function handleDispatchError(
           `**Operator action:** investigate process pressure on the host ` +
           `(\`ps -ef | wc -l\`, \`ulimit -u\`, look for orphaned \`claude\` / \`pyry\` processes). ` +
           `The ticket will re-queue on the next pickup cycle once \`${errorLabel}\` is removed.`
-        : `## ⚠️ Agent Error: ${agent.name}\n\nThe ${agent.name} agent encountered an error:\n\n\`\`\`\n${error.message.slice(-2000)}\n\`\`\`${sessionId !== "unknown" ? `\n\n**Debug**: \`${resumeCommand({ runner: streamResult?.runner, sessionId })}\`` : ""}${unrecordedRetry ? `\n\nThe error was a transient one the dispatcher would normally retry, but neither the retry counter nor the retry marker comment could be written — GitHub was refusing writes at the time. A retry nothing recorded would re-run every cycle with no backoff and no cap, so the ticket is parked instead. Strip \`${errorLabel}\` to re-queue it once GitHub is healthy.` : ""}\n\nManual intervention required.`;
+        : `## ⚠️ Agent Error: ${agent.name}\n\nThe ${agent.name} agent encountered an error:\n\n\`\`\`\n${error.message.slice(-2000)}\n\`\`\`${agentOutputSection(error, streamResult)}${sessionId !== "unknown" ? `\n\n**Debug**: \`${resumeCommand({ runner: streamResult?.runner, sessionId })}\`` : ""}${unrecordedRetry ? `\n\nThe error was a transient one the dispatcher would normally retry, but neither the retry counter nor the retry marker comment could be written — GitHub was refusing writes at the time. A retry nothing recorded would re-run every cycle with no backoff and no cap, so the ticket is parked instead. Strip \`${errorLabel}\` to re-queue it once GitHub is healthy.` : ""}\n\nManual intervention required.`;
       await client.addComment(item.issueNumber, commentBody);
     } catch {}
   }
@@ -2947,7 +3180,7 @@ export async function setupBranchAndWorktree(
   ctx: DispatchContext,
 ): Promise<{ ok: true } | { ok: false }> {
   const { agent, item, client, branchName, worktreeDir, useWorktree } = ctx;
-  const { execSync, mkdirSync, symlinkSync, existsSync } = ctx.deps;
+  const { execSync, mkdirSync, existsSync, copyCodegraphIndex, isSymlinkPath } = ctx.deps;
 
   // PO and issue-0 (manual dispatch) run on the default branch — just pull latest
   if (!useWorktree) {
@@ -3167,32 +3400,33 @@ export async function setupBranchAndWorktree(
       console.log(`   🌳 Created worktree at ${worktreeDir}`);
     }
 
-    // Symlink the canonical repo's codegraph index into the worktree.
-    // `.codegraph/` is gitignored and lives outside `.git/`, so
-    // `git worktree add` won't bring it across — without this link,
-    // agents that try `mcp__codegraph__*` tools find an empty index
-    // (the codegraph MCP server reads from CWD = worktree dir),
-    // silently fall through to grep, and pay tokens for the codegraph
-    // tool surface without getting any of its value. See
-    // `decideCodegraphSymlink` in lib.ts for the decision rules.
+    // Give the worktree its own copy of the canonical codegraph index.
+    // `.codegraph/` is gitignored, so `git worktree add` doesn't bring it
+    // across, and the agent's codegraph server reads the index at its cwd.
+    // A copy rather than a symlink, because a codegraph 1.x server writes
+    // the files it serves into the index it opened: through a link, one
+    // ticket's branch landed in the index every other worktree shares. See
+    // `decideCodegraphIndexCopy` in worktree.ts for the decision rules.
     const codegraphSrc = resolve(repoRoot, ".codegraph");
     const codegraphDst = resolve(worktreeDir, ".codegraph");
-    const cgDecision = decideCodegraphSymlink({
-      sourceExists: existsSync(codegraphSrc),
-      destExists: existsSync(codegraphDst),
+    const cgDecision = decideCodegraphIndexCopy({
+      sourceExists: existsSync(resolve(codegraphSrc, "codegraph.db")),
+      destExists: existsSync(resolve(codegraphDst, "codegraph.db")),
+      destIsSymlink: isSymlinkPath(codegraphDst),
     });
-    if (cgDecision.action === "symlink") {
+    if (cgDecision.action === "copy" || cgDecision.action === "replace-symlink") {
       try {
-        symlinkSync(codegraphSrc, codegraphDst);
-        console.log(`   🔗 Linked .codegraph/ from canonical repo`);
+        copyCodegraphIndex(codegraphSrc, codegraphDst, { replaceSymlink: cgDecision.action === "replace-symlink" });
+        console.log(cgDecision.action === "copy"
+          ? `   🔗 Copied .codegraph/ index from canonical repo`
+          : `   🔗 Replaced the legacy .codegraph/ symlink with a copy of the canonical index`);
       } catch (e) {
-        // Soft-fail: don't abort dispatch over a broken symlink.
-        // Agent runs without codegraph this cycle; operator sees the
-        // warning and can investigate (permission issue, races, etc).
-        console.warn(`   ⚠️  Failed to symlink .codegraph/ into worktree: ${e}`);
+        // Soft-fail: don't abort dispatch over the index. The agent runs
+        // without codegraph this cycle; the operator sees the warning.
+        console.warn(`   ⚠️  Failed to copy .codegraph/ into worktree: ${e}`);
       }
     } else if (cgDecision.reason === "no-source") {
-      console.warn(`   ⚠️  Canonical .codegraph/ index missing at ${codegraphSrc} — agents in this worktree will fall through to grep when they call codegraph_*. Run \`codegraph init -i\` in the repo root to bootstrap.`);
+      console.warn(`   ⚠️  Canonical .codegraph/ index missing at ${codegraphSrc}: agents in this worktree run without codegraph. Run \`codegraph init -y\` in the repo root to bootstrap.`);
     }
   } catch (e) {
     console.error(`   ❌ Failed to create worktree: ${e}`);
@@ -3483,6 +3717,76 @@ function pushPreRunMerge(ctx: DispatchContext, remoteExists: boolean, headBefore
   }
 }
 
+/**
+ * Merge `main` into the verifier's worktree again right before its gates run,
+ * when main moved since the setup merge. Returns the prompt note that tells
+ * the verifier main is current at a named commit, or "" when nothing applies
+ * or the merge could not be made.
+ *
+ * The setup merge happens minutes before the gates: the spawn preparation
+ * (code index refresh, docs index) sits in between, and the poll loop keeps
+ * merging finished tickets meanwhile. The fork's pre-verify gate then finds
+ * `origin/main` missing from HEAD and the verifier FAILs the ticket for a
+ * merge nobody's code needed. On desktop #1825 at 03:17 on 2026-10-07 the
+ * setup merge and the auto-merge of #1829 were four seconds apart, and the
+ * gate ran two minutes later. This closes that window to the seconds between
+ * this merge and the first gate.
+ *
+ * Runs only for the agents the stage set gates (the verifier), in their own
+ * worktree, never with a conflicted merge already pending. A conflict here
+ * aborts and leaves the worktree as it was, so the gates judge the branch as
+ * before and the verdict's stale base finding is settled by the rework router.
+ * The merge is pushed at once, like the setup merge (`pushPreRunMerge`).
+ */
+function refreshBaseBeforeGates(ctx: DispatchContext): string {
+  const { agent, item, useWorktree, worktreeDir, branchName } = ctx;
+  if (!useWorktree || item.issueNumber <= 0 || ctx.pendingMerge) return "";
+  if (activeStageSet().preSpawnGate?.agentNames.has(agent.name) !== true) return "";
+  const { execSync: exec } = ctx.deps;
+  try {
+    exec(`git checkout ${defaultBranch} && git pull`, { cwd: repoRoot, stdio: "pipe", timeout: 120_000 });
+  } catch (e: any) {
+    console.warn(`   ⚠️  Could not update ${defaultBranch} before the gates; they judge the setup merge: ${e?.message ?? e}`);
+    return "";
+  }
+  let mainSha = "";
+  try {
+    mainSha = String(exec(`git rev-parse ${defaultBranch}`, { cwd: repoRoot, encoding: "utf-8", stdio: "pipe" })).trim();
+  } catch {}
+  if (!FULL_SHA.test(mainSha)) return "";
+  let current = false;
+  try {
+    exec(`git merge-base --is-ancestor ${mainSha} HEAD`, { cwd: worktreeDir, stdio: "pipe" });
+    current = true;
+  } catch {}
+  if (!current) {
+    const headBefore = readWorktreeHead(exec, worktreeDir);
+    try {
+      exec(`git -c merge.conflictStyle=diff3 merge ${defaultBranch} --no-edit`, { cwd: worktreeDir, stdio: "pipe" });
+    } catch {
+      try { exec(`git merge --abort`, { cwd: worktreeDir, stdio: "pipe" }); } catch {}
+      console.warn(`   ⚠️  ${defaultBranch} moved since setup and merging it again into ${branchName} conflicts; the gates judge the setup merge`);
+      return "";
+    }
+    console.log(`   🔀 ${defaultBranch} moved since setup; merged ${mainSha.slice(0, 12)} into ${branchName} again before the gates`);
+    pushPreRunMerge(ctx, true, headBefore);
+  }
+  return baseCurrencyNote(defaultBranch, mainSha);
+}
+
+/** The verifier's note that main is merged as of a named commit. */
+export function baseCurrencyNote(branch: string, mainSha: string): string {
+  return [
+    "",
+    "",
+    "## Base branch",
+    "",
+    `The dispatcher merged \`${branch}\` at \`${mainSha}\` into this worktree right before the gates ran, and pushed the merge. ` +
+    `Keeping the branch current with \`${branch}\` is the dispatcher's job: it merges \`${branch}\` again before every review and before the final merge. ` +
+    `If \`origin/${branch}\` moves while you review, that is not a finding and not a reason to FAIL. Review the commit in front of you.`,
+  ].join("\n");
+}
+
 type SpawnConfig = Parameters<typeof runClaudeStreaming>[0];
 
 // Build prompt + read agent CLAUDE.md + write prompt files + compute
@@ -3611,7 +3915,11 @@ export async function prepareAgentSpawn(
   // visible via get_design_context. Write tools (use_figma, generate_diagram) deliberately excluded
   // — agents read Figma, never modify it. Per-agent prescriptions in each fork's <role>/CLAUDE.md
   // gate actual usage.
-  const baseTools = "Bash,Read,Write,Edit,Glob,Grep,TodoWrite,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status,mcp__plugin_context7_context7__resolve-library-id,mcp__plugin_context7_context7__query-docs,mcp__codegraph__codegraph_search,mcp__codegraph__codegraph_callers,mcp__codegraph__codegraph_callees,mcp__codegraph__codegraph_impact,mcp__codegraph__codegraph_node,mcp__codegraph__codegraph_context,mcp__codegraph__codegraph_files,mcp__codegraph__codegraph_status,mcp__plugin_figma_figma__get_design_context,mcp__plugin_figma_figma__get_screenshot,mcp__plugin_figma_figma__get_metadata,mcp__plugin_figma_figma__get_variable_defs,mcp__plugin_figma_figma__search_design_system";
+  const baseTools = "Bash,Read,Write,Edit,Glob,Grep,TodoWrite,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status,mcp__plugin_context7_context7__resolve-library-id,mcp__plugin_context7_context7__query-docs,mcp__codegraph__codegraph_explore,mcp__plugin_figma_figma__get_design_context,mcp__plugin_figma_figma__get_screenshot,mcp__plugin_figma_figma__get_metadata,mcp__plugin_figma_figma__get_variable_defs,mcp__plugin_figma_figma__search_design_system";
+  // codegraph 1.x lists one MCP tool, codegraph_explore; it returns the source, call paths
+  // and blast radius the 0.x search/callers/callees/impact/node/context tools gave
+  // piecemeal. Those names are gone from the server's default surface, and the containers
+  // don't re-enable them (CODEGRAPH_MCP_TOOLS), so they are not granted here.
   // context7 tools carry the plugin prefix (mcp__plugin_context7_context7__*) so the
   // allowlist matches the tool the agent actually loads. The bare mcp__context7__* form
   // never matched, so every context7 call was silently denied (desktop #29, 2026-07-03).
@@ -3717,6 +4025,9 @@ async function runParallelVerifierReview(
   reReview = false,
 ): Promise<StreamResult> {
   const { config, promptText } = spawn;
+  // Before the source diff is read and the gates start: main may have moved
+  // during the spawn preparation (see refreshBaseBeforeGates).
+  const baseNote = refreshBaseBeforeGates(ctx);
   const sourcePromptFile = config.promptFile + ".source.txt";
   const sourceSystemFile = config.promptFile + ".source-system.txt";
   const sourceLogFile = config.logFile.replace(/\.log$/, ".source.log");
@@ -3758,10 +4069,13 @@ async function runParallelVerifierReview(
   console.log("   🔎 Source review running alongside verifier gates; verdict waits for both");
   const sourceStartedAt = Date.now();
   let sourceReviewMs = 0;
+  const progress: ReviewProgress = { phase: "source review", budgetMs: config.timeoutMs };
+  ctx.review = progress;
   const results = await Promise.allSettled([
-    maybeRunPreSpawnGates(ctx),
+    maybeRunPreSpawnGates(ctx)
+      .finally(() => { progress.gatesMs = Date.now() - sourceStartedAt; }),
     ctx.deps.runClaudeStreaming({ ...config, sourceReview: true, sourceReviewRoot: ctx.agentCwd, promptFile: sourcePromptFile, systemPromptFile: sourceSystemFile, logFile: sourceLogFile })
-      .finally(() => { sourceReviewMs = Date.now() - sourceStartedAt; }),
+      .finally(() => { sourceReviewMs = Date.now() - sourceStartedAt; progress.sourceMs = sourceReviewMs; }),
   ]);
   const [gates, review] = results;
   if (gates.status === "rejected") throw gates.reason;
@@ -3769,10 +4083,13 @@ async function runParallelVerifierReview(
   const source = review.value;
   ctx.deps.writeLog(ctx.logFile, "SOURCE REVIEW RESULT", source.output);
   if (source.isError || source.terminalReason !== "stop" || !source.output.trim()) {
-    throw new Error(`Preliminary source review did not complete: ${source.output || source.terminalReason}. No verdict published.`);
+    const detail = `${source.output || source.terminalReason}. No verdict published.`;
+    if (source.timedOut) throw new ReviewBudgetExhaustedError(`Preliminary source review ran out of time: ${detail}`, "time");
+    throw new Error(`Preliminary source review did not complete: ${detail}`);
   }
+  progress.sourceReport = source.output;
   const finalNote = [
-    gates.value.promptNote,
+    gates.value.promptNote + baseNote,
     "", "## Completed preliminary source review", "",
     "Both source review and deterministic gates have finished. Apply your full verifier contract to these findings and the gate evidence.",
     "Use this complete source review rather than repeating it from scratch. Validate findings as needed, finish deferred Figma/live evidence checks, triage any red gate, then publish one verdict containing all findings.",
@@ -3782,9 +4099,17 @@ async function runParallelVerifierReview(
   ctx.deps.writeLog(ctx.logFile, "FINAL REVIEW INPUT", finalNote);
   const remainingMs = finalReviewBudgetMs(config.timeoutMs, sourceReviewMs);
   const remainingTurns = isClaude ? config.maxTurns - source.numTurns : config.maxTurns;
-  if (remainingTurns <= 0) throw new Error("Verifier turn budget exhausted before final review. No verdict published.");
+  if (remainingTurns <= 0) throw new ReviewBudgetExhaustedError("Verifier turn budget exhausted before final review. No verdict published.", "turns");
+  progress.phase = "final review";
+  progress.budgetMs = remainingMs;
   const final = await ctx.deps.runClaudeStreaming({ ...config, timeoutMs: remainingMs, maxTurns: remainingTurns });
   return mergeLegResults(source, final);
+}
+
+/** The first leg's result with the newest leg's agent output, so the
+ *  error comment shows where the run actually stopped. */
+function withLatestAgentOutput(first: StreamResult, tail: string | undefined): StreamResult {
+  return tail && tail !== first.agentOutputTail ? { ...first, agentOutputTail: tail } : first;
 }
 
 /**
@@ -3890,12 +4215,13 @@ export async function maybeResumeExhaustedRun(
         `Resume leg ${legNumber} failed: ${e?.message ?? e}\nFalling through to the original error path.`,
       );
       console.warn(`   ⚠️  Resume leg ${legNumber} failed (${e?.message ?? e}) — falling back to the original result`);
-      return first;
+      return withLatestAgentOutput(first, agentOutputOf(e, null) || current.agentOutputTail);
     }
     legsUsed += 1;
     current = mergeLegResults(current, leg);
   }
 
+  if (ctx.review && legsUsed > 0) ctx.review.legsUsed = legsUsed;
   if (current.isError) {
     if (legsUsed > 0) {
       ctx.deps.writeLog(
@@ -3905,7 +4231,7 @@ export async function maybeResumeExhaustedRun(
       );
       console.log(`   ⚠️  Still exhausted after ${legsUsed} resume leg(s) — salvage runs on the original result`);
     }
-    return first;
+    return withLatestAgentOutput(first, current.agentOutputTail);
   }
   return current;
 }
@@ -4102,12 +4428,13 @@ function openPrNumbersFor(ctx: DispatchContext): number[] | null {
 }
 
 /**
- * Commit and push what a stopped run left in its worktree to the branch's
- * existing pull request, and say so on the ticket. Runs from
- * `dispatchToAgent`'s catch, BEFORE `handleDispatchError` and the
- * worktree teardown, for a run that ended by wall-clock timeout or idle
- * stall. Decision in `decidePartialWorkSalvage` (agent-runtime.ts), which
- * also carries the incidents.
+ * Commit and push what a failed run left in its worktree to its branch,
+ * and say so on the ticket. Runs from `dispatchToAgent`'s catch, BEFORE
+ * `handleDispatchError` and the worktree teardown, for a run that ended
+ * by wall-clock timeout, idle stall, crash or error result
+ * (`runFailureKind`). The branch's pull request, if it has one, is named
+ * in the comment; none is opened. Decision in `decidePartialWorkSalvage`
+ * (agent-runtime.ts), which also carries the incidents.
  *
  * It never changes how the failure itself is handled: an idle stall still
  * goes to the transient retry, a timeout still parks under
@@ -4121,7 +4448,7 @@ function openPrNumbersFor(ctx: DispatchContext): number[] | null {
  */
 export async function salvagePartialWork(
   ctx: DispatchContext,
-  stopKind: RunStopKind,
+  stopKind: RunFailureKind,
 ): Promise<{ keepWorktree: boolean }> {
   const { agent, item, client, agentCwd, branchName, logFile, useWorktree } = ctx;
   const { execSync, spawnSync } = ctx.deps;
@@ -4130,11 +4457,11 @@ export async function salvagePartialWork(
   }
   const stopped = stopKind === "timeout"
     ? "hit its wall-clock limit"
-    : "stalled (its stream went silent with no tool running)";
+    : stopKind === "idle_stall"
+      ? "stalled (its stream went silent with no tool running)"
+      : "ended in an error";
   try {
-    const prLookup = openPrNumbersFor(ctx);
-    const prNumbers = prLookup ?? [];
-    const openPrCount = prLookup === null ? -1 : prLookup.length;
+    const prNumbers = openPrNumbersFor(ctx) ?? [];
     const gitStatusOutput = String(execSync(`git status --porcelain`, { cwd: agentCwd, encoding: "utf-8", timeout: 15_000 }));
     // `-q --verify` prints MERGE_HEAD's sha when a merge is in progress
     // and exits 1 with no output when none is.
@@ -4157,7 +4484,7 @@ export async function salvagePartialWork(
       : [];
 
     const decision = decidePartialWorkSalvage({
-      openPrCount, gitStatusOutput, commitsAheadOfOrigin, mergeInProgress, mergeCheckProblems,
+      gitStatusOutput, commitsAheadOfOrigin, mergeInProgress, mergeCheckProblems,
     });
     if (!decision.salvage) {
       ctx.deps.writeLog(logFile, "PARTIAL_SALVAGE_SKIPPED", `${stopKind}: ${decision.reason}`);
@@ -4168,7 +4495,8 @@ export async function salvagePartialWork(
     const dirty = gitStatusOutput.trim().length > 0;
     if (dirty) {
       execSync(`git add -A`, { cwd: agentCwd, stdio: "pipe", timeout: 15_000 });
-      const runShape = stopKind === "timeout" ? "a timed-out run" : "a stalled run";
+      const runShape = stopKind === "timeout" ? "a timed-out run"
+        : stopKind === "idle_stall" ? "a stalled run" : "a run that ended in an error";
       const commit = spawnSync(
         "git",
         [
@@ -5517,6 +5845,32 @@ function readReusableGatePass(
   if (decision.reuse) return decision.pass;
   console.log(`   🧪 Recorded gate pass for #${issueNumber} not reused (${decision.reason})`);
   return null;
+}
+
+/**
+ * The recorded gate pass the next verifier dispatch would reuse on this
+ * worktree's files, with the time it stops being reusable. Null when there
+ * is none, reuse is off, or anything cannot be read. Only an exact reuse
+ * counts; the out-of-time comment does not promise the docs-only one.
+ */
+function reusableGatesForNextRun(ctx: DispatchContext): { commit: string; untilMs: number } | null {
+  const gates = parseVerifierGates(process.env.PYRY_VERIFIER_GATES);
+  if (gates.length === 0 || !verifierGateReuseEnabled(process.env)) return null;
+  const head = mergedWorktreeHead(ctx);
+  if (head === null) return null;
+  const pass = readRecordedGatePass(ctx, resolve(LOGS_DIR, verifierGatePassFileName(ctx.item.issueNumber)));
+  if (pass === null) return null;
+  const decision = decideVerifierGateReuse({
+    pass,
+    issueNumber: ctx.item.issueNumber,
+    tree: head.tree,
+    gatesHash: hashGateList(gates),
+    nowMs: Date.now(),
+    logExists: (p) => ctx.deps.existsSync(p),
+  });
+  if (!decision.reuse) return null;
+  const passedAtMs = Date.parse(decision.pass.passedAt);
+  return Number.isNaN(passedAtMs) ? null : { commit: decision.pass.commit, untilMs: passedAtMs + VERIFIER_GATE_REUSE_MAX_AGE_MS };
 }
 
 /**
@@ -7156,15 +7510,38 @@ export function makeRealClaudeGateRunner(): RealClaudeGateRunner | null {
   if (REAL_CLAUDE_GATE_CMD === "") return null;
   if (REAL_CLAUDE_GATE_FORMAT === null) return null; // bad format, already reported
   const format = REAL_CLAUDE_GATE_FORMAT;
-  return ({ issueNumber }) => runRealClaudeGateSuite({
-    issueNumber,
-    command: REAL_CLAUDE_GATE_CMD,
-    baselineCommand: REAL_CLAUDE_GATE_BASELINE_CMD,
-    format,
-    timeoutMs: REAL_CLAUDE_GATE_TIMEOUT_MS,
-    selection: REAL_CLAUDE_GATE_SELECTION,
-    minExecuted: REAL_CLAUDE_GATE_MIN_EXECUTED,
-  });
+  return async ({ issueNumber }) => {
+    const report = await runRealClaudeGateSuite({
+      issueNumber,
+      command: REAL_CLAUDE_GATE_CMD,
+      baselineCommand: REAL_CLAUDE_GATE_BASELINE_CMD,
+      format,
+      timeoutMs: REAL_CLAUDE_GATE_TIMEOUT_MS,
+      selection: REAL_CLAUDE_GATE_SELECTION,
+      minExecuted: REAL_CLAUDE_GATE_MIN_EXECUTED,
+    });
+    recordGateRunMeta(report);
+    return report;
+  };
+}
+
+/**
+ * Keep the run record beside a live gate output: the tested commits and how
+ * the run ended, which the output itself does not hold. The documentation
+ * agent's gate report reads it (gate-report.ts). Best effort: without it the
+ * report says the tested commits are not known there.
+ */
+export function recordGateRunMeta(
+  report: GateRunReport,
+  deps: Pick<DispatchDeps, "writeFileSync"> = DEFAULT_DEPS,
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  if (!report.outputPath.endsWith(".log")) return;
+  try {
+    deps.writeFileSync(gateRunMetaPath(report.outputPath), serializeGateRunMeta(report, env, new Date()));
+  } catch (e: any) {
+    console.warn(`   ⚠️  Could not keep the live gate run record beside ${report.outputPath}: ${e?.message ?? e}`);
+  }
 }
 
 /**
@@ -9149,6 +9526,16 @@ export async function pollLoop(): Promise<void> {
     const gateHoldsVerifiers = gateActive && REAL_CLAUDE_GATE_HOLD_VERIFIERS;
     await runAutoAdvance(client, MAX_CONCURRENT, pool.size);
     await runDoneCleanup(client);
+    // Merge what is already in Done BEFORE this cycle's dispatches merge main
+    // into their branches. A ticket that reached Done since the last cycle
+    // (a documentation run finishing while the loop waited) used to merge
+    // only at the end of the cycle, seconds after a verifier's setup had
+    // merged main, so that verifier's gates found main moved again: desktop
+    // #1825 at 03:17 on 2026-10-07, with #1829 merged four seconds after the
+    // setup merge. The end-of-cycle pass below stays for tickets that reach
+    // Done during this cycle. With nothing in Done it costs no call.
+    await runParentClose(client);
+    await runAutoMerge(client);
 
     // Concurrency model: WIP=N (default 2 via PYRY_MAX_CONCURRENT env var).
     // Serial within a dependency chain is preserved by `hasOpenBlockers`

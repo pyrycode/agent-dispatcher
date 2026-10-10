@@ -309,6 +309,86 @@ describe("checkMergeResolution — real git, the #808 shape", () => {
   });
 });
 
+// pyrycode-desktop#1731 on 2026-10-06. The builder finished the merge, then
+// changed some of main's new lines in a later commit to fix a reviewer's
+// finding. The check read the branch tip, called those lines lost in the
+// merge, and parked the ticket for a hand merge. It now reads the merge
+// commit. Same files as the #808 shape: main adds an import git merges on
+// its own and an argument inside the conflict.
+describe("checkMergeResolution — real git, a later commit rewrites main's lines (#1731)", () => {
+  const deps = { execSync, readFileSync };
+  const git = (cwd: string, cmd: string) =>
+    execSync(`git -c user.name=t -c user.email=t@t ${cmd}`, { cwd, stdio: "pipe", encoding: "utf-8" });
+
+  const BASE = ["import ui.Status", "", "fun screen() {", "  Status(", "    usage = usage,", "  )", "}", ""].join("\n");
+  const MAIN = ["import ui.Status", "import ui.TurnOutcome", "", "fun screen() {", "  Status(", "    usage = usage,", "    turnOutcome = turnOutcome,", "  )", "}", ""].join("\n");
+  const BRANCH = ["import ui.Status", "", "fun screen() {", "  Overlay {", "    Status(", "      usage = usage,", "    )", "  }", "}", ""].join("\n");
+  const MERGED = ["import ui.Status", "import ui.TurnOutcome", "", "fun screen() {", "  Overlay {", "    Status(", "      usage = usage,", "      turnOutcome = turnOutcome,", "    )", "  }", "}", ""].join("\n");
+
+  function conflictedRepo() {
+    const dir = mkdtempSync(join(tmpdir(), "merge-handoff-"));
+    git(dir, "init -q -b main");
+    writeFileSync(join(dir, "Screen.kt"), BASE);
+    git(dir, "add -A");
+    git(dir, "commit -q -m base");
+    git(dir, "checkout -q -b feature/1731");
+    writeFileSync(join(dir, "Screen.kt"), BRANCH);
+    git(dir, "commit -q -am overlay");
+    git(dir, "checkout -q main");
+    writeFileSync(join(dir, "Screen.kt"), MAIN);
+    git(dir, "commit -q -am outcome");
+    git(dir, "checkout -q feature/1731");
+    assert.throws(() => git(dir, "-c merge.conflictStyle=diff3 merge main --no-edit"), "the fixture must conflict");
+    const pending = readPendingMerge(dir, deps);
+    assert.ok(pending, "a stopped merge must be readable");
+    return { dir, pending };
+  }
+
+  const commitFile = (dir: string, text: string, message: string) => {
+    writeFileSync(join(dir, "Screen.kt"), text);
+    git(dir, `commit -q -am ${message}`);
+  };
+
+  test("rewriting main's lines in a commit after a clean merge passes with nothing to review", () => {
+    const { dir, pending } = conflictedRepo();
+    try {
+      commitFile(dir, MERGED, "merge --no-edit");
+      // The reviewer's fix: main's import moves package and its argument is
+      // renamed. Read at the tip, the first is lost outside the conflict
+      // blocks and the second changed inside them.
+      commitFile(dir, MERGED.replace("import ui.TurnOutcome", "import ui.outcome.TurnOutcome").replace("turnOutcome = turnOutcome,", "outcome = turnOutcome,"), "review-fix");
+      assert.deepEqual(checkMergeResolution(dir, pending, deps), { problems: [], notes: [] });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a line the merge itself dropped is still caught after later commits", () => {
+    const { dir, pending } = conflictedRepo();
+    try {
+      commitFile(dir, BRANCH, "merge --no-edit");
+      commitFile(dir, BRANCH.replace("usage = usage,", "usage = usage.current,"), "review-fix");
+      const { problems, notes } = checkMergeResolution(dir, pending, deps);
+      assert.deepEqual(problems, ["`Screen.kt` lost 1 line(s) main added outside the conflict blocks: `import ui.TurnOutcome`."]);
+      assert.deepEqual(notes, [{ path: "Screen.kt", lines: ["turnOutcome = turnOutcome,"] }]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("conflict markers left at the tip are caught even when the merge commit was clean", () => {
+    const { dir, pending } = conflictedRepo();
+    try {
+      commitFile(dir, MERGED, "merge --no-edit");
+      commitFile(dir, `${MERGED}<<<<<<< HEAD\n=======\n>>>>>>> main\n`, "later");
+      const { problems } = checkMergeResolution(dir, pending, deps);
+      assert.deepEqual(problems, ["`Screen.kt` still has conflict markers."]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 // pyrycode-mobile#1355 on 2026-10-02. Main wrapped the send in
 // `sendInLocalWindow { ... }`, called `onSent()` after it and documented
 // that in the KDoc. The ticket sends trimmed text and changes the order, so

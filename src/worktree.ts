@@ -1,4 +1,4 @@
-// Worktree, branch setup, codegraph symlink, and path resolution helpers.
+// Worktree, branch setup, codegraph index copy, and path resolution helpers.
 //
 // All pure: parses git output, makes decisions; the caller does the I/O
 // (git invocations, fs.symlinkSync, fs.existsSync, etc).
@@ -27,59 +27,68 @@ export function shouldAutoCommit(gitStatusOutput: string): boolean {
 // --------- Codegraph worktree integration ---------
 
 /**
- * The decision shape returned by `decideCodegraphSymlink`. The caller
- * applies the side effect (symlinkSync) and the log line based on the
- * `action` and `reason`.
+ * The decision shape returned by `decideCodegraphIndexCopy`. The caller
+ * applies the side effect (copy the index, after removing a legacy
+ * symlink) and the log line based on the `action` and `reason`.
  *
- * - `symlink` + `ready`: caller should `symlinkSync(source, dest)`
- * - `skip` + `already-present`: dst exists; do nothing, don't warn
- * - `skip` + `no-source`: source index missing; warn so operator
- *   bootstraps via `codegraph init -i` in the canonical repo
+ * - `copy` + `ready`: no index in the worktree yet; copy the canonical one
+ * - `replace-symlink` + `legacy-symlink`: the worktree still has the
+ *   symlink older dispatchers made; remove the link, then copy
+ * - `skip` + `already-present`: the worktree has its own index; leave it
+ * - `skip` + `no-source`: canonical index missing; warn so the operator
+ *   bootstraps it with `codegraph init -y` in the canonical repo
  */
-export interface CodegraphSymlinkDecision {
-  action: "symlink" | "skip";
-  reason: "ready" | "already-present" | "no-source";
+export interface CodegraphIndexCopyDecision {
+  action: "copy" | "replace-symlink" | "skip";
+  reason: "ready" | "legacy-symlink" | "already-present" | "no-source";
 }
 
 /**
- * Decide whether to symlink the canonical repo's `.codegraph/` index
- * into a freshly created worktree.
+ * Decide how a freshly prepared worktree gets its codegraph index.
  *
- * **Why a symlink at all:** the dispatcher creates a worktree per
- * dispatched ticket (`.pyrycode-worktrees/<repo>/<agent>-<n>/`).
- * Each worktree is a fresh checkout — `git worktree add` does not
- * carry untracked files into the new tree, and `.codegraph/` is
- * gitignored. An agent spawned in the worktree with codegraph in its
- * `allowedTools` would launch the codegraph MCP server with cwd =
- * worktree dir, find no `.codegraph/`, and return empty results for
- * every query. The agent then silently falls back to grep, paying
- * for the codegraph tool surface in tokens without getting any of
- * the value.
+ * **Why the worktree needs one at all:** `git worktree add` does not
+ * carry untracked files, and `.codegraph/` is gitignored. An agent's
+ * codegraph server starts with cwd = worktree, so without an index there
+ * it answers nothing and the agent pays for the tool surface for no value.
  *
- * **Soft-fail on no-source:** if the canonical repo hasn't been
- * indexed yet, we don't fail the dispatch. Agents still run; they
- * just lose codegraph for that ticket. The warning surfaces the
- * setup gap so the operator knows to run `codegraph init -i`.
+ * **Why a private copy, not a symlink to the canonical index:** codegraph
+ * 1.x serves from a writer that catches the index up with the files on
+ * disk when it starts and then folds every edit in through a file watcher.
+ * Through a symlink that writer is the worktree's server, so one ticket's
+ * branch and its uncommitted edits were written into the shared index the
+ * main checkout and every other worktree read (reproduced with 1.6.2 on
+ * pyrybox, 2026-10-09). A copy keeps each branch's edits in its own index,
+ * which also means the agent's index follows its own edits. Copying is a
+ * consistent SQLite snapshot (`copyCodegraphIndex`), and the server's
+ * catch-up then only re-reads what the branch changed.
  *
- * **Idempotent:** if the destination already exists (previous run
- * left a symlink, or an operator dropped a real dir there), leave
- * it alone. Re-creating would either be a no-op or destroy
- * intentional state.
+ * **Legacy symlinks:** worktrees made by older dispatchers still hold the
+ * link. Replacing it before the agent starts is what stops the shared
+ * index from being written by a reused worktree.
  *
- * Pure decision; the caller (in dispatch.ts) does the `existsSync`
- * checks, the `symlinkSync` call, and the log/warn output.
+ * **Soft-fail on no-source:** a missing canonical index never fails the
+ * dispatch; agents run without codegraph and the warning names the gap.
+ *
+ * Pure decision; the caller (in dispatch.ts) does the filesystem checks,
+ * the copy, and the log/warn output.
  */
-export function decideCodegraphSymlink(opts: {
+export function decideCodegraphIndexCopy(opts: {
   sourceExists: boolean;
   destExists: boolean;
-}): CodegraphSymlinkDecision {
+  destIsSymlink: boolean;
+}): CodegraphIndexCopyDecision {
+  if (opts.destIsSymlink) {
+    return opts.sourceExists
+      ? { action: "replace-symlink", reason: "legacy-symlink" }
+      : { action: "skip", reason: "no-source" };
+  }
   if (opts.destExists) {
     return { action: "skip", reason: "already-present" };
   }
   if (!opts.sourceExists) {
     return { action: "skip", reason: "no-source" };
   }
-  return { action: "symlink", reason: "ready" };
+  return { action: "copy", reason: "ready" };
 }
 
 // --------- Worktree branch setup ---------

@@ -65,11 +65,13 @@ A Codex run stopped by its wall clock gets the same continuation legs under the 
 
 ### Salvage
 
-When an agent exhausts its budget mid-dispatch (and any resume-in-place legs are spent), the dispatcher tries two recovery paths before flagging the run as errored:
+When a run fails, the dispatcher tries these recovery paths before flagging it as errored. The first two apply only when the agent exhausted its budget mid-dispatch and any resume-in-place legs are spent:
 
 1. **PR-already-exists** — if the agent opened a non-draft PR before timing out, treat the run as success.
 2. **Safer-salvage** — if the worktree has uncommitted changes or committed branch changes relative to the default branch, run `go vet` + `go build` (or the consumer's configured salvage gates). When they pass, commit only outstanding edits, push and open a draft PR with `error:max_turns_salvaged`. A clean branch with no content change is not recoverable. The ticket stays blocked until human triage; recovery never marks the agent complete.
-3. **Partial-work salvage** — a run the dispatcher stopped, by the wall clock or the idle watchdog, on a branch that already has an open PR. Rework, documentation and every later run have one, so the draft-PR path above cannot apply. Only stages that own commits on the branch qualify (architect, developer, builder, documentation; never verifier, code-review, qa or the refiner). If the worktree has uncommitted changes or local commits origin lacks, and no merge is unfinished, the dispatcher commits them as `wip(<agent>): partial work from a timed-out run (#<n>)`, pushes to the existing branch and comments on the ticket, before the worktree is removed. The failure is then handled as before: a stall retries, a timeout parks under `error:<agent>`, but the next run starts from the pushed work. If the push fails, the comment names the worktree and it is kept. Added after pyrycode-mobile #1430 and #1332 lost finished documentation edits to timeouts on 2026-10-01 and 2026-10-02.
+3. **Partial-work salvage** — any other failed run: stopped by the wall clock or the idle watchdog, a crash with no result, an error result, or a budget the draft-PR path could not save. Only stages that own commits on the branch qualify (architect, developer, builder, documentation; never verifier, code-review, qa or the refiner). If the worktree has uncommitted changes or local commits origin lacks, and no merge is unfinished, the dispatcher commits them as `wip(<agent>): partial work from a timed-out run (#<n>)`, or "a stalled run" or "a run that ended in an error", pushes to the branch and comments on the ticket, before the worktree is removed. It opens no PR; the comment names the branch's PR when there is one. The failure is then handled as before: a stall or transient error retries, anything else parks under `error:<agent>`, but the next run starts from the pushed work. If the push fails, the comment names the worktree and it is kept. A permission denial, a blocked Codex run, a refinement or blocker-wait outcome, and a spawn that never started are never salvaged. Added after pyrycode-mobile #1430 and #1332 lost finished documentation edits to timeouts on 2026-10-01 and 2026-10-02. Widened to crashes, errors and branches without a PR on 2026-10-06 (#18): a crashed run's unpushed commits used to stop the next dispatch until a person pushed them, as on pyrycode-mobile #1340.
+
+**What the error comment shows.** The `Agent Error` comment on the ticket holds the dispatcher's error line, the last 1500 characters of the CLI's stderr after a crash, and the agent's own last output: its last 12 text messages and tool calls, newest last, up to 2000 characters. A tool call is one line, such as `[Bash] ./gradlew check` under Claude or `[shell] ...` under Codex, noted when it starts, so a run killed inside a long command shows which one. Tool results are not kept. The text is scrubbed of credentials first. The draft-PR salvage body's "Last messages from the agent" block uses the same output; it was empty on every salvage before 2026-10-06, because it read the result frame's text, which a `max_turns` result does not carry (#16). After resume legs, the output is the last leg's. The agent's words stay out of the error message itself, which the transient-retry classifier reads.
 
 ### Family circuit breaker
 
@@ -153,7 +155,7 @@ Optional:
 | `PYRY_HEALTH_DAEMON_CMD` | — | Pre-dispatch health check for the test daemon, usually printing its version. Guards `PYRY_HEALTH_DAEMON_ROLES`, default `builder,verifier`, and the live gate. With `PYRY_HEALTH_DAEMON_MIN_VERSION` set, the first version number the command prints must be at least that. Unset is off. |
 | `PYRY_HEALTH_<CHECK>_ROLES` | per check | Comma- or space-separated roles a check guards, overriding its default. `all` or `*` means every role. `<CHECK>` is `GITHUB`, `FIGMA`, `LIVE_LOGIN` or `DAEMON`. GitHub defaults to every role. |
 | `PYRY_HEALTH_CACHE_MS` | `300000` | How long a health check result is kept, per check and environment, so a two-minute poll does not run `gh` or `op` every cycle. `0` re-runs every cycle. Garbage keeps the default. |
-| `PYRY_BUILDER_REWORK_CAP` | `6` | Rework breaker: how many times a ticket can be sent back to the code owner, `needs-rework:builder` in the builder set, before the next route parks it under `error:rework-loop`. Reworks routed to any other agent count on a separate `rework-other:N` label that never parks. On a verifier route to the builder, a `[MUST FIX]` finding with the same `path → Symbol` in the last two FAIL verdicts parks at once, whatever the count, when the two findings also read alike: their normalised word sets must overlap by at least 0.3 Jaccard similarity, so a different defect in the same function is not a repeat (agent-dispatcher#130); the parking comment says which rule fired. Zero, negative or garbage keeps `6`. Was a flat 3 on every rework route until 2026-10-05 (agent-dispatcher#122). Printed in the startup banner. |
+| `PYRY_BUILDER_REWORK_CAP` | `6` | Rework breaker: how many times a ticket can be sent back to the code owner, `needs-rework:builder` in the builder set, before the next route parks it under `error:rework-loop`. Reworks routed to any other agent count on a separate `rework-other:N` label that never parks. On a verifier route to the builder, a `[MUST FIX]` finding with the same `path → Symbol` in the last two FAIL verdicts parks at once, whatever the count, when the two findings also read alike: their normalised word sets must overlap by at least 0.3 Jaccard similarity, so a different defect in the same function is not a repeat (agent-dispatcher#130); the parking comment says which rule fired. A finding located at a branch (`feature/<n>`, `main` or `HEAD`) rather than a source file has no source symbol and never counts as a repeat: on 2026-10-07 the same "merge current main" finding in two FAILs running parked desktop #1825 with every code finding fixed. A blocker wait and a stale base FAIL settled by the dispatcher count nothing. Zero, negative or garbage keeps `6`. Was a flat 3 on every rework route until 2026-10-05 (agent-dispatcher#122). Printed in the startup banner. |
 | `PYRY_FAMILY_DISPATCH_LIMIT` | `24` | Family circuit breaker: dispatch budget per ticket family before the whole lineage is parked under `error:family-breaker` on its root. Per-family resume via a reset comment on the root; this knob is the global fallback. See above. |
 | `OWNER_TYPE` | `user` | `user` or `organization` for GitHub Project owner |
 | `PYRY_REAL_CLAUDE_GATE_CMD` | — | Shell command that runs the fork's live-claude suite. **Empty disables the gate entirely** and gated tickets park for an operator. See below. |
@@ -201,9 +203,15 @@ The advance chain is Backlog → In Development → In Code Review → In Docume
 - **Only documentation changed since a green run** → when the recorded pass is on other files but every file changed since its commit matches `PYRY_VERIFIER_DOCS_PATHS`, the code gates are reused and only the `PYRY_VERIFIER_DOCS_GATES` run. The note lists the changed files and tells the verifier to check only those against the open findings, not to review the code again. A rework that only fixes the plan no longer pays for every gate.
 - **Failures already on main** → for a red gate listed in `PYRY_VERIFIER_GATE_FORMATS`, the dispatcher first reads the failing test names from the gate's output. When the gate has a `baseline` template, those names are re-run once in the same worktree with the same filter, as the real-claude gate's same-tree re-run does. A name seen passing there is flaky. It goes on its shared flaky-test ticket, filed or commented on as for the real-claude gate, and the verifier's note lists it as not this ticket's. A re-run that cannot build a filter, times out, executes nothing or cannot be read excuses nothing. The names that remain go on to the checks against main. A name that also failed in the latest main sweep is a baseline failure, but only when that sweep ran on a main commit the branch's merged tree contains; a newer sweep, an unknown commit or no recorded sweep is not used. When the gate has a `baseline` template, the remaining names are re-run alone on the main commit merged into the worktree, as the real-claude gate's base re-run does, and the ones that fail there are baseline too. Baseline names are listed in the verifier's note as not this ticket's and recorded on the main sweep's open ticket, with the gated ticket and its commit; a name that ticket already lists is not recorded again. When no failure remains, because each was flaky or baseline, the gate counts as green for the verdict: the verifier gets the gates-passed note with the flaky and baseline lists, the gates after it still run, and the run is not recorded for reuse. A red whose output does not name every failure, such as a build error, stays red. Added after pyrycode-mobile #1747 failed four verifier passes on 2026-10-04 and 2026-10-05 over device tests that failed only under full-suite load, which a focused re-run on main could not reproduce. The same-tree re-run was added after flakes caused 10 verifier FAILs on pyrycode-mobile and 3 on pyrycode-desktop in the week to 2026-10-05.
 
+**Main merged again right before the gates.** The setup merge of main happens minutes before the gates run, because the spawn preparation (code index refresh, docs index) sits in between and the poll loop keeps merging finished tickets meanwhile. So for the gated agents only, the dispatcher updates main and, when main moved since setup, merges it into the worktree again just before the first gate, and pushes the merge at once. In the parallel review this happens before the source review starts too. The verifier's prompt gets a `## Base branch` note naming the merged main commit and saying that main moving during the review is not a finding. A conflict on this second merge is aborted and the gates judge the setup merge as before. Added after desktop #1731, #1779, #1818 and #1825 each lost a builder round on 2026-10-06 and 2026-10-07 to a FAIL whose only finding was that `origin/main` was not an ancestor of the reviewed head; on #1825 the setup merge and the auto-merge of another ticket were four seconds apart.
+
+**A stale base FAIL costs no builder round.** When the newest FAIL verdict's only `[MUST FIX]` findings say the branch lacks current main (located at the ticket branch, `feature/<n>`, rather than a source file), the rework router does not send the ticket to the builder. The dispatcher merges `origin/main` into the pushed branch itself, in a detached worktree of its own, and pushes the merge. The ticket keeps its column, the trigger label is stripped, the rework count is unchanged, and the verifier reviews again; the stale base findings are answered in the rework answers file so the re-review knows why they are fixed. A branch that already contains main is settled the same way without a merge. When main conflicts with the branch, the ticket goes to the builder as a merge handoff, which counts nothing. A merge that cannot be tried (a fetch or push failure, or a local branch with commits origin lacks) routes the FAIL as an ordinary rework. Each attempt posts a comment with a hidden marker, and after 3 attempts on one ticket a stale base FAIL routes as an ordinary rework, under the hard cap.
+
 In the classic set this feature is entirely inert (locked by test): no gate runs, no env is read.
 
 **Gate report for the documentation agent.** The documentation agent's prompt gets a `## Gate report` section built from the dispatcher's own logs. It lists the ticket's recorded verifier gate pass, with its time, commit and each gate's line. It gives the executed, passed, failed and skipped counts of every verifier gate with a format in `PYRY_VERIFIER_GATE_FORMATS`, and of the newest real-claude gate output, read with `PYRY_REAL_CLAUDE_GATE_FORMAT`. For each test the issue body or the plan names, it gives the result in each of those runs: passed, failed, skipped or not run. A test counts as named when its method, the part after `#`, the last ` › ` segment or the last Go name segment, appears there as a whole word. A `Class#method` or Go `TestName` the text mentions is listed even when no log has it. A run whose log is missing or unreadable, or that has no format, is listed with no per-test counts, never as passed. With nothing to report the section says so in one line. No other agent gets it. Added after 11 of 15 pyrycode-mobile documentation send-backs in the week to 2026-10-05 asked for evidence the agent could not see (#136).
+
+The newest real-claude gate run is also reported test by test: every test with its status (passed, failed, flaky or skipped with its reason), attempts and duration where the format reports them, and its `daemon-revision` annotations on Playwright. A header gives the tested branch head and main commit and how the run ended, read from a run record the dispatcher keeps beside each live gate output as `<stamp>_real-claude-gate_#<N>.meta.log`, and the daemon revision: the distinct `daemon-revision` annotation values and `PYRY_BIN` for Playwright, and for the Go suite, which builds the daemon from the tested tree, the tested commits. A failure that passed on the dispatcher's same-tree re-run says so. A suite of over 150 tests, such as the Go live suite, lists only its failures, flakes, skips and the tests the issue, the plan or the verifier's last verdict names, and counts the rest. Tests named in the verifier's last verdict, whose documentation handoff often names them, count as named in the section above too. Added after the desktop documentation agent parked five tickets overnight on 2026-10-06 (#1658, #1729, #1731, #1817, #1818) asking for named live results and the daemon revision, which an operator then posted from the gate log by hand.
 
 **Parallel source review.** With `PYRY_VERIFIER_PARALLEL_REVIEW=1`, a Claude or Codex
 verifier starts its complete source review while the configured gates run. This
@@ -298,6 +306,19 @@ verifier wall-clock budget. Claude also shares its turn limit across both phases
 Parallel review does not grant the single-phase automatic continuation budget.
 Their usage is combined. Source-review output has
 its own `.source.log`; the main log records the report and final input.
+
+**When a verifier runs out of time.** A verifier run that ends because its wall
+clock or its turn limit ran out, after any continuation leg, parks under
+`error:verifier` with one comment that says what happened, in place of the
+generic agent error. It names the part that ran out and the budget it had: the
+review, or with review overlap the source review or the final review. It gives
+how long the gates took, which is never charged to the review, and whether a
+green run of every gate is recorded for the next run to reuse, and until when.
+It carries the finished source review's report, cut at 20000 characters. Discord
+gets one line. The ticket still parks, because a review that ran out of its own
+time usually runs out again on a re-run. Added after mobile #1619 lost two
+verifier runs on 2026-10-03 to gates that took the whole hour. Each time a person
+read the logs to learn the gates were green and reusable, then cleared the label.
 
 The verifier serial switch still covers the entire dispatch, so this option does
 not overlap two emulator suites. A separate concurrency cap of two permits a
@@ -632,9 +653,13 @@ operator review; the dispatcher does not retry the denied action.
 
 A Codex builder may return `status: waiting_on_blocker` after linking an open
 GitHub dependency. The dispatcher reads blockers afresh, posts the wait and
-routes through `needs-rework:refiner`. The existing router leaves the ticket
-in development without adding a rework count. A missing or closed blocker,
-failed run, or approval rejection still becomes an agent error.
+adds `needs-rework:builder`. The router treats a rework label that routes a
+ticket back to the column it already sits in, while the ticket has an open
+blocker, as a wait: it strips the usual state labels, leaves the ticket in
+development, counts no rework and skips the loop breaker. Until 2026-10-07 that
+route counted as a builder rework, so desktop #1738 and #1766 each gained a
+rework count with no review failed. A missing or closed blocker, failed run, or
+approval rejection still becomes an agent error.
 
 Codex has no Claude-style max-turn budget. The existing per-stage wall-clock
 budget applies, with process-group termination and a two-second forced-stop grace
@@ -845,6 +870,90 @@ Before the next run, the dispatcher moves such a leftover aside to a
 and then creates a fresh worktree. After a run, removal stays ordinary, so a
 finished run's captures remain at their path for the implementation role.
 
+## Recovering a ticket by hand
+
+`scripts/recover-ticket.py` makes a manual recovery repeatable. It needs Python 3
+and a `gh` login with the `project` scope. Every mutating subcommand takes
+`--dry-run` and prints exactly what it would do; run that first.
+
+```bash
+R=dispatcher/scripts/recover-ticket.py
+python3 $R halt pyrycode 3022                 # card to Halted, refused while a wip: label is present
+python3 $R export pyrycode 3022               # patch of unpushed and uncommitted work, read only
+python3 $R clean-local pyrycode 3022 --dry-run
+python3 $R handback pyrycode 3022 --column Backlog --remove-label error:builder --dry-run
+python3 $R port pyrycode 3023 --from feature/3023-dispatch-base --dry-run
+python3 $R family-reset pyrycode 2959 --require-progress-hours 24 --min-gap-hours 24 --dry-run
+python3 $R clear-wip pyrycode 3023 --label wip:builder --min-age-minutes 110 --dry-run
+```
+
+- `halt` moves the card to Halted, which the dispatcher never reads.
+- `export` reads each `<role>-<N>` worktree (in place, or already moved into
+  the recovery folder, or any `--worktree`) and writes
+  `recover-<repo>-<N>-<name>.patch` plus an `.untracked.txt` list. The patch is
+  everything since the worktree's merge base with `origin/feature/<N>` (or
+  `origin/main` when that branch does not exist), committed or not. A worktree
+  stopped in the middle of a merge, rebase, cherry-pick or revert is refused:
+  its HEAD and index are a half-made state. It also lists every local
+  `feature/<N>` and `feature/<N>-<suffix>` branch with its commits ahead of
+  `origin/main` and writes one `recover-<repo>-<N>-branch-<name>.patch` each,
+  since side branches such as `feature/3023-dispatch-base` are where a hand
+  recovery leaves the real work. A patch over `--max-patch-mb` (default 2) is
+  not written and is named in a warning; #3023's first export was an 11.8 MB
+  half merge of another ticket's lineage. Exit 2 when anything was refused or
+  capped.
+- `clean-local` clears the two states that park the next stage after a hand
+  recovery pushed a fresh `feature/<N>`. A local `feature/<N>` that differs
+  from origin and cannot fast-forward ("Local and origin have DIVERGED") is
+  renamed to `preserved/<N>-<stamp>`. The refiner, builder, verifier and
+  documentation worktrees of the ticket ("already exists") are moved, folder
+  and `.git/worktrees` admin dir both, into
+  `<root>/.pyrycode-recovery/<repo>/<N>-<stamp>/`, with a `RECOVERY.txt`.
+  Live-gate worktrees are left to the gate. It refuses while a `wip:` label is
+  present or the ticket's agent log changed in the last 10 minutes.
+- `handback` checks that origin has `feature/<N>`, runs `clean-local`, edits
+  the labels, sets the column and reads the card back. It warns when the
+  column and labels would auto-advance or a label still blocks dispatch.
+  `--column keep` leaves the card in its column, for clearing a stale local
+  state plus its `error:<role>` label.
+- `port` takes the commits in `origin/main..<--from>` whose subject names
+  `(#N)`, the pipeline's commit convention, so another ticket's lineage stays
+  out (`--all-commits` takes every non-merge commit). It makes a `--shared`
+  scratch clone of the dispatcher's checkout, branches `feature/<N>` from a
+  fresh `origin/main`, cherry-picks with `-x`, runs the repo's `checks` from
+  `recover-ticket.json` (Go: `go vet ./...` and `make build`; desktop:
+  `npm ci` and `npm run typecheck`; other repos: none, said so), and pushes a
+  new `feature/<N>`. If origin already has a different `feature/<N>` it stops
+  and never forces. `--dry-run` does the clone, picks and checks for real in a
+  temporary folder it removes, and pushes nothing. Hand back with `handback`.
+- `family-reset` posts the `<!-- family-dispatch-reset -->` comment on a
+  family root and removes `error:family-breaker`. `--require-progress-hours`
+  refuses unless a child or grandchild moved column or closed that recently;
+  `--min-gap-hours` refuses a second reset within that window.
+- `clear-wip` removes a `wip:<role>` label only when the label was added, and
+  no agent log of the ticket written, at least `--min-age-minutes` ago. Use
+  the dispatcher's own "Stranded-wip gate" time from its start log.
+
+Commits made by the script (only `port`, in its scratch clone) need an
+identity. Fresh clones and the dispatcher's checkout on the pyrybox host have
+none, so `port` sets a repo-local `user.name` and `user.email` in its clone
+when they are missing: `git_identity` in `recover-ticket.json`, the identity
+of the dispatcher's own commits, or `--git-name` and `--git-email`. It never
+writes the dispatcher's checkout config, which the containers share.
+
+Nothing is deleted, force pushed or pruned. Never run `git worktree prune`
+from the pyrybox host: the containers write `/work/Projects/...` paths into
+every worktree, so the host sees them all as prunable and a prune drops the
+worktrees of runs in flight. The script maps those paths to the host itself.
+
+Board, project, field and column ids are read live from the board number. The
+repo to board map, the agent roles and the root candidates live in
+`scripts/recover-ticket.json`. The checkout root is `--root`, else
+`$RECOVER_TICKET_ROOT`, else the first that exists of `/work/Projects`,
+`/home/pyry/pyrycode-runtime/work/Projects` and `~/Workspace/Projects`. The
+dispatcher's checkout is `<root>/<repo>` unless `--checkout` says otherwise.
+Tests: `python3 -m unittest discover -s scripts -p 'test_*.py'`.
+
 ## Builder live-test account
 
 `PYRY_DEV_AGENTS_TOKEN` is an optional `op://Automation/xcl7xsu5ppbww3m5gav7wmbt6e/credential` reference resolved at dispatcher start. It must identify the separate service account that can read only the Dev agents vault. Never configure it with the Automation account token.
@@ -852,3 +961,13 @@ finished run's captures remain at their path for the implementation role.
 The spawn scrubber removes both account variables. For builders alone, it maps this restricted token to `OP_SERVICE_ACCOUNT_TOKEN`. Other roles receive neither account. The non-secret `PYRY_AGENT_SHELL_ENV` filter still refuses secret names. Codex builders inherit the restricted account through a names-only shell allowlist, never through a secret value in arguments. That list preserves the container's existing `GH_TOKEN` publishing login and its `DISPLAY` and `PLAYWRIGHT_BROWSERS_PATH` settings for Desktop tests. It does not pass `GITHUB_TOKEN` or the Automation account.
 
 Mobile's `scripts/android-test-gate.py live --tests "Class#method"` fetches its own child login. Go and Desktop repairs use `python3 "$AGENTS_REPO_PATH/dispatcher/scripts/live-claude-gate.py" go --tests "^TestName$"` or `desktop --spec e2e/real-name.spec.ts --tests "test title"`. Run from the product worktree. Build Desktop first. These launchers fetch `op://Dev agents/Claude long term token/password` with the restricted account and remove account credentials from test children. Missing access is an environment error. A zero-test run fails. Record the executed and passed counts. Full-suite runs remain dispatcher work.
+
+## Full-duration process proofs
+
+`pnpm test` runs policy tests and ordinary fake-process integration tests.
+`pnpm run test:slow` includes 13 real-clock timeout, termination and wait-credit proofs.
+The longer tier retains its existing timing margins for loaded hosts.
+Both tiers limit simultaneous test files to four workers so fake child startup
+does not compete with every test file at once.
+Run it after changes to runner timeouts, process termination or wait-credit accounting.
+The consumer launcher exposes it as `bin/pyry-test --slow`.

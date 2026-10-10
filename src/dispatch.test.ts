@@ -24,7 +24,7 @@ import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
 
 import { basename, dirname, join, resolve } from "node:path";
@@ -96,7 +96,13 @@ import {
   type StreamResult,
   runEnvPreflight,
   type EnvPreflightState,
+  answerStaleBaseFindings,
+  baseCurrencyNote,
+  recordGateRunMeta,
+  refreshStaleBaseBranch,
 } from "./dispatch.js";
+import { parseGateRunMeta } from "./gate-report.js";
+import { serializeLastVerdict } from "./verdict-handoff.js";
 import { formatGateEvidenceComment } from "./gate-output.js";
 import { flakyMarker } from "./flaky-tickets.js";
 import { FINAL_MERGE_HANDOFF_MARKER, MERGE_RESOLUTION_NOTE_MARKER, mergeResolutionComment } from "./merge-handoff.js";
@@ -116,7 +122,7 @@ import {
   shouldSkipDispatch,
 } from "./pipeline-decisions.js";
 import { AGENTS } from "./types.js";
-import { AgentRunStoppedError, buildResumePrompt, idleStallMessage, noResultErrorMessage, ResourceExhaustedError, timeoutFor } from "./agent-runtime.js";
+import { AgentRunFailedError, AgentRunStoppedError, buildResumePrompt, idleStallMessage, noResultErrorMessage, ResourceExhaustedError, timeoutFor } from "./agent-runtime.js";
 import { resolveAgentsRepoRoot, resolveTargetRepoRoot } from "./worktree.js";
 import { CodexStreamAdapter, TOOL_UNAVAILABLE_REASON } from "./agent-runner.js";
 
@@ -153,7 +159,7 @@ const TEST_CODEGRAPH_PATH = resolve(TEST_REPO_ROOT, ".codegraph");
 export type CallLog = {
   exec: { cmd: string; opts?: any }[];
   spawn: { cmd: string; args: string[]; opts?: any; input?: string }[];
-  fs: { kind: "exists" | "read" | "write" | "mkdir" | "symlink"; path: string; content?: string; target?: string }[];
+  fs: { kind: "exists" | "read" | "write" | "mkdir" | "codegraph-copy"; path: string; content?: string; target?: string }[];
   client: { method: string; args: any[] }[];
   discord: string[];
   /** Count of `runClaudeStreaming` invocations (not the streamed output). */
@@ -318,9 +324,11 @@ export function makeMockDeps(opts: MockDepsOptions = {}): { deps: DispatchDeps; 
     return undefined;
   }) as unknown as typeof import("node:fs").mkdirSync;
 
-  const mockSymlinkSync = ((target: string, path: string) => {
-    calls.fs.push({ kind: "symlink", path: String(path), target: String(target) });
-  }) as unknown as typeof import("node:fs").symlinkSync;
+  const mockCopyCodegraphIndex = ((src: string, dst: string) => {
+    calls.fs.push({ kind: "codegraph-copy", path: String(dst), target: String(src) });
+  }) as typeof import("./codegraph-index.js").copyCodegraphIndex;
+  // No symlinks in the mock filesystem.
+  const mockIsSymlinkPath = (() => false) as typeof import("./codegraph-index.js").isSymlinkPath;
 
   const defaultStream: StreamResult = {
     output: "agent finished cleanly",
@@ -372,7 +380,8 @@ export function makeMockDeps(opts: MockDepsOptions = {}): { deps: DispatchDeps; 
     readFileSync: mockReadFileSync,
     writeFileSync: mockWriteFileSync,
     mkdirSync: mockMkdirSync,
-    symlinkSync: mockSymlinkSync,
+    copyCodegraphIndex: mockCopyCodegraphIndex,
+    isSymlinkPath: mockIsSymlinkPath,
     runClaudeStreaming: mockRunClaudeStreaming,
     notifyDiscord: mockNotifyDiscord,
     buildPromptForAgent: mockBuildPromptForAgent,
@@ -1438,9 +1447,9 @@ describe("setupBranchAndWorktree — coverage edges", () => {
     assert.ok(!calls.exec.some(c => c.cmd.includes("git worktree add")));
   });
 
-  test("codegraph symlink — source missing → warn, no symlink, still {ok:true}", async () => {
-    // `decideCodegraphSymlink({sourceExists:false, destExists:false})`
-    // returns `skip / no-source` — caller should warn but not fail.
+  test("codegraph index copy: source missing → warn, no copy, still {ok:true}", async () => {
+    // `decideCodegraphIndexCopy({sourceExists:false, ...})` returns
+    // `skip / no-source`: the caller warns but doesn't fail.
     const { ctx, calls } = makeTestContext({
       item: { issueNumber: 115 },
       mockOptions: {
@@ -1458,13 +1467,12 @@ describe("setupBranchAndWorktree — coverage edges", () => {
     const result = await setupBranchAndWorktree(ctx);
 
     assert.deepEqual(result, { ok: true }, "missing codegraph source must not block dispatch");
-    // No symlink should have been issued — the existsSync check on the
-    // source returned false (empty fsMap), so decideCodegraphSymlink
-    // returns skip/no-source.
+    // No copy: the existsSync check on the source database returned
+    // false (empty fsMap), so decideCodegraphIndexCopy returns skip/no-source.
     assert.equal(
-      calls.fs.filter(c => c.kind === "symlink").length,
+      calls.fs.filter(c => c.kind === "codegraph-copy").length,
       0,
-      "no symlinkSync should be invoked when source is missing",
+      "no index copy should be made when the source is missing",
     );
   });
 
@@ -1961,7 +1969,7 @@ describe("prepareAgentSpawn", () => {
     assert.equal(config.timeoutMs, 1_500_000, "developer = 25min");
     // baseTools without Agent (developer doesn't sub-dispatch).
     assert.ok(config.allowedTools.includes("Bash,Read,Write,Edit"));
-    assert.ok(config.allowedTools.includes("mcp__codegraph__"));
+    assert.ok(config.allowedTools.includes("mcp__codegraph__codegraph_explore"));
     assert.ok(
       config.allowedTools.includes("mcp__plugin_context7_context7__resolve-library-id"),
       "context7 must use the plugin tool name so the allowlist matches the loaded tool",
@@ -2628,6 +2636,37 @@ describe("handleAgentResultErrors", () => {
     assert.ok(ghPrCreate!.args.includes("--draft"), "salvage PR must be a DRAFT");
     // Salvage comment posted to the issue.
     assert.ok(client.comments.some(c => /Salvaged from `max_turns`/.test(c.body)));
+  });
+
+  test("the draft PR's 'Last messages' block holds the agent's own last output, not the empty result text (#16)", async () => {
+    const { ctx, calls } = makeTestContext({
+      item: { issueNumber: 445 },
+      mockOptions: { execImpls: { "gh pr list --head": () => "[]", "git status --porcelain": () => "M new.go\n" } },
+    });
+
+    // A max_turns result frame carries no `result` text: output is "".
+    await handleAgentResultErrors(
+      streamResult({ isError: true, terminalReason: "max_turns", numTurns: 71, output: "", agentOutputTail: "Tests pass; drafting the commit.\n[Bash] go test ./..." }),
+      ctx,
+    );
+
+    const body = String(calls.spawn.find(s => s.cmd === "gh" && s.args.includes("create"))?.input ?? "");
+    assert.match(body, /\*\*Last messages from the agent \(may include unresolved findings\):\*\*\n\n```\nTests pass; drafting the commit\.\n\[Bash\] go test \.\/\.\.\.\n```/);
+  });
+
+  test("the draft PR's 'Last messages' block falls back to the last assistant text, then says the agent wrote none", async () => {
+    for (const [over, expected] of [
+      [{ lastAssistantText: "Still chasing the transport_test flake." }, "Still chasing the transport_test flake."],
+      [{}, "(the agent wrote no text before it stopped)"],
+    ] as const) {
+      const { ctx, calls } = makeTestContext({
+        item: { issueNumber: 446 },
+        mockOptions: { execImpls: { "gh pr list --head": () => "[]", "git status --porcelain": () => "M new.go\n" } },
+      });
+      await handleAgentResultErrors(streamResult({ isError: true, terminalReason: "max_turns", output: "", ...over }), ctx);
+      const body = String(calls.spawn.find(s => s.cmd === "gh" && s.args.includes("create"))?.input ?? "");
+      assert.ok(body.includes("```\n" + expected + "\n```"), expected);
+    }
   });
 
   test("gh pr list fails → SALVAGE_GH_FAILED warn, falls through; throws when neither salvage applies", async () => {
@@ -3980,6 +4019,194 @@ describe("parallel verifier source review", () => {
       });
     });
   }
+});
+
+// Mobile #1619, 2026-10-03, twice: the gates took the verifier's whole
+// hour, the final review never started, and the ticket got a bare error
+// string. A person read the logs, wrote down that the gates were green and
+// reusable, cleared the label and dispatched again. Gate time is not charged
+// to the review, in either mode, and a verdict run that still runs out of
+// time or turns leaves one comment that says what ran out and what it got
+// through (verifier-out-of-time.ts).
+describe("verifier out of time (mobile #1619)", () => {
+  const MIN = 60_000;
+  async function withVerifier(fn: () => Promise<void>, opts: { runner?: "claude" | "codex"; parallel: boolean }) {
+    const prior = { runner: process.env.PYRY_AGENT_RUNNER, parallel: process.env.PYRY_VERIFIER_PARALLEL_REVIEW };
+    process.env.PYRY_AGENT_RUNNER = opts.runner ?? "codex";
+    process.env.PYRY_VERIFIER_PARALLEL_REVIEW = opts.parallel ? "1" : "0";
+    try { await withStageSet("builder", () => withVerifierGates("make check", fn)); }
+    finally {
+      if (prior.runner === undefined) delete process.env.PYRY_AGENT_RUNNER; else process.env.PYRY_AGENT_RUNNER = prior.runner;
+      if (prior.parallel === undefined) delete process.env.PYRY_VERIFIER_PARALLEL_REVIEW; else process.env.PYRY_VERIFIER_PARALLEL_REVIEW = prior.parallel;
+    }
+  }
+  function fixture(n: number, extra: { execImpls?: Record<string, ExecHandler>; fsMap?: Record<string, string> } = {}) {
+    const client = new MockGitHubClient({ status: { [n]: "In Code Review" }, labels: { [n]: [] } });
+    const { deps, calls } = makeMockDeps({
+      execImpls: { ...fullHappyExecImpls(`feature/${n}`), ...(extra.execImpls ?? {}) },
+      fsMap: { [claudeMdAbsPath("verifier/CLAUDE.md")]: "Review independently", ...(extra.fsMap ?? {}) },
+    });
+    return { client, deps, calls, run: () => dispatchToAgent(builderAgent("verifier"), makeProjectItem({ issueNumber: n }), client, deps) };
+  }
+  /** Run `fn` on a clock the test moves by hand. */
+  async function onClock(fn: (clock: { t0: number; set: (offsetMs: number) => void }) => Promise<void>) {
+    const realNow = Date.now;
+    const t0 = realNow();
+    let now = t0;
+    Date.now = () => now;
+    try { await fn({ t0, set: (offsetMs) => { now = t0 + offsetMs; } }); }
+    finally { Date.now = realNow; }
+  }
+  const timedOutResult = (runner: "claude" | "codex", sessionId: string) =>
+    streamResult({ runner, isError: true, timedOut: true, terminalReason: "timeout", sessionId, output: "", agentOutputTail: "[shell] figma get_screenshot 696:4913\nComparing Figma frames" });
+  /** The one comment the park left, after asserting the run parked and did not advance. */
+  function parkComment(f: ReturnType<typeof fixture>, n: number): string {
+    assert.ok(f.client.addLabelCalls.some(x => x.issueNumber === n && x.label === "error:verifier"));
+    assert.ok(!f.client.addLabelCalls.some(x => x.label === "done:verifier"));
+    const bodies = f.client.comments.filter(c => c.issueNumber === n).map(c => c.body);
+    assert.equal(bodies.length, 1, "one comment on the ticket");
+    assert.doesNotMatch(bodies[0]!, /Agent Error|Manual intervention required/);
+    assert.ok(f.calls.discord.some(m => /ran out of (time|turns) on #\d+ with no verdict/.test(m)));
+    return bodies[0]!;
+  }
+
+  for (const runner of ["codex", "claude"] as const) {
+    test(`${runner}: gates longer than the budget, then the final review runs out of its own time`, async () => {
+      await withVerifier(() => onClock(async (clock) => {
+        const f = fixture(1619);
+        let budget = 0;
+        let finalTimeout = 0;
+        f.deps.spawnGate = async () => {
+          await new Promise<void>(r => setTimeout(r, 5));
+          clock.set(61 * MIN);
+          return { exitCode: 0, timedOut: false, spawnError: null };
+        };
+        f.deps.runClaudeStreaming = async opts => {
+          if (opts.sourceReview) {
+            budget = opts.timeoutMs;
+            await new Promise<void>(r => setImmediate(r));
+            clock.set(4 * MIN);
+            return streamResult({ runner, output: "No MUST FIX findings.\n- NIT: index.md, Failure notice" });
+          }
+          finalTimeout = opts.timeoutMs;
+          clock.set(61 * MIN + finalTimeout);
+          // Claude's runner rejects when the wall clock kills it with no result frame.
+          if (runner === "claude") throw new AgentRunStoppedError(`Agent timed out after ${opts.timeoutMs / 1000}s`, "timeout", "[Bash] figma get_screenshot 696:4913\nComparing Figma frames");
+          return timedOutResult(runner, "final-thread");
+        };
+        await f.run();
+        assert.equal(finalTimeout, budget - 4 * MIN, "an hour of gates costs the final review nothing");
+        const body = parkComment(f, 1619);
+        assert.match(body, /^## ⏱️ Verifier ran out of time/);
+        assert.match(body, new RegExp(`The verifier's final review used its ${Math.round(finalTimeout / MIN)}-minute budget\\. It was stopped before it published a verdict\\.`));
+        assert.match(body, /\*\*Gates:\*\* took 61 minutes\. That time is not charged to the review's budget\./);
+        assert.match(body, /\*\*Source review:\*\* finished in 4 minutes\./);
+        assert.match(body, /<summary>Source review report<\/summary>\n\nNo MUST FIX findings\.\n- NIT: index\.md, Failure notice/);
+        assert.match(body, /remove `error:verifier` to run the verifier again/);
+        assert.match(body, /\*\*Last output from the agent\*\*.*\n\n```\n\[(shell|Bash)\] figma get_screenshot 696:4913\nComparing Figma frames\n```/);
+        if (runner === "codex") assert.match(body, /\*\*Debug\*\*: `codex resume final-thread`/);
+      }), { runner, parallel: true });
+    });
+  }
+
+  test("a source review that runs out of time says the final review never started", async () => {
+    await withVerifier(async () => {
+      const f = fixture(1620);
+      let finalized = false;
+      f.deps.runClaudeStreaming = async opts => {
+        if (opts.sourceReview) return timedOutResult("codex", "source-thread");
+        finalized = true;
+        return streamResult({ runner: "codex" });
+      };
+      await f.run();
+      assert.equal(finalized, false);
+      const minutes = timeoutFor(builderAgent("verifier")) / MIN;
+      assert.match(parkComment(f, 1620), new RegExp(`The verifier's source review used its ${minutes}-minute budget\\. The final review never started, so no verdict was published\\.`));
+    }, { parallel: true });
+  });
+
+  test("Claude: a source review that uses every shared turn leaves the turns comment", async () => {
+    await withVerifier(async () => {
+      const f = fixture(1621);
+      f.deps.runClaudeStreaming = async opts => {
+        if (opts.sourceReview) return streamResult({ output: "Source findings", numTurns: opts.maxTurns });
+        throw new Error("the final review must not start");
+      };
+      await f.run();
+      const body = parkComment(f, 1621);
+      assert.match(body, /^## ⏱️ Verifier ran out of turns/);
+      assert.match(body, /The verifier's source review used the whole turn budget\. The final review never started/);
+      assert.match(body, /Source findings/);
+    }, { runner: "claude", parallel: true });
+  });
+
+  test("serial: gates longer than the budget leave the verifier its whole clock", async () => {
+    await withVerifier(() => onClock(async (clock) => {
+      const f = fixture(1622);
+      let agentTimeout = 0;
+      f.deps.spawnGate = async () => {
+        clock.set(61 * MIN);
+        return { exitCode: 0, timedOut: false, spawnError: null };
+      };
+      f.deps.runClaudeStreaming = async opts => {
+        agentTimeout = opts.timeoutMs;
+        return streamResult({ runner: "codex", output: "Verdict posted" });
+      };
+      await f.run();
+      assert.equal(agentTimeout, timeoutFor(builderAgent("verifier")));
+      assert.ok(!f.client.addLabelCalls.some(x => x.label === "error:verifier"));
+    }), { parallel: false });
+  });
+
+  test("serial: a review that runs out after its continuation leg names the leg and the reusable gate run", async () => {
+    const n = 1623;
+    const HEAD = "c".repeat(40);
+    const TREE = "e".repeat(40);
+    const logsDir = resolve(TEST_AGENTS_REPO_ROOT, "logs");
+    const logPaths = [resolve(logsDir, `verifier-gate_#${n}_1.log`), resolve(logsDir, `verifier-gate_#${n}_1.stderr.log`)];
+    const passedAt = new Date(Date.now() - 60 * MIN).toISOString();
+    const pass: VerifierGatePass = {
+      issueNumber: n, commit: HEAD, tree: TREE, gatesHash: hashGateList(["make check"]), gates: ["make check"],
+      passedAt, summary: ["✓ make check (exit 0)"], logPaths,
+    };
+    await withVerifier(async () => {
+      const f = fixture(n, {
+        execImpls: { "git rev-parse HEAD": () => `${HEAD}\n${TREE}\n` },
+        fsMap: { [resolve(logsDir, `verifier-gate_#${n}.pass.json`)]: JSON.stringify(pass), ...Object.fromEntries(logPaths.map(p => [p, ""])) },
+      });
+      let runs = 0;
+      f.deps.runClaudeStreaming = async opts => {
+        runs++;
+        return timedOutResult("codex", opts.resumeSessionId ?? "review-thread");
+      };
+      await f.run();
+      assert.equal(runs, 2, "the first leg and one continuation leg");
+      assert.equal(f.calls.gates.length, 0, "the recorded pass stood in for the gates");
+      const body = parkComment(f, n);
+      const minutes = timeoutFor(builderAgent("verifier")) / MIN;
+      assert.match(body, new RegExp(`The verifier used its ${minutes}-minute budget and one continuation leg with a fresh budget\\. It was stopped before it published a verdict\\.`));
+      assert.match(body, /\*\*Gates:\*\* took under a minute\./);
+      const until = new Date(Date.parse(passedAt) + 24 * 60 * MIN).toISOString().slice(0, 16).replace("T", " ");
+      assert.ok(body.includes(`every gate passed on commit \`${HEAD.slice(0, 12)}\``), body);
+      assert.ok(body.includes(`starts before ${until} UTC`), body);
+      assert.doesNotMatch(body, /Source review/);
+    }, { parallel: false });
+  });
+
+  test("a builder that runs out of time keeps the ordinary error comment", async () => {
+    await withStageSet("builder", async () => {
+      const client = new MockGitHubClient({ status: { 1624: "In Development" }, labels: { 1624: [] } });
+      const { deps } = makeMockDeps({
+        execImpls: fullHappyExecImpls("feature/1624"),
+        fsMap: { [claudeMdAbsPath("builder/CLAUDE.md")]: "Build it" },
+        streamResult: () => { throw new AgentRunStoppedError("Agent timed out after 2400s", "timeout"); },
+      });
+      await dispatchToAgent(builderAgent("builder"), makeProjectItem({ issueNumber: 1624 }), client, deps);
+      const bodies = client.comments.filter(c => c.issueNumber === 1624).map(c => c.body);
+      assert.ok(bodies.some(b => /## ⚠️ Agent Error: builder/.test(b)));
+      assert.ok(!bodies.some(b => /ran out of time/.test(b)));
+    });
+  });
 });
 
 describe("dispatchToAgent — orchestrator integration", () => {
@@ -7010,7 +7237,7 @@ describe("createCodegraphReindexer (post-merge, background, one at a time)", () 
     try { await fn(warnings); } finally { console.warn = origWarn; console.log = origLog; }
   };
 
-  test("runs codegraph index -f at the repo root and returns before it finishes", async () => {
+  test("runs codegraph sync -q at the repo root and returns before it finishes", async () => {
     await withWarnings(async () => {
       const calls: { cmd: string; args: string[]; cwd: string }[] = [];
       const reindexer = createCodegraphReindexer(async (cmd, args, opts) => {
@@ -7019,7 +7246,7 @@ describe("createCodegraphReindexer (post-merge, background, one at a time)", () 
       });
       reindexer.request("/repo");
       await reindexer.whenIdle();
-      assert.deepEqual(calls, [{ cmd: "codegraph", args: ["index", "-f"], cwd: "/repo" }]);
+      assert.deepEqual(calls, [{ cmd: "codegraph", args: ["sync", "-q"], cwd: "/repo" }]);
     });
   });
 
@@ -7228,7 +7455,7 @@ describe("spawnGateCommand — the real spawner", () => {
     assert.equal(readFileSync(stderrPath, "utf-8").trim(), "to-stderr");
   });
 
-  test("waiting for the Android device moves the deadline by the time waited", { timeout: 20_000 }, async (t) => {
+  test("waiting for the Android device moves the deadline by the time waited", { timeout: 20_000, skip: process.env.PYRY_SLOW_TESTS !== "1" }, async (t) => {
     const saved = process.env.PYRY_TIMEOUT_CEILING_FACTOR;
     process.env.PYRY_TIMEOUT_CEILING_FACTOR = "10";
     t.after(() => { if (saved === undefined) delete process.env.PYRY_TIMEOUT_CEILING_FACTOR; else process.env.PYRY_TIMEOUT_CEILING_FACTOR = saved; });
@@ -7247,7 +7474,7 @@ describe("spawnGateCommand — the real spawner", () => {
     assert.equal(readFileSync(tmp("device-wait.log"), "utf-8").trim(), "done");
   });
 
-  test("waiting for a Gradle build place on stdout moves the deadline too", { timeout: 20_000 }, async (t) => {
+  test("waiting for a Gradle build place on stdout moves the deadline too", { timeout: 20_000, skip: process.env.PYRY_SLOW_TESTS !== "1" }, async (t) => {
     const saved = process.env.PYRY_TIMEOUT_CEILING_FACTOR;
     process.env.PYRY_TIMEOUT_CEILING_FACTOR = "10";
     t.after(() => { if (saved === undefined) delete process.env.PYRY_TIMEOUT_CEILING_FACTOR; else process.env.PYRY_TIMEOUT_CEILING_FACTOR = saved; });
@@ -7265,7 +7492,7 @@ describe("spawnGateCommand — the real spawner", () => {
     assert.ok((outcome.waitCreditMs ?? 0) >= 3000, `credit ${outcome.waitCreditMs}`);
   });
 
-  test("a gate still waiting at the hard ceiling is torn down", { timeout: 20_000 }, async (t) => {
+  test("a gate still waiting at the hard ceiling is torn down", { timeout: 20_000, skip: process.env.PYRY_SLOW_TESTS !== "1" }, async (t) => {
     const saved = process.env.PYRY_TIMEOUT_CEILING_FACTOR;
     process.env.PYRY_TIMEOUT_CEILING_FACTOR = "2";
     t.after(() => { if (saved === undefined) delete process.env.PYRY_TIMEOUT_CEILING_FACTOR; else process.env.PYRY_TIMEOUT_CEILING_FACTOR = saved; });
@@ -7922,6 +8149,40 @@ describe("maybeResumeExhaustedRun — same-dispatch continuation leg", () => {
       assert.equal(calls.claudeStreams, 1);
       // Salvage must see the original inputs — the very same object.
       assert.equal(result, first);
+    });
+  });
+
+  test("still exhausted: salvage gets the original result, but with the last leg's agent output", async () => {
+    await withResumeLegs(undefined, async () => {
+      const { ctx } = makeTestContext({
+        mockOptions: {
+          streamResult: () => streamResult({ isError: true, terminalReason: "max_turns", sessionId: "sess-first", numTurns: 135, agentOutputTail: "leg two: rerunning the gate" }),
+        },
+      });
+      const first = { ...EXHAUSTED_MAX_TURNS(), agentOutputTail: "leg one: writing tests" };
+
+      const result = await maybeResumeExhaustedRun(first, makeSpawnConfig(ctx.logFile), ctx);
+
+      assert.equal(result.agentOutputTail, "leg two: rerunning the gate");
+      assert.equal(result.numTurns, first.numTurns, "every other field is the original first leg's");
+      assert.equal(result.output, first.output);
+      assert.equal(result.terminalReason, "max_turns");
+    });
+  });
+
+  test("a continuation leg rejected with the agent's output hands that output on", async () => {
+    await withResumeLegs(undefined, async () => {
+      const { ctx } = makeTestContext({
+        mockOptions: {
+          streamResult: () => { throw new AgentRunStoppedError("Agent timed out after 1500s", "timeout", "leg two: stuck in connectedAndroidTest"); },
+        },
+      });
+      const first = EXHAUSTED_MAX_TURNS();
+
+      const result = await maybeResumeExhaustedRun(first, makeSpawnConfig(ctx.logFile), ctx);
+
+      assert.equal(result.agentOutputTail, "leg two: stuck in connectedAndroidTest");
+      assert.equal(result.terminalReason, first.terminalReason);
     });
   });
 
@@ -10358,17 +10619,81 @@ describe("partial-work salvage — stopped run with an existing PR (mobile #1430
     assert.ok(calls.logs.some(l => l.section === "PARTIAL_SALVAGE_SKIPPED" && /nothing to save/.test(l.content)));
   });
 
-  test("skipped when the branch has no PR (the draft-PR salvage owns that case)", async () => {
+  test("no PR on the branch: the reject door never reaches the draft-PR salvage, so the branch is pushed and no PR is opened (#18)", async () => {
     const { agent, item, client, deps, calls } = stoppedRun({
       issue: 1438,
+      agent: { name: "developer" },
       stop: { reject: new AgentRunStoppedError("Agent timed out after 2280s", "timeout") },
       exec: { "gh pr list --head": () => "[]", "git status --porcelain": () => " M a.md\n" },
     });
 
     await dispatchToAgent(agent, item, client, deps);
 
+    assert.equal(commitOf(calls)?.args[2], "wip(developer): partial work from a timed-out run (#1438)");
+    assert.deepEqual(pushOf(calls)?.args, ["push", "-u", "origin", "feature/1438"]);
+    assert.ok(!calls.spawn.some(c => c.cmd === "gh" && c.args.includes("create")), "no PR is opened");
+    assert.ok(!client.addLabelCalls.some(c => c.label === "error:max_turns_salvaged"));
+    const saved = client.comments.find(c => /Partial work saved/.test(c.body))?.body ?? "";
+    assert.match(saved, /pushed them to `feature\/1438`, so nothing is lost/);
+    assert.doesNotMatch(saved, /\(PR #/);
+    assert.ok(client.addLabelCalls.some(c => c.label === "error:developer"), "the timeout still parks");
+  });
+
+  test("a crash with no result frame (pyrycode-mobile #1340 shape) saves a builder's work and the comment shows the agent's last output", async () => {
+    const tail = "All tests pass. Committing the fix.\n[Bash] git commit -m 'fix(thread): close the prompt'";
+    const { agent, item, client, deps, calls } = stoppedRun({
+      issue: 1440,
+      agent: { name: "builder", column: "In Development", claudeMdPath: "builder/CLAUDE.md", producesCommits: true },
+      stop: { reject: new AgentRunFailedError(noResultErrorMessage(1, "Error: socket hang up\n"), tail) },
+      exec: { "gh pr list --head": () => PR_JSON, "git status --porcelain": () => " M app/src/Thread.kt\n" },
+    });
+
+    await dispatchToAgent(agent, item, client, deps);
+
+    assert.equal(commitOf(calls)?.args[2], "wip(builder): partial work from a run that ended in an error (#1440)");
+    assert.ok(pushOf(calls), "pushed to the branch");
+    assert.ok(client.comments.some(c => /Partial work saved/.test(c.body) && /The builder run ended in an error/.test(c.body)));
+    const park = client.comments.find(c => /Agent Error: builder/.test(c.body))?.body ?? "";
+    assert.match(park, /Claude CLI exited with code 1, no result message received/);
+    assert.match(park, /\*\*Last output from the agent\*\* \(its messages and tool calls, newest last\):\n\n```\nAll tests pass\. Committing the fix\.\n\[Bash\] git commit/);
+    assert.ok(client.addLabelCalls.some(c => c.label === "error:builder"));
+    assert.ok(cleanupRan(calls.exec), "teardown runs after a successful push");
+  });
+
+  test("a Codex error result with commits origin lacks → pushed without a new commit", async () => {
+    const { agent, item, client, deps, calls } = stoppedRun({
+      issue: 1441,
+      agent: { name: "builder", column: "In Development", claudeMdPath: "builder/CLAUDE.md", producesCommits: true },
+      stop: { result: streamResult({
+        runner: "codex", isError: true, terminalReason: "codex_error",
+        output: "Codex exited with code 1 without a successful completed task outcome",
+        agentOutputTail: "Running the device gate.\n[shell] /bin/zsh -lc 'python3 scripts/android-test-gate.py ui'",
+      }) },
+      exec: { "gh pr list --head": () => PR_JSON, "git status --porcelain": () => "", "git rev-list --count origin/feature/1441..HEAD": () => "1\n" },
+    });
+
+    await dispatchToAgent(agent, item, client, deps);
+
+    assert.equal(commitOf(calls), undefined);
+    assert.ok(pushOf(calls));
+    assert.ok(client.comments.some(c => /found local commits origin did not have/.test(c.body)));
+    const park = client.comments.find(c => /Agent Error: builder/.test(c.body))?.body ?? "";
+    assert.match(park, /\[shell\] \/bin\/zsh -lc 'python3 scripts\/android-test-gate\.py ui'/);
+  });
+
+  test("a blocked Codex run is still never pushed, whatever ended it", async () => {
+    const { agent, item, client, deps, calls } = stoppedRun({
+      issue: 1442,
+      agent: { name: "builder", column: "In Development", claudeMdPath: "builder/CLAUDE.md", producesCommits: true },
+      stop: { result: streamResult({ runner: "codex", isError: true, terminalReason: "codex_blocked", output: "A required commit was rejected." }) },
+      exec: { "gh pr list --head": () => PR_JSON, "git status --porcelain": () => " M a.kt\n" },
+    });
+
+    await dispatchToAgent(agent, item, client, deps);
+
+    assert.equal(commitOf(calls), undefined);
     assert.equal(pushOf(calls), undefined);
-    assert.ok(calls.logs.some(l => l.section === "PARTIAL_SALVAGE_SKIPPED" && /no open pull request/.test(l.content)));
+    assert.ok(!client.comments.some(c => /Partial work/.test(c.body)));
   });
 
   test("push failure → comment names the kept worktree, and the teardown is skipped", async () => {
@@ -10388,6 +10713,58 @@ describe("partial-work salvage — stopped run with an existing PR (mobile #1430
     assert.ok(calls.logs.some(l => l.section === "PARTIAL_SALVAGE_PUSH_FAILED" && /non-fast-forward/.test(l.content)));
     assert.ok(client.addLabelCalls.some(c => c.label === "error:documentation"), "the error path still runs");
     assert.ok(!cleanupRan(calls.exec), "the worktree holding the only copy is not torn down");
+  });
+});
+
+describe("the error comment shows the agent's own last output (agent-dispatcher #16)", () => {
+  const block = (body: string, heading: RegExp) => {
+    const at = body.search(heading);
+    if (at < 0) return null;
+    const open = body.indexOf("```\n", at) + 4;
+    return body.slice(open, body.indexOf("\n```", open));
+  };
+
+  test("from the result: its own block after the error, before the debug hint", async () => {
+    const { ctx, client } = makeTestContext({ agent: { name: "documentation" }, item: { issueNumber: 1430 } });
+    const result = streamResult({ isError: true, timedOut: true, sessionId: "sess-1430", agentOutputTail: "Now updating the catalog.\n[Edit] docs/knowledge/CATALOG.md" });
+
+    await handleDispatchError(new Error("Agent error (unknown). Ran 38m 0s (timeout 38min)."), ctx, result);
+
+    const body = client.comments.find(c => /Agent Error: documentation/.test(c.body))?.body ?? "";
+    assert.equal(block(body, /Last output from the agent/), "Now updating the catalog.\n[Edit] docs/knowledge/CATALOG.md");
+    assert.ok(body.indexOf("Agent error (unknown)") < body.indexOf("Last output from the agent"));
+    assert.ok(body.indexOf("Last output from the agent") < body.indexOf("**Debug**"));
+  });
+
+  test("from the runner's rejection when no result came back", async () => {
+    const { ctx, client } = makeTestContext({ agent: { name: "documentation" }, item: { issueNumber: 1431 } });
+    const err = new AgentRunStoppedError("Agent timed out after 2280s", "timeout", "Running the docs size check.\n[Bash] python3 scripts/docs-size.py");
+
+    await handleDispatchError(err, ctx, null);
+
+    const body = client.comments.find(c => /Agent Error: documentation/.test(c.body))?.body ?? "";
+    assert.match(body, /```\nAgent timed out after 2280s\n```/);
+    assert.equal(block(body, /Last output from the agent/), "Running the docs size check.\n[Bash] python3 scripts/docs-size.py");
+  });
+
+  test("no section when the agent wrote nothing", async () => {
+    const { ctx, client } = makeTestContext({ agent: { name: "verifier", producesCommits: false }, item: { issueNumber: 1432 } });
+
+    await handleDispatchError(new AgentRunFailedError(noResultErrorMessage(1, "")), ctx, null);
+
+    const body = client.comments.find(c => /Agent Error: verifier/.test(c.body))?.body ?? "";
+    assert.ok(body.length > 0);
+    assert.doesNotMatch(body, /Last output from the agent/);
+  });
+
+  test("the agent's words never make a crash retry: classification reads only the error message", async () => {
+    const { ctx, client } = makeTestContext({ agent: { name: "verifier", producesCommits: false }, item: { issueNumber: 1433 } });
+    const err = new AgentRunFailedError(noResultErrorMessage(1, ""), "The API answered 529 overloaded and a socket hang up earlier; retrying.");
+
+    await handleDispatchError(err, ctx, null);
+
+    assert.ok(client.addLabelCalls.some(c => c.label === "error:verifier"), "parks for a human");
+    assert.ok(!client.comments.some(c => /Auto-retry scheduled/.test(c.body)));
   });
 });
 
@@ -11445,5 +11822,261 @@ describe("verdict handoff lands where the pipeline helper accepts it (desktop #1
     // dotenv prints a line of its own first; the result is the last line.
     const { homes } = JSON.parse(child.stdout.trim().split("\n").at(-1)!);
     assert.equal(homes[0], homedir(), "the dispatcher's own home comes first");
+  });
+});
+
+// --------- Merge race (2026-10-07) ---------
+//
+// Main moved between the verifier's setup merge and its pre-verify gate, and
+// four desktop tickets lost a builder round each to a FAIL that only said
+// "merge current main" (#1731, #1779, #1818, #1825). The dispatcher now
+// merges main again right before the gates, and settles a stale base FAIL
+// itself (reconcile.ts) through refreshStaleBaseBranch.
+
+describe("refreshStaleBaseBranch: merges current main into the pushed branch", () => {
+  function sh(cmd: string, cwd: string): string {
+    return execSync(cmd, { cwd, encoding: "utf-8", stdio: "pipe" }).trim();
+  }
+  /** origin with main and feature/1825, a clone as the dispatcher's repo, and main moved on origin since. */
+  function repos() {
+    const root = mkdtempSync(join(tmpdir(), "stale-base-"));
+    const origin = join(root, "origin.git");
+    const work = join(root, "work", "pyrycode-desktop");
+    const other = join(root, "other");
+    sh(`git init -q --bare -b main "${origin}"`, root);
+    for (const dir of [work, other]) {
+      sh(`git clone -q "${origin}" "${dir}"`, root);
+      sh(`git config user.name Test && git config user.email test@example.com`, dir);
+    }
+    writeFileSync(join(work, "a.txt"), "one\ntwo\nthree\n");
+    sh(`git checkout -q -b main && git add a.txt && git commit -q -m base && git push -q origin main`, work);
+    sh(`git checkout -q -b feature/1825 && echo feature > f.txt && git add f.txt && git commit -q -m feature && git push -q -u origin feature/1825 && git checkout -q main`, work);
+    sh(`git fetch -q origin && git checkout -q -b main origin/main && echo moved > m.txt && git add m.txt && git commit -q -m "main moved" && git push -q origin main`, other);
+    return { root, origin, work, other, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+  }
+
+  test("main moved: a merge commit with both parents is pushed to origin/feature/1825 and the worktree is gone", () => {
+    const r = repos();
+    try {
+      const oldHead = sh(`git rev-parse origin/feature/1825`, r.work);
+      const out = refreshStaleBaseBranch({ issueNumber: 1825, repoRoot: r.work, defaultBranch: "main" });
+      assert.equal(out.kind, "merged", JSON.stringify(out));
+      if (out.kind !== "merged") return;
+      const mainSha = sh(`git rev-parse main`, r.other);
+      assert.equal(out.mainSha, mainSha);
+      assert.equal(sh(`git rev-parse refs/heads/feature/1825`, r.origin), out.headSha, "pushed");
+      assert.deepEqual(sh(`git rev-list --parents -n 1 ${out.headSha}`, r.origin).split(" ").slice(1).sort(), [oldHead, mainSha].sort());
+      assert.equal(sh(`git log -1 --format=%s ${out.headSha}`, r.origin), "Merge branch 'main' into feature/1825");
+      assert.equal(sh(`git worktree list`, r.work).split("\n").length, 1, "the dispatcher's worktree was removed");
+      assert.equal(sh(`git rev-parse feature/1825`, r.work), oldHead, "the local branch is left for the next dispatch to fast-forward");
+
+      const again = refreshStaleBaseBranch({ issueNumber: 1825, repoRoot: r.work, defaultBranch: "main" });
+      assert.deepEqual(again, { kind: "current", mainSha, headSha: out.headSha });
+    } finally { r.cleanup(); }
+  });
+
+  test("main that conflicts with the branch merges nothing and names the file", () => {
+    const r = repos();
+    try {
+      sh(`git checkout -q feature/1825 && printf 'one\\nfeature two\\nthree\\n' > a.txt && git commit -q -am "feature edits a" && git push -q origin feature/1825 && git checkout -q main`, r.work);
+      sh(`printf 'one\\nmain two\\nthree\\n' > a.txt && git commit -q -am "main edits a" && git push -q origin main`, r.other);
+      const before = sh(`git rev-parse refs/heads/feature/1825`, r.origin);
+      const out = refreshStaleBaseBranch({ issueNumber: 1825, repoRoot: r.work, defaultBranch: "main" });
+      assert.deepEqual(out, { kind: "conflict", paths: ["a.txt"] });
+      assert.equal(sh(`git rev-parse refs/heads/feature/1825`, r.origin), before, "nothing pushed");
+      assert.equal(sh(`git worktree list`, r.work).split("\n").length, 1);
+    } finally { r.cleanup(); }
+  });
+
+  test("a local branch with commits origin lacks is left alone", () => {
+    const r = repos();
+    try {
+      sh(`git checkout -q feature/1825 && echo local > l.txt && git add l.txt && git commit -q -m unpushed && git checkout -q main`, r.work);
+      const before = sh(`git rev-parse refs/heads/feature/1825`, r.origin);
+      const out = refreshStaleBaseBranch({ issueNumber: 1825, repoRoot: r.work, defaultBranch: "main" });
+      assert.equal(out.kind, "failed");
+      assert.match((out as { reason: string }).reason, /commits origin\/feature\/1825 lacks/);
+      assert.equal(sh(`git rev-parse refs/heads/feature/1825`, r.origin), before);
+    } finally { r.cleanup(); }
+  });
+
+  test("a branch origin does not have is a failure, not a merge", () => {
+    const r = repos();
+    try {
+      const out = refreshStaleBaseBranch({ issueNumber: 4242, repoRoot: r.work, defaultBranch: "main" });
+      assert.equal(out.kind, "failed");
+    } finally { r.cleanup(); }
+  });
+});
+
+describe("answerStaleBaseFindings: the re-review reads why the stale base finding is fixed", () => {
+  const fixture = JSON.parse(readFileSync(new URL("./fixtures/desktop-stale-base-verdicts.json", import.meta.url), "utf8")) as {
+    tickets: Record<string, { comments: Array<{ createdAt: string; body: string }> }>;
+  };
+
+  test("#1825's last FAIL: finding 1 is answered as fixed by the dispatcher's merge", async () => {
+    await withStageSet("builder", async () => {
+      const body = fixture.tickets["1825"].comments[1].body;
+      const commit = "84017318d33f056c02efbc026ab368a415f21a37";
+      const { deps, calls } = makeMockDeps({
+        fsMap: { [lastVerdictPath("verifier", 1825)]: serializeLastVerdict({ decision: "FAIL", commit, labels: ["needs-rework:builder"], body }, "2026-10-07T00:22:16Z") },
+      });
+      answerStaleBaseFindings(1825, { kind: "merged", mainSha: "e94bf2a5aadc057e21828e1ea4ccf7e0e0ff4fc4", headSha: "362f24a647561f7e6071b3a9904d6c3702205a8f" }, deps);
+      const write = calls.fs.find(f => f.kind === "write" && f.path === reworkAnswersPath(1825, commit));
+      assert.ok(write, "answers file written");
+      assert.equal(write!.content, "1. Fixed in 362f24a64756: the dispatcher merged current main (e94bf2a5aadc) into the branch; no source change.\n");
+    });
+  });
+
+  test("no last verdict: nothing is written and nothing throws", async () => {
+    await withStageSet("builder", async () => {
+      const { deps, calls } = makeMockDeps();
+      answerStaleBaseFindings(1825, { kind: "current", mainSha: "a".repeat(40), headSha: "b".repeat(40) }, deps);
+      assert.equal(calls.fs.filter(f => f.kind === "write").length, 0);
+    });
+  });
+});
+
+describe("verifier dispatch merges main again right before its gates", () => {
+  const MAIN = "e94bf2a5aadc057e21828e1ea4ccf7e0e0ff4fc4";
+  const MERGE_MAIN = "git -c merge.conflictStyle=diff3 merge main --no-edit";
+  /** Each `git rev-parse HEAD` reads a new commit, so a merge always moves HEAD. */
+  function headCounter() {
+    let n = 0;
+    return () => `${String(++n).padStart(2, "0")}`.padEnd(40, "c") + "\n";
+  }
+  function deps1825(opts: { ancestor: boolean; conflict?: boolean }) {
+    const claudeMd = claudeMdAbsPath("verifier/CLAUDE.md");
+    let mainMerges = 0;
+    const atFirstGate: { merges: number; pushed: boolean } = { merges: -1, pushed: false };
+    const mocks = makeMockDeps({
+      execImpls: {
+        ...fullHappyExecImpls("feature/1825"),
+        "git rev-parse main": () => MAIN + "\n",
+        "git rev-parse HEAD": headCounter(),
+        [`git merge-base --is-ancestor ${MAIN} HEAD`]: () => (opts.ancestor ? "" : execError({ stderr: "" })),
+        [MERGE_MAIN]: () => {
+          mainMerges++;
+          return opts.conflict && mainMerges === 2 ? execError({ stderr: "CONFLICT (content): Merge conflict in a.txt" }) : "";
+        },
+      },
+      fsMap: { [claudeMd]: "verifier system prompt" },
+      gateImpl: () => {
+        if (atFirstGate.merges < 0) {
+          atFirstGate.merges = mainMerges;
+          atFirstGate.pushed = mocks.calls.exec.some(c => c.cmd === "git push origin feature/1825");
+        }
+        return { exitCode: 0, timedOut: false, spawnError: null };
+      },
+    });
+    return { ...mocks, atFirstGate, mainMerges: () => mainMerges };
+  }
+  const prompt = (calls: ReturnType<typeof makeMockDeps>["calls"]) =>
+    calls.fs.find(f => f.kind === "write" && f.path.endsWith(".prompt-1825.txt"))?.content ?? "";
+
+  test("main moved since setup: merged again and pushed before the first gate, and the prompt names the merged main", async () => {
+    await withStageSet("builder", () => withVerifierGates(undefined, async () => {
+      const { deps, calls, atFirstGate } = deps1825({ ancestor: false });
+      const client = new MockGitHubClient({ status: { 1825: "In Code Review" }, labels: { 1825: [] } });
+      await dispatchToAgent(builderAgent("verifier"), makeProjectItem({ issueNumber: 1825 }), client, deps);
+      assert.equal(atFirstGate.merges, 2, "the setup merge, then the merge before the gates");
+      assert.equal(atFirstGate.pushed, true, "the merge is pushed before any gate runs");
+      const pull = calls.exec.findIndex(c => c.cmd === "git checkout main && git pull");
+      assert.ok(pull >= 0);
+      assert.ok(prompt(calls).includes(baseCurrencyNote("main", MAIN).trim()), prompt(calls).slice(-800));
+    }));
+  });
+
+  test("main unchanged since setup: no second merge, the prompt still names the merged main", async () => {
+    await withStageSet("builder", () => withVerifierGates(undefined, async () => {
+      const { deps, calls, atFirstGate } = deps1825({ ancestor: true });
+      const client = new MockGitHubClient({ status: { 1825: "In Code Review" }, labels: { 1825: [] } });
+      await dispatchToAgent(builderAgent("verifier"), makeProjectItem({ issueNumber: 1825 }), client, deps);
+      assert.equal(atFirstGate.merges, 1);
+      assert.match(prompt(calls), /## Base branch/);
+    }));
+  });
+
+  test("a conflict on the second merge aborts it; the gates judge the setup merge and the prompt claims nothing", async () => {
+    await withStageSet("builder", () => withVerifierGates(undefined, async () => {
+      const { deps, calls, atFirstGate } = deps1825({ ancestor: false, conflict: true });
+      const client = new MockGitHubClient({ status: { 1825: "In Code Review" }, labels: { 1825: [] } });
+      await dispatchToAgent(builderAgent("verifier"), makeProjectItem({ issueNumber: 1825 }), client, deps);
+      assert.equal(atFirstGate.merges, 2);
+      assert.ok(calls.exec.some(c => c.cmd === "git merge --abort"));
+      assert.equal(calls.gates.length > 0, true, "the gates still run");
+      assert.doesNotMatch(prompt(calls), /## Base branch/);
+    }));
+  });
+
+  test("the builder gets no such merge: only the gated agents do", async () => {
+    await withStageSet("builder", () => withVerifierGates(undefined, async () => {
+      const claudeMd = claudeMdAbsPath("builder/CLAUDE.md");
+      const { deps, calls } = makeMockDeps({
+        execImpls: { ...fullHappyExecImpls("feature/1825"), "git rev-parse main": () => MAIN + "\n" },
+        fsMap: { [claudeMd]: "builder system prompt" },
+      });
+      const client = new MockGitHubClient({ status: { 1825: "In Development" }, labels: { 1825: [] } });
+      await dispatchToAgent(builderAgent("builder"), makeProjectItem({ issueNumber: 1825 }), client, deps);
+      assert.ok(!calls.exec.some(c => c.cmd.includes(`merge-base --is-ancestor ${MAIN}`)));
+      assert.doesNotMatch(calls.fs.find(f => f.kind === "write" && f.path.endsWith(".prompt-1825.txt"))?.content ?? "", /## Base branch/);
+    }));
+  });
+
+  test("parallel review: the merge happens before the gates and the source review start", async () => {
+    const prior = { runner: process.env.PYRY_AGENT_RUNNER, parallel: process.env.PYRY_VERIFIER_PARALLEL_REVIEW };
+    process.env.PYRY_AGENT_RUNNER = "codex";
+    process.env.PYRY_VERIFIER_PARALLEL_REVIEW = "1";
+    try {
+      await withStageSet("builder", () => withVerifierGates("make check", async () => {
+        const { deps, calls, atFirstGate, mainMerges } = deps1825({ ancestor: false });
+        let mergesAtSourceStart = -1;
+        deps.runClaudeStreaming = async (o) => {
+          if (o.sourceReview && mergesAtSourceStart < 0) mergesAtSourceStart = mainMerges();
+          return streamResult({ runner: "codex", output: "Published verdict", usage: { input_tokens: 7 } });
+        };
+        const client = new MockGitHubClient({ status: { 1825: "In Code Review" }, labels: { 1825: [] } });
+        await dispatchToAgent(builderAgent("verifier"), makeProjectItem({ issueNumber: 1825 }), client, deps);
+        assert.equal(atFirstGate.merges, 2);
+        assert.equal(mergesAtSourceStart, 2);
+        const finalInput = calls.fs.filter(f => f.kind === "write" && f.path.endsWith(".prompt-1825.txt")).at(-1)?.content ?? "";
+        assert.match(finalInput, /## Base branch/);
+      }));
+    } finally {
+      if (prior.runner === undefined) delete process.env.PYRY_AGENT_RUNNER; else process.env.PYRY_AGENT_RUNNER = prior.runner;
+      if (prior.parallel === undefined) delete process.env.PYRY_VERIFIER_PARALLEL_REVIEW; else process.env.PYRY_VERIFIER_PARALLEL_REVIEW = prior.parallel;
+    }
+  });
+});
+
+describe("recordGateRunMeta: the live gate keeps a run record beside its output", () => {
+  test("writes <output>.meta.log with the tested commits, the outcome and PYRY_BIN", () => {
+    const { deps, calls } = makeMockDeps();
+    const report = {
+      runError: null, timedOut: false, exitCode: 0, tally: null,
+      command: "npx playwright test --config playwright.real-claude.config.ts --reporter=json",
+      branchName: "feature/1818", baseRef: "origin/main",
+      baseSha: "4abcc59eb26217b4a2911edcf30e8386b59faed6", headSha: "7d59fb97d04130eb72da6982d583e2020e2692a9",
+      commitsBehind: 0, durationMs: 420_486, outputPath: "/logs/2026-10-07T02-23-21-880Z_real-claude-gate_#1818.log",
+      outputBytes: 1, baselineFailures: null, baselineSkipReason: null, baselineOutputPath: null,
+      rerunFailures: null, rerunSkipReason: null, rerunOutputPath: null,
+      selection: { mode: "full" as const, reason: "every run" },
+    };
+    recordGateRunMeta(report, deps, { PYRY_BIN: "/usr/local/bin/pyry" });
+    const write = calls.fs.find(f => f.kind === "write");
+    assert.equal(write?.path, "/logs/2026-10-07T02-23-21-880Z_real-claude-gate_#1818.meta.log");
+    const meta = parseGateRunMeta(write!.content!);
+    assert.ok(meta);
+    assert.equal(meta!.headSha, report.headSha);
+    assert.equal(meta!.baseSha, report.baseSha);
+    assert.equal(meta!.selection, "full");
+    assert.equal(meta!.pyryBin, "/usr/local/bin/pyry");
+    assert.equal(meta!.exitCode, 0);
+  });
+
+  test("a report with no output file writes nothing", () => {
+    const { deps, calls } = makeMockDeps();
+    recordGateRunMeta({ outputPath: "(none)" } as any, deps, {});
+    assert.equal(calls.fs.filter(f => f.kind === "write").length, 0);
   });
 });
