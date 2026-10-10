@@ -1,4 +1,5 @@
 import { graphql } from "@octokit/graphql";
+import { githubFetch, freshGitHubRead } from "./github-transport.js";
 import type { ProjectConfig, ProjectItem } from "./types.js";
 import {
   AUTO_RETRY_COMMENT_MARKER,
@@ -96,7 +97,7 @@ async function fetchWithRetry(
 ): Promise<Response> {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      const response = await fetch(url, options);
+      const response = await githubFetch(url, options);
       if (retryOnStatus && !response.ok && RETRYABLE_HTTP_STATUS.has(response.status) && attempt < retries) {
         console.warn(`   ⚠️  fetch got ${response.status} (attempt ${attempt}/${retries}), retrying in ${delayMs}ms...`);
         await new Promise((r) => setTimeout(r, delayMs));
@@ -105,6 +106,7 @@ async function fetchWithRetry(
       }
       return response;
     } catch (error) {
+      if (!["GET", "HEAD"].includes(options.method ?? "GET") && !retryOnStatus) throw error;
       if (attempt === retries) throw error;
       console.warn(`   ⚠️  fetch attempt ${attempt}/${retries} failed, retrying in ${delayMs}ms...`);
       await new Promise((r) => setTimeout(r, delayMs));
@@ -345,6 +347,7 @@ export class GitHubProjectClient {
     this.config = config;
     this.gql = graphql.defaults({
       headers: { authorization: `token ${config.token}` },
+      request: { fetch: githubFetch },
     });
   }
 
@@ -383,7 +386,26 @@ export class GitHubProjectClient {
    * first fetch, so the cached snapshot would be stale.
    */
   async getItemStatus(issueNumber: number, options?: { forceRefresh?: boolean }): Promise<string | null> {
-    if (options?.forceRefresh) this.clearItemsCache();
+    if (options?.forceRefresh) {
+      if (!this.projectId) throw new Error("Not initialized");
+      const result: any = await freshGitHubRead(() => this.gql(`
+        query($owner: String!, $repo: String!, $number: Int!) {
+          repository(owner: $owner, name: $repo) {
+            issue(number: $number) {
+              projectItems(first: 100) {
+                nodes { project { id } fieldValueByName(name: "Status") {
+                  ... on ProjectV2ItemFieldSingleSelectValue { name }
+                } }
+                pageInfo { hasNextPage }
+              }
+            }
+          }
+        }
+      `, { owner: this.config.owner, repo: this.config.repo, number: issueNumber }));
+      const items = result.repository?.issue?.projectItems;
+      if (!items || items.pageInfo?.hasNextPage) throw new Error(`Could not read every board for #${issueNumber}`);
+      return items.nodes.find((item: any) => item.project?.id === this.projectId)?.fieldValueByName?.name ?? null;
+    }
     const all = await this.getAllItems();
     const item = all.find(i => i.issueNumber === issueNumber);
     return item?.status ?? null;
@@ -712,6 +734,10 @@ export class GitHubProjectClient {
   }
 
   async getIssueLabels(issueNumber: number): Promise<string[]> {
+    return freshGitHubRead(() => this.readIssueLabels(issueNumber));
+  }
+
+  private async readIssueLabels(issueNumber: number): Promise<string[]> {
     const response = await fetchWithRetry(
       `https://api.github.com/repos/${this.config.owner}/${this.config.repo}/issues/${issueNumber}/labels`,
       {
@@ -730,6 +756,10 @@ export class GitHubProjectClient {
   }
 
   async getOpenBlockers(issueNumber: number): Promise<number[]> {
+    return freshGitHubRead(() => this.readOpenBlockers(issueNumber));
+  }
+
+  private async readOpenBlockers(issueNumber: number): Promise<number[]> {
     const result: any = await this.gql(`
       query($owner: String!, $repo: String!, $number: Int!) {
         repository(owner: $owner, name: $repo) {

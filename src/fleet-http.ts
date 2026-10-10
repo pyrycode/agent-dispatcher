@@ -1,14 +1,15 @@
 import { createServer, request, type IncomingMessage, type Server } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 import { chmodSync } from "node:fs";
+import type { GitHubBroker, GitHubRequest, GitHubResponse } from "./github-broker.js";
 import type { Claim, FleetStore, FleetSnapshot, StartRequest, StartResult } from "./fleet-store.js";
 
-export async function readJson(req: IncomingMessage): Promise<any> {
+export async function readJson(req: IncomingMessage, maxBytes = 1024 * 1024): Promise<any> {
   let size = 0;
   const chunks: Buffer[] = [];
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > 1024 * 1024) throw new Error("Request too large");
+    if (size > maxBytes) throw new Error("Request too large");
     chunks.push(Buffer.from(chunk));
   }
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
@@ -27,7 +28,7 @@ export async function listen(server: Server, port: number | string, host = "127.
   if (typeof port === "string") chmodSync(port, 0o600);
   return server;
 }
-export async function serveFleet(store: FleetStore, machines: Record<string, string>, admin: string, port: number, host = "127.0.0.1"): Promise<Server> {
+export async function serveFleet(store: FleetStore, machines: Record<string, string>, admin: string, port: number, host = "127.0.0.1", github?: GitHubBroker): Promise<Server> {
   const secrets = [...Object.values(machines), admin];
   if (secrets.some(s => !s) || new Set(secrets).size !== secrets.length) throw new Error("Fleet credentials must be non-empty and distinct");
   const server = createServer(async (req, res) => {
@@ -40,8 +41,13 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
     if (!isAdmin && !machine) return send(401, { error: "Authentication required" });
     try {
       if (req.method === "GET" && req.url === "/state") return send(200, store.snapshot());
+      if (req.method === "GET" && req.url === "/github/status" && isAdmin) return send(200, github?.status() ?? { enabled: false });
       if (req.method !== "POST") return send(404, { error: "Unknown operation" });
       const body = await readJson(req);
+      if (req.url === "/github") {
+        if (!machine || !github) return send(403, { error: "Shared GitHub not configured" });
+        return send(200, await github.request(body.project, body.request));
+      }
       if (req.url === "/start") {
         if (!machine || body.machine !== machine) return send(403, { error: "Machine identity mismatch" });
         return send(200, store.start(body));
@@ -82,12 +88,13 @@ export class JsonClient {
     } else if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("Invalid service connection");
   }
   async call<T>(path: string, body?: unknown): Promise<T> {
+    const timeoutMs = path === "/github" ? 60_000 : 10_000;
     if (this.socketPath) return new Promise<T>((resolve, reject) => {
       const req = request({ socketPath: this.socketPath, path, method: body === undefined ? "GET" : "POST",
         headers: { Authorization: `Bearer ${this.token}`, "Content-Type": "application/json" },
-        signal: AbortSignal.timeout(10_000), agent: false,
+        signal: AbortSignal.timeout(timeoutMs), agent: false,
       }, response => {
-        void readJson(response).then(value => {
+        void readJson(response, path === "/github" ? 16 * 1024 * 1024 : 1024 * 1024).then(value => {
           if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
             reject(new Error(`Service ${response.statusCode}: ${JSON.stringify(value).slice(0, 500)}`));
           } else resolve(value as T);
@@ -100,7 +107,7 @@ export class JsonClient {
       method: body === undefined ? "GET" : "POST",
       headers: { Authorization: `Bearer ${this.token}`, "Content-Type": "application/json" },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      signal: AbortSignal.timeout(10_000), redirect: "error",
+      signal: AbortSignal.timeout(timeoutMs), redirect: "error",
     });
     if (!response.ok) throw new Error(`Service ${response.status}: ${(await response.text()).slice(0, 500)}`);
     return await response.json() as T;
@@ -108,6 +115,7 @@ export class JsonClient {
 }
 export class FleetClient extends JsonClient {
   authorize(session: string, ticket: string, runId?: string): Promise<Claim> { return this.call("/authorize", { session, ticket, runId }); }
+  github(project: string, request: GitHubRequest): Promise<GitHubResponse> { return this.call("/github", { project, request }); }
   snapshot(): Promise<FleetSnapshot> { return this.call("/state"); }
   start(req: StartRequest): Promise<StartResult> { return this.call("/start", req); }
   async finish(session: string, id: string, completed = true, unused = false): Promise<void> { await this.call("/finish", { session, id, completed, unused }); }

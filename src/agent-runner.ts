@@ -108,6 +108,7 @@ export function resolveAgentShellEnv(env: NodeJS.ProcessEnv, opts: {
     if (value === undefined || value.trim() === "") continue;
     out[name] = value;
   }
+  if (env.PYRY_SHARED_GITHUB === "1" && env.GH_CONFIG_DIR) out.GH_CONFIG_DIR = env.GH_CONFIG_DIR;
   return out;
 }
 

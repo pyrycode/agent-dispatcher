@@ -5,7 +5,7 @@ import { validateStart, validateLimits, type MachineLimits, type FleetRun } from
 import { scheduleMachine, runnableTickets, acceptsDuringProjectDrain, type WorkOffer } from "./machine-scheduler.js";
 
 export interface MachineConfig extends MachineLimits { machine: string; projects: string[]; drainingProjects?: string[]; ticketLimit?: number }
-type ClaimService = Pick<FleetClient, "snapshot" | "start" | "finish"> & Partial<Pick<FleetClient, "authorize">>;
+type ClaimService = Pick<FleetClient, "snapshot" | "start" | "finish"> & Partial<Pick<FleetClient, "authorize" | "github">>;
 interface Offers { session: string; work: WorkOffer[]; at: number }
 export function offerId(machine: string, session: string, offer: WorkOffer): string {
   return createHash("sha256").update(JSON.stringify([machine, session, offer.project, offer.key])).digest("hex");
@@ -135,6 +135,10 @@ export async function serveManager(manager: MachineManager, projectTokens: Recor
         return send(200, { ok: true, drainingProjects: manager.config.drainingProjects });
       }
       if (!project) return send(403, { error: "Project credential required" });
+      if (req.url === "/github") {
+        if (!manager.claims.github) return send(403, { error: "Shared GitHub not configured" });
+        return send(200, await manager.claims.github(project, body));
+      }
       if (req.url === "/offers") {
         manager.offer(project, body.session, body.offers);
         return send(200, await manager.grants(project, body.session));

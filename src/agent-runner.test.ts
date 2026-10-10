@@ -89,6 +89,10 @@ describe("PYRY_AGENT_SHELL_ENV: non-secret settings for Codex commands", () => {
     assert.deepEqual(resolveAgentShellEnv({ PYRY_AGENT_SHELL_ENV: " ", ANDROID_HOME: "/sdk" }, { warn: m => q.warnings.push(m), warned: q.warned }), {});
     assert.deepEqual(q.warnings, []);
   });
+  test("managed GitHub passes its CLI route without the manager credential", () => {
+    assert.deepEqual(resolveAgentShellEnv({ PYRY_SHARED_GITHUB: "1", GH_CONFIG_DIR: "/private/github", PYRY_MANAGER_TOKEN: "private-token" }), { GH_CONFIG_DIR: "/private/github" });
+    assert.deepEqual(resolveAgentShellEnv({ GH_CONFIG_DIR: "/ordinary/github" }), {});
+  });
   test("a refused name is skipped with one warning per process, even when set, across many runs", () => {
     const q = quiet();
     const env = { PYRY_AGENT_SHELL_ENV: "ANDROID_HOME,GITHUB_TOKEN,op_session,GITHUB_TOKEN", ANDROID_HOME: "/sdk", GITHUB_TOKEN: "ghp_fixture", op_session: "x" };
