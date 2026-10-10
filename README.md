@@ -831,7 +831,7 @@ so it has no daemon check:
 ```sh
 PYRY_HEALTH_GITHUB_CMD="gh auth status --hostname github.com"
 PYRY_HEALTH_FIGMA_CMD="codex mcp list | grep -Eq '^figma[[:space:]].*[[:space:]]enabled[[:space:]]+OAuth'"
-PYRY_HEALTH_LIVE_LOGIN_CMD='[ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || op read --no-newline "op://Dev agents/Claude long term token/password" >/dev/null'
+PYRY_HEALTH_LIVE_LOGIN_CMD='[ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || op read --no-newline "op://kmzgpgsyeesea3pkiuk2ul2phq/Claude long term token/password" >/dev/null'
 ```
 
 Desktop, Codex runner. The daemon path is the same file as `PYRY_BIN`:
@@ -839,7 +839,7 @@ Desktop, Codex runner. The daemon path is the same file as `PYRY_BIN`:
 ```sh
 PYRY_HEALTH_GITHUB_CMD="gh auth status --hostname github.com"
 PYRY_HEALTH_FIGMA_CMD="codex mcp list | grep -Eq '^figma[[:space:]].*[[:space:]]enabled[[:space:]]+OAuth'"
-PYRY_HEALTH_LIVE_LOGIN_CMD='[ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || op read --no-newline "op://Dev agents/Claude long term token/password" >/dev/null'
+PYRY_HEALTH_LIVE_LOGIN_CMD='[ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || op read --no-newline "op://kmzgpgsyeesea3pkiuk2ul2phq/Claude long term token/password" >/dev/null'
 PYRY_HEALTH_DAEMON_CMD="/absolute/path/to/pyrycode-desktop-tests/pyry --version"
 PYRY_HEALTH_DAEMON_MIN_VERSION=0.33.0
 ```
@@ -967,7 +967,7 @@ Tests: `python3 -m unittest discover -s scripts -p 'test_*.py'`.
 
 The spawn scrubber removes both account variables. For builders alone, it maps this restricted token to `OP_SERVICE_ACCOUNT_TOKEN`. Other roles receive neither account. The non-secret `PYRY_AGENT_SHELL_ENV` filter still refuses secret names. Codex builders inherit the restricted account through a names-only shell allowlist, never through a secret value in arguments. That list preserves the container's existing `GH_TOKEN` publishing login and its `DISPLAY` and `PLAYWRIGHT_BROWSERS_PATH` settings for Desktop tests. It does not pass `GITHUB_TOKEN` or the Automation account.
 
-Mobile's `scripts/android-test-gate.py live --tests "Class#method"` fetches its own child login. Go and Desktop repairs use `python3 "$AGENTS_REPO_PATH/dispatcher/scripts/live-claude-gate.py" go --tests "^TestName$"` or `desktop --spec e2e/real-name.spec.ts --tests "test title"`. Run from the product worktree. Build Desktop first. These launchers fetch `op://Dev agents/Claude long term token/password` with the restricted account and remove account credentials from test children. Missing access is an environment error. A zero-test run fails. Record the executed and passed counts. Full-suite runs remain dispatcher work.
+Mobile's `scripts/android-test-gate.py live --tests "Class#method"` fetches its own child login. Go and Desktop repairs use `python3 "$AGENTS_REPO_PATH/dispatcher/scripts/live-claude-gate.py" go --tests "^TestName$"` or `desktop --spec e2e/real-name.spec.ts --tests "test title"`. Run from the product worktree. Build Desktop first. These launchers fetch `op://kmzgpgsyeesea3pkiuk2ul2phq/Claude long term token/password` with the restricted account and remove account credentials from test children. Missing access is an environment error. A zero-test run fails. Record the executed and passed counts. Full-suite runs remain dispatcher work.
 
 ## Full-duration process proofs
 

@@ -28,6 +28,19 @@ import sys
 from unittest.mock import Mock,patch
 
 class LiveLauncherTest(unittest.TestCase):
+    def test_login_survives_a_vault_rename(self):
+        def renamed_account(argv, **kwargs):
+            # The fixture account has one vault, now named SV - Dev agents.
+            if any("op://Dev agents/" in arg for arg in argv):
+                return Mock(returncode=1, stdout="", stderr="old vault missing")
+            self.assertEqual(argv, ["op", "read", "--no-newline", "op://kmzgpgsyeesea3pkiuk2ul2phq/Claude long term token/password"])
+            self.assertEqual(kwargs["env"]["OP_BIOMETRIC_UNLOCK_ENABLED"], "false")
+            return Mock(returncode=0, stdout="renamed-vault-login\n")
+        with patch.object(gate.subprocess, "run", side_effect=renamed_account):
+            child = gate.live_claude_environment({"OP_SERVICE_ACCOUNT_TOKEN": "restricted-fixture"})
+        self.assertEqual(child["CLAUDE_CODE_OAUTH_TOKEN"], "renamed-vault-login")
+        self.assertNotIn("OP_SERVICE_ACCOUNT_TOKEN", child)
+
     def test_fetch_failure_stops_before_test_and_prints_no_secret(self):
         output=io.StringIO()
         with patch.dict(os.environ,{'OP_SERVICE_ACCOUNT_TOKEN':'restricted-fixture'},clear=True), patch.object(sys,'argv',['gate','go','--tests','^TestOne$']), patch.object(gate.subprocess,'run',return_value=Mock(returncode=1,stdout='',stderr='restricted-fixture')) as run, contextlib.redirect_stderr(output):
