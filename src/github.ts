@@ -118,10 +118,8 @@ async function fetchWithRetry(
  * GitHub Projects v2 client used by the dispatcher.
  *
  * **Item ordering:** every items() query orders by `POSITION` ascending
- * — top of column first. This is the user's manual board ordering and
- * doubles as the priority signal the dispatcher uses to pick which
- * Backlog ticket to advance next. Drag a ticket up the column to
- * prioritize it; drag down to defer.
+ * — top of column first. Selection ranks priority labels ahead of column
+ * and board position. This order breaks ties within the same priority.
  *
  * **Pagination:** `fetchAllItems` loops on `pageInfo.hasNextPage` +
  * `endCursor` until the project is fully drained. Pre-2026-05-09 the

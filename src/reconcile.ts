@@ -104,44 +104,23 @@ export async function runAutoAdvance(
   runsInFlight: number,
 ): Promise<void> {
   // Rules + WIP-probe columns come from the stage set resolved at startup.
-  // Classic wraps AUTO_ADVANCE_RULES / MID_PIPELINE_COLUMNS by reference,
-  // so this is byte-identical to the pre-stage-set dispatcher there; the
-  // builder set's chain skips In Architecture and In QA entirely.
+  // The builder set skips In Architecture and In QA entirely.
   const { advanceRules, midPipelineColumns, agents } = activeStageSet();
 
-  // Seats taken: the pool's runs in flight, plus every ticket past Backlog
-  // that selection would start right now. The Backlog promotion budget is
-  // what is left, `max(0, maxConcurrent - seatsTaken)`.
-  //
-  // Before 2026-09-22 this counted every non-errored ticket past Backlog.
-  // A ticket queued behind a busy one-at-a-time agent (the verifier,
-  // documentation) holds no seat, but it held Backlog shut, and the free
-  // seat went to the only work left: refining the next Backlog ticket.
-  // Mobile refined its whole Backlog that way with three tickets past it
-  // and two runs going. Same shape as the blocked-ticket deadlock of
-  // 2026-05-16 (agent-dispatcher#10). Asking selection itself keeps
-  // blockers, error labels and the serial caps in one place.
-  let waitingForSeat = 0;
+  // Read waiting work so ready Backlog tickets compete for free seats by
+  // priority. A running agent always keeps its seat.
+  let midByColumn: Map<string, ProjectItem[]> | undefined;
   try {
     const midItems = await Promise.all(
       midPipelineColumns.map(c => client.getItemsByStatus(c)),
     );
-    // Retry-waiting tickets stay out, as they did in the old count: their
-    // backoff holds them out of selection too (holdBackoffWaiters).
-    const midByColumn = new Map(
+    midByColumn = new Map(
       midPipelineColumns.map((c, i) => [c, midItems[i].filter(it => !isRetryWaiting(it.labels))] as const),
     );
-    waitingForSeat = selectDispatches({
-      itemsByColumn: midByColumn,
-      pollOrder: agents.filter(a => a.column !== "Backlog"),
-      maxConcurrent,
-    }).length;
   } catch (error: any) {
-    // Fail-open: a transient GraphQL error shouldn't deadlock the pipeline.
-    // The budget then counts the runs in flight alone.
+    // Fail-open: a transient read error should not deadlock promotion.
     console.warn(`   ⚠️  Seat probe failed; Backlog promotion counts running agents only: ${error.message}`);
   }
-  const seatsTaken = runsInFlight + waitingForSeat;
 
   // Fetch items for each unique `from` column referenced by the rule table.
   // Building once and passing into the pure decision keeps I/O bounded and
@@ -163,9 +142,38 @@ export async function runAutoAdvance(
     advanceRules,
     MANUAL_ADVANCE_GATES,
     itemsByColumn,
-    seatsTaken,
+    runsInFlight,
     maxConcurrent,
   );
+
+  let waitingForSeat = 0;
+  if (midByColumn) {
+    // Put prospective promotions after existing work in their target column.
+    // Selection applies priority first; equal priorities favour work already
+    // past Backlog. The original board arrays stay untouched.
+    const prospective = new Map(midByColumn);
+    const promotions = decision.advances.filter(a => a.fromColumn === "Backlog");
+    const promotionIds = new Set(promotions.map(a => a.itemId));
+    for (const promotion of promotions) {
+      const item = itemsByColumn.get("Backlog")!.find(i => i.id === promotion.itemId)!;
+      prospective.set(promotion.toColumn, [
+        ...(prospective.get(promotion.toColumn) ?? []),
+        { ...item, status: promotion.toColumn },
+      ]);
+    }
+    const selected = selectDispatches({
+      itemsByColumn: prospective,
+      pollOrder: [...agents].reverse(),
+      maxConcurrent: Math.max(0, maxConcurrent - runsInFlight),
+    });
+    const selectedIds = new Set(selected.map(c => c.item.id));
+    waitingForSeat = selected.filter(c => !promotionIds.has(c.item.id)).length;
+    decision.advances = decision.advances.filter(a => {
+      if (a.fromColumn !== "Backlog" || selectedIds.has(a.itemId)) return true;
+      decision.backlogHeld.push(a.issueNumber);
+      return false;
+    });
+  }
 
   // Apply advances. Track whether ANY mutation was attempted — the
   // cache-invalidation rule is "did we change board state?" not "did
@@ -192,7 +200,7 @@ export async function runAutoAdvance(
   if (decision.backlogHeld.length > 0) {
     const numbers = decision.backlogHeld.map(n => `#${n}`).join(", ");
     console.log(
-      `   🛑 Backlog: ${numbers} held — no free seat (${runsInFlight} running + ${waitingForSeat} waiting past Backlog, cap ${maxConcurrent})`,
+      `   🛑 Backlog: ${numbers} held — waiting for a dispatch seat (${runsInFlight} running + ${waitingForSeat} waiting past Backlog, cap ${maxConcurrent})`,
     );
   }
 

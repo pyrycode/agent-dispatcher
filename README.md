@@ -21,6 +21,26 @@ Each transition is gated by a `done:<agent>` label, advanced automatically when 
 
 A `needs-rework:<agent>` naming an agent the active stage set does not run parks the ticket under `error:rework-target` with a comment listing the agents that exist. Without that, the label stays on, nothing moves, and the agent that applied it is re-dispatched every cycle: on 2026-09-06 a verifier on the builder set applied `needs-rework:po`, a role that set lacks, and ran again 27 seconds later.
 
+### Ticket priority
+
+Priority labels decide which eligible ticket starts next, across all active
+columns and within each column:
+
+1. `priority:high`
+2. `priority:normal`
+3. No recognised priority label
+4. `priority:low`
+
+Equal priorities keep the existing order: later pipeline columns first, then
+card position within the column. A high-priority Backlog ticket starts before
+an unmarked ticket waiting in Development. Ready Backlog tickets use the same
+priority order when competing for a free seat to enter the pipeline.
+
+Priority does not interrupt running agents or bypass blockers, error holds,
+manual gates, family holds, or per-agent concurrency limits. Inbox stays parked.
+Labels apply to the ticket itself. If several recognised priority labels are
+present, the highest wins.
+
 ### Worktree isolation
 
 Each dispatch creates a fresh `git worktree` under `.<target>-worktrees/<agent>-<issue#>/`. Concurrent dispatches don't interfere; failures leave the worktree as evidence for triage; `git worktree remove --force` cleans up.

@@ -8,6 +8,7 @@
 // (the only cross-file dependency in this file).
 
 import { hasOpenBlockers } from "./blockers.js";
+import { byTicketPriority } from "./ticket-priority.js";
 import { MERGE_HANDOFF_LABEL } from "./merge-handoff.js";
 
 // --------- Auto-advance rules ---------
@@ -180,9 +181,9 @@ export interface AutoAdvanceDecision {
  *     `done:<agent>` is set. Eligible items are reported in `gatedAwaiting`
  *     for heartbeat logging.
  *   - **Backlog**: capacity = `max(0, maxConcurrent - seatsTaken)`.
- *     Advance the first `min(eligible.length, capacity)` items in input
- *     order; hold the rest in `backlogHeld`. When capacity is 0, all
- *     eligible Backlog items are held. The cap matches `selectDispatches`'s
+ *     Advance the first `min(eligible.length, capacity)` items in priority
+ *     order, preserving board position for ties; hold the rest in
+ *     `backlogHeld`. When capacity is 0, all eligible Backlog items are held. The cap matches `selectDispatches`'s
  *     concurrency model — N parallel threads through the pipeline, no
  *     PO frontrunning past available capacity. Without this cap, refined
  *     `done:po` tickets would accumulate in Backlog while only one
@@ -193,9 +194,8 @@ export interface AutoAdvanceDecision {
  *     positive `issueNumber`, carries no `needs-rework:*` or `error:*`
  *     label, and has no OPEN blocker.
  *
- * Backlog input order is the user's prioritization signal — `runAutoAdvance`
- * queries with `orderBy: { field: POSITION, direction: ASC }` so top-of-column
- * comes first. Trust it; don't re-sort.
+ * Backlog priority labels override board order. Equal priorities retain the
+ * input order from the board query, so top-of-column comes first for ties.
  */
 export function decideAutoAdvance(
   rules: readonly AdvanceRule[],
@@ -234,7 +234,8 @@ export function decideAutoAdvance(
 
   for (const rule of rules) {
     const all = itemsByColumn.get(rule.from) ?? [];
-    const eligible = all.filter(item => isEligible(item, rule));
+    const filtered = all.filter(item => isEligible(item, rule));
+    const eligible = rule.from === "Backlog" ? byTicketPriority(filtered, item => item.labels) : filtered;
 
     if (gates.has(rule.from)) {
       if (eligible.length > 0) {
@@ -248,8 +249,8 @@ export function decideAutoAdvance(
 
     if (rule.from === "Backlog") {
       // Capacity-bounded Backlog promotion. Advance up to `capacity` items
-      // in input (board-position) order; hold the rest. Capacity tracks
-      // free pipeline seats so PO refinements don't pile up as `done:po`
+      // in priority order, then board-position order; hold the rest.
+      // Capacity tracks free pipeline seats so PO refinements don't pile up as `done:po`
       // tickets that can't enter the pipeline (the bug shape: with WIP=N
       // dispatch but a hardcoded WIP=1 advance, refined backlog tickets
       // got stranded one-per-cycle while the pipeline ran serially).
