@@ -87,3 +87,12 @@ describe("priority labels decide Backlog promotion", () => {
     assert.deepEqual(decision.backlogHeld, [1]);
   });
 });
+
+
+test("managed selection offers every eligible serial candidate to the shared authority", () => {
+  const agent = { name: "documentation", column: "In Documentation", serial: true } as any;
+  const items = [1, 2].map(issueNumber => ({ issueNumber, labels: [], id: String(issueNumber) }));
+  const result = selectDispatches({ itemsByColumn: new Map([[agent.column, items]]), pollOrder: [agent], maxConcurrent: 10, deferRoleLimits: true });
+  assert.equal(result.length, 2);
+  assert.equal(result[0].agent.serial, true);
+});

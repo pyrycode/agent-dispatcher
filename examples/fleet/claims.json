@@ -1,0 +1,9 @@
+{
+  "database": "/absolute/private/path/claims.sqlite",
+  "host": "127.0.0.1",
+  "port": 7430,
+  "operatorTokenEnv": "FLEET_CLAIMS_OPERATOR_TOKEN",
+  "machines": {
+    "example-computer": { "heavyLimit": 2, "tokenEnv": "FLEET_MACHINE_TOKEN" }
+  }
+}

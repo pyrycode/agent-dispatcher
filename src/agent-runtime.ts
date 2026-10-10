@@ -781,6 +781,9 @@ export const SPAWN_ENV_DENYLIST: ReadonlySet<string> = new Set([
   "TARGET_REPO_PATH",
   "OP_SERVICE_ACCOUNT_TOKEN", // Automation account: never hand it to agents.
   "PYRY_DEV_AGENTS_TOKEN", // Explicit builder-only exception below.
+  "PYRY_MANAGER_TOKEN",
+  "PYRY_MANAGER_URL",
+  "PYRY_MANAGED",
 ]);
 
 /**

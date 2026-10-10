@@ -1,0 +1,6 @@
+{
+  "managerUrl": "http://127.0.0.1:7431",
+  "operatorTokenEnv": "FLEET_LOCAL_OPERATOR_TOKEN",
+  "claimsUrl": "http://127.0.0.1:7430",
+  "claimsOperatorTokenEnv": "FLEET_CLAIMS_OPERATOR_TOKEN"
+}

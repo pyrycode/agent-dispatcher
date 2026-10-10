@@ -92,6 +92,8 @@ export function selectDispatches<T extends DecisionItem>(opts: {
   maxConcurrent: number;
   rootLabelsByIssue?: ReadonlyMap<number, readonly string[]>;
   excludedRoots?: ReadonlySet<number>;
+  /** Managed callers offer all candidates; shared admission applies role caps. */
+  deferRoleLimits?: boolean;
 }): DispatchCandidate<T>[] {
   const { itemsByColumn, pollOrder, maxConcurrent, rootLabelsByIssue, excludedRoots } = opts;
   const out: DispatchCandidate<T>[] = [];
@@ -99,7 +101,7 @@ export function selectDispatches<T extends DecisionItem>(opts: {
   const budgets = new Map<AgentConfig, number>();
   const candidates: DispatchCandidate<T>[] = [];
   for (const agent of pollOrder) {
-    const cap = agent.serial ? 1 : agent.maxInFlight;
+    const cap = opts.deferRoleLimits ? undefined : agent.serial ? 1 : agent.maxInFlight;
     let inFlight = 0;
     if (cap !== undefined) {
       const wipLabel = `wip:${agent.name}`;
