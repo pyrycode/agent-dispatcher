@@ -31,7 +31,8 @@ async function main(): Promise<void> {
     const claims = new FleetClient(config.claimsUrl, secret(config.claimsTokenEnv));
     const manager = new MachineManager({ machine: config.machine, heavyLimit: config.heavyLimit, combinedLimit: config.combinedLimit, projects: config.projects.map((p: any) => p.repo) }, claims);
     const tokens = Object.fromEntries(config.projects.map((p: any) => [p.repo, secret(p.tokenEnv)]));
-    const server = await serveManager(manager, tokens, secret(config.operatorTokenEnv), config.port ?? 7431, config.host ?? "127.0.0.1");
+    const endpoint = config.socketPath ? resolve(config.socketPath) : config.port ?? 7431;
+    const server = await serveManager(manager, tokens, secret(config.operatorTokenEnv), endpoint, config.host ?? "127.0.0.1");
     const timer = setInterval(() => { void manager.tick().catch(e => console.error("Scheduling paused:", e.message)); }, 1000);
     const close = () => { manager.draining = true; clearInterval(timer); server.close(() => process.exit(0)); };
     process.on("SIGTERM", close); process.on("SIGINT", close);

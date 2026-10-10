@@ -93,7 +93,7 @@ export class MachineManager {
   }
 }
 
-export async function serveManager(manager: MachineManager, projectTokens: Record<string, string>, operatorToken: string, port: number, host = "127.0.0.1"): Promise<Server> {
+export async function serveManager(manager: MachineManager, projectTokens: Record<string, string>, operatorToken: string, port: number | string, host = "127.0.0.1"): Promise<Server> {
   const tokens = [...Object.values(projectTokens), operatorToken];
   if (tokens.some(t => !t) || new Set(tokens).size !== tokens.length) throw new Error("Manager credentials must be distinct");
   const server = createServer(async (req, res) => {

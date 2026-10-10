@@ -1,5 +1,6 @@
-import { createServer, type IncomingMessage, type Server } from "node:http";
+import { createServer, request, type IncomingMessage, type Server } from "node:http";
 import { timingSafeEqual } from "node:crypto";
+import { chmodSync } from "node:fs";
 import type { Claim, FleetStore, FleetSnapshot, StartRequest, StartResult } from "./fleet-store.js";
 
 export async function readJson(req: IncomingMessage): Promise<any> {
@@ -16,11 +17,14 @@ export function tokenMatches(header: string | undefined, secret: string): boolea
   const a = Buffer.from(header ?? ""), b = Buffer.from(`Bearer ${secret}`);
   return secret.length > 0 && a.length === b.length && timingSafeEqual(a, b);
 }
-export async function listen(server: Server, port: number, host = "127.0.0.1"): Promise<Server> {
+export async function listen(server: Server, port: number | string, host = "127.0.0.1"): Promise<Server> {
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(port, host, () => { server.removeListener("error", reject); resolve(); });
+    const ready = () => { server.removeListener("error", reject); resolve(); };
+    if (typeof port === "string") server.listen(port, ready);
+    else server.listen(port, host, ready);
   });
+  if (typeof port === "string") chmodSync(port, 0o600);
   return server;
 }
 export async function serveFleet(store: FleetStore, machines: Record<string, string>, admin: string, port: number, host = "127.0.0.1"): Promise<Server> {
@@ -67,11 +71,31 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
 }
 
 export class JsonClient {
+  private readonly socketPath?: string;
   constructor(readonly url: string, private readonly token: string) {
     const parsed = new URL(url);
-    if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password || !token) throw new Error("Invalid service connection");
+    if (parsed.username || parsed.password || !token) throw new Error("Invalid service connection");
+    if (parsed.protocol === "unix:") {
+      const path = decodeURIComponent(parsed.pathname);
+      if (parsed.host || parsed.search || parsed.hash || !path.startsWith("/") || path === "/" || path.includes("\0")) throw new Error("Invalid socket connection");
+      this.socketPath = path;
+    } else if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("Invalid service connection");
   }
   async call<T>(path: string, body?: unknown): Promise<T> {
+    if (this.socketPath) return new Promise<T>((resolve, reject) => {
+      const req = request({ socketPath: this.socketPath, path, method: body === undefined ? "GET" : "POST",
+        headers: { Authorization: `Bearer ${this.token}`, "Content-Type": "application/json" },
+        signal: AbortSignal.timeout(10_000), agent: false,
+      }, response => {
+        void readJson(response).then(value => {
+          if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
+            reject(new Error(`Service ${response.statusCode}: ${JSON.stringify(value).slice(0, 500)}`));
+          } else resolve(value as T);
+        }, reject);
+      });
+      req.on("error", reject);
+      req.end(body === undefined ? undefined : JSON.stringify(body));
+    });
     const response = await fetch(new URL(path, this.url), {
       method: body === undefined ? "GET" : "POST",
       headers: { Authorization: `Bearer ${this.token}`, "Content-Type": "application/json" },

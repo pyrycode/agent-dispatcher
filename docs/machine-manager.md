@@ -36,7 +36,11 @@ Use matching limits in the claim service and local manager. Both enforce them; a
 
 Credential fields name environment variables. Supply values through the existing 1Password service-account launcher. Use distinct credentials for each machine, each local project and both operator interfaces. Do not give claim-server operator credentials to dispatchers or agents. The dispatcher removes its manager credential from agent environments.
 
-Services bind to loopback by default. Expose the central claim service only through the private network and encrypted transport, such as an SSH tunnel or private-network HTTPS proxy. A plain HTTP connection on the public network is not supported. For container dispatchers, expose the local manager on an appropriate host-private interface and restrict access to that host's containers.
+Services bind to loopback by default. Expose the central claim service only through the private network and encrypted transport, such as an SSH tunnel or private-network HTTPS proxy. A plain HTTP connection on the public network is not supported.
+
+For containers on Linux or macOS, the manager also accepts `socketPath` instead of a TCP listener. Dispatchers and the local status/drain client use `unix:///absolute/path/manager.sock` as their manager URL. Mount the containing private directory read-only into each project container and use separate project tokens. The socket has mode 0600, so the containers must use the host user's identity. Keep the directory itself in place across restarts. The supervising service must remove a stale socket after an unclean exit before restarting its sole owner. No host network port is needed. Pyrybox's opt-in units and rollout instructions live in `pyrycode-agents/container/managed/`.
+
+`scripts/fleet-container-smoke.mjs` verifies the transport with temporary Podman containers and sleeping child jobs. Compile with `pnpm exec tsc` and run `node scripts/fleet-container-smoke.mjs host` on Linux. It never contacts GitHub or mounts production state. Set `FLEET_TEST_PEER=1` and `FLEET_TEST_PORT` to wait for the script's `peer URL` mode on a second computer through an SSH tunnel. The test covers both capacity limits, exclusive claims, the documentation lock, manager and container crashes, manual release and completion. Its fixed test credentials must never be used in deployed services.
 
 From the shared engine checkout, with credentials already in the environment:
 
