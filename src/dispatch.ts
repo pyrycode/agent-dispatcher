@@ -6,7 +6,7 @@ import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { config } from "dotenv";
 import { githubPauseMs, freshGitHubRead } from "./github-transport.js";
-import { runRecoveryWork, recoveryHandoff, parseRecoveryDecision, RECOVERY_INSTRUCTIONS } from "./recovery-work.js";
+import { runRecoveryWork, recoveryHandoff, parseRecoveryDecision, RECOVERY_INSTRUCTIONS, cleanRecoveryLabels } from "./recovery-work.js";
 import { recoveryLogContext } from "./recovery-context.js";
 import type { RecoveryIncident, RecoveryDecision } from "./fleet-recovery.js";
 import { ManagedDispatch, trackManagedChild } from "./managed-dispatch.js";
@@ -9448,6 +9448,7 @@ export async function pollLoop(): Promise<void> {
     // failure mode — ~50 minutes of error noise before reset).
     try {
       await client.getItemsByStatus("Backlog");  // touches the cache
+      if (managed && recoveryEnabled) managed.setRecoveryTickets(await client.getOpenProjectItems());
       const rl = client.getRateLimit();
       if (rl) {
         console.log(`   📊 GraphQL: ${rl.remaining} points remaining (this query: ${rl.cost}; resets ${rl.resetAt})`);
@@ -9485,6 +9486,9 @@ export async function pollLoop(): Promise<void> {
     // safety net for state changes produced by this cycle's dispatch.
     const reconcileBoard = async (): Promise<void> => {
       const reconcile = async (): Promise<void> => {
+        if (managed && recoveryEnabled) {
+          await cleanRecoveryLabels(await maintenanceClient.getAllProjectItems(), (n, label) => maintenanceClient.removeLabel(n, label));
+        }
         await runClosedSweep(maintenanceClient);
         await runStrandedWipSweep(maintenanceClient, notifyDiscord, STRANDED_WIP_MIN_AGE_MS, Date.now(),
           new Set([...pool.keys(), ...(managed?.inFlightKeys() ?? []), ...(gateRun ? [`real-claude-gate#${gateRun.issue}`] : [])]));
@@ -9758,6 +9762,7 @@ export async function pollLoop(): Promise<void> {
                 return parseRecoveryDecision(result.output);
               },
               comment: (n, body) => recoveryClient.addComment(n, body),
+              addLabel: (n, label) => recoveryClient.addLabel(n, label),
               removeLabel: (n, label) => recoveryClient.removeLabel(n, label),
               move: (id, status) => recoveryClient.updateItemStatus(id, status),
               notify: notifyDiscord,

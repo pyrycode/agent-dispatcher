@@ -72,3 +72,20 @@ test("legacy owned ready tickets continue above the cap and prevent new claims",
   assert.deepEqual(capped([1, 2, 3, 4].map(n => offer("org/core", n, "light")), state).map(o => o.ticket), ["org/core#1", "org/core#2", "org/core#3"]);
   assert.deepEqual(capped([offer("org/core", 1, "light"), offer("org/mobile", 4, "light"), offer("org/mobile", 5, "light")], state).map(o => o.ticket), ["org/core#1", "org/mobile#4"]);
 });
+
+
+test("recovery beats ownership age, board order and normal job priority", () => {
+  const normal = { ...offer("org/core", 1), order: -100 };
+  const recovery = { ...offer("org/mobile", 2), role: "recovery", order: 100 };
+  const state = { ...empty, claims: [{ ticket: normal.ticket, machine: "mac", generation: "old", created: 1 }] };
+  assert.equal(select([normal, recovery], state)[0].ticket, recovery.ticket);
+  const repair = { ...recovery, role: "builder", recovery: true };
+  assert.equal(select([normal, repair], state)[0].ticket, repair.ticket);
+});
+
+test("recovery priority never interrupts active work or ignores project drains", () => {
+  const recovery = { ...offer("org/mobile", 2), role: "recovery" };
+  const state: FleetSnapshot = { ...empty, runs: [{ ...offer("org/core", 1), id: "active", machine: "mac", session: "s", generation: "g", created: 1 }] };
+  assert.deepEqual(select([recovery], state), []);
+  assert.deepEqual(scheduleMachine({machine: "mac", projects: ["org/core", "org/mobile"], drainingProjects: ["org/mobile"], heavyLimit: 1, combinedLimit: 1, offers: [recovery], state: empty}), []);
+});

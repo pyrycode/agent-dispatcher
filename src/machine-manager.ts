@@ -41,6 +41,7 @@ export class MachineManager {
     for (const item of work) {
       if (item.project !== project || typeof item.key !== "string" || !item.key || item.key.length > 200 || keys.has(item.key) || !Number.isFinite(item.order)) throw new Error("Invalid offer");
       keys.add(item.key);
+      if (item.recovery !== undefined && typeof item.recovery !== "boolean") throw new Error("Invalid recovery priority");
       validateStart({ ...item, id: offerId(this.config.machine, session, item), machine: this.config.machine, session });
     }
     const old = this.offers.get(project);
@@ -65,7 +66,7 @@ export class MachineManager {
       if (!current || !current.work.some(w => w.key === job.key) || this.now() - current.at >= 180_000) continue;
       // A lost reply leaves a durable reservation. grants() recovers that exact
       // run from the server; it never guesses that a timed-out start failed.
-      const { key: _key, order: _order, ...request } = job;
+      const { key: _key, order: _order, recovery: _recovery, ...request } = job;
       const result = await this.claims.start({ ...request, id: offerId(this.config.machine, current.session, job), machine: this.config.machine, session: current.session });
       if (!result.ok && result.reason === "finished") this.finished.add(`${job.project}/${job.key}`);
     }

@@ -104,3 +104,32 @@ test("native GitHub login health uses both the viewer query and API home endpoin
     assert.ok(paths.includes("/graphql")); assert.ok(paths.includes("/"));
   }
 });
+
+
+test("server outages pause managed REST and GraphQL reads and recover without replaying writes", async t => {
+  let status = 503; const calls: string[] = [];
+  const broker = new GitHubBroker({token: "central", projects: ["org/core"], fetcher: async (_url, init) => {
+    calls.push(init?.method ?? "GET");
+    return new Response(status === 200 ? '{"data":{"viewer":{"login":"ok"}}}' : "GitHub temporarily unavailable", {status, headers: {"retry-after": "3"}});
+  }});
+  const store = new FleetStore(":memory:", {mac: {heavyLimit: 1, combinedLimit: 1}});
+  const fleet = await serveFleet(store, {mac: "mac"}, "operator", 0, "127.0.0.1", broker);
+  const address = fleet.address(); assert.ok(address && typeof address !== "string");
+  const manager = new MachineManager({machine: "mac", projects: ["org/core"], heavyLimit: 1, combinedLimit: 1}, new FleetClient(`http://127.0.0.1:${address.port}`, "mac"));
+  const server = await serveManager(manager, {"org/core": "core"}, "op", 0);
+  const local = server.address(); assert.ok(local && typeof local !== "string");
+  t.after(async () => { await close(server); await close(fleet); store.close(); });
+  configureGitHubTransport(`http://127.0.0.1:${local.port}`, "core");
+  for (const code of [500, 502, 503, 504]) {
+    status = code;
+    for (const [path, init] of [["/repos/org/core/issues/1", {}], ["/graphql", {method: "POST", body: JSON.stringify({query: "{ viewer { login } }"})}]] as const) {
+      await assert.rejects(githubFetch(`https://api.github.com${path}`, init), error => githubPauseMs(error) === 3000);
+    }
+  }
+  await assert.rejects(githubFetch("https://api.github.com/repos/org/core/issues/1/comments", {method: "POST", body: "{}"}), error => githubPauseMs(error) !== null);
+  assert.equal(calls.filter(m => m === "POST").length, 5, "the failed comment is sent only once");
+  status = 200;
+  assert.equal((await githubFetch("https://api.github.com/repos/org/core/issues/1")).status, 200);
+  assert.equal(calls.length, 10);
+  assert.equal(githubPauseMs(Object.assign(new Error("Bad credentials"), {status: 401})), null);
+});

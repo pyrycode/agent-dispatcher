@@ -9,7 +9,7 @@ import { FleetStore, type StartRequest } from "./fleet-store.js";
 import { FleetClient, JsonClient, serveFleet } from "./fleet-http.js";
 import { MachineManager, serveManager } from "./machine-manager.js";
 import { ManagedDispatch } from "./managed-dispatch.js";
-import { runRecoveryWork, recoveryPlan, parseRecoveryDecision, recoveryHandoff, observationFor } from "./recovery-work.js";
+import { runRecoveryWork, recoveryPlan, parseRecoveryDecision, recoveryHandoff, observationFor, cleanRecoveryLabels } from "./recovery-work.js";
 import type { AgentConfig, ProjectItem } from "./types.js";
 import { recoveryLogContext } from "./recovery-context.js";
 
@@ -131,13 +131,13 @@ test("changed evidence, converging work and failed assessments never trigger a r
     const current = item();
     const incident: RecoveryIncident = { id: "incident", ticket: `${project}#1`, fingerprint: recoveryFingerprint(observationFor(project, current)), reason: "error", state: "queued", created: 1, updated: 1, runId: null, decision: null };
     await runRecoveryWork(incident, {
-      project, agents, begin: async () => ({ ...incident, state: "assessing" }),
+      project, agents, addLabel: async () => {}, begin: async () => ({ ...incident, state: "assessing" }),
       readCurrent: async () => ++reads > 1 && mode === "changed" ? { ...current, status: "Done" } : current,
       assess: async () => { assessed++; if (mode === "failed") throw new Error("bad output"); return { action: mode === "wait" ? "wait" : "retry", reason: "Evidence" }; },
       decide: async d => { decided = d; return d; }, complete: async () => {},
       comment: async () => {}, removeLabel: async (_n, label) => { writes.push(label); }, move: async () => { writes.push("move"); }, notify: async () => {},
     });
-    assert.equal(assessed, 1); assert.deepEqual(writes, []);
+    assert.equal(assessed, 1); assert.deepEqual(writes, mode === "failed" ? ["orchestrator:investigating", "orchestrator:fixing"] : ["orchestrator:investigating"]);
     assert.equal(decided.action, mode === "failed" ? "escalate" : "wait");
   }
 });
@@ -157,7 +157,7 @@ test("real HTTP admission, durable decision and code-owner handback work togethe
   assert.equal(managed.ready(offer), true);
   const order: string[] = []; let comment = "";
   await managed.run(offer, () => runRecoveryWork(incident, {
-    project, agents, readCurrent: async () => structuredClone(current),
+    project, agents, addLabel: async () => {}, readCurrent: async () => structuredClone(current),
     begin: () => managed.recoveryStep<RecoveryIncident>("begin", incident.id),
     assess: async () => ({ action: "rework", reason: "Reproduce the history validator gap and repair all entry points" }),
     decide: async d => { order.push("persist"); return managed.recoveryStep("decide", incident.id, d); },
@@ -167,7 +167,7 @@ test("real HTTP admission, durable decision and code-owner handback work togethe
     removeLabel: async (_n, label) => { await managed.authorize(1); order.push(label); current.labels = current.labels.filter(l => l !== label); },
     notify: async () => { order.push("notify"); },
   }));
-  assert.deepEqual(order, ["persist", "comment", "move", "done:builder", "error:rework-loop", "notify"]);
+  assert.deepEqual(order, ["persist", "comment", "move", "done:builder", "error:rework-loop", "notify", "orchestrator:investigating"]);
   assert.deepEqual(current.labels, ["rework-count:6", "needs-real-claude"]);
   assert.match(recoveryHandoff([comment]), /repair all entry points/);
   assert.equal(store.snapshot().runs.length, 0);
@@ -199,7 +199,7 @@ test("a partial GitHub handback is never replayed and retains its repair budget"
   store.start(request());
   let assessed = 0;
   await assert.rejects(runRecoveryWork(incident, {
-    project, agents, readCurrent: async () => current,
+    project, agents, addLabel: async () => {}, readCurrent: async () => current,
     begin: async () => store.recoveryStep("mac", "session", project, incident.id, "run-1", "begin") as RecoveryIncident,
     assess: async () => { assessed++; return { action: "rework", reason: "Fix common cause" }; },
     decide: async d => store.recoveryStep("mac", "session", project, incident.id, "run-1", "decide", d) as any,
@@ -240,4 +240,40 @@ test("diagnosis evidence is bounded and restricted to this ticket's last two log
   assert.deepEqual(logs.map(l => l.name), ["2_builder_#1.log", "3_builder_#1.log"]);
   assert.ok(logs.every(l => l.tail.length === 12000));
   assert.ok(logs[1].tail.endsWith("tail-3"));
+});
+
+
+test("investigating is visible during assessment; fixing survives a successful handback only", async () => {
+  for (const mode of ["rework", "retry", "wait", "escalate", "interrupted"] as const) {
+    const current = item();
+    const incident: RecoveryIncident = {id: "visible", ticket: `${project}#1`, fingerprint: recoveryFingerprint(observationFor(project, current)), reason: "error", state: "queued", created: 1, updated: 1, runId: null, decision: null};
+    const run = runRecoveryWork(incident, {
+      project, agents, begin: async () => ({...incident, state: "assessing"}), readCurrent: async () => structuredClone(current),
+      addLabel: async (_n, label) => {current.labels.push(label);},
+      removeLabel: async (_n, label) => {current.labels = current.labels.filter(l => l !== label);},
+      assess: async () => {
+        assert.ok(current.labels.includes("orchestrator:investigating"));
+        return {action: mode === "interrupted" ? "rework" : mode, reason: "Evidence"};
+      },
+      decide: async d => d, complete: async () => {}, notify: async () => {},
+      comment: async () => {}, move: async () => {if (mode === "interrupted") throw new Error("outage");},
+    });
+    if (mode === "interrupted") await assert.rejects(run, /outage/); else await run;
+    assert.equal(current.labels.includes("orchestrator:investigating"), false);
+    assert.equal(current.labels.includes("orchestrator:fixing"), mode === "rework" || mode === "retry");
+    assert.equal(current.labels.includes("error:builder"), mode !== "rework" && mode !== "retry");
+  }
+});
+
+test("idle-ticket reconciliation repairs stale labels after outage or restart", async () => {
+  const activeRepair = item(["orchestrator:fixing"]);
+  const held = {...item(["orchestrator:fixing"]), issueNumber: 2, status: "Halted"};
+  const failed = {...item(["orchestrator:fixing", "error:builder"]), issueNumber: 3};
+  const done = {...item(["orchestrator:fixing", "orchestrator:investigating"]), issueNumber: 4, status: "Done"};
+  const interrupted = {...item(["orchestrator:investigating"]), issueNumber: 5};
+  const removed: string[] = [];
+  await cleanRecoveryLabels([activeRepair, held, failed, done, interrupted], async (n,l) => {removed.push(`${n}:${l}`);});
+  assert.deepEqual(removed, ["2:orchestrator:fixing", "3:orchestrator:fixing", "4:orchestrator:fixing", "4:orchestrator:investigating", "5:orchestrator:investigating"]);
+  assert.deepEqual(activeRepair.labels, ["orchestrator:fixing"]);
+  await cleanRecoveryLabels([held, failed, done, interrupted], async () => {throw new Error("duplicate cleanup");});
 });
