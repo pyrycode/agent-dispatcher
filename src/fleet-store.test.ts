@@ -9,6 +9,32 @@ const request = (id: string, machine = "mac", ticket = "org/mobile#1"): StartReq
   id, machine, session: "session-1", project: ticket.split("#")[0], ticket,
   role: "builder", resource: "heavy", locks: [],
 });
+
+test("an unused first reservation does not leave a priority claim", t => {
+  const { store } = fixture(t);
+  store.start(request("unused"));
+  store.finish("mac", "session-1", "unused", false, true);
+  assert.deepEqual(store.snapshot(), { claims: [], runs: [] });
+  assert.equal(store.start(request("next", "linux")).ok, true);
+  store.finish("mac", "session-1", "unused", false, true);
+  assert.equal(store.snapshot().claims[0].machine, "linux");
+  assert.equal(store.snapshot().runs[0].id, "next");
+});
+
+test("unused reservations preserve ownership after completed or blocked work", t => {
+  const { store } = fixture(t);
+  for (const completed of [true, false]) {
+    const ticket = `org/mobile#${completed ? 1 : 2}`;
+    store.start(request(`worked-${completed}`, "mac", ticket));
+    store.finish("mac", "session-1", `worked-${completed}`, completed);
+    store.start(request(`unused-${completed}`, "mac", ticket));
+    store.finish("mac", "session-1", `unused-${completed}`, false, true);
+    assert.deepEqual(store.start(request(`foreign-${completed}`, "linux", ticket)), { ok: false, reason: "foreign-claim" });
+    // A contradictory retry cannot retroactively turn actual work into unused work.
+    store.finish("mac", "session-1", `worked-${completed}`, false, true);
+    assert.equal(store.snapshot().claims.find(c => c.ticket === ticket)?.machine, "mac");
+  }
+});
 function fixture(t: TestContext) {
   const dir = mkdtempSync(join(tmpdir(), "fleet-store-"));
   const path = join(dir, "claims.sqlite");

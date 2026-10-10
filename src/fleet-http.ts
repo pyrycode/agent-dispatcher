@@ -48,7 +48,7 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
       }
       if (req.url === "/finish") {
         if (!machine) return send(403, { error: "Machine credential required" });
-        store.finish(machine, body.session, body.id, body.completed !== false);
+        store.finish(machine, body.session, body.id, body.completed !== false, body.unused === true);
         return send(200, { ok: true });
       }
       if (req.url === "/authorize") {
@@ -110,7 +110,7 @@ export class FleetClient extends JsonClient {
   authorize(session: string, ticket: string, runId?: string): Promise<Claim> { return this.call("/authorize", { session, ticket, runId }); }
   snapshot(): Promise<FleetSnapshot> { return this.call("/state"); }
   start(req: StartRequest): Promise<StartResult> { return this.call("/start", req); }
-  async finish(session: string, id: string, completed = true): Promise<void> { await this.call("/finish", { session, id, completed }); }
+  async finish(session: string, id: string, completed = true, unused = false): Promise<void> { await this.call("/finish", { session, id, completed, unused }); }
   async free(ticket: string, generation: string, stopped: boolean): Promise<void> {
     await this.call("/free", { ticket, generation, stopped });
   }

@@ -85,11 +85,11 @@ export class MachineManager {
     const ids = new Set(current.work.map(o => offerId(this.config.machine, session, o)));
     return (await this.claims.snapshot()).runs.filter(r => r.machine === this.config.machine && r.project === project && r.session === session && ids.has(r.id));
   }
-  async finish(project: string, session: string, id: string, completed = true): Promise<void> {
+  async finish(project: string, session: string, id: string, completed = true, unused = false): Promise<void> {
     const state = await this.claims.snapshot();
     const run = state.runs.find(r => r.id === id);
     if (run && (run.project !== project || run.session !== session || run.machine !== this.config.machine)) throw new Error("Run owner mismatch");
-    await this.claims.finish(session, id, completed);
+    await this.claims.finish(session, id, completed, unused);
   }
 }
 
@@ -117,7 +117,7 @@ export async function serveManager(manager: MachineManager, projectTokens: Recor
       }
       if (req.url === "/withdraw") return send(200, await manager.withdraw(project, body.session));
       if (req.url === "/finish") {
-        await manager.finish(project, body.session, body.id, body.completed !== false);
+        await manager.finish(project, body.session, body.id, body.completed !== false, body.unused === true);
         return send(200, { ok: true });
       }
       if (req.url === "/authorize") {
