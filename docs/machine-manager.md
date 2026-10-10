@@ -83,6 +83,16 @@ The service working directory must contain the installed `tsx` dependency. For t
 
 ## Status, drain and manual recovery
 
+### Visible GitHub claims
+
+The claim service can mirror ownership to issue labels such as `claim:pyrybox` and `claim:macbook`. Enable `githubLabels` in its configuration with a `tokenEnv` credential name and an explicit `projects` repository list, as shown in `examples/fleet/claims.json`. Supply a GitHub token with issue-label read and write access for those repositories through the existing private environment file or secret launcher. The default service without this section makes no GitHub calls.
+
+One central publisher checks on startup and every minute. It creates missing label definitions, backfills existing claims, replaces old owner labels after transfer and removes labels after manual release or cancellation of unused reservations. It includes closed tickets because their claims persist. Offline and blocked tickets retain their labels. Internal maintenance reservations are excluded.
+
+The `claim:` prefix is reserved for this display. GitHub labels never grant or transfer ownership; manual changes are corrected from the claim database. The publisher only adds or removes individual claim labels, leaving other issue labels intact. GitHub outages retry on later passes without affecting claims, capacity or dispatch. Label visibility is eventually consistent and can lag changes by one minute plus API time. Only the claim service needs this configuration; project dispatchers need no label-specific change or restart.
+
+### Operator commands
+
 ```sh
 pnpm fleet status /absolute/private/path/operator.json
 pnpm fleet drain /absolute/private/path/operator.json

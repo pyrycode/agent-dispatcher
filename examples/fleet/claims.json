@@ -3,6 +3,10 @@
   "host": "127.0.0.1",
   "port": 7430,
   "operatorTokenEnv": "FLEET_CLAIMS_OPERATOR_TOKEN",
+  "githubLabels": {
+    "tokenEnv": "FLEET_GITHUB_TOKEN",
+    "projects": ["pyrycode/pyrycode", "pyrycode/pyrycode-mobile", "pyrycode/pyrycode-desktop"]
+  },
   "machines": {
     "macbook": {
       "heavyLimit": 1,
