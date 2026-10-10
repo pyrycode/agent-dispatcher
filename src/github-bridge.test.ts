@@ -85,3 +85,22 @@ test("an unavailable service fails closed and quota pauses are bounded", async t
   assert.equal(githubPauseMs(new Error("Shared GitHub unavailable")), 60_000);
   assert.equal(githubPauseMs(Object.assign(new Error("API rate limit exceeded"), { headers: { "x-ratelimit-reset": "1000" } }), 100), 60_000);
 });
+
+test("native GitHub login health uses both the viewer query and API home endpoint", async t => {
+  const dir = mkdtempSync("/tmp/gh-auth-"); const socket = join(dir, "api.sock");
+  const paths: string[] = [];
+  const broker = new GitHubBroker({ token: "central-secret", projects: ["org/core"], fetcher: async input => {
+    const path = new URL(String(input)).pathname; paths.push(path);
+    return new Response(path === "/graphql" ? '{"data":{"viewer":{"login":"fixture"}}}' : '{}', {
+      headers: { "content-type": "application/json", "x-oauth-scopes": "repo, read:org, gist" },
+    });
+  } });
+  const bridge = await serveGitHubBridge(socket, request => broker.request("org/core", request));
+  t.after(async () => { await close(bridge); rmSync(dir, { recursive: true }); });
+  assert.equal((await socketRequest(socket, "/")).status, 200);
+  if (spawnSync("gh", ["--version"]).status === 0) {
+    writeFileSync(join(dir, "config.yml"), `http_unix_socket: ${JSON.stringify(socket)}\n`);
+    await promisify(execFile)("gh", ["auth", "status", "--hostname", "github.com"], { env: { ...process.env, GH_CONFIG_DIR: dir, GH_TOKEN: "fixture", GH_HOST: "github.com" } });
+    assert.ok(paths.includes("/graphql")); assert.ok(paths.includes("/"));
+  }
+});
