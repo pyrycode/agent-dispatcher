@@ -50,3 +50,25 @@ test("active medium reservations consume combined capacity after a restart", () 
     offers: [offer("org/mobile", 3), offer("org/mobile", 4, "light")] });
   assert.deepEqual(selected.map(o => o.resource), ["light"]);
 });
+
+const capped = (offers: WorkOffer[], state: FleetSnapshot = empty) => scheduleMachine({
+  machine: "mac", heavyLimit: 1, combinedLimit: 2, ticketLimit: 2,
+  projects: ["org/core", "org/mobile"], offers, state,
+});
+test("new light claims share the two-ticket budget across projects", () => {
+  assert.deepEqual(capped([offer("org/mobile", 3, "light"), offer("org/core", 1, "light"), offer("org/core", 2, "light")]).map(o => o.ticket), ["org/core#1", "org/core#2"]);
+});
+test("active tickets count after restart, but maintenance does not", () => {
+  const state: FleetSnapshot = { claims: [], runs: [1, 2].map(n => ({ ...offer("org/core", n, "light"), id: `r${n}`, machine: "mac", session: "old", generation: "g", created: 1 })) };
+  const maintenance = { ...offer("org/mobile", 9, "light"), ticket: "org/mobile#@reconcile", role: "reconcile" };
+  assert.deepEqual(capped([offer("org/mobile", 3, "light"), maintenance], state).map(o => o.ticket), [maintenance.ticket]);
+});
+test("blocked and completed claims without offers leave room for new tickets", () => {
+  const state: FleetSnapshot = { ...empty, claims: [1, 2, 3].map(n => ({ ticket: `org/core#${n}`, machine: "mac", generation: "g", created: n })) };
+  assert.equal(capped([offer("org/mobile", 4, "light"), offer("org/mobile", 5, "light")], state).length, 2);
+});
+test("legacy owned ready tickets continue above the cap and prevent new claims", () => {
+  const state: FleetSnapshot = { ...empty, claims: [1, 2, 3].map(n => ({ ticket: `org/core#${n}`, machine: "mac", generation: "g", created: n })) };
+  assert.deepEqual(capped([1, 2, 3, 4].map(n => offer("org/core", n, "light")), state).map(o => o.ticket), ["org/core#1", "org/core#2", "org/core#3"]);
+  assert.deepEqual(capped([offer("org/core", 1, "light"), offer("org/mobile", 4, "light"), offer("org/mobile", 5, "light")], state).map(o => o.ticket), ["org/core#1", "org/mobile#4"]);
+});

@@ -77,3 +77,27 @@ test("withdraw waits for an uncertain in-flight grant and returns it for cancell
   assert.equal(store.snapshot().runs.length, 0);
   store.close();
 });
+
+test("manager rejects invalid claim budgets", () => {
+  const client = { snapshot: async () => ({ claims: [], runs: [] }), start: async () => ({ ok: false as const, reason: "foreign-claim" as const }), finish: async () => {} };
+  for (const ticketLimit of [0, -1, 1.5, NaN]) assert.throws(() => new MachineManager({ machine: "mac", heavyLimit: 1, combinedLimit: 2, projects: ["org/core"], ticketLimit }, client), /ticket limit/);
+});
+test("manager enforces the cap over repeated polls and returns space after completion", async () => {
+  const store = new FleetStore(":memory:", { mac: { heavyLimit: 1, combinedLimit: 2 } });
+  const manager = new MachineManager({ machine: "mac", heavyLimit: 1, combinedLimit: 2, ticketLimit: 2, projects: ["org/core", "org/mobile"] }, {
+    snapshot: async () => store.snapshot(), start: async r => store.start(r), finish: async (s, id) => store.finish("mac", s, id),
+  });
+  const work = (project: string, n: number): WorkOffer => ({ project, ticket: `${project}#${n}`, role: "refiner", resource: "light", key: `${n}`, order: n, locks: [] });
+  manager.offer("org/core", "s", [work("org/core", 1)]);
+  manager.offer("org/mobile", "m", [work("org/mobile", 2), work("org/mobile", 3)]);
+  await manager.tick(); await manager.tick();
+  assert.equal(store.snapshot().runs.length, 2);
+  assert.equal((await manager.status()).runnableTicketCount, 2);
+  const run = store.snapshot().runs.find(r => r.project === "org/core")!;
+  await manager.finish("org/core", "s", run.id);
+  manager.offer("org/core", "s", []);
+  await manager.tick();
+  assert.deepEqual(store.snapshot().runs.map(r => r.ticket).sort(), ["org/mobile#2", "org/mobile#3"]);
+  assert.equal(store.snapshot().claims.length, 3); // Done claims remain reserved.
+  store.close();
+});
