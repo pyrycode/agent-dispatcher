@@ -2,9 +2,9 @@ import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { listen, readJson, tokenMatches, type FleetClient } from "./fleet-http.js";
 import { validateStart, validateLimits, type MachineLimits, type FleetRun } from "./fleet-store.js";
-import { scheduleMachine, type WorkOffer } from "./machine-scheduler.js";
+import { scheduleMachine, acceptsDuringProjectDrain, type WorkOffer } from "./machine-scheduler.js";
 
-export interface MachineConfig extends MachineLimits { machine: string; projects: string[] }
+export interface MachineConfig extends MachineLimits { machine: string; projects: string[]; drainingProjects?: string[] }
 type ClaimService = Pick<FleetClient, "snapshot" | "start" | "finish"> & Partial<Pick<FleetClient, "authorize">>;
 interface Offers { session: string; work: WorkOffer[]; at: number }
 export function offerId(machine: string, session: string, offer: WorkOffer): string {
@@ -19,6 +19,20 @@ export class MachineManager {
   constructor(readonly config: MachineConfig, readonly claims: ClaimService, private readonly now = Date.now) {
     validateLimits(config);
     if (!config.machine || new Set(config.projects).size !== config.projects.length) throw new Error("Invalid machine configuration");
+    if (config.drainingProjects !== undefined && (!Array.isArray(config.drainingProjects) || config.drainingProjects.some(p => !config.projects.includes(p)))) throw new Error("Invalid project drain configuration");
+  }
+  async setProjectDraining(project: string, draining: boolean, persist: (projects: string[]) => void): Promise<void> {
+    if (!this.config.projects.includes(project) || typeof draining !== "boolean") throw new Error("Invalid project drain request");
+    const projects = new Set(this.config.drainingProjects ?? []);
+    if (draining) projects.add(project); else projects.delete(project);
+    const next = [...projects];
+    // Save before acknowledging or changing admission. A failed save leaves
+    // the previous policy intact. Both operations are synchronous.
+    persist(next);
+    this.config.drainingProjects = next;
+    // A start already sent to the authority can still commit. Wait for it
+    // before acknowledging the drain; subsequent jobs check the new policy.
+    try { await this.tickPromise; } catch { /* a lost reply remains reserved */ }
   }
   offer(project: string, session: string, work: WorkOffer[]): void {
     if (!this.config.projects.includes(project) || !session || session.length > 200 || !Array.isArray(work) || work.length > 5000) throw new Error("Invalid offers");
@@ -45,6 +59,7 @@ export class MachineManager {
     const selected = scheduleMachine({ ...this.config, offers, state });
     for (const job of selected) {
       if (this.draining) break;
+      if (!acceptsDuringProjectDrain(job, this.config.machine, this.config.drainingProjects ?? [], state)) continue;
       const current = this.offers.get(job.project);
       if (!current || !current.work.some(w => w.key === job.key) || this.now() - current.at >= 180_000) continue;
       // A lost reply leaves a durable reservation. grants() recovers that exact
@@ -69,13 +84,14 @@ export class MachineManager {
     const state = await this.claims.snapshot();
     const available = [...this.offers.values()].filter(o => this.now() - o.at < 180_000).flatMap(o => o.work);
     const eligible = new Set(scheduleMachine({ ...this.config, offers: available, state }).map(o => `${o.project}/${o.key}`));
-    return { machine: this.config.machine, heavyLimit: this.config.heavyLimit, combinedLimit: this.config.combinedLimit, draining: this.draining, ...state,
-      projects: this.config.projects.map(project => ({ project, lastSeen: this.offers.get(project)?.at ?? null })),
+    return { machine: this.config.machine, heavyLimit: this.config.heavyLimit, combinedLimit: this.config.combinedLimit, draining: this.draining, drainingProjects: this.config.drainingProjects ?? [], ...state,
+      projects: this.config.projects.map(project => ({ project, draining: this.config.drainingProjects?.includes(project) ?? false, lastSeen: this.offers.get(project)?.at ?? null })),
       queue: available.map(o => ({ ticket: o.ticket, role: o.role, resource: o.resource,
         state: this.finished.has(`${o.project}/${o.key}`) ? "already-completed"
           : state.runs.some(r => r.ticket === o.ticket) ? "reserved-or-running"
           : this.draining ? "draining"
           : state.claims.some(c => c.ticket === o.ticket && c.machine !== this.config.machine) ? "owned-elsewhere"
+          : !acceptsDuringProjectDrain(o, this.config.machine, this.config.drainingProjects ?? [], state) ? "project-draining"
           : eligible.has(`${o.project}/${o.key}`) ? "eligible" : "waiting-for-capacity-or-lock" })),
     };
   }
@@ -93,7 +109,7 @@ export class MachineManager {
   }
 }
 
-export async function serveManager(manager: MachineManager, projectTokens: Record<string, string>, operatorToken: string, port: number | string, host = "127.0.0.1"): Promise<Server> {
+export async function serveManager(manager: MachineManager, projectTokens: Record<string, string>, operatorToken: string, port: number | string, host = "127.0.0.1", persistDrains?: (projects: string[]) => void): Promise<Server> {
   const tokens = [...Object.values(projectTokens), operatorToken];
   if (tokens.some(t => !t) || new Set(tokens).size !== tokens.length) throw new Error("Manager credentials must be distinct");
   const server = createServer(async (req, res) => {
@@ -109,6 +125,12 @@ export async function serveManager(manager: MachineManager, projectTokens: Recor
         if (!admin) return send(403, { error: "Operator credential required" });
         manager.draining = true;
         return send(200, { ok: true });
+      }
+      if (req.url === "/project-drain") {
+        if (!admin) return send(403, { error: "Operator credential required" });
+        if (!persistDrains) throw new Error("Persistent project drains are not configured");
+        await manager.setProjectDraining(body.project, body.draining, persistDrains);
+        return send(200, { ok: true, drainingProjects: manager.config.drainingProjects });
       }
       if (!project) return send(403, { error: "Project credential required" });
       if (req.url === "/offers") {

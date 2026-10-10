@@ -5,6 +5,7 @@ import { FleetStore } from "./fleet-store.js";
 import { FleetClient, JsonClient, serveFleet } from "./fleet-http.js";
 import { MachineManager, serveManager } from "./machine-manager.js";
 import { startClaimLabelSync } from "./claim-labels.js";
+import { persistProjectDrains } from "./fleet-config.js";
 
 function secret(name: string): string {
   if (typeof name !== "string" || !name || !process.env[name]) throw new Error(`Missing credential environment variable: ${name}`);
@@ -12,8 +13,8 @@ function secret(name: string): string {
 }
 async function main(): Promise<void> {
   const [command, configPath, ...args] = process.argv.slice(2);
-  if (!configPath || !["claims", "manager", "status", "drain", "free"].includes(command)) {
-    throw new Error("Usage: fleet-bin.ts claims|manager|status|drain|free CONFIG [TICKET GENERATION --confirmed-stopped]");
+  if (!configPath || !["claims", "manager", "status", "drain", "drain-project", "resume-project", "free"].includes(command)) {
+    throw new Error("Usage: fleet-bin.ts claims|manager|status|drain|drain-project|resume-project|free CONFIG [PROJECT | TICKET GENERATION --confirmed-stopped]");
   }
   const config = JSON.parse(readFileSync(configPath, "utf8"));
   if (command === "claims") {
@@ -31,10 +32,10 @@ async function main(): Promise<void> {
   }
   if (command === "manager") {
     const claims = new FleetClient(config.claimsUrl, secret(config.claimsTokenEnv));
-    const manager = new MachineManager({ machine: config.machine, heavyLimit: config.heavyLimit, combinedLimit: config.combinedLimit, projects: config.projects.map((p: any) => p.repo) }, claims);
+    const manager = new MachineManager({ machine: config.machine, heavyLimit: config.heavyLimit, combinedLimit: config.combinedLimit, projects: config.projects.map((p: any) => p.repo), drainingProjects: config.drainingProjects }, claims);
     const tokens = Object.fromEntries(config.projects.map((p: any) => [p.repo, secret(p.tokenEnv)]));
     const endpoint = config.socketPath ? resolve(config.socketPath) : config.port ?? 7431;
-    const server = await serveManager(manager, tokens, secret(config.operatorTokenEnv), endpoint, config.host ?? "127.0.0.1");
+    const server = await serveManager(manager, tokens, secret(config.operatorTokenEnv), endpoint, config.host ?? "127.0.0.1", projects => persistProjectDrains(configPath, projects));
     const timer = setInterval(() => { void manager.tick().catch(e => console.error("Scheduling paused:", e.message)); }, 1000);
     const close = () => { manager.draining = true; clearInterval(timer); server.close(() => process.exit(0)); };
     process.on("SIGTERM", close); process.on("SIGINT", close);
@@ -48,8 +49,16 @@ async function main(): Promise<void> {
     console.log(`Freed ${args[0]}. Working copies and GitHub workflow state were preserved.`);
     return;
   }
-  const client = new JsonClient(config.managerUrl, secret(config.operatorTokenEnv));
+  const managerUrl = config.managerUrl ?? (config.socketPath ? `unix://${resolve(config.socketPath)}` : undefined);
+  if (!managerUrl) throw new Error("Operator configuration requires managerUrl or socketPath");
+  const client = new JsonClient(managerUrl, secret(config.operatorTokenEnv));
   if (command === "drain") { await client.call("/drain", {}); console.log("Draining: no new grants. Existing grants remain reserved."); }
+  else if (command === "drain-project" || command === "resume-project") {
+    if (args.length !== 1) throw new Error(`${command} requires PROJECT`);
+    const draining = command === "drain-project";
+    await client.call("/project-drain", { project: args[0], draining });
+    console.log(draining ? `Draining ${args[0]}: existing owned tickets continue; no new tickets or main sweeps. Saved across manager restarts.` : `Resumed ${args[0]}: new tickets are eligible again.`);
+  }
   else console.log(JSON.stringify(await client.call("/state"), null, 2));
 }
 main().catch(error => { console.error(error.message); process.exitCode = 1; });
