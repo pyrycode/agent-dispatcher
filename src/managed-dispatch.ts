@@ -87,10 +87,24 @@ export class ManagedDispatch {
   }
   ready(pending: Pending): boolean { return !this.draining && !!pending.run && !this.running.has(pending.run.id); }
   async endCycle(): Promise<void> {
-    for (const [name, pending] of this.pending) {
-      if (this.seen.has(name) || (pending.run && this.running.has(pending.run.id))) continue;
-      if (pending.run) await this.finish(pending.run, false, true); // Never started: safe to cancel.
-      this.pending.delete(name);
+    const retired = [...this.pending].filter(([name, pending]) =>
+      !this.seen.has(name) && !(pending.run && this.running.has(pending.run.id)));
+    if (retired.length) {
+      // Stop publishing before forgetting offers. A start may have committed
+      // without reaching sync's cached grants. Withdraw waits for that start
+      // and returns every session reservation, including those unseen grants.
+      while (this.syncing) await sleep(20);
+      this.syncing = true;
+      try {
+        const runs = await this.connection.call<FleetRun[]>("/withdraw", { session: this.session });
+        for (const [name, pending] of retired) {
+          const run = runs.find(r => r.ticket === pending.offer.ticket && r.role === pending.offer.role);
+          if (run) await this.finish(run, false, true); // Never started: safe to cancel.
+          this.pending.delete(name);
+        }
+        // Current offers and running jobs remain intact. sync republishes
+        // them with their original keys and recovers their existing grants.
+      } finally { this.syncing = false; }
     }
     await this.sync();
   }
