@@ -5,7 +5,10 @@ import { resolve, dirname, basename } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { config } from "dotenv";
-import { githubPauseMs } from "./github-transport.js";
+import { githubPauseMs, freshGitHubRead } from "./github-transport.js";
+import { runRecoveryWork, recoveryHandoff, parseRecoveryDecision, RECOVERY_INSTRUCTIONS } from "./recovery-work.js";
+import { recoveryLogContext } from "./recovery-context.js";
+import type { RecoveryIncident, RecoveryDecision } from "./fleet-recovery.js";
 import { ManagedDispatch, trackManagedChild } from "./managed-dispatch.js";
 import { DispatchPool, excludeInFlight, freeSeats, launchCandidates, liveGateRunnerFor, mayStartMainSweep, resolvePollIntervalMs } from "./dispatch-pool.js";
 import { countVerdictsSince, isStaleBaseFinding, parseVerdictArtifacts, pickVerdictPr, shouldFlagMissingVerdict } from "./verdict-guard.js";
@@ -1515,6 +1518,10 @@ async function buildPromptForAgent(
 
   // Gather context from previous phases
   const ticketNum = item.issueNumber;
+
+  if (process.env.PYRY_RECOVERY === "1" && ["builder", "developer"].includes(agent.name) && ticketNum > 0) {
+    parts.push(recoveryHandoff(await client.getIssueCommentBodies(ticketNum)));
+  }
 
   // Architecture docs — needed by developer, code-review, documentation.
   // The builder set's refiner is the PO contract under a new name, so it
@@ -9235,6 +9242,11 @@ export async function pollLoop(): Promise<void> {
   // Runs in flight. Seats refill as runs settle instead of per batch; see
   // dispatch-pool.ts for the measurement that motivated it (2026-09-22).
   const pool = new DispatchPool();
+  // Fleet recovery is enabled only after the claim authority and all managers have upgraded.
+  const recoveryEnabled = process.env.PYRY_RECOVERY === "1";
+  if (recoveryEnabled && !managed) throw new Error("PYRY_RECOVERY requires managed dispatch");
+  let recoveryCheckedAt = 0;
+  let recoveryQueue: RecoveryIncident[] = [];
 
   // Per-cycle dispatch concurrency cap. Default 2 (modest parallelism without
   // burning Anthropic rate-limit budget too fast). Set PYRY_MAX_CONCURRENT=1
@@ -9700,8 +9712,68 @@ export async function pollLoop(): Promise<void> {
     // Pre-dispatch health checks, after selection and before any wip label,
     // family counter or worktree: a held ticket is simply not dispatched
     // this cycle (agent-dispatcher#131).
+    if (managed && recoveryEnabled && !drainMode && !envHeld) {
+      if (Date.now() - recoveryCheckedAt >= 300_000) {
+        // Reuses the board snapshot. No extra board poll and no model on a quiet cycle.
+        const incidents = await managed.recoveryReport(await client.getOpenProjectItems());
+        recoveryQueue = incidents.filter(i => i.state === "queued");
+        for (const alert of incidents.filter(i => i.state === "escalated")) await notifyDiscord(`${alert.ticket}: ${alert.reason}. Operator intervention required.`);
+        recoveryCheckedAt = Date.now();
+      }
+      for (const incident of recoveryQueue) {
+        const issue = Number(incident.ticket.split("#")[1]);
+        const key = `recovery#${issue}`;
+        if (pool.has(key)) continue;
+        const offer = managed.offer(issue, "recovery", "heavy", [], -4);
+        offer.offer.roleLimit = 1;
+        if (!managed.ready(offer)) continue;
+        pool.launch(key, () => managed.run(offer, async () => {
+          const recoveryClient = managed.client(rawClient, false, issue);
+          try {
+            await runRecoveryWork(incident, {
+              project: managed.project, agents: stageSet.agents,
+              readCurrent: async () => {
+                recoveryClient.clearItemsCache();
+                return freshGitHubRead(async () => (await recoveryClient.getOpenProjectItems()).find(i => i.issueNumber === issue));
+              },
+              begin: () => managed.recoveryStep<RecoveryIncident>("begin", incident.id),
+              decide: decision => managed.recoveryStep<RecoveryDecision>("decide", incident.id, decision),
+              complete: () => managed.recoveryStep("complete", incident.id),
+              assess: async item => {
+                const runner = selectRunner("recovery");
+                if (runner === "codex" && !process.env.PYRY_CODEX_BIN) process.env.PYRY_CODEX_BIN = resolveCodexExecutable(process.env);
+                const logFile = agentLogPath("recovery", issue);
+                const promptFile = logFile + ".prompt.txt";
+                const systemPromptFile = logFile + ".system.txt";
+                const comments = (await recoveryClient.getIssueCommentBodies(issue)).slice(-12).map(c => c.slice(-6000));
+                writeFileSync(promptFile, scrubCredentials(JSON.stringify({ incident, ticket: item, comments, logs: recoveryLogContext(LOGS_DIR, issue) })), { mode: 0o600 });
+                writeFileSync(systemPromptFile, RECOVERY_INSTRUCTIONS, { mode: 0o600 });
+                const result = await runClaudeStreaming({ runner, sourceReview: true, sourceReviewRoot: repoRoot,
+                  promptFile, systemPromptFile, cwd: repoRoot, logFile,
+                  model: runner === "codex" ? process.env.PYRY_CODEX_MODEL ?? "gpt-6.1-sol" : "sonnet",
+                  effort: runner === "codex" ? process.env.PYRY_CODEX_EFFORT ?? "high" : "high", maxTurns: 20, timeoutMs: 600_000,
+                  allowedTools: "Read,Glob,Grep", disallowedTools: "Bash,Write,Edit,Agent",
+                  env: { ...scrubSpawnEnv(process.env), CLAUDE_CODE_ENTRYPOINT: "recovery" } });
+                if (result.isError || result.timedOut || result.hadPermissionDenial) throw new Error("Recovery assessment failed");
+                return parseRecoveryDecision(result.output);
+              },
+              comment: (n, body) => recoveryClient.addComment(n, body),
+              removeLabel: (n, label) => recoveryClient.removeLabel(n, label),
+              move: (id, status) => recoveryClient.updateItemStatus(id, status),
+              notify: notifyDiscord,
+            });
+          } catch (error) {
+            console.error(`Recovery failed for ${incident.ticket}:`, error);
+            await notifyDiscord(`${incident.ticket}: recovery stopped without a confirmed handback. Inspect its recovery log; ownership was preserved.`);
+          } finally {
+            recoveryQueue = recoveryQueue.filter(i => i.id !== incident.id);
+          }
+        }));
+      }
+    }
+    const recoveringTickets = new Set(recoveryQueue.map(i => Number(i.ticket.split("#")[1])));
     const offeredCandidates = managed
-      ? selectedCandidates.filter((c, order) => managed.ready(managed.agentOffer(c.agent, c.item, order)))
+      ? selectedCandidates.filter((c, order) => !recoveringTickets.has(c.item.issueNumber) && managed.ready(managed.agentOffer(c.agent, c.item, order)))
       : selectedCandidates;
     const health = managed ? { dispatch: offeredCandidates, held: [] } : await holdUnhealthyCandidates({
       candidates: offeredCandidates,

@@ -85,6 +85,86 @@ The operator-authenticated claim-service endpoint `GET /github/status` reports u
 
 For a watcher on the claim-service host, add `github.socketPath` and optionally `github.cliConfigDir`. The service creates an isolated CLI configuration for that private socket. Set the watcher's `GH_CONFIG_DIR` to that directory. Keep the directory private to the service user. The supervisor must remove the sole service's stale socket before restart, as with the manager socket. REST requests select a configured repository from their path. GraphQL requests use the first configured project as their access context. This socket is only for trusted host jobs; containers use their project-authenticated manager instead.
 
+## Managed recovery
+
+The orchestrator can assess errored tickets and repeated review rework. Enable
+`PYRY_RECOVERY=1` in each managed project dispatcher after upgrading the central
+claim service and its computer manager. Independent dispatch refuses this setting.
+Leave the old board watcher in read-only mode. Do not enable its takeover scripts.
+
+Each enabled dispatcher reports its open board snapshot every five minutes. It
+reuses the ordinary board query and sends only ticket numbers, columns, labels
+and blocker state. The central service records incidents in its existing SQLite
+database. Repeated polls do not call a model. A resolved error that returns creates
+a new incident. Rework counts of two or more request an assessment, not a repair.
+
+The owning computer offers an assessment as the `recovery` role. It uses normal
+admission and a heavy reservation. Only one assessment runs across the fleet at
+a time. Existing ownership, both capacity limits, project drains and full drains
+apply. An unreachable owner or uncertain reservation is never released by recovery.
+An unclaimed ticket can be assessed only after normal admission claims it.
+
+The assessment uses the project's configured runner, with an optional `recovery`
+role override in its existing runner file. Codex inherits the configured model and
+effort. Claude uses Sonnet with high effort. It uses the existing restricted source
+reader, with a ten-minute limit and twenty Claude turns. The prompt contains the
+ticket, its last twelve comments and the tails of its last two agent logs. Local
+source reads are allowed; publishing, file edits, tests and delegation are not.
+A failed reader or invalid response escalates, without a less restricted fallback.
+
+The four possible decisions are:
+
+- `wait`: review is making progress or no intervention is needed. Record the
+  assessment and allow the ordinary workflow to continue.
+- `retry`: remove the error on the current failed stage. Code restricts this to
+  a recognised stage with no completion label. Existing automatic backoff keeps
+  its own budget and is not assessed by this path.
+- `rework`: leave a concrete repair brief and return unfinished code to its
+  builder or developer. Remove obsolete downstream completion and rework labels.
+  Keep the rework count, claim, required live gate and earlier planning evidence.
+  The normal code agent receives the brief, reserves capacity separately, makes
+  the repair and returns through the usual review and testing stages.
+- `escalate`: record the reason for operator intervention. No workflow state is
+  changed.
+
+The model only proposes a decision. The wrapper checks current open issue state
+before and after assessment, and validates the proposed handback. It cannot
+override Halted or needs-human holds, open blockers, running labels, permission
+denials or family breakers. It cannot accept a failed live gate, reset rework
+counts, mark code reviewed, merge a pull request or restart a dispatcher.
+
+The central ledger permits at most forty assessments and two automatic repair
+handbacks per rolling day across the fleet. A ticket gets at most one automatic
+handback per rolling day. Budget exhaustion escalates the incident. An unchanged
+assessed incident is not assessed again just because a day passed. Normal review
+can still advance, and a changed rework count creates a new assessment.
+
+The decision and repair budget are stored before GitHub writes. A process that
+stops during assessment or handback keeps its reservation. Once that exact run
+has been finished through normal shutdown or operator recovery, an incomplete
+incident escalates instead of replaying writes. `complete` in the incident list
+means the decision was applied, not that the subsequent repair passed verification.
+
+Inspect incident history with:
+
+```sh
+pnpm fleet recovery /absolute/private/path/operator.json
+```
+
+The manager also exposes it at `GET /recovery/state`. Ordinary status identifies
+missing or stale dispatcher reports and reservations older than three hours.
+These are requests to check real worker progress, not proof a process crashed.
+Running labels without reservations are flagged after three hours. Open work
+columns with no workflow progress are flagged after a day. Expected blocker waits
+are excluded. Explicit holds and stalled-work alerts are recorded without AI.
+Alerts and non-wait decisions use the dispatcher's existing notification route.
+
+Upgrade order: claim service, computer managers, then project dispatchers. Enable
+the flag for one project first and inspect its incident history and next recovery
+handback. Turning the flag off stops new recovery offers; it does not release
+existing reservations or interrupt a running assessment. Keep the old watcher
+read-only until all projects are reporting through this path.
+
 ## Services on Linux and macOS
 
 Use a systemd user service on Linux and a launchd user agent on macOS. Templates are provided. Replace every absolute placeholder before installation. Keep the manager outside project containers. There is exactly one manager for the host, even when projects use different containers or Node versions.
