@@ -32,7 +32,7 @@ async function main(): Promise<void> {
   }
   if (command === "manager") {
     const claims = new FleetClient(config.claimsUrl, secret(config.claimsTokenEnv));
-    const manager = new MachineManager({ machine: config.machine, heavyLimit: config.heavyLimit, combinedLimit: config.combinedLimit, projects: config.projects.map((p: any) => p.repo), drainingProjects: config.drainingProjects }, claims);
+    const manager = new MachineManager({ machine: config.machine, heavyLimit: config.heavyLimit, combinedLimit: config.combinedLimit, ticketLimit: config.ticketLimit ?? 2, projects: config.projects.map((p: any) => p.repo), drainingProjects: config.drainingProjects }, claims);
     const tokens = Object.fromEntries(config.projects.map((p: any) => [p.repo, secret(p.tokenEnv)]));
     const endpoint = config.socketPath ? resolve(config.socketPath) : config.port ?? 7431;
     const server = await serveManager(manager, tokens, secret(config.operatorTokenEnv), endpoint, config.host ?? "127.0.0.1", projects => persistProjectDrains(configPath, projects));
