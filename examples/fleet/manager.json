@@ -1,0 +1,24 @@
+{
+  "machine": "macbook",
+  "heavyLimit": 1,
+  "claimsUrl": "http://127.0.0.1:7430",
+  "claimsTokenEnv": "FLEET_MACBOOK_TOKEN",
+  "host": "127.0.0.1",
+  "port": 7431,
+  "operatorTokenEnv": "FLEET_LOCAL_OPERATOR_TOKEN",
+  "projects": [
+    {
+      "repo": "pyrycode/pyrycode",
+      "tokenEnv": "FLEET_CORE_TOKEN"
+    },
+    {
+      "repo": "pyrycode/pyrycode-mobile",
+      "tokenEnv": "FLEET_MOBILE_TOKEN"
+    },
+    {
+      "repo": "pyrycode/pyrycode-desktop",
+      "tokenEnv": "FLEET_DESKTOP_TOKEN"
+    }
+  ],
+  "combinedLimit": 1
+}

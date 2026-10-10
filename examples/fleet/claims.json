@@ -1,0 +1,23 @@
+{
+  "database": "/absolute/private/path/claims.sqlite",
+  "host": "127.0.0.1",
+  "port": 7430,
+  "operatorTokenEnv": "FLEET_CLAIMS_OPERATOR_TOKEN",
+  "machines": {
+    "macbook": {
+      "heavyLimit": 1,
+      "combinedLimit": 1,
+      "tokenEnv": "FLEET_MACBOOK_TOKEN"
+    },
+    "pyrybox": {
+      "heavyLimit": 1,
+      "combinedLimit": 2,
+      "tokenEnv": "FLEET_PYRYBOX_TOKEN"
+    },
+    "six-core": {
+      "heavyLimit": 1,
+      "combinedLimit": 2,
+      "tokenEnv": "FLEET_SIX_CORE_TOKEN"
+    }
+  }
+}

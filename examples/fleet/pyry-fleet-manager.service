@@ -1,0 +1,16 @@
+[Unit]
+Description=Pyrycode machine work manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/absolute/path/to/agent-dispatcher
+ExecStart=/absolute/path/to/start-fleet-manager
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+UMask=0077
+
+[Install]
+WantedBy=default.target

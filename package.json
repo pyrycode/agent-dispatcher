@@ -6,6 +6,7 @@
   "description": "Dispatch agent runs against a GitHub Project board. Label-driven state machine, worktree isolation, salvage on max_turns.",
   "scripts": {
     "start": "tsx src/dispatch-bin.ts",
+    "fleet": "node --import tsx src/fleet-bin.ts",
     "watch": "tsx --watch src/dispatch-bin.ts",
     "test": "tsx --test --test-concurrency=4 src/*.test.ts src/eval/*.test.ts",
     "typecheck": "tsc --noEmit -p .",

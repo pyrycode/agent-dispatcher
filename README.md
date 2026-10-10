@@ -978,3 +978,7 @@ Both tiers limit simultaneous test files to four workers so fake child startup
 does not compete with every test file at once.
 Run it after changes to runner timeouts, process termination or wait-credit accounting.
 The consumer launcher exposes it as `bin/pyry-test --slow`.
+
+## Multiple computers
+
+Optional [managed dispatch](docs/machine-manager.md) shares heavy capacity across projects on each computer and reserves tickets across computers. The guide covers configuration, Linux and macOS services, draining and manual ticket release.

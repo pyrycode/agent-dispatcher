@@ -5,6 +5,7 @@ import { resolve, dirname, basename } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { config } from "dotenv";
+import { ManagedDispatch, trackManagedChild } from "./managed-dispatch.js";
 import { DispatchPool, excludeInFlight, freeSeats, launchCandidates, liveGateRunnerFor, mayStartMainSweep, resolvePollIntervalMs } from "./dispatch-pool.js";
 import { countVerdictsSince, isStaleBaseFinding, parseVerdictArtifacts, pickVerdictPr, shouldFlagMissingVerdict } from "./verdict-guard.js";
 import { countOpenPrs, shouldFlagMissingPr } from "./pr-guard.js";
@@ -133,6 +134,8 @@ import { activeStageSet } from "./stage-sets.js";
 import { resolveEffort } from "./effort-policy.js";
 import {
   REAL_CLAUDE_GATE_FAIL_COLUMN,
+  REAL_CLAUDE_GATE_RUN_FROM_COLUMN,
+  decideRealClaudeGateRun,
   decideDoneCleanup,
   decideMergeRetry,
   decidePostRunLabels,
@@ -990,7 +993,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
     // it down without a `child` reference. `child.pid` is undefined if
     // spawn synchronously failed; the surrounding `retrySpawnOnTransientError`
     // wrapper handles that path separately, but be defensive anyway.
-    if (child.pid !== undefined) liveChildPgrpPids.add(child.pid);
+    if (child.pid !== undefined) { liveChildPgrpPids.add(child.pid); trackManagedChild(child.pid); }
 
     let buffer = "";
     const decoder = new StringDecoder("utf8");
@@ -2309,7 +2312,7 @@ export function runCommandAsync(
       res({ ok: false, exitCode: null, timedOut: false, output: `could not spawn ${cmd}: ${e?.message ?? e}` });
       return;
     }
-    if (child.pid !== undefined) liveChildPgrpPids.add(child.pid);
+    if (child.pid !== undefined) { liveChildPgrpPids.add(child.pid); trackManagedChild(child.pid); }
 
     let tail = "";
     const keep = (chunk: Buffer) => { tail = (tail + chunk.toString("utf8")).slice(-4096); };
@@ -6730,7 +6733,7 @@ export const spawnGateCommand: GateSpawner = async (req) => {
     return { exitCode: null, timedOut: false, spawnError: `could not spawn gate command: ${e?.message ?? e}` };
   }
 
-  if (child.pid !== undefined) liveChildPgrpPids.add(child.pid);
+  if (child.pid !== undefined) { liveChildPgrpPids.add(child.pid); trackManagedChild(child.pid); }
 
   const out = createWriteStream(req.stdoutPath);
   const err = createWriteStream(req.stderrPath);
@@ -7694,6 +7697,7 @@ export async function startMainSweepCycle(opts: MainSweepCycleOpts): Promise<{
   // sweep itself only needs to notice main moving within a cycle or two.
   let head: string | null = null;
   try { head = git(`rev-parse origin/${base}`); } catch {}
+  if (opts.expectedHead !== undefined && head !== opts.expectedHead) return { decision: { run: false, reason: "main changed since the managed grant" }, finished: null };
   let mergesSince: number | null = null;
   if (head !== null && state.lastSha !== null && head !== state.lastSha) {
     try {
@@ -7727,6 +7731,7 @@ interface MainSweepCycleOpts {
   repoRoot?: string;
   defaultBranch?: string;
   deps?: Partial<MainSweepCycleDeps>;
+  expectedHead?: string;
 }
 
 /** `startMainSweepCycle` awaited to the end. Returns the decision. */
@@ -8065,6 +8070,7 @@ export async function selectPastParkedFamilies(opts: {
   threshold?: number;
   /** Defaults to FAMILY_BREAKER_SELECTION_PASSES. */
   maxPasses?: number;
+  deferRoleLimits?: boolean;
 }): Promise<{
   candidates: Array<{ agent: AgentConfig; item: ProjectItem }>;
   tallies: Map<number, number>;
@@ -8082,6 +8088,7 @@ export async function selectPastParkedFamilies(opts: {
       maxConcurrent: opts.maxConcurrent,
       rootLabelsByIssue: opts.rootLabelsByIssue,
       excludedRoots: cycle.vetoedRoots,
+      deferRoleLimits: opts.deferRoleLimits,
     });
     if (selected.length === 0) break;
 
@@ -9154,13 +9161,26 @@ export async function runEnvPreflight(opts: {
 }
 
 export async function pollLoop(): Promise<void> {
-  const client = new GitHubProjectClient({
+  const rawClient = new GitHubProjectClient({
     owner: process.env.GITHUB_OWNER!,
     repo: process.env.GITHUB_REPO!,
     projectNumber: parseInt(process.env.PROJECT_NUMBER!, 10),
     token: process.env.GITHUB_TOKEN!,
     ownerType: "organization",
   });
+  const managed = ManagedDispatch.fromEnv(process.env);
+  if (managed && AUTOCURATE_MEMORY) throw new Error("Managed dispatch requires PYRY_AUTOCURATE_MEMORY=0");
+  if (managed) await managed.start();
+  const client = managed ? managed.client(rawClient) : rawClient;
+  const maintenanceClient = managed ? managed.client(rawClient, true) : rawClient;
+  const mergeReady = async (): Promise<void> => {
+    if (!managed) return runAutoMerge(client);
+    for (const item of await client.getItemsByStatus("Done")) {
+      if (item.issueNumber <= 0 || item.labels.includes("merged") || item.labels.some(l => l.startsWith("error:"))) continue;
+      const offer = managed.offer(item.issueNumber, "merge", "heavy", [`${managed.project}:merge`], -2);
+      if (managed.ready(offer)) await managed.run(offer, () => runAutoMerge(managed.client(rawClient, false, item.issueNumber)));
+    }
+  };
   // GitHub's board listing can lag its issues (2026-09-23 incident); the
   // client then reads columns from the issues and says so here, once.
   client.setListingGapHandler((message) => { void notifyDiscord(message); });
@@ -9212,13 +9232,13 @@ export async function pollLoop(): Promise<void> {
   // (Phase 2/3 will increase load). Serial-within-a-dependency-chain is
   // preserved by `hasOpenBlockers` regardless of this cap — it only
   // gates parallel dispatches of *unrelated* tickets. Shipped 2026-05-07.
-  const MAX_CONCURRENT = (() => {
+  const MAX_CONCURRENT = managed ? Number.MAX_SAFE_INTEGER : (() => {
     const raw = process.env.PYRY_MAX_CONCURRENT;
     if (!raw) return 2;
     const n = parseInt(raw, 10);
     return Number.isFinite(n) && n > 0 ? n : 2;
   })();
-  console.log(`   Concurrency cap: ${MAX_CONCURRENT} (PYRY_MAX_CONCURRENT)`);
+  console.log(managed ? "   Concurrency: shared heavy and medium capacity from the machine manager" : `   Concurrency cap: ${MAX_CONCURRENT} (PYRY_MAX_CONCURRENT)`);
   {
     const verifier = activeStageSet().agents.find((a) => a.name === "verifier");
     if (verifier) {
@@ -9321,6 +9341,8 @@ export async function pollLoop(): Promise<void> {
   let gateRun = null as { issue: number; done: Promise<void> } | null;
 
   while (true) {
+    if (managed?.draining) drainMode = true;
+    managed?.beginCycle();
     // Drain check: exit cleanly before starting the next cycle if SIGTERM
     // was received. Placement at top of loop means a cycle that's already
     // mid-execution (including a running dispatchToAgent) finishes first —
@@ -9338,6 +9360,7 @@ export async function pollLoop(): Promise<void> {
         console.log(`🚦 Drain: waiting for the real-claude gate on #${gateRun.issue} to finish`);
         await gateRun.done;
       }
+      if (managed) await managed.stop();
       console.log("✅ Drain complete. Exiting cleanly.");
       break;
     }
@@ -9436,27 +9459,29 @@ export async function pollLoop(): Promise<void> {
     // Surfaced 2026-05-02 after dispatcher stop left #73 unable to advance
     // through code-review. The end-of-cycle maintenance (below) stays as a
     // safety net for state changes produced by this cycle's dispatch.
-    await runClosedSweep(client);
-    // Ordered with the other maintenance passes. The closed sweep runs
-    // first as a courtesy, though the board snapshot is cached and it does
-    // not clear it, so a ticket it just moved to Done can still read as
-    // being in its old column here and collect one observe marker on its
-    // way out. Harmless: it lands in Done next cycle and `runDoneCleanup`
-    // strips its `wip:` there without an age gate.
-    //
-    // Once per cycle only. The age gate means a second pass at the end of
-    // the cycle could never strip anything the opening pass didn't, and it
-    // would cost a comments fetch per candidate to learn that.
-    // A background gate run holds `wip:real-claude-gate` on its ticket, so it
-    // counts as in flight here exactly as a pool entry does.
-    await runStrandedWipSweep(
-      client, notifyDiscord, STRANDED_WIP_MIN_AGE_MS, Date.now(),
-      gateRun === null ? pool.keys() : new Set([...pool.keys(), `real-claude-gate#${gateRun.issue}`]),
-    );
-    await runPendingVerdictPublish(client);
-    await runPendingDoneFinalize(client);
-    await runReworkRouting(client, REWORK_ROUTING_OPTIONS);
-    await runRealClaudeGate(client);
+    const reconcileBoard = async (): Promise<void> => {
+      const reconcile = async (): Promise<void> => {
+        await runClosedSweep(maintenanceClient);
+        await runStrandedWipSweep(maintenanceClient, notifyDiscord, STRANDED_WIP_MIN_AGE_MS, Date.now(),
+          new Set([...pool.keys(), ...(managed?.inFlightKeys() ?? []), ...(gateRun ? [`real-claude-gate#${gateRun.issue}`] : [])]));
+        await runPendingVerdictPublish(maintenanceClient);
+        await runPendingDoneFinalize(maintenanceClient);
+        await runReworkRouting(maintenanceClient, REWORK_ROUTING_OPTIONS);
+        await runRealClaudeGate(maintenanceClient);
+        if (managed) {
+          await runAutoAdvance(maintenanceClient, MAX_CONCURRENT, pool.size);
+          await runDoneCleanup(maintenanceClient);
+          await runParentClose(maintenanceClient);
+          const items = new Map<string, ProjectItem[]>();
+          for (const agent of pollOrder) items.set(agent.column, await maintenanceClient.getItemsByStatus(agent.column));
+          await holdBackoffWaiters(items, maintenanceClient);
+        }
+      };
+      if (!managed) return reconcile();
+      const offer = managed.offer("@reconcile", "reconcile", "light", [`${managed.project}:reconcile`], -3);
+      if (managed.ready(offer)) await managed.run(offer, reconcile);
+    };
+    await reconcileBoard();
     // Run the live gate for one parked ticket, here and only here.
     //
     // AFTER the park step, so a ticket that finished code review this cycle
@@ -9498,7 +9523,27 @@ export async function pollLoop(): Promise<void> {
       runner: realClaudeGateRunner, draining: drainMode, envHeld, healthFailures: gateHealthFailures.length,
     });
     let gateHeld = false;
-    if (!REAL_CLAUDE_GATE_BACKGROUND) {
+    if (managed) {
+      if (gateRun === null && gateRunner !== null) {
+        const parked = await client.getItemsByStatus(REAL_CLAUDE_GATE_RUN_FROM_COLUMN);
+        const candidate = decideRealClaudeGateRun(parked, stageSet.realClaudeGate.reviewDoneLabel);
+        if (candidate) {
+          const offer = managed.offer(candidate.issueNumber, "real-claude-gate", "heavy", [], -1);
+          const verifierBusy = REAL_CLAUDE_GATE_HOLD_VERIFIERS && [...pool.keys()].some(k => k.startsWith("verifier#"));
+          if (managed.ready(offer) && !verifierBusy && sweepRun === null) {
+            const done = managed.run(offer, async () => {
+              await runRealClaudeGateExecution(
+                managed.client(rawClient, false, candidate.issueNumber), gateRunner,
+                REAL_CLAUDE_GATE_MIN_EXECUTED, notifyDiscord, 0,
+                (flaky, ctx) => recordFlakyTests(client, flaky, ctx), undefined,
+                (failures, ctx) => recordInheritedTests(client, failures, ctx),
+              );
+            }).finally(() => { if (gateRun?.done === done) gateRun = null; });
+            gateRun = { issue: candidate.issueNumber, done };
+          }
+        }
+      }
+    } else if (!REAL_CLAUDE_GATE_BACKGROUND) {
       gateHeld = await runRealClaudeGateExecution(
         client,
         gateRunner,
@@ -9530,10 +9575,12 @@ export async function pollLoop(): Promise<void> {
     }
     // A waiting or running background gate keeps the main sweep off the
     // emulator, and verifiers too unless the fork lets them share it.
-    const gateActive = REAL_CLAUDE_GATE_BACKGROUND && (gateHeld || gateRun !== null);
+    const gateActive = (managed !== null || REAL_CLAUDE_GATE_BACKGROUND) && (gateHeld || gateRun !== null);
     const gateHoldsVerifiers = gateActive && REAL_CLAUDE_GATE_HOLD_VERIFIERS;
-    await runAutoAdvance(client, MAX_CONCURRENT, pool.size);
-    await runDoneCleanup(client);
+    if (!managed) {
+      await runAutoAdvance(maintenanceClient, MAX_CONCURRENT, pool.size);
+      await runDoneCleanup(maintenanceClient);
+    }
     // Merge what is already in Done BEFORE this cycle's dispatches merge main
     // into their branches. A ticket that reached Done since the last cycle
     // (a documentation run finishing while the loop waited) used to merge
@@ -9542,8 +9589,8 @@ export async function pollLoop(): Promise<void> {
     // #1825 at 03:17 on 2026-10-07, with #1829 merged four seconds after the
     // setup merge. The end-of-cycle pass below stays for tickets that reach
     // Done during this cycle. With nothing in Done it costs no call.
-    await runParentClose(client);
-    await runAutoMerge(client);
+    if (!managed) await runParentClose(maintenanceClient);
+    await mergeReady();
 
     // Concurrency model: WIP=N (default 2 via PYRY_MAX_CONCURRENT env var).
     // Serial within a dependency chain is preserved by `hasOpenBlockers`
@@ -9582,7 +9629,7 @@ export async function pollLoop(): Promise<void> {
     let rootLabelsByIssue: Map<number, readonly string[]> | undefined;
     try {
       rootLabelsByIssue = new Map(
-        (await client.getAllProjectItems()).map((i) => [i.issueNumber, i.labels] as const),
+        (await rawClient.getAllProjectItems()).map((i) => [i.issueNumber, i.labels] as const),
       );
     } catch (e: any) {
       console.warn(`   ⚠️  Board-wide label lookup failed (family veto degraded this cycle): ${e?.message ?? e}`);
@@ -9629,8 +9676,11 @@ export async function pollLoop(): Promise<void> {
         itemsByColumn: stillHeld.itemsByColumn,
         pollOrder,
         maxConcurrent: seats,
+        deferRoleLimits: managed !== null,
         rootLabelsByIssue,
-        client,
+        // Family metadata is shared across sibling owners. It cannot launch work
+        // or change a ticket stage. Append-only marker comments remain the tally.
+        client: rawClient,
       });
     const selectedCandidates = gateHeld && !REAL_CLAUDE_GATE_BACKGROUND
       ? []
@@ -9638,8 +9688,11 @@ export async function pollLoop(): Promise<void> {
     // Pre-dispatch health checks, after selection and before any wip label,
     // family counter or worktree: a held ticket is simply not dispatched
     // this cycle (agent-dispatcher#131).
-    const health = await holdUnhealthyCandidates({
-      candidates: selectedCandidates,
+    const offeredCandidates = managed
+      ? selectedCandidates.filter((c, order) => managed.ready(managed.agentOffer(c.agent, c.item, order)))
+      : selectedCandidates;
+    const health = managed ? { dispatch: offeredCandidates, held: [] } : await holdUnhealthyCandidates({
+      candidates: offeredCandidates,
       checks: HEALTH_CHECKS,
       checker: healthChecker,
       envFor: healthEnvFor,
@@ -9673,7 +9726,31 @@ export async function pollLoop(): Promise<void> {
     // wip cleanup; the pool only watches for the end. Nothing launches once
     // a stop signal has arrived, even mid-cycle, and a claim the signal
     // interrupts is undone; see `launchCandidates`.
-    await launchCandidates({
+    if (managed) {
+      for (const c of candidates) {
+        if (drainMode) break;
+        const offer = managed.agentOffer(c.agent, c.item, 0);
+        if (!managed.ready(offer)) continue;
+        pool.launch(`${c.agent.name}#${c.item.issueNumber}`, () => managed.run(offer, async () => {
+          if (drainMode) return;
+          const [labels, blockers, status] = await Promise.all([
+            client.getIssueLabels(c.item.issueNumber), client.getOpenBlockers(c.item.issueNumber),
+            client.getItemStatus(c.item.issueNumber, { forceRefresh: true }),
+          ]);
+          if (blockers.length || status !== c.agent.column || shouldSkipDispatch(labels, c.agent.name)) return;
+          c.item.labels = labels;
+          const health = await holdUnhealthyCandidates({
+            candidates: [c], checks: HEALTH_CHECKS, checker: healthChecker, envFor: healthEnvFor,
+            client, notify: notifyDiscord, state: healthNotices, recheckMs: HEALTH_CACHE_MS,
+          });
+          if (!health.dispatch.length || drainMode) return;
+          const claim = await claimForDispatch(c.agent, c.item, client);
+          if (drainMode) { await releaseDispatchClaim(c.agent, c.item, client, claim); return; }
+          await countFamilyDispatch(c.agent, c.item, rawClient, { tallies: familyTallies, rootLabelsByIssue });
+          await runConcurrentDispatches([c], client);
+        }));
+      }
+    } else await launchCandidates({
       candidates,
       pool,
       draining: () => drainMode,
@@ -9714,21 +9791,21 @@ export async function pollLoop(): Promise<void> {
     // strip pipeline labels off Done tickets. Runs even when nothing was
     // dispatched (catches tickets advanced/closed by humans or label
     // changes between cycles).
-    await runClosedSweep(client);
-    await runPendingVerdictPublish(client);
-    await runPendingDoneFinalize(client);
-    await runReworkRouting(client, REWORK_ROUTING_OPTIONS);
-    await runRealClaudeGate(client);
-    await runAutoAdvance(client, MAX_CONCURRENT, pool.size);
-    await runDoneCleanup(client);
-
-    // Close Done parents whose sub-issues are all closed. Before the
-    // auto-merge; see `runParentClose`.
-    await runParentClose(client);
+    if (managed) await reconcileBoard();
+    else {
+      await runClosedSweep(client);
+      await runPendingVerdictPublish(client);
+      await runPendingDoneFinalize(client);
+      await runReworkRouting(client, REWORK_ROUTING_OPTIONS);
+      await runRealClaudeGate(client);
+      await runAutoAdvance(client, MAX_CONCURRENT, pool.size);
+      await runDoneCleanup(client);
+      await runParentClose(client);
+    }
 
     // Auto-merge PRs for tickets in the Done column. Extracted to
     // `runAutoMerge` below for testability.
-    await runAutoMerge(client);
+    await mergeReady();
 
     // In-depth run against main, in the background, never beside a
     // verifier's gates. After the merge so this cycle's merge counts. See
@@ -9736,18 +9813,44 @@ export async function pollLoop(): Promise<void> {
     if (mainSweep !== null && mayStartMainSweep({ configured: true, sweepRunning: sweepRun !== null, gateActive, envHeld, draining: drainMode })) {
       const verifierBusy = [...pool.keys()].some((k) => k.startsWith("verifier#")) ||
         [...itemsByColumn.values()].some((items) => items.some((i) => i.labels.includes("wip:verifier")));
-      const { finished } = await startMainSweepCycle({
+      let sweepDue = true;
+      let sweepHead = "";
+      if (managed) {
+        const deps = DEFAULT_MAIN_SWEEP_CYCLE_DEPS(mainSweep);
+        const state = parseMainSweepState(deps.readState());
+        let mergesSince: number | null = null;
+        try {
+          sweepHead = String(execSync(`git rev-parse origin/${defaultBranch}`, { cwd: repoRoot, encoding: "utf8", timeout: 15_000, stdio: "pipe" })).trim();
+          if (state.lastSha && state.lastSha !== sweepHead) {
+            mergesSince = Number(String(execSync(`git rev-list --count --merges ${state.lastSha}..${sweepHead}`, { cwd: repoRoot, encoding: "utf8", timeout: 15_000, stdio: "pipe" })).trim());
+          }
+        } catch { sweepHead = ""; }
+        sweepDue = decideMainSweep({ head: sweepHead || null, lastSha: state.lastSha, mergesSince,
+          every: mainSweep.every, idle: !dispatched && activeWork === 0 && pool.size === 0, verifierBusy }).run;
+      }
+      const sweepOffer = managed && sweepDue
+        ? managed.offer(`@main-sweep-${sweepHead}`, "main-sweep", "heavy", [`${managed.project}:main-sweep`], Number.MAX_SAFE_INTEGER)
+        : undefined;
+      const startSweep = () => startMainSweepCycle({
         config: mainSweep,
         client,
         idle: !dispatched && activeWork === 0 && pool.size === 0,
         verifierBusy,
         repo: `${process.env.GITHUB_OWNER}/${process.env.GITHUB_REPO}`,
+        ...(managed ? { expectedHead: sweepHead } : {}),
       });
+      const finished = managed
+        ? sweepOffer && managed.ready(sweepOffer) && !verifierBusy
+          ? managed.run(sweepOffer, async () => { const result = await startSweep(); await result.finished; return result.decision.run; }).then(() => {})
+          : null
+        : (await startSweep()).finished;
       if (finished !== null) {
         const run: Promise<void> = finished.finally(() => { if (sweepRun === run) sweepRun = null; });
         sweepRun = run;
       }
     }
+
+    if (managed) await managed.endCycle();
 
     // Wait for a seat to free or for the poll interval, whichever comes
     // first. A run settling wakes the loop at once, so the finished ticket's
@@ -9762,15 +9865,16 @@ export async function pollLoop(): Promise<void> {
     // A background gate ending wakes it the same way, so held verifiers and
     // the gated ticket's next stage start at once.
     const gateEnd = gateRun?.done ?? new Promise<void>(() => {});
+    const managerGrant = managed?.anyGranted() ?? new Promise<void>(() => {});
     if (pool.size > 0) {
       console.log(`⏰ Waiting up to ${POLL_INTERVAL / 1000}s or for a freed seat (${pool.size} in flight)...`);
-      await Promise.race([interval, pool.anySettled(), sweepEnd, gateEnd]);
+      await Promise.race([interval, pool.anySettled(), sweepEnd, gateEnd, managerGrant]);
     } else if (sweepRun !== null || gateRun !== null) {
       console.log(`⏰ Waiting up to ${POLL_INTERVAL / 1000}s or for the main sweep or live gate to finish...`);
-      await Promise.race([interval, sweepEnd, gateEnd]);
+      await Promise.race([interval, sweepEnd, gateEnd, managerGrant]);
     } else {
       console.log(`⏰ Sleeping ${POLL_INTERVAL / 1000}s...`);
-      await interval;
+      await Promise.race([interval, managerGrant]);
     }
     if (tick !== undefined) clearTimeout(tick);
   }
