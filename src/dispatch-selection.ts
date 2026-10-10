@@ -36,7 +36,8 @@ export interface DispatchCandidate<T extends DecisionItem = DecisionItem> {
  * priorities preserve `pollOrder` (most-advanced-first), then board order.
  * Caps are applied after sorting so a lower-priority item cannot take the
  * only slot for a serial agent before a higher-priority item is considered.
- * Eligibility is the same per-item gate the original WIP=1 loop applied — `shouldSkipDispatch`
+ * Eligibility is the same per-item gate the original WIP=1 loop applied:
+ * `shouldSkipDispatch`
  * (label-based: ready/needs-rework/wip/error/error:max_turns_salvaged) AND
  * `hasOpenBlockers` (open-blocker-based, applies to all agents
  * including PO — see that function's docstring for the docs-lag rationale).

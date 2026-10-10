@@ -183,7 +183,8 @@ export interface AutoAdvanceDecision {
  *   - **Backlog**: capacity = `max(0, maxConcurrent - seatsTaken)`.
  *     Advance the first `min(eligible.length, capacity)` items in priority
  *     order, preserving board position for ties; hold the rest in
- *     `backlogHeld`. When capacity is 0, all eligible Backlog items are held. The cap matches `selectDispatches`'s
+ *     `backlogHeld`. When capacity is 0, all eligible Backlog items are held.
+ *     The cap matches `selectDispatches`'s
  *     concurrency model — N parallel threads through the pipeline, no
  *     PO frontrunning past available capacity. Without this cap, refined
  *     `done:po` tickets would accumulate in Backlog while only one
@@ -250,7 +251,8 @@ export function decideAutoAdvance(
     if (rule.from === "Backlog") {
       // Capacity-bounded Backlog promotion. Advance up to `capacity` items
       // in priority order, then board-position order; hold the rest.
-      // Capacity tracks free pipeline seats so PO refinements don't pile up as `done:po`
+      // Capacity tracks free pipeline seats so PO refinements don't pile
+      // up as `done:po`
       // tickets that can't enter the pipeline (the bug shape: with WIP=N
       // dispatch but a hardcoded WIP=1 advance, refined backlog tickets
       // got stranded one-per-cycle while the pipeline ran serially).
