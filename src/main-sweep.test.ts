@@ -262,14 +262,16 @@ describe("runMainSweepCycle", () => {
     const runs: string[] = [];
     const board: string[] = [];
     const comments: { issue: number; body: string }[] = [];
+    const createdLabels: string[][] = [];
     const client: MainSweepClient = {
       addComment: async (issue, body) => {
         if (opts.commentFails) throw new Error("502");
         comments.push({ issue, body });
       },
-      createIssue: async (title) => {
+      createIssue: async (title, _body, labels = []) => {
         if (opts.createFails) throw new Error("403");
         board.push(`create ${title}`);
+        createdLabels.push(labels);
         return { number: 950, nodeId: "N", url: "u" };
       },
       addItemToProject: async () => { board.push("add"); return "ITEM"; },
@@ -303,7 +305,7 @@ describe("runMainSweepCycle", () => {
         run: (sha) => { runs.push(sha); return new Promise((r) => { release = r; }); },
       },
     });
-    return { cycle, start, release: (o: MainSweepOutcome) => release(o), runs, board, comments, written, lastState };
+    return { cycle, start, release: (o: MainSweepOutcome) => release(o), runs, board, comments, createdLabels, written, lastState };
   }
 
   test("off when not configured", async () => {
@@ -339,6 +341,7 @@ describe("runMainSweepCycle", () => {
     const h = harness({ state: { lastSha: A, lastGoodSha: A, openIssue: null }, result: outcome({ failedNames: ["p.C#a"] }) });
     await h.cycle(true);
     assert.deepEqual(h.board, ["create In-depth test run failed on main at ccccccc", "add", "status Backlog"]);
+    assert.deepEqual(h.createdLabels, [["bug", "priority:low"]]);
     assert.deepEqual(h.lastState(), {
       lastSha: C, lastGoodSha: A, openIssue: 950, failures: { sha: C, names: ["p.C#a"] }, reportedNames: ["p.C#a"],
     });

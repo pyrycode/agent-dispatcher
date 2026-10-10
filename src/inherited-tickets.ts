@@ -104,7 +104,7 @@ export async function recordInheritedTests(
   if (untrackedNow.length > 0) {
     try {
       const { title, body } = fixTicket(untrackedNow, ctx);
-      const created = await client.createIssue(title, body, ["bug"]);
+      const created = await client.createIssue(title, body, ["bug", "priority:low"]);
       groups.set(created.number, { issue: { ...created, title, body }, names: untrackedNow, created: true });
     } catch (error) {
       console.warn(`   ⚠️ Could not file a fix ticket for ${untrackedNow.join(", ")}: ${error}`);

@@ -67,7 +67,7 @@ describe("flaky-test tickets", () => {
 
     assert.deepEqual(result, { filed: [{ name: NAME, issue: 3000 }], commented: [], untracked: [] });
     assert.equal(client.created[0].title, "flaky live test: interactiveTurn_stopRunningTurn_showsInterruptedThenRepliesAgain");
-    assert.deepEqual(client.created[0].labels, ["bug", FLAKY_TEST_LABEL]);
+    assert.deepEqual(client.created[0].labels, ["bug", FLAKY_TEST_LABEL, "priority:low"]);
     assert.match(client.created[0].body, /Gate run for #1016/);
     assert.equal(findFlakyTicket([{ number: 3000, body: client.created[0].body }], NAME), 3000);
     assert.deepEqual(client.statuses, [{ itemId: "item-node-3000", status: FLAKY_TEST_COLUMN }]);
