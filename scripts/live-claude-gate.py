@@ -19,12 +19,12 @@ def live_claude_environment(parent):
     op_env = {**env, "OP_SERVICE_ACCOUNT_TOKEN": token, "OP_BIOMETRIC_UNLOCK_ENABLED": "false"}
     try:
         result = subprocess.run(
-            ["op", "read", "--no-newline", "op://Dev agents/Claude long term token/password"],
+            ["op", "read", "--no-newline", "op://kmzgpgsyeesea3pkiuk2ul2phq/Claude long term token/password"],
             env=op_env, capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.TimeoutExpired):
         raise ClaudeEnvironmentError("Dev Agents login lookup unavailable. Check the 1Password CLI and account access.") from None
     if result.returncode or not result.stdout.strip():
-        raise ClaudeEnvironmentError("Dev Agents Claude login unavailable. Add or check the Claude long term token item in the Dev agents vault.")
+        raise ClaudeEnvironmentError("Dev Agents Claude login unavailable. Add or check the Claude long term token item in the account's permitted vault.")
     env["CLAUDE_CODE_OAUTH_TOKEN"] = result.stdout.rstrip("\n")
     return env
 
