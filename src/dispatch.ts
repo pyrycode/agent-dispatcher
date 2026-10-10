@@ -1680,6 +1680,14 @@ async function buildPromptForAgent(
     }
   }
 
+  parts.push(
+    "\n## Run-generated follow-up tickets\n" +
+    "When your role requires a new bug, flaky-test, test failure or maintenance follow-up discovered during this run, " +
+    "add it to the target repository's board in Backlog with priority:low. Search for an existing ticket first. " +
+    "Keep an existing ticket's priority when reusing it. This default does not change which tickets your role may file. " +
+    "For split children that continue the assigned work, preserve the parent ticket's priority instead.",
+  );
+
   // Per-agent task framing.
   //
   // Pre-2026-05-09, this block contained role-specific AND
@@ -7800,7 +7808,7 @@ async function recordMainSweep(r: {
       repo: opts.repo, head, lastGoodSha: state.lastGoodSha, mergeSubjects, command: config.command, outcome,
     });
     try {
-      const issue = await opts.client.createIssue(title, body);
+      const issue = await opts.client.createIssue(title, body, ["bug", "priority:low"]);
       const itemId = await opts.client.addItemToProject(issue.nodeId);
       await opts.client.updateItemStatus(itemId, "Backlog");
       next.openIssue = issue.number;

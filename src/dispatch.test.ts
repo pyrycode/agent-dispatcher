@@ -12080,3 +12080,19 @@ describe("recordGateRunMeta: the live gate keeps a run record beside its output"
     assert.equal(calls.fs.filter(f => f.kind === "write").length, 0);
   });
 });
+
+describe("buildPromptForAgent — run-generated follow-up priority", () => {
+  test("both stage sets instruct roles to file repair follow-ups in Backlog at low priority", async () => {
+    for (const [set, name] of [["classic", "developer"], ["builder", "builder"], ["builder", "documentation"]] as const) {
+      const agent = resolveStageSet(set).agents.find(a => a.name === name)!;
+      const prompt = await withStageSet(set, () => DEFAULT_DEPS.buildPromptForAgent(
+        agent, makeProjectItem({ issueNumber: 42 }), resolve(tmpdir(), "no-followup-spec-root"), new MockGitHubClient(),
+      ));
+      assert.match(prompt, /## Run-generated follow-up tickets/);
+      assert.match(prompt, /Backlog.*priority:low/);
+      assert.match(prompt, /bug.*flaky-test.*test failure.*maintenance/);
+      assert.match(prompt, /existing ticket.*priority/);
+      assert.match(prompt, /split.*parent.*priority/);
+    }
+  });
+});
