@@ -202,7 +202,7 @@ export async function recordFlakyTests(
     }
     try {
       const { title, body } = buildFlakyTestIssue(name, ctx);
-      const issue = await client.createIssue(title, body, ["bug", FLAKY_TEST_LABEL]);
+      const issue = await client.createIssue(title, body, ["bug", FLAKY_TEST_LABEL, "priority:low"]);
       result.filed.push({ name, issue: issue.number });
       // Recorded before the board writes: the ticket exists either way, and
       // listing it as untracked would invite a second one.
