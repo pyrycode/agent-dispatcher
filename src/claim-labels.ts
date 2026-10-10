@@ -108,10 +108,10 @@ export class GitHubClaimLabels implements ClaimLabelApi {
 }
 
 /** Visibility failures never prevent the authority from serving work. */
-export function startClaimLabelSync(config: { tokenEnv: string; projects: string[] } | undefined, claims: () => readonly Claim[], env = process.env): () => void {
+export function startClaimLabelSync(config: { tokenEnv: string; projects: string[] } | undefined, claims: () => readonly Claim[], env = process.env, fetcher: typeof fetch = fetch): () => void {
   if (!config) return () => {};
   try {
-    const mirror = new ClaimLabelMirror(config.projects, claims, new GitHubClaimLabels(env[config.tokenEnv] ?? ""));
+    const mirror = new ClaimLabelMirror(config.projects, claims, new GitHubClaimLabels(env[config.tokenEnv] ?? "", fetcher));
     const tick = () => void mirror.sync().then(result => {
       if (result.added || result.removed) console.log(`Claim labels: added ${result.added}, removed ${result.removed}`);
       for (const error of result.errors) console.warn(`Claim label sync will retry: ${error}`);

@@ -5,6 +5,7 @@ import { resolve, dirname, basename } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { config } from "dotenv";
+import { githubPauseMs } from "./github-transport.js";
 import { ManagedDispatch, trackManagedChild } from "./managed-dispatch.js";
 import { DispatchPool, excludeInFlight, freeSeats, launchCandidates, liveGateRunnerFor, mayStartMainSweep, resolvePollIntervalMs } from "./dispatch-pool.js";
 import { countVerdictsSince, isStaleBaseFinding, parseVerdictArtifacts, pickVerdictPr, shouldFlagMissingVerdict } from "./verdict-guard.js";
@@ -9185,7 +9186,15 @@ export async function pollLoop(): Promise<void> {
   // client then reads columns from the issues and says so here, once.
   client.setListingGapHandler((message) => { void notifyDiscord(message); });
 
-  await client.initialize();
+  for (;;) {
+    try { await client.initialize(); break; }
+    catch (error) {
+      const pause = githubPauseMs(error);
+      if (pause === null) throw error;
+      console.warn("Shared GitHub paused at startup; waiting without launching work.");
+      await new Promise(resolve => setTimeout(resolve, pause));
+    }
+  }
 
   // Poll later pipeline stages first — finish what's closest to Done before
   // starting new work. This minimizes WIP and maximizes throughput.
@@ -9371,6 +9380,7 @@ export async function pollLoop(): Promise<void> {
     // state changes. See `clearItemsCache` docstring in github.ts for
     // the consistency model (single snapshot per cycle, intra-cycle
     // state changes not visible until next cycle).
+    try {
     client.clearItemsCache();
 
     // Legacy consumers keep their local memory index under its cap. Consumers
@@ -9436,15 +9446,16 @@ export async function pollLoop(): Promise<void> {
         // Default sleep: 60s if no reset header (defensive — better than
         // tight-looping into more rate-limit errors).
         const targetSec = rateLimit.resetUnixSeconds ?? (nowSec + 60);
-        const waitSec = Math.max(60, targetSec - nowSec + 5);  // +5s safety margin
+        const waitSec = Math.min(60, Math.max(1, targetSec - nowSec + 5));
         const waitMin = Math.round(waitSec / 60);
-        console.warn(`   🛑 GraphQL rate limit hit. Sleeping ${waitMin}min (until reset + 5s safety margin), then resuming poll cycle.`);
+        console.warn(`   🛑 GraphQL rate limit hit. Rechecking in ${waitMin}min; existing runs continue.`);
         await new Promise((r) => setTimeout(r, waitSec * 1000));
         continue;  // restart cycle after sleep
       }
       // Non-rate-limit fetch error: log + continue to sub-steps. The
       // sub-steps will independently retry and most will fail too, but
       // they'll continue normally on the next cycle.
+      if (githubPauseMs(e) !== null) throw e;
       console.warn(`   ⚠️  Pre-fetch failed (non-rate-limit): ${(e as any)?.message || e}`);
     }
 
@@ -9877,6 +9888,12 @@ export async function pollLoop(): Promise<void> {
       await Promise.race([interval, managerGrant]);
     }
     if (tick !== undefined) clearTimeout(tick);
+    } catch (error) {
+      const pause = githubPauseMs(error);
+      if (pause === null) throw error;
+      console.warn("Shared GitHub paused; existing agent runs continue and the cycle will retry.");
+      await new Promise(resolve => setTimeout(resolve, pause));
+    }
   }
 }
 

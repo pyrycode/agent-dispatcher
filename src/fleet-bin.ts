@@ -5,6 +5,9 @@ import { FleetStore } from "./fleet-store.js";
 import { FleetClient, JsonClient, serveFleet } from "./fleet-http.js";
 import { MachineManager, serveManager } from "./machine-manager.js";
 import { startClaimLabelSync } from "./claim-labels.js";
+import { GitHubBroker } from "./github-broker.js";
+import { githubResponse } from "./github-transport.js";
+import { configureGitHubCLI, serveGitHubBridge } from "./github-bridge.js";
 import { persistProjectDrains } from "./fleet-config.js";
 
 function secret(name: string): string {
@@ -23,9 +26,26 @@ async function main(): Promise<void> {
     const machines = Object.fromEntries(Object.entries(config.machines).map(([id, value]) => [id, secret((value as any).tokenEnv)]));
     const limits = Object.fromEntries(Object.entries(config.machines).map(([id, value]) => [id, { heavyLimit: (value as any).heavyLimit, combinedLimit: (value as any).combinedLimit }]));
     const store = new FleetStore(database, limits);
-    const server = await serveFleet(store, machines, secret(config.operatorTokenEnv), config.port ?? 7430, config.host ?? "127.0.0.1");
-    const stopLabels = startClaimLabelSync(config.githubLabels, () => store.snapshot().claims);
-    const close = () => { stopLabels(); server.close(() => { store.close(); process.exit(0); }); };
+    const github = config.github ? new GitHubBroker({ ...config.github, token: secret(config.github.tokenEnv) }) : undefined;
+    const server = await serveFleet(store, machines, secret(config.operatorTokenEnv), config.port ?? 7430, config.host ?? "127.0.0.1", github);
+    let cli: Awaited<ReturnType<typeof serveGitHubBridge>> | undefined;
+    if (github && config.github.socketPath) {
+      const socket = resolve(config.github.socketPath);
+      configureGitHubCLI(resolve(config.github.cliConfigDir ?? dirname(socket)), socket);
+      cli = await serveGitHubBridge(socket, request => github.request(request.path.match(/^\/repos\/([^/]+\/[^/?]+)/)?.[1] ?? config.github.projects[0], request));
+    }
+    const labelFetch: typeof fetch = github ? async (input, init) => {
+      const req = new Request(input, init);
+      const url = new URL(req.url);
+      if (url.origin !== "https://api.github.com") throw new Error("GitHub API host required");
+      const project = url.pathname.match(/^\/repos\/([^/]+\/[^/]+)/)?.[1];
+      if (!project) throw new Error("Claim labels require a repository");
+      return githubResponse(await github.request(project, { method: req.method, path: url.pathname + url.search,
+        headers: { accept: req.headers.get("accept") ?? "application/vnd.github+json", "content-type": "application/json" },
+        ...(!["GET", "HEAD"].includes(req.method) ? { body: await req.text() } : {}) }));
+    } : fetch;
+    const stopLabels = startClaimLabelSync(config.githubLabels, () => store.snapshot().claims, process.env, labelFetch);
+    const close = () => { stopLabels(); cli?.close(); server.close(() => { store.close(); process.exit(0); }); };
     process.on("SIGTERM", close); process.on("SIGINT", close);
     console.log("Claim service listening", server.address());
     return;

@@ -16,6 +16,7 @@
 // recur even under a future refactor that misses the gate. See
 // `📋 Projects/2026-04-10 - Pyrycode/Lessons.md` for the full lesson.
 
+import { startGitHubBridge } from "./github-bridge.js";
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -45,6 +46,8 @@ if (isNaN(parseInt(process.env.PROJECT_NUMBER!, 10))) {
   console.error(`PROJECT_NUMBER must be a number, got: "${process.env.PROJECT_NUMBER}"`);
   process.exit(1);
 }
+
+await startGitHubBridge(process.env);
 
 // Resolve the stage set once for the process (PYRY_STAGE_SET; the fork's
 // .env is already loaded by dispatch.ts's module body, which ESM evaluates

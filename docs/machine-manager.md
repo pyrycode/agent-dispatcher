@@ -2,7 +2,7 @@
 
 Managed mode adds one manager per physical computer and one shared claim service. The existing project dispatchers still own their stages, blockers, tool environments and agent runs. This is opt-in. Do not run an independent dispatcher against a board that managed computers share.
 
-The claim service uses SQLite on its own local disk. It grants a ticket and the computer's capacity in one transaction. There is no broker, distributed database, heartbeat expiry or automatic failover. A service outage prevents new starts. An existing run can finish, but its reservation remains until the finish is acknowledged.
+The claim service uses SQLite on its own local disk. It grants a ticket and the computer's capacity in one transaction. There is no distributed database, heartbeat expiry or automatic failover. A service outage prevents new starts. An existing run can finish, but its reservation remains until the finish is acknowledged.
 
 ## Scheduling
 
@@ -64,6 +64,22 @@ PYRY_AUTOCURATE_MEMORY=0
 Medium is an admission class, not a CPU or memory quota. Build agents still need bounded test workers and focused checks; classify a build job as heavy before launch if it needs a full suite. This change does not alter test-runner worker counts. Review the actual role commands before classifying one as light. Documentation is light by default. Its serial restriction is independent of its resource class. Unknown role names default to heavy.
 
 Start each updated consumer with `bin/pyry-start --managed`. The flag survives restart and takes effect after secret loading. A partial manager configuration fails closed. The old `PYRY_MAX_CONCURRENT` limit applies only to independent mode. Mobile skips its pre-launch Gradle formatting check in managed mode because it would run before admission. The builder and verifier retain their admitted checks.
+
+## Shared GitHub connection
+
+The claim service can own the fleet's GitHub API connection too. Add `github` with `tokenEnv`, an explicit `projects` list, `cacheMs` and `readReserve` to its configuration. The example shares reads for two minutes and holds the last 200 requests or GraphQL points for writes. The claim-label publisher uses the same connection when enabled.
+
+Set `PYRY_SHARED_GITHUB=1` in each managed dispatcher's environment. Its existing manager connection carries GitHub requests to the central service. Both the dispatcher client and agent `gh` commands use this path. An isolated child process serves the CLI's documented `http_unix_socket` option. This preserves synchronous CLI commands and file arguments. Agent environments receive only the private CLI configuration directory. They do not receive a manager credential or the central GitHub credential.
+
+Identical in-flight reads across computers share one request. Successful reads are cached. Writes run in order and invalidate cached reads even when their result is uncertain. PR head and merge checks, ticket launch status, launch labels and blockers bypass the cache. A ticket-status check reads that ticket rather than the whole board.
+
+The service tracks REST and GraphQL allowances separately. Quota exhaustion holds upstream requests until reset. Service failure never falls back to each computer calling GitHub directly. Dispatchers retry quota and connection failures without stopping existing agent runs. Existing local verdict and done handoffs retain results for later publication. The service does not automatically replay uncertain mutations.
+
+Keep the existing local Git authentication for clone, fetch and push. Managed agents must use `gh` for GitHub API operations so they use the shared connection. A separately launched script, watcher, `curl` command or MCP connector does not inherit this route automatically. Configure those callers explicitly before claiming that all automated traffic is centralised.
+
+The operator-authenticated claim-service endpoint `GET /github/status` reports upstream calls, cache hits, held requests, writes and the observed allowances. It never returns credentials or cached ticket content. Use these counters to verify savings after rollout.
+
+For a watcher on the claim-service host, add `github.socketPath` and optionally `github.cliConfigDir`. The service creates an isolated CLI configuration for that private socket. Set the watcher's `GH_CONFIG_DIR` to that directory. Keep the directory private to the service user. The supervisor must remove the sole service's stale socket before restart, as with the manager socket. REST requests select a configured repository from their path. GraphQL requests use the first configured project as their access context. This socket is only for trusted host jobs; containers use their project-authenticated manager instead.
 
 ## Services on Linux and macOS
 
