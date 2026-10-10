@@ -11,9 +11,16 @@ export interface WorkOffer {
   roleLimit?: number;
 }
 
+/** Draining stops new tickets, while reconciliation can still advance owned work. */
+export function acceptsDuringProjectDrain(offer: WorkOffer, machine: string, drainingProjects: readonly string[], state: FleetSnapshot): boolean {
+  return !drainingProjects.includes(offer.project)
+    || (offer.role === "reconcile" && offer.ticket === `${offer.project}#@reconcile`)
+    || (/#[1-9]\d*$/.test(offer.ticket) && state.claims.some(c => c.ticket === offer.ticket && c.machine === machine));
+}
+
 /** Offers are already eligible: blockers, errors and backoff belong to the dispatcher. */
 export function scheduleMachine(opts: {
-  machine: string; projects: readonly string[];
+  machine: string; projects: readonly string[]; drainingProjects?: readonly string[];
   offers: readonly WorkOffer[]; state: FleetSnapshot;
 } & MachineLimits): WorkOffer[] {
   const claims = new Map(opts.state.claims.map(c => [c.ticket, c]));
@@ -23,7 +30,8 @@ export function scheduleMachine(opts: {
   let heavyPlaces = Math.max(0, opts.heavyLimit - localRuns.filter(r => r.resource === "heavy").length);
   let combinedPlaces = Math.max(0, opts.combinedLimit - localRuns.filter(r => r.resource !== "light").length);
   const rank = new Map(opts.projects.map((p, i) => [p, i]));
-  const ready = opts.offers.filter(o => rank.has(o.project) && (!claims.has(o.ticket) || claims.get(o.ticket)!.machine === opts.machine));
+  const ready = opts.offers.filter(o => rank.has(o.project) && (!claims.has(o.ticket) || claims.get(o.ticket)!.machine === opts.machine)
+    && acceptsDuringProjectDrain(o, opts.machine, opts.drainingProjects ?? [], opts.state));
   ready.sort((a, b) => {
     const ac = claims.get(a.ticket), bc = claims.get(b.ticket);
     return Number(!ac) - Number(!bc)

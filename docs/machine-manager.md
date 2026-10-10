@@ -96,13 +96,21 @@ The `claim:` prefix is reserved for this display. GitHub labels never grant or t
 ```sh
 pnpm fleet status /absolute/private/path/operator.json
 pnpm fleet drain /absolute/private/path/operator.json
+pnpm fleet drain-project /absolute/private/path/operator.json pyrycode/pyrycode-mobile
+pnpm fleet resume-project /absolute/private/path/operator.json pyrycode/pyrycode-mobile
 pnpm fleet free /absolute/private/path/operator.json \
   'pyrycode/pyrycode#123' CURRENT_GENERATION --confirmed-stopped
 ```
 
-Status includes durable owners, active reservations, both capacity limits, project order, last reports and the eligible queue. A claim with no offer can be blocked, errored, completed or waiting for its dispatcher. GitHub remains the source for the detailed workflow reason. A reservation records permission to run, not proof that its process is still alive.
+Status includes durable owners, active reservations, both capacity limits, project order, project drain policies, last reports and the eligible queue. A claim with no offer can be blocked, errored, completed or waiting for its dispatcher. GitHub remains the source for the detailed workflow reason. A reservation records permission to run, not proof that its process is still alive.
 
-Drain stops new grants. Dispatchers finish their current jobs and stop. Stop the service after draining, then restart it to resume. The drain flag is local process state; a manager restart resumes admission. Never configure an external watchdog to restart a deliberately drained manager.
+`drain` stops all new grants on the computer. Existing grants can finish, but subsequent stages of those tickets cannot start. The drain flag is local process state; a manager restart resumes admission. Never configure an external watchdog to restart a deliberately drained manager.
+
+`drain-project` stops new ticket claims for one project on this computer. Tickets already owned by it can continue through build, verification, documentation, final checks and merge. Blocked or errored tickets retain their claims and continue when runnable. Other projects remain eligible under the shared limits. Reconciliation remains allowed so board updates can finish; background main sweeps are held back. This command waits for any start already sent to the claim service before acknowledging the change. It does not stop running agents or release tickets to another computer.
+
+The project policy is saved atomically in the manager's private configuration as `drainingProjects`, an optional list of configured repository names. It survives service and computer restarts until `resume-project` removes it. Keep the project dispatcher running while draining; removing its configuration or stopping its service would prevent later stages from finishing. Once the owned tickets are done, it remains idle for new tickets. Previously owned tickets keep their owner when reopened, just as they do outside drain mode. Free their claims manually to transfer them.
+
+The operator client can use a separate `managerUrl` configuration, or the manager configuration's `socketPath` when run from the manager's working directory. Only the operator credential can change a project policy. The manager must be able to write its own configuration directory. If saving fails, the command reports an error and leaves admission unchanged.
 
 Tickets remain owned between stages and while offline. Normal completion retains ownership too, so reopening a ticket keeps its previous computer. Use `free` to transfer it. The command requires the current generation from status and explicit confirmation that the old dispatcher, watcher and subprocesses are stopped or disabled. It does not delete working copies, clear error labels, move board items or kill remote processes. Freeing is deliberately manual.
 
