@@ -11,6 +11,7 @@
 import { AGENTS, type AgentConfig } from "./types.js";
 import { resolveFamilyRoot, shouldSkipDispatch, type DecisionItem } from "./pipeline-decisions.js";
 import { hasOpenBlockers } from "./blockers.js";
+import { byTicketPriority } from "./ticket-priority.js";
 
 // Built from AGENTS — the CLASSIC stage set's name → column mapping. Kept
 // for callers pinned to the classic shape (tests); live routing reads the
@@ -31,9 +32,12 @@ export interface DispatchCandidate<T extends DecisionItem = DecisionItem> {
 /**
  * Pick which (agent, item) tuples to dispatch this cycle, up to `maxConcurrent`.
  *
- * Iterates `pollOrder` (most-advanced-first) and within each agent's column
- * scans items in order, accumulating eligible dispatches. Eligibility is the
- * same per-item gate the original WIP=1 loop applied — `shouldSkipDispatch`
+ * Priority labels come first: high, normal, unmarked, then low. Equal
+ * priorities preserve `pollOrder` (most-advanced-first), then board order.
+ * Caps are applied after sorting so a lower-priority item cannot take the
+ * only slot for a serial agent before a higher-priority item is considered.
+ * Eligibility is the same per-item gate the original WIP=1 loop applied:
+ * `shouldSkipDispatch`
  * (label-based: ready/needs-rework/wip/error/error:max_turns_salvaged) AND
  * `hasOpenBlockers` (open-blocker-based, applies to all agents
  * including PO — see that function's docstring for the docs-lag rationale).
@@ -92,38 +96,34 @@ export function selectDispatches<T extends DecisionItem>(opts: {
   const { itemsByColumn, pollOrder, maxConcurrent, rootLabelsByIssue, excludedRoots } = opts;
   const out: DispatchCandidate<T>[] = [];
   if (maxConcurrent <= 0) return out;
+  const budgets = new Map<AgentConfig, number>();
+  const candidates: DispatchCandidate<T>[] = [];
   for (const agent of pollOrder) {
-    if (out.length >= maxConcurrent) break;
-    const items = itemsByColumn.get(agent.column) ?? [];
-
-    // Serial agents (e.g. documentation): cap at WIP=1 across the whole
-    // pipeline. Count in-flight `wip:<agent>` from every column in the
-    // snapshot, plus any items already picked this cycle for this agent.
-    // Once one slot is taken, this agent is done for the cycle.
-    // `maxInFlight` is the same cap with a number other than one.
     const cap = agent.serial ? 1 : agent.maxInFlight;
-    let serialBudget = Number.POSITIVE_INFINITY;
+    let inFlight = 0;
     if (cap !== undefined) {
       const wipLabel = `wip:${agent.name}`;
-      let inFlight = 0;
       for (const cols of itemsByColumn.values()) {
-        for (const it of cols) {
-          if (it.labels.includes(wipLabel)) inFlight++;
+        for (const item of cols) {
+          if (item.labels.includes(wipLabel)) inFlight++;
         }
       }
-      serialBudget = Math.max(0, cap - inFlight);
     }
-
-    for (const item of items) {
-      if (out.length >= maxConcurrent) break;
-      if (serialBudget <= 0) break;
+    budgets.set(agent, cap === undefined ? Infinity : Math.max(0, cap - inFlight));
+    for (const item of itemsByColumn.get(agent.column) ?? []) {
       const familyRoot = resolveFamilyRoot(item);
       if (excludedRoots?.has(familyRoot)) continue;
       if (shouldSkipDispatch(item.labels, agent.name, rootLabelsByIssue?.get(familyRoot))) continue;
       if (item.issueNumber > 0 && hasOpenBlockers(item.blockedBy ?? [])) continue;
-      out.push({ agent, item });
-      if (cap !== undefined) serialBudget--;
+      candidates.push({ agent, item });
     }
+  }
+  for (const candidate of byTicketPriority(candidates, c => c.item.labels)) {
+    if (out.length >= maxConcurrent) break;
+    const remaining = budgets.get(candidate.agent)!;
+    if (remaining <= 0) continue;
+    out.push(candidate);
+    budgets.set(candidate.agent, remaining - 1);
   }
   return out;
 }

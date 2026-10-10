@@ -304,6 +304,50 @@ describe("runAutoAdvance — the Backlog budget counts free seats", () => {
     });
   });
 
+  test("ready high-priority Backlog beats unmarked waiting Development", async () => {
+    await withStageSet("builder", async () => {
+      const client = new MockClient([
+        makeItem({ id: "item-900", issueNumber: 900, status: "In Development", labels: [] }),
+        makeItem({ id: "item-901", issueNumber: 901, status: "Backlog", labels: ["done:refiner", "priority:high"] }),
+      ]);
+      await runAutoAdvance(client, 1, 0);
+      assert.deepEqual(client.updateItemStatusCalls, [{ itemId: "item-901", newStatus: "In Development" }]);
+    });
+  });
+
+  test("unmarked ready Backlog beats low-priority waiting Development", async () => {
+    await withStageSet("builder", async () => {
+      const client = new MockClient([
+        makeItem({ id: "item-900", issueNumber: 900, status: "In Development", labels: ["priority:low"] }),
+        makeItem({ id: "item-901", issueNumber: 901, status: "Backlog", labels: ["done:refiner"] }),
+      ]);
+      await runAutoAdvance(client, 1, 0);
+      assert.deepEqual(client.updateItemStatusCalls, [{ itemId: "item-901", newStatus: "In Development" }]);
+    });
+  });
+
+  test("equal-priority waiting work past Backlog keeps the free seat", async () => {
+    await withStageSet("builder", async () => {
+      const client = new MockClient([
+        makeItem({ id: "item-900", issueNumber: 900, status: "In Development", labels: ["priority:high"] }),
+        makeItem({ id: "item-901", issueNumber: 901, status: "Backlog", labels: ["done:refiner", "priority:high"] }),
+      ]);
+      await runAutoAdvance(client, 1, 0);
+      assert.deepEqual(client.updateItemStatusCalls, []);
+    });
+  });
+
+  test("ready high-priority Backlog never takes a running agent's seat", async () => {
+    await withStageSet("builder", async () => {
+      const client = new MockClient([
+        makeItem({ id: "item-900", issueNumber: 900, status: "In Development", labels: ["wip:builder"] }),
+        makeItem({ id: "item-901", issueNumber: 901, status: "Backlog", labels: ["done:refiner", "priority:high"] }),
+      ]);
+      await runAutoAdvance(client, 1, 1);
+      assert.deepEqual(client.updateItemStatusCalls, []);
+    });
+  });
+
   test("refiner runs hold seats like any other run", async () => {
     await withStageSet("builder", async () => {
       const client = new MockClient([
