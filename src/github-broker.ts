@@ -85,7 +85,7 @@ export class GitHubBroker {
     // Cross-project blocker/source reads are allowed among configured repos.
     // Writes are restricted to the authenticated local project's repository.
     if (repo ? !(githubRead(req) ? this.config.projects.includes(repo) : repo === project)
-      : !["/graphql", "/user", "/rate_limit"].includes(path) && !/^\/orgs\/[^/]+(?:\/memberships\/[^/]+)?$/.test(path)) throw new Error("GitHub endpoint not allowed");
+      : !["/graphql", "/user", "/rate_limit"].includes(path) && !(path === "/" && ["GET", "HEAD"].includes(req.method)) && !/^\/orgs\/[^/]+(?:\/memberships\/[^/]+)?$/.test(path)) throw new Error("GitHub endpoint not allowed");
   }
   private async upstream(req: GitHubRequest, read: boolean): Promise<GitHubResponse> {
     const resource = req.path === "/graphql" ? "graphql" : "core";
