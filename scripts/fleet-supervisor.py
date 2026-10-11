@@ -45,6 +45,11 @@ class Supervisor:
         if state and state['phase'] == 'complete':
             if observed.get('generation') == desired and observed.get('healthy'):
                 return state
+            if state['desired'] == desired and self.clock() - state['verified'] < 24 * 3600:
+                state['phase'] = 'attention'
+                state['reason'] = 'Health failed again after a verified restart. No repeat restart within twenty-four hours.'
+                atomic(receipt, state)
+                return state
             state = None
         if not state:
             # A service intentionally left stopped stays stopped.
@@ -145,8 +150,15 @@ def main():
             try:
                 desired = adapter.desired()
                 for project in config['projects']:
-                    if project in desired:
-                        results.append(supervisor.tick(project, desired[project]))
+                    try:
+                        if project in desired:
+                            results.append(supervisor.tick(project, desired[project]))
+                        else:
+                            results.append({'phase': 'attention', 'project': project,
+                                            'reason': 'Configured credential or desired source lookup unavailable. No stop signal sent.'})
+                    except Exception as error:
+                        results.append({'phase': 'attention', 'project': project,
+                                        'reason': 'Configured workload observation failed. ' + type(error).__name__})
                 attention = adapter.attention()
                 attention['operations'] = results
                 atomic(Path(config['reportFile']), attention)

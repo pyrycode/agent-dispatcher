@@ -49,6 +49,12 @@ class Tests(unittest.TestCase):
     def test_missing_preflight_does_not_drain(self):
         self.adapter.preflight=lambda p,d:False
         self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'preflight-failed');self.assertEqual(self.adapter.calls,[])
+    def test_repeated_health_failure_does_not_restart_again(self):
+        self.worker.tick(PROJECT,'new');self.adapter.current.update(stopped=True,childrenStopped=True)
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'complete')
+        self.adapter.current.update(healthy=False)
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'attention')
+        self.assertEqual(self.adapter.calls,['drain','update','start'])
     def test_stopped_service_is_preserved(self):
         self.adapter.current.update(stopped=True,childrenStopped=True)
         self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'stopped');self.assertEqual(self.adapter.calls,[])
