@@ -9,7 +9,7 @@ export interface RecoveryObservation {
   artifactRevision?: string;
   pause?: PauseRecord;
 }
-export type RecoveryAction = "wait" | "retry" | "rework" | "resume" | "unblock" | "propose-close" | "escalate";
+export type RecoveryAction = "wait" | "retry" | "rework" | "resume" | "refine" | "unblock" | "propose-close" | "escalate";
 export interface RecoveryDecision { action: RecoveryAction; reason: string; blocker?: string }
 export interface RecoveryIncident {
   id: string; ticket: string; fingerprint: string; reason: string;
@@ -56,11 +56,12 @@ export function recoveryTrigger(o: RecoveryObservation): { reason: string; manua
   const errors = o.labels.filter(l => l.startsWith("error:"));
   if (errors.length) return { reason: errors.sort().join(", "), manual: false };
   if (o.labels.some(l => /^rework-count:\d+$/.test(l) && Number(l.split(":")[1]) >= 2)) return { reason: "Repeated review rework", manual: false };
+  if (o.status === "Inbox" && o.labels.some(l => l === "needs-real-claude" || l === "done:refiner")) return { reason: "Pipeline evidence or refinement is needed in Inbox", manual: false };
   return null;
 }
 export function validateRecoveryDecision(value: unknown): RecoveryDecision {
   const d = value as RecoveryDecision;
-  if (!d || !["wait", "retry", "rework", "resume", "unblock", "propose-close", "escalate"].includes(d.action) || typeof d.reason !== "string" || !d.reason.trim() || d.reason.length > 6000) throw new Error("Invalid recovery decision");
+  if (!d || !["wait", "retry", "rework", "resume", "refine", "unblock", "propose-close", "escalate"].includes(d.action) || typeof d.reason !== "string" || !d.reason.trim() || d.reason.length > 6000) throw new Error("Invalid recovery decision");
   if (d.action === "unblock" && !/^[\w.-]+\/[\w.-]+#[1-9]\d*$/.test(d.blocker ?? "")) throw new Error("Unblock requires a full blocker ticket");
   return { action: d.action, reason: d.reason, ...(d.action === "unblock" ? { blocker: d.blocker } : {}) };
 }
@@ -189,12 +190,12 @@ export class RecoveryLedger {
     if (incident.decision) return incident.decision;
     if (incident.state !== "assessing") throw new Error("Recovery is not being assessed");
     let decision = validateRecoveryDecision(value);
-    if (["retry", "rework", "resume", "unblock"].includes(decision.action)) {
-      const repairs = this.db.prepare("SELECT count(*) AS n FROM fleet_recovery WHERE ticket=? AND decision IS NOT NULL AND updated>? AND json_extract(decision,'$.action') IN ('retry','rework','resume','unblock')").get(incident.ticket, this.now() - 86400000)!;
+    if (["retry", "rework", "resume", "refine", "unblock"].includes(decision.action)) {
+      const repairs = this.db.prepare("SELECT count(*) AS n FROM fleet_recovery WHERE ticket=? AND decision IS NOT NULL AND updated>? AND json_extract(decision,'$.action') IN ('retry','rework','resume','refine','unblock')").get(incident.ticket, this.now() - 86400000)!;
       if (Number(repairs.n) >= RECOVERY_REPAIRS_PER_TICKET) decision = { action: "escalate", reason: "Automatic repair budget exhausted: three repairs per ticket per rolling day" };
     }
     this.db.prepare("UPDATE fleet_recovery SET state=?, decision=?, updated=? WHERE id=?").run(
-      ["retry", "rework", "resume", "unblock"].includes(decision.action) ? "applying" : decision.action === "wait" ? "complete" : "escalated", JSON.stringify(decision), this.now(), id);
+      ["retry", "rework", "resume", "refine", "unblock"].includes(decision.action) ? "applying" : decision.action === "wait" ? "complete" : "escalated", JSON.stringify(decision), this.now(), id);
     return decision;
   }
   complete(id: string, runId: string): void {

@@ -99,7 +99,7 @@ class NativeAdapter:
         cfg = self.config['projects'][project]
         # Only configured container destinations. Code executes inside its process namespace.
         payload = Path(__file__).read_text()
-        payload = payload[:payload.index("if __name__ == '__main__':")]
+        payload = payload[:payload.rindex("\nif __name__ == '__main__':")]
         payload += '\n' + '''cfg = json.loads(sys.stdin.readline())
 f = lock(cfg['lock']); pid = int(f['PID'])
 assert f['AGENTS_REPO_PATH'] == cfg['agents']

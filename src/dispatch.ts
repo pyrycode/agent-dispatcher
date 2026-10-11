@@ -1542,8 +1542,11 @@ async function buildPromptForAgent(
   // Gather context from previous phases
   const ticketNum = item.issueNumber;
 
-  if (process.env.PYRY_RECOVERY === "1" && ["builder", "developer"].includes(agent.name) && ticketNum > 0) {
-    parts.push(recoveryHandoff(await client.getIssueCommentBodies(ticketNum)));
+  if (process.env.PYRY_RECOVERY === "1" && ["builder", "developer", "refiner", "po"].includes(agent.name) && ticketNum > 0) {
+    parts.push(recoveryHandoff(await client.getIssueCommentBodies(ticketNum), ["refiner", "po"].includes(agent.name) ? "refinement" : "code"));
+    if (["refiner", "po"].includes(agent.name)) parts.push(`
+## Dependency purpose
+Use native blockers for required repairs. Shared-file editing alone is coordination. Record the affected files and intended order in refinement evidence. When an existing native blocker is solely edit coordination, include this explicit receipt as its own line in your final outcome: <!-- edit-coordination: {"blocker":123,"paths":["relative/file"],"reason":"why this is edit coordination rather than a required repair"} -->. Use the real blocker number. A required repair must never receive this receipt. The manager verifies current changes before any later removal.`);
   }
 
   // Architecture docs — needed by developer, code-review, documentation.
@@ -4898,7 +4901,7 @@ export async function handlePostRun(
   const { agent, item, client, agentCwd, useWorktree, branchName, logFile, startTime } = ctx;
   const { execSync, spawnSync, notifyDiscord } = ctx.deps;
 
-  if (["refiner", "po"].includes(agent.name) && item.issueNumber > 0 && client.recordCoordination && !streamResult.isError) {
+  if (process.env.PYRY_RECOVERY === "1" && ["refiner", "po"].includes(agent.name) && item.issueNumber > 0 && client.recordCoordination && !streamResult.isError) {
     const project = `${process.env.GITHUB_OWNER}/${process.env.GITHUB_REPO}`;
     for (const record of coordinationReceipts(streamResult.output, project, item.issueNumber)) {
       const blocker = Number(record.blocker.split("#")[1]);

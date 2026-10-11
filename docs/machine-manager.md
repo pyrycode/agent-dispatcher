@@ -263,7 +263,7 @@ All supervisors and launch commands must use the shared path. This does not limi
 
 ## Recovery without board supervision
 
-Recovery now watches changed issue evidence and dependency revisions as well as errors and repeated rework. Blocked issues receive an assessment. An unchanged dependency wait does not repeat that assessment on a timer. Changed evidence can reopen an escalation after a thirty minute cooldown. Workflow changes remain eligible immediately. Inbox items with no progress for a day also enter assessment.
+Recovery now watches changed issue evidence and dependency revisions as well as errors and repeated rework. Blocked issues receive an assessment. An unchanged dependency wait does not repeat that assessment on a timer. Changed evidence can reopen an escalation after a thirty minute cooldown. Workflow changes remain eligible immediately. Inbox items with no progress for a day also enter assessment. A pipeline Inbox item needing live evidence can enter immediately. Evidence refinement returns to the normal planning stage with its portable proof brief.
 
 The claim database records pause origin, actor, reason, missing prerequisite, reopening condition and previous stage. A pipeline pause can resume after assessment and fresh safety checks. A human hold stays in place. Older Halted cards have unknown origin and appear in the decision report. Moving an old card is never taken as proof that a person intended it to resume.
 

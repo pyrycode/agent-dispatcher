@@ -142,3 +142,12 @@ test('only explicit admitted planning output records coordination for the curren
   assert.deepEqual(coordinationReceipts('Quoted: '+receipt,project,1),[]);
   assert.throws(()=>coordinationReceipts('<!-- edit-coordination: {"blocker":"other/repo#2"} -->',project,1));
 });
+
+
+test('the 3071 shape requests evidence refinement without bypassing a causal dependency', () => {
+  const inbox={...item,status:'Inbox',labels:['needs-real-claude','security-sensitive','rework-other:1']};
+  assert.equal(recoveryTrigger(observationFor(project,inbox))?.manual,false);
+  const planner={...agents[0],name:'refiner',column:'Backlog'};
+  assert.equal(recoveryPlan(inbox,{action:'refine',reason:'Collect portable authenticated queue proof'},[planner,...agents]).status,'Backlog');
+  assert.throws(()=>recoveryPlan({...inbox,blockedBy:[{number:2,state:'OPEN'}]},{action:'refine',reason:'Skip dependency'},[planner,...agents]));
+});
