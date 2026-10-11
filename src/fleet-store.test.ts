@@ -108,6 +108,30 @@ test("reject reused request IDs with different contents and malformed inputs", t
   assert.throws(() => store.start({ ...request("b"), project: "org/other" }), /ticket/);
 });
 
+test('central runner changes are durable and only affect new grants', t => {
+  const { store, path } = fixture(t);
+  assert.equal(store.runnerPolicy(), undefined);
+  const codex = store.setRunner('codex');
+  assert.deepEqual(codex, { runner: 'codex', revision: 1 });
+  assert.deepEqual(store.setRunner('codex'), codex, 'repeating the same operator command is idempotent');
+  const first = request('first');
+  const grant = store.start(first);
+  const original = store.snapshot().runs[0];
+  const claude = store.setRunner('claude');
+  assert.deepEqual(claude, { runner: 'claude', revision: 2 });
+  assert.deepEqual(store.start(first), grant, 'a lost start reply recovers the original grant after the switch');
+  assert.deepEqual(store.snapshot().runs[0], original, 'existing work keeps its saved runner and ownership');
+  store.start(request('next', 'linux', 'org/desktop#2'));
+  assert.deepEqual(store.snapshot().runs.map(r => r.runnerPolicy), [codex, claude]);
+  const reopened = new FleetStore(path, { mac: { heavyLimit: 2, combinedLimit: 2 }, linux: { heavyLimit: 2, combinedLimit: 2 } });
+  t.after(() => reopened.close());
+  assert.deepEqual(reopened.runnerPolicy(), claude);
+  assert.deepEqual(reopened.snapshot().runs, store.snapshot().runs);
+  assert.deepEqual(reopened.setRunner(null), { runner: null, revision: 3 });
+  assert.throws(() => store.setRunner('opus'), /Runner must/);
+  assert.throws(() => store.start({ ...request('forged'), runnerPolicy: codex } as StartRequest), /central operator/);
+});
+
 test("workflow cleanup cannot modify another owner or a live run", t => {
   const { store } = fixture(t);
   store.start(request("a"));

@@ -466,6 +466,11 @@ board processing.
 
 ### Runner file: switch without a restart
 
+For managed dispatch, the central operator can select one runner for the entire
+fleet. See [Central fleet runner](docs/machine-manager.md#central-fleet-runner).
+That choice overrides the local file and its role entries. When the central
+choice is unset, the local rules below continue to apply.
+
 A restart drains first, and a drain can wait most of an hour for running agents.
 So the runner can also come from a JSON file that the dispatcher reads again
 before every agent spawn:

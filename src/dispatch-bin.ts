@@ -25,6 +25,7 @@ import { fileURLToPath } from "node:url";
 import { dispatchInbox, installSignalHandlers, pollLoop } from "./dispatch.js";
 import { decideCodegraphHealth, findMissingAgentClaudeMds } from "./agent-runtime.js";
 import { resolveAgentRunner, resolveCodexExecutable } from "./agent-runner.js";
+import { ManagedDispatch } from './managed-dispatch.js';
 import { loadRunnerFileStrict, runnerFilePath, runnersInUse } from "./runner-file.js";
 import { activeStageSet, type StageSet } from "./stage-sets.js";
 import { validateEffortPolicy } from "./effort-policy.js";
@@ -59,13 +60,15 @@ let stageSet: StageSet;
 try {
   stageSet = activeStageSet();
   validateEffortPolicy(process.env.PYRY_EFFORT_POLICY, stageSet.name);
-  // Every runner the runner file or PYRY_AGENT_RUNNER can pick must be
-  // installed now; a broken runner file fails here, before the board.
-  const runnerFile = loadRunnerFileStrict(runnerFilePath(process.env, resolveAgentsRepoRootWithEnv({
+  // A central choice overrides local settings, including startup validation.
+  // Otherwise validate the local file and every runner it can pick.
+  const centralRunner = await ManagedDispatch.runnerFromEnv(process.env);
+  const runnerFile = centralRunner ? null : loadRunnerFileStrict(runnerFilePath(process.env, resolveAgentsRepoRootWithEnv({
     envValue: process.env.AGENTS_REPO_PATH,
     fallbackSrcDir: dirname(fileURLToPath(import.meta.url)),
   })));
-  const runners = runnersInUse(runnerFile, resolveAgentRunner(process.env));
+  const runners = centralRunner ? new Set([centralRunner]) : runnersInUse(runnerFile, resolveAgentRunner(process.env));
+  if (centralRunner) console.log(`Central fleet runner: ${centralRunner} (local runner choices overridden)`);
   if (runnerFile) console.log(`Runner file: ${JSON.stringify(runnerFile)} (read again before every agent run)`);
   if (runners.has("codex")) {
     process.env.PYRY_CODEX_BIN = resolveCodexExecutable(process.env);

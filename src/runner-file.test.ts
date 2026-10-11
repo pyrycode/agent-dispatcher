@@ -17,6 +17,18 @@ function selector(env: NodeJS.ProcessEnv, initial: string | null) {
 }
 
 describe("runner file", () => {
+  test('a central runner overrides local roles and even invalid local settings', () => {
+    let runner: 'claude' | 'codex' | undefined = 'codex';
+    let reads = 0;
+    const select = createRunnerSelector({ path: '/agents/runner.json', env: { PYRY_AGENT_RUNNER: 'invalid' },
+      read: () => { reads++; return '{"runner":"claude","roles":{"verifier":"claude","recovery":"claude"}}'; }, override: () => runner });
+    for (const role of ['refiner', 'builder', 'verifier', 'documentation', 'recovery']) assert.equal(select(role), 'codex');
+    runner = 'claude';
+    assert.equal(select('builder'), 'claude');
+    assert.equal(reads, 0, 'an active central choice never consults local overrides');
+    runner = undefined;
+    assert.throws(() => select('builder'), /Invalid PYRY_AGENT_RUNNER/, 'local settings apply again when central override is removed');
+  });
   test("parses the runner and per-role overrides, and rejects anything else", () => {
     assert.deepEqual(parseRunnerFile('{"runner":"codex","roles":{"verifier":"claude"}}'),
       { runner: "codex", roles: { verifier: "claude" } });

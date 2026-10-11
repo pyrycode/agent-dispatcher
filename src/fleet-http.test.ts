@@ -3,6 +3,24 @@ import assert from "node:assert/strict";
 import { FleetStore } from "./fleet-store.js";
 import { serveFleet, FleetClient } from "./fleet-http.js";
 
+test('only the central operator can change the fleet runner', async t => {
+  const store = new FleetStore(':memory:', { mac: { heavyLimit: 1, combinedLimit: 1 } });
+  const server = await serveFleet(store, { mac: 'machine-test' }, 'operator-test', 0);
+  t.after(async () => { await new Promise<void>(r => server.close(() => r())); store.close(); });
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  const url = `http://127.0.0.1:${address.port}`;
+  const machine = new FleetClient(url, 'machine-test');
+  const operator = new FleetClient(url, 'operator-test');
+  assert.equal(await operator.call('/runner'), null);
+  await assert.rejects(machine.call('/runner', { runner: 'claude' }), /403/);
+  await assert.rejects(operator.call('/runner', { runner: 'typo' }), /409/);
+  assert.equal(await operator.call('/runner'), null, 'invalid writes preserve the current setting');
+  assert.deepEqual(await operator.call('/runner', { runner: 'codex' }), { runner: 'codex', revision: 1 });
+  assert.deepEqual((await machine.snapshot()).runnerPolicy, { runner: 'codex', revision: 1 });
+  assert.deepEqual(await operator.call('/runner', { runner: null }), { runner: null, revision: 2 });
+});
+
 test("authenticated HTTP contention and recovery preserve exactly one owner", async t => {
   const store = new FleetStore(":memory:", { mac: { heavyLimit: 1, combinedLimit: 1 }, linux: { heavyLimit: 1, combinedLimit: 1 } });
   const server = await serveFleet(store, { mac: "mac-secret", linux: "linux-secret" }, "admin-secret", 0);

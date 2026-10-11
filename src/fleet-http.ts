@@ -43,10 +43,15 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
       if (req.method === "GET" && req.url === "/operations/desired") return send(200, desired?.() ?? {});
       if (req.method === "GET" && req.url === "/operations/reports") return send(200, store.operations.list());
       if (req.method === "GET" && req.url === "/state") return send(200, store.snapshot());
+      if (req.method === "GET" && req.url === "/runner") return send(200, store.runnerPolicy() ?? null);
       if (req.method === "GET" && req.url === "/recovery/state") return send(200, store.recovery.list());
       if (req.method === "GET" && req.url === "/github/status" && isAdmin) return send(200, github?.status() ?? { enabled: false });
       if (req.method !== "POST") return send(404, { error: "Unknown operation" });
       const body = await readJson(req);
+      if (req.url === '/runner') {
+        if (!isAdmin) return send(403, { error: 'Operator credential required' });
+        return send(200, store.setRunner(body.runner));
+      }
       if (req.url === '/operations/report') {
         if (!isAdmin && body.machine !== machine) return send(403, {error:'Machine identity mismatch'});
         store.operations.record(isAdmin ? body.machine : machine!, body.report);

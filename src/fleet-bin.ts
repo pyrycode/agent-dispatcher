@@ -18,10 +18,16 @@ function secret(name: string): string {
 }
 async function main(): Promise<void> {
   const [command, configPath, ...args] = process.argv.slice(2);
-  if (!configPath || !["claims", "manager", "status", "desired", "attention", "report-attention", "pause", "coordination", "recovery", "drain", "drain-project", "resume-project", "free"].includes(command)) {
-    throw new Error("Usage: fleet-bin.ts claims|manager|status|recovery|drain|drain-project|resume-project|free CONFIG [PROJECT | TICKET GENERATION --confirmed-stopped]");
+  if (!configPath || !["claims", "manager", "status", "runner", "desired", "attention", "report-attention", "pause", "coordination", "recovery", "drain", "drain-project", "resume-project", "free"].includes(command)) {
+    throw new Error("Usage: fleet-bin.ts claims|manager|status|runner|recovery|drain|drain-project|resume-project|free CONFIG [claude|codex|local | PROJECT | TICKET GENERATION --confirmed-stopped]");
   }
   const config = JSON.parse(readFileSync(configPath, "utf8"));
+  if (command === 'runner') {
+    if (args.length > 1 || (args.length === 1 && !['claude', 'codex', 'local'].includes(args[0]))) throw new Error('Runner accepts claude, codex or local; omit to show the current choice');
+    const claims = new JsonClient(config.claimsUrl, secret(config.claimsOperatorTokenEnv));
+    console.log(JSON.stringify(await claims.call('/runner', args.length ? { runner: args[0] === 'local' ? null : args[0] } : undefined)));
+    return;
+  }
   if (command === "claims") {
     const database = resolve(config.database);
     mkdirSync(dirname(database), { recursive: true, mode: 0o700 });

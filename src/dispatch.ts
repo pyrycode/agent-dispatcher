@@ -13,7 +13,7 @@ import { verifyCoordination } from "./recovery-coordination.js";
 import { recoveryInventory, relatedTickets, relatedEvidence } from "./recovery-evidence.js";
 import { recoveryLogContext } from "./recovery-context.js";
 import { RECOVERY_RETURNED_INBOX, type RecoveryIncident, type RecoveryDecision } from "./fleet-recovery.js";
-import { ManagedDispatch, trackManagedChild } from "./managed-dispatch.js";
+import { ManagedDispatch, managedRunRunner, trackManagedChild } from "./managed-dispatch.js";
 import { DispatchPool, excludeInFlight, freeSeats, launchCandidates, liveGateRunnerFor, mayStartMainSweep, resolvePollIntervalMs } from "./dispatch-pool.js";
 import { countVerdictsSince, isStaleBaseFinding, parseBuilderCompletions, parseVerdictArtifacts, pickVerdictPr, shouldFlagMissingVerdict } from "./verdict-guard.js";
 import { countOpenPrs, shouldFlagMissingPr } from "./pr-guard.js";
@@ -283,10 +283,11 @@ const agentsRepoRoot = resolveAgentsRepoRootWithEnv({
 // exports directly rather than through the .env file.
 config({ path: resolve(agentsRepoRoot, ".env") });
 
-// The agent runner, Claude or Codex, is read before every spawn from the
-// fork's runner file, falling back to PYRY_AGENT_RUNNER (runner-file.ts).
+// Managed runs first use the central choice saved in their admission grant.
+// Without it, read the fork's runner file before every spawn, falling back
+// to PYRY_AGENT_RUNNER (runner-file.ts).
 // Created after the .env load so PYRY_RUNNER_FILE and the fallback apply.
-const selectRunner = createRunnerSelector({ path: () => runnerFilePath(process.env, agentsRepoRoot), env: process.env });
+const selectRunner = createRunnerSelector({ path: () => runnerFilePath(process.env, agentsRepoRoot), env: process.env, override: managedRunRunner });
 
 // The target repo — where code lives and agents work.
 // Falls through to resolveTargetRepoRoot (parent of agents/) when unset, so
@@ -9371,7 +9372,7 @@ export async function pollLoop(): Promise<void> {
     checks: HEALTH_CHECKS,
     checker: healthChecker,
     roles: pollOrder.map((a) => a.name),
-    envFor: (role, check) => healthEnvForAgent(process.env, role, selectRunner(role), check.scope),
+    envFor: (role, check) => healthEnvForAgent(process.env, role, managed?.runner() ?? selectRunner(role), check.scope),
     liveGateEnv: realClaudeGateRunner === null ? null : buildGateSpawnEnv(process.env),
     notify: notifyDiscord,
     state: healthNotices,
@@ -9735,7 +9736,7 @@ export async function pollLoop(): Promise<void> {
 
     // Tickets already held by a health check that still fails stay out of
     // selection, so they do not take a seat every cycle (agent-dispatcher#131).
-    const healthEnvFor: HealthEnvFor = (role, check) => healthEnvForAgent(process.env, role, selectRunner(role), check.scope);
+    const healthEnvFor: HealthEnvFor = (role, check) => healthEnvForAgent(process.env, role, managed?.runner() ?? selectRunner(role), check.scope);
     const stillHeld = envHeld ? { itemsByColumn, held: 0 } : await dropStillHeld({
       itemsByColumn, pollOrder, checks: HEALTH_CHECKS, checker: healthChecker, envFor: healthEnvFor,
       notify: notifyDiscord, state: healthNotices,

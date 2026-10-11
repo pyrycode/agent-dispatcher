@@ -100,12 +100,16 @@ export function createRunnerSelector(opts: {
   env: NodeJS.ProcessEnv;
   read?: (path: string) => string;
   warn?: (message: string) => void;
+  /** A centrally admitted run takes precedence over every local choice. */
+  override?: () => AgentRunner | undefined;
 }): (role: string) => AgentRunner {
   const read = opts.read ?? ((p: string) => readFileSync(p, "utf8"));
   const warn = opts.warn ?? ((message: string) => console.warn(message));
   let lastGood: RunnerFile | null = null;
   let lastError = "";
   return (role: string) => {
+    const override = opts.override?.();
+    if (override) return override;
     const fallback = resolveAgentRunner(opts.env);
     const outcome = readRunnerFile(typeof opts.path === "function" ? opts.path() : opts.path, read);
     let file: RunnerFile | null;
