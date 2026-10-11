@@ -74,13 +74,34 @@ test("legacy owned ready tickets continue above the cap and prevent new claims",
 });
 
 
-test("recovery beats ownership age, board order and normal job priority", () => {
+test("owned ordinary work precedes unclaimed recovery and repair stages", () => {
+  const normal = { ...offer("org/mobile", 1), order: 100 };
+  const recovery = { ...offer("org/core", 2), role: "recovery", order: -100 };
+  const state = { ...empty, claims: [{ ticket: normal.ticket, machine: "mac", generation: "old", created: 1 }] };
+  assert.equal(select([recovery, normal], state)[0].ticket, normal.ticket);
+  assert.equal(select([{ ...recovery, role: "builder", recovery: true }, normal], state)[0].ticket, normal.ticket);
+});
+
+test("owned recovery and repair stages precede older owned ordinary work", () => {
   const normal = { ...offer("org/core", 1), order: -100 };
   const recovery = { ...offer("org/mobile", 2), role: "recovery", order: 100 };
-  const state = { ...empty, claims: [{ ticket: normal.ticket, machine: "mac", generation: "old", created: 1 }] };
+  const state = { ...empty, claims: [normal, recovery].map((o, i) => ({ ticket: o.ticket, machine: "mac", generation: "g", created: i + 1 })) };
   assert.equal(select([normal, recovery], state)[0].ticket, recovery.ticket);
-  const repair = { ...recovery, role: "builder", recovery: true };
-  assert.equal(select([normal, repair], state)[0].ticket, repair.ticket);
+  assert.equal(select([normal, { ...recovery, role: "builder", recovery: true }], state)[0].ticket, recovery.ticket);
+});
+
+test("an owned heavy offer without capacity allows fitting unclaimed work", () => {
+  const owned = offer("org/mobile", 2);
+  const state: FleetSnapshot = { claims: [{ ticket: owned.ticket, machine: "mac", generation: "g", created: 1 }],
+    runs: [{ ...offer("org/core", 1), id: "active", machine: "mac", session: "s", generation: "g", created: 1 }] };
+  const fitting: WorkOffer = { ...offer("org/core", 3), resource: "medium" };
+  assert.deepEqual(scheduleMachine({ machine: "mac", heavyLimit: 1, combinedLimit: 2, ticketLimit: 3,
+    projects: ["org/core", "org/mobile"], offers: [owned, fitting], state }).map(o => o.ticket), [fitting.ticket]);
+});
+
+test("unclaimed recovery still precedes unclaimed ordinary project priority", () => {
+  const recovery = { ...offer("org/mobile", 2), role: "recovery" };
+  assert.equal(select([offer("org/core", 1), recovery])[0].ticket, recovery.ticket);
 });
 
 test("recovery priority never interrupts active work or ignores project drains", () => {
