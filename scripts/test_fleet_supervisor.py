@@ -55,6 +55,16 @@ class Tests(unittest.TestCase):
         self.adapter.current.update(healthy=False)
         self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'attention')
         self.assertEqual(self.adapter.calls,['drain','update','start'])
+    def test_startup_probe_can_wait_without_repeating_the_start(self):
+        self.worker.tick(PROJECT,'new');self.adapter.current.update(stopped=True,childrenStopped=True)
+        self.adapter.verify=lambda p,d: (_ for _ in ()).throw(RuntimeError('Startup lock not written yet'))
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'verifying')
+        observe=self.adapter.observe
+        self.adapter.observe=lambda p: (_ for _ in ()).throw(RuntimeError('Workload warming up'))
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'verifying')
+        self.adapter.observe=observe;self.adapter.verify=lambda p,d:True
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'complete')
+        self.assertEqual(self.adapter.calls,['drain','update','start'])
     def test_stopped_service_is_preserved(self):
         self.adapter.current.update(stopped=True,childrenStopped=True)
         self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'stopped');self.assertEqual(self.adapter.calls,[])
