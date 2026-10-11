@@ -14,6 +14,11 @@ export interface WorkOffer {
   requiresRecovery?: boolean;
 }
 
+/** The authority classifies queued checks, including offers from older workers. */
+function idleAssessment(offer: WorkOffer, state: FleetSnapshot): boolean {
+  return offer.role === "recovery" && !!state.idleRecoveryTickets?.includes(offer.ticket);
+}
+
 /** Draining stops new tickets, while reconciliation can still advance owned work. */
 export function acceptsDuringProjectDrain(offer: WorkOffer, machine: string, drainingProjects: readonly string[], state: FleetSnapshot): boolean {
   return !drainingProjects.includes(offer.project)
@@ -26,7 +31,7 @@ export function runnableTickets(machine: string, offers: readonly WorkOffer[], s
   const owned = new Set(state.claims.filter(c => c.machine === machine).map(c => c.ticket));
   return new Set([
     ...state.runs.filter(r => r.machine === machine).map(r => r.ticket),
-    ...offers.filter(o => owned.has(o.ticket)).map(o => o.ticket),
+    ...offers.filter(o => owned.has(o.ticket) && !idleAssessment(o, state)).map(o => o.ticket),
   ].filter(ticket => /#[1-9]\d*$/.test(ticket)));
 }
 
@@ -48,7 +53,8 @@ export function scheduleMachine(opts: {
     && acceptsDuringProjectDrain(o, opts.machine, opts.drainingProjects ?? [], opts.state));
   ready.sort((a, b) => {
     const ac = claims.get(a.ticket), bc = claims.get(b.ticket);
-    return Number(!ac) - Number(!bc)
+    return Number(idleAssessment(a, opts.state)) - Number(idleAssessment(b, opts.state))
+      || Number(!ac) - Number(!bc)
       || Number(!(a.role === "recovery" || a.recovery)) - Number(!(b.role === "recovery" || b.recovery))
       || Number(!a.recoveryError) - Number(!b.recoveryError)
       || (ac && bc ? ac.created - bc.created : rank.get(a.project)! - rank.get(b.project)!)
@@ -56,6 +62,7 @@ export function scheduleMachine(opts: {
   });
   const selected: WorkOffer[] = [];
   for (const job of ready) {
+    if (idleAssessment(job, opts.state) && [...localRuns, ...selected].some(r => /#[1-9]\d*$/.test(r.ticket))) continue;
     if (active.has(job.ticket) || locks.has(`${job.project}:reconcile`) || job.locks.some(l => locks.has(l))) continue;
     if (job.roleLimit !== undefined && [...opts.state.runs, ...selected].filter(r => r.project === job.project && r.role === job.role).length >= job.roleLimit) continue;
     const newTicket = /#[1-9]\d*$/.test(job.ticket) && !claims.has(job.ticket);

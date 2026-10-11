@@ -110,3 +110,63 @@ test("recovery priority never interrupts active work or ignores project drains",
   assert.deepEqual(select([recovery], state), []);
   assert.deepEqual(scheduleMachine({machine: "mac", projects: ["org/core", "org/mobile"], drainingProjects: ["org/mobile"], heavyLimit: 1, combinedLimit: 1, offers: [recovery], state: empty}), []);
 });
+
+const idleCheck = (n: number) => ({ ...offer("org/core", n), role: "recovery" });
+const idleState = (jobs: WorkOffer[]) => ({ ...empty,
+  idleRecoveryTickets: jobs.map(o => o.ticket),
+  claims: jobs.map((o, i) => ({ ticket: o.ticket, machine: "mac", generation: "g", created: i + 1 })),
+});
+
+test("an older owned idle assessment yields to unclaimed ready work", () => {
+  const check = idleCheck(1), ready = offer("org/mobile", 2);
+  assert.deepEqual(select([check, ready], idleState([check])).map(o => o.ticket), [ready.ticket]);
+});
+
+test("waiting idle assessments do not fill the new-ticket budget", () => {
+  const checks = [idleCheck(1), idleCheck(2), idleCheck(3)], ready = offer("org/mobile", 4);
+  assert.deepEqual(capped([...checks, ready], idleState(checks)).map(o => o.ticket), [ready.ticket]);
+});
+
+test("starting ticket work leaves idle assessments waiting despite spare capacity", () => {
+  const check = idleCheck(1);
+  const ready: WorkOffer = { ...offer("org/mobile", 2), resource: "medium" };
+  assert.deepEqual(capped([check, ready], idleState([check])).map(o => o.ticket), [ready.ticket]);
+});
+
+test("a running medium ticket prevents idle assessment in the free heavy place", () => {
+  const check = idleCheck(1);
+  const state = { ...idleState([check]), runs: [{ ...offer("org/mobile", 2), resource: "medium" as const,
+    id: "active", machine: "mac", session: "s", generation: "g", created: 1 }] };
+  assert.deepEqual(capped([check], state), []);
+});
+
+test("an idle computer can assess while other computers work", () => {
+  const check = idleCheck(1);
+  const state = { ...idleState([check]), runs: [{ ...offer("org/mobile", 2),
+    id: "remote", machine: "linux", session: "s", generation: "g", created: 1 }] };
+  assert.deepEqual(capped([check], state).map(o => o.ticket), [check.ticket]);
+});
+
+test("foreign work and drained projects do not prevent a fitting idle assessment", () => {
+  const check = idleCheck(1), foreign = offer("org/mobile", 2), drained = offer("org/mobile", 3);
+  const state = { ...idleState([check]), claims: [...idleState([check]).claims,
+    { ticket: foreign.ticket, machine: "linux", generation: "f", created: 1 }] };
+  assert.deepEqual(scheduleMachine({ machine: "mac", projects: ["org/core", "org/mobile"],
+    heavyLimit: 1, combinedLimit: 2, drainingProjects: ["org/mobile"],
+    offers: [check, foreign, drained], state }).map(o => o.ticket), [check.ticket]);
+});
+
+test("idle checks do not displace error investigation or assigned repair", () => {
+  const check = idleCheck(1);
+  const failed = { ...offer("org/mobile", 2), role: "recovery", recoveryError: true };
+  const repair = { ...offer("org/mobile", 3), recovery: true, recoveryError: true };
+  for (const actionable of [failed, repair]) {
+    assert.deepEqual(select([check, actionable], idleState([check])).map(o => o.ticket), [actionable.ticket]);
+  }
+});
+
+test("internal housekeeping is not ticket work and still obeys its locks", () => {
+  const check = idleCheck(1);
+  const maintenance = { ...offer("org/mobile", 2, "light"), ticket: "org/mobile#@reconcile", role: "reconcile", locks: ["org/mobile:reconcile"] };
+  assert.deepEqual(capped([check, maintenance], idleState([check])).map(o => o.ticket), [maintenance.ticket, check.ticket]);
+});

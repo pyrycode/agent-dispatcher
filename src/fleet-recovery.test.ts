@@ -17,6 +17,70 @@ const project = "org/core";
 const limits = { mac: { heavyLimit: 1, combinedLimit: 2 }, linux: { heavyLimit: 1, combinedLimit: 2 } };
 const observation = (n = 1, labels = ["error:builder"]): RecoveryObservation => ({ ticket: `${project}#${n}`, status: "In Development", labels, blocked: false });
 const request = (n = 1, extra: Partial<StartRequest> = {}): StartRequest => ({ id: `run-${n}`, session: "session", machine: "mac", project, ticket: `${project}#${n}`, role: "recovery", resource: "heavy", locks: [], ...extra });
+
+test("quiet Inbox intake can be assessed without treating holds or errors as idle", () => {
+  const store = new FleetStore(":memory:", limits);
+  const inbox = { ...observation(1, []), status: "Inbox" };
+  assert.equal(store.recoveryReport("mac", project, [inbox])[0]?.state, "queued");
+  assert.deepEqual(store.snapshot().idleRecoveryTickets, [inbox.ticket]);
+  store.recoveryReport("mac", project, [{ ...inbox, labels: ["error:refiner"] }]);
+  assert.equal(store.snapshot().idleRecoveryTickets, undefined);
+  assert.equal(store.recoveryReport("mac", project, [{ ...inbox, labels: ["needs-human:decision"] }])[0]?.state, "escalated");
+  assert.equal(store.snapshot().idleRecoveryTickets, undefined);
+  store.close();
+});
+
+test("an unchanged idle Inbox wait does not repeat on the ordinary retry timer", () => {
+  const db = new DatabaseSync(":memory:"); let now = 100000000;
+  const ledger = new RecoveryLedger(db, () => now);
+  const inbox = { ...observation(1, []), status: "Inbox" };
+  const [incident] = ledger.report("mac", project, [inbox], { claims: [], runs: [] });
+  assert.ok(incident);
+  ledger.begin(incident.id, "r"); ledger.decide(incident.id, "r", { action: "wait", reason: "Needs a clearer scope" }); ledger.complete(incident.id, "r");
+  now += RECOVERY_RECHECK_MS + 1;
+  assert.deepEqual(ledger.report("mac", project, [inbox], { claims: [], runs: [] }), []);
+  assert.equal(ledger.list().length, 1);
+  assert.equal(ledger.report("mac", project, [{ ...inbox, evidenceRevision: "a".repeat(64) }], { claims: [], runs: [] })[0]?.state, "queued");
+  db.close();
+});
+
+test("completed assessment-only waits release ownership and retain their evidence", () => {
+  for (const hasImplementation of [false, true]) {
+    const store = new FleetStore(":memory:", limits);
+    if (hasImplementation) {
+      store.start(request(1, { id: "builder", role: "builder" }));
+      store.finish("mac", "session", "builder");
+    }
+    const [incident] = store.recoveryReport("mac", project, [{ ...observation(1, []), blocked: true }]);
+    store.start(request());
+    store.recoveryStep("mac", "session", project, incident.id, "run-1", "begin");
+    store.recoveryStep("mac", "session", project, incident.id, "run-1", "decide", { action: "wait", reason: "The prerequisite is still being built" });
+    store.recoveryStep("mac", "session", project, incident.id, "run-1", "complete");
+    store.finish("mac", "session", "run-1");
+    assert.equal(store.snapshot().claims.length, hasImplementation ? 1 : 0);
+    assert.equal(store.snapshot().releasedAssessmentClaims?.length ?? 0, hasImplementation ? 0 : 1);
+    assert.equal(store.recovery.incident(incident.id).state, "complete");
+    assert.equal(store.recovery.incident(incident.id).decision?.action, "wait");
+    store.finish("mac", "session", "run-1");
+    assert.equal(store.snapshot().claims.length, hasImplementation ? 1 : 0, "completion replay preserves the result");
+    store.close();
+  }
+});
+
+test("an unfinished or repair-assigned assessment keeps its claim", () => {
+  for (const outcome of ["unconfirmed", "repair"] as const) {
+    const store = new FleetStore(":memory:", limits);
+    const [incident] = store.recoveryReport("mac", project, [observation()]);
+    store.start(request());
+    store.recoveryStep("mac", "session", project, incident.id, "run-1", "begin");
+    store.recoveryStep("mac", "session", project, incident.id, "run-1", "decide",
+      { action: outcome === "repair" ? "rework" : "wait", reason: "Recorded assessment" });
+    if (outcome === "repair") store.recoveryStep("mac", "session", project, incident.id, "run-1", "complete");
+    store.finish("mac", "session", "run-1", outcome === "repair");
+    assert.equal(store.snapshot().claims.length, 1);
+    store.close();
+  }
+});
 const agents: AgentConfig[] = ["refiner", "builder", "verifier", "documentation"].map((name, n) => ({ name, column: ["Backlog", "In Development", "In Code Review", "In Documentation"][n], description: name, claudeMdPath: "unused", usesWorktree: true, producesCommits: name === "builder" }));
 const item = (labels = ["error:builder"]): ProjectItem => ({ id: "item", issueId: "issue", issueNumber: 1, title: "Repair", body: "", status: "In Development", labels, url: "https://example.test/1", blockedBy: [], parentNumber: null, grandparentNumber: null });
 const url = (server: { address(): unknown }) => `http://127.0.0.1:${(server.address() as { port: number }).port}`;
@@ -107,7 +171,7 @@ test("a documented retry reset survives the decision ledger and is applied befor
 test("a pipeline return to Inbox queues one assessment without promoting ordinary intake or operator holds", () => {
   const store = new FleetStore(":memory:", limits);
   const returned = { ...observation(167, ["orchestrator:returned-inbox"]), status: "Inbox" };
-  assert.equal(recoveryTrigger({ ...returned, labels: [] }), null);
+  assert.equal(recoveryTrigger({ ...returned, labels: [] })?.reason, "Inbox readiness reassessment");
   assert.equal(recoveryTrigger({ ...returned, status: "Backlog" }), null);
   assert.equal(recoveryTrigger({ ...returned, labels: [...returned.labels, "needs-human:decision"] })?.manual, true);
   const [incident] = store.recoveryReport("mac", project, [returned]);

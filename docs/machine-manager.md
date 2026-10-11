@@ -156,8 +156,18 @@ Backlog waits remain quiet. A running label stranded in Backlog can also alert.
 The owning computer offers an assessment as the `recovery` role. It uses normal
 admission and a heavy reservation. Only one assessment runs across the fleet at
 a time. Existing ownership, both capacity limits, project drains and full drains
-apply. Runnable owned recovery and repair work precedes owned ordinary work. Both owned groups precede unclaimed recovery and ordinary work. A job that cannot fit the available capacity does not block a fitting job. Already reserved or running jobs are not interrupted. An unreachable owner or uncertain reservation is never released by recovery.
+apply. Runnable owned recovery and repair work precedes owned ordinary work. Both owned groups precede unclaimed recovery and ordinary work. Routine dependency assessments and quiet Inbox readiness checks are an exception: they run only when the local computer has no active ticket reservation and no ready ticket work was selected. These waiting checks do not count against the new-ticket limit. The central snapshot identifies them from their recorded incident reason, including offers from older workers. Actual errors, returned Inbox investigations and assigned repairs retain their existing recovery priority. A job that cannot fit the available capacity does not block a fitting job. Already reserved or running jobs are not interrupted. An unreachable owner or uncertain reservation is never released by recovery.
 An unclaimed ticket can be assessed only after normal admission claims it.
+A confirmed completed assessment that says `wait` releases that claim if its
+ownership generation contains only completed read-only assessments or explicitly
+unused reservations. Any implementation run, uncertain run or assigned repair
+preserves ownership. Recorded decisions and run history remain available.
+The authority records the exact released owner and ownership generation.
+Restart verification accepts that receipt while preserving its check against
+unexplained ownership changes.
+An unchanged quiet Inbox wait does not repeat on the ordinary thirty-minute
+retry timer. New workflow or evidence can make it eligible again. A ready Inbox
+ticket returns to ordinary refinement and retains normal review and test gates.
 
 The assessment follows the central runner choice when configured. Otherwise, it
 uses the project's configured runner and optional `recovery` role override. Codex inherits the configured model.
