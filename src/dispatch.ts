@@ -926,7 +926,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
         // Resolved from the env Codex itself gets, so nothing withheld from
         // Codex can come back through the allowlist.
         shellEnv: resolveAgentShellEnv(codexChildEnv(opts.env)),
-        builderLiveTests: opts.env.CLAUDE_CODE_ENTRYPOINT === "builder" && Boolean(opts.env.OP_SERVICE_ACCOUNT_TOKEN?.trim()),
+        builderLiveTests: opts.env.CLAUDE_CODE_ENTRYPOINT === "builder" && Boolean(opts.env.OP_SERVICE_ACCOUNT_TOKEN?.trim() || opts.env.PYRY_LIVE_CLAUDE_TOKEN?.trim()),
         resumeThreadId: opts.resumeSessionId }));
     } else if (opts.sourceReview) {
       if (!opts.sourceReviewRoot) throw new Error("Claude source review requires an explicit source root");

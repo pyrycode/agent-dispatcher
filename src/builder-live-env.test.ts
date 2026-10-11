@@ -1,7 +1,26 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { agentSpawnEnv, SPAWN_ENV_DENYLIST } from "./agent-runtime.js";
-import { agentShellEnvNameProblem, buildCodexInvocation } from "./agent-runner.js";
+import { agentShellEnvNameProblem, buildCodexInvocation, codexChildEnv } from "./agent-runner.js";
+import { healthEnvForAgent } from "./health-check.js";
+
+test("only the builder keeps a loaded live-test credential through Codex's scrubber", () => {
+  const parent = { CLAUDE_CODE_OAUTH_TOKEN: "loaded-live-fixture", PYRY_LIVE_CLAUDE_TOKEN: "untrusted-alias-fixture" };
+  const builder = codexChildEnv(agentSpawnEnv(parent, "builder"));
+  assert.equal(builder.PYRY_LIVE_CLAUDE_TOKEN, "loaded-live-fixture");
+  assert.equal(builder.CLAUDE_CODE_OAUTH_TOKEN, undefined);
+  for (const role of ["verifier", "refiner", "documentation", "recovery", "developer", "code-review"]) {
+    assert.equal(codexChildEnv(agentSpawnEnv(parent, role)).PYRY_LIVE_CLAUDE_TOKEN, undefined, role);
+  }
+});
+
+test("a loaded credential supports builder health checks without a service account", () => {
+  const health = healthEnvForAgent({ CLAUDE_CODE_OAUTH_TOKEN: "loaded-live-fixture", RANDOM_SETTING: "dropped" }, "builder", "codex");
+  assert.equal(health.key, "builder:codex-live");
+  assert.equal(health.env.PYRY_LIVE_CLAUDE_TOKEN, "loaded-live-fixture");
+  assert.equal(health.env.OP_SERVICE_ACCOUNT_TOKEN, undefined);
+  assert.equal(health.env.RANDOM_SETTING, undefined);
+});
 
 test("only builder receives the restricted account, never Automation", () => {
   const parent = { PYRY_DEV_AGENTS_TOKEN: "restricted-fixture", OP_SERVICE_ACCOUNT_TOKEN: "automation-fixture", PATH: "/bin" };
@@ -43,6 +62,7 @@ test("Codex builder uses names-only narrow inheritance and secret names stay rej
   assert.ok(args.includes('shell_environment_policy.inherit="all"'));
   const names = args.find(arg => arg.startsWith("shell_environment_policy.include_only="))!;
   assert.ok(names.includes("OP_SERVICE_ACCOUNT_TOKEN"));
+  assert.ok(names.includes("PYRY_LIVE_CLAUDE_TOKEN"));
   assert.ok(names.includes("ANDROID_HOME"));
   assert.ok(names.includes("GH_TOKEN"), "container publishing login must survive the builder override");
   assert.ok(names.includes("DISPLAY"), "Desktop live tests need the container display");

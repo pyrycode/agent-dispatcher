@@ -836,7 +836,7 @@ so it has no daemon check:
 ```sh
 PYRY_HEALTH_GITHUB_CMD="gh auth status --hostname github.com"
 PYRY_HEALTH_FIGMA_CMD="codex mcp list | grep -Eq '^figma[[:space:]].*[[:space:]]enabled[[:space:]]+OAuth'"
-PYRY_HEALTH_LIVE_LOGIN_CMD='[ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || op read --no-newline "op://kmzgpgsyeesea3pkiuk2ul2phq/Claude long term token/password" >/dev/null'
+PYRY_HEALTH_LIVE_LOGIN_CMD='[ -n "$PYRY_LIVE_CLAUDE_TOKEN" ] || [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || op read --no-newline "op://kmzgpgsyeesea3pkiuk2ul2phq/Claude long term token/password" >/dev/null'
 ```
 
 Desktop, Codex runner. The daemon path is the same file as `PYRY_BIN`:
@@ -844,14 +844,16 @@ Desktop, Codex runner. The daemon path is the same file as `PYRY_BIN`:
 ```sh
 PYRY_HEALTH_GITHUB_CMD="gh auth status --hostname github.com"
 PYRY_HEALTH_FIGMA_CMD="codex mcp list | grep -Eq '^figma[[:space:]].*[[:space:]]enabled[[:space:]]+OAuth'"
-PYRY_HEALTH_LIVE_LOGIN_CMD='[ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || op read --no-newline "op://kmzgpgsyeesea3pkiuk2ul2phq/Claude long term token/password" >/dev/null'
+PYRY_HEALTH_LIVE_LOGIN_CMD='[ -n "$PYRY_LIVE_CLAUDE_TOKEN" ] || [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || op read --no-newline "op://kmzgpgsyeesea3pkiuk2ul2phq/Claude long term token/password" >/dev/null'
 PYRY_HEALTH_DAEMON_CMD="/absolute/path/to/pyrycode-desktop-tests/pyry --version"
 PYRY_HEALTH_DAEMON_MIN_VERSION=0.33.0
 ```
 
 The live-login command passes in the gate's environment, which carries the
 fork's `CLAUDE_CODE_OAUTH_TOKEN`, and in a builder's, which carries the
-restricted Dev Agents account instead. The Figma command proves that Codex
+builder-only `PYRY_LIVE_CLAUDE_TOKEN` loaded from protected startup credentials.
+If no local login was supplied, the restricted Dev Agents account remains a
+fallback. The Figma command proves that Codex
 has a Figma login configured. It cannot prove the server answers, which
 would need a model run. A daemon version only changes on a release; to
 require a particular pyrycode commit instead, make the daemon command fail
@@ -970,9 +972,9 @@ Tests: `python3 -m unittest discover -s scripts -p 'test_*.py'`.
 
 `PYRY_DEV_AGENTS_TOKEN` is an optional `op://Automation/xcl7xsu5ppbww3m5gav7wmbt6e/credential` reference resolved at dispatcher start. It must identify the separate service account that can read only the Dev agents vault. Never configure it with the Automation account token.
 
-The spawn scrubber removes both account variables. For builders alone, it maps this restricted token to `OP_SERVICE_ACCOUNT_TOKEN`. Other roles receive neither account. The non-secret `PYRY_AGENT_SHELL_ENV` filter still refuses secret names. Codex builders inherit the restricted account through a names-only shell allowlist, never through a secret value in arguments. That list preserves the container's existing `GH_TOKEN` publishing login and its `DISPLAY` and `PLAYWRIGHT_BROWSERS_PATH` settings for Desktop tests. It does not pass `GITHUB_TOKEN` or the Automation account.
+The spawn scrubber removes both account variables and any inherited live-test alias. For builders alone, it copies the protected startup `CLAUDE_CODE_OAUTH_TOKEN` into `PYRY_LIVE_CLAUDE_TOKEN`. This builder-only name survives Codex's Claude credential scrubber. It also maps the restricted account to `OP_SERVICE_ACCOUNT_TOKEN` as a fallback when the actual login is absent. Other Codex roles receive neither account nor the live-test alias. The non-secret `PYRY_AGENT_SHELL_ENV` filter still refuses secret names. Codex builders inherit through a names-only shell allowlist, never through a secret value in arguments. That list preserves the container's existing `GH_TOKEN` publishing login and its `DISPLAY` and `PLAYWRIGHT_BROWSERS_PATH` settings for Desktop tests. It does not pass `GITHUB_TOKEN` or the Automation account.
 
-Mobile's `scripts/android-test-gate.py live --tests "Class#method"` fetches its own child login. Go and Desktop repairs use `python3 "$AGENTS_REPO_PATH/dispatcher/scripts/live-claude-gate.py" go --tests "^TestName$"` or `desktop --spec e2e/real-name.spec.ts --tests "test title"`. Run from the product worktree. Build Desktop first. These launchers fetch `op://kmzgpgsyeesea3pkiuk2ul2phq/Claude long term token/password` with the restricted account and remove account credentials from test children. Missing access is an environment error. A zero-test run fails. Record the executed and passed counts. Full-suite runs remain dispatcher work.
+Mobile's `scripts/android-test-gate.py live --tests "Class#method"` fetches its own child login. Go and Desktop repairs use `python3 "$AGENTS_REPO_PATH/dispatcher/scripts/live-claude-gate.py" go --tests "^TestName$"` or `desktop --spec e2e/real-name.spec.ts --tests "test title"`. Run from the product worktree. Build Desktop first. The shared Go and Desktop launcher uses the loaded live-test alias before any online lookup. It fetches `op://kmzgpgsyeesea3pkiuk2ul2phq/Claude long term token/password` only when a local login is absent. Launchers remove account credentials and the alias from test children. Update the configured live-login health command to check the alias before its online fallback. Missing access is an environment error. A zero-test run fails. Record the executed and passed counts. Full-suite runs remain dispatcher work.
 
 ## Full-duration process proofs
 
