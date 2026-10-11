@@ -268,7 +268,7 @@ export function healthEnvForAgent(
   const env = agentSpawnEnv(parent, role);
   if (runner !== "codex") return { key: `${role}:claude`, env };
   const child = codexChildEnv(env);
-  if (scope === "process" || !(role === "builder" && child.OP_SERVICE_ACCOUNT_TOKEN?.trim())) return { key: `${role}:codex`, env: child };
+  if (scope === "process" || !(role === "builder" && (child.OP_SERVICE_ACCOUNT_TOKEN?.trim() || child.PYRY_LIVE_CLAUDE_TOKEN?.trim()))) return { key: `${role}:codex`, env: child };
   const shellEnv = resolveAgentShellEnv(child, { warn: () => {} });
   const narrowed = { ...pickNames(child, builderLiveInheritedNames(Object.keys(shellEnv))), ...shellEnv };
   return { key: `${role}:codex-live`, env: narrowed };

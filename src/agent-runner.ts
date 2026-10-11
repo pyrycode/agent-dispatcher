@@ -122,7 +122,7 @@ export function builderLiveInheritedNames(shellEnvNames: readonly string[]): str
   return [
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_*", "TERM", "TMPDIR", "TMP", "TEMP",
     "GH_TOKEN", "DISPLAY", "PLAYWRIGHT_BROWSERS_PATH",
-    "AGENTS_REPO_PATH", ...shellEnvNames, "OP_SERVICE_ACCOUNT_TOKEN",
+    "AGENTS_REPO_PATH", ...shellEnvNames, "OP_SERVICE_ACCOUNT_TOKEN", "PYRY_LIVE_CLAUDE_TOKEN",
   ];
 }
 

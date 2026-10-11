@@ -11,8 +11,10 @@ class ClaudeEnvironmentError(RuntimeError):
 
 
 def live_claude_environment(parent):
-    """Fetch the login in memory, strip account credentials from test children."""
-    env = {key: value for key, value in parent.items() if not key.startswith("OP_") and key != "PYRY_DEV_AGENTS_TOKEN"}
+    """Reuse the loaded login, strip account credentials from test children."""
+    env = {key: value for key, value in parent.items() if not key.startswith("OP_") and key not in {"PYRY_DEV_AGENTS_TOKEN", "PYRY_LIVE_CLAUDE_TOKEN"}}
+    if parent.get("PYRY_LIVE_CLAUDE_TOKEN", "").strip():
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = parent["PYRY_LIVE_CLAUDE_TOKEN"]
     token = parent.get("OP_SERVICE_ACCOUNT_TOKEN")
     if env.get("CLAUDE_CODE_OAUTH_TOKEN") or not token:
         return env

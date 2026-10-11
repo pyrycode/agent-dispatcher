@@ -781,6 +781,7 @@ export const SPAWN_ENV_DENYLIST: ReadonlySet<string> = new Set([
   "TARGET_REPO_PATH",
   "OP_SERVICE_ACCOUNT_TOKEN", // Automation account: never hand it to agents.
   "PYRY_DEV_AGENTS_TOKEN", // Explicit builder-only exception below.
+  "PYRY_LIVE_CLAUDE_TOKEN", // Recreated from the protected startup credential for builders only.
   "PYRY_MANAGER_TOKEN",
   "PYRY_MANAGER_URL",
   "PYRY_MANAGED",
@@ -800,7 +801,7 @@ export function scrubSpawnEnv(parentEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 }
 
 /**
- * The sole secret exception: builders may fetch a live-test login through
+ * Builders reuse the live-test login loaded at startup, or fetch it through
  * the restricted Dev Agents account. The Automation account is always
  * scrubbed first. No other role receives either service-account token.
  * Keep this separate from the non-secret PYRY_AGENT_SHELL_ENV allowlist.
@@ -809,6 +810,8 @@ export function agentSpawnEnv(parentEnv: NodeJS.ProcessEnv, role: string): NodeJ
   const env: NodeJS.ProcessEnv = { ...scrubSpawnEnv(parentEnv), CLAUDE_CODE_ENTRYPOINT: role };
   const token = parentEnv.PYRY_DEV_AGENTS_TOKEN;
   if (role === "builder" && token?.trim()) env.OP_SERVICE_ACCOUNT_TOKEN = token;
+  const live = parentEnv.CLAUDE_CODE_OAUTH_TOKEN;
+  if (role === "builder" && live?.trim()) env.PYRY_LIVE_CLAUDE_TOKEN = live;
   return env;
 }
 
