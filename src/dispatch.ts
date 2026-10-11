@@ -9524,6 +9524,8 @@ export async function pollLoop(): Promise<void> {
         if (pool.has(key)) continue;
         const offer = managed.offer(issue, "recovery", "heavy", [], -4);
         offer.offer.roleLimit = 1;
+        offer.offer.requiresRecovery = true;
+        offer.offer.recoveryError = incident.reason.startsWith('error:');
         if (!managed.ready(offer)) continue;
         pool.launch(key, () => managed.run(offer, async () => {
           const recoveryClient = managed.client(rawClient, false, issue);
@@ -9648,7 +9650,20 @@ export async function pollLoop(): Promise<void> {
           if (drainMode) { await releaseDispatchClaim(c.agent, c.item, client, claim); return; }
           await countFamilyDispatch(c.agent, c.item, rawClient, { tallies: familyTallies, rootLabelsByIssue });
           await runConcurrentDispatches([c], client);
-        }));
+        }, recoveryEnabled ? {
+          observe: async () => {
+            const [labels, blockers, status] = await Promise.all([
+              client.getIssueLabels(c.item.issueNumber), client.getOpenBlockers(c.item.issueNumber),
+              client.getItemStatus(c.item.issueNumber, { forceRefresh: true }),
+            ]);
+            return { ...c.item, labels, status: status ?? 'Done', evidenceRevision: undefined,
+              blockedBy: blockers.map(number => ({ number, state: 'OPEN' as const })) };
+          },
+          onRecovery: incidents => {
+            recoveryQueue = [...recoveryQueue.filter(i => i.ticket !== `${managed.project}#${c.item.issueNumber}`),
+              ...incidents.filter(i => i.state === 'queued' && i.current !== false)];
+          },
+        } : undefined));
       }
     } else await launchCandidates({
       candidates,

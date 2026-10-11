@@ -10,6 +10,8 @@ export interface WorkOffer {
   order: number;
   roleLimit?: number;
   recovery?: boolean;
+  recoveryError?: boolean;
+  requiresRecovery?: boolean;
 }
 
 /** Draining stops new tickets, while reconciliation can still advance owned work. */
@@ -48,6 +50,7 @@ export function scheduleMachine(opts: {
     const ac = claims.get(a.ticket), bc = claims.get(b.ticket);
     return Number(!ac) - Number(!bc)
       || Number(!(a.role === "recovery" || a.recovery)) - Number(!(b.role === "recovery" || b.recovery))
+      || Number(!a.recoveryError) - Number(!b.recoveryError)
       || (ac && bc ? ac.created - bc.created : rank.get(a.project)! - rank.get(b.project)!)
       || a.order - b.order || a.ticket.localeCompare(b.ticket) || a.key.localeCompare(b.key);
   });

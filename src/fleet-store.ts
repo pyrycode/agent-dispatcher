@@ -3,7 +3,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { RecoveryFacts, type PauseRecord, type EvidenceRecord, type CoordinationRecord } from "./recovery-facts.js";
-import { RecoveryLedger, type RecoveryObservation, type RecoveryDecision } from "./fleet-recovery.js";
+import { RecoveryLedger, validateObservations, type RecoveryObservation, type RecoveryDecision, type RecoveryIncident } from "./fleet-recovery.js";
 import { OperationReports } from './operation-reports.js';
 import type { AgentRunner } from './agent-runner.js';
 
@@ -28,6 +28,7 @@ export interface StartRequest {
   resource: ResourceClass;
   locks: string[];
   roleLimit?: number;
+  requiresRecovery?: boolean;
 }
 export interface Claim { ticket: string; machine: string; generation: string; created: number }
 export interface FleetRun extends StartRequest { generation: string; created: number; runnerPolicy?: RunnerPolicy }
@@ -48,6 +49,7 @@ export function validateStart(req: StartRequest): void {
   }
   if (req.resource !== "heavy" && req.resource !== "medium" && req.resource !== "light") throw new Error("Invalid resource class");
   if (req.roleLimit !== undefined && (!Number.isSafeInteger(req.roleLimit) || req.roleLimit < 1)) throw new Error("Invalid role limit");
+  if (req.requiresRecovery !== undefined && (typeof req.requiresRecovery !== 'boolean' || req.role !== 'recovery')) throw new Error('Invalid recovery requirement');
   if (!Array.isArray(req.locks) || req.locks.length > 16 || req.locks.some(k => typeof k !== "string" || !k.startsWith(`${req.project}:`) || k.length > 300)) {
     throw new Error("Invalid project locks");
   }
@@ -191,6 +193,7 @@ export class FleetStore {
       if (req.role === "reconcile" && (req.ticket !== `${req.project}#@reconcile` || !req.locks.includes(`${req.project}:reconcile`))) throw new Error("Housekeeping requires the project lock");
       if (req.role === "recovery") {
         if (req.resource !== "heavy" || !/#[1-9]\d*$/.test(req.ticket)) throw new Error("Recovery requires a heavy ticket reservation");
+        if (req.requiresRecovery && !this.db.prepare("SELECT 1 FROM fleet_recovery WHERE ticket=? AND present=1 AND state='queued'").get(req.ticket)) return { ok: false, reason: 'locked' };
         if (this.db.prepare("SELECT 1 FROM fleet_runs WHERE finished IS NULL AND json_extract(request,'$.role')='recovery'").get()) return { ok: false, reason: "locked" };
       }
       if (this.db.prepare("SELECT 1 FROM fleet_locks WHERE name=?").get(`${req.project}:reconcile`)) return { ok: false, reason: "locked" };
@@ -224,12 +227,21 @@ export class FleetStore {
     });
   }
 
-  finish(machine: string, session: string, id: string, completed = true, unused = false): void {
+  finish(machine: string, session: string, id: string, completed?: boolean, unused?: boolean): void;
+  finish(machine: string, session: string, id: string, completed: boolean, unused: boolean, observation: RecoveryObservation | undefined): RecoveryIncident[];
+  finish(machine: string, session: string, id: string, completed = true, unused = false, observation?: RecoveryObservation): RecoveryIncident[] {
     if (unused && completed) throw new Error("Unused work cannot be completed");
-    this.transaction(() => {
+    return this.transaction(() => {
       const run = this.db.prepare("SELECT * FROM fleet_runs WHERE id=?").get(id);
       if (!run || run.machine !== machine || run.session !== session) throw new Error("Run owner mismatch");
-      if (run.finished !== null) return; // Retries cannot revise what actually happened.
+      const request = JSON.parse(String(run.request)) as StartRequest;
+      if (observation) {
+        validateObservations(request.project, [observation]);
+        if (unused || observation.ticket !== run.ticket) throw new Error('Completion observation mismatch');
+      }
+      // Recover the original result after a lost acknowledgement. Do not report
+      // again after a recovery worker may already have started.
+      if (run.finished !== null) return observation ? this.recovery.list(request.project).filter(i => i.current && i.ticket === run.ticket) : [];
       this.db.prepare("DELETE FROM fleet_locks WHERE run_id=?").run(id);
       this.db.prepare("UPDATE fleet_runs SET finished=?,outcome=? WHERE id=? AND finished IS NULL").run(Date.now(), unused ? "unused" : completed ? "completed" : "cancelled", id);
       // An explicitly withdrawn, never-started reservation has no work to own.
@@ -246,6 +258,11 @@ export class FleetStore {
         this.db.prepare("DELETE FROM fleet_claims WHERE ticket=? AND generation=? AND NOT EXISTS (SELECT 1 FROM fleet_runs WHERE ticket=? AND finished IS NULL)")
           .run(run.ticket, run.generation, run.ticket);
       }
+      // The new incident and slot release commit together. A single completion
+      // must never retire incidents belonging to other tickets in the project.
+      if (!observation) return [];
+      return this.recovery.report(machine, request.project, [{ ...observation,
+        pause: this.facts.getPause(observation.ticket), artifactRevision: this.facts.revision([observation.ticket]) }], this.snapshot(), true);
     });
   }
 
