@@ -1,5 +1,6 @@
 import { recoveryFingerprint, recoveryTrigger, hasOperatorHold, validateRecoveryDecision, RECOVERY_RETURNED_INBOX, type RecoveryDecision, type RecoveryIncident } from "./fleet-recovery.js";
 import type { AgentConfig, ProjectItem } from "./types.js";
+import { FAMILY_BREAKER_LABEL, resolveFamilyRoot } from "./pipeline-decisions.js";
 
 export const RECOVERY_INVESTIGATING = "orchestrator:investigating";
 export const RECOVERY_FIXING = "orchestrator:fixing";
@@ -37,7 +38,14 @@ export function parseRecoveryDecision(output: string): RecoveryDecision {
 export function observationFor(project: string, item: ProjectItem) {
   return { ticket: `${project}#${item.issueNumber}`, status: item.status, labels: item.labels,
     blocked: item.blockedBy.some(b => b.state === "OPEN"), evidenceRevision: item.evidenceRevision,
-    artifactRevision: item.artifactRevision, pause: item.recoveryPause };
+    artifactRevision: item.artifactRevision, pause: item.recoveryPause, familyHold: item.recoveryFamilyHold };
+}
+
+/** Reuse selection's parent evidence without changing the child's real labels. */
+export function withRecoveryFamilyHold(project: string, item: ProjectItem, labels?: ReadonlyMap<number, readonly string[]>): ProjectItem {
+  const root = resolveFamilyRoot(item);
+  const rootLabels = labels?.get(root) ?? (root === item.issueNumber ? item.labels : []);
+  return { ...item, recoveryFamilyHold: rootLabels.includes(FAMILY_BREAKER_LABEL) ? `${project}#${root}` : undefined };
 }
 
 export function recoveryStillCurrent(project: string, item: ProjectItem | undefined, incident: RecoveryIncident): item is ProjectItem {

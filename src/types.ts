@@ -43,6 +43,8 @@ export interface ProjectItem {
    *  parent once every sub-issue is closed. */
   subIssues?: { total: number; completed: number };
   evidenceRevision?: string;
+  /** Parent family budget hold, observed without copying labels to this issue. */
+  recoveryFamilyHold?: string;
   artifactRevision?: string;
   recoveryPause?: import("./recovery-facts.js").PauseRecord;
 }
