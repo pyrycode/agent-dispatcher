@@ -28,6 +28,15 @@ import sys
 from unittest.mock import Mock,patch
 
 class LiveLauncherTest(unittest.TestCase):
+    def test_loaded_builder_login_works_during_password_manager_outage(self):
+        with patch.object(gate.subprocess, 'run', side_effect=AssertionError('must not fetch online')):
+            child = gate.live_claude_environment({'PYRY_LIVE_CLAUDE_TOKEN':'cached-login',
+                'OP_SERVICE_ACCOUNT_TOKEN':'restricted-fixture', 'PYRY_DEV_AGENTS_TOKEN':'delivery-fixture'})
+        self.assertEqual(child['CLAUDE_CODE_OAUTH_TOKEN'], 'cached-login')
+        self.assertNotIn('PYRY_LIVE_CLAUDE_TOKEN', child)
+        self.assertNotIn('OP_SERVICE_ACCOUNT_TOKEN', child)
+        self.assertNotIn('PYRY_DEV_AGENTS_TOKEN', child)
+
     def test_login_survives_a_vault_rename(self):
         def renamed_account(argv, **kwargs):
             # The fixture account has one vault, now named SV - Dev agents.
