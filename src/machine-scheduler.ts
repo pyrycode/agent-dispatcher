@@ -46,8 +46,8 @@ export function scheduleMachine(opts: {
     && acceptsDuringProjectDrain(o, opts.machine, opts.drainingProjects ?? [], opts.state));
   ready.sort((a, b) => {
     const ac = claims.get(a.ticket), bc = claims.get(b.ticket);
-    return Number(!(a.role === "recovery" || a.recovery)) - Number(!(b.role === "recovery" || b.recovery))
-      || Number(!ac) - Number(!bc)
+    return Number(!ac) - Number(!bc)
+      || Number(!(a.role === "recovery" || a.recovery)) - Number(!(b.role === "recovery" || b.recovery))
       || (ac && bc ? ac.created - bc.created : rank.get(a.project)! - rank.get(b.project)!)
       || a.order - b.order || a.ticket.localeCompare(b.ticket) || a.key.localeCompare(b.key);
   });

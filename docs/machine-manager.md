@@ -4,9 +4,51 @@ Managed mode adds one manager per physical computer and one shared claim service
 
 The claim service uses SQLite on its own local disk. It grants a ticket and the computer's capacity in one transaction. There is no distributed database, heartbeat expiry or automatic failover. A service outage prevents new starts. An existing run can finish, but its reservation remains until the finish is acknowledged.
 
+## Central fleet runner
+
+The central operator can choose Codex or Claude for every managed development
+role across all computers. Use the existing operator configuration and its
+central operator credential:
+
+```sh
+pnpm fleet runner /path/to/operator.json codex
+pnpm fleet runner /path/to/operator.json claude
+pnpm fleet runner /path/to/operator.json
+```
+
+The final command reads the current choice. The existing `operator.sh` wrapper
+also accepts `runner codex`, `runner claude`, and `runner` when it forwards
+commands to this entry point. `runner local` restores local runner files and
+environment settings. A fresh installation has no central override.
+
+The setting is saved in the claims database and takes effect on new admitted
+runs without a dispatcher restart. It overrides local files, role entries and
+launch-time runner choices for refinement, building, verification,
+documentation, recovery and the classic roles. Existing model defaults and
+per-role Claude model choices remain unchanged.
+
+Deploy this feature to the claim service and every participating dispatcher
+before enabling the override. Older dispatchers do not use the central choice.
+
+Each grant saves its runner and the setting revision. An already admitted run
+keeps that choice through preliminary source review, final review and any
+resumed session. A switch neither interrupts workers nor transfers a session
+between providers. Retrying a lost admission response returns the original
+choice. Status reports the current setting and each grant's saved choice.
+
+Both providers must already be installed and authenticated on the computers
+that will use them. A missing provider or failed login blocks that work through
+the existing checks. It never silently substitutes the other provider. Product
+tests that deliberately exercise real Claude continue to exercise Claude.
+
+Only the central operator credential can change this setting. Machine and
+project credentials can read it and receive grants, but cannot override it.
+The existing admission and status channels distribute the choice. No new
+monitoring or reporting process is added.
+
 ## Scheduling
 
-Each manager configuration lists projects in priority order. Recovery assessments and tickets labelled `orchestrator:fixing` take precedence over ordinary work, regardless of board priority, ticket priority or claim age. Within each group it considers runnable locally claimed tickets first, oldest claim first. It then considers unclaimed tickets in project order. Within that ordering it uses the dispatcher's ticket priority labels and stage order. Running work is never pre-empted. A blocked or errored ticket stays owned but is absent from eligible offers, so other work can proceed. Strict project priority can starve a lower project if higher projects always have eligible work.
+Each manager configuration lists projects in priority order. It first considers runnable locally claimed recovery and repair work, then locally claimed ordinary work, then unclaimed recovery and repair work, then unclaimed ordinary work. Recovery includes assessments and tickets labelled `orchestrator:fixing`. Within the claimed groups, oldest claim comes first. Within the unclaimed groups, project order comes first. The dispatcher's ticket priority labels and stage order break ties. An owned offer that cannot fit the remaining capacity does not prevent fitting unclaimed work from starting. Running work is never pre-empted. A blocked or errored ticket stays owned but is absent from eligible offers, so other work can proceed. Strict project priority can starve a lower project if higher projects always have eligible work.
 
 A dispatcher can explicitly cancel a reservation it never started, for example after a board stage changes. That cancellation releases a new ticket claim only if no actual or uncertain run has used that ownership generation. Completed, failed and blocked work keeps its claim. Offline reservations still require manual release. A cancelled offer therefore cannot gain priority over work that is ready to run.
 
@@ -110,11 +152,11 @@ Backlog waits remain quiet. A running label stranded in Backlog can also alert.
 The owning computer offers an assessment as the `recovery` role. It uses normal
 admission and a heavy reservation. Only one assessment runs across the fleet at
 a time. Existing ownership, both capacity limits, project drains and full drains
-apply. Recovery assessments and their repair pipeline are scheduled before ordinary work across all local projects. Already reserved or running jobs are not interrupted. An unreachable owner or uncertain reservation is never released by recovery.
+apply. Runnable owned recovery and repair work precedes owned ordinary work. Both owned groups precede unclaimed recovery and ordinary work. A job that cannot fit the available capacity does not block a fitting job. Already reserved or running jobs are not interrupted. An unreachable owner or uncertain reservation is never released by recovery.
 An unclaimed ticket can be assessed only after normal admission claims it.
 
-The assessment uses the project's configured runner, with an optional `recovery`
-role override in its existing runner file. Codex inherits the configured model.
+The assessment follows the central runner choice when configured. Otherwise, it
+uses the project's configured runner and optional `recovery` role override. Codex inherits the configured model.
 Claude uses Sonnet. Both investigate with extra-high effort, independently of
 lower ordinary role settings. It uses the existing restricted source
 reader, with a thirty-minute limit and eighty Claude turns. The prompt contains the

@@ -26,6 +26,9 @@ import { Buffer } from "node:buffer";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { execSync, spawnSync } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
+import { FleetStore } from './fleet-store.js';
+import { MachineManager, serveManager } from './machine-manager.js';
+import { ManagedDispatch } from './managed-dispatch.js';
 
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9538,6 +9541,58 @@ test("Codex spawn selection does not inherit Claude model overrides", async () =
       if (previous[k] === undefined) delete process.env[k]; else process.env[k] = previous[k];
     }
   }
+});
+
+test('central runner reaches production spawn preparation while preserving role models', async t => {
+  const store = new FleetStore(':memory:', { mac: { heavyLimit: 1, combinedLimit: 1 } });
+  const manager = new MachineManager({ machine: 'mac', heavyLimit: 1, combinedLimit: 1, projects: ['org/core'] }, {
+    snapshot: async () => store.snapshot(), start: async r => store.start(r),
+    finish: async (session, id, completed, unused) => store.finish('mac', session, id, completed, unused),
+  });
+  const server = await serveManager(manager, { 'org/core': 'project-test' }, 'operator-test', 0);
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  const managed = new ManagedDispatch('org/core', { PYRY_MANAGER_URL: `http://127.0.0.1:${address.port}`, PYRY_MANAGER_TOKEN: 'project-test' });
+  const keys = ['PYRY_AGENT_RUNNER', 'PYRY_CODEX_MODEL', 'PYRY_CODEX_BIN'] as const;
+  const previous = Object.fromEntries(keys.map(k => [k, process.env[k]]));
+  t.after(async () => {
+    for (const k of keys) { if (previous[k] === undefined) delete process.env[k]; else process.env[k] = previous[k]; }
+    await managed.stop(); await new Promise<void>(r => server.close(() => r())); store.close();
+  });
+  process.env.PYRY_AGENT_RUNNER = 'invalid-local-choice';
+  process.env.PYRY_CODEX_BIN = process.execPath; // All agent spawns are mocked; no Codex process starts.
+  delete process.env.PYRY_CODEX_MODEL;
+  await managed.start();
+  const admit = async (issue: number, role: string) => {
+    managed.beginCycle(); const pending = managed.offer(issue, role, 'light');
+    await managed.endCycle(); await manager.tick(); await managed.sync();
+    assert.equal(managed.ready(pending), true); return pending;
+  };
+  store.setRunner('codex');
+  await managed.run(await admit(100, 'builder'), async () => {
+    for (const name of ['refiner', 'builder', 'verifier', 'documentation']) {
+      const path = `${name}/CLAUDE.md`;
+      const { ctx } = makeTestContext({ agent: { name, claudeMdPath: path, model: 'claude-sonnet-5' },
+        mockOptions: { fsMap: { [claudeMdAbsPath(path)]: 'role instructions' } } });
+      const prepared = await prepareAgentSpawn(ctx);
+      assert.ok(prepared.ok);
+      assert.equal(prepared.config.runner, 'codex', name);
+      assert.equal(prepared.config.model, 'gpt-6.1-sol', name);
+    }
+    store.setRunner('claude'); await managed.sync();
+    const { ctx } = makeTestContext({ mockOptions: { fsMap: { [claudeMdAbsPath('developer/CLAUDE.md')]: 'role' } } });
+    const prepared = await prepareAgentSpawn(ctx);
+    assert.ok(prepared.ok);
+    assert.equal(prepared.config.runner, 'codex', 'a later phase in this grant retains its original runner');
+  });
+  await managed.run(await admit(101, 'documentation'), async () => {
+    const { ctx } = makeTestContext({ agent: { name: 'documentation', claudeMdPath: 'documentation/CLAUDE.md', model: 'claude-sonnet-5' },
+      mockOptions: { fsMap: { [claudeMdAbsPath('documentation/CLAUDE.md')]: 'role' } } });
+    const prepared = await prepareAgentSpawn(ctx);
+    assert.ok(prepared.ok);
+    assert.equal(prepared.config.runner, 'claude');
+    assert.equal(prepared.config.model, 'claude-sonnet-5', 'the central switch leaves Claude role models intact');
+  });
 });
 
 test("effort trial reaches both runners and records the actual selection without changing models", async () => {

@@ -6,7 +6,8 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { FleetStore } from "./fleet-store.js";
 import { FleetClient, serveFleet } from "./fleet-http.js";
 import { MachineManager, offerId, serveManager } from "./machine-manager.js";
-import { ManagedDispatch, trackManagedChild } from "./managed-dispatch.js";
+import { ManagedDispatch, managedRunRunner, trackManagedChild } from "./managed-dispatch.js";
+import { createRunnerSelector } from './runner-file.js';
 import type { Server } from "node:http";
 import type { ProjectItem } from "./types.js";
 
@@ -16,6 +17,62 @@ const url = (server: Server) => {
   return `http://127.0.0.1:${a.port}`;
 };
 const close = (server: Server) => new Promise<void>(resolve => server.close(() => resolve()));
+
+test('one central runner reaches every role and computer without replacing an active run', async t => {
+  const store = new FleetStore(':memory:', { mac: { heavyLimit: 2, combinedLimit: 2 }, linux: { heavyLimit: 2, combinedLimit: 2 } });
+  const claimsServer = await serveFleet(store, { mac: 'mac-test', linux: 'linux-test' }, 'admin-test', 0);
+  const instances: Array<{ manager: MachineManager; server: Server; managed: ManagedDispatch; env: NodeJS.ProcessEnv }> = [];
+  t.after(async () => {
+    for (const instance of instances) { await instance.managed.stop(); await close(instance.server); }
+    await close(claimsServer); store.close();
+  });
+  for (const machine of ['mac', 'linux']) {
+    const project = `org/${machine}`;
+    const manager = new MachineManager({ machine, heavyLimit: 2, combinedLimit: 2, projects: [project] }, new FleetClient(url(claimsServer), `${machine}-test`));
+    const server = await serveManager(manager, { [project]: 'project-test' }, 'operator-test', 0);
+    const env = { GITHUB_OWNER: 'org', GITHUB_REPO: machine, PYRY_MANAGER_URL: url(server), PYRY_MANAGER_TOKEN: 'project-test' };
+    const managed = new ManagedDispatch(project, env);
+    instances.push({ manager, server, managed, env });
+    await managed.start();
+  }
+  const select = createRunnerSelector({ path: '/unused/runner.json', env: { PYRY_AGENT_RUNNER: 'claude' }, override: managedRunRunner,
+    read: () => '{"runner":"claude","roles":{"verifier":"claude","recovery":"claude"}}' });
+  assert.equal(select('builder'), 'claude', 'unmanaged selection remains local');
+  store.setRunner('codex');
+  for (const { manager, managed, env } of instances) {
+    await managed.sync();
+    assert.equal(managed.runner(), 'codex', 'health checks see the central choice');
+    assert.equal(await ManagedDispatch.runnerFromEnv(env), 'codex', 'startup validation uses the central choice');
+    let issue = 1;
+    for (const role of ['po', 'architect', 'developer', 'qa', 'code-review', 'refiner', 'builder', 'verifier', 'documentation', 'recovery']) {
+      managed.beginCycle();
+      const offer = managed.offer(issue++, role, role === 'recovery' ? 'heavy' : 'light');
+      await managed.endCycle(); await manager.tick(); await managed.sync();
+      assert.equal(managed.ready(offer), true, role);
+      await managed.run(offer, async () => assert.equal(select(role), 'codex', role));
+    }
+  }
+  const first = instances[0];
+  first.managed.beginCycle();
+  const active = first.managed.offer(100, 'builder', 'medium');
+  await first.managed.endCycle(); await first.manager.tick(); await first.managed.sync();
+  await first.managed.run(active, async () => {
+    assert.equal(select('builder'), 'codex');
+    store.setRunner('claude');
+    await first.managed.sync();
+    assert.equal(first.managed.runner(), 'codex', 'active health and launch phases retain their admitted runner');
+    assert.equal(select('builder'), 'codex', 'continuation retains the active selection');
+    const second = instances[1];
+    second.managed.beginCycle();
+    const fresh = second.managed.offer(100, 'builder', 'medium');
+    await second.managed.endCycle(); await second.manager.tick(); await second.managed.sync();
+    await second.managed.run(fresh, async () => assert.equal(select('builder'), 'claude', 'a new grant uses the new choice'));
+    assert.equal(select('builder'), 'codex', 'another concurrent run cannot replace this context');
+  });
+  assert.equal(first.managed.runner(), 'claude', 'idle health checks follow the latest setting');
+  store.setRunner(null); await first.managed.sync();
+  assert.equal(first.managed.runner(), undefined, 'local restores existing per-role selection');
+});
 
 test("a cancelled stale stage offer cannot outrank a higher-priority ticket", async t => {
   const store = new FleetStore(":memory:", { mac: { heavyLimit: 1, combinedLimit: 1 } });

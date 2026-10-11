@@ -5,6 +5,10 @@ import { randomUUID } from "node:crypto";
 import { RecoveryFacts, type PauseRecord, type EvidenceRecord, type CoordinationRecord } from "./recovery-facts.js";
 import { RecoveryLedger, type RecoveryObservation, type RecoveryDecision } from "./fleet-recovery.js";
 import { OperationReports } from './operation-reports.js';
+import type { AgentRunner } from './agent-runner.js';
+
+/** An operator choice, frozen into each new grant. Null restores local settings. */
+export interface RunnerPolicy { runner: AgentRunner | null; revision: number }
 
 export type ResourceClass = "heavy" | "medium" | "light";
 export interface MachineLimits { heavyLimit: number; combinedLimit: number }
@@ -26,13 +30,14 @@ export interface StartRequest {
   roleLimit?: number;
 }
 export interface Claim { ticket: string; machine: string; generation: string; created: number }
-export interface FleetRun extends StartRequest { generation: string; created: number }
-export interface FleetSnapshot { claims: Claim[]; runs: FleetRun[] }
+export interface FleetRun extends StartRequest { generation: string; created: number; runnerPolicy?: RunnerPolicy }
+export interface FleetSnapshot { claims: Claim[]; runs: FleetRun[]; runnerPolicy?: RunnerPolicy }
 export type StartResult = { ok: true; generation: string } | {
   ok: false; reason: "foreign-claim" | "running" | "capacity" | "locked" | "finished";
 };
 
 export function validateStart(req: StartRequest): void {
+  if (Object.hasOwn(req, 'runnerPolicy')) throw new Error('Runner choice belongs to the central operator');
   for (const key of ["id", "machine", "session", "project", "ticket", "role"] as const) {
     if (typeof req[key] !== "string" || !req[key] || req[key].length > 250) throw new Error(`Invalid ${key}`);
   }
@@ -73,12 +78,33 @@ export class FleetStore {
       CREATE TABLE IF NOT EXISTS fleet_locks (
         name TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES fleet_runs(id)
       ) STRICT;
+      CREATE TABLE IF NOT EXISTS fleet_runner_policy (
+        singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+        runner TEXT CHECK(runner IS NULL OR runner IN ('claude','codex')),
+        revision INTEGER NOT NULL CHECK(revision>0)
+      ) STRICT;
     `);
     this.recovery = new RecoveryLedger(this.db);
     this.facts = new RecoveryFacts(this.db);
     this.operations = new OperationReports(this.db, Object.keys(limits));
   }
   close(): void { this.db.close(); }
+
+  runnerPolicy(): RunnerPolicy | undefined {
+    const row = this.db.prepare('SELECT runner,revision FROM fleet_runner_policy WHERE singleton=1').get();
+    return row ? { runner: row.runner as AgentRunner | null, revision: Number(row.revision) } : undefined;
+  }
+  setRunner(runner: unknown): RunnerPolicy {
+    if (runner !== null && runner !== 'claude' && runner !== 'codex') throw new Error('Runner must be claude, codex or null');
+    return this.transaction(() => {
+      const previous = this.runnerPolicy();
+      if (previous?.runner === runner) return previous;
+      const policy: RunnerPolicy = { runner, revision: (previous?.revision ?? 0) + 1 };
+      this.db.prepare('INSERT INTO fleet_runner_policy VALUES (1,?,?) ON CONFLICT(singleton) DO UPDATE SET runner=excluded.runner,revision=excluded.revision')
+        .run(policy.runner, policy.revision);
+      return policy;
+    });
+  }
 
   recoveryReport(machine: string, project: string, observations: RecoveryObservation[]) {
     if (!Object.hasOwn(this.limits, machine)) throw new Error("Unknown machine");
@@ -157,7 +183,8 @@ export class FleetStore {
     return this.transaction(() => {
       const previous = this.db.prepare("SELECT request,generation,finished FROM fleet_runs WHERE id=?").get(req.id);
       if (previous) {
-        if (previous.request !== request) throw new Error("Request ID reused with different contents");
+        const { runnerPolicy: _policy, ...original } = JSON.parse(String(previous.request));
+        if (JSON.stringify(original) !== request) throw new Error("Request ID reused with different contents");
         return previous.finished === null ? { ok: true, generation: String(previous.generation) } : { ok: false, reason: "finished" };
       }
       if (req.ticket.includes("#@main-sweep-") && this.db.prepare("SELECT 1 FROM fleet_runs WHERE ticket=? AND finished IS NOT NULL AND outcome='completed'").get(req.ticket)) return { ok: false, reason: "finished" };
@@ -188,8 +215,10 @@ export class FleetStore {
       }
       const generation = claim ? String(claim.generation) : randomUUID();
       const now = Date.now();
+      const runnerPolicy = this.runnerPolicy();
+      const admitted = runnerPolicy ? JSON.stringify({ ...JSON.parse(request), runnerPolicy }) : request;
       this.db.prepare("INSERT OR IGNORE INTO fleet_claims VALUES (?,?,?,?)").run(req.ticket, req.machine, generation, now);
-      this.db.prepare("INSERT INTO fleet_runs VALUES (?,?,?,?,?,?,?,?,NULL,NULL)").run(req.id, req.machine, req.session, req.ticket, generation, req.resource, request, now);
+      this.db.prepare("INSERT INTO fleet_runs VALUES (?,?,?,?,?,?,?,?,NULL,NULL)").run(req.id, req.machine, req.session, req.ticket, generation, req.resource, admitted, now);
       for (const lock of new Set(req.locks)) this.db.prepare("INSERT INTO fleet_locks VALUES (?,?)").run(lock, req.id);
       return { ok: true, generation };
     });
@@ -234,7 +263,9 @@ export class FleetStore {
   }
 
   snapshot(): FleetSnapshot {
+    const runnerPolicy = this.runnerPolicy();
     return {
+      ...(runnerPolicy ? { runnerPolicy } : {}),
       claims: this.db.prepare("SELECT * FROM fleet_claims ORDER BY created,ticket").all() as unknown as Claim[],
       runs: this.db.prepare("SELECT request,generation,created FROM fleet_runs WHERE finished IS NULL ORDER BY created,id").all()
         .map(row => ({ ...JSON.parse(String(row.request)), generation: String(row.generation), created: Number(row.created) })),

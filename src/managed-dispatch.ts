@@ -8,12 +8,15 @@ import type { AgentConfig, ProjectItem } from "./types.js";
 import { observationFor } from "./recovery-work.js";
 import type { PauseRecord, EvidenceRecord, CoordinationRecord } from "./recovery-facts.js";
 import type { RecoveryObservation, RecoveryIncident, RecoveryDecision } from "./fleet-recovery.js";
+import type { AgentRunner } from './agent-runner.js';
 import { offerId } from "./machine-manager.js";
 
 const DEFAULT_RESOURCE_CLASSES: Readonly<Record<string, ResourceClass>> = {
   builder: "medium", developer: "medium", refiner: "light", po: "light", documentation: "light",
 };
 const currentRun = new AsyncLocalStorage<{ run: FleetRun; groups: Set<number> }>();
+/** A granted run uses its saved choice even after the global setting changes. */
+export function managedRunRunner(): AgentRunner | undefined { return currentRun.getStore()?.run.runnerPolicy?.runner ?? undefined; }
 /** Called by the existing spawn sites. Slot release waits for grandchildren too. */
 export function trackManagedChild(pid: number): void { currentRun.getStore()?.groups.add(pid); }
 export function managedGroupAlive(pid: number): boolean {
@@ -53,6 +56,17 @@ export class ManagedDispatch {
   static fromEnv(env: NodeJS.ProcessEnv): ManagedDispatch | null {
     if (!env.PYRY_MANAGER_URL && !env.PYRY_MANAGER_TOKEN && env.PYRY_MANAGED !== "1") return null;
     return new ManagedDispatch(`${env.GITHUB_OWNER}/${env.GITHUB_REPO}`, env);
+  }
+  /** Read the central choice before validating local runner files at startup. */
+  static async runnerFromEnv(env: NodeJS.ProcessEnv): Promise<AgentRunner | undefined> {
+    const managed = ManagedDispatch.fromEnv(env);
+    if (!managed) return undefined;
+    const state = await managed.connection.call<FleetSnapshot>('/state');
+    return state.runnerPolicy?.runner ?? undefined;
+  }
+  runner(): AgentRunner | undefined {
+    const active = currentRun.getStore();
+    return (active ? active.run.runnerPolicy : this.state.runnerPolicy)?.runner ?? undefined;
   }
   async start(): Promise<void> {
     await this.sync();
