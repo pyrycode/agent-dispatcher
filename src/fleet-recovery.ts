@@ -1,16 +1,21 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { FleetSnapshot } from "./fleet-store.js";
+import type { PauseRecord } from "./recovery-facts.js";
 
 export interface RecoveryObservation {
   ticket: string; status: string; labels: string[]; blocked: boolean;
+  evidenceRevision?: string;
+  artifactRevision?: string;
+  pause?: PauseRecord;
 }
-export type RecoveryAction = "wait" | "retry" | "rework" | "escalate";
-export interface RecoveryDecision { action: RecoveryAction; reason: string }
+export type RecoveryAction = "wait" | "retry" | "rework" | "resume" | "refine" | "unblock" | "propose-close" | "escalate";
+export interface RecoveryDecision { action: RecoveryAction; reason: string; blocker?: string }
 export interface RecoveryIncident {
   id: string; ticket: string; fingerprint: string; reason: string;
   state: "queued" | "assessing" | "applying" | "complete" | "escalated" | "resolved";
   created: number; updated: number; runId: string | null; decision: RecoveryDecision | null;
+  current?: boolean;
 }
 
 export const RECOVERY_RECHECK_MS = 30 * 60_000;
@@ -28,28 +33,37 @@ export function validateObservations(project: string, observations: RecoveryObse
     if (!o || !o.ticket.startsWith(`${project}#`) || !/^[1-9]\d*$/.test(o.ticket.slice(project.length + 1)) || seen.has(o.ticket)
       || typeof o.status !== "string" || o.status.length > 100 || typeof o.blocked !== "boolean"
       || !Array.isArray(o.labels) || o.labels.length > 200 || o.labels.some(l => typeof l !== "string" || l.length > 200)) throw new Error("Invalid recovery observation");
+    if (o.artifactRevision !== undefined && !/^[a-f0-9]{64}$/.test(o.artifactRevision)) throw new Error("Invalid artifact revision");
+    if (o.evidenceRevision !== undefined && !/^[a-f0-9]{64}$/.test(o.evidenceRevision)) throw new Error("Invalid evidence revision");
     seen.add(o.ticket);
   }
 }
 export function recoveryFingerprint(o: RecoveryObservation): string {
   return createHash("sha256").update(JSON.stringify([o.status, o.blocked,
-    o.labels.filter(l => /^(error:|needs-human:|rework-count:|done:|needs-rework:|needs-real-claude$)/.test(l)).sort()])).digest("hex");
+    o.labels.filter(l => /^(error:|needs-human:|rework-count:|done:|needs-rework:|needs-real-claude$)/.test(l)).sort(),
+    o.evidenceRevision ?? null, o.artifactRevision ?? null, o.pause ?? null])).digest("hex");
 }
 export function recoveryTrigger(o: RecoveryObservation): { reason: string; manual: boolean } | null {
   if (o.status === "Done") return null;
-  if (o.status === "Halted" || hasOperatorHold(o.labels)) return { reason: "Explicit operator hold", manual: true };
+  if (hasOperatorHold(o.labels) || o.status === "Halted" && o.pause?.origin === "operator") return { reason: "Explicit operator hold", manual: true };
+  if (o.status === "Halted") return o.pause?.origin === "pipeline"
+    ? { reason: `Pipeline pause: ${o.pause.reason}`, manual: false }
+    : { reason: "Pause origin unknown; record who paused this ticket and the reopening condition", manual: true };
   if (o.labels.some(l => /permission_denied|family-breaker/.test(l))) return { reason: "Permission or family boundary needs an operator", manual: true };
   // These waits already have dedicated bounded recovery. Do not buy another retry budget.
-  if (o.blocked || o.labels.some(l => l.startsWith("error-retry-count:") || l.startsWith("health-hold:"))) return null;
+  if (o.blocked) return { reason: "Dependency evidence and coordination reassessment", manual: false };
+  if (o.labels.some(l => l.startsWith("error-retry-count:") || l.startsWith("health-hold:"))) return null;
   const errors = o.labels.filter(l => l.startsWith("error:"));
   if (errors.length) return { reason: errors.sort().join(", "), manual: false };
   if (o.labels.some(l => /^rework-count:\d+$/.test(l) && Number(l.split(":")[1]) >= 2)) return { reason: "Repeated review rework", manual: false };
+  if (o.status === "Inbox" && o.labels.some(l => l === "needs-real-claude" || l === "done:refiner")) return { reason: "Pipeline evidence or refinement is needed in Inbox", manual: false };
   return null;
 }
 export function validateRecoveryDecision(value: unknown): RecoveryDecision {
   const d = value as RecoveryDecision;
-  if (!d || !["wait", "retry", "rework", "escalate"].includes(d.action) || typeof d.reason !== "string" || !d.reason.trim() || d.reason.length > 6000) throw new Error("Invalid recovery decision");
-  return { action: d.action, reason: d.reason };
+  if (!d || !["wait", "retry", "rework", "resume", "refine", "unblock", "propose-close", "escalate"].includes(d.action) || typeof d.reason !== "string" || !d.reason.trim() || d.reason.length > 6000) throw new Error("Invalid recovery decision");
+  if (d.action === "unblock" && !/^[\w.-]+\/[\w.-]+#[1-9]\d*$/.test(d.blocker ?? "")) throw new Error("Unblock requires a full blocker ticket");
+  return { action: d.action, reason: d.reason, ...(d.action === "unblock" ? { blocker: d.blocker } : {}) };
 }
 
 /** Uses the claim authority's database. No independent watcher can race this ledger. */
@@ -63,14 +77,15 @@ export class RecoveryLedger {
     CREATE UNIQUE INDEX IF NOT EXISTS fleet_recovery_current ON fleet_recovery(ticket) WHERE present=1;
     CREATE TABLE IF NOT EXISTS fleet_recovery_progress (
       ticket TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, since INTEGER NOT NULL
-    ) STRICT;`);
+    ) STRICT;
+    CREATE TABLE IF NOT EXISTS fleet_recovery_workflow (ticket TEXT PRIMARY KEY, fingerprint TEXT NOT NULL) STRICT;`);
   }
   list(project?: string): RecoveryIncident[] {
     const rows = project ? this.db.prepare("SELECT * FROM fleet_recovery WHERE ticket LIKE ? ORDER BY created DESC LIMIT 500").all(`${project}#%`)
       : this.db.prepare("SELECT * FROM fleet_recovery ORDER BY created DESC LIMIT 500").all();
     return rows.map(r => ({ id: String(r.id), ticket: String(r.ticket), fingerprint: String(r.fingerprint), reason: String(r.reason),
       state: r.state as RecoveryIncident["state"], created: Number(r.created), updated: Number(r.updated), runId: r.run_id as string | null,
-      decision: r.decision ? JSON.parse(String(r.decision)) : null }));
+      decision: r.decision ? JSON.parse(String(r.decision)) : null, current: r.present === 1 }));
   }
   report(machine: string, project: string, observations: RecoveryObservation[], fleet: FleetSnapshot): RecoveryIncident[] {
     validateObservations(project, observations);
@@ -118,9 +133,9 @@ export class RecoveryLedger {
       }
       let trigger = recoveryTrigger(o);
       const wip = o.labels.some(l => l.startsWith("wip:"));
-      const workflowColumn = o.status.startsWith("In ") || o.status === "Backlog" && (wip || !!owner);
+      const workflowColumn = o.status === "Inbox" || o.status.startsWith("In ") || o.status === "Backlog" && (wip || !!owner);
       if ((!trigger || wip) && !o.blocked && workflowColumn && this.now() - Number(progress.since) >= (wip ? 3 : 24) * 3600000) {
-        trigger = { reason: wip ? "Running label without a reservation; verify the worker stopped" : "No workflow progress for 24 hours", manual: true };
+        trigger = { reason: wip ? "Running label without a reservation; verify the worker stopped" : "No workflow progress for 24 hours", manual: wip };
       }
       if (old && trigger?.manual && old.state === "queued" && old.fingerprint === fingerprint) {
         this.db.prepare("UPDATE fleet_recovery SET state='escalated',reason=?,updated=? WHERE id=?").run(trigger.reason, this.now(), old.id);
@@ -129,12 +144,18 @@ export class RecoveryLedger {
       }
       const legacyLimit = old?.state === "escalated" && ["Explicit operator hold", "Fleet recovery assessment daily limit reached",
         "Automatic repair budget exhausted: two fleet repairs and one per ticket per day"].includes(String(old.reason));
-      const waited = old?.state === "complete" && old.decision && JSON.parse(String(old.decision)).action === "wait"
+      const waited = !o.blocked && old?.state === "complete" && old.decision && JSON.parse(String(old.decision)).action === "wait"
         && this.now() - Number(old.updated) >= RECOVERY_RECHECK_MS;
+      const workflow = recoveryFingerprint({ ...o, evidenceRevision: undefined, artifactRevision: undefined, pause: undefined });
+      const assessedWorkflow = this.db.prepare("SELECT fingerprint FROM fleet_recovery_workflow WHERE ticket=?").get(o.ticket);
+      const evidenceChanged = trigger && old && old.fingerprint !== fingerprint && assessedWorkflow?.fingerprint === workflow
+        && this.now() - Number(old.updated) < RECOVERY_RECHECK_MS;
+      if (evidenceChanged && trigger && !trigger.manual) continue;
       const recheck = (legacyLimit || waited) && trigger && !trigger.manual && !wip;
       if (old && (!trigger || old.fingerprint !== fingerprint || recheck)) this.db.prepare("UPDATE fleet_recovery SET present=0, updated=CASE WHEN state='queued' THEN ? ELSE updated END, state=CASE WHEN state='queued' THEN 'resolved' ELSE state END WHERE id=?").run(this.now(), old.id);
       if (!trigger || old?.fingerprint === fingerprint && !recheck || (wip && !trigger.manual)) continue;
       const id = randomUUID();
+      this.db.prepare("INSERT INTO fleet_recovery_workflow VALUES (?,?) ON CONFLICT(ticket) DO UPDATE SET fingerprint=excluded.fingerprint").run(o.ticket, workflow);
       this.db.prepare("INSERT INTO fleet_recovery VALUES (?,?,?,?,?,?,?,NULL,NULL,1)").run(id, o.ticket, fingerprint, trigger.reason, trigger.manual ? "escalated" : "queued", this.now(), this.now());
       if (trigger.manual) newAlerts.add(id);
     }
@@ -169,12 +190,12 @@ export class RecoveryLedger {
     if (incident.decision) return incident.decision;
     if (incident.state !== "assessing") throw new Error("Recovery is not being assessed");
     let decision = validateRecoveryDecision(value);
-    if (decision.action === "retry" || decision.action === "rework") {
-      const repairs = this.db.prepare("SELECT count(*) AS n FROM fleet_recovery WHERE ticket=? AND decision IS NOT NULL AND updated>? AND json_extract(decision,'$.action') IN ('retry','rework')").get(incident.ticket, this.now() - 86400000)!;
+    if (["retry", "rework", "resume", "refine", "unblock"].includes(decision.action)) {
+      const repairs = this.db.prepare("SELECT count(*) AS n FROM fleet_recovery WHERE ticket=? AND decision IS NOT NULL AND updated>? AND json_extract(decision,'$.action') IN ('retry','rework','resume','refine','unblock')").get(incident.ticket, this.now() - 86400000)!;
       if (Number(repairs.n) >= RECOVERY_REPAIRS_PER_TICKET) decision = { action: "escalate", reason: "Automatic repair budget exhausted: three repairs per ticket per rolling day" };
     }
     this.db.prepare("UPDATE fleet_recovery SET state=?, decision=?, updated=? WHERE id=?").run(
-      ["retry", "rework"].includes(decision.action) ? "applying" : decision.action === "wait" ? "complete" : "escalated", JSON.stringify(decision), this.now(), id);
+      ["retry", "rework", "resume", "refine", "unblock"].includes(decision.action) ? "applying" : decision.action === "wait" ? "complete" : "escalated", JSON.stringify(decision), this.now(), id);
     return decision;
   }
   complete(id: string, runId: string): void {

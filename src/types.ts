@@ -10,6 +10,8 @@ export interface ProjectConfig {
 export interface BlockerInfo {
   number: number;
   state: "OPEN" | "CLOSED";
+  url?: string;
+  updatedAt?: string;
 }
 
 export interface ProjectItem {
@@ -40,6 +42,9 @@ export interface ProjectItem {
    *  fetch did not carry it. Read by `runParentClose` to close a Done
    *  parent once every sub-issue is closed. */
   subIssues?: { total: number; completed: number };
+  evidenceRevision?: string;
+  artifactRevision?: string;
+  recoveryPause?: import("./recovery-facts.js").PauseRecord;
 }
 
 export interface AgentConfig {

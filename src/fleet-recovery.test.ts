@@ -23,7 +23,7 @@ const url = (server: { address(): unknown }) => `http://127.0.0.1:${(server.addr
 
 test("quiet polls and expected waits never schedule AI; two reworks request assessment", () => {
   assert.equal(recoveryTrigger(observation(1, [])), null);
-  assert.equal(recoveryTrigger({ ...observation(), blocked: true }), null);
+  assert.equal(recoveryTrigger({ ...observation(), blocked: true })?.manual, false);
   assert.equal(recoveryTrigger(observation(1, ["error-retry-count:2", "error:builder"])), null);
   assert.equal(recoveryTrigger(observation(1, ["needs-real-claude"])), null);
   assert.equal(recoveryTrigger(observation(1, ["rework-count:1"])), null);

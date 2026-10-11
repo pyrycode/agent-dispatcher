@@ -28,7 +28,7 @@ export async function listen(server: Server, port: number | string, host = "127.
   if (typeof port === "string") chmodSync(port, 0o600);
   return server;
 }
-export async function serveFleet(store: FleetStore, machines: Record<string, string>, admin: string, port: number, host = "127.0.0.1", github?: GitHubBroker): Promise<Server> {
+export async function serveFleet(store: FleetStore, machines: Record<string, string>, admin: string, port: number, host = "127.0.0.1", github?: GitHubBroker, desired?: () => unknown): Promise<Server> {
   const secrets = [...Object.values(machines), admin];
   if (secrets.some(s => !s) || new Set(secrets).size !== secrets.length) throw new Error("Fleet credentials must be non-empty and distinct");
   const server = createServer(async (req, res) => {
@@ -40,11 +40,37 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
     const machine = Object.keys(machines).find(m => tokenMatches(req.headers.authorization, machines[m]));
     if (!isAdmin && !machine) return send(401, { error: "Authentication required" });
     try {
+      if (req.method === "GET" && req.url === "/operations/desired") return send(200, desired?.() ?? {});
+      if (req.method === "GET" && req.url === "/operations/reports") return send(200, store.operations.list());
       if (req.method === "GET" && req.url === "/state") return send(200, store.snapshot());
       if (req.method === "GET" && req.url === "/recovery/state") return send(200, store.recovery.list());
       if (req.method === "GET" && req.url === "/github/status" && isAdmin) return send(200, github?.status() ?? { enabled: false });
       if (req.method !== "POST") return send(404, { error: "Unknown operation" });
       const body = await readJson(req);
+      if (req.url === '/operations/report') {
+        if (!isAdmin && body.machine !== machine) return send(403, {error:'Machine identity mismatch'});
+        store.operations.record(isAdmin ? body.machine : machine!, body.report);
+        return send(200, {ok:true});
+      }
+      if (req.url === "/recovery/facts") return send(200, store.recoveryFacts(body.tickets));
+      if (req.url === "/recovery/evidence") {
+        if (!machine) return send(403, { error: "Machine credential required" });
+        return send(200, store.recordEvidence(machine, body.project, body.records));
+      }
+      if (req.url === "/recovery/pause" || req.url === "/recovery/coordination") {
+        if (!machine) return send(403, { error: "Machine credential required" });
+        return send(200, req.url === "/recovery/pause"
+          ? store.recordPause(machine, body.session, body.project, body.runId, body.record)
+          : store.recordCoordination(machine, body.session, body.project, body.runId, body.record));
+      }
+      if (req.url === "/recovery/operator-coordination") {
+        if (!isAdmin) return send(403, { error: "Operator credential required" });
+        store.facts.coordinate(body.record); return send(200, { ok: true });
+      }
+      if (req.url === "/recovery/operator-pause") {
+        if (!isAdmin) return send(403, { error: "Operator credential required" });
+        store.facts.pause({ ...body.record, origin: "operator" }); return send(200, { ok: true });
+      }
       if (req.url === "/recovery/report") {
         if (!machine) return send(403, { error: "Machine credential required" });
         return send(200, store.recoveryReport(machine, body.project, body.observations));

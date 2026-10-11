@@ -260,3 +260,40 @@ Back up SQLite using its online backup facilities, or stop the claim service and
 5. Add a second computer. Confirm that both can process different tickets and cannot run the same ticket. Test manual recovery on a stopped test worker before increasing capacity.
 
 All supervisors and launch commands must use the shared path. This does not limit arbitrary tests a person starts in a terminal. Linux service installation and macOS service installation need validation on their target computers before production activation.
+
+## Recovery without board supervision
+
+Recovery now watches changed issue evidence and dependency revisions as well as errors and repeated rework. Blocked issues receive an assessment. An unchanged dependency wait does not repeat that assessment on a timer. Changed evidence can reopen an escalation after a thirty minute cooldown. Workflow changes remain eligible immediately. Inbox items with no progress for a day also enter assessment. A pipeline Inbox item needing live evidence can enter immediately. Evidence refinement returns to the normal planning stage with its portable proof brief.
+
+The claim database records pause origin, actor, reason, missing prerequisite, reopening condition and previous stage. A pipeline pause can resume after assessment and fresh safety checks. A human hold stays in place. Older Halted cards have unknown origin and appear in the decision report. Moving an old card is never taken as proof that a person intended it to resume.
+
+Each computer inventories the retained logs needed by its open issues and their related ticket references. The shared inventory contains source name, computer, size, modification time, outcome and digest. It contains no log text. The assessor reads bounded local log and stderr tails and recent comments on related tickets through the shared GitHub connection. It uses remote inventory entries to find retained evidence or specify a portable reproduction for the ordinary code agent. Isolated tests retain ordinary admission and live-test credentials. An inaccessible artifact is not proof that no failure occurred.
+
+Native blockers remain causal unless their coordination purpose was explicitly recorded. Automatic removal also requires fresh, complete pull request file lists with no overlap. Missing branches, incomplete listings and a model's unsupported description do not authorise removal. Record an existing coordination relation with `operator.sh coordination RECEIPT.json`. A receipt contains `ticket`, `blocker`, `paths` and `reason`. It does not modify the relation itself.
+
+`operator.sh attention` returns one fleet decision report. It excludes resolved history and separates active recovery, explicit human holds, missing computers and decisions. A `propose-close` assessment appears there with its evidence and limits. It never closes an issue or claims a repair was verified. A person can approve that decision without opening a board. Three automatic repair assignments per ticket per rolling day still apply. Resuming a pipeline pause and removing coordination blockers share that budget.
+
+### Local update and credential supervisor
+
+The claim service can look up consumer main and its dispatcher submodule pin once every five minutes for the fleet. Enable `updates` in its protected configuration:
+
+```json
+{"updates":{"dispatcherRepository":"pyrycode/agent-dispatcher","consumers":{
+  "pyrycode/pyrycode":"pyrycode/pyrycode-agents",
+  "pyrycode/pyrycode-mobile":"pyrycode/pyrycode-mobile-agents",
+  "pyrycode/pyrycode-desktop":"pyrycode/pyrycode-desktop-agents",
+  "pyrycode/pyrycode-relay":"pyrycode/pyrycode-relay-agents"
+}}}
+```
+
+`operator.sh desired` returns that manifest. A lookup failure offers no new update once the last successful manifest is fifteen minutes old. The submodule destination must match the configured shared dispatcher repository.
+
+Run `python3 scripts/fleet-supervisor.py CONFIG.json` as a local service. Its protected configuration names the existing operator wrapper, state directory, report file, Python executable, platform and project adapters. Mac adapters name the agents checkout, target checkout, canonical workload access helper and runner. Linux adapters name those checkouts, container paths, the container and service names, and the protected GitHub container secret. See `examples/fleet/supervisor.json`.
+
+The supervisor compares the source recorded at dispatcher startup with the desired pins. Updating a checkout cannot falsely attest that its old process loaded new code. It also compares the actual running GitHub credential with the configured workload credential using a local salted fingerprint. It verifies authentication and repository access before draining and after restart. Credential values are never recorded in reports or receipts. Linux credential provisioning remains the operator credential loader's responsibility. Replacing the configured container secret triggers a reload. Updating a remote password-manager item without provisioning that secret does not.
+
+A durable receipt is written before one graceful stop signal. Existing jobs finish. The supervisor waits for the old process and child groups or container to stop and for reservations to finish. It updates main with ordinary fast-forward pulls, updates the pinned submodule and starts through the existing launcher. It then checks the loaded source, credentials, startup checks, manager reporting, drain policies and every existing real ticket owner. Stopped services stay stopped. Dirty checkouts, retained reservations and changes to operator policies stop the operation for inspection.
+
+A crash after an uncertain stop or start acknowledgement never causes another signal or start. That operation appears in the consolidated report. Inspection is required before clearing its receipt. No branch, local work, claim or retry counter is reset.
+
+Supervisor operation summaries are published to the existing claim authority. Only the authenticated computer can submit its summary. Reports contain phases and reasons, without commands, credentials or ownership records. The existing five-minute board-watch timer reads the consolidated decision report and uses its existing Pyrycode-client delivery path. No Codex reporting heartbeat is needed.

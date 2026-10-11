@@ -8,6 +8,8 @@ import { startClaimLabelSync } from "./claim-labels.js";
 import { GitHubBroker } from "./github-broker.js";
 import { githubResponse } from "./github-transport.js";
 import { configureGitHubCLI, serveGitHubBridge } from "./github-bridge.js";
+import { FleetUpdates } from "./fleet-updates.js";
+import { recoveryReport } from "./recovery-report.js";
 import { persistProjectDrains } from "./fleet-config.js";
 
 function secret(name: string): string {
@@ -16,7 +18,7 @@ function secret(name: string): string {
 }
 async function main(): Promise<void> {
   const [command, configPath, ...args] = process.argv.slice(2);
-  if (!configPath || !["claims", "manager", "status", "recovery", "drain", "drain-project", "resume-project", "free"].includes(command)) {
+  if (!configPath || !["claims", "manager", "status", "desired", "attention", "report-attention", "pause", "coordination", "recovery", "drain", "drain-project", "resume-project", "free"].includes(command)) {
     throw new Error("Usage: fleet-bin.ts claims|manager|status|recovery|drain|drain-project|resume-project|free CONFIG [PROJECT | TICKET GENERATION --confirmed-stopped]");
   }
   const config = JSON.parse(readFileSync(configPath, "utf8"));
@@ -26,8 +28,13 @@ async function main(): Promise<void> {
     const machines = Object.fromEntries(Object.entries(config.machines).map(([id, value]) => [id, secret((value as any).tokenEnv)]));
     const limits = Object.fromEntries(Object.entries(config.machines).map(([id, value]) => [id, { heavyLimit: (value as any).heavyLimit, combinedLimit: (value as any).combinedLimit }]));
     const store = new FleetStore(database, limits);
-    const github = config.github ? new GitHubBroker({ ...config.github, token: secret(config.github.tokenEnv) }) : undefined;
-    const server = await serveFleet(store, machines, secret(config.operatorTokenEnv), config.port ?? 7430, config.host ?? "127.0.0.1", github);
+    const github = config.github ? new GitHubBroker({ ...config.github,
+      projects: [...new Set([...config.github.projects, ...Object.values(config.updates?.consumers ?? {})])], token: secret(config.github.tokenEnv) }) : undefined;
+    const updates = config.updates && github ? new FleetUpdates(github, config.updates.consumers, config.updates.dispatcherRepository) : undefined;
+    const refresh = () => { void updates?.refresh().catch(() => console.warn("Consumer update lookup paused; running workers preserved")); };
+    if (updates) { try { await updates.refresh(); } catch { /* retry without offering any update */ } }
+    const updateTimer = updates ? setInterval(refresh, 300_000) : undefined;
+    const server = await serveFleet(store, machines, secret(config.operatorTokenEnv), config.port ?? 7430, config.host ?? "127.0.0.1", github, () => updates?.snapshot() ?? {});
     let cli: Awaited<ReturnType<typeof serveGitHubBridge>> | undefined;
     if (github && config.github.socketPath) {
       const socket = resolve(config.github.socketPath);
@@ -45,7 +52,7 @@ async function main(): Promise<void> {
         ...(!["GET", "HEAD"].includes(req.method) ? { body: await req.text() } : {}) }));
     } : fetch;
     const stopLabels = startClaimLabelSync(config.githubLabels, () => store.snapshot().claims, process.env, labelFetch);
-    const close = () => { stopLabels(); cli?.close(); server.close(() => { store.close(); process.exit(0); }); };
+    const close = () => { if (updateTimer) clearInterval(updateTimer); stopLabels(); cli?.close(); server.close(() => { store.close(); process.exit(0); }); };
     process.on("SIGTERM", close); process.on("SIGINT", close);
     console.log("Claim service listening", server.address());
     return;
@@ -69,9 +76,33 @@ async function main(): Promise<void> {
     console.log(`Freed ${args[0]}. Working copies and GitHub workflow state were preserved.`);
     return;
   }
+  if (command === "pause" || command === "coordination") {
+    if (args.length !== 1) throw new Error("Provide a saved JSON receipt file");
+    const record = JSON.parse(readFileSync(args[0], "utf8"));
+    const claims = new JsonClient(config.claimsUrl, secret(config.claimsOperatorTokenEnv));
+    console.log(JSON.stringify(await claims.call(`/recovery/operator-${command}`, { record })));
+    return;
+  }
   const managerUrl = config.managerUrl ?? (config.socketPath ? `unix://${resolve(config.socketPath)}` : undefined);
   if (!managerUrl) throw new Error("Operator configuration requires managerUrl or socketPath");
   const client = new JsonClient(managerUrl, secret(config.operatorTokenEnv));
+  if (command === 'report-attention') {
+    if (args.length !== 1) throw new Error('Provide the saved local supervisor report');
+    const state = await client.call<any>('/state');
+    const claims = new JsonClient(config.claimsUrl, secret(config.claimsOperatorTokenEnv ?? config.claimsTokenEnv));
+    const report = JSON.parse(readFileSync(args[0], 'utf8'));
+    await claims.call('/operations/report', {machine:state.machine,report:{...report,operations:report.operations ?? []}});
+    return;
+  }
+  if (command === "desired") {
+    const claims = new JsonClient(config.claimsUrl, secret(config.claimsOperatorTokenEnv ?? config.claimsTokenEnv));
+    console.log(JSON.stringify(await claims.call("/operations/desired"))); return;
+  }
+  if (command === "attention") {
+    const claims = new JsonClient(config.claimsUrl, secret(config.claimsOperatorTokenEnv ?? config.claimsTokenEnv));
+    const [incidents, state, operations] = await Promise.all([claims.call<import("./fleet-recovery.js").RecoveryIncident[]>("/recovery/state"), client.call<any>("/state"),claims.call<any[]>('/operations/reports')]);
+    console.log(JSON.stringify({...recoveryReport(incidents, state),operationReports:operations}, null, 2)); return;
+  }
   if (command === "drain") { await client.call("/drain", {}); console.log("Draining: no new grants. Existing grants remain reserved."); }
   else if (command === "drain-project" || command === "resume-project") {
     if (args.length !== 1) throw new Error(`${command} requires PROJECT`);
