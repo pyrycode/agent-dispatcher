@@ -228,6 +228,9 @@ export interface ReworkRoutingOptions {
    *  request, null when it has none. Throws when it cannot be read. Absent,
    *  the repeat rule never fires and the count rule alone applies. */
   readPrVerdicts?: (issueNumber: number) => Promise<string | null>;
+  /** Recorded code-owner completions. Missing or unreadable history leaves
+   *  the hard cap in charge; two reviews alone do not prove a repair round. */
+  readBuilderCompletions?: (issueNumber: number) => Promise<readonly string[]>;
   /** Merge current main into the ticket's branch and push it, for a FAIL
    *  whose only blocking findings are a stale base. Supplied by dispatch.ts.
    *  Absent, such a FAIL routes to the builder like any other. */
@@ -367,7 +370,8 @@ export async function runReworkRouting(
         const json = await options.readPrVerdicts(route.issueNumber);
         if (json !== null) {
           artifacts = parseVerdictArtifacts(json);
-          repeatedKeys = findRepeatedMustFix(artifacts);
+          const completions = await options.readBuilderCompletions?.(route.issueNumber) ?? [];
+          repeatedKeys = findRepeatedMustFix(artifacts, completions);
         }
       } catch (e: any) {
         console.warn(`   ⚠️  Could not read verdicts for #${route.issueNumber}; rework breaker uses the count alone: ${e?.message ?? e}`);

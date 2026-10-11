@@ -29,6 +29,8 @@ export interface VerdictArtifact {
   at: string;
   /** The review's or comment's text, empty when the payload carried none. */
   body?: string;
+  /** Commit reviewed, when the review or its body records it. */
+  head?: string;
 }
 
 /**
@@ -39,13 +41,26 @@ export interface VerdictArtifact {
  */
 export function parseVerdictArtifacts(json: string): VerdictArtifact[] {
   const data = JSON.parse(json) as {
-    reviews?: Array<{ submittedAt?: string; body?: string }>;
+    reviews?: Array<{ submittedAt?: string; body?: string; commit?: { oid?: string } }>;
     comments?: Array<{ createdAt?: string; body?: string }>;
   };
   const out: VerdictArtifact[] = [];
-  for (const r of data.reviews ?? []) if (r.submittedAt) out.push({ at: r.submittedAt, body: r.body ?? "" });
-  for (const c of data.comments ?? []) if (c.createdAt) out.push({ at: c.createdAt, body: c.body ?? "" });
+  const artifact = (at: string, body = "", commit?: string): VerdictArtifact => {
+    const head = commit ?? body.match(/Reviewed PR head:\s*`([0-9a-f]{40})`/i)?.[1];
+    return { at, body, ...(head ? { head: head.toLowerCase() } : {}) };
+  };
+  for (const r of data.reviews ?? []) if (r.submittedAt) out.push(artifact(r.submittedAt, r.body, r.commit?.oid));
+  for (const c of data.comments ?? []) if (c.createdAt) out.push(artifact(c.createdAt, c.body));
   return out;
+}
+
+/** Dispatcher completion comments on the ticket, not arbitrary mentions of repair. */
+export function parseBuilderCompletions(json: string, owner: string): string[] {
+  const data = JSON.parse(json) as { comments?: Array<{ createdAt?: string; body?: string }> };
+  return (data.comments ?? []).filter(c => c.createdAt && Number.isFinite(Date.parse(c.createdAt))
+    && c.body?.startsWith("## 🤖 ")
+    && c.body.includes(`\n${owner} agent has completed work on this ticket.`))
+    .map(c => c.createdAt!);
 }
 
 /** A verifier verdict that failed the PR: headed "Verifier Review" and ruling FAIL. */
@@ -133,37 +148,41 @@ export function findingTextSimilarity(a: string, b: string): number {
 }
 
 /**
- * The `[MUST FIX]` keys the newest FAIL verdict shares with the FAIL verdict
- * before it, where the two findings under that key also read alike
+ * The `[MUST FIX]` keys the newest FAIL shares with the last FAIL before a
+ * recorded builder completion, where the findings under that key read alike
  * (`REPEAT_FINDING_SIMILARITY`): the verifier raising the same finding after
  * the builder said it was fixed, not a new finding in the same function.
  * Reviews and comments both count, ordered by time; PASS verdicts and other
  * comments are skipped. A verdict posted twice word for word, as a review and
- * a comment, is one round. Empty when there are fewer than two FAIL verdicts
- * or either has no parseable key, so the caller falls back to the count rule.
+ * a comment, is one round. A completion must lie strictly between the two
+ * verdicts, and known identical heads are never a repair round. Missing
+ * evidence leaves the independent hard cap in charge.
  */
-export function findRepeatedMustFix(artifacts: readonly VerdictArtifact[]): string[] {
-  const [newest, previous] = failVerdictsNewestFirst(artifacts);
+export function findRepeatedMustFix(artifacts: readonly VerdictArtifact[], builderCompletions: readonly string[] = []): string[] {
+  const [newest, ...older] = failVerdictsNewestFirst(artifacts);
+  if (newest === undefined) return [];
+  const completedAt = builderCompletions.map(Date.parse);
+  const previous = older.find(p => completedAt.some(t => t > Date.parse(p.at) && t < Date.parse(newest.at)));
   if (previous === undefined) return [];
-  const prior = extractMustFixFindings(previous).filter((f) => !isBranchInvariantKey(f.key));
-  const repeated = extractMustFixFindings(newest).filter((f) =>
+  if (newest.head && newest.head === previous.head) return [];
+  const prior = extractMustFixFindings(previous.body!).filter((f) => !isBranchInvariantKey(f.key));
+  const repeated = extractMustFixFindings(newest.body!).filter((f) =>
     !isBranchInvariantKey(f.key) &&
     prior.some((p) => p.key === f.key && findingTextSimilarity(p.text, f.text) >= REPEAT_FINDING_SIMILARITY));
   return [...new Set(repeated.map((f) => f.key))];
 }
 
-/** The distinct FAIL verdict bodies, newest first. */
-function failVerdictsNewestFirst(artifacts: readonly VerdictArtifact[]): string[] {
-  const fails = artifacts
+/** FAIL artifacts with their review identity, newest first. */
+function failVerdictsNewestFirst(artifacts: readonly VerdictArtifact[]): VerdictArtifact[] {
+  return artifacts
     .filter((a) => a.body && isFailVerdict(a.body) && Number.isFinite(Date.parse(a.at)))
     .sort((a, b) => Date.parse(b.at) - Date.parse(a.at))
-    .map((a) => a.body!.trim());
-  return [...new Set(fails)];
+    .map((a) => ({ ...a, body: a.body!.trim() }));
 }
 
 /** The newest FAIL verdict's body, or null when the pull request has none. */
 export function newestFailVerdict(artifacts: readonly VerdictArtifact[]): string | null {
-  return failVerdictsNewestFirst(artifacts)[0] ?? null;
+  return failVerdictsNewestFirst(artifacts)[0]?.body ?? null;
 }
 
 // Branch invariants: findings about the branch, not about any source.
