@@ -32,4 +32,34 @@ class Tests(unittest.TestCase):
         with patch.object(module.urllib.request,'urlopen',side_effect=AssertionError('No HTTP request allowed')):
             self.assertFalse(module.credential_probe({'GH_TOKEN':'first','GITHUB_TOKEN':'second'},'salt','org/core')['ok'])
 
+class CredentialPollingTests(unittest.TestCase):
+    def adapter(self):
+        return module.NativeAdapter({'stateDirectory':tempfile.mkdtemp(),'operator':'legacy-wrapper','platform':'mac','projects':{}})
+    def test_unchanged_credential_checks_are_bounded_and_expire(self):
+        adapter=self.adapter()
+        with patch.object(module.time,'monotonic',side_effect=[0,60,299,300]),patch.object(adapter,'read_expected',side_effect=[{'ok':True,'credential':'first'},{'ok':True,'credential':'rotated'}]) as read:
+            self.assertEqual(adapter.expected('org/core')['credential'],'first')
+            self.assertEqual(adapter.expected('org/core')['credential'],'first')
+            self.assertEqual(adapter.expected('org/core')['credential'],'first')
+            self.assertEqual(adapter.expected('org/core')['credential'],'rotated')
+        self.assertEqual(read.call_count,2)
+    def test_failed_lookup_waits_then_retries(self):
+        adapter=self.adapter()
+        with patch.object(module.time,'monotonic',side_effect=[0,60,300]),patch.object(adapter,'read_expected',side_effect=[RuntimeError('rate limited'),{'ok':True}]) as read:
+            with self.assertRaises(RuntimeError):adapter.expected('org/core')
+            with self.assertRaises(RuntimeError):adapter.expected('org/core')
+            self.assertTrue(adapter.expected('org/core')['ok'])
+        self.assertEqual(read.call_count,2)
+    def test_operation_preflight_rechecks_even_with_cached_credential(self):
+        adapter=self.adapter();adapter.config['projects']={'org/core':{'agents':'/configured/agents'}}
+        with patch.object(adapter,'read_expected',return_value={'ok':True,'credential':'first'}) as read,patch.object(module,'execute',side_effect=['','','main']):
+            adapter.expected('org/core')
+            self.assertTrue(adapter.preflight('org/core',{'credential':'first'}))
+        self.assertEqual(read.call_count,2)
+    def test_configured_control_command_avoids_reloading_operator_credentials(self):
+        adapter=self.adapter();adapter.config['operatorCommand']=['node','fleet-bin'];adapter.config['operatorConfig']='/configured/operator.json'
+        with patch.object(module,'execute',return_value='{}') as execute:
+            adapter.status()
+        self.assertEqual(execute.call_args.args[0],['node','fleet-bin','status','/configured/operator.json'])
+
 if __name__=='__main__':unittest.main()
