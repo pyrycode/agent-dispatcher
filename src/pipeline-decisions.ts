@@ -1960,8 +1960,9 @@ export function isMergeConflictError(stderr: string | null | undefined): boolean
  * Returns true to skip (don't dispatch this agent on this ticket).
  * Returns false otherwise (proceed with dispatch).
  *
- * Per-agent labels: OTHER agents' labels do NOT cause a skip — only
- * labels scoped to the agent currently being considered.
+ * Ordinary stage labels only block their own agent. Any pending rework
+ * blocks every agent until reconciliation moves the card and strips the
+ * request. Selection and the fresh-label launch check both use this gate.
  *
  * Global-block labels (`GLOBAL_BLOCK_LABELS`) skip ALL agents until a
  * human strips them.
@@ -1981,6 +1982,10 @@ export function shouldSkipDispatch(
 ): boolean {
   if (labels.some((l) => GLOBAL_BLOCK_LABELS.has(l))) return true;
   if (rootLabels?.includes(FAMILY_BREAKER_LABEL)) return true;
+  // Reconciliation may await managed admission after restart. A pending
+  // repair must reach its target column and lose its trigger before any
+  // stage launches, including the fresh-label check immediately pre-launch.
+  if (labels.some((l) => l.startsWith("needs-rework:"))) return true;
   return PIPELINE_LABEL_PREFIXES.some((p) => labels.includes(p + agentName));
 }
 
