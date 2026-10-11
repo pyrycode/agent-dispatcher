@@ -3,7 +3,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { RecoveryFacts, type PauseRecord, type EvidenceRecord, type CoordinationRecord } from "./recovery-facts.js";
-import { RecoveryLedger, validateObservations, type RecoveryObservation, type RecoveryDecision, type RecoveryIncident } from "./fleet-recovery.js";
+import { RecoveryLedger, validateObservations, IDLE_RECOVERY_REASONS, type RecoveryObservation, type RecoveryDecision, type RecoveryIncident } from "./fleet-recovery.js";
 import { OperationReports } from './operation-reports.js';
 import type { AgentRunner } from './agent-runner.js';
 
@@ -32,7 +32,7 @@ export interface StartRequest {
 }
 export interface Claim { ticket: string; machine: string; generation: string; created: number }
 export interface FleetRun extends StartRequest { generation: string; created: number; runnerPolicy?: RunnerPolicy }
-export interface FleetSnapshot { claims: Claim[]; runs: FleetRun[]; runnerPolicy?: RunnerPolicy }
+export interface FleetSnapshot { claims: Claim[]; runs: FleetRun[]; runnerPolicy?: RunnerPolicy; idleRecoveryTickets?: string[]; releasedAssessmentClaims?: Claim[] }
 export type StartResult = { ok: true; generation: string } | {
   ok: false; reason: "foreign-claim" | "running" | "capacity" | "locked" | "finished";
 };
@@ -88,6 +88,7 @@ export class FleetStore {
     `);
     this.recovery = new RecoveryLedger(this.db);
     this.facts = new RecoveryFacts(this.db);
+    this.db.exec("CREATE TABLE IF NOT EXISTS fleet_assessment_releases (ticket TEXT NOT NULL, machine TEXT NOT NULL, generation TEXT NOT NULL, created INTEGER NOT NULL, PRIMARY KEY(ticket,generation)) STRICT");
     this.operations = new OperationReports(this.db, Object.keys(limits));
   }
   close(): void { this.db.close(); }
@@ -253,6 +254,18 @@ export class FleetStore {
             AND (finished IS NULL OR outcome IS NULL OR outcome!='unused'))`)
           .run(run.ticket, run.generation, run.ticket, run.generation);
       }
+      // A completed read-only check that says wait owns no delivery work.
+      // Preserve ownership if this generation has any normal or uncertain run.
+      if (completed && request.role === "recovery" && this.db.prepare(`SELECT 1 FROM fleet_recovery
+        WHERE run_id=? AND state='complete' AND json_extract(decision,'$.action')='wait'`).get(id)) {
+        const released = this.db.prepare(`DELETE FROM fleet_claims WHERE ticket=? AND generation=?
+          AND NOT EXISTS (SELECT 1 FROM fleet_runs WHERE ticket=? AND generation=?
+            AND (finished IS NULL OR outcome IS NULL OR outcome NOT IN ('completed','unused')
+              OR (json_extract(request,'$.role')!='recovery' AND outcome!='unused')))`)
+          .run(run.ticket, run.generation, run.ticket, run.generation);
+        if (released.changes) this.db.prepare("INSERT OR IGNORE INTO fleet_assessment_releases VALUES (?,?,?,?)")
+          .run(run.ticket, run.machine, run.generation, Date.now());
+      }
       // Shared maintenance jobs have no long-lived ticket owner.
       if (String(run.ticket).includes("#@")) {
         this.db.prepare("DELETE FROM fleet_claims WHERE ticket=? AND generation=? AND NOT EXISTS (SELECT 1 FROM fleet_runs WHERE ticket=? AND finished IS NULL)")
@@ -281,8 +294,13 @@ export class FleetStore {
 
   snapshot(): FleetSnapshot {
     const runnerPolicy = this.runnerPolicy();
+    const idleRecoveryTickets = this.db.prepare("SELECT ticket FROM fleet_recovery WHERE present=1 AND state='queued' AND reason IN (?,?)")
+      .all(...IDLE_RECOVERY_REASONS).map(r => String(r.ticket));
+    const releasedAssessmentClaims = this.db.prepare("SELECT * FROM fleet_assessment_releases").all() as unknown as Claim[];
     return {
       ...(runnerPolicy ? { runnerPolicy } : {}),
+      ...(idleRecoveryTickets.length ? { idleRecoveryTickets } : {}),
+      ...(releasedAssessmentClaims.length ? { releasedAssessmentClaims } : {}),
       claims: this.db.prepare("SELECT * FROM fleet_claims ORDER BY created,ticket").all() as unknown as Claim[],
       runs: this.db.prepare("SELECT request,generation,created FROM fleet_runs WHERE finished IS NULL ORDER BY created,id").all()
         .map(row => ({ ...JSON.parse(String(row.request)), generation: String(row.generation), created: Number(row.created) })),

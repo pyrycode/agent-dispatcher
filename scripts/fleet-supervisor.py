@@ -126,7 +126,8 @@ class Supervisor:
                     return state
                 after = self.adapter.status()
                 current = real_claims(after)
-                if any(current.get(ticket) != owner for ticket, owner in state['claims'].items()):
+                releases = {(c['ticket'], c['machine'], c['generation']) for c in after.get('releasedAssessmentClaims', [])}
+                if any(current.get(ticket) != owner and (ticket, *owner) not in releases for ticket, owner in state['claims'].items()):
                     raise RuntimeError('Existing ticket ownership changed. Inspect the retained comparison.')
                 if policy(after) != state['policy']:
                     raise RuntimeError('Operator drain policy changed during verification.')

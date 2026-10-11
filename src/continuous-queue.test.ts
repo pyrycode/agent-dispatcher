@@ -13,6 +13,28 @@ const offer = (project: string, issue: number, role = 'recovery'): WorkOffer => 
 const url = (s: any) => `http://127.0.0.1:${s.address().port}`;
 const close = (s: any) => new Promise<void>(r => s.close(r));
 
+for (const kind of ['dependency', 'inbox'] as const) {
+  test(`central ${kind} assessment yields to ready work without new offer metadata`, async t => {
+    const store = new FleetStore(':memory:', { hp: { heavyLimit: 1, combinedLimit: 2 } });
+    const fleet = await serveFleet(store, { hp: 'machine' }, 'admin', 0);
+    t.after(async () => { await close(fleet); store.close(); });
+    const client = new FleetClient(url(fleet), 'machine');
+    const check = offer(desktop, 1927), ready = { ...offer(mobile, 2009, 'builder'), resource: 'medium' as const };
+    // Retain an older claim from a previous blocker assessment.
+    const prior = { ...check, id: 'previous-check', machine: 'hp', session: 's' };
+    store.start(prior); store.finish('hp', 's', prior.id);
+    store.recoveryReport('hp', desktop, [{ ticket: check.ticket, status: kind === 'inbox' ? 'Inbox' : 'Backlog',
+      blocked: kind === 'dependency', labels: [] }]);
+    const manager = new MachineManager({ machine: 'hp', projects: [desktop, mobile], heavyLimit: 1, combinedLimit: 2, ticketLimit: 1 }, client);
+    manager.offer(desktop, 'd', [check]); manager.offer(mobile, 'm', [ready]);
+    await manager.tick();
+    assert.deepEqual(store.snapshot().runs.map(r => r.ticket), [ready.ticket]);
+    store.finish('hp', 'm', store.snapshot().runs[0].id);
+    await manager.tick();
+    assert.deepEqual(store.snapshot().runs.map(r => r.ticket), [check.ticket]);
+  });
+}
+
 test('retiring one Mobile offer keeps 2009 visible ahead of Desktop 1927', async t => {
   const store = new FleetStore(':memory:', { hp: { heavyLimit: 1, combinedLimit: 1 } });
   const fleet = await serveFleet(store, { hp: 'machine' }, 'admin', 0);

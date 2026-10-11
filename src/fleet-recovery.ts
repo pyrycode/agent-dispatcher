@@ -20,6 +20,9 @@ export interface RecoveryIncident {
 }
 
 export const RECOVERY_RECHECK_MS = 30 * 60_000;
+export const RECOVERY_DEPENDENCY_REASON = "Dependency evidence and coordination reassessment";
+export const RECOVERY_INBOX_REASON = "Inbox readiness reassessment";
+export const IDLE_RECOVERY_REASONS = [RECOVERY_DEPENDENCY_REASON, RECOVERY_INBOX_REASON];
 export const RECOVERY_RETURNED_INBOX = "orchestrator:returned-inbox";
 export const RECOVERY_REPAIRS_PER_TICKET = 3;
 export const RECOVERY_STALLED_RUN_MS = 3 * 3600000;
@@ -58,13 +61,14 @@ export function recoveryTrigger(o: RecoveryObservation): { reason: string; manua
   if (o.labels.some(l => l.startsWith("health-hold:"))) return null;
   const errors = o.labels.filter(l => l.startsWith("error:") && l !== "error:family-breaker");
   if (errors.length) return { reason: errors.sort().join(", "), manual: false };
-  if (o.blocked) return { reason: "Dependency evidence and coordination reassessment", manual: false };
+  if (o.blocked) return { reason: RECOVERY_DEPENDENCY_REASON, manual: false };
   if (o.labels.some(l => l.startsWith("error-retry-count:"))) return null;
   // The assigned repair already addresses these retained historical counts.
   // A new stage error still triggers diagnosis above.
   if (o.labels.includes("orchestrator:fixing")) return null;
   if (o.labels.some(l => /^rework-count:\d+$/.test(l) && Number(l.split(":")[1]) >= 2)) return { reason: "Repeated review rework", manual: false };
   if (o.status === "Inbox" && o.labels.some(l => l === RECOVERY_RETURNED_INBOX || l === "needs-real-claude" || l === "done:refiner")) return { reason: "Pipeline evidence or refinement is needed in Inbox", manual: false };
+  if (o.status === "Inbox") return { reason: RECOVERY_INBOX_REASON, manual: false };
   return null;
 }
 export function validateRecoveryDecision(value: unknown): RecoveryDecision {
@@ -155,7 +159,8 @@ export class RecoveryLedger {
       }
       const legacyLimit = old?.state === "escalated" && ["Explicit operator hold", "Fleet recovery assessment daily limit reached",
         "Automatic repair budget exhausted: two fleet repairs and one per ticket per day"].includes(String(old.reason));
-      const waited = !o.blocked && old?.state === "complete" && old.decision && JSON.parse(String(old.decision)).action === "wait"
+      const waited = !o.blocked && trigger && !IDLE_RECOVERY_REASONS.includes(trigger.reason)
+        && old?.state === "complete" && old.decision && JSON.parse(String(old.decision)).action === "wait"
         && this.now() - Number(old.updated) >= RECOVERY_RECHECK_MS;
       const workflow = recoveryFingerprint({ ...o, evidenceRevision: undefined, artifactRevision: undefined, pause: undefined });
       const assessedWorkflow = this.db.prepare("SELECT fingerprint FROM fleet_recovery_workflow WHERE ticket=?").get(o.ticket);

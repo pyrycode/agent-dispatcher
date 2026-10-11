@@ -59,6 +59,20 @@ class Adapter:
 class Tests(unittest.TestCase):
     def setUp(self):self.directory=Path(tempfile.mkdtemp());self.adapter=Adapter();self.worker=module.Supervisor(self.directory,self.adapter,lambda:1000)
     def receipt(self):return self.directory/'org_core.json'
+    def test_confirmed_assessment_release_is_not_lost_delivery_work(self):
+        self.worker.tick(PROJECT,'new')
+        self.adapter.current.update(stopped=True,childrenStopped=True)
+        self.adapter.state['claims']=[]
+        self.adapter.state['releasedAssessmentClaims']=[{'ticket':PROJECT+'#1','machine':'mac','generation':'owner'}]
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'complete')
+    def test_release_proof_must_match_the_saved_owner_and_generation(self):
+        for machine,generation in [('other','owner'),('mac','other')]:
+            self.setUp()
+            self.worker.tick(PROJECT,'new')
+            self.adapter.current.update(stopped=True,childrenStopped=True)
+            self.adapter.state['claims']=[]
+            self.adapter.state['releasedAssessmentClaims']=[{'ticket':PROJECT+'#1','machine':machine,'generation':generation}]
+            self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'attention')
     def test_one_signal_children_and_ownership(self):
         self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'draining')
         self.worker=module.Supervisor(self.directory,self.adapter,lambda:1100)
