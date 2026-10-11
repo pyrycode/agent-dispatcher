@@ -35,21 +35,36 @@ class Tests(unittest.TestCase):
 class CredentialPollingTests(unittest.TestCase):
     def adapter(self):
         return module.NativeAdapter({'stateDirectory':tempfile.mkdtemp(),'operator':'legacy-wrapper','platform':'mac','projects':{}})
-    def test_unchanged_credential_checks_are_bounded_and_expire(self):
+    def test_successful_lookup_is_reused_after_a_day_until_explicit_refresh(self):
         adapter=self.adapter()
-        with patch.object(module.time,'monotonic',side_effect=[0,60,299,300]),patch.object(adapter,'read_expected',side_effect=[{'ok':True,'credential':'first'},{'ok':True,'credential':'rotated'}]) as read:
+        with patch.object(module.time,'monotonic',side_effect=[0,300,86401,86402]),patch.object(adapter,'read_expected',side_effect=[{'ok':True,'credential':'first'},{'ok':True,'credential':'rotated'}]) as read:
             self.assertEqual(adapter.expected('org/core')['credential'],'first')
             self.assertEqual(adapter.expected('org/core')['credential'],'first')
             self.assertEqual(adapter.expected('org/core')['credential'],'first')
+            adapter.refresh_credentials()
             self.assertEqual(adapter.expected('org/core')['credential'],'rotated')
         self.assertEqual(read.call_count,2)
     def test_failed_lookup_waits_then_retries(self):
         adapter=self.adapter()
-        with patch.object(module.time,'monotonic',side_effect=[0,60,300]),patch.object(adapter,'read_expected',side_effect=[RuntimeError('rate limited'),{'ok':True}]) as read:
+        with patch.object(module.time,'monotonic',side_effect=[0,300,3599,3600]),patch.object(adapter,'read_expected',side_effect=[RuntimeError('rate limited'),{'ok':True}]) as read:
             with self.assertRaises(RuntimeError):adapter.expected('org/core')
             with self.assertRaises(RuntimeError):adapter.expected('org/core')
+            # An automatic preflight must not bypass failure backoff.
+            with self.assertRaises(RuntimeError):adapter.expected('org/core',refresh=True)
             self.assertTrue(adapter.expected('org/core')['ok'])
         self.assertEqual(read.call_count,2)
+    def test_rejected_authentication_waits_before_retry(self):
+        adapter=self.adapter()
+        with patch.object(module.time,'monotonic',side_effect=[0,300,3600]),patch.object(adapter,'read_expected',side_effect=[{'ok':False},{'ok':True}]) as read:
+            self.assertFalse(adapter.expected('org/core')['ok'])
+            self.assertFalse(adapter.expected('org/core',refresh=True)['ok'])
+            self.assertTrue(adapter.expected('org/core')['ok'])
+        self.assertEqual(read.call_count,2)
+    def test_mac_probe_loads_only_github_credential(self):
+        adapter=self.adapter();adapter.config.update(python='python3',projects={'org/core':{'agents':'/configured/agents','access':'dedicated-access','githubOnlyProbe':True}})
+        with patch.object(module,'execute',return_value='{"ok":true}') as run:
+            self.assertTrue(adapter.read_expected('org/core')['ok'])
+        self.assertIn('--only-vars=GITHUB_TOKEN',run.call_args.args[0])
     def test_operation_preflight_rechecks_even_with_cached_credential(self):
         adapter=self.adapter();adapter.config['projects']={'org/core':{'agents':'/configured/agents'}}
         with patch.object(adapter,'read_expected',return_value={'ok':True,'credential':'first'}) as read,patch.object(module,'execute',side_effect=['','','main']):
