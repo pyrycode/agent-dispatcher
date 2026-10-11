@@ -15,6 +15,8 @@ export interface RecoveryIncident {
 
 export const RECOVERY_RECHECK_MS = 30 * 60_000;
 export const RECOVERY_REPAIRS_PER_TICKET = 3;
+export const RECOVERY_STALLED_RUN_MS = 3 * 3600000;
+const RETAINED_RUN_REASON = "Retained reservation without workflow progress for three hours; inspect local child processes before intervening";
 export function hasOperatorHold(labels: readonly string[]): boolean {
   return labels.some(l => l.startsWith("needs-human:") && l !== "needs-human:sizing");
 }
@@ -79,15 +81,35 @@ export class RecoveryLedger {
       const owner = fleet.claims.find(c => c.ticket === o.ticket);
       if (owner && owner.machine !== machine) continue;
       seen.add(o.ticket);
-      const old = this.db.prepare("SELECT * FROM fleet_recovery WHERE ticket=? AND present=1").get(o.ticket);
+      let old = this.db.prepare("SELECT * FROM fleet_recovery WHERE ticket=? AND present=1").get(o.ticket);
       const fingerprint = recoveryFingerprint(o);
       let progress = this.db.prepare("SELECT * FROM fleet_recovery_progress WHERE ticket=?").get(o.ticket);
       if (!progress || progress.fingerprint !== fingerprint) {
         this.db.prepare("INSERT INTO fleet_recovery_progress VALUES (?,?,?) ON CONFLICT(ticket) DO UPDATE SET fingerprint=excluded.fingerprint,since=excluded.since").run(o.ticket, fingerprint, this.now());
         progress = { since: this.now() };
       }
-      // A run, including an uncertain crashed run, keeps its incident and reservation.
-      if (active.has(o.ticket)) continue;
+      // A retained run never authorises a second worker. It must not also hide
+      // a stalled handback to Backlog or an uncertain crashed worker forever.
+      const run = fleet.runs.find(r => r.ticket === o.ticket);
+      const retainedAlert = old?.reason === RETAINED_RUN_REASON;
+      // A new run or workflow progress also confirms the diagnosed stall ended.
+      // Do not turn a resolved reservation diagnostic into an operator hold.
+      if (old && retainedAlert && (old.run_id !== run?.id || old.fingerprint !== fingerprint)) {
+        this.db.prepare("UPDATE fleet_recovery SET present=0,state='resolved',updated=? WHERE id=?").run(this.now(), old.id);
+        old = undefined;
+      }
+      if (run) {
+        if (this.now() - Math.max(Number(progress.since), run.created) >= RECOVERY_STALLED_RUN_MS
+          && !["assessing", "applying"].includes(String(old?.state))
+          && (!old || old.fingerprint !== fingerprint || ["queued", "complete", "resolved"].includes(String(old.state)))) {
+          if (old) this.db.prepare("UPDATE fleet_recovery SET present=0 WHERE id=?").run(old.id);
+          const id = randomUUID();
+          this.db.prepare("INSERT INTO fleet_recovery VALUES (?,?,?,?,?,?,?,?,NULL,1)")
+            .run(id, o.ticket, fingerprint, RETAINED_RUN_REASON, "escalated", this.now(), this.now(), run.id);
+          newAlerts.add(id);
+        }
+        continue;
+      }
       if (old && ["assessing", "applying"].includes(String(old.state))) {
         this.db.prepare("UPDATE fleet_recovery SET state='escalated', reason=?, updated=? WHERE id=?")
           .run("Recovery ended without a confirmed result; inspect before retrying", this.now(), old.id);
@@ -96,7 +118,8 @@ export class RecoveryLedger {
       }
       let trigger = recoveryTrigger(o);
       const wip = o.labels.some(l => l.startsWith("wip:"));
-      if ((!trigger || wip) && !o.blocked && o.status.startsWith("In ") && this.now() - Number(progress.since) >= (wip ? 3 : 24) * 3600000) {
+      const workflowColumn = o.status.startsWith("In ") || o.status === "Backlog" && (wip || !!owner);
+      if ((!trigger || wip) && !o.blocked && workflowColumn && this.now() - Number(progress.since) >= (wip ? 3 : 24) * 3600000) {
         trigger = { reason: wip ? "Running label without a reservation; verify the worker stopped" : "No workflow progress for 24 hours", manual: true };
       }
       if (old && trigger?.manual && old.state === "queued" && old.fingerprint === fingerprint) {
