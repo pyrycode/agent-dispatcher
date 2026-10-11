@@ -112,3 +112,36 @@ test('a mismatched completion observation cannot free a reservation or create an
   assert.throws(() => store.finish('hp', 's', job.id, true, false, { ticket: `${mobile}#2055`, status: 'In Build', blocked: false, labels: ['error:builder'] }), /mismatch/);
   assert.deepEqual(store.snapshot(), before); assert.deepEqual(store.recovery.list(), []);
 });
+
+for (const outcome of ['pipeline-pause', 'operator-hold', 'healthy'] as const) {
+  test(`completion consults central recovery facts for ${outcome}`, async t => {
+    const store = new FleetStore(':memory:', { hp: { heavyLimit: 1, combinedLimit: 1 } });
+    const fleet = await serveFleet(store, { hp: 'machine' }, 'admin', 0);
+    const client = new FleetClient(url(fleet), 'machine');
+    const manager = new MachineManager({ machine: 'hp', projects: [desktop, mobile], heavyLimit: 1, combinedLimit: 1 }, client);
+    const server = await serveManager(manager, { [mobile]: 'mobile', [desktop]: 'desktop' }, 'operator', 0);
+    const worker = new ManagedDispatch(mobile, { PYRY_MANAGER_URL: url(server), PYRY_MANAGER_TOKEN: 'mobile' });
+    t.after(async () => { await worker.stop(); await close(server); await close(fleet); store.close(); });
+    await worker.sync(); worker.beginCycle(); const build = worker.offer(2009, 'builder', 'heavy'); await worker.endCycle(); await manager.tick(); await worker.sync();
+    manager.offer(desktop, 'd', [offer(desktop, 1927)]);
+    const call = client.call.bind(client);
+    let admitted: string | undefined;
+    client.call = async <T>(path: string, body?: unknown): Promise<T> => {
+      const result = await call<T>(path, body);
+      if (path === '/finish' && (body as any)?.observation) {
+        await manager.tick();
+        admitted = store.snapshot().runs[0]?.ticket;
+      }
+      return result;
+    };
+    await worker.run(build, async () => {
+      if (outcome !== 'healthy') store.facts.pause({ ticket: `${mobile}#2009`, origin: outcome === 'pipeline-pause' ? 'pipeline' : 'operator',
+        actor: 'builder', reason: 'Prerequisite needs assessment', missing: 'Read completion evidence', resumeOn: 'Prerequisite verified', resumeStatus: 'In Build', revision: 'r' });
+    }, {
+      // The ticket read does not include the separately recorded pause origin.
+      observe: async () => ({ issueNumber: 2009, status: outcome === 'healthy' ? 'In Build' : 'Halted', labels: [], blockedBy: [] } as unknown as ProjectItem),
+      onRecovery: () => {},
+    });
+    assert.equal(admitted, outcome === 'pipeline-pause' ? `${mobile}#2009` : `${desktop}#1927`);
+  });
+}
