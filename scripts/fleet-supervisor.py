@@ -8,6 +8,7 @@ import importlib.util
 import json
 import os
 import secrets
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -156,9 +157,18 @@ def main():
         module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
         adapter = module.NativeAdapter(config)
         supervisor = Supervisor(state, adapter)
+        # SIGHUP requests a fresh credential lookup, without stopping dispatchers.
+        refresh_requested = False
+        def request_refresh(signum, frame):
+            nonlocal refresh_requested
+            refresh_requested = True
+        signal.signal(signal.SIGHUP, request_refresh)
         while True:
             results = []
             try:
+                if refresh_requested:
+                    adapter.refresh_credentials()
+                    refresh_requested = False
                 desired = adapter.desired()
                 for project in config['projects']:
                     try:

@@ -1,12 +1,47 @@
 import importlib.util
 import json
+import os
+import signal
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 spec=importlib.util.spec_from_file_location('supervisor',Path(__file__).with_name('fleet-supervisor.py'))
 module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
 PROJECT='org/core'
+
+class CredentialRefreshSignalTests(unittest.TestCase):
+    def test_signal_refreshes_without_restarting_supervisor(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder)
+            (root/'fleet-supervisor.py').write_bytes(Path(__file__).with_name('fleet-supervisor.py').read_bytes())
+            (root/'fleet-native.py').write_text('''class NativeAdapter:
+    def __init__(self, config): self.refreshes=0
+    def desired(self): return {}
+    def refresh_credentials(self): self.refreshes+=1
+    def attention(self): return {'refreshes': self.refreshes}
+    def publish_attention(self): pass
+''')
+            report=root/'report.json'
+            config=root/'config.json'
+            config.write_text(json.dumps({'stateDirectory':str(root/'state'),'reportFile':str(report),'projects':{},'intervalSeconds':0.02}))
+            config.chmod(0o600)
+            process=subprocess.Popen([sys.executable,str(root/'fleet-supervisor.py'),str(config)],stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
+            try:
+                deadline=time.monotonic()+5
+                while not report.exists() and time.monotonic()<deadline: time.sleep(0.02)
+                self.assertTrue(report.exists())
+                process.send_signal(signal.SIGHUP)
+                while time.monotonic()<deadline:
+                    if json.loads(report.read_text()).get('refreshes')==1: break
+                    time.sleep(0.02)
+                self.assertEqual(json.loads(report.read_text())['refreshes'],1)
+                self.assertIsNone(process.poll())
+            finally:
+                process.terminate();process.wait(timeout=5);process.stderr.close()
 
 class Adapter:
     def __init__(self):

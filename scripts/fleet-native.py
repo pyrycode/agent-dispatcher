@@ -83,10 +83,14 @@ class NativeAdapter:
     def expected(self, project, refresh=False):
         now = time.monotonic()
         cached = self.expected_cache.get(project)
-        if not refresh and cached and now - cached[0] < 300:
-            if isinstance(cached[1], Exception):
-                raise RuntimeError('Configured credential lookup is waiting before retrying')
-            return cached[1]
+        if cached:
+            failed = isinstance(cached[1], Exception) or not cached[1].get('ok')
+            if failed and now - cached[0] < self.config.get('credentialRetrySeconds', 3600):
+                if isinstance(cached[1], Exception):
+                    raise RuntimeError('Configured credential lookup is waiting before retrying')
+                return cached[1]
+            if not failed and not refresh:
+                return cached[1]
         try:
             value = self.read_expected(project)
         except Exception:
@@ -95,11 +99,17 @@ class NativeAdapter:
         self.expected_cache[project] = (now, value)
         return value
 
+    def refresh_credentials(self):
+        """An operator can request a new lookup after changing a credential."""
+        self.expected_cache.clear()
+
     def read_expected(self, project):
         cfg = self.config['projects'][project]
         if self.config['platform'] == 'mac':
-            child = [cfg['access'], 'op', 'run', '--env-file=' + cfg['agents'] + '/.env', '--',
-                     self.config['python'], str(Path(__file__).resolve()), 'probe']
+            child = [cfg['access'], 'op', 'run', '--env-file=' + cfg['agents'] + '/.env']
+            if cfg.get('githubOnlyProbe'):
+                child.append('--only-vars=GITHUB_TOKEN')
+            child += ['--', self.config['python'], str(Path(__file__).resolve()), 'probe']
             env = {k: v for k, v in os.environ.items() if k in SAFE_ENV}
             env['PYRY_AUTOMATION_ACCESS'] = cfg['access']
             return json.loads(execute(child, env=env, input=json.dumps({'salt': self.salt, 'project': project})))
