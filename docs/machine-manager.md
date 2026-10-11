@@ -152,11 +152,11 @@ Backlog waits remain quiet. A running label stranded in Backlog can also alert.
 The owning computer offers an assessment as the `recovery` role. It uses normal
 admission and a heavy reservation. Only one assessment runs across the fleet at
 a time. Existing ownership, both capacity limits, project drains and full drains
-apply. Recovery assessments and their repair pipeline are scheduled before ordinary work across all local projects. Already reserved or running jobs are not interrupted. An unreachable owner or uncertain reservation is never released by recovery.
+apply. Runnable owned recovery and repair work precedes owned ordinary work. Both owned groups precede unclaimed recovery and ordinary work. A job that cannot fit the available capacity does not block a fitting job. Already reserved or running jobs are not interrupted. An unreachable owner or uncertain reservation is never released by recovery.
 An unclaimed ticket can be assessed only after normal admission claims it.
 
-The assessment uses the project's configured runner, with an optional `recovery`
-role override in its existing runner file. Codex inherits the configured model.
+The assessment follows the central runner choice when configured. Otherwise, it
+uses the project's configured runner and optional `recovery` role override. Codex inherits the configured model.
 Claude uses Sonnet. Both investigate with extra-high effort, independently of
 lower ordinary role settings. It uses the existing restricted source
 reader, with a thirty-minute limit and eighty Claude turns. The prompt contains the
