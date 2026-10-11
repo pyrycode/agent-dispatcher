@@ -8,6 +8,7 @@ export interface RecoveryObservation {
   evidenceRevision?: string;
   artifactRevision?: string;
   pause?: PauseRecord;
+  familyHold?: string;
 }
 export type RecoveryAction = "wait" | "retry" | "rework" | "resume" | "refine" | "unblock" | "propose-close" | "escalate";
 export interface RecoveryDecision { action: RecoveryAction; reason: string; blocker?: string }
@@ -36,17 +37,19 @@ export function validateObservations(project: string, observations: RecoveryObse
       || !Array.isArray(o.labels) || o.labels.length > 200 || o.labels.some(l => typeof l !== "string" || l.length > 200)) throw new Error("Invalid recovery observation");
     if (o.artifactRevision !== undefined && !/^[a-f0-9]{64}$/.test(o.artifactRevision)) throw new Error("Invalid artifact revision");
     if (o.evidenceRevision !== undefined && !/^[a-f0-9]{64}$/.test(o.evidenceRevision)) throw new Error("Invalid evidence revision");
+    if (o.familyHold !== undefined && (typeof o.familyHold !== "string" || !o.familyHold.startsWith(`${project}#`) || !/^[1-9]\d*$/.test(o.familyHold.slice(project.length + 1)))) throw new Error("Invalid family hold");
     seen.add(o.ticket);
   }
 }
 export function recoveryFingerprint(o: RecoveryObservation): string {
   return createHash("sha256").update(JSON.stringify([o.status, o.blocked,
     o.labels.filter(l => l === RECOVERY_RETURNED_INBOX || /^(error:|needs-human:|rework-count:|done:|needs-rework:|needs-real-claude$)/.test(l)).sort(),
-    o.evidenceRevision ?? null, o.artifactRevision ?? null, o.pause ?? null])).digest("hex");
+    o.evidenceRevision ?? null, o.artifactRevision ?? null, o.pause ?? null, ...(o.familyHold ? [o.familyHold] : [])])).digest("hex");
 }
 export function recoveryTrigger(o: RecoveryObservation): { reason: string; manual: boolean } | null {
   if (o.status === "Done") return null;
   if (hasOperatorHold(o.labels) || o.status === "Halted" && o.pause?.origin === "operator") return { reason: "Explicit operator hold", manual: true };
+  if (o.familyHold) return { reason: `Family dispatch budget reached on ${o.familyHold}; deliberate operator budget decision required`, manual: true };
   if (o.status === "Halted") return o.pause?.origin === "pipeline"
     ? { reason: `Pipeline pause: ${o.pause.reason}`, manual: false }
     : { reason: "Pause origin unknown; record who paused this ticket and the reopening condition", manual: true };

@@ -8,7 +8,7 @@ import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { config } from "dotenv";
 import { githubPauseMs, freshGitHubRead } from "./github-transport.js";
-import { runRecoveryWork, recoveryHandoff, parseRecoveryDecision, RECOVERY_INSTRUCTIONS, RECOVERY_EFFORT, RECOVERY_MAX_TURNS, RECOVERY_TIMEOUT_MS, cleanRecoveryLabels } from "./recovery-work.js";
+import { runRecoveryWork, recoveryHandoff, parseRecoveryDecision, RECOVERY_INSTRUCTIONS, RECOVERY_EFFORT, RECOVERY_MAX_TURNS, RECOVERY_TIMEOUT_MS, cleanRecoveryLabels, withRecoveryFamilyHold } from "./recovery-work.js";
 import { verifyCoordination } from "./recovery-coordination.js";
 import { recoveryInventory, relatedTickets, relatedEvidence } from "./recovery-evidence.js";
 import { recoveryLogContext } from "./recovery-context.js";
@@ -9720,7 +9720,7 @@ export async function pollLoop(): Promise<void> {
     // its labels are already in hand.
     if (rootLabelsByIssue) {
       const offBoard = collectOffBoardFamilyRoots(
-        [...itemsByColumn.values()].flat(),
+        await rawClient.getOpenProjectItems(),
         rootLabelsByIssue,
       );
       for (const root of offBoard) {
@@ -9766,7 +9766,7 @@ export async function pollLoop(): Promise<void> {
     if (managed && recoveryEnabled && !drainMode && !envHeld) {
       if (Date.now() - recoveryCheckedAt >= 300_000) {
         // Reuses the board snapshot. No extra board poll and no model on a quiet cycle.
-        const recoveryItems = await client.getOpenProjectItems();
+        const recoveryItems = (await client.getOpenProjectItems()).map(i => withRecoveryFamilyHold(managed.project, i, rootLabelsByIssue));
         const evidenceIssues = new Set(recoveryItems.filter(i => !i.labels.some(l => l.startsWith("wip:"))).map(i => i.issueNumber));
         for (const i of recoveryItems) for (const ref of relatedTickets(managed.project, [i.body], [], [managed.project]))
           evidenceIssues.add(Number(ref.split("#")[1]));
@@ -9792,7 +9792,10 @@ export async function pollLoop(): Promise<void> {
                 recoveryClient.clearItemsCache();
                 return freshGitHubRead(async () => {
                   const current = (await recoveryClient.getOpenProjectItems()).find(i => i.issueNumber === issue);
-                  return current ? managed.hydrateRecovery(current) : undefined;
+                  if (!current) return undefined;
+                  const root = resolveFamilyRoot(current);
+                  const familyLabels = root === current.issueNumber ? current.labels : await recoveryClient.getIssueLabels(root);
+                  return managed.hydrateRecovery(withRecoveryFamilyHold(managed.project, current, new Map([[root, familyLabels]])));
                 });
               },
               begin: () => managed.recoveryStep<RecoveryIncident>("begin", incident.id),
