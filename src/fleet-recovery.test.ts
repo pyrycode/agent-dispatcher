@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { RecoveryLedger, recoveryFingerprint, recoveryTrigger, RECOVERY_RECHECK_MS, type RecoveryObservation, type RecoveryIncident } from "./fleet-recovery.js";
+import { RecoveryLedger, recoveryFingerprint, recoveryTrigger, RECOVERY_RECHECK_MS, RECOVERY_STALLED_RUN_MS, type RecoveryObservation, type RecoveryIncident } from "./fleet-recovery.js";
 import { FleetStore, type StartRequest } from "./fleet-store.js";
 import { FleetClient, JsonClient, serveFleet } from "./fleet-http.js";
 import { MachineManager, serveManager } from "./machine-manager.js";
@@ -108,6 +108,94 @@ test("stale labels produce one alert; manager heartbeat is not worker proof", as
   manager.offer(project, "session", []);
   now += 180001;
   assert.equal((await manager.status()).projects[0].health, "dispatcher-unreachable");
+  db.close();
+});
+
+test("a retained Backlog builder produces one durable diagnostic without releasing or duplicating work", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "retained-run-db-")), "fleet.sqlite");
+  const store = new FleetStore(path, limits);
+  let now = Date.now();
+  let db = new DatabaseSync(path);
+  let ledger = new RecoveryLedger(db, () => now);
+  store.start(request(1, { role: "builder" }));
+  const before = store.snapshot();
+  now = before.runs[0].created;
+  const backlog = { ...observation(1, []), status: "Backlog" };
+  assert.deepEqual(ledger.report("mac", project, [backlog], before), []);
+  now += RECOVERY_STALLED_RUN_MS - 1;
+  assert.deepEqual(ledger.report("mac", project, [backlog], before), []);
+  now++;
+  const [incident] = ledger.report("mac", project, [backlog], before);
+  assert.equal(incident.state, "escalated");
+  assert.equal(incident.runId, "run-1");
+  assert.match(incident.reason, /Retained reservation.*local child processes/);
+  assert.deepEqual(store.snapshot(), before);
+  assert.deepEqual(store.start(request(1, { id: "duplicate", role: "refiner" })), { ok: false, reason: "running" });
+  db.close(); db = new DatabaseSync(path); ledger = new RecoveryLedger(db, () => now);
+  assert.deepEqual(ledger.report("mac", project, [backlog], before), [], "restart must not repeat the alert");
+  assert.deepEqual(ledger.report("linux", project, [backlog], before), [], "a different computer must not diagnose the owner's ticket");
+  store.finish("mac", "session", "run-1");
+  ledger.report("mac", project, [backlog], store.snapshot());
+  assert.equal(ledger.incident(incident.id).state, "resolved");
+  assert.deepEqual(store.snapshot().claims, before.claims, "finishing the run preserves its ticket owner and generation");
+  assert.equal(store.start(request(1, { id: "refine", role: "refiner" })).ok, true);
+  db.close(); store.close();
+});
+
+test("stalled retained runs remain visible with errors, running labels or earlier completed assessments", () => {
+  for (const status of ["Backlog", "In Development"]) for (const labels of [[], ["wip:builder"], ["error:builder"]]) {
+    const db = new DatabaseSync(":memory:"); let now = 1000;
+    const ledger = new RecoveryLedger(db, () => now);
+    const stuck = { ...observation(1, labels), status };
+    const fleet = { claims: [], runs: [{ ...request(1, { role: "builder" }), generation: "generation", created: now }] };
+    if (labels.includes("error:builder")) {
+      const [assessment] = ledger.report("mac", project, [stuck], { claims: [], runs: [] });
+      ledger.begin(assessment.id, "assessment");
+      ledger.decide(assessment.id, "assessment", { action: "wait", reason: "Wait for the builder" });
+    }
+    ledger.report("mac", project, [stuck], fleet);
+    now += RECOVERY_STALLED_RUN_MS;
+    const [alert] = ledger.report("mac", project, [stuck], fleet);
+    assert.equal(alert.state, "escalated");
+    assert.deepEqual(ledger.report("mac", project, [stuck], fleet), []);
+    const resumed = ledger.report("mac", project, [stuck], { claims: [], runs: [] });
+    assert.equal(ledger.incident(alert.id).state, "resolved");
+    if (labels.includes("error:builder")) assert.equal(resumed[0].state, "queued", "a stopped run's diagnostic must not suppress ordinary error recovery");
+    db.close();
+  }
+});
+
+test("workflow progress and a newly admitted run restart the retained-reservation grace period", () => {
+  const db = new DatabaseSync(":memory:"); let now = 1000;
+  const ledger = new RecoveryLedger(db, () => now);
+  const run = { ...request(1, { role: "builder" }), generation: "generation", created: now };
+  const fleet = { claims: [], runs: [run] };
+  ledger.report("mac", project, [observation(1, [])], fleet);
+  now += RECOVERY_STALLED_RUN_MS - 1;
+  const changed = { ...observation(1, ["done:builder"]), status: "Backlog" };
+  assert.deepEqual(ledger.report("mac", project, [changed], fleet), []);
+  now += RECOVERY_STALLED_RUN_MS - 1;
+  assert.deepEqual(ledger.report("mac", project, [changed], fleet), []);
+  fleet.runs = [{ ...run, id: "new-run", created: now }];
+  now++;
+  assert.deepEqual(ledger.report("mac", project, [changed], fleet), []);
+  now += RECOVERY_STALLED_RUN_MS;
+  assert.equal(ledger.report("mac", project, [changed], fleet)[0].runId, "new-run");
+  db.close();
+});
+
+test("ordinary unclaimed Backlog waits stay quiet while stranded Backlog running labels alert", () => {
+  const db = new DatabaseSync(":memory:"); let now = 1000;
+  const ledger = new RecoveryLedger(db, () => now);
+  const empty = { claims: [], runs: [] };
+  const backlog = { ...observation(1, []), status: "Backlog" };
+  const stranded = { ...observation(2, ["wip:builder"]), status: "Backlog" };
+  ledger.report("mac", project, [backlog, stranded], empty);
+  now += 24 * 3600000;
+  const incidents = ledger.report("mac", project, [backlog, stranded], empty);
+  assert.equal(incidents.length, 1);
+  assert.equal(incidents[0].ticket, stranded.ticket);
+  assert.equal(incidents[0].state, "escalated");
   db.close();
 });
 

@@ -15,6 +15,8 @@ export interface RecoveryIncident {
 
 export const RECOVERY_RECHECK_MS = 30 * 60_000;
 export const RECOVERY_REPAIRS_PER_TICKET = 3;
+export const RECOVERY_STALLED_RUN_MS = 3 * 3600000;
+const RETAINED_RUN_REASON = "Retained reservation without workflow progress for three hours; inspect local child processes before intervening";
 export function hasOperatorHold(labels: readonly string[]): boolean {
   return labels.some(l => l.startsWith("needs-human:") && l !== "needs-human:sizing");
 }
@@ -86,8 +88,28 @@ export class RecoveryLedger {
         this.db.prepare("INSERT INTO fleet_recovery_progress VALUES (?,?,?) ON CONFLICT(ticket) DO UPDATE SET fingerprint=excluded.fingerprint,since=excluded.since").run(o.ticket, fingerprint, this.now());
         progress = { since: this.now() };
       }
-      // A run, including an uncertain crashed run, keeps its incident and reservation.
-      if (active.has(o.ticket)) continue;
+      // A retained run never authorises a second worker. It must not also hide
+      // a stalled handback to Backlog or an uncertain crashed worker forever.
+      const run = fleet.runs.find(r => r.ticket === o.ticket);
+      const retainedAlert = old?.reason === RETAINED_RUN_REASON;
+      if (run) {
+        if (this.now() - Math.max(Number(progress.since), run.created) >= RECOVERY_STALLED_RUN_MS
+          && !["assessing", "applying"].includes(String(old?.state))
+          && (!old || old.fingerprint !== fingerprint || ["queued", "complete", "resolved"].includes(String(old.state))
+            || retainedAlert && old.run_id !== run.id)) {
+          if (old) this.db.prepare("UPDATE fleet_recovery SET present=0 WHERE id=?").run(old.id);
+          const id = randomUUID();
+          this.db.prepare("INSERT INTO fleet_recovery VALUES (?,?,?,?,?,?,?,?,NULL,1)")
+            .run(id, o.ticket, fingerprint, RETAINED_RUN_REASON, "escalated", this.now(), this.now(), run.id);
+          newAlerts.add(id);
+        }
+        continue;
+      }
+      // The owner confirmed this exact run ended. Its diagnostic incident must
+      // not become an operator hold on the now-runnable ordinary pipeline.
+      if (retainedAlert) {
+        this.db.prepare("UPDATE fleet_recovery SET present=0,state='resolved',updated=? WHERE id=?").run(this.now(), old.id);
+      }
       if (old && ["assessing", "applying"].includes(String(old.state))) {
         this.db.prepare("UPDATE fleet_recovery SET state='escalated', reason=?, updated=? WHERE id=?")
           .run("Recovery ended without a confirmed result; inspect before retrying", this.now(), old.id);
@@ -96,7 +118,8 @@ export class RecoveryLedger {
       }
       let trigger = recoveryTrigger(o);
       const wip = o.labels.some(l => l.startsWith("wip:"));
-      if ((!trigger || wip) && !o.blocked && o.status.startsWith("In ") && this.now() - Number(progress.since) >= (wip ? 3 : 24) * 3600000) {
+      const workflowColumn = o.status.startsWith("In ") || o.status === "Backlog" && (wip || !!owner);
+      if ((!trigger || wip) && !o.blocked && workflowColumn && this.now() - Number(progress.since) >= (wip ? 3 : 24) * 3600000) {
         trigger = { reason: wip ? "Running label without a reservation; verify the worker stopped" : "No workflow progress for 24 hours", manual: true };
       }
       if (old && trigger?.manual && old.state === "queued" && old.fingerprint === fingerprint) {
@@ -110,7 +133,7 @@ export class RecoveryLedger {
         && this.now() - Number(old.updated) >= RECOVERY_RECHECK_MS;
       const recheck = (legacyLimit || waited) && trigger && !trigger.manual && !wip;
       if (old && (!trigger || old.fingerprint !== fingerprint || recheck)) this.db.prepare("UPDATE fleet_recovery SET present=0, updated=CASE WHEN state='queued' THEN ? ELSE updated END, state=CASE WHEN state='queued' THEN 'resolved' ELSE state END WHERE id=?").run(this.now(), old.id);
-      if (!trigger || old?.fingerprint === fingerprint && !recheck || (wip && !trigger.manual)) continue;
+      if (!trigger || old?.fingerprint === fingerprint && !recheck && !retainedAlert || (wip && !trigger.manual)) continue;
       const id = randomUUID();
       this.db.prepare("INSERT INTO fleet_recovery VALUES (?,?,?,?,?,?,?,NULL,NULL,1)").run(id, o.ticket, fingerprint, trigger.reason, trigger.manual ? "escalated" : "queued", this.now(), this.now());
       if (trigger.manual) newAlerts.add(id);

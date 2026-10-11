@@ -5,7 +5,7 @@ import { once } from "node:events";
 import { setTimeout as sleep } from "node:timers/promises";
 import { FleetStore } from "./fleet-store.js";
 import { FleetClient, serveFleet } from "./fleet-http.js";
-import { MachineManager, serveManager } from "./machine-manager.js";
+import { MachineManager, offerId, serveManager } from "./machine-manager.js";
 import { ManagedDispatch, trackManagedChild } from "./managed-dispatch.js";
 import type { Server } from "node:http";
 import type { ProjectItem } from "./types.js";
@@ -81,4 +81,67 @@ test("real manager grants cover workflow writes and remain occupied until the ch
   await run;
   assert.equal(store.snapshot().runs.filter(r => r.machine === "mac").length, 0);
   assert.equal(store.snapshot().claims.find(c => c.ticket === "org/core#1")?.machine, "mac");
+});
+
+test("a builder admission committed after its Backlog handback is cancelled before refinement starts", async t => {
+  const project = "org/core";
+  const store = new FleetStore(":memory:", { mac: { heavyLimit: 1, combinedLimit: 1 } });
+  store.start({ id: "original-builder", machine: "mac", session: "original-session", project,
+    ticket: `${project}#1905`, role: "builder", resource: "medium", locks: [] });
+  store.finish("mac", "original-session", "original-builder");
+  const originalClaim = store.snapshot().claims[0];
+  let admit!: () => void, started!: () => void;
+  const admission = new Promise<void>(resolve => { admit = resolve; });
+  const requested = new Promise<void>(resolve => { started = resolve; });
+  const manager = new MachineManager({ machine: "mac", heavyLimit: 1, combinedLimit: 1, projects: [project] }, {
+    snapshot: async () => store.snapshot(),
+    start: async request => { started(); await admission; return store.start(request); },
+    finish: async (session, id, completed, unused) => store.finish("mac", session, id, completed, unused),
+  });
+  const server = await serveManager(manager, { [project]: "project-test" }, "operator-test", 0);
+  const managed = new ManagedDispatch(project, { PYRY_MANAGER_URL: url(server), PYRY_MANAGER_TOKEN: "project-test" });
+  t.after(async () => { admit(); await managed.stop(); await close(server); store.close(); });
+  await managed.sync();
+  managed.beginCycle(); managed.offer(1905, "builder", "medium"); await managed.endCycle();
+  const tick = manager.tick(); await requested;
+  // The completed builder has returned the card to Backlog before its stale
+  // admission commits. The dispatcher never received or launched that grant.
+  managed.beginCycle(); const refiner = managed.offer(1905, "refiner", "light"); await managed.endCycle();
+  admit(); await tick;
+  assert.equal(store.snapshot().runs[0].role, "builder", "reproduce the late stale-stage grant");
+  await managed.sync();
+  assert.equal(store.snapshot().runs.length, 0, "the live session can prove this exact grant never launched");
+  assert.deepEqual(store.snapshot().claims, [originalClaim]);
+  await manager.tick(); await managed.sync();
+  assert.equal(managed.ready(refiner), true, "refinement gets normal admission after cancellation");
+  let refinements = 0;
+  await managed.run(refiner, async () => { refinements++; });
+  assert.equal(refinements, 1);
+  assert.deepEqual(store.snapshot().claims, [originalClaim]);
+});
+
+test("an unseen grant retains old-session ownership while same-session cancellation retries after failure", async t => {
+  const project = "org/core";
+  const store = new FleetStore(":memory:", { mac: { heavyLimit: 2, combinedLimit: 2 } });
+  let unavailable = true;
+  const manager = new MachineManager({ machine: "mac", heavyLimit: 2, combinedLimit: 2, projects: [project] }, {
+    snapshot: async () => store.snapshot(), start: async request => store.start(request),
+    finish: async (session, id, completed, unused) => {
+      if (unavailable) throw new Error("temporary service outage");
+      store.finish("mac", session, id, completed, unused);
+    },
+  });
+  const server = await serveManager(manager, { [project]: "project-test" }, "operator-test", 0);
+  const managed = new ManagedDispatch(project, { PYRY_MANAGER_URL: url(server), PYRY_MANAGER_TOKEN: "project-test" });
+  t.after(async () => { unavailable = false; await managed.stop(); await close(server); store.close(); });
+  const stale = { project, ticket: `${project}#1`, role: "builder", resource: "medium" as const, locks: [], key: "withdrawn", order: 0 };
+  store.start({ ...stale, id: offerId("mac", managed.session, stale), machine: "mac", session: managed.session });
+  store.start({ id: "uncertain", machine: "mac", session: "previous-session", project,
+    ticket: `${project}#2`, role: "builder", resource: "medium", locks: [] });
+  const before = store.snapshot();
+  await assert.rejects(managed.sync(), /temporary service outage/);
+  assert.deepEqual(store.snapshot(), before, "failure must retain the exact reservation for retry");
+  unavailable = false; await managed.sync();
+  assert.deepEqual(store.snapshot().runs, before.runs.filter(r => r.id === "uncertain"));
+  assert.deepEqual(store.snapshot().claims, before.claims.filter(c => c.ticket === `${project}#2`));
 });

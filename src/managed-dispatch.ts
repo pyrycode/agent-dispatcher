@@ -6,6 +6,7 @@ import type { Claim, FleetRun, FleetSnapshot, ResourceClass } from "./fleet-stor
 import type { WorkOffer } from "./machine-scheduler.js";
 import type { AgentConfig, ProjectItem } from "./types.js";
 import type { RecoveryObservation, RecoveryIncident, RecoveryDecision } from "./fleet-recovery.js";
+import { offerId } from "./machine-manager.js";
 
 const DEFAULT_RESOURCE_CLASSES: Readonly<Record<string, ResourceClass>> = {
   builder: "medium", developer: "medium", refiner: "light", po: "light", documentation: "light",
@@ -109,17 +110,28 @@ export class ManagedDispatch {
     if (this.syncing) return;
     this.syncing = true;
     try {
-      const state = await this.connection.call<FleetSnapshot & { draining: boolean }>("/state");
+      const state = await this.connection.call<FleetSnapshot & { machine: string; draining: boolean }>("/state");
       const runs = await this.connection.call<FleetRun[]>("/offers", { session: this.session, offers: [...this.pending.values()]
         .filter(p => Date.now() >= (this.cooldown.get(this.name(p.offer.ticket, p.offer.role)) ?? 0)).map(p => p.offer) });
       this.state = state;
       this.draining = state.draining || this.draining;
       let fresh = false;
       for (const p of this.pending.values()) {
-        // Returned grants belong to this session. Ticket + role is unique in its offers.
-        const run = runs.find(r => r.ticket === p.offer.ticket && r.role === p.offer.role);
+        // Exact identity matters when a stage is withdrawn and offered again
+        // while a previous admission request is still in flight.
+        const run = runs.find(r => r.id === offerId(state.machine, this.session, p.offer));
         if (run && !p.run) fresh = true;
         p.run = run;
+      }
+      for (const run of state.runs) {
+        if (run.machine !== state.machine || run.project !== this.project || run.session !== this.session || this.running.has(run.id)) continue;
+        const pending = this.pending.get(this.name(run.ticket, run.role));
+        if (pending && offerId(state.machine, this.session, pending.offer) === run.id) continue;
+        // Admission may have committed after an ungranted offer disappeared.
+        // Only this live session knows this run never entered run(), whose
+        // running entry lasts through child exit and finish acknowledgement.
+        // Old sessions and uncertain/running children are never inferred dead.
+        await this.finish(run, false, true);
       }
       if (fresh) { this.wake?.(); this.wake = undefined; }
     } finally { this.syncing = false; }

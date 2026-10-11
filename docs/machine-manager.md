@@ -10,6 +10,8 @@ Each manager configuration lists projects in priority order. Recovery assessment
 
 A dispatcher can explicitly cancel a reservation it never started, for example after a board stage changes. That cancellation releases a new ticket claim only if no actual or uncertain run has used that ownership generation. Completed, failed and blocked work keeps its claim. Offline reservations still require manual release. A cancelled offer therefore cannot gain priority over work that is ready to run.
 
+Every dispatcher sync also reconciles reservations admitted after their offer disappeared. It cancels only an exact reservation from its current live session that never launched and has no matching offer. Local runs remain recorded until all tracked child groups exit and completion is acknowledged. Reservations from an older session remain uncertain. Removing a stale stage offer can therefore release unused capacity without interrupting work or changing an established ticket owner.
+
 Production managers default to `ticketLimit: 2`, shared across all their projects. Active ticket reservations and locally owned tickets with runnable offers count. Blocked, errored and completed claims without offers keep their ownership but do not count. Existing ownership can continue above the limit. Internal maintenance jobs do not count. Light roles remain free of resource limits, but cannot acquire extra tickets past the claim budget. Status reports the configured limit and runnable ticket count.
 
 Each role is `heavy`, `medium` or `light`. Build agents default to medium, including the classic developer role. Refinement and documentation agents default to light. Verifiers and unknown roles default to heavy. Documentation keeps its separate one-at-a-time restriction per project board across computers. Explicit role configuration can override these defaults.
@@ -97,6 +99,13 @@ reuses the ordinary board query and sends only ticket numbers, columns, labels
 and blocker state. The central service records incidents in its existing SQLite
 database. Repeated polls do not call a model. A resolved error that returns creates
 a new incident. Rework counts of two or more request an assessment, not a repair.
+
+A retained reservation with no workflow progress for three hours produces one
+durable operator incident for that exact run. This includes cards returned to
+Backlog. It does not launch another worker or release uncertain capacity. Fresh
+workflow progress and a new reservation restart the grace period. The diagnostic
+resolves when the owning session confirms that run ended. Ordinary unclaimed
+Backlog waits remain quiet. A running label stranded in Backlog can also alert.
 
 The owning computer offers an assessment as the `recovery` role. It uses normal
 admission and a heavy reservation. Only one assessment runs across the fleet at
