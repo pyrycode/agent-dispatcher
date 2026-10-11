@@ -3499,6 +3499,29 @@ describe("handlePostRun — decidePostRunLabels integration", () => {
     assert.ok(!/Needs rework by/.test(client.comments[0]!.body));
   });
 
+  test("successful refiner demotion to Inbox records recovery instead of completion", async () => {
+    const previous = process.env.PYRY_RECOVERY;
+    process.env.PYRY_RECOVERY = "1";
+    try {
+      for (const name of ["refiner", "po"]) {
+        const client = new MockGitHubClient({ status: { 167: "Inbox" }, labels: { 167: ["security-sensitive"] } });
+        const { ctx } = makeTestContext({
+          agent: { name, column: "Backlog", claudeMdPath: "unused", usesWorktree: false, producesCommits: false },
+          item: { issueNumber: 167 }, client,
+        });
+        assert.deepEqual(await handlePostRun(STREAM_OK(), ctx, false), { ok: true });
+        assert.ok(client.addLabelCalls.some(c => c.label === "orchestrator:returned-inbox"));
+        assert.ok(!client.addLabelCalls.some(c => c.label.startsWith("done:")));
+        assert.ok(client.getItemStatusCalls.some(c => c.forceRefresh));
+        assert.match(client.comments[0].body, /returned this ticket to Inbox/);
+        assert.doesNotMatch(client.comments[0].body, /Ready for human review/);
+      }
+    } finally {
+      if (previous === undefined) delete process.env.PYRY_RECOVERY;
+      else process.env.PYRY_RECOVERY = previous;
+    }
+  });
+
   test("logKind=status-unknown (getItemStatus throws) → no ready label, no error", async () => {
     const client = new MockGitHubClient({
       labels: { 413: [] },

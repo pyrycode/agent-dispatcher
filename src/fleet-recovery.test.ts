@@ -32,6 +32,19 @@ test("quiet polls and expected waits never schedule AI; two reworks request asse
   assert.equal(recoveryTrigger(observation(1, ["error:builder:permission_denied"]))?.manual, true);
 });
 
+test("a pipeline return to Inbox queues one assessment without promoting ordinary intake or operator holds", () => {
+  const store = new FleetStore(":memory:", limits);
+  const returned = { ...observation(167, ["orchestrator:returned-inbox"]), status: "Inbox" };
+  assert.equal(recoveryTrigger({ ...returned, labels: [] }), null);
+  assert.equal(recoveryTrigger({ ...returned, status: "Backlog" }), null);
+  assert.equal(recoveryTrigger({ ...returned, labels: [...returned.labels, "needs-human:decision"] })?.manual, true);
+  const [incident] = store.recoveryReport("mac", project, [returned]);
+  assert.equal(incident.state, "queued");
+  assert.equal(store.recoveryReport("mac", project, [returned])[0].id, incident.id);
+  assert.notEqual(recoveryFingerprint(returned), recoveryFingerprint({ ...returned, labels: [] }));
+  store.close();
+});
+
 test("an incident survives restart and only its admitted owner can assess it", () => {
   const path = join(mkdtempSync(join(tmpdir(), "recovery-db-")), "fleet.sqlite");
   let store = new FleetStore(path, limits);

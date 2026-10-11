@@ -12,7 +12,7 @@ import { runRecoveryWork, recoveryHandoff, parseRecoveryDecision, RECOVERY_INSTR
 import { verifyCoordination } from "./recovery-coordination.js";
 import { recoveryInventory, relatedTickets, relatedEvidence } from "./recovery-evidence.js";
 import { recoveryLogContext } from "./recovery-context.js";
-import type { RecoveryIncident, RecoveryDecision } from "./fleet-recovery.js";
+import { RECOVERY_RETURNED_INBOX, type RecoveryIncident, type RecoveryDecision } from "./fleet-recovery.js";
 import { ManagedDispatch, trackManagedChild } from "./managed-dispatch.js";
 import { DispatchPool, excludeInFlight, freeSeats, launchCandidates, liveGateRunnerFor, mayStartMainSweep, resolvePollIntervalMs } from "./dispatch-pool.js";
 import { countVerdictsSince, isStaleBaseFinding, parseBuilderCompletions, parseVerdictArtifacts, pickVerdictPr, shouldFlagMissingVerdict } from "./verdict-guard.js";
@@ -5284,6 +5284,13 @@ export async function handlePostRun(
       console.warn(`   ⚠️  Failed to fetch post-run status for #${item.issueNumber}: ${e}`);
     }
 
+    // A demotion intentionally has no done label. Keep an explicit recovery
+    // signal so this successful planning run cannot strand the ticket in Inbox.
+    const returnedInbox = currentColumn === "Inbox" && agent.column !== "Inbox";
+    if (returnedInbox && process.env.PYRY_RECOVERY === "1" && !streamResult.isError && !streamResult.hadPermissionDenial) {
+      await client.addLabel(item.issueNumber, RECOVERY_RETURNED_INBOX);
+    }
+
     // Pure decision in lib.ts — caller below applies the side effects.
     // See decidePostRunLabels for the routing rules; tests in lib.test.ts.
     const decision = decidePostRunLabels({
@@ -5365,7 +5372,9 @@ export async function handlePostRun(
     try {
       await client.addComment(
         item.issueNumber,
-        decision.reworkTarget
+        returnedInbox
+          ? `## 🤖 ${agent.description}\n\n${agent.name} agent returned this ticket to Inbox.\n\n<details>\n<summary>Agent output (click to expand)</summary>\n\n\`\`\`\n${output.slice(-3000)}\n\`\`\`\n</details>\n\nRecovery will assess the missing planning input and prerequisites before another attempt.`
+          : decision.reworkTarget
           ? `## 🤖 ${agent.description}\n\n${agent.name} agent flagged issues on this ticket → rework by **${decision.reworkTarget}**.\n\n<details>\n<summary>Agent output (click to expand)</summary>\n\n\`\`\`\n${output.slice(-3000)}\n\`\`\`\n</details>\n\n**Needs rework by ${decision.reworkTarget}.** See agent findings above.`
           : `## 🤖 ${agent.description}\n\n${agent.name} agent has completed work on this ticket.\n\n<details>\n<summary>Agent output (click to expand)</summary>\n\n\`\`\`\n${output.slice(-3000)}\n\`\`\`\n</details>\n\n**Ready for human review.** Move to the next column when approved.`
       );
