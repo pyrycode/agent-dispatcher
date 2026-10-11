@@ -63,4 +63,3 @@ class CredentialPollingTests(unittest.TestCase):
         self.assertEqual(execute.call_args.args[0],['node','fleet-bin','status','/configured/operator.json'])
 
 if __name__=='__main__':unittest.main()
-
