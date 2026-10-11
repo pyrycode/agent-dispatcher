@@ -41,7 +41,12 @@ class Supervisor:
         state = json.loads(receipt.read_text()) if receipt.exists() else None
         if state and state['phase'] == 'attention':
             return state
-        observed = self.adapter.observe(project)
+        try:
+            observed = self.adapter.observe(project)
+        except Exception:
+            if state and state['phase'] in {'start-requested', 'verifying'} and self.clock() - state['created'] < 6 * 3600:
+                return state
+            raise
         if state and state['phase'] == 'complete':
             if observed.get('generation') == desired and observed.get('healthy'):
                 return state
@@ -110,7 +115,13 @@ class Supervisor:
                     raise RuntimeError('Start delivery uncertain. Inspect before another start.')
                 state['phase'] = 'verifying'
             if state['phase'] == 'verifying':
-                if not self.adapter.verify(project, desired):
+                try:
+                    ready = self.adapter.verify(project, desired)
+                except Exception:
+                    # The service can be active before the new workload lock exists.
+                    # Keep the already acknowledged start and wait for its receipt.
+                    return state
+                if not ready:
                     return state
                 after = self.adapter.status()
                 current = real_claims(after)
