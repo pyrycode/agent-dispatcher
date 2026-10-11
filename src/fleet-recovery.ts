@@ -94,7 +94,7 @@ export class RecoveryLedger {
       const retainedAlert = old?.reason === RETAINED_RUN_REASON;
       // A new run or workflow progress also confirms the diagnosed stall ended.
       // Do not turn a resolved reservation diagnostic into an operator hold.
-      if (retainedAlert && (old.run_id !== run?.id || old.fingerprint !== fingerprint)) {
+      if (old && retainedAlert && (old.run_id !== run?.id || old.fingerprint !== fingerprint)) {
         this.db.prepare("UPDATE fleet_recovery SET present=0,state='resolved',updated=? WHERE id=?").run(this.now(), old.id);
         old = undefined;
       }
