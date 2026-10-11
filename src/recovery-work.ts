@@ -1,6 +1,6 @@
 import { recoveryFingerprint, recoveryTrigger, hasOperatorHold, validateRecoveryDecision, RECOVERY_RETURNED_INBOX, type RecoveryDecision, type RecoveryIncident } from "./fleet-recovery.js";
 import type { AgentConfig, ProjectItem } from "./types.js";
-import { FAMILY_BREAKER_LABEL, resolveFamilyRoot } from "./pipeline-decisions.js";
+import { AUTO_RETRY_RESET_COMMENT_MARKER, FAMILY_BREAKER_LABEL, resolveFamilyRoot } from "./pipeline-decisions.js";
 
 export const RECOVERY_INVESTIGATING = "orchestrator:investigating";
 export const RECOVERY_FIXING = "orchestrator:fixing";
@@ -156,7 +156,7 @@ export async function runRecoveryWork(incident: RecoveryIncident, deps: Recovery
       fixing = true; // Even a lost acknowledgement can have applied the label.
       await deps.addLabel(issue, RECOVERY_FIXING);
     }
-    await deps.comment(item.issueNumber, `${RECOVERY_MARKER}${incident.id} -->\n## Orchestrator recovery\n\nAction: ${decision.action}\n\n${decision.reason}${decision.retryReset ? `\n\nOrdinary retry count reset finding: ${decision.retryReset}` : ""}`);
+    await deps.comment(item.issueNumber, `${RECOVERY_MARKER}${incident.id} -->\n${decision.retryReset ? `${AUTO_RETRY_RESET_COMMENT_MARKER}\n` : ""}## Orchestrator recovery\n\nAction: ${decision.action}\n\n${decision.reason}${decision.retryReset ? `\n\nOrdinary retry count reset finding: ${decision.retryReset}` : ""}`);
     if (plan.unblock) {
       if (!await deps.verifyCoordination!(item, plan.unblock)) throw new Error("Coordination changed before removal");
       await deps.removeBlocker!(item.issueNumber, plan.unblock);

@@ -2224,6 +2224,8 @@ export const RETRY_BASE_MS = 5 * 60_000;
  *  find the most recent one and read its createdAt as the last-failure time.
  *  An HTML comment renders invisibly in GitHub's Markdown. */
 export const AUTO_RETRY_COMMENT_MARKER = "<!-- pyry-auto-retry -->";
+/** A manager-recorded relevant recovery finding starts a new transient retry budget. */
+export const AUTO_RETRY_RESET_COMMENT_MARKER = "<!-- pyry-auto-retry-reset -->";
 
 /** One transient-error signature: `match` is the lowercased substring probed
  *  against the agent's error text; `signature` is the human-facing name
