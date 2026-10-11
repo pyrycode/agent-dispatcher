@@ -10,7 +10,6 @@ import type { PauseRecord, EvidenceRecord, CoordinationRecord } from "./recovery
 import type { RecoveryObservation, RecoveryIncident, RecoveryDecision } from "./fleet-recovery.js";
 import type { AgentRunner } from './agent-runner.js';
 import { offerId } from "./machine-manager.js";
-import { recoveryTrigger } from './fleet-recovery.js';
 
 const DEFAULT_RESOURCE_CLASSES: Readonly<Record<string, ResourceClass>> = {
   builder: "medium", developer: "medium", refiner: "light", po: "light", documentation: "light",
@@ -207,12 +206,14 @@ export class ManagedDispatch {
                 if (!prepared) {
                   const item = await recovery.observe();
                   observation = item ? observationFor(this.project, item) : undefined;
-                  const trigger = observation && recoveryTrigger(observation);
-                  if (trigger && !trigger.manual) {
-                    successor = this.offer(item!.issueNumber, 'recovery', 'heavy', [], -4);
+                  // Only the authority has the durable pause origin and latest
+                  // recovery facts. Publish a possibility; its incident check
+                  // prevents healthy completions and operator holds launching.
+                  if (item) {
+                    successor = this.offer(item.issueNumber, 'recovery', 'heavy', [], -4);
                     successor.offer.roleLimit = 1;
                     successor.offer.requiresRecovery = true;
-                    successor.offer.recoveryError = trigger.reason.startsWith('error:');
+                    successor.offer.recoveryError = item.labels.some(l => l.startsWith('error:') && l !== 'error:family-breaker');
                   }
                   prepared = true;
                 }
