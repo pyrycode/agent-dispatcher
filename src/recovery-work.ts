@@ -1,4 +1,4 @@
-import { recoveryFingerprint, recoveryTrigger, hasOperatorHold, validateRecoveryDecision, type RecoveryDecision, type RecoveryIncident } from "./fleet-recovery.js";
+import { recoveryFingerprint, recoveryTrigger, hasOperatorHold, validateRecoveryDecision, RECOVERY_RETURNED_INBOX, type RecoveryDecision, type RecoveryIncident } from "./fleet-recovery.js";
 import type { AgentConfig, ProjectItem } from "./types.js";
 
 export const RECOVERY_INVESTIGATING = "orchestrator:investigating";
@@ -15,7 +15,7 @@ Return status completed and put ONLY a JSON object in summary: {"action":"wait|r
 wait: review findings are converging, a dependency or live gate is expected, or no intervention is needed.
 retry: the same stage can succeed unchanged because evidence shows a temporary failure has cleared. Never retry a denied permission or an exhausted retry budget.
 rework: code needs repair. At rework count two assess whether findings shrink in kind. Repeated holes in the same area need a shared-cause repair, not another one-line patch. Explain a reproducer, the class of defect and the checks needed. The ordinary builder will do the repair and then normal review and testing continue.
-refine: an Inbox investigation needs scope or portable reproduction evidence before implementation. Supply the evidence and a portable reproduction brief. It returns to the ordinary refiner and does not bypass refinement or code review.
+refine: an Inbox investigation needs scope or portable reproduction evidence before implementation. Inspect why the previous stage returned it. Supply a concrete repair of the missing planning input, not another unchanged attempt. A missing causal prerequisite must remain a dependency. It returns to the ordinary refiner and does not bypass refinement or code review.
 resume: a recorded pipeline pause can return to its recorded stage after its missing prerequisite is satisfied. An unknown pause origin or a human hold cannot resume automatically.
 unblock: only a recorded edit-coordination blocker whose fresh changes no longer overlap. Name the full blocker ticket. A causal repair dependency cannot be removed because it is hard to reproduce.
 propose-close: retained evidence supports a not-reproduced, obsolete or duplicate investigation outcome. Explain the exact evidence and limits. This becomes a decision in the consolidated report and never claims a bug was fixed.
@@ -65,7 +65,7 @@ export function recoveryPlan(item: ProjectItem, decision: RecoveryDecision, agen
     const planner = agents.find(a => a.name === "refiner" || a.name === "po");
     if (!planner || item.status !== "Inbox" || item.labels.some(l => l.startsWith("error:") && l !== `error:${planner.name}`
       || l === "done:builder" || l === "done:developer" || l === "done:verifier" || l === "done:code-review")) throw new Error("Refinement requires an unfinished Inbox investigation");
-    return { status: planner.column, remove: item.labels.filter(l => l === `done:${planner.name}` || l === `error:${planner.name}`) };
+    return { status: planner.column, remove: item.labels.filter(l => l === RECOVERY_RETURNED_INBOX || l === `done:${planner.name}` || l === `error:${planner.name}`) };
   }
   if (decision.action === "resume") {
     const pause = item.recoveryPause;
@@ -169,7 +169,8 @@ export async function runRecoveryWork(incident: RecoveryIncident, deps: Recovery
 export async function cleanRecoveryLabels(items: readonly ProjectItem[], remove: (issue: number, label: string) => Promise<void>): Promise<void> {
   for (const item of items) {
     const stop = ["Done", "Halted"].includes(item.status) || hasOperatorHold(item.labels) || item.labels.some(l => l.startsWith("error:"));
-    for (const label of item.labels.filter(l => l === RECOVERY_INVESTIGATING || l === RECOVERY_FIXING && stop)) {
+    for (const label of item.labels.filter(l => l === RECOVERY_INVESTIGATING || l === RECOVERY_FIXING && stop
+      || l === RECOVERY_RETURNED_INBOX && item.status !== "Inbox")) {
       await remove(item.issueNumber, label);
       item.labels = item.labels.filter(l => l !== label);
     }

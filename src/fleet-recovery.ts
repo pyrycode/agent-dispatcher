@@ -19,6 +19,7 @@ export interface RecoveryIncident {
 }
 
 export const RECOVERY_RECHECK_MS = 30 * 60_000;
+export const RECOVERY_RETURNED_INBOX = "orchestrator:returned-inbox";
 export const RECOVERY_REPAIRS_PER_TICKET = 3;
 export const RECOVERY_STALLED_RUN_MS = 3 * 3600000;
 const RETAINED_RUN_REASON = "Retained reservation without workflow progress for three hours; inspect local child processes before intervening";
@@ -40,7 +41,7 @@ export function validateObservations(project: string, observations: RecoveryObse
 }
 export function recoveryFingerprint(o: RecoveryObservation): string {
   return createHash("sha256").update(JSON.stringify([o.status, o.blocked,
-    o.labels.filter(l => /^(error:|needs-human:|rework-count:|done:|needs-rework:|needs-real-claude$)/.test(l)).sort(),
+    o.labels.filter(l => l === RECOVERY_RETURNED_INBOX || /^(error:|needs-human:|rework-count:|done:|needs-rework:|needs-real-claude$)/.test(l)).sort(),
     o.evidenceRevision ?? null, o.artifactRevision ?? null, o.pause ?? null])).digest("hex");
 }
 export function recoveryTrigger(o: RecoveryObservation): { reason: string; manual: boolean } | null {
@@ -56,7 +57,7 @@ export function recoveryTrigger(o: RecoveryObservation): { reason: string; manua
   const errors = o.labels.filter(l => l.startsWith("error:"));
   if (errors.length) return { reason: errors.sort().join(", "), manual: false };
   if (o.labels.some(l => /^rework-count:\d+$/.test(l) && Number(l.split(":")[1]) >= 2)) return { reason: "Repeated review rework", manual: false };
-  if (o.status === "Inbox" && o.labels.some(l => l === "needs-real-claude" || l === "done:refiner")) return { reason: "Pipeline evidence or refinement is needed in Inbox", manual: false };
+  if (o.status === "Inbox" && o.labels.some(l => l === RECOVERY_RETURNED_INBOX || l === "needs-real-claude" || l === "done:refiner")) return { reason: "Pipeline evidence or refinement is needed in Inbox", manual: false };
   return null;
 }
 export function validateRecoveryDecision(value: unknown): RecoveryDecision {
