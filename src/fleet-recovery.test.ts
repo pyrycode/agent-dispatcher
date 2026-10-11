@@ -98,6 +98,7 @@ test("a documented retry reset survives the decision ledger and is applied befor
       assert.equal(ledger.incident(incident.id).state, "complete");
       assert.ok(writes.indexOf("error-retry-count:4") < writes.indexOf("error:documentation"));
       assert.match(comment, /Restored the missing dedicated account/);
+      assert.match(comment, /^<!-- fleet-recovery:.* -->\n<!-- pyry-auto-retry-reset -->\n/, "the durable comment reader needs an unambiguous reset boundary");
     }
     db.close();
   }

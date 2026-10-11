@@ -4,6 +4,7 @@ import { githubFetch, freshGitHubRead } from "./github-transport.js";
 import type { ProjectConfig, ProjectItem } from "./types.js";
 import {
   AUTO_RETRY_COMMENT_MARKER,
+  AUTO_RETRY_RESET_COMMENT_MARKER,
   STRANDED_WIP_OBSERVED_MARKER,
   STRANDED_WIP_SWEPT_MARKER,
   tallyFamilyComments,
@@ -78,6 +79,28 @@ export async function countMarkersNewestFirst(
     total += count((await fetchPage(page)).comments);
   }
   return total;
+}
+
+/** Retry history after the newest recorded recovery finding, bounded and newest first. */
+export async function retryHistoryNewestFirst(
+  fetchPage: (page: number) => Promise<CommentsPage>,
+  maxPages: number,
+): Promise<{ count: number; latestAt: Date | null }> {
+  const first = await fetchPage(1);
+  let read = 1; let count = 0; let latestAt: Date | null = null;
+  for (let page = first.lastPage ?? 1; page >= 1; page--) {
+    if (page !== 1 && read >= maxPages) break;
+    const comments = page === 1 ? first.comments : (read++, (await fetchPage(page)).comments);
+    for (const comment of [...comments].reverse()) {
+      if (typeof comment?.body !== "string") continue;
+      if (comment.body.startsWith("<!-- fleet-recovery:") && comment.body.split("\n")[1] === AUTO_RETRY_RESET_COMMENT_MARKER) return { count, latestAt };
+      if (!comment.body.includes(AUTO_RETRY_COMMENT_MARKER)) continue;
+      count++;
+      const at = comment.created_at ? new Date(comment.created_at) : null;
+      if (at && !isNaN(at.getTime()) && (!latestAt || at > latestAt)) latestAt = at;
+    }
+  }
+  return { count, latestAt };
 }
 
 /** Transient GitHub responses worth another attempt for an IDEMPOTENT
@@ -1008,7 +1031,7 @@ export class GitHubProjectClient {
    * (100) is far more than any ticket accrues in practice.
    */
   async getLatestRetryAt(issueNumber: number): Promise<Date | null> {
-    return latestMarkerAt(await this.fetchIssueComments(issueNumber), AUTO_RETRY_COMMENT_MARKER);
+    return (await retryHistoryNewestFirst(page => this.fetchIssueCommentsPage(issueNumber, page), MARKER_COUNT_MAX_PAGES)).latestAt;
   }
 
   /**
@@ -1082,7 +1105,7 @@ export class GitHubProjectClient {
   }
 
   /**
-   * How many dispatcher auto-retry marker comments an issue carries. This is
+   * Dispatcher auto-retry comments since the newest recorded recovery reset. This is
    * the durable attempt count the retry scheduler falls back to when the
    * `error-retry-count:N` label failed to persist — otherwise a repeated
    * label-write failure would reset the attempt to 1 each time and the cap
@@ -1090,12 +1113,7 @@ export class GitHubProjectClient {
    * count as 0 and proceeds.
    */
   async countRetryMarkers(issueNumber: number): Promise<number> {
-    const comments = await this.fetchIssueComments(issueNumber);
-    let count = 0;
-    for (const c of comments) {
-      if (typeof c?.body === "string" && c.body.includes(AUTO_RETRY_COMMENT_MARKER)) count++;
-    }
-    return count;
+    return (await retryHistoryNewestFirst(page => this.fetchIssueCommentsPage(issueNumber, page), MARKER_COUNT_MAX_PAGES)).count;
   }
 
   /**

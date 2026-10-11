@@ -14,6 +14,31 @@ import {
   GitHubProjectClient,
 } from "./github.js";
 
+test("a recovery reset restarts comment-based retry counts and timestamps beyond the first page", async () => {
+  const retry = (created_at: string) => ({ body: '<!-- pyry-auto-retry -->\nRetry', created_at });
+  const reset = { body: '<!-- fleet-recovery:incident -->\n<!-- pyry-auto-retry-reset -->\n## Orchestrator recovery\n\nA relevant cause was repaired.', created_at: '2026-10-11T15:00:00Z' };
+  const comments = Array.from({ length: 230 }, () => ({ body: 'ordinary comment', created_at: '2026-10-11T10:00:00Z' }));
+  for (const i of [10, 20, 30, 40]) comments[i] = retry('2026-10-11T12:00:00Z');
+  comments[150] = reset;
+  const read: number[] = []; const original = globalThis.fetch;
+  globalThis.fetch = (async input => {
+    const page = Number(new URL(String(input)).searchParams.get('page') ?? 1); read.push(page);
+    return new Response(JSON.stringify(comments.slice((page - 1) * 100, page * 100)), { headers: { Link: '<https://api.github.com/x?page=3>; rel="last"' } });
+  }) as typeof fetch;
+  try {
+    const client = new GitHubProjectClient({ owner: 'o', repo: 'r', token: 'fixture' } as any);
+    assert.equal(await client.countRetryMarkers(1809), 0, 'historical attempts before the recorded fix must not consume the new budget');
+    assert.deepEqual(read, [1, 3, 2]);
+    assert.equal(await client.getLatestRetryAt(1809), null);
+    comments[220] = retry('2026-10-11T16:00:00Z');
+    comments[225] = { body: 'Quoted reset evidence: ' + reset.body, created_at: '2026-10-11T16:01:00Z' };
+    assert.equal(await client.countRetryMarkers(1809), 1, 'label-write failure still has a bounded durable count after reset');
+    assert.equal((await client.getLatestRetryAt(1809))?.toISOString(), '2026-10-11T16:00:00.000Z');
+    comments[229] = { ...reset, created_at: '2026-10-11T17:00:00Z' };
+    assert.equal(await client.countRetryMarkers(1809), 0, 'the latest justified reset begins the next budget');
+  } finally { globalThis.fetch = original; }
+});
+
 type Item = { issueNumber: number; status: string; labels: string[] };
 const item = (issueNumber: number, status: string, labels: string[] = []): Item => ({ issueNumber, status, labels });
 const numbers = (items: Item[]) => items.map((i) => i.issueNumber);
