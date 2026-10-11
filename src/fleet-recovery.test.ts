@@ -24,12 +24,83 @@ const url = (server: { address(): unknown }) => `http://127.0.0.1:${(server.addr
 test("quiet polls and expected waits never schedule AI; two reworks request assessment", () => {
   assert.equal(recoveryTrigger(observation(1, [])), null);
   assert.equal(recoveryTrigger({ ...observation(), blocked: true })?.manual, false);
-  assert.equal(recoveryTrigger(observation(1, ["error-retry-count:2", "error:builder"])), null);
+  assert.equal(recoveryTrigger(observation(1, ["error-retry-count:2"])), null);
   assert.equal(recoveryTrigger(observation(1, ["needs-real-claude"])), null);
   assert.equal(recoveryTrigger(observation(1, ["rework-count:1"])), null);
   assert.equal(recoveryTrigger(observation(1, ["rework-count:2"]))?.manual, false);
   assert.equal(recoveryTrigger({ ...observation(), status: "Halted" })?.manual, true);
   assert.equal(recoveryTrigger(observation(1, ["error:builder:permission_denied"]))?.manual, true);
+});
+
+test("exhausted documentation retries queue one immediate assessment without restarting pending retries", () => {
+  const store = new FleetStore(":memory:", limits);
+  const stopped = { ...observation(1809, ["error:documentation", "error-retry-count:4", "done:verifier"]), status: "In Documentation" };
+  const [incident] = store.recoveryReport("mac", project, [stopped]);
+  assert.ok(incident, "the parked documentation error must not wait for the 24-hour fallback");
+  assert.equal(incident.state, "queued");
+  assert.equal(store.recoveryReport("mac", project, [stopped])[0].id, incident.id);
+  assert.equal(recoveryTrigger(observation(1, ["error:builder", "error-retry-count:2"]))?.manual, false, "an error marks a stopped stage even below the retry limit");
+  assert.equal(recoveryTrigger(observation(1, ["error-retry-count:4"])), null, "the final pending retry still owns its backoff");
+  assert.notEqual(recoveryFingerprint(stopped), recoveryFingerprint({ ...stopped, labels: stopped.labels.filter(l => !l.startsWith("error-retry-count:")) }), "a counter change invalidates a stale reset decision");
+  assert.equal(recoveryTrigger({ ...stopped, labels: [...stopped.labels, "health-hold:login"] }), null);
+  assert.equal(recoveryTrigger({ ...stopped, labels: [...stopped.labels, "needs-human:approval"] })?.manual, true);
+  store.close();
+});
+
+test("ordinary retry resets require a relevant recovery finding and preserve review counters", () => {
+  const stopped = { ...item(["error:documentation", "error-retry-count:4", "done:verifier", "rework-count:2", "family-dispatches:9"]), status: "In Documentation" };
+  const finding = "The dedicated live sign-in is now provisioned and its login probe succeeds; rerun the named Luna scenario.";
+  const retry = parseRecoveryDecision(JSON.stringify({ action: "retry", reason: "The missing prerequisite has been restored", retryReset: finding }));
+  assert.deepEqual(recoveryPlan(stopped, retry, agents).remove.sort(), ["error-retry-count:4", "error:documentation"]);
+  assert.throws(() => recoveryPlan(stopped, { action: "retry", reason: "Try unchanged" }, agents), /retry reset/i);
+  for (const action of ["wait", "escalate", "propose-close"]) {
+    assert.deepEqual(recoveryPlan(stopped, parseRecoveryDecision(JSON.stringify({ action, reason: "No actionable finding" })), agents).remove, []);
+    assert.throws(() => parseRecoveryDecision(JSON.stringify({ action, reason: "No action", retryReset: finding })), /Invalid/);
+  }
+  for (const retryReset of ["", "   ", false, "x".repeat(6001)]) {
+    assert.throws(() => parseRecoveryDecision(JSON.stringify({ action: "retry", reason: "Retry", retryReset })), /Invalid/);
+  }
+  const broken = item(["error:builder", "error-retry-count:4", "rework-count:2", "family-dispatches:9"]);
+  const repair = parseRecoveryDecision(JSON.stringify({ action: "rework", reason: "Repair the confirmed environment-name mismatch", retryReset: "The builder can replace the mismatched environment name and prove the original failure no longer occurs." }));
+  assert.deepEqual(recoveryPlan(broken, repair, agents).remove.sort(), ["error-retry-count:4", "error:builder"]);
+  assert.throws(() => recoveryPlan(broken, { action: "rework", reason: "Repeat the previous repair" }, agents), /retry reset/i);
+  const inbox = { ...item(["error:refiner", "error-retry-count:4", "orchestrator:returned-inbox"]), status: "Inbox" };
+  const refinement = parseRecoveryDecision(JSON.stringify({ action: "refine", reason: "Add the missing reproducible planning input", retryReset: "A bounded local capture recipe replaces the unavailable historical artifact." }));
+  assert.deepEqual(recoveryPlan(inbox, refinement, agents).remove.sort(), ["error-retry-count:4", "error:refiner", "orchestrator:returned-inbox"]);
+  const halted = { ...item(["error-retry-count:4"]), status: "Halted", recoveryPause: { ticket: project + "#1", origin: "pipeline" as const, actor: "builder", reason: "Login unavailable", missing: "Login", resumeOn: "Login restored", resumeStatus: "In Development", revision: "pause" } };
+  const resume = parseRecoveryDecision(JSON.stringify({ action: "resume", reason: "Login restored", retryReset: "The missing login now passes the credential probe." }));
+  assert.deepEqual(recoveryPlan(halted, resume, agents).remove, ["error-retry-count:4"]);
+});
+
+test("a documented retry reset survives the decision ledger and is applied before releasing the stage error", async () => {
+  for (const budgetExhausted of [false, true]) {
+    const db = new DatabaseSync(":memory:");
+    const ledger = new RecoveryLedger(db, () => 100000000);
+    const current = { ...item(["error:documentation", "error-retry-count:4", "done:verifier"]), status: "In Documentation" };
+    const [incident] = ledger.report("mac", project, [observationFor(project, current)], { claims: [], runs: [] });
+    assert.ok(incident);
+    if (budgetExhausted) db.prepare("INSERT INTO fleet_recovery VALUES (?,?,?,?,?,?,?,?,?,0)").run("prior", project + "#1", "prior", "prior repair", "complete", 99999000, 99999000, "prior", JSON.stringify({ action: "rework", reason: "Earlier repair" }));
+    if (budgetExhausted) for (const id of ["prior-2", "prior-3"]) db.prepare("INSERT INTO fleet_recovery SELECT ?,ticket,fingerprint,reason,state,created,updated,run_id,decision,present FROM fleet_recovery WHERE id='prior'").run(id);
+    const writes: string[] = []; let comment = "";
+    const decision = parseRecoveryDecision(JSON.stringify({ action: "retry", reason: "The dedicated account now passes the login probe", retryReset: "Restored the missing dedicated account and verified the prerequisite." }));
+    await runRecoveryWork(incident, {
+      project, agents, readCurrent: async () => current, begin: async () => ledger.begin(incident.id, "recovery"),
+      assess: async () => decision, decide: async d => ledger.decide(incident.id, "recovery", d), complete: async () => ledger.complete(incident.id, "recovery"),
+      addLabel: async () => {}, removeLabel: async (_issue, label) => { writes.push(label); },
+      comment: async (_issue, body) => { comment = body; }, move: async () => {}, notify: async () => {},
+    });
+    if (budgetExhausted) {
+      assert.equal(ledger.incident(incident.id).decision?.action, "escalate");
+      assert.equal(writes.includes("error-retry-count:4"), false);
+      assert.equal(writes.includes("error:documentation"), false);
+    } else {
+      assert.deepEqual(ledger.incident(incident.id).decision, decision);
+      assert.equal(ledger.incident(incident.id).state, "complete");
+      assert.ok(writes.indexOf("error-retry-count:4") < writes.indexOf("error:documentation"));
+      assert.match(comment, /Restored the missing dedicated account/);
+    }
+    db.close();
+  }
 });
 
 test("a pipeline return to Inbox queues one assessment without promoting ordinary intake or operator holds", () => {

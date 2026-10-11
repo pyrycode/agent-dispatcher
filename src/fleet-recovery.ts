@@ -11,7 +11,7 @@ export interface RecoveryObservation {
   familyHold?: string;
 }
 export type RecoveryAction = "wait" | "retry" | "rework" | "resume" | "refine" | "unblock" | "propose-close" | "escalate";
-export interface RecoveryDecision { action: RecoveryAction; reason: string; blocker?: string }
+export interface RecoveryDecision { action: RecoveryAction; reason: string; blocker?: string; retryReset?: string }
 export interface RecoveryIncident {
   id: string; ticket: string; fingerprint: string; reason: string;
   state: "queued" | "assessing" | "applying" | "complete" | "escalated" | "resolved";
@@ -43,7 +43,7 @@ export function validateObservations(project: string, observations: RecoveryObse
 }
 export function recoveryFingerprint(o: RecoveryObservation): string {
   return createHash("sha256").update(JSON.stringify([o.status, o.blocked,
-    o.labels.filter(l => l === RECOVERY_RETURNED_INBOX || /^(error:|needs-human:|rework-count:|done:|needs-rework:|needs-real-claude$)/.test(l)).sort(),
+    o.labels.filter(l => l === RECOVERY_RETURNED_INBOX || /^(error:|error-retry-count:|needs-human:|rework-count:|done:|needs-rework:|needs-real-claude$)/.test(l)).sort(),
     o.evidenceRevision ?? null, o.artifactRevision ?? null, o.pause ?? null, ...(o.familyHold ? [o.familyHold] : [])])).digest("hex");
 }
 export function recoveryTrigger(o: RecoveryObservation): { reason: string; manual: boolean } | null {
@@ -54,11 +54,13 @@ export function recoveryTrigger(o: RecoveryObservation): { reason: string; manua
     ? { reason: `Pipeline pause: ${o.pause.reason}`, manual: false }
     : { reason: "Pause origin unknown; record who paused this ticket and the reopening condition", manual: true };
   if (o.labels.some(l => /permission_denied|family-breaker/.test(l))) return { reason: "Permission or family boundary needs an operator", manual: true };
-  // These waits already have dedicated bounded recovery. Do not buy another retry budget.
   if (o.blocked) return { reason: "Dependency evidence and coordination reassessment", manual: false };
-  if (o.labels.some(l => l.startsWith("error-retry-count:") || l.startsWith("health-hold:"))) return null;
+  // Health holds and pending transient retries keep their existing recovery.
+  // A stage error means retries have stopped, so it needs diagnosis, not a blind retry.
+  if (o.labels.some(l => l.startsWith("health-hold:"))) return null;
   const errors = o.labels.filter(l => l.startsWith("error:"));
   if (errors.length) return { reason: errors.sort().join(", "), manual: false };
+  if (o.labels.some(l => l.startsWith("error-retry-count:"))) return null;
   if (o.labels.some(l => /^rework-count:\d+$/.test(l) && Number(l.split(":")[1]) >= 2)) return { reason: "Repeated review rework", manual: false };
   if (o.status === "Inbox" && o.labels.some(l => l === RECOVERY_RETURNED_INBOX || l === "needs-real-claude" || l === "done:refiner")) return { reason: "Pipeline evidence or refinement is needed in Inbox", manual: false };
   return null;
@@ -67,7 +69,10 @@ export function validateRecoveryDecision(value: unknown): RecoveryDecision {
   const d = value as RecoveryDecision;
   if (!d || !["wait", "retry", "rework", "resume", "refine", "unblock", "propose-close", "escalate"].includes(d.action) || typeof d.reason !== "string" || !d.reason.trim() || d.reason.length > 6000) throw new Error("Invalid recovery decision");
   if (d.action === "unblock" && !/^[\w.-]+\/[\w.-]+#[1-9]\d*$/.test(d.blocker ?? "")) throw new Error("Unblock requires a full blocker ticket");
-  return { action: d.action, reason: d.reason, ...(d.action === "unblock" ? { blocker: d.blocker } : {}) };
+  if (d.retryReset !== undefined && (!['retry', 'rework', 'refine', 'resume'].includes(d.action)
+    || typeof d.retryReset !== "string" || !d.retryReset.trim() || d.retryReset.length > 6000)) throw new Error("Invalid retry reset finding");
+  return { action: d.action, reason: d.reason, ...(d.action === "unblock" ? { blocker: d.blocker } : {}),
+    ...(d.retryReset !== undefined ? { retryReset: d.retryReset } : {}) };
 }
 
 /** Uses the claim authority's database. No independent watcher can race this ledger. */
