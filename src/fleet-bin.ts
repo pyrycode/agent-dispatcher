@@ -87,11 +87,11 @@ async function main(): Promise<void> {
   if (!managerUrl) throw new Error("Operator configuration requires managerUrl or socketPath");
   const client = new JsonClient(managerUrl, secret(config.operatorTokenEnv));
   if (command === "desired") {
-    const claims = new JsonClient(config.claimsUrl, secret(config.claimsOperatorTokenEnv));
+    const claims = new JsonClient(config.claimsUrl, secret(config.claimsOperatorTokenEnv ?? config.claimsTokenEnv));
     console.log(JSON.stringify(await claims.call("/operations/desired"))); return;
   }
   if (command === "attention") {
-    const claims = new JsonClient(config.claimsUrl, secret(config.claimsOperatorTokenEnv));
+    const claims = new JsonClient(config.claimsUrl, secret(config.claimsOperatorTokenEnv ?? config.claimsTokenEnv));
     const [incidents, state] = await Promise.all([claims.call<import("./fleet-recovery.js").RecoveryIncident[]>("/recovery/state"), client.call<any>("/state")]);
     console.log(JSON.stringify(recoveryReport(incidents, state), null, 2)); return;
   }

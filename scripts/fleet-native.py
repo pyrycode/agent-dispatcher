@@ -88,7 +88,10 @@ class NativeAdapter:
         revisions = self.operator('desired')
         result = {}
         for project in self.config['projects']:
-            expected = self.expected(project)
+            try:
+                expected = self.expected(project)
+            except Exception:
+                continue
             if expected.get('ok') and project in revisions:
                 desired = {**revisions[project], 'credential': expected['credential']}
                 result[project] = desired
