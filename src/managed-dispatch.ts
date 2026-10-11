@@ -10,6 +10,7 @@ import type { PauseRecord, EvidenceRecord, CoordinationRecord } from "./recovery
 import type { RecoveryObservation, RecoveryIncident, RecoveryDecision } from "./fleet-recovery.js";
 import type { AgentRunner } from './agent-runner.js';
 import { offerId } from "./machine-manager.js";
+import { recoveryTrigger } from './fleet-recovery.js';
 
 const DEFAULT_RESOURCE_CLASSES: Readonly<Record<string, ResourceClass>> = {
   builder: "medium", developer: "medium", refiner: "light", po: "light", documentation: "light",
@@ -31,7 +32,8 @@ export function resourceClasses(raw: string | undefined): Record<string, Resourc
   return parsed;
 }
 
-interface Pending { offer: WorkOffer; run?: FleetRun }
+interface Pending { offer: WorkOffer; run?: FleetRun; retired?: boolean }
+interface CompletionRecovery { observe: () => Promise<ProjectItem | undefined>; onRecovery: (incidents: RecoveryIncident[]) => void }
 export class ManagedDispatch {
   readonly session = randomUUID();
   readonly connection: JsonClient;
@@ -87,7 +89,10 @@ export class ManagedDispatch {
   setRecoveryTickets(items: readonly ProjectItem[]): void {
     this.recoveryTickets = new Set(items.filter(i => i.labels.includes("orchestrator:fixing"))
       .map(i => `${this.project}#${i.issueNumber}`));
-    for (const p of this.pending.values()) if (!p.run) p.offer.recovery = this.recoveryTickets.has(p.offer.ticket);
+    for (const p of this.pending.values()) if (!p.run && p.offer.role !== 'recovery') {
+      p.offer.recovery = this.recoveryTickets.has(p.offer.ticket);
+      p.offer.recoveryError = p.offer.recovery;
+    }
   }
   private name(ticket: string, role: string): string { return `${ticket}/${role}`; }
   offer(issue: number | string, role: string, resource: ResourceClass, locks: string[] = [], order = 0): Pending {
@@ -99,6 +104,7 @@ export class ManagedDispatch {
       pending = { offer: { project: this.project, ticket, role, resource, locks, key: randomUUID(), order } };
       this.pending.set(name, pending);
     }
+    pending.retired = false;
     // Order is scheduling metadata, not part of the durable run identity.
     if (!pending.run) {
       pending.offer.order = order;
@@ -110,28 +116,33 @@ export class ManagedDispatch {
     const pending = this.offer(item.issueNumber, agent.name, this.classes[agent.name] ?? DEFAULT_RESOURCE_CLASSES[agent.name] ?? "heavy",
       agent.serial ? [`${this.project}:role:${agent.name}`] : [], order);
     pending.offer.roleLimit = agent.serial ? 1 : agent.maxInFlight;
-    if (!pending.run) pending.offer.recovery = item.labels.includes("orchestrator:fixing");
+    if (!pending.run) {
+      pending.offer.recovery = item.labels.includes("orchestrator:fixing");
+      pending.offer.recoveryError = pending.offer.recovery;
+    }
     return pending;
   }
-  ready(pending: Pending): boolean { return !this.draining && !!pending.run && !this.running.has(pending.run.id); }
+  ready(pending: Pending): boolean { return !this.draining && !pending.retired && !!pending.run && !this.running.has(pending.run.id); }
+  private offers(exclude?: Pending): WorkOffer[] {
+    return [...this.pending.values()].filter(p => p !== exclude && !p.retired
+      && Date.now() >= (this.cooldown.get(this.name(p.offer.ticket, p.offer.role)) ?? 0)).map(p => p.offer);
+  }
   async endCycle(): Promise<void> {
     const retired = [...this.pending].filter(([name, pending]) =>
       !this.seen.has(name) && !(pending.run && this.running.has(pending.run.id)));
     if (retired.length) {
-      // Stop publishing before forgetting offers. A start may have committed
-      // without reaching sync's cached grants. Withdraw waits for that start
-      // and returns every session reservation, including those unseen grants.
+      for (const [, pending] of retired) pending.retired = true;
+      // Replace the queue in one operation. Surviving offers stay visible.
+      // Wait for uncertain admissions before cancelling only retired grants.
       while (this.syncing) await sleep(20);
       this.syncing = true;
       try {
-        const runs = await this.connection.call<FleetRun[]>("/withdraw", { session: this.session });
+        const runs = await this.connection.call<FleetRun[]>('/replace', { session: this.session, offers: this.offers() });
         for (const [name, pending] of retired) {
           const run = runs.find(r => r.id === offerId(r.machine, this.session, pending.offer));
           if (run && !this.running.has(run.id)) await this.finish(run, false, true); // Never started: safe to cancel.
           this.pending.delete(name);
         }
-        // Current offers and running jobs remain intact. sync republishes
-        // them with their original keys and recovers their existing grants.
       } finally { this.syncing = false; }
     }
     await this.sync();
@@ -141,8 +152,7 @@ export class ManagedDispatch {
     this.syncing = true;
     try {
       const state = await this.connection.call<FleetSnapshot & { machine: string; draining: boolean }>("/state");
-      const runs = await this.connection.call<FleetRun[]>("/offers", { session: this.session, offers: [...this.pending.values()]
-        .filter(p => Date.now() >= (this.cooldown.get(this.name(p.offer.ticket, p.offer.role)) ?? 0)).map(p => p.offer) });
+      const runs = await this.connection.call<FleetRun[]>("/offers", { session: this.session, offers: this.offers() });
       this.state = state;
       this.draining = state.draining || this.draining;
       let fresh = false;
@@ -156,7 +166,7 @@ export class ManagedDispatch {
       for (const run of state.runs) {
         if (run.machine !== state.machine || run.project !== this.project || run.session !== this.session || this.running.has(run.id)) continue;
         const pending = this.pending.get(this.name(run.ticket, run.role));
-        if (pending && offerId(state.machine, this.session, pending.offer) === run.id) continue;
+        if (pending && !pending.retired && offerId(state.machine, this.session, pending.offer) === run.id) continue;
         // Admission may have committed after an ungranted offer disappeared.
         // Only this live session knows this run never entered run(), whose
         // running entry lasts through child exit and finish acknowledgement.
@@ -169,7 +179,7 @@ export class ManagedDispatch {
   anyGranted(): Promise<void> {
     return new Promise(resolve => { this.wake = resolve; });
   }
-  async run<T>(pending: Pending, work: () => Promise<T>): Promise<T> {
+  async run<T>(pending: Pending, work: () => Promise<T>, recovery?: CompletionRecovery): Promise<T> {
     if (!this.ready(pending)) throw new Error("No managed run grant");
     const run = pending.run!;
     this.running.add(run.id);
@@ -185,10 +195,47 @@ export class ManagedDispatch {
       } finally {
         const groups = currentRun.getStore()!.groups;
         while ([...groups].some(managedGroupAlive)) await sleep(1000);
-        // Never free a slot on an uncertain reply or on parent-process exit alone.
-        while (true) {
-          try { await this.finish(run, completed); break; }
-          catch { await sleep(5000); }
+        if (recovery) {
+          // Keep the slot until fresh failure evidence and its successor offer
+          // are recorded. The authority commits the incident with slot release.
+          while (this.syncing) await sleep(20);
+          this.syncing = true;
+          try {
+            let prepared = false, observation: RecoveryObservation | undefined, successor: Pending | undefined;
+            while (true) {
+              try {
+                if (!prepared) {
+                  const item = await recovery.observe();
+                  observation = item ? observationFor(this.project, item) : undefined;
+                  const trigger = observation && recoveryTrigger(observation);
+                  if (trigger && !trigger.manual) {
+                    successor = this.offer(item!.issueNumber, 'recovery', 'heavy', [], -4);
+                    successor.offer.roleLimit = 1;
+                    successor.offer.requiresRecovery = true;
+                    successor.offer.recoveryError = trigger.reason.startsWith('error:');
+                  }
+                  prepared = true;
+                }
+                await this.connection.call('/offers', { session: this.session, offers: this.offers(pending) });
+                const result = await this.connection.call<{ incidents?: RecoveryIncident[] }>('/finish', { session: this.session, id: run.id, completed, observation });
+                const incidents = result.incidents ?? [];
+                if (successor && !incidents.some(i => i.state === 'queued' && i.current !== false)) {
+                  successor.retired = true;
+                }
+                recovery.onRecovery(incidents);
+                break;
+              } catch (error) {
+                console.error('Completion handoff pending:', error instanceof Error ? error.message : error);
+                await sleep(5000);
+              }
+            }
+          } finally { this.syncing = false; }
+        } else {
+          // Never free a slot on an uncertain reply or on parent-process exit alone.
+          while (true) {
+            try { await this.finish(run, completed); break; }
+            catch { await sleep(5000); }
+          }
         }
         this.running.delete(run.id);
         this.pending.delete(this.name(pending.offer.ticket, pending.offer.role));

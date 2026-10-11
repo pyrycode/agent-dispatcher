@@ -53,13 +53,16 @@ export function recoveryTrigger(o: RecoveryObservation): { reason: string; manua
     ? { reason: `Pipeline pause: ${o.pause.reason}`, manual: false }
     : { reason: "Pause origin unknown; record who paused this ticket and the reopening condition", manual: true };
   if (o.labels.some(l => /permission_denied/.test(l))) return { reason: "Denied permission needs an operator", manual: true };
-  if (o.blocked) return { reason: "Dependency evidence and coordination reassessment", manual: false };
   // Health holds and pending transient retries keep their existing recovery.
   // A stage error means retries have stopped, so it needs diagnosis, not a blind retry.
   if (o.labels.some(l => l.startsWith("health-hold:"))) return null;
   const errors = o.labels.filter(l => l.startsWith("error:") && l !== "error:family-breaker");
   if (errors.length) return { reason: errors.sort().join(", "), manual: false };
+  if (o.blocked) return { reason: "Dependency evidence and coordination reassessment", manual: false };
   if (o.labels.some(l => l.startsWith("error-retry-count:"))) return null;
+  // The assigned repair already addresses these retained historical counts.
+  // A new stage error still triggers diagnosis above.
+  if (o.labels.includes("orchestrator:fixing")) return null;
   if (o.labels.some(l => /^rework-count:\d+$/.test(l) && Number(l.split(":")[1]) >= 2)) return { reason: "Repeated review rework", manual: false };
   if (o.status === "Inbox" && o.labels.some(l => l === RECOVERY_RETURNED_INBOX || l === "needs-real-claude" || l === "done:refiner")) return { reason: "Pipeline evidence or refinement is needed in Inbox", manual: false };
   return null;
@@ -95,7 +98,7 @@ export class RecoveryLedger {
       state: r.state as RecoveryIncident["state"], created: Number(r.created), updated: Number(r.updated), runId: r.run_id as string | null,
       decision: r.decision ? JSON.parse(String(r.decision)) : null, current: r.present === 1 }));
   }
-  report(machine: string, project: string, observations: RecoveryObservation[], fleet: FleetSnapshot): RecoveryIncident[] {
+  report(machine: string, project: string, observations: RecoveryObservation[], fleet: FleetSnapshot, partial = false): RecoveryIncident[] {
     validateObservations(project, observations);
     const active = new Set(fleet.runs.map(r => r.ticket));
     const seen = new Set<string>();
@@ -167,7 +170,7 @@ export class RecoveryLedger {
       this.db.prepare("INSERT INTO fleet_recovery VALUES (?,?,?,?,?,?,?,NULL,NULL,1)").run(id, o.ticket, fingerprint, trigger.reason, trigger.manual ? "escalated" : "queued", this.now(), this.now());
       if (trigger.manual) newAlerts.add(id);
     }
-    for (const row of this.db.prepare("SELECT id,ticket FROM fleet_recovery WHERE ticket LIKE ? AND present=1").all(`${project}#%`)) {
+    for (const row of partial ? [] : this.db.prepare("SELECT id,ticket FROM fleet_recovery WHERE ticket LIKE ? AND present=1").all(`${project}#%`)) {
       const ticket = String(row.ticket);
       if (!seen.has(ticket) && !active.has(ticket) && !fleet.claims.some(c => c.ticket === ticket && c.machine !== machine)) {
         this.db.prepare("UPDATE fleet_recovery SET present=0, state=CASE WHEN state='queued' THEN 'resolved' ELSE state END, updated=? WHERE id=?").run(this.now(), row.id);

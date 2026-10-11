@@ -42,6 +42,7 @@ export class MachineManager {
       if (item.project !== project || typeof item.key !== "string" || !item.key || item.key.length > 200 || keys.has(item.key) || !Number.isFinite(item.order)) throw new Error("Invalid offer");
       keys.add(item.key);
       if (item.recovery !== undefined && typeof item.recovery !== "boolean") throw new Error("Invalid recovery priority");
+      if (item.recoveryError !== undefined && typeof item.recoveryError !== 'boolean') throw new Error('Invalid error priority');
       validateStart({ ...item, id: offerId(this.config.machine, session, item), machine: this.config.machine, session });
     }
     const old = this.offers.get(project);
@@ -56,20 +57,30 @@ export class MachineManager {
     return promise;
   }
   private async tickOnce(): Promise<void> {
-    const state = await this.claims.snapshot();
-    const offers = [...this.offers.values()].filter(o => this.now() - o.at < 180_000).flatMap(o => o.work).filter(o => !this.finished.has(`${o.project}/${o.key}`));
-    const selected = scheduleMachine({ ...this.config, offers, state });
-    for (const job of selected) {
+    const attempted = new Set<string>();
+    while (!this.draining) {
+      const state = await this.claims.snapshot();
       if (this.draining) break;
+      const offers = [...this.offers.values()].filter(o => this.now() - o.at < 180_000).flatMap(o => o.work)
+        .filter(o => !this.finished.has(`${o.project}/${o.key}`) && !attempted.has(`${o.project}/${o.key}`));
+      const job = scheduleMachine({ ...this.config, offers, state })[0];
+      if (!job) break;
+      attempted.add(`${job.project}/${job.key}`);
       if (!acceptsDuringProjectDrain(job, this.config.machine, this.config.drainingProjects ?? [], state)) continue;
       const current = this.offers.get(job.project);
       if (!current || !current.work.some(w => w.key === job.key) || this.now() - current.at >= 180_000) continue;
       // A lost reply leaves a durable reservation. grants() recovers that exact
       // run from the server; it never guesses that a timed-out start failed.
-      const { key: _key, order: _order, recovery: _recovery, ...request } = job;
+      const { key: _key, order: _order, recovery: _recovery, recoveryError: _error, ...request } = job;
       const result = await this.claims.start({ ...request, id: offerId(this.config.machine, current.session, job), machine: this.config.machine, session: current.session });
       if (!result.ok && result.reason === "finished") this.finished.add(`${job.project}/${job.key}`);
     }
+  }
+  async replace(project: string, session: string, work: WorkOffer[]): Promise<FleetRun[]> {
+    // Survivors remain published while an already-sent admission settles.
+    this.offer(project, session, work);
+    try { await this.tickPromise; } catch { /* snapshot recovers uncertain starts */ }
+    return (await this.claims.snapshot()).runs.filter(r => r.machine === this.config.machine && r.project === project && r.session === session);
   }
   async withdraw(project: string, session: string): Promise<FleetRun[]> {
     const current = this.offers.get(project);
@@ -157,7 +168,12 @@ export async function serveManager(manager: MachineManager, projectTokens: Recor
         return send(200, await manager.grants(project, body.session));
       }
       if (req.url === "/withdraw") return send(200, await manager.withdraw(project, body.session));
+      if (req.url === '/replace') return send(200, await manager.replace(project, body.session, body.offers));
       if (req.url === "/finish") {
+        if (body.observation !== undefined) {
+          if (!manager.claims.call || body.observation?.ticket?.split('#')[0] !== project) throw new Error('Completion project mismatch');
+          return send(200, await manager.claims.call('/finish', body));
+        }
         await manager.finish(project, body.session, body.id, body.completed !== false, body.unused === true);
         return send(200, { ok: true });
       }

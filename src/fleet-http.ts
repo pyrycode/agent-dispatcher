@@ -95,8 +95,8 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
       }
       if (req.url === "/finish") {
         if (!machine) return send(403, { error: "Machine credential required" });
-        store.finish(machine, body.session, body.id, body.completed !== false, body.unused === true);
-        return send(200, { ok: true });
+        const incidents = store.finish(machine, body.session, body.id, body.completed !== false, body.unused === true, body.observation);
+        return send(200, { ok: true, incidents });
       }
       if (req.url === "/authorize") {
         if (!machine) return send(403, { error: "Machine credential required" });
