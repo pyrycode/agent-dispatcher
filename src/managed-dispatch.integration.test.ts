@@ -106,9 +106,9 @@ test("a builder admission committed after its Backlog handback is cancelled befo
   const tick = manager.tick(); await requested;
   // The completed builder has returned the card to Backlog before its stale
   // admission commits. The dispatcher never received or launched that grant.
-  managed.beginCycle(); const refiner = managed.offer(1905, "refiner", "light"); await managed.endCycle();
-  admit(); await tick;
-  assert.equal(store.snapshot().runs[0].role, "builder", "reproduce the late stale-stage grant");
+  managed.beginCycle(); const refiner = managed.offer(1905, "refiner", "light");
+  const transition = managed.endCycle();
+  admit(); await tick; await transition;
   await managed.sync();
   assert.equal(store.snapshot().runs.length, 0, "the live session can prove this exact grant never launched");
   assert.deepEqual(store.snapshot().claims, [originalClaim]);
@@ -144,4 +144,71 @@ test("an unseen grant retains old-session ownership while same-session cancellat
   unavailable = false; await managed.sync();
   assert.deepEqual(store.snapshot().runs, before.runs.filter(r => r.id === "uncertain"));
   assert.deepEqual(store.snapshot().claims, before.claims.filter(c => c.ticket === `${project}#2`));
+});
+
+
+test("stage withdrawal recovers a grant committed before the dispatcher received it", async t => {
+  const store = new FleetStore(":memory:", { mac: { heavyLimit: 1, combinedLimit: 2 } });
+  const claimsServer = await serveFleet(store, { mac: "mac-test" }, "admin-test", 0);
+  let release!: () => void;
+  const barrier = new Promise<void>(resolve => { release = resolve; });
+  let started!: () => void;
+  const starting = new Promise<void>(resolve => { started = resolve; });
+  const client = new FleetClient(url(claimsServer), "mac-test");
+  const manager = new MachineManager({ machine: "mac", heavyLimit: 1, combinedLimit: 2, projects: ["org/core"] }, {
+    snapshot: () => client.snapshot(),
+    start: async request => { started(); await barrier; return client.start(request); },
+    finish: (...args) => client.finish(...args),
+  });
+  const managerServer = await serveManager(manager, { "org/core": "project-test" }, "operator-test", 0);
+  const managed = new ManagedDispatch("org/core", { PYRY_MANAGER_URL: url(managerServer), PYRY_MANAGER_TOKEN: "project-test" });
+  t.after(async () => { release(); await managed.stop(); await close(managerServer); await close(claimsServer); store.close(); });
+  await managed.start();
+  managed.beginCycle();
+  managed.offer(3089, "verifier", "heavy");
+  await managed.endCycle();
+  const tick = manager.tick();
+  await starting;
+  managed.beginCycle();
+  const builder = managed.offer(3089, "builder", "medium");
+  const transition = managed.endCycle();
+  release();
+  await tick;
+  await transition;
+  assert.equal(store.snapshot().runs.some(run => run.role === "verifier"), false);
+  await manager.tick();
+  await managed.sync();
+  assert.equal(managed.ready(builder), true);
+});
+
+
+test("withdrawing outdated offers preserves an already running job", async t => {
+  const store = new FleetStore(":memory:", { mac: { heavyLimit: 1, combinedLimit: 2 } });
+  const claimsServer = await serveFleet(store, { mac: "mac-test" }, "admin-test", 0);
+  const manager = new MachineManager({ machine: "mac", heavyLimit: 1, combinedLimit: 2, projects: ["org/core"] }, new FleetClient(url(claimsServer), "mac-test"));
+  const managerServer = await serveManager(manager, { "org/core": "project-test" }, "operator-test", 0);
+  const managed = new ManagedDispatch("org/core", { PYRY_MANAGER_URL: url(managerServer), PYRY_MANAGER_TOKEN: "project-test" });
+  let release!: () => void;
+  const barrier = new Promise<void>(resolve => { release = resolve; });
+  let started!: () => void;
+  const starting = new Promise<void>(resolve => { started = resolve; });
+  let activeRun: Promise<unknown> | undefined;
+  t.after(async () => { release(); await activeRun; await managed.stop(); await close(managerServer); await close(claimsServer); store.close(); });
+  await managed.start();
+  managed.beginCycle();
+  const active = managed.offer(1, "builder", "medium");
+  managed.offer(2, "verifier", "heavy");
+  await managed.endCycle();
+  await manager.tick();
+  await managed.sync();
+  activeRun = managed.run(active, async () => { started(); await barrier; });
+  await starting;
+  managed.beginCycle();
+  await managed.endCycle();
+  assert.deepEqual(store.snapshot().runs.map(run => run.ticket), ["org/core#1"]);
+  assert.equal(store.snapshot().claims.some(claim => claim.ticket === "org/core#2"), false);
+  release();
+  await activeRun;
+  assert.deepEqual(store.snapshot().runs, []);
+  assert.equal(store.snapshot().claims[0]?.ticket, "org/core#1");
 });
