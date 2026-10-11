@@ -55,7 +55,7 @@ describe("priority labels decide dispatch order", () => {
     assert.deepEqual(candidates.map(c => c.item.issueNumber), [2]);
   });
 
-  test("priority does not bypass in-flight caps or ticket and family holds", () => {
+  test("priority respects in-flight caps and ticket holds while retired family labels are inert", () => {
     const documentation = pollOrder.find(a => a.name === "documentation")!;
     const blocked = { ...item(2, ["priority:high"]), blockedBy: [{ number: 99, state: "OPEN" as const }] };
     const familyHeld = { ...item(3, ["priority:high"]), parentNumber: 100 };
@@ -68,7 +68,7 @@ describe("priority labels decide dispatch order", () => {
       rootLabelsByIssue: new Map([[100, ["error:family-breaker"]]]),
       maxConcurrent: 3,
     });
-    assert.deepEqual(candidates.map(c => c.item.issueNumber), [4]);
+    assert.deepEqual(candidates.map(c => c.item.issueNumber), [3, 4]);
   });
 
   test("unknown labels are unmarked and conflicting labels use the highest rank", () => {

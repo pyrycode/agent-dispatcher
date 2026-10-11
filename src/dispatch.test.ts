@@ -66,8 +66,8 @@ import {
   reworkAnswersPath,
   salvagePartialWork,
   strandedWipMinAgeMs,
-  runFamilyBreaker,
-  selectPastParkedFamilies,
+  readFamilyDispatchTallies,
+  selectWithFamilyAccounting,
   runPreDispatchPrep,
   claimForDispatch,
   releaseDispatchClaim,
@@ -7552,7 +7552,7 @@ describe("spawnGateCommand — the real spawner", () => {
 });
 
 // =====================================================================
-// runFamilyBreaker — the family circuit breaker's veto seam
+// readFamilyDispatchTallies — the family circuit breaker's veto seam
 // =====================================================================
 //
 // Sits between selectDispatches and runPreDispatchPrep, before any
@@ -7562,166 +7562,7 @@ describe("spawnGateCommand — the real spawner", () => {
 // whose family is at/over PYRY_FAMILY_DISPATCH_LIMIT — parking the root
 // with error:family-breaker and one deduped explanatory comment.
 
-describe("runFamilyBreaker — veto seam", () => {
-  const DEV = AGENTS.find(a => a.name === "developer")!;
-  const child = (n: number, root: number) =>
-    makeProjectItem({ issueNumber: n, parentNumber: root, url: `https://github.com/test/repo/issues/${n}` });
 
-  test("a family under the threshold passes every candidate through untouched", async () => {
-    const client = new MockGitHubClient();
-    client.familyStateByIssue.set(40, { markerCount: 23, breakerCommented: false });
-    const candidates = [{ agent: DEV, item: child(41, 40) }];
-
-    const out = await runFamilyBreaker(candidates, client, { threshold: 24 });
-
-    assert.deepEqual(out.kept, candidates);
-    assert.equal(out.tallies.get(40), 23);
-    assert.equal(client.addLabelCalls.length, 0);
-    assert.equal(client.comments.length, 0);
-  });
-
-  test("a family at the threshold drops the candidate and parks the ROOT, not the candidate", async () => {
-    const client = new MockGitHubClient();
-    client.familyStateByIssue.set(40, { markerCount: 24, breakerCommented: false });
-    const candidates = [{ agent: DEV, item: child(41, 40) }];
-
-    const out = await runFamilyBreaker(candidates, client, { threshold: 24 });
-
-    assert.deepEqual(out.kept, []);
-    // The park switch lands on the family root #40, never on the child.
-    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 40, label: FAMILY_BREAKER_LABEL }]);
-    assert.equal(client.comments.length, 1);
-    assert.equal(client.comments[0].issueNumber, 40);
-    assert.ok(client.comments[0].body.includes(FAMILY_BREAKER_COMMENT_MARKER), "trip comment carries the dedupe marker");
-    assert.ok(client.comments[0].body.includes("24"), "trip comment carries the tally and threshold");
-    assert.ok(client.comments[0].body.includes(FAMILY_BREAKER_LABEL), "trip comment tells the operator which label resumes the family");
-  });
-
-  test("a grandchild is vetoed through its grandparent root", async () => {
-    const client = new MockGitHubClient();
-    client.familyStateByIssue.set(40, { markerCount: 30, breakerCommented: true });
-    const grandchild = makeProjectItem({ issueNumber: 42, parentNumber: 41, grandparentNumber: 40 });
-
-    const out = await runFamilyBreaker([{ agent: DEV, item: grandchild }], client, { threshold: 24 });
-
-    assert.deepEqual(out.kept, []);
-    assert.equal(client.getFamilyDispatchStateCalls[0], 40);
-  });
-
-  test("the trip comment posts once — a family that already explained itself is dropped quietly", async () => {
-    const client = new MockGitHubClient();
-    client.familyStateByIssue.set(40, { markerCount: 30, breakerCommented: true });
-
-    const out = await runFamilyBreaker([{ agent: DEV, item: child(41, 40) }], client, { threshold: 24 });
-
-    assert.deepEqual(out.kept, []);
-    assert.equal(client.comments.length, 0, "no second trip comment across cycles");
-  });
-
-  test("a root already wearing the breaker label is not relabelled", async () => {
-    const client = new MockGitHubClient();
-    client.familyStateByIssue.set(40, { markerCount: 30, breakerCommented: true });
-
-    const out = await runFamilyBreaker([{ agent: DEV, item: child(41, 40) }], client, {
-      threshold: 24,
-      rootLabelsByIssue: new Map([[40, [FAMILY_BREAKER_LABEL]]]),
-    });
-
-    assert.deepEqual(out.kept, []);
-    assert.equal(client.addLabelCalls.length, 0, "label already present — no churn");
-  });
-
-  test("one tally fetch per family root per cycle serves every candidate of that family", async () => {
-    const client = new MockGitHubClient();
-    client.familyStateByIssue.set(40, { markerCount: 30, breakerCommented: false });
-    const candidates = [
-      { agent: DEV, item: child(41, 40) },
-      { agent: DEV, item: child(43, 40) },
-    ];
-
-    const out = await runFamilyBreaker(candidates, client, { threshold: 24 });
-
-    assert.deepEqual(out.kept, []);
-    assert.deepEqual(client.getFamilyDispatchStateCalls, [40], "one comments fetch for the shared root");
-    assert.equal(client.addLabelCalls.length, 1, "park switch applied once");
-    assert.equal(client.comments.length, 1, "trip comment posted once");
-  });
-
-  test("a tally fetch failure fails open — the candidate dispatches and the cycle survives", async () => {
-    const client = new MockGitHubClient();
-    client.failures.getFamilyDispatchState = new Error("comments API down");
-    const candidates = [{ agent: DEV, item: child(41, 40) }];
-
-    const out = await runFamilyBreaker(candidates, client, { threshold: 24 });
-
-    assert.deepEqual(out.kept, candidates, "a missed veto costs one dispatch; a crashed cycle costs everything");
-    assert.equal(client.addLabelCalls.length, 0);
-    assert.equal(client.comments.length, 0);
-  });
-
-  test("when comments are unreadable the convenience label is the fallback and can still trip the breaker", async () => {
-    const client = new MockGitHubClient();
-    client.failures.getFamilyDispatchState = new Error("comments API down");
-
-    const out = await runFamilyBreaker([{ agent: DEV, item: child(41, 40) }], client, {
-      threshold: 24,
-      rootLabelsByIssue: new Map([[40, ["family-dispatches:30"]]]),
-    });
-
-    assert.deepEqual(out.kept, []);
-    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 40, label: FAMILY_BREAKER_LABEL }]);
-  });
-
-  test("a convenience label lying high does not park a family whose comments say otherwise", async () => {
-    // The disagreement case: comments are the source of truth.
-    const client = new MockGitHubClient();
-    client.familyStateByIssue.set(40, { markerCount: 3, breakerCommented: false });
-    const candidates = [{ agent: DEV, item: child(41, 40) }];
-
-    const out = await runFamilyBreaker(candidates, client, {
-      threshold: 24,
-      rootLabelsByIssue: new Map([[40, ["family-dispatches:50"]]]),
-    });
-
-    assert.deepEqual(out.kept, candidates);
-    assert.equal(client.addLabelCalls.length, 0);
-  });
-
-  test("a ticket with no parent is its own family root and parks itself at the threshold", async () => {
-    const client = new MockGitHubClient();
-    client.familyStateByIssue.set(100, { markerCount: 24, breakerCommented: false });
-    const item = makeProjectItem({ issueNumber: 100 });
-
-    const out = await runFamilyBreaker([{ agent: DEV, item }], client, { threshold: 24 });
-
-    assert.deepEqual(out.kept, []);
-    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 100, label: FAMILY_BREAKER_LABEL }]);
-    assert.equal(client.comments[0].issueNumber, 100);
-  });
-
-  test("mixed candidates: only the tripped family is dropped, the healthy one dispatches", async () => {
-    const client = new MockGitHubClient();
-    client.familyStateByIssue.set(40, { markerCount: 24, breakerCommented: false });
-    client.familyStateByIssue.set(50, { markerCount: 2, breakerCommented: false });
-    const healthy = { agent: DEV, item: child(51, 50) };
-
-    const out = await runFamilyBreaker([{ agent: DEV, item: child(41, 40) }, healthy], client, { threshold: 24 });
-
-    assert.deepEqual(out.kept, [healthy]);
-    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 40, label: FAMILY_BREAKER_LABEL }]);
-  });
-
-  test("a label-add failure on trip is swallowed — the candidate still drops and the cycle survives", async () => {
-    const client = new MockGitHubClient();
-    client.familyStateByIssue.set(40, { markerCount: 24, breakerCommented: false });
-    client.failures.addLabel = new Error("label write failed");
-    client.failures.addComment = new Error("comment write failed");
-
-    const out = await runFamilyBreaker([{ agent: DEV, item: child(41, 40) }], client, { threshold: 24 });
-
-    assert.deepEqual(out.kept, [], "the veto holds even when the park bookkeeping fails");
-  });
-});
 
 // =====================================================================
 // runPreDispatchPrep — family dispatch accounting
@@ -7856,89 +7697,10 @@ describe("runPreDispatchPrep — family dispatch accounting", () => {
 });
 
 // =====================================================================
-// runFamilyBreaker — per-family reset and resume
+// readFamilyDispatchTallies — per-family reset and resume
 // =====================================================================
 
-describe("runFamilyBreaker — per-family reset", () => {
-  const DEV = AGENTS.find(a => a.name === "developer")!;
-  const child = (n: number, root: number) =>
-    makeProjectItem({ issueNumber: n, parentNumber: root });
 
-  test("the trip comment instructs the two-step resume: reset comment first, then the label — env knob only as global fallback", async () => {
-    const client = new MockGitHubClient();
-    client.familyStateByIssue.set(40, { markerCount: 24, breakerCommented: false });
-
-    await runFamilyBreaker([{ agent: DEV, item: child(41, 40) }], client, { threshold: 24 });
-
-    assert.equal(client.comments.length, 1);
-    const body = client.comments[0].body;
-    assert.ok(body.includes(FAMILY_DISPATCH_RESET_MARKER), "operator must be shown the exact reset marker to post");
-    assert.ok(body.includes(FAMILY_BREAKER_LABEL), "operator must be told which label to remove");
-    assert.ok(body.includes("PYRY_FAMILY_DISPATCH_LIMIT"), "env knob stays documented as the global fallback");
-  });
-
-  test("a reset comment zeroes the family tally so the freed family dispatches again", async () => {
-    const client = new MockGitHubClient();
-    client.familyStateByIssue.set(40, { markerCount: 24, breakerCommented: false });
-    // Operator posted the reset marker on the root.
-    await client.addComment(40, `${FAMILY_DISPATCH_RESET_MARKER} resuming after fixing the split loop`);
-    const candidates = [{ agent: DEV, item: child(41, 40) }];
-
-    const out = await runFamilyBreaker(candidates, client, { threshold: 24 });
-
-    assert.deepEqual(out.kept, candidates, "post-reset the tally is 0 — the family flows");
-    assert.equal(out.tallies.get(40), 0, "prep numbering restarts from the reset");
-    assert.ok(!client.addLabelCalls.some(c => c.label === FAMILY_BREAKER_LABEL), "no re-park after a reset");
-  });
-
-  test("trip, reset, resume, second runaway: the breaker trips again and posts a FRESH explanation", async () => {
-    const client = new MockGitHubClient();
-    client.familyStateByIssue.set(40, { markerCount: 24, breakerCommented: false });
-    const candidates = [{ agent: DEV, item: child(41, 40) }];
-
-    // Cycle 1: the family trips and explains itself.
-    const first = await runFamilyBreaker(candidates, client, { threshold: 24 });
-    assert.deepEqual(first.kept, []);
-    assert.equal(client.comments.filter(c => c.body.includes(FAMILY_BREAKER_COMMENT_MARKER)).length, 1);
-
-    // Operator resumes: reset comment, then removes the label (the label
-    // never reached rootLabelsByIssue here, so nothing else to clear).
-    await client.addComment(40, `${FAMILY_DISPATCH_RESET_MARKER} resuming`);
-
-    // Cycle 2: family flows again.
-    const second = await runFamilyBreaker(candidates, client, { threshold: 24 });
-    assert.deepEqual(second.kept, candidates);
-
-    // The resumed family runs away again: 24 fresh dispatch markers.
-    for (let i = 1; i <= 24; i++) {
-      await client.addComment(40, `${FAMILY_DISPATCH_COMMENT_MARKER}\n🧮 Family dispatch ${i}`);
-    }
-
-    // Cycle 3: trips again AND explains again — the pre-reset trip comment
-    // must not suppress the fresh explanation.
-    const third = await runFamilyBreaker(candidates, client, { threshold: 24 });
-    assert.deepEqual(third.kept, []);
-    assert.equal(
-      client.comments.filter(c => c.body.includes(FAMILY_BREAKER_COMMENT_MARKER)).length,
-      2,
-      "a second runaway after a reset gets its own trip comment",
-    );
-  });
-
-  test("the trip comment's own reset-marker mention does not reset the tally it just tripped on", async () => {
-    const client = new MockGitHubClient();
-    client.familyStateByIssue.set(40, { markerCount: 24, breakerCommented: false });
-    const candidates = [{ agent: DEV, item: child(41, 40) }];
-
-    // Trip posts the explanation (whose body quotes the reset marker).
-    await runFamilyBreaker(candidates, client, { threshold: 24 });
-    // Next cycle: the tally must still be 24, the family still vetoed.
-    const out = await runFamilyBreaker(candidates, client, { threshold: 24 });
-
-    assert.deepEqual(out.kept, [], "a trip comment must never count as a reset");
-    assert.equal(out.tallies.get(40), 24);
-  });
-});
 
 // =====================================================================
 // maybeResumeExhaustedRun — same-dispatch resume-in-place
@@ -9245,7 +9007,7 @@ describe("stage-set threading tripwires (source assertions)", () => {
 });
 
 // =====================================================================
-// selectPastParkedFamilies — the board must not starve behind a parked
+// selectWithFamilyAccounting — the board must not starve behind a parked
 // family
 // =====================================================================
 //
@@ -9256,168 +9018,7 @@ describe("stage-set threading tripwires (source assertions)", () => {
 // only slot to a ticket it then threw away, and 48 unrelated tickets
 // never got looked at.
 
-describe("selectPastParkedFamilies — a parked family must not starve the board", () => {
-  const PO = AGENTS.find(a => a.name === "po")!;
-  const child = (n: number, root: number) =>
-    makeProjectItem({ issueNumber: n, status: "Backlog", parentNumber: root });
-  const loner = (n: number) => makeProjectItem({ issueNumber: n, status: "Backlog" });
 
-  test("at concurrency 1 the slot goes to the next unrelated ticket, not to the void", async () => {
-    const client = new MockGitHubClient();
-    client.familyStateByIssue.set(1906, { markerCount: 24, breakerCommented: false });
-    // Board order is the live one: three parked descendants at the head,
-    // an unrelated ticket behind them.
-    const backlog = [child(1927, 1906), child(1928, 1906), child(1907, 1906), loner(1958)];
-
-    const out = await selectPastParkedFamilies({
-      itemsByColumn: new Map([["Backlog", backlog]]),
-      pollOrder: [PO],
-      maxConcurrent: 1,
-      client,
-      threshold: 24,
-    });
-
-    assert.equal(out.candidates.length, 1, "the cycle must dispatch, not idle");
-    assert.equal(out.candidates[0].item.issueNumber, 1958, "the slot goes to the unrelated ticket");
-  });
-
-  test("one comments fetch and one park write per root, however many passes it takes", async () => {
-    const client = new MockGitHubClient();
-    client.familyStateByIssue.set(1906, { markerCount: 24, breakerCommented: false });
-    const backlog = [child(1927, 1906), child(1928, 1906), child(1907, 1906), loner(1958)];
-
-    await selectPastParkedFamilies({
-      itemsByColumn: new Map([["Backlog", backlog]]),
-      pollOrder: [PO],
-      maxConcurrent: 1,
-      client,
-      threshold: 24,
-    });
-
-    assert.deepEqual(
-      client.getFamilyDispatchStateCalls.filter(n => n === 1906).length,
-      1,
-      "the shared cycle state means a re-selection pass refetches nothing",
-    );
-    assert.deepEqual(
-      client.addLabelCalls.filter(c => c.label === FAMILY_BREAKER_LABEL),
-      [{ issueNumber: 1906, label: FAMILY_BREAKER_LABEL }],
-      "the root is parked once, not once per pass",
-    );
-    assert.equal(
-      client.comments.filter(c => c.body.includes(FAMILY_BREAKER_COMMENT_MARKER)).length,
-      1,
-      "one trip explanation per cycle",
-    );
-  });
-
-  test("two parked families in a row both get skipped and the third family dispatches", async () => {
-    const client = new MockGitHubClient();
-    client.familyStateByIssue.set(500, { markerCount: 30, breakerCommented: false });
-    client.familyStateByIssue.set(600, { markerCount: 24, breakerCommented: false });
-    const backlog = [child(501, 500), child(601, 600), loner(700)];
-
-    const out = await selectPastParkedFamilies({
-      itemsByColumn: new Map([["Backlog", backlog]]),
-      pollOrder: [PO],
-      maxConcurrent: 1,
-      client,
-      threshold: 24,
-    });
-
-    assert.equal(out.candidates[0]?.item.issueNumber, 700);
-    assert.deepEqual([...out.cycle.vetoedRoots].sort((a, b) => a - b), [500, 600]);
-  });
-
-  test("a healthy board takes exactly one pass — no extra selection, no extra fetch", async () => {
-    const client = new MockGitHubClient();
-    const backlog = [loner(10), loner(11)];
-
-    const out = await selectPastParkedFamilies({
-      itemsByColumn: new Map([["Backlog", backlog]]),
-      pollOrder: [PO],
-      maxConcurrent: 2,
-      client,
-      threshold: 24,
-    });
-
-    assert.deepEqual(out.candidates.map(c => c.item.issueNumber), [10, 11]);
-    assert.equal(out.cycle.vetoedRoots.size, 0);
-  });
-
-  test("a board that is nothing but parked families dispatches nothing and says so", async () => {
-    const client = new MockGitHubClient();
-    client.familyStateByIssue.set(800, { markerCount: 24, breakerCommented: false });
-    const backlog = [child(801, 800), child(802, 800)];
-
-    const out = await selectPastParkedFamilies({
-      itemsByColumn: new Map([["Backlog", backlog]]),
-      pollOrder: [PO],
-      maxConcurrent: 1,
-      client,
-      threshold: 24,
-    });
-
-    assert.deepEqual(out.candidates, [], "nothing dispatchable is the honest answer here");
-    assert.deepEqual([...out.cycle.vetoedRoots], [800]);
-  });
-
-  test("the pass cap bounds the work and still dispatches what it found", async () => {
-    const client = new MockGitHubClient();
-    // Five parked families ahead of the healthy ticket, two passes allowed.
-    for (const root of [10, 20, 30, 40, 50]) {
-      client.familyStateByIssue.set(root, { markerCount: 24, breakerCommented: false });
-    }
-    const backlog = [
-      child(11, 10), child(21, 20), child(31, 30), child(41, 40), child(51, 50), loner(99),
-    ];
-
-    const out = await selectPastParkedFamilies({
-      itemsByColumn: new Map([["Backlog", backlog]]),
-      pollOrder: [PO],
-      maxConcurrent: 1,
-      client,
-      threshold: 24,
-      maxPasses: 2,
-    });
-
-    assert.deepEqual(out.candidates, [], "the cap holds — this cycle gives up rather than walking the board");
-    assert.equal(out.cycle.vetoedRoots.size, 2, "but every family it did examine is parked on the board");
-    // The next cycle starts with those two vetoed at selection for free,
-    // so progress is monotonic even when the cap bites.
-    const next = await selectPastParkedFamilies({
-      itemsByColumn: new Map([["Backlog", backlog]]),
-      pollOrder: [PO],
-      maxConcurrent: 1,
-      rootLabelsByIssue: new Map([[10, [FAMILY_BREAKER_LABEL]], [20, [FAMILY_BREAKER_LABEL]]]),
-      client,
-      threshold: 24,
-      maxPasses: 2,
-    });
-    assert.equal(next.cycle.vetoedRoots.size, 2, "two fresh families examined, not the two already labelled");
-  });
-
-  test("an already-labelled root costs no pass at all — the label veto absorbs it at selection", async () => {
-    const client = new MockGitHubClient();
-    client.familyStateByIssue.set(1906, { markerCount: 24, breakerCommented: true });
-    const backlog = [child(1927, 1906), loner(1958)];
-
-    const out = await selectPastParkedFamilies({
-      itemsByColumn: new Map([["Backlog", backlog]]),
-      pollOrder: [PO],
-      maxConcurrent: 1,
-      rootLabelsByIssue: new Map([[1906, [FAMILY_BREAKER_LABEL]]]),
-      client,
-      threshold: 24,
-    });
-
-    assert.equal(out.candidates[0]?.item.issueNumber, 1958);
-    assert.ok(
-      !client.getFamilyDispatchStateCalls.includes(1906),
-      "the parked root costs no tally fetch — selection never offered its child",
-    );
-  });
-});
 
 // A Codex run stopped by the wall clock gets the same continuation as
 // Claude, resuming its own thread through Codex. Approved 2026-10-05.
@@ -10021,7 +9622,7 @@ describe("runEnvPreflight — a required variable missing from the dispatcher ho
     const src = readDispatchSource();
     assert.match(src, /const gateRunner = liveGateRunnerFor\(\{\s*runner: realClaudeGateRunner, draining: drainMode, envHeld, healthFailures: gateHealthFailures\.length,\s*\}\);/);
     assert.equal((src.match(/^\s+gateRunner,$/gm) ?? []).length, 2, "both gate calls take the held runner");
-    assert.match(src, /envHeld\s*\?\s*\{ candidates: \[\], tallies: new Map<number, number>\(\) \}\s*:\s*await selectPastParkedFamilies/);
+    assert.match(src, /envHeld\s*\?\s*\{ candidates: \[\], tallies: new Map<number, number>\(\) \}\s*:\s*await selectWithFamilyAccounting/);
     assert.match(src, /if \(mainSweep !== null && mayStartMainSweep\(\{ configured: true, sweepRunning: sweepRun !== null, gateActive, envHeld, draining: drainMode \}\)\)/);
   });
 

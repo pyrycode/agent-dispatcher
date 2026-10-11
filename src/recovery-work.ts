@@ -1,6 +1,6 @@
 import { recoveryFingerprint, recoveryTrigger, hasOperatorHold, validateRecoveryDecision, RECOVERY_RETURNED_INBOX, type RecoveryDecision, type RecoveryIncident } from "./fleet-recovery.js";
 import type { AgentConfig, ProjectItem } from "./types.js";
-import { AUTO_RETRY_RESET_COMMENT_MARKER, FAMILY_BREAKER_LABEL, resolveFamilyRoot } from "./pipeline-decisions.js";
+import { AUTO_RETRY_RESET_COMMENT_MARKER } from "./pipeline-decisions.js";
 
 export const RECOVERY_INVESTIGATING = "orchestrator:investigating";
 export const RECOVERY_FIXING = "orchestrator:fixing";
@@ -20,7 +20,7 @@ refine: an Inbox investigation needs scope or portable reproduction evidence bef
 resume: a recorded pipeline pause can return to its recorded stage after its missing prerequisite is satisfied. An unknown pause origin or a human hold cannot resume automatically.
 unblock: only a recorded edit-coordination blocker whose fresh changes no longer overlap. Name the full blocker ticket. A causal repair dependency cannot be removed because it is hard to reproduce.
 propose-close: retained evidence supports a not-reproduced, obsolete or duplicate investigation outcome. Explain the exact evidence and limits. This becomes a decision in the consolidated report and never claims a bug was fixed.
-When a ticket carries error-retry-count labels, retry, rework, refine and resume require retryReset. Name the evidence that the failure cause has cleared, or the specific relevant fix assigned to the ordinary agent. An unchanged attempt or a guess is insufficient. Code records this finding and clears only the ordinary transient retry count during that handoff. Wait, escalation and closure proposals never reset it. The separate per-ticket recovery budget, review rework counters and family limits remain intact.
+When a ticket carries error-retry-count labels, retry, rework, refine and resume require retryReset. Name the evidence that the failure cause has cleared, or the specific relevant fix assigned to the ordinary agent. An unchanged attempt or a guess is insufficient. Code records this finding and clears only the ordinary transient retry count during that handoff. Wait, escalation and closure proposals never reset it. The separate per-ticket recovery budget and review rework counters remain intact. Family dispatch counts are history only and never hold work.
 For stopped runs that ended without a completed outcome, inspect saved work and actual terminal evidence. A normal exit code alone does not establish completion. Resume the unfinished stage only after the manager has no retained worker and the original cause no longer prevents execution.
 Missing remote files must first be sought in related comments and the cross-computer evidence inventory. Provide a portable reproduction recipe to the ordinary code agent when an isolated authenticated capture is needed. It uses ordinary test admission.
 escalate: an operator decision, denied permissions, uncertain worker state, or work the pipeline cannot perform. Explain what you investigated and the specific action that needs an operator. Missing evidence is grounds for escalation only after available logs and source reads cannot establish a safe action. A repository defect in build or test infrastructure can be handed to its code agent for repair.
@@ -39,14 +39,7 @@ export function parseRecoveryDecision(output: string): RecoveryDecision {
 export function observationFor(project: string, item: ProjectItem) {
   return { ticket: `${project}#${item.issueNumber}`, status: item.status, labels: item.labels,
     blocked: item.blockedBy.some(b => b.state === "OPEN"), evidenceRevision: item.evidenceRevision,
-    artifactRevision: item.artifactRevision, pause: item.recoveryPause, familyHold: item.recoveryFamilyHold };
-}
-
-/** Reuse selection's parent evidence without changing the child's real labels. */
-export function withRecoveryFamilyHold(project: string, item: ProjectItem, labels?: ReadonlyMap<number, readonly string[]>): ProjectItem {
-  const root = resolveFamilyRoot(item);
-  const rootLabels = labels?.get(root) ?? (root === item.issueNumber ? item.labels : []);
-  return { ...item, recoveryFamilyHold: rootLabels.includes(FAMILY_BREAKER_LABEL) ? `${project}#${root}` : undefined };
+    artifactRevision: item.artifactRevision, pause: item.recoveryPause };
 }
 
 export function recoveryStillCurrent(project: string, item: ProjectItem | undefined, incident: RecoveryIncident): item is ProjectItem {

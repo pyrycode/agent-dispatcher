@@ -9,7 +9,7 @@ import { FleetStore, type StartRequest } from "./fleet-store.js";
 import { FleetClient, JsonClient, serveFleet } from "./fleet-http.js";
 import { MachineManager, serveManager } from "./machine-manager.js";
 import { ManagedDispatch } from "./managed-dispatch.js";
-import { runRecoveryWork, recoveryPlan, parseRecoveryDecision, recoveryHandoff, observationFor, cleanRecoveryLabels, withRecoveryFamilyHold } from "./recovery-work.js";
+import { runRecoveryWork, recoveryPlan, parseRecoveryDecision, recoveryHandoff, observationFor, cleanRecoveryLabels } from "./recovery-work.js";
 import type { AgentConfig, ProjectItem } from "./types.js";
 import { recoveryLogContext } from "./recovery-context.js";
 
@@ -117,34 +117,9 @@ test("a pipeline return to Inbox queues one assessment without promoting ordinar
   store.close();
 });
 
-test("a parent family hold becomes a budget decision rather than repeated verifier recovery", () => {
-  const store = new FleetStore(":memory:", limits);
-  const child = Object.assign(item(["rework-count:2", "done:builder"]), {
-    issueNumber: 3163, parentNumber: 2962, recoveryFamilyHold: `${project}#2962`, status: "In Code Review",
-  });
-  const held = observationFor(project, child);
-  assert.equal(recoveryTrigger(held)?.manual, true);
-  const [incident] = store.recoveryReport("mac", project, [held]);
-  assert.equal(incident.state, "escalated");
-  assert.match(incident.reason, /org\/core#2962/);
-  assert.deepEqual(store.recoveryReport("mac", project, [held]), [], "unchanged parent hold does not buy another assessment");
-  assert.throws(() => recoveryPlan(child, { action: "rework", reason: "Try again" }, agents), /safe/);
-  const cleared = observationFor(project, { ...child, recoveryFamilyHold: undefined });
-  const [next] = store.recoveryReport("mac", project, [cleared]);
-  assert.equal(next.state, "queued", "a deliberate parent-budget change reopens normal assessment");
-  assert.notEqual(next.id, incident.id);
-  store.close();
-});
 
-test("recovery resolves a closed or archived family root without changing child labels or holding another family", () => {
-  const labels = new Map([[2962, ["error:family-breaker"]], [3121, []]]);
-  const child = { ...item(["done:builder"]), issueNumber: 3163, parentNumber: 3100, grandparentNumber: 2962 };
-  const observed = withRecoveryFamilyHold(project, child, labels);
-  assert.equal(observed.recoveryFamilyHold, `${project}#2962`);
-  assert.deepEqual(observed.labels, child.labels);
-  assert.equal(child.labels.includes("error:family-breaker"), false);
-  assert.equal(withRecoveryFamilyHold(project, { ...child, grandparentNumber: 3121 }, labels).recoveryFamilyHold, undefined);
-});
+
+
 
 test("an incident survives restart and only its admitted owner can assess it", () => {
   const path = join(mkdtempSync(join(tmpdir(), "recovery-db-")), "fleet.sqlite");
@@ -337,7 +312,7 @@ test("strict decisions and code guards cannot bypass holds, review or dependenci
   assert.throws(() => parseRecoveryDecision('{"action":"merge","reason":"Skip review"}'), /Invalid/);
   assert.throws(() => parseRecoveryDecision('{"status":"blocked","summary":"{}"}'), /did not complete/);
   const rework = { action: "rework" as const, reason: "Repair the common cause" };
-  for (const changed of [ { ...item(), status: "Halted" }, item(["error:family-breaker"]), item(["error:builder:permission_denied"]), item(["rework-count:2", "done:verifier"]), { ...item(), blockedBy: [{ number: 2, state: "OPEN" as const }] } ]) {
+  for (const changed of [ { ...item(), status: "Halted" }, item(["error:builder:permission_denied"]), item(["rework-count:2", "done:verifier"]), { ...item(), blockedBy: [{ number: 2, state: "OPEN" as const }] } ]) {
     assert.throws(() => recoveryPlan(changed, rework, agents));
   }
   const labels = ["error:rework-loop", "done:builder", "needs-rework:builder", "rework-count:6", "needs-real-claude", "claim:mac"];
