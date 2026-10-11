@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { graphql } from "@octokit/graphql";
 import { githubFetch, freshGitHubRead } from "./github-transport.js";
 import type { ProjectConfig, ProjectItem } from "./types.js";
@@ -179,11 +180,12 @@ const ISSUE_FIELDS = `
                       body
                       url
                       state
+                      comments(last: 8) { nodes { id updatedAt body } }
                       labels(first: 10) {
                         nodes { name }
                       }
                       blockedBy(first: 10) {
-                        nodes { number state }
+                        nodes { number state url updatedAt }
                       }
                       parent {
                         number
@@ -203,9 +205,14 @@ function toRawItem(itemId: string, status: string | null | undefined, content: a
     state: content.state ?? null,
     labels: content.labels.nodes.map((l: any) => l.name),
     url: content.url,
+    evidenceRevision: createHash("sha256").update(JSON.stringify([content.body ?? "",
+      (content.comments?.nodes ?? []).filter((c: any) => !/^(<!-- (?:fleet-recovery|family-dispatch|stranded-wip|auto-retry)|## Orchestrator recovery)/.test(c.body ?? ""))
+        .map((c: any) => [c.id, c.updatedAt]),
+      (content.blockedBy?.nodes ?? []).map((b: any) => [b.url, b.state, b.updatedAt])])).digest("hex"),
     blockedBy: (content.blockedBy?.nodes ?? []).map((b: any) => ({
       number: b.number,
       state: b.state,
+      ...(b.url ? { url: b.url, updatedAt: b.updatedAt } : {}),
     })),
     ...mapParentChain(content),
     ...(content.subIssuesSummary
@@ -808,6 +815,28 @@ export class GitHubProjectClient {
       throw new Error(`Could not verify #${issueNumber} is blocked by #${blockerNumber}`);
     }
     this.clearItemsCache();
+  }
+
+  async recordCoordination(_record: import("./recovery-facts.js").CoordinationRecord): Promise<void> {
+    // ManagedDispatch intercepts this method under the admitted planning run.
+    throw new Error("Coordination receipts require managed dispatch");
+  }
+
+  async removeBlocker(issueNumber: number, blockerTicket: string): Promise<void> {
+    const match = blockerTicket.match(/^([\w.-]+)\/([\w.-]+)#([1-9]\d*)$/);
+    if (!match) throw new Error("Invalid blocker ticket");
+    const data: any = await this.gql(`query($owner:String!,$repo:String!,$n:Int!,$bo:String!,$br:String!,$bn:Int!) {
+      target: repository(owner:$owner,name:$repo) { issue(number:$n) { id blockedBy(first:100) { nodes { id } pageInfo { hasNextPage } } } }
+      blocker: repository(owner:$bo,name:$br) { issue(number:$bn) { id } }
+    }`, { owner: this.config.owner, repo: this.config.repo, n: issueNumber, bo: match[1], br: match[2], bn: Number(match[3]) });
+    const target = data.target?.issue; const blocker = data.blocker?.issue;
+    if (!target?.id || !blocker?.id || target.blockedBy.pageInfo.hasNextPage) throw new Error("Blocker snapshot incomplete");
+    if (!target.blockedBy.nodes.some((b: any) => b.id === blocker.id)) return;
+    await this.gql(`mutation($issue:ID!,$blocker:ID!) { removeBlockedBy(input:{issueId:$issue,blockingIssueId:$blocker}) { issue { id } } }`, { issue: target.id, blocker: blocker.id });
+    this.clearItemsCache();
+    const verify: any = await this.gql(`query($owner:String!,$repo:String!,$n:Int!) { repository(owner:$owner,name:$repo) { issue(number:$n) { blockedBy(first:100) { nodes { id } pageInfo { hasNextPage } } } } }`, { owner:this.config.owner,repo:this.config.repo,n:issueNumber });
+    const after = verify.repository?.issue?.blockedBy;
+    if (!after || after.pageInfo.hasNextPage || after.nodes.some((b: any) => b.id === blocker.id)) throw new Error("Blocker removal not verified");
   }
 
   /**

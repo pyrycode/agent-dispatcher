@@ -1,0 +1,16 @@
+{
+  "platform": "mac",
+  "operator": "/Users/operator/.local/share/pyry-fleet/operator.sh",
+  "python": "/usr/bin/python3",
+  "stateDirectory": "/Users/operator/.local/share/pyry-fleet/supervisor",
+  "reportFile": "/Users/operator/.local/share/pyry-fleet/attention.json",
+  "intervalSeconds": 300,
+  "projects": {
+    "pyrycode/pyrycode-mobile": {
+      "agents": "/Users/operator/Workspace/Projects/pyrycode-mobile-agents",
+      "target": "/Users/operator/Workspace/Projects/pyrycode-mobile",
+      "access": "/Users/operator/.local/bin/automation-access",
+      "runner": "codex"
+    }
+  }
+}

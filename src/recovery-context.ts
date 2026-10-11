@@ -5,7 +5,7 @@ import { scrubCredentials } from "./agent-runtime.js";
 /** Bounded evidence from this ticket only. Do not send complete logs or credential files. */
 export function recoveryLogContext(logsDir: string, issue: number): Array<{ name: string; tail: string }> {
   if (!Number.isSafeInteger(issue) || issue < 1) throw new Error("Invalid recovery ticket");
-  const names = readdirSync(logsDir).filter(n => n.endsWith(`_#${issue}.log`) && !n.includes("_recovery_")).sort().slice(-2);
+  const names = readdirSync(logsDir).filter(n => (n.endsWith(`_#${issue}.log`) || n.endsWith(`_#${issue}.stderr.log`)) && !n.includes("_recovery_")).sort().slice(-2);
   return names.map(name => {
     const path = join(logsDir, name);
     const fd = openSync(path, "r");

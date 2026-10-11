@@ -1,3 +1,5 @@
+import { coordinationReceipts } from "./recovery-receipts.js";
+import { writeRuntimeReceipt } from "./runtime-receipt.js";
 import { type ChildProcess, execSync, spawn, spawnSync } from "node:child_process";
 import { readFileSync, existsSync, writeFileSync, mkdirSync, mkdtempSync, rmdirSync, appendFileSync, readdirSync, createWriteStream, statSync, symlinkSync, unlinkSync, openSync, closeSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -7,6 +9,8 @@ import { fileURLToPath } from "node:url";
 import { config } from "dotenv";
 import { githubPauseMs, freshGitHubRead } from "./github-transport.js";
 import { runRecoveryWork, recoveryHandoff, parseRecoveryDecision, RECOVERY_INSTRUCTIONS, RECOVERY_EFFORT, RECOVERY_MAX_TURNS, RECOVERY_TIMEOUT_MS, cleanRecoveryLabels } from "./recovery-work.js";
+import { verifyCoordination } from "./recovery-coordination.js";
+import { recoveryInventory, relatedTickets, relatedEvidence } from "./recovery-evidence.js";
 import { recoveryLogContext } from "./recovery-context.js";
 import type { RecoveryIncident, RecoveryDecision } from "./fleet-recovery.js";
 import { ManagedDispatch, trackManagedChild } from "./managed-dispatch.js";
@@ -2155,6 +2159,7 @@ async function attemptPermissionDenialSalvage(opts: {
 // `dispatch.test.ts` pass a hand-rolled mock without `as any` casting.
 // Mirrors the `ReconcileClient` pattern in `reconcile.ts`.
 export interface DispatchClient {
+  recordCoordination?(record: import("./recovery-facts.js").CoordinationRecord): Promise<void>;
   addLabel(issueNumber: number, label: string): Promise<void>;
   removeLabel(issueNumber: number, label: string): Promise<void>;
   addComment(issueNumber: number, body: string): Promise<void>;
@@ -4893,6 +4898,13 @@ export async function handlePostRun(
   const { agent, item, client, agentCwd, useWorktree, branchName, logFile, startTime } = ctx;
   const { execSync, spawnSync, notifyDiscord } = ctx.deps;
 
+  if (["refiner", "po"].includes(agent.name) && item.issueNumber > 0 && client.recordCoordination && !streamResult.isError) {
+    const project = `${process.env.GITHUB_OWNER}/${process.env.GITHUB_REPO}`;
+    for (const record of coordinationReceipts(streamResult.output, project, item.issueNumber)) {
+      const blocker = Number(record.blocker.split("#")[1]);
+      if ((await client.getOpenBlockers(item.issueNumber)).includes(blocker)) await client.recordCoordination(record);
+    }
+  }
   if (streamResult.terminalReason === "waiting_on_blocker") {
     if (streamResult.runner !== "codex" || agent.name !== "builder" || item.issueNumber <= 0
         || streamResult.isError || streamResult.hadPermissionDenial || saferSalvaged) {
@@ -9188,6 +9200,7 @@ export async function runEnvPreflight(opts: {
 }
 
 export async function pollLoop(): Promise<void> {
+  writeRuntimeReceipt(LOGS_DIR, agentsRepoRoot, resolve(__dirname, ".."));
   const rawClient = new GitHubProjectClient({
     owner: process.env.GITHUB_OWNER!,
     repo: process.env.GITHUB_REPO!,
@@ -9342,7 +9355,7 @@ export async function pollLoop(): Promise<void> {
   );
   // Run the health checks once now and say whether they passed, rather than
   // only listing them. Cached, so the first cycle reuses the results.
-  await startupHealthCheck({
+  const startupHealth = await startupHealthCheck({
     checks: HEALTH_CHECKS,
     checker: healthChecker,
     roles: pollOrder.map((a) => a.name),
@@ -9351,6 +9364,8 @@ export async function pollLoop(): Promise<void> {
     notify: notifyDiscord,
     state: healthNotices,
   });
+
+  writeFileSync(resolve(LOGS_DIR, "runtime-health.json"), JSON.stringify({ pid: process.pid, passed: startupHealth.passed, failed: startupHealth.failures.map(f => f.check.name) }), { mode: 0o600 });
 
   // Main sweep: the fork's in-depth command against main, when idle or every N
   // merges. Null when PYRY_MAIN_SWEEP_CMD is unset. See runMainSweepCycle.
@@ -9738,7 +9753,12 @@ export async function pollLoop(): Promise<void> {
     if (managed && recoveryEnabled && !drainMode && !envHeld) {
       if (Date.now() - recoveryCheckedAt >= 300_000) {
         // Reuses the board snapshot. No extra board poll and no model on a quiet cycle.
-        const incidents = await managed.recoveryReport(await client.getOpenProjectItems());
+        const recoveryItems = await client.getOpenProjectItems();
+        const evidenceIssues = new Set(recoveryItems.filter(i => !i.labels.some(l => l.startsWith("wip:"))).map(i => i.issueNumber));
+        for (const i of recoveryItems) for (const ref of relatedTickets(managed.project, [i.body], [], [managed.project]))
+          evidenceIssues.add(Number(ref.split("#")[1]));
+        await managed.recordEvidence(recoveryInventory(LOGS_DIR, managed.project, "local", [...evidenceIssues]));
+        const incidents = await managed.recoveryReport(recoveryItems);
         recoveryQueue = incidents.filter(i => i.state === "queued");
         for (const alert of incidents.filter(i => i.state === "escalated")) await notifyDiscord(`${alert.ticket}: ${alert.reason}. Operator intervention required.`);
         recoveryCheckedAt = Date.now();
@@ -9757,7 +9777,10 @@ export async function pollLoop(): Promise<void> {
               project: managed.project, agents: stageSet.agents,
               readCurrent: async () => {
                 recoveryClient.clearItemsCache();
-                return freshGitHubRead(async () => (await recoveryClient.getOpenProjectItems()).find(i => i.issueNumber === issue));
+                return freshGitHubRead(async () => {
+                  const current = (await recoveryClient.getOpenProjectItems()).find(i => i.issueNumber === issue);
+                  return current ? managed.hydrateRecovery(current) : undefined;
+                });
               },
               begin: () => managed.recoveryStep<RecoveryIncident>("begin", incident.id),
               decide: decision => managed.recoveryStep<RecoveryDecision>("decide", incident.id, decision),
@@ -9769,7 +9792,15 @@ export async function pollLoop(): Promise<void> {
                 const promptFile = logFile + ".prompt.txt";
                 const systemPromptFile = logFile + ".system.txt";
                 const comments = (await recoveryClient.getIssueCommentBodies(issue)).slice(-12).map(c => c.slice(-6000));
-                writeFileSync(promptFile, scrubCredentials(JSON.stringify({ incident, ticket: item, comments, logs: recoveryLogContext(LOGS_DIR, issue) })), { mode: 0o600 });
+                const allowed = process.env.PYRY_RECOVERY_PROJECTS?.split(",") ?? (process.env.GITHUB_OWNER === "pyrycode"
+                  ? ["pyrycode/pyrycode", "pyrycode/pyrycode-mobile", "pyrycode/pyrycode-desktop", "pyrycode/pyrycode-relay", "pyrycode/tui-driver"] : [managed.project]);
+                const related = relatedTickets(managed.project, [item.body, ...comments], item.blockedBy.flatMap(b => b.url ? [b.url] : []), allowed)
+                  .filter(t => t !== incident.ticket);
+                const facts = await managed.recoveryFacts([incident.ticket, ...related]);
+                const relatedIssues = await relatedEvidence(related, process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? "");
+                const logs = recoveryLogContext(LOGS_DIR, issue);
+                for (const ref of related.filter(t => t.startsWith(managed.project + "#")).slice(0, 3)) logs.push(...recoveryLogContext(LOGS_DIR, Number(ref.split("#")[1])));
+                writeFileSync(promptFile, scrubCredentials(JSON.stringify({ incident, ticket: item, comments, logs, relatedIssues, facts })), { mode: 0o600 });
                 writeFileSync(systemPromptFile, RECOVERY_INSTRUCTIONS, { mode: 0o600 });
                 const result = await runClaudeStreaming({ runner, sourceReview: true, sourceReviewRoot: repoRoot,
                   promptFile, systemPromptFile, cwd: repoRoot, logFile,
@@ -9784,6 +9815,11 @@ export async function pollLoop(): Promise<void> {
               addLabel: (n, label) => recoveryClient.addLabel(n, label),
               removeLabel: (n, label) => recoveryClient.removeLabel(n, label),
               move: (id, status) => recoveryClient.updateItemStatus(id, status),
+              verifyCoordination: async (_item, blocker) => {
+                const [facts] = await managed.recoveryFacts([incident.ticket]);
+                return verifyCoordination(facts.coordination.find(c => c.blocker === blocker), process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? "");
+              },
+              removeBlocker: (n, blocker) => recoveryClient.removeBlocker(n, blocker),
               notify: notifyDiscord,
             });
           } catch (error) {

@@ -1,0 +1,13 @@
+[Unit]
+Description=Pyrycode local update and credential supervisor
+After=pyry-fleet-manager.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/pyrycode-runtime/work/Projects/pyrycode-agents/dispatcher/scripts/fleet-supervisor.py %h/pyrycode-runtime/fleet/supervisor.json
+Restart=on-failure
+RestartSec=30
+UMask=0077
+
+[Install]
+WantedBy=default.target

@@ -2,6 +2,7 @@
 // Keep this file on the claim server's local disk, never on a shared filesystem.
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
+import { RecoveryFacts, type PauseRecord, type EvidenceRecord, type CoordinationRecord } from "./recovery-facts.js";
 import { RecoveryLedger, type RecoveryObservation, type RecoveryDecision } from "./fleet-recovery.js";
 
 export type ResourceClass = "heavy" | "medium" | "light";
@@ -49,6 +50,7 @@ export function validateStart(req: StartRequest): void {
 export class FleetStore {
   private readonly db: DatabaseSync;
   readonly recovery: RecoveryLedger;
+  readonly facts: RecoveryFacts;
   constructor(path: string, private readonly limits: Readonly<Record<string, MachineLimits>>) {
     for (const value of Object.values(limits)) validateLimits(value);
     this.db = new DatabaseSync(path);
@@ -71,12 +73,14 @@ export class FleetStore {
       ) STRICT;
     `);
     this.recovery = new RecoveryLedger(this.db);
+    this.facts = new RecoveryFacts(this.db);
   }
   close(): void { this.db.close(); }
 
   recoveryReport(machine: string, project: string, observations: RecoveryObservation[]) {
     if (!Object.hasOwn(this.limits, machine)) throw new Error("Unknown machine");
-    return this.transaction(() => this.recovery.report(machine, project, observations, this.snapshot()));
+    return this.transaction(() => this.recovery.report(machine, project, observations.map(o => ({ ...o,
+      pause: this.facts.getPause(o.ticket), artifactRevision: this.facts.revision([o.ticket]) })), this.snapshot()));
   }
   recoveryStep(machine: string, session: string, project: string, id: string, runId: string, step: "begin" | "decide" | "complete", decision?: RecoveryDecision) {
     const incident = this.recovery.incident(id);
@@ -89,6 +93,32 @@ export class FleetStore {
       if (step === "complete") { this.recovery.complete(id, runId); return { ok: true }; }
       throw new Error("Invalid recovery operation");
     });
+  }
+
+  recoveryFacts(tickets: string[]) {
+    const evidence = this.facts.getEvidence(tickets);
+    return tickets.map(ticket => ({ ticket, pause: this.facts.getPause(ticket),
+      artifactRevision: this.facts.revision([ticket]), evidence: evidence.filter(e => e.ticket === ticket),
+      coordination: this.facts.getCoordination(ticket) }));
+  }
+  recordPause(machine: string, session: string, project: string, runId: string, record: PauseRecord) {
+    if (!record?.ticket?.startsWith(`${project}#`) || record.origin !== "pipeline") throw new Error("Pipeline pause required");
+    const claim = this.authorize(machine, session, record.ticket, runId);
+    const run = this.snapshot().runs.find(r => r.id === runId);
+    if (!run || run.project !== project) throw new Error("Pause requires an admitted run");
+    this.facts.pause({ ...record, actor: `${machine}/${run.role}`, revision: claim.generation });
+    return { ok: true };
+  }
+  recordCoordination(machine: string, session: string, project: string, runId: string, record: CoordinationRecord) {
+    if (!record?.ticket?.startsWith(`${project}#`)) throw new Error("Coordination project mismatch");
+    this.authorize(machine, session, record.ticket, runId);
+    const run = this.snapshot().runs.find(r => r.id === runId);
+    if (!run || !["refiner", "po"].includes(run.role)) throw new Error("Coordination requires an admitted planning run");
+    this.facts.coordinate(record); return { ok: true };
+  }
+  recordEvidence(machine: string, project: string, records: EvidenceRecord[]) {
+    if (!Object.hasOwn(this.limits, machine)) throw new Error("Unknown machine");
+    return this.transaction(() => { this.facts.evidence(machine, project, records); return { ok: true }; });
   }
 
   /** Guard small workflow writes too. An active job is writable only by that run. */

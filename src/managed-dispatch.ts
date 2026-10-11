@@ -5,6 +5,8 @@ import { JsonClient } from "./fleet-http.js";
 import type { Claim, FleetRun, FleetSnapshot, ResourceClass } from "./fleet-store.js";
 import type { WorkOffer } from "./machine-scheduler.js";
 import type { AgentConfig, ProjectItem } from "./types.js";
+import { observationFor } from "./recovery-work.js";
+import type { PauseRecord, EvidenceRecord, CoordinationRecord } from "./recovery-facts.js";
 import type { RecoveryObservation, RecoveryIncident, RecoveryDecision } from "./fleet-recovery.js";
 import { offerId } from "./machine-manager.js";
 
@@ -187,8 +189,16 @@ export class ManagedDispatch {
   async authorize(issue: number): Promise<void> {
     await this.connection.call<Claim>("/authorize", { session: this.session, ticket: `${this.project}#${issue}`, runId: currentRun.getStore()?.run.id });
   }
-  recoveryReport(items: ProjectItem[]): Promise<RecoveryIncident[]> {
-    const observations: RecoveryObservation[] = items.map(i => ({ ticket: `${this.project}#${i.issueNumber}`, status: i.status, labels: i.labels, blocked: i.blockedBy.some(b => b.state === "OPEN") }));
+  async recoveryFacts(tickets: string[]) {
+    return this.connection.call<Array<{ ticket: string; pause?: PauseRecord; artifactRevision?: string; evidence: EvidenceRecord[]; coordination: CoordinationRecord[] }>>("/recovery/facts", { tickets });
+  }
+  async hydrateRecovery(item: ProjectItem): Promise<ProjectItem> {
+    const [facts] = await this.recoveryFacts([`${this.project}#${item.issueNumber}`]);
+    return { ...item, recoveryPause: facts.pause, artifactRevision: facts.artifactRevision };
+  }
+  recordEvidence(records: EvidenceRecord[]) { return this.connection.call("/recovery/evidence", { records }); }
+  async recoveryReport(items: ProjectItem[]): Promise<RecoveryIncident[]> {
+    const observations: RecoveryObservation[] = items.map(i => observationFor(this.project, i));
     return this.connection.call("/recovery/report", { observations });
   }
   recoveryStep<T>(step: "begin" | "decide" | "complete", id: string, decision?: RecoveryDecision): Promise<T> {
@@ -203,11 +213,16 @@ export class ManagedDispatch {
   client<T extends object>(base: T, maintenance = false, onlyIssue?: number): T {
     const itemNumbers = new Map<string, number>();
     const createdNumbers = new Map<string, number>();
-    const numbers = new Set(["addLabel", "removeLabel", "addComment", "closeIssue", "addBlocker"]);
+    const numbers = new Set(["addLabel", "removeLabel", "addComment", "closeIssue", "addBlocker", "removeBlocker"]);
     const items = new Set(["updateItemStatus", "moveItemToTop"]);
     const lists = new Set(["getAllProjectItems", "getOpenProjectItems", "getItemsByStatus", "getClosedItemsNotInDone"]);
     return new Proxy(base, {
       get: (target, key) => {
+        if (key === "recordCoordination") return async (record: CoordinationRecord) => {
+          const run = currentRun.getStore()?.run;
+          if (!run || !record.ticket.startsWith(`${this.project}#`)) throw new Error("Coordination requires an admitted planning run");
+          await this.connection.call("/recovery/coordination", { session: this.session, runId: run.id, record });
+        };
         const value = Reflect.get(target, key);
         if (typeof value !== "function") return value;
         if (typeof key !== "string") return value.bind(target);
@@ -218,6 +233,16 @@ export class ManagedDispatch {
             const number = itemNumbers.get(args[0]);
             if (number === undefined) throw new Error("Cannot mutate an item outside the managed snapshot");
             await this.authorize(number);
+            if (key === "updateItemStatus" && args[1] === "Halted") {
+              const run = currentRun.getStore()?.run;
+              if (!run) throw new Error("Pipeline pause requires an admitted run");
+              const previous = await (target as any).getItemStatus(number, { forceRefresh: true });
+              await this.connection.call("/recovery/pause", { session: this.session, runId: run.id, record: {
+                ticket: `${this.project}#${number}`, origin: "pipeline", actor: run.role,
+                reason: "Pipeline requested a pause", missing: "Read the stage outcome and newest evidence",
+                resumeOn: "Assessment confirms the missing prerequisite is satisfied", resumeStatus: previous,
+                revision: run.generation } });
+            }
           }
           const result = await value.apply(target, args);
           if (key === "createIssue") createdNumbers.set(result.nodeId, result.number);
