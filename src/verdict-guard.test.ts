@@ -13,6 +13,7 @@ import {
   newestFailVerdict,
   REPEAT_FINDING_SIMILARITY,
   parseVerdictArtifacts,
+  parseBuilderCompletions,
   staleBaseFindings,
   pickVerdictPr,
   shouldFlagMissingVerdict,
@@ -78,6 +79,57 @@ describe("repeated verifier finding — the rework breaker's repeat rule (agent-
     assert.deepStrictEqual(parsed.map((a) => a.body), ["review text", "comment text", ""]);
   });
 
+  test("builder completion evidence uses the existing dispatcher report for the actual code owner", () => {
+    const report = (owner: string) => `## 🤖 Implementation\n\n${owner} agent has completed work on this ticket.\n`;
+    const json = JSON.stringify({ comments: [
+      { createdAt: "2026-10-04T08:30:00Z", body: report("builder") },
+      { createdAt: "2026-10-04T09:30:00Z", body: report("developer") },
+      { createdAt: "2026-10-04T10:30:00Z", body: report("verifier") },
+      { createdAt: "2026-10-04T11:30:00Z", body: "Builder repair is needed." },
+      { createdAt: "2026-10-04T12:30:00Z", body: "## 🤖 Builder\n\nbuilder agent flagged issues on this ticket → refiner." },
+      { createdAt: "garbage", body: report("builder") },
+      { body: report("builder") },
+    ] });
+    assert.deepStrictEqual(parseBuilderCompletions(json, "builder"), ["2026-10-04T08:30:00Z"]);
+    assert.deepStrictEqual(parseBuilderCompletions(json, "developer"), ["2026-10-04T09:30:00Z"]);
+    assert.deepStrictEqual(parseBuilderCompletions("{}", "builder"), []);
+    assert.throws(() => parseBuilderCompletions("unreadable", "builder"));
+  });
+
+  test("a repeat requires a recorded builder completion strictly between FAILs, even on different heads", () => {
+    const artifacts = parseVerdictArtifacts(JSON.stringify({ reviews: [
+      { submittedAt: "2026-10-04T09:00:00Z", body: verdict("FAIL", [row]), commit: { oid: "a".repeat(40) } },
+      { submittedAt: "2026-10-04T10:00:00Z", body: verdict("FAIL", [row, vm]), commit: { oid: "b".repeat(40) } },
+    ] }));
+    for (const completions of [[], ["2026-10-04T08:00:00Z"], ["2026-10-04T09:00:00Z"],
+      ["2026-10-04T10:00:00Z"], ["2026-10-04T11:00:00Z"], ["garbage"]]) {
+      assert.deepStrictEqual(findRepeatedMustFix(artifacts, completions), [], JSON.stringify(completions));
+    }
+    assert.deepStrictEqual(findRepeatedMustFix(artifacts, ["2026-10-04T09:30:00Z"]),
+      ["app/src/main/java/de/pyryco/mobile/ui/ChannelListScreen.kt → ChannelRow"]);
+  });
+
+  test("duplicate same-head reviews cannot establish a failed repair, even with a completion comment", () => {
+    const body = (extra: string) => `${verdict("FAIL", [row])}\n${extra}\nReviewed PR head: \`${"a".repeat(40)}\`.`;
+    const artifacts = parseVerdictArtifacts(JSON.stringify({ comments: [
+      { createdAt: "2026-10-04T09:00:00Z", body: body("first review") },
+      { createdAt: "2026-10-04T10:00:00Z", body: body("unchanged review") },
+    ] }));
+    assert.deepStrictEqual(artifacts.map(a => a.head), ["a".repeat(40), "a".repeat(40)]);
+    assert.deepStrictEqual(findRepeatedMustFix(artifacts, ["2026-10-04T09:30:00Z"]), []);
+  });
+
+  test("copies of the newest verdict do not hide a genuine failed repair round", () => {
+    const body = verdict("FAIL", [row]);
+    const artifacts = parseVerdictArtifacts(JSON.stringify({ reviews: [
+      { submittedAt: "2026-10-04T09:00:00Z", body, commit: { oid: "a".repeat(40) } },
+      { submittedAt: "2026-10-04T10:00:00Z", body, commit: { oid: "b".repeat(40) } },
+      { submittedAt: "2026-10-04T10:00:05Z", body, commit: { oid: "b".repeat(40) } },
+    ] }));
+    assert.deepStrictEqual(findRepeatedMustFix(artifacts, ["2026-10-04T09:30:00Z"]),
+      ["app/src/main/java/de/pyryco/mobile/ui/ChannelListScreen.kt → ChannelRow"]);
+  });
+
   test("extractMustFixKeys reads `path → Symbol` from MUST FIX lines only", () => {
     const body = verdict("FAIL", [
       row,
@@ -105,7 +157,7 @@ describe("repeated verifier finding — the rework breaker's repeat rule (agent-
         { createdAt: "2026-10-04T10:00:00Z", body: verdict("FAIL", [row]) },
       ],
     }));
-    assert.deepStrictEqual(findRepeatedMustFix(artifacts), ["app/src/main/java/de/pyryco/mobile/ui/ChannelListScreen.kt → ChannelRow"],
+    assert.deepStrictEqual(findRepeatedMustFix(artifacts, ["2026-10-04T09:30:00Z"]), ["app/src/main/java/de/pyryco/mobile/ui/ChannelListScreen.kt → ChannelRow"],
       "only the newest two FAILs are compared, so the older vm finding is not reported");
   });
 
@@ -116,7 +168,7 @@ describe("repeated verifier finding — the rework breaker's repeat rule (agent-
         { createdAt: "2026-10-04T09:00:00Z", body: verdict("FAIL", [row]) },
       ],
     }));
-    assert.deepStrictEqual(findRepeatedMustFix(artifacts), []);
+    assert.deepStrictEqual(findRepeatedMustFix(artifacts, ["2026-10-04T08:30:00Z"]), []);
   });
 
   test("reviews and comments both count, ordered by time, and PASS verdicts and other comments are skipped", () => {
@@ -128,7 +180,7 @@ describe("repeated verifier finding — the rework breaker's repeat rule (agent-
         { createdAt: "2026-10-04T09:30:00Z", body: `${row}\n**Decision: FAIL**\nnot headed as a verifier review` },
       ],
     }));
-    assert.deepStrictEqual(findRepeatedMustFix(artifacts), ["app/src/main/java/de/pyryco/mobile/ui/ChannelListScreen.kt → ChannelRow"]);
+    assert.deepStrictEqual(findRepeatedMustFix(artifacts, ["2026-10-04T08:30:00Z"]), ["app/src/main/java/de/pyryco/mobile/ui/ChannelListScreen.kt → ChannelRow"]);
   });
 
   test("one verdict posted twice, as a review and a comment, is one round, not a repeat", () => {
@@ -174,11 +226,11 @@ describe("repeated verifier finding compares the finding text, not only its loca
   test("#1747 negative: 12:42 and 14:05 share the ThreadScreen key but raise different defects, so nothing repeats", () => {
     assert.ok(extractMustFixKeys(at("12:42:48").body).includes(threadScreen));
     assert.ok(extractMustFixKeys(at("14:05:22").body).includes(threadScreen), "the location-only rule saw a repeat here");
-    assert.deepStrictEqual(findRepeatedMustFix(artifactsOf("12:42:48", "14:05:22")), []);
+    assert.deepStrictEqual(findRepeatedMustFix(artifactsOf("12:42:48", "14:05:22"), ["2026-10-05T13:00:00Z"]), []);
   });
 
   test("#1747 positive: 10:18 and 12:42 raise the same ordering defect in reworded text, so it repeats", () => {
-    assert.deepStrictEqual(findRepeatedMustFix(artifactsOf("10:18:57", "12:42:48")), [threadScreen]);
+    assert.deepStrictEqual(findRepeatedMustFix(artifactsOf("10:18:57", "12:42:48"), ["2026-10-05T11:00:00Z"]), [threadScreen]);
   });
 
   test("the threshold sits between the measured #1755 pairs", () => {
@@ -197,8 +249,8 @@ describe("repeated verifier finding compares the finding text, not only its loca
       { createdAt: "2026-10-05T09:00:00Z", body: verdict(first) },
       { createdAt: "2026-10-05T10:00:00Z", body: verdict(second) },
     ] }));
-    assert.deepStrictEqual(findRepeatedMustFix(comments(a, b)), []);
-    assert.deepStrictEqual(findRepeatedMustFix(comments(a, a.replace("so a double tap", "so a double-tap"))), ["app/src/Screen.kt → Screen"]);
+    assert.deepStrictEqual(findRepeatedMustFix(comments(a, b), ["2026-10-05T09:30:00Z"]), []);
+    assert.deepStrictEqual(findRepeatedMustFix(comments(a, a.replace("so a double tap", "so a double-tap")), ["2026-10-05T09:30:00Z"]), ["app/src/Screen.kt → Screen"]);
   });
 
   test("extractMustFixFindings keeps each finding's text after the key, and a key with several findings keeps them all", () => {
@@ -232,7 +284,7 @@ describe("a stale base is a branch invariant, not a repeated finding (merge race
     const [first, second] = verdicts(1825);
     assert.ok(extractMustFixKeys(first.body).includes("feature/1825 → reviewed"), "the key the old rule matched on");
     assert.ok(extractMustFixKeys(second.body).includes("feature/1825 → reviewed"));
-    assert.deepStrictEqual(findRepeatedMustFix(artifacts(first, second)), []);
+    assert.deepStrictEqual(findRepeatedMustFix(artifacts(first, second), [new Date((Date.parse(first.createdAt) + Date.parse(second.createdAt)) / 2).toISOString()]), []);
   });
 
   test("a repeated source finding beside a branch finding still repeats", () => {
@@ -243,7 +295,7 @@ describe("a stale base is a branch invariant, not a repeated finding (merge race
       { createdAt: "2026-10-07T00:00:00Z", body: body(branch, source) },
       { createdAt: "2026-10-07T01:00:00Z", body: body(branch, source.replace("is reversed", "stays reversed")) },
     );
-    assert.deepStrictEqual(findRepeatedMustFix(comments), ["src/store/a.ts → reduce"]);
+    assert.deepStrictEqual(findRepeatedMustFix(comments, ["2026-10-07T00:30:00Z"]), ["src/store/a.ts → reduce"]);
   });
 
   test("isBranchInvariantKey: a ticket branch, main or HEAD is a location with no source symbol; a file never is", () => {

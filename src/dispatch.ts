@@ -11,7 +11,7 @@ import { recoveryLogContext } from "./recovery-context.js";
 import type { RecoveryIncident, RecoveryDecision } from "./fleet-recovery.js";
 import { ManagedDispatch, trackManagedChild } from "./managed-dispatch.js";
 import { DispatchPool, excludeInFlight, freeSeats, launchCandidates, liveGateRunnerFor, mayStartMainSweep, resolvePollIntervalMs } from "./dispatch-pool.js";
-import { countVerdictsSince, isStaleBaseFinding, parseVerdictArtifacts, pickVerdictPr, shouldFlagMissingVerdict } from "./verdict-guard.js";
+import { countVerdictsSince, isStaleBaseFinding, parseBuilderCompletions, parseVerdictArtifacts, pickVerdictPr, shouldFlagMissingVerdict } from "./verdict-guard.js";
 import { countOpenPrs, shouldFlagMissingPr } from "./pr-guard.js";
 import { PENDING_VERDICT_PREFIX, REREVIEW_PATCH_CAP, decideVerdictRecovery, extractVerdictFindings, reworkFindingsNote, handoffMarker, isVerdictPublishFailure, parseLastVerdict, parsePendingVerdictState, parsePrVerdictView, parseVerdictHandoff, reReviewNote, serializeLastVerdict, serializePendingVerdictState, verdictHandoffNote, type HandoffParse, type PendingVerdictState, type VerdictHandoff, type VerdictPrLookup } from "./verdict-handoff.js";
 import { resolveImportOnlyMerge } from "./merge-resolve.js";
@@ -476,6 +476,25 @@ const REWORK_ROUTING_OPTIONS: ReworkRoutingOptions = {
     const pr = pickVerdictPr(prJson);
     if (pr === null) return null;
     return execSync(`gh pr view ${pr} --json reviews,comments`, { cwd: repoRoot, encoding: "utf-8", timeout: 15_000 });
+  },
+  readBuilderCompletions: async (issueNumber) => {
+    // A bounded recent window, through the same shared GitHub transport as
+    // other gh reads. Missing history cannot invent a completed repair.
+    const result = JSON.parse(execSync("gh api graphql --input -", {
+      cwd: repoRoot, encoding: "utf-8", timeout: 15_000,
+      input: JSON.stringify({
+        query: `query($owner: String!, $repo: String!, $number: Int!) {
+          repository(owner: $owner, name: $repo) { issue(number: $number) {
+            comments(last: 100) { nodes { createdAt body } }
+          } }
+        }`,
+        variables: { owner: process.env.GITHUB_OWNER, repo: process.env.GITHUB_REPO, number: issueNumber },
+      }),
+    }));
+    const comments = result.data?.repository?.issue?.comments?.nodes;
+    if (result.errors || !Array.isArray(comments)) throw new Error("Builder completion history could not be read");
+    const owner = activeStageSet().realClaudeGate.failReworkLabel.slice("needs-rework:".length);
+    return parseBuilderCompletions(JSON.stringify({ comments }), owner);
   },
   refreshStaleBase: async (issueNumber) => {
     const outcome = refreshStaleBaseBranch({ issueNumber });

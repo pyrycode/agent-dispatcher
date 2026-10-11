@@ -568,12 +568,36 @@ describe("runReworkRouting — builder rework breaker (#122)", () => {
     });
   });
 
+  test("duplicate FAIL reviews without a builder repair route to the builder instead of parking #3177", async () => {
+    await withStageSet("builder", async () => {
+      for (const count of [0, 3]) {
+        const item = makeItem({ id: `item-3177-${count}`, issueNumber: 3177,
+          labels: count ? [`rework-count:${count}`] : [] });
+        const client = new MockClient([item]);
+        const head = "290fddc3101076887e8bdeb4316bfe07d63eb03a";
+        const verdicts = [failVerdict(row), failVerdict(row, finding(2))]
+          .map(body => `${body}\nReviewed PR head: \`${head}\`.`);
+
+        await route(client, item, "In Code Review", "needs-rework:builder", {
+          readPrVerdicts: async () => prJson(verdicts),
+        });
+
+        assert.equal(item.status, "In Development", "duplicate reviews are not a failed repair round");
+        assert.ok(!item.labels.includes("error:rework-loop"));
+        assert.ok(item.labels.includes(`rework-count:${count + 1}`));
+      }
+    });
+  });
+
   test("two consecutive FAIL verdicts sharing a MUST FIX key park on the second route and name the key", async () => {
     await withStageSet("builder", async () => {
       const item = makeItem({ id: "item-1655", issueNumber: 1655, labels: [] });
       const client = new MockClient([item]);
       const verdicts = [failVerdict(row)];
-      const options = { readPrVerdicts: async () => prJson(verdicts) };
+      const options = {
+        readPrVerdicts: async () => prJson(verdicts),
+        readBuilderCompletions: async () => ["2026-10-04T00:30:00Z"],
+      };
 
       await route(client, item, "In Code Review", "needs-rework:builder", options);
       assert.equal(item.status, "In Development", "one FAIL has nothing to repeat");
@@ -594,6 +618,32 @@ describe("runReworkRouting — builder rework breaker (#122)", () => {
       const comments = client.addCommentCalls.length;
       await runReworkRouting(client, options);
       assert.equal(client.addCommentCalls.length, comments);
+    });
+  });
+
+  test("missing or unreadable completion evidence leaves the hard cap independent and preserves maintainer holds", async () => {
+    await withStageSet("builder", async () => {
+      for (const unreadable of [false, true]) {
+        for (const count of [0, 6]) {
+          const hold = "needs-human:maintainer-repair";
+          const item = makeItem({ id: `item-evidence-${unreadable}-${count}`, issueNumber: 3177,
+            labels: [hold, ...(count ? [`rework-count:${count}`] : [])] });
+          const client = new MockClient([item]);
+          await route(client, item, "In Code Review", "needs-rework:builder", {
+            readPrVerdicts: async () => prJson([failVerdict(row), failVerdict(row, finding(2))]),
+            readBuilderCompletions: async () => {
+              if (unreadable) throw new Error("completion history unavailable");
+              return [];
+            },
+          });
+          assert.ok(item.labels.includes(hold), "operator hold is never cleared");
+          assert.equal(item.labels.includes("error:rework-loop"), count === 6);
+          if (count === 6) {
+            assert.match(client.addCommentCalls.at(-1)?.body ?? "", /hard cap/i);
+            assert.doesNotMatch(client.addCommentCalls.at(-1)?.body ?? "", /repeated finding/i);
+          } else assert.equal(item.status, "In Development");
+        }
+      }
     });
   });
 
