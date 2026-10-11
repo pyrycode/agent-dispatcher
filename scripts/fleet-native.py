@@ -64,15 +64,38 @@ class NativeAdapter:
                 os.chmod(salt, 0o600); stream.write(secrets.token_hex(32))
         self.salt = salt.read_text()
         self.local = {}
+        self.expected_cache = {}
+
+    def operator_command(self, *arguments):
+        # Configured commands run with the supervisor's own startup credentials.
+        # No credential values are persisted, printed or borrowed from another process.
+        if 'operatorCommand' not in self.config:
+            return [self.config['operator'], *arguments]
+        return [*self.config['operatorCommand'], arguments[0], self.config['operatorConfig'], *arguments[1:]]
 
     def operator(self, command):
-        return json.loads(execute([self.config['operator'], command]))
+        return json.loads(execute(self.operator_command(command)))
 
     def status(self): return self.operator('status')
     def attention(self): return self.operator('attention')
-    def publish_attention(self): execute([self.config['operator'], 'report-attention', self.config['reportFile']])
+    def publish_attention(self): execute(self.operator_command('report-attention', self.config['reportFile']))
 
-    def expected(self, project):
+    def expected(self, project, refresh=False):
+        now = time.monotonic()
+        cached = self.expected_cache.get(project)
+        if not refresh and cached and now - cached[0] < 300:
+            if isinstance(cached[1], Exception):
+                raise RuntimeError('Configured credential lookup is waiting before retrying')
+            return cached[1]
+        try:
+            value = self.read_expected(project)
+        except Exception:
+            self.expected_cache[project] = (now, RuntimeError('Configured credential lookup unavailable'))
+            raise
+        self.expected_cache[project] = (now, value)
+        return value
+
+    def read_expected(self, project):
         cfg = self.config['projects'][project]
         if self.config['platform'] == 'mac':
             child = [cfg['access'], 'op', 'run', '--env-file=' + cfg['agents'] + '/.env', '--',
@@ -189,7 +212,7 @@ print(json.dumps({'startupHealthy': health.get('passed'), 'runtime': receipt, 'p
 
     def preflight(self, project, desired):
         cfg = self.config['projects'][project]
-        expected = self.expected(project)
+        expected = self.expected(project, refresh=True)
         if not expected.get('ok') or expected.get('credential') != desired['credential']: return False
         for repo in [cfg['agents'], str(Path(cfg['agents']) / 'dispatcher')]:
             if execute(['git', '-C', repo, 'status', '--porcelain', '--untracked-files=no']): return False
