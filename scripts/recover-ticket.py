@@ -353,7 +353,7 @@ def handback_warnings(column, labels_after):
     return warnings
 
 
-GLOBAL_BLOCKS = {"error:max_turns_salvaged", "error:merge-conflict", "error:rework-loop", "error:family-breaker"}
+GLOBAL_BLOCKS = {"error:max_turns_salvaged", "error:merge-conflict", "error:rework-loop"}
 
 
 def export_base(remote_feature_exists, number):
@@ -1050,7 +1050,7 @@ def cmd_family_reset(config, args):
         raise RecoverError(reason)
     repo = f"{config['owner']}/{args.repo}"
     body = (f"{FAMILY_RESET_MARKER}\nFamily dispatch tally reset by recover-ticket at {utc_stamp()}; "
-            f"`{FAMILY_BREAKER_LABEL}` removed so the family can dispatch again.")
+            f"retired `{FAMILY_BREAKER_LABEL}` removed. Family counts no longer limit dispatch.")
     if args.dry_run:
         print(f"would comment on {repo}#{args.number}: {body!r}")
         print(f"would run: gh issue edit {args.number} -R {repo} --remove-label {FAMILY_BREAKER_LABEL}")

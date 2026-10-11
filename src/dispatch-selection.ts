@@ -9,7 +9,7 @@
 // pipeline-decisions.ts and `hasOpenBlockers` from blockers.ts.
 
 import { AGENTS, type AgentConfig } from "./types.js";
-import { resolveFamilyRoot, shouldSkipDispatch, type DecisionItem } from "./pipeline-decisions.js";
+import { shouldSkipDispatch, type DecisionItem } from "./pipeline-decisions.js";
 import { hasOpenBlockers } from "./blockers.js";
 import { byTicketPriority } from "./ticket-priority.js";
 
@@ -64,24 +64,8 @@ export interface DispatchCandidate<T extends DecisionItem = DecisionItem> {
  * conflicts the dispatcher's pre-merge step can't resolve. Surfaced
  * 2026-05-10 by concurrent documentation runs on #1 and #2.
  *
- * **Family breaker veto.** `rootLabelsByIssue` maps issue number → label
- * set for every item on the board (all columns, closed included — a split
- * family's root usually sits closed in Done). Each candidate's family
- * root is resolved from its parent-chain snapshot fields, and a root
- * carrying `error:family-breaker` vetoes the candidate via
- * `shouldSkipDispatch`'s rootLabels arm. Optional: without the lookup
- * (older callers, lookup build failure) selection behaves exactly as
- * before and the veto is left to `runFamilyBreaker`'s tally check.
- *
- * **`excludedRoots`.** Families the caller has already established are
- * parked THIS cycle — a tally trip the root's labels do not yet show.
- * Selection spends its `maxConcurrent` budget before the tally check
- * runs, so without a way to re-select minus the parked family, a single
- * parked lineage at the head of a column starves the whole board: the
- * budget is handed to candidates that are guaranteed to be dropped, and
- * the next cycle repeats it from the same snapshot order. The poll loop
- * re-selects with this set filled in. Empty or absent behaves exactly as
- * before.
+ * Family-root labels are used by the caller for historical accounting.
+ * They never impose a dispatch limit.
  *
  * Pure function over a snapshot. Caller is responsible for invalidating the
  * snapshot (per-cycle items cache) at appropriate boundaries.
@@ -91,11 +75,10 @@ export function selectDispatches<T extends DecisionItem>(opts: {
   pollOrder: readonly AgentConfig[];
   maxConcurrent: number;
   rootLabelsByIssue?: ReadonlyMap<number, readonly string[]>;
-  excludedRoots?: ReadonlySet<number>;
   /** Managed callers offer all candidates; shared admission applies role caps. */
   deferRoleLimits?: boolean;
 }): DispatchCandidate<T>[] {
-  const { itemsByColumn, pollOrder, maxConcurrent, rootLabelsByIssue, excludedRoots } = opts;
+  const { itemsByColumn, pollOrder, maxConcurrent } = opts;
   const out: DispatchCandidate<T>[] = [];
   if (maxConcurrent <= 0) return out;
   const budgets = new Map<AgentConfig, number>();
@@ -113,9 +96,7 @@ export function selectDispatches<T extends DecisionItem>(opts: {
     }
     budgets.set(agent, cap === undefined ? Infinity : Math.max(0, cap - inFlight));
     for (const item of itemsByColumn.get(agent.column) ?? []) {
-      const familyRoot = resolveFamilyRoot(item);
-      if (excludedRoots?.has(familyRoot)) continue;
-      if (shouldSkipDispatch(item.labels, agent.name, rootLabelsByIssue?.get(familyRoot))) continue;
+      if (shouldSkipDispatch(item.labels, agent.name)) continue;
       if (item.issueNumber > 0 && hasOpenBlockers(item.blockedBy ?? [])) continue;
       candidates.push({ agent, item });
     }

@@ -43,22 +43,21 @@ export function validateObservations(project: string, observations: RecoveryObse
 }
 export function recoveryFingerprint(o: RecoveryObservation): string {
   return createHash("sha256").update(JSON.stringify([o.status, o.blocked,
-    o.labels.filter(l => l === RECOVERY_RETURNED_INBOX || /^(error:|error-retry-count:|needs-human:|rework-count:|done:|needs-rework:|needs-real-claude$)/.test(l)).sort(),
-    o.evidenceRevision ?? null, o.artifactRevision ?? null, o.pause ?? null, ...(o.familyHold ? [o.familyHold] : [])])).digest("hex");
+    o.labels.filter(l => l !== "error:family-breaker" && (l === RECOVERY_RETURNED_INBOX || /^(error:|error-retry-count:|needs-human:|rework-count:|done:|needs-rework:|needs-real-claude$)/.test(l))).sort(),
+    o.evidenceRevision ?? null, o.artifactRevision ?? null, o.pause ?? null])).digest("hex");
 }
 export function recoveryTrigger(o: RecoveryObservation): { reason: string; manual: boolean } | null {
   if (o.status === "Done") return null;
   if (hasOperatorHold(o.labels) || o.status === "Halted" && o.pause?.origin === "operator") return { reason: "Explicit operator hold", manual: true };
-  if (o.familyHold) return { reason: `Family dispatch budget reached on ${o.familyHold}; deliberate operator budget decision required`, manual: true };
   if (o.status === "Halted") return o.pause?.origin === "pipeline"
     ? { reason: `Pipeline pause: ${o.pause.reason}`, manual: false }
     : { reason: "Pause origin unknown; record who paused this ticket and the reopening condition", manual: true };
-  if (o.labels.some(l => /permission_denied|family-breaker/.test(l))) return { reason: "Permission or family boundary needs an operator", manual: true };
+  if (o.labels.some(l => /permission_denied/.test(l))) return { reason: "Denied permission needs an operator", manual: true };
   if (o.blocked) return { reason: "Dependency evidence and coordination reassessment", manual: false };
   // Health holds and pending transient retries keep their existing recovery.
   // A stage error means retries have stopped, so it needs diagnosis, not a blind retry.
   if (o.labels.some(l => l.startsWith("health-hold:"))) return null;
-  const errors = o.labels.filter(l => l.startsWith("error:"));
+  const errors = o.labels.filter(l => l.startsWith("error:") && l !== "error:family-breaker");
   if (errors.length) return { reason: errors.sort().join(", "), manual: false };
   if (o.labels.some(l => l.startsWith("error-retry-count:"))) return null;
   if (o.labels.some(l => /^rework-count:\d+$/.test(l) && Number(l.split(":")[1]) >= 2)) return { reason: "Repeated review rework", manual: false };
