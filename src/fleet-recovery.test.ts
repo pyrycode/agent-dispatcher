@@ -199,6 +199,25 @@ test("ordinary unclaimed Backlog waits stay quiet while stranded Backlog running
   db.close();
 });
 
+test("a retained-run diagnostic resolves on observed progress or replacement of that exact run", () => {
+  for (const mode of ["progress", "replacement"]) {
+    const db = new DatabaseSync(":memory:"); let now = 1000;
+    const ledger = new RecoveryLedger(db, () => now);
+    let current = { ...observation(1, []), status: "Backlog" };
+    const fleet = { claims: [], runs: [{ ...request(1, { role: "builder" }), generation: "generation", created: now }] };
+    ledger.report("mac", project, [current], fleet);
+    now += RECOVERY_STALLED_RUN_MS;
+    const [alert] = ledger.report("mac", project, [current], fleet);
+    if (mode === "progress") current = { ...current, status: "In Development", labels: ["done:builder"] };
+    else fleet.runs = [{ ...fleet.runs[0], id: "replacement", created: now }];
+    assert.deepEqual(ledger.report("mac", project, [current], fleet), []);
+    assert.equal(ledger.incident(alert.id).state, "resolved");
+    now += RECOVERY_STALLED_RUN_MS;
+    assert.notEqual(ledger.report("mac", project, [current], fleet)[0].id, alert.id);
+    db.close();
+  }
+});
+
 test("strict decisions and code guards cannot bypass holds, review or dependencies", () => {
   assert.deepEqual(parseRecoveryDecision('{"action":"wait","reason":"Findings shrink"}'), { action: "wait", reason: "Findings shrink" });
   assert.throws(() => parseRecoveryDecision('{"action":"merge","reason":"Skip review"}'), /Invalid/);

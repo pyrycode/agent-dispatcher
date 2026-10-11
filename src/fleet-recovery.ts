@@ -81,7 +81,7 @@ export class RecoveryLedger {
       const owner = fleet.claims.find(c => c.ticket === o.ticket);
       if (owner && owner.machine !== machine) continue;
       seen.add(o.ticket);
-      const old = this.db.prepare("SELECT * FROM fleet_recovery WHERE ticket=? AND present=1").get(o.ticket);
+      let old = this.db.prepare("SELECT * FROM fleet_recovery WHERE ticket=? AND present=1").get(o.ticket);
       const fingerprint = recoveryFingerprint(o);
       let progress = this.db.prepare("SELECT * FROM fleet_recovery_progress WHERE ticket=?").get(o.ticket);
       if (!progress || progress.fingerprint !== fingerprint) {
@@ -92,11 +92,16 @@ export class RecoveryLedger {
       // a stalled handback to Backlog or an uncertain crashed worker forever.
       const run = fleet.runs.find(r => r.ticket === o.ticket);
       const retainedAlert = old?.reason === RETAINED_RUN_REASON;
+      // A new run or workflow progress also confirms the diagnosed stall ended.
+      // Do not turn a resolved reservation diagnostic into an operator hold.
+      if (retainedAlert && (old.run_id !== run?.id || old.fingerprint !== fingerprint)) {
+        this.db.prepare("UPDATE fleet_recovery SET present=0,state='resolved',updated=? WHERE id=?").run(this.now(), old.id);
+        old = undefined;
+      }
       if (run) {
         if (this.now() - Math.max(Number(progress.since), run.created) >= RECOVERY_STALLED_RUN_MS
           && !["assessing", "applying"].includes(String(old?.state))
-          && (!old || old.fingerprint !== fingerprint || ["queued", "complete", "resolved"].includes(String(old.state))
-            || retainedAlert && old.run_id !== run.id)) {
+          && (!old || old.fingerprint !== fingerprint || ["queued", "complete", "resolved"].includes(String(old.state)))) {
           if (old) this.db.prepare("UPDATE fleet_recovery SET present=0 WHERE id=?").run(old.id);
           const id = randomUUID();
           this.db.prepare("INSERT INTO fleet_recovery VALUES (?,?,?,?,?,?,?,?,NULL,1)")
@@ -104,11 +109,6 @@ export class RecoveryLedger {
           newAlerts.add(id);
         }
         continue;
-      }
-      // The owner confirmed this exact run ended. Its diagnostic incident must
-      // not become an operator hold on the now-runnable ordinary pipeline.
-      if (retainedAlert) {
-        this.db.prepare("UPDATE fleet_recovery SET present=0,state='resolved',updated=? WHERE id=?").run(this.now(), old.id);
       }
       if (old && ["assessing", "applying"].includes(String(old.state))) {
         this.db.prepare("UPDATE fleet_recovery SET state='escalated', reason=?, updated=? WHERE id=?")
@@ -133,7 +133,7 @@ export class RecoveryLedger {
         && this.now() - Number(old.updated) >= RECOVERY_RECHECK_MS;
       const recheck = (legacyLimit || waited) && trigger && !trigger.manual && !wip;
       if (old && (!trigger || old.fingerprint !== fingerprint || recheck)) this.db.prepare("UPDATE fleet_recovery SET present=0, updated=CASE WHEN state='queued' THEN ? ELSE updated END, state=CASE WHEN state='queued' THEN 'resolved' ELSE state END WHERE id=?").run(this.now(), old.id);
-      if (!trigger || old?.fingerprint === fingerprint && !recheck && !retainedAlert || (wip && !trigger.manual)) continue;
+      if (!trigger || old?.fingerprint === fingerprint && !recheck || (wip && !trigger.manual)) continue;
       const id = randomUUID();
       this.db.prepare("INSERT INTO fleet_recovery VALUES (?,?,?,?,?,?,?,NULL,NULL,1)").run(id, o.ticket, fingerprint, trigger.reason, trigger.manual ? "escalated" : "queued", this.now(), this.now());
       if (trigger.manual) newAlerts.add(id);
