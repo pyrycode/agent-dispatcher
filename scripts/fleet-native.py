@@ -70,6 +70,7 @@ class NativeAdapter:
 
     def status(self): return self.operator('status')
     def attention(self): return self.operator('attention')
+    def publish_attention(self): execute([self.config['operator'], 'report-attention', self.config['reportFile']])
 
     def expected(self, project):
         cfg = self.config['projects'][project]

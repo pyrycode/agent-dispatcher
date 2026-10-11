@@ -4,6 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { RecoveryFacts, type PauseRecord, type EvidenceRecord, type CoordinationRecord } from "./recovery-facts.js";
 import { RecoveryLedger, type RecoveryObservation, type RecoveryDecision } from "./fleet-recovery.js";
+import { OperationReports } from './operation-reports.js';
 
 export type ResourceClass = "heavy" | "medium" | "light";
 export interface MachineLimits { heavyLimit: number; combinedLimit: number }
@@ -51,6 +52,7 @@ export class FleetStore {
   private readonly db: DatabaseSync;
   readonly recovery: RecoveryLedger;
   readonly facts: RecoveryFacts;
+  readonly operations: OperationReports;
   constructor(path: string, private readonly limits: Readonly<Record<string, MachineLimits>>) {
     for (const value of Object.values(limits)) validateLimits(value);
     this.db = new DatabaseSync(path);
@@ -74,6 +76,7 @@ export class FleetStore {
     `);
     this.recovery = new RecoveryLedger(this.db);
     this.facts = new RecoveryFacts(this.db);
+    this.operations = new OperationReports(this.db, Object.keys(limits));
   }
   close(): void { this.db.close(); }
 

@@ -18,7 +18,7 @@ function secret(name: string): string {
 }
 async function main(): Promise<void> {
   const [command, configPath, ...args] = process.argv.slice(2);
-  if (!configPath || !["claims", "manager", "status", "desired", "attention", "pause", "coordination", "recovery", "drain", "drain-project", "resume-project", "free"].includes(command)) {
+  if (!configPath || !["claims", "manager", "status", "desired", "attention", "report-attention", "pause", "coordination", "recovery", "drain", "drain-project", "resume-project", "free"].includes(command)) {
     throw new Error("Usage: fleet-bin.ts claims|manager|status|recovery|drain|drain-project|resume-project|free CONFIG [PROJECT | TICKET GENERATION --confirmed-stopped]");
   }
   const config = JSON.parse(readFileSync(configPath, "utf8"));
@@ -86,14 +86,22 @@ async function main(): Promise<void> {
   const managerUrl = config.managerUrl ?? (config.socketPath ? `unix://${resolve(config.socketPath)}` : undefined);
   if (!managerUrl) throw new Error("Operator configuration requires managerUrl or socketPath");
   const client = new JsonClient(managerUrl, secret(config.operatorTokenEnv));
+  if (command === 'report-attention') {
+    if (args.length !== 1) throw new Error('Provide the saved local supervisor report');
+    const state = await client.call<any>('/state');
+    const claims = new JsonClient(config.claimsUrl, secret(config.claimsOperatorTokenEnv ?? config.claimsTokenEnv));
+    const report = JSON.parse(readFileSync(args[0], 'utf8'));
+    await claims.call('/operations/report', {machine:state.machine,report:{...report,operations:report.operations ?? []}});
+    return;
+  }
   if (command === "desired") {
     const claims = new JsonClient(config.claimsUrl, secret(config.claimsOperatorTokenEnv ?? config.claimsTokenEnv));
     console.log(JSON.stringify(await claims.call("/operations/desired"))); return;
   }
   if (command === "attention") {
     const claims = new JsonClient(config.claimsUrl, secret(config.claimsOperatorTokenEnv ?? config.claimsTokenEnv));
-    const [incidents, state] = await Promise.all([claims.call<import("./fleet-recovery.js").RecoveryIncident[]>("/recovery/state"), client.call<any>("/state")]);
-    console.log(JSON.stringify(recoveryReport(incidents, state), null, 2)); return;
+    const [incidents, state, operations] = await Promise.all([claims.call<import("./fleet-recovery.js").RecoveryIncident[]>("/recovery/state"), client.call<any>("/state"),claims.call<any[]>('/operations/reports')]);
+    console.log(JSON.stringify({...recoveryReport(incidents, state),operationReports:operations}, null, 2)); return;
   }
   if (command === "drain") { await client.call("/drain", {}); console.log("Draining: no new grants. Existing grants remain reserved."); }
   else if (command === "drain-project" || command === "resume-project") {

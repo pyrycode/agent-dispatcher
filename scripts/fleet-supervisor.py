@@ -162,10 +162,15 @@ def main():
                 attention = adapter.attention()
                 attention['operations'] = results
                 atomic(Path(config['reportFile']), attention)
+                adapter.publish_attention()
             except Exception as error:
                 # Do not print arbitrary subprocess output, credentials or authored evidence.
                 atomic(Path(config['reportFile']), {'generatedAt': time.time(), 'service': 'attention',
                        'reason': 'Fleet supervisor could not reach its configured control service. ' + type(error).__name__ + ': ' + str(error)[:300]})
+                try:
+                    adapter.publish_attention()
+                except Exception:
+                    pass
             if args.once:
                 return
             time.sleep(config.get('intervalSeconds', 60))

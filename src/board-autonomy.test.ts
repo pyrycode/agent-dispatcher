@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { RecoveryFacts, type PauseRecord } from './recovery-facts.js';
 import { RecoveryLedger, recoveryTrigger } from './fleet-recovery.js';
 import { FleetStore } from './fleet-store.js';
+import { serveFleet, JsonClient } from './fleet-http.js';
 import { recoveryPlan, observationFor, runRecoveryWork } from './recovery-work.js';
 import { recoveryInventory, relatedTickets, relatedEvidence } from './recovery-evidence.js';
 import { coordinationCanRelease } from './recovery-coordination.js';
@@ -22,6 +23,21 @@ const empty = { claims: [], runs: [] };
 const item: ProjectItem = { id:'card',issueId:'node',issueNumber:1,title:'Repair',body:'',status:'Halted',labels:[],url:'https://github.com/org/core/issues/1',blockedBy:[],parentNumber:null,grandparentNumber:null };
 const agents: AgentConfig[] = [{name:'builder',column:'In Development',description:'',claudeMdPath:'',usesWorktree:true,producesCommits:true}];
 const pause: PauseRecord = {ticket:project+'#1',origin:'pipeline',actor:'mac/builder',reason:'Live infrastructure was unavailable',missing:'Restored access',resumeOn:'Verified access has returned',resumeStatus:'In Development',revision:'generation'};
+
+test('supervisor reports are machine-scoped and contain no executable or ownership data', async t => {
+  const store = new FleetStore(':memory:', {mac:{heavyLimit:1,combinedLimit:2},linux:{heavyLimit:1,combinedLimit:2}});
+  const server = await serveFleet(store,{mac:'mac-fixture',linux:'linux-fixture'},'admin-fixture',0);
+  t.after(async () => {await new Promise<void>(r=>server.close(()=>r()));store.close();});
+  const address=server.address(); assert.ok(address && typeof address !== 'string');
+  const client=new JsonClient(`http://127.0.0.1:${address.port}`,'mac-fixture');
+  const report={operations:[{project,phase:'attention',reason:'Restart needs inspection',claims:['private'],desired:{credential:'fingerprint'},command:'launch-something'}]};
+  await assert.rejects(client.call('/operations/report',{machine:'linux',report}),/403/);
+  await client.call('/operations/report',{machine:'mac',report});
+  const records=await client.call<any[]>('/operations/reports');
+  assert.deepEqual(records[0].operations,[{project,phase:'attention',reason:'Restart needs inspection'}]);
+  assert.equal(records[0].machine,'mac');
+  await assert.rejects(client.call('/operations/report',{machine:'mac',report:{operations:[{project,phase:'arbitrary-command'}]}}));
+});
 
 test('unavailable optional related evidence preserves the other ticket evidence', async () => {
   const original = globalThis.fetch;
