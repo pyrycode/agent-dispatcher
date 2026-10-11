@@ -59,6 +59,7 @@ export async function relatedEvidence(tickets: string[], token: string) {
     if (!/^[\w.-]+\/[\w.-]+$/.test(repo) || !/^[1-9]\d*$/.test(number)) throw new Error("Invalid related ticket");
     const headers = { authorization: `Bearer ${token}`, accept: "application/vnd.github+json" };
     const base = `https://api.github.com/repos/${repo}/issues/${number}`;
+    try {
     const issue = await githubFetch(base, { headers, signal: AbortSignal.timeout(30_000) });
     if (!issue.ok) return { ticket, unavailable: issue.status };
     const value = await issue.json() as any;
@@ -74,5 +75,10 @@ export async function relatedEvidence(tickets: string[], token: string) {
     }
     return { ticket, title: value.title, state: value.state, body: scrubCredentials(String(value.body ?? "").slice(-8000)),
       comments: comments.slice(-8).map(c => ({ url: c.html_url, updated: c.updated_at, body: scrubCredentials(String(c.body ?? "").slice(-6000)) })) };
+    } catch {
+      // Optional cross-project evidence may be unavailable. Preserve the other evidence
+      // without exposing transport error text or treating missing evidence as success.
+      return { ticket, unavailable: "transport" };
+    }
   }));
 }

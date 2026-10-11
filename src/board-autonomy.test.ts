@@ -11,7 +11,7 @@ import { RecoveryFacts, type PauseRecord } from './recovery-facts.js';
 import { RecoveryLedger, recoveryTrigger } from './fleet-recovery.js';
 import { FleetStore } from './fleet-store.js';
 import { recoveryPlan, observationFor, runRecoveryWork } from './recovery-work.js';
-import { recoveryInventory, relatedTickets } from './recovery-evidence.js';
+import { recoveryInventory, relatedTickets, relatedEvidence } from './recovery-evidence.js';
 import { coordinationCanRelease } from './recovery-coordination.js';
 import { recoveryReport } from './recovery-report.js';
 import { FleetUpdates } from './fleet-updates.js';
@@ -22,6 +22,20 @@ const empty = { claims: [], runs: [] };
 const item: ProjectItem = { id:'card',issueId:'node',issueNumber:1,title:'Repair',body:'',status:'Halted',labels:[],url:'https://github.com/org/core/issues/1',blockedBy:[],parentNumber:null,grandparentNumber:null };
 const agents: AgentConfig[] = [{name:'builder',column:'In Development',description:'',claudeMdPath:'',usesWorktree:true,producesCommits:true}];
 const pause: PauseRecord = {ticket:project+'#1',origin:'pipeline',actor:'mac/builder',reason:'Live infrastructure was unavailable',missing:'Restored access',resumeOn:'Verified access has returned',resumeStatus:'In Development',revision:'generation'};
+
+test('unavailable optional related evidence preserves the other ticket evidence', async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = async input => {
+    const url = String(input);
+    if (url.includes('/issues/2')) throw new Error('transport failure with private details');
+    return new Response(JSON.stringify(url.includes('/comments') ? [] : {title:'Useful evidence',state:'open',body:'Observed failure'}));
+  };
+  try {
+    const result = await relatedEvidence(['org/core#1','org/core#2'], 'test-token');
+    assert.equal(result[0].body, 'Observed failure');
+    assert.deepEqual(result[1], {ticket:'org/core#2',unavailable:'transport'});
+  } finally { globalThis.fetch = original; }
+});
 
 test('Halted requires an authoritative origin; operator holds never resume', () => {
   assert.equal(recoveryTrigger(observationFor(project,item))?.manual,true);
