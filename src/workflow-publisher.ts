@@ -84,7 +84,9 @@ export class WorkflowPublisher {
           }
         const mutations = pending.flatMap(({ item }, i) => [
           `i${i}:updateIssue(input:{id:${JSON.stringify(item.issueId)},state:${item.state},labelIds:${JSON.stringify(item.labels.map((n) => labels.find((l) => l.name === n)!.node_id))}}){issue{id}}`,
-          `s${i}:updateProjectV2ItemFieldValue(input:{projectId:${JSON.stringify(config.projectId)},itemId:${JSON.stringify(item.id)},fieldId:${JSON.stringify(config.statusFieldId)},value:{singleSelectOptionId:${JSON.stringify(config.options[item.status])}}}){projectV2Item{id}}`,
+          ...(!item.archived
+            ? [`s${i}:updateProjectV2ItemFieldValue(input:{projectId:${JSON.stringify(config.projectId)},itemId:${JSON.stringify(item.id)},fieldId:${JSON.stringify(config.statusFieldId)},value:{singleSelectOptionId:${JSON.stringify(config.options[item.status])}}}){projectV2Item{id}}`]
+            : []),
         ]);
         // A partial GraphQL response acknowledges nothing. Setting the same desired values again is safe.
         const result = await this.gql(
@@ -95,10 +97,11 @@ export class WorkflowPublisher {
         for (const [index, { ticket, item }] of pending.entries()) {
           if (
             result.data?.[`i${index}`]?.issue?.id !== item.issueId ||
-            result.data?.[`s${index}`]?.projectV2Item?.id !== item.id
+            (!item.archived &&
+              result.data?.[`s${index}`]?.projectV2Item?.id !== item.id)
           )
             throw new Error("Workflow display acknowledgement missing");
-          if (item.positioned || item.position < 0) {
+          if (!item.archived && (item.positioned || item.position < 0)) {
             const ordered = this.store.workflow.list(config.project),
               position = ordered.findIndex((i) => i.id === item.id);
             await this.gql(
@@ -212,7 +215,7 @@ export class WorkflowPublisher {
   /** Read content and discover issues. Existing workflow fields are only compared, never adopted. */
   async refresh(config: WorkflowProject): Promise<void> {
     if (this.store.workflow.preparing(config.project)) return;
-    const fields = `id number title body url state comments(last:8){nodes{id updatedAt body}} parent{number parent{number}} subIssuesSummary{total completed} blockedBy(first:100){nodes{number state url} pageInfo{hasNextPage}} labels(first:100){nodes{name} pageInfo{hasNextPage}} projectItems(first:100){nodes{id project{id} fieldValueByName(name:"Status"){... on ProjectV2ItemFieldSingleSelectValue{name}}} pageInfo{hasNextPage}}`;
+    const fields = `id number title body url state comments(last:8){nodes{id updatedAt body}} parent{number parent{number}} subIssuesSummary{total completed} blockedBy(first:100){nodes{number state url} pageInfo{hasNextPage}} labels(first:100){nodes{name} pageInfo{hasNextPage}} projectItems(first:100){nodes{id isArchived project{id} fieldValueByName(name:"Status"){... on ProjectV2ItemFieldSingleSelectValue{name}}} pageInfo{hasNextPage}}`;
     const known = this.store.workflow.list(config.project);
     // Read known tickets by identity, including any a person closed in GitHub.
     for (let start = 0; start < known.length; start += 50) {
@@ -297,6 +300,7 @@ export class WorkflowPublisher {
         ...known?.item,
         evidenceRevision,
         id: board.id,
+        archived: board.isArchived === true ? true : undefined,
         issueId: issue.id,
         issueNumber: issue.number,
         title: issue.title,
