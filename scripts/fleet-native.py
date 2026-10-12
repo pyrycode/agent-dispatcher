@@ -255,7 +255,7 @@ print(json.dumps({'startupHealthy': health.get('passed'), 'runtime': receipt, 'p
         if self.config['platform'] != 'linux' or not cfg.get('publishStorage'): return
         # Called only after the dispatcher and its children have finished. A
         # container replacement must retain their final handoffs, not an earlier copy.
-        destination=Path(cfg['publishStorage'])
+        destination=Path(cfg['publishStorage']).resolve()
         backup=Path(tempfile.mkdtemp(prefix='publish-before-restart-',dir=self.config['stateDirectory']))
         snapshot=backup/'container';snapshot.mkdir(mode=0o700)
         execute(['podman','cp',cfg['container']+':/Users/juhanailmoniemi/.codex/publish/.',snapshot])
