@@ -2136,6 +2136,7 @@ async function attemptPermissionDenialSalvage(opts: {
 // `dispatch.test.ts` pass a hand-rolled mock without `as any` casting.
 // Mirrors the `ReconcileClient` pattern in `reconcile.ts`.
 export interface DispatchClient {
+  recordMergedIssue?(issueNumber:number):Promise<void>;
   recordCoordination?(record: import("./recovery-facts.js").CoordinationRecord): Promise<void>;
   addLabel(issueNumber: number, label: string): Promise<void>;
   removeLabel(issueNumber: number, label: string): Promise<void>;
@@ -2420,8 +2421,11 @@ export function createCodegraphReindexer(
 const defaultCodegraphReindexer = createCodegraphReindexer(runCommandAsync);
 
 export const DEFAULT_DEPS: DispatchDeps = {
-  execSync,
-  spawnSync,
+  execSync: ((command:any,options:any={})=>execSync(command,{...options,env:{...(options.env??process.env),...managedTaskEnv()}})) as typeof execSync,
+  spawnSync: ((command:any,args:any,options:any={})=>{
+    if(!Array.isArray(args)) {options=args??{};args=[];}
+    return spawnSync(command,args,{...options,env:{...(options.env??process.env),...managedTaskEnv()}});
+  }) as typeof spawnSync,
   existsSync,
   readFileSync,
   writeFileSync,
@@ -5516,7 +5520,7 @@ export async function runVerifierGates(opts: {
       cwd: opts.cwd,
       // Same env discipline as the real-claude gate: dispatcher secrets
       // scrubbed, ANTHROPIC_API_KEY removed (see buildGateSpawnEnv).
-      env: buildGateSpawnEnv(process.env),
+      env: {...buildGateSpawnEnv(process.env),...managedTaskEnv()},
       timeoutMs: VERIFIER_GATE_TIMEOUT_MS,
       stdoutPath,
       stderrPath,
@@ -5604,7 +5608,7 @@ async function rerunVerifierGateFailures(
     const outcome = await ctx.deps.spawnGate({
       command,
       cwd: ctx.agentCwd,
-      env: buildGateSpawnEnv(process.env),
+      env: {...buildGateSpawnEnv(process.env),...managedTaskEnv()},
       timeoutMs: VERIFIER_GATE_TIMEOUT_MS,
       stdoutPath: outputPath,
       stderrPath: outputPath.replace(/\.log$/, ".stderr.log"),
@@ -7231,7 +7235,7 @@ export async function runRealClaudeGateSuite(opts: {
     const outcome = await deps.spawnGate({
       command,
       cwd: worktreeDir,
-      env: buildGateSpawnEnv(process.env),
+      env: {...buildGateSpawnEnv(process.env),...managedTaskEnv()},
       timeoutMs: opts.timeoutMs,
       stdoutPath,
       stderrPath,
@@ -7436,7 +7440,7 @@ async function runFailuresOnBase(opts: {
     const outcome = await deps.spawnGate({
       command,
       cwd: worktreeDir,
-      env: buildGateSpawnEnv(process.env),
+      env: {...buildGateSpawnEnv(process.env),...managedTaskEnv()},
       timeoutMs: opts.timeoutMs,
       stdoutPath,
       stderrPath,
@@ -7525,7 +7529,7 @@ async function runBranchRerun(opts: {
     const outcome = await deps.spawnGate({
       command,
       cwd: opts.worktreeDir,
-      env: buildGateSpawnEnv(process.env),
+      env: {...buildGateSpawnEnv(process.env),...managedTaskEnv()},
       timeoutMs: opts.timeoutMs,
       stdoutPath,
       stderrPath,
@@ -7669,7 +7673,7 @@ export async function runMainSweep(opts: {
     const spawned = await deps.spawnGate({
       command: opts.command,
       cwd: worktreeDir,
-      env: buildGateSpawnEnv(process.env),
+      env: {...buildGateSpawnEnv(process.env),...managedTaskEnv()},
       timeoutMs: opts.timeoutMs,
       stdoutPath,
       stderrPath,
@@ -8463,7 +8467,13 @@ export async function runAutoMerge(
           `gh pr list --head "feature/${item.issueNumber}" --state open --json number --jq '.[0].number'`,
           { cwd: repoRoot, encoding: "utf-8", timeout: 15_000 }
         ).toString().trim();
-        if (!prCheck) continue;
+        if (!prCheck) {
+          if(client.recordMergedIssue) {
+            const merged=execSync(`gh pr list --head "feature/${item.issueNumber}" --state merged --json number --jq '.[0].number'`,{cwd:repoRoot,encoding:'utf8',timeout:15_000}).toString().trim();
+            if(/^[1-9]\d*$/.test(merged))await client.recordMergedIssue(item.issueNumber);
+          }
+          continue;
+        }
         const parsed = parseInt(prCheck, 10);
         if (isNaN(parsed)) continue;
         prNumber = parsed;
@@ -8516,6 +8526,7 @@ export async function runAutoMerge(
           `gh pr merge ${prNumber} --merge --delete-branch`,
           { cwd: repoRoot, encoding: "utf-8", timeout: 30_000 }
         );
+        await client.recordMergedIssue?.(item.issueNumber);
         // Pull merged changes to local main. Failure is non-fatal — the
         // PR already merged on origin, so the next cycle's dispatch will
         // re-pull and recover. But silent swallowing leaves stale local
@@ -9000,7 +9011,7 @@ export async function runEnvPreflight(opts: {
 
 export async function pollLoop(): Promise<void> {
   writeRuntimeReceipt(LOGS_DIR, agentsRepoRoot, resolve(__dirname, ".."));
-  const rawClient = new GitHubProjectClient({
+  let rawClient = new GitHubProjectClient({
     owner: process.env.GITHUB_OWNER!,
     repo: process.env.GITHUB_REPO!,
     projectNumber: parseInt(process.env.PROJECT_NUMBER!, 10),
@@ -9009,7 +9020,7 @@ export async function pollLoop(): Promise<void> {
   });
   const managed = ManagedDispatch.fromEnv(process.env);
   if (managed && AUTOCURATE_MEMORY) throw new Error("Managed dispatch requires PYRY_AUTOCURATE_MEMORY=0");
-  if (managed) await managed.start();
+  if (managed) {await managed.start();rawClient=managed.authorityClient(rawClient);}
   const client = managed ? managed.client(rawClient) : rawClient;
   const maintenanceClient = managed ? managed.client(rawClient, true) : rawClient;
   const mergeReady = async (): Promise<void> => {
@@ -9377,7 +9388,7 @@ export async function pollLoop(): Promise<void> {
     // failure skips the gate this cycle; its tickets keep waiting.
     // In drain mode the gate starts nothing, so its checks are skipped too.
     const gateHealthFailures = drainMode || envHeld || realClaudeGateRunner === null ? [] : await liveGateHealthFailures({
-      checks: HEALTH_CHECKS, checker: healthChecker, env: buildGateSpawnEnv(process.env), notify: notifyDiscord, state: healthNotices,
+      checks: HEALTH_CHECKS, checker: healthChecker, env: {...buildGateSpawnEnv(process.env),...managedTaskEnv()}, notify: notifyDiscord, state: healthNotices,
     });
     // Read after the checks, so a stop signal that landed during them counts.
     const gateRunner = liveGateRunnerFor({
@@ -9596,7 +9607,7 @@ export async function pollLoop(): Promise<void> {
                   model: runner === "codex" ? process.env.PYRY_CODEX_MODEL ?? "gpt-6.1-sol" : "sonnet",
                   effort: RECOVERY_EFFORT, maxTurns: RECOVERY_MAX_TURNS, timeoutMs: RECOVERY_TIMEOUT_MS,
                   allowedTools: "Read,Glob,Grep", disallowedTools: "Bash,Write,Edit,Agent",
-                  env: { ...scrubSpawnEnv(process.env), CLAUDE_CODE_ENTRYPOINT: "recovery" } });
+                  env: { ...scrubSpawnEnv(process.env),...managedTaskEnv(), CLAUDE_CODE_ENTRYPOINT: "recovery" } });
                 if (result.isError || result.timedOut || result.hadPermissionDenial) throw new Error("Recovery assessment failed");
                 return parseRecoveryDecision(result.output);
               },

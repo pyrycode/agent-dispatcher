@@ -16,7 +16,7 @@ interface SyncResult { added: number; removed: number; errors: string[] }
 /** One central display-only writer. It never changes claims or grants. */
 export class ClaimLabelMirror {
   private pending: Promise<SyncResult> | undefined;
-  constructor(private readonly projects: string[], private readonly claims: () => readonly Claim[], private readonly api: ClaimLabelApi, private readonly escalated: () => readonly string[] = () => []) {
+  constructor(private readonly projects: string[], private readonly claims: () => readonly Claim[], private readonly api: ClaimLabelApi, private readonly escalated: () => readonly string[] = () => [], private readonly skipProject:(project:string)=>boolean = ()=>false) {
     if (!Array.isArray(projects) || projects.some(p => typeof p !== "string" || !/^[\w.-]+\/[\w.-]+$/.test(p)) || new Set(projects).size !== projects.length) throw new Error("Invalid claim-label projects");
   }
   sync(): Promise<SyncResult> {
@@ -26,6 +26,7 @@ export class ClaimLabelMirror {
   private async syncOnce(): Promise<SyncResult> {
     const result: SyncResult = { added: 0, removed: 0, errors: [] };
     for (const project of this.projects) {
+      if(this.skipProject(project)) continue;
       try {
         const catalog = new Set((await this.api.listLabels(project)).filter(managedLabel));
         const actual = new Map<number, string[]>();
@@ -115,10 +116,10 @@ export class GitHubClaimLabels implements ClaimLabelApi {
 }
 
 /** Visibility failures never prevent the authority from serving work. */
-export function startClaimLabelSync(config: { tokenEnv: string; projects: string[] } | undefined, claims: () => readonly Claim[], env = process.env, fetcher: typeof fetch = fetch, escalated: () => readonly string[] = () => []): () => void {
+export function startClaimLabelSync(config: { tokenEnv: string; projects: string[] } | undefined, claims: () => readonly Claim[], env = process.env, fetcher: typeof fetch = fetch, escalated: () => readonly string[] = () => [], skipProject:(project:string)=>boolean = ()=>false): () => void {
   if (!config) return () => {};
   try {
-    const mirror = new ClaimLabelMirror(config.projects, claims, new GitHubClaimLabels(env[config.tokenEnv] ?? "", fetcher), escalated);
+    const mirror = new ClaimLabelMirror(config.projects, claims, new GitHubClaimLabels(env[config.tokenEnv] ?? "", fetcher), escalated, skipProject);
     const tick = () => void mirror.sync().then(result => {
       if (result.added || result.removed) console.log(`Claim labels: added ${result.added}, removed ${result.removed}`);
       for (const error of result.errors) console.warn(`Claim label sync will retry: ${error}`);

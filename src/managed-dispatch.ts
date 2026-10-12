@@ -1,3 +1,6 @@
+import {startGitHubBridge} from "./github-bridge.js";
+import {withGitHubActor} from "./github-transport.js";
+import {workflowClient} from "./workflow-client.js";
 import {execFileSync} from "node:child_process";
 import {fileURLToPath} from "node:url";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -17,12 +20,12 @@ import { offerId } from "./machine-manager.js";
 const DEFAULT_RESOURCE_CLASSES: Readonly<Record<string, ResourceClass>> = {
   builder: "medium", developer: "medium", refiner: "light", po: "light", documentation: "light",
 };
-const currentRun = new AsyncLocalStorage<{ run: FleetRun; groups: Set<number>; taskSocket?: string }>();
+const currentRun = new AsyncLocalStorage<{ run: FleetRun; groups: Set<number>; taskSocket?: string; githubEnv?:NodeJS.ProcessEnv }>();
 /** A granted run uses its saved choice even after the global setting changes. */
 export function managedRunRunner(): AgentRunner | undefined { return currentRun.getStore()?.run.runnerPolicy?.runner ?? undefined; }
 export function managedTaskEnv(): NodeJS.ProcessEnv {
   const socket=currentRun.getStore()?.taskSocket;
-  return socket?{PYRY_TASK_SOCKET:socket}:{};
+  return {...currentRun.getStore()?.githubEnv,...(socket?{PYRY_TASK_SOCKET:socket}:{})};
 }
 /** Native repair recipes use the same tracked-child completion rule as project workers. */
 export async function withManagedTaskRun<T>(run: FleetRun, work: () => Promise<T>): Promise<T> {
@@ -68,7 +71,7 @@ export class ManagedDispatch {
   tasksEnabled: boolean;
   private readonly tasksDisabled: boolean;
 
-  constructor(readonly project: string, env: NodeJS.ProcessEnv) {
+  constructor(readonly project: string, private readonly env: NodeJS.ProcessEnv) {
     if (!env.PYRY_MANAGER_URL || !env.PYRY_MANAGER_TOKEN) throw new Error("Managed dispatch requires PYRY_MANAGER_URL and PYRY_MANAGER_TOKEN");
     this.connection = new JsonClient(env.PYRY_MANAGER_URL, env.PYRY_MANAGER_TOKEN);
     this.classes = resourceClasses(env.PYRY_RESOURCE_CLASSES);
@@ -136,6 +139,7 @@ export class ManagedDispatch {
     // Order is scheduling metadata, not part of the durable run identity.
     if (!pending.run) {
       pending.offer.order = order;
+      if(this.state.workflowProjects?.includes(this.project))pending.offer.workflowVersion=1;
       pending.offer.recovery = this.recoveryTickets.has(ticket);
     }
     return pending;
@@ -212,11 +216,19 @@ export class ManagedDispatch {
     if (!this.ready(pending)) throw new Error("No managed run grant");
     const run = pending.run!;
     this.running.add(run.id);
-    return currentRun.run({ run, groups: new Set() }, async () => {
+    return withGitHubActor({session:this.session,runId:run.id},()=>currentRun.run({ run, groups: new Set() }, async () => {
       let completed = false;
-      const bridge = this.tasksEnabled && /#[1-9]\d*$/.test(run.ticket) && ['builder','developer'].includes(run.role) ? await taskBridge(this.connection,run) : undefined;
-      if (bridge) currentRun.getStore()!.taskSocket=bridge.socket;
+      let ghBridge:Awaited<ReturnType<typeof startGitHubBridge>>;
+      let bridge:Awaited<ReturnType<typeof taskBridge>>|undefined;
       try {
+        if(this.state.workflowProjects?.includes(this.project)) {
+          if(this.env.PYRY_SHARED_GITHUB!=='1')throw new Error('Authoritative workflow requires the shared GitHub bridge');
+          const ghEnv={...this.env};
+          ghBridge=await startGitHubBridge(ghEnv,{session:this.session,runId:run.id});
+          if(ghBridge)currentRun.getStore()!.githubEnv={GH_CONFIG_DIR:ghEnv.GH_CONFIG_DIR};
+        }
+        bridge=this.tasksEnabled && /#[1-9]\d*$/.test(run.ticket) && ['builder','developer'].includes(run.role) ? await taskBridge(this.connection,run) : undefined;
+        if(bridge)currentRun.getStore()!.taskSocket=bridge.socket;
         // Fresh authority check before starting, including after a manual release.
         const state = await this.connection.call<FleetSnapshot>("/state");
         if (!state.runs.some(r => r.id === run.id && r.session === this.session && r.generation === run.generation)) throw new Error("Run grant no longer active");
@@ -271,12 +283,13 @@ export class ManagedDispatch {
             catch { await sleep(5000); }
           }
         }
+        ghBridge?.kill();
         this.running.delete(run.id);
         this.pending.delete(this.name(pending.offer.ticket, pending.offer.role));
         this.cooldown.set(this.name(pending.offer.ticket, pending.offer.role), Date.now() + 60_000);
         this.wake?.(); this.wake = undefined;
       }
-    });
+    }));
   }
   private async finish(run: FleetRun, completed = true, unused = false): Promise<void> {
     await this.connection.call("/finish", { session: this.session, id: run.id, completed, unused });
@@ -304,8 +317,12 @@ export class ManagedDispatch {
   inFlightKeys(): Set<string> {
     return new Set(this.state.runs.filter(r => r.project === this.project).map(r => `${r.role}#${r.ticket.split("#")[1]}`));
   }
+  authorityClient<T extends object>(base:T):T {
+    return workflowClient(base,this.connection,this.project,()=>this.state.workflowProjects?.includes(this.project)===true,()=>({session:this.session,runId:currentRun.getStore()?.run.id}));
+  }
   /** Restrict all workflow writers, including cleanup, to this computer's tickets. */
   client<T extends object>(base: T, maintenance = false, onlyIssue?: number): T {
+    base = this.authorityClient(base);
     const itemNumbers = new Map<string, number>();
     const createdNumbers = new Map<string, number>();
     const numbers = new Set(["addLabel", "removeLabel", "addComment", "closeIssue", "addBlocker", "removeBlocker"]);

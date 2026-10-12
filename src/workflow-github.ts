@@ -1,0 +1,752 @@
+import {
+  parse,
+  print,
+  Kind,
+  valueFromASTUntyped,
+  type FieldNode,
+  type SelectionSetNode,
+  type OperationDefinitionNode,
+} from "graphql";
+import { randomUUID } from "node:crypto";
+import type { FleetStore } from "./fleet-store.js";
+import type {
+  GitHubBroker,
+  GitHubRequest,
+  GitHubResponse,
+} from "./github-broker.js";
+import type {
+  WorkflowItem,
+  WorkflowChange,
+  WorkflowProject,
+} from "./workflow-store.js";
+
+type Actor = { machine: string; session: string; runId?: string };
+const response = (value: unknown): GitHubResponse => ({
+  status: 200,
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify(value),
+});
+
+/** Compatibility at the existing GitHub bridge. Workflow writes commit only to SQLite. */
+export class WorkflowGitHub {
+  private catalog = new Map<
+    string,
+    Array<{ id: number; node_id: string; name: string }>
+  >();
+  constructor(
+    private readonly store: FleetStore,
+    private readonly upstream: GitHubBroker,
+  ) {}
+  async labels(project: string, refresh = false) {
+    if (!refresh && this.catalog.has(project))
+      return this.catalog.get(project)!;
+    const all: Array<{ id: number; node_id: string; name: string }> = [];
+    for (let page = 1; ; page++) {
+      const result = await this.upstream.request(project, {
+        method: "GET",
+        path: `/repos/${project}/labels?per_page=100&page=${page}`,
+        fresh: refresh,
+      });
+      if (result.status !== 200)
+        throw new Error("Cannot resolve workflow label names");
+      const rows = JSON.parse(result.body);
+      if (!Array.isArray(rows)) throw new Error("Invalid label catalogue");
+      all.push(...rows);
+      if (rows.length < 100) break;
+    }
+    this.catalog.set(project, all);
+    return all;
+  }
+  private async names(project: string, ids: string[]) {
+    if (!Array.isArray(ids)) throw new Error("Label IDs required");
+    let labels = await this.labels(project);
+    if (ids.some((id) => !labels.some((l) => l.node_id === id)))
+      labels = await this.labels(project, true);
+    return ids.map((id) => {
+      const l = labels.find((l) => l.node_id === id);
+      if (!l) throw new Error("Unknown label ID");
+      return l.name;
+    });
+  }
+  private mutate(
+    project: string,
+    ticket: string,
+    change: WorkflowChange,
+    actor?: Actor,
+  ) {
+    if (ticket.split("#")[0] !== project || !actor)
+      throw new Error("Workflow changes require the owning run identity");
+    return this.store.workflowChange(
+      actor.machine,
+      actor.session,
+      actor.runId,
+      ticket,
+      change,
+      randomUUID(),
+    );
+  }
+  private node(
+    item: WorkflowItem,
+    labels: Array<{ node_id: string; name: string }>,
+  ) {
+    return {
+      id: item.issueId,
+      number: item.issueNumber,
+      title: item.title,
+      body: item.body,
+      url: item.url,
+      state: item.state,
+      labels: {
+        nodes: item.labels.map((name) => ({
+          id: labels.find((l) => l.name === name)?.node_id,
+          name,
+        })),
+        totalCount: item.labels.length,
+        pageInfo: { hasNextPage: false },
+      },
+    };
+  }
+  async request(
+    project: string,
+    request: GitHubRequest,
+    actor?: Actor,
+  ): Promise<GitHubResponse> {
+    if (!this.store.workflow.enabled(project))
+      return this.upstream.request(project, request);
+    const path = request.path.split("?")[0],
+      body = JSON.parse(request.body ?? "{}");
+    const match = path.match(
+      /^\/repos\/([^/]+\/[^/]+)\/issues\/(\d+)(?:\/(labels|comments)(?:\/(.*))?)?$/,
+    );
+    if (
+      request.method === "GET" &&
+      match &&
+      match[1] !== project &&
+      this.store.workflow.enabled(match[1])
+    )
+      return this.request(match[1], request);
+    if (match && match[1] === project) {
+      const ticket = `${project}#${match[2]}`;
+      let item = this.store.workflow
+        .list(project)
+        .find((i) => i.issueNumber === Number(match[2]));
+      if (!item) {
+        const remote = JSON.parse(
+          (
+            await this.checked(project, {
+              method: "GET",
+              path: `/repos/${project}/issues/${match[2]}`,
+            })
+          ).body,
+        );
+        if (remote.pull_request) return this.upstream.request(project, request);
+        await this.adoptIssue(project, remote.node_id);
+        item = this.store.workflow.get(ticket);
+      }
+      if (match[3] === "labels") {
+        if (request.method === "POST")
+          this.mutate(
+            project,
+            ticket,
+            { addLabels: Array.isArray(body) ? body : body.labels },
+            actor,
+          );
+        else if (request.method === "PUT")
+          this.mutate(
+            project,
+            ticket,
+            { labels: Array.isArray(body) ? body : body.labels },
+            actor,
+          );
+        else if (request.method === "DELETE")
+          this.mutate(
+            project,
+            ticket,
+            {
+              removeLabels: match[4]
+                ? [decodeURIComponent(match[4])]
+                : item.labels,
+            },
+            actor,
+          );
+        else if (request.method !== "GET")
+          throw new Error("Unsupported workflow label operation");
+        const labels =
+          request.method === "GET"
+            ? await this.labels(project)
+            : (this.catalog.get(project) ?? []);
+        return response(
+          this.store.workflow
+            .get(ticket)
+            .labels.map(
+              (name) => labels.find((l) => l.name === name) ?? { name },
+            ),
+        );
+      }
+      if (match[3] === "comments" && request.method === "POST") {
+        if (!actor) throw new Error("Workflow comment requires a run");
+        const id = randomUUID();
+        this.store.workflowComment(
+          actor.machine,
+          actor.session,
+          actor.runId,
+          ticket,
+          body.body,
+          id,
+        );
+        return response({
+          id,
+          node_id: id,
+          body: body.body,
+          html_url: item.url,
+          created_at: new Date().toISOString(),
+        });
+      }
+      if (match[3] === "comments" && request.method === "GET") {
+        const result = await this.checked(project, request),
+          rows = JSON.parse(result.body);
+        if (!result.headers.link?.includes('rel="next"'))
+          for (const c of this.store.workflow.unpublishedComments(ticket))
+            if (
+              !rows.some((r: any) =>
+                r.body?.includes(`<!-- orchestrator-comment:${c.id} -->`),
+              )
+            )
+              rows.push(c);
+        return { ...result, body: JSON.stringify(rows) };
+      }
+      if (!match[3] && request.method === "GET") {
+        const result = await this.checked(project, request),
+          value = JSON.parse(result.body);
+        return response({
+          ...value,
+          state: item.state.toLowerCase(),
+          labels: item.labels.map((name) => ({ name })),
+        });
+      }
+      if (
+        !match[3] &&
+        request.method === "PATCH" &&
+        body.labels === undefined &&
+        body.state === undefined
+      ) {
+        const result = await this.checked(project, request);
+        await this.adoptIssue(project, item.issueId);
+        return result;
+      }
+      if (
+        !match[3] &&
+        request.method === "PATCH" &&
+        (body.labels !== undefined || body.state !== undefined)
+      ) {
+        const { labels, state, ...content } = body;
+        if (Object.keys(content).length)
+          await this.checked(project, {
+            ...request,
+            body: JSON.stringify(content),
+          });
+        this.mutate(
+          project,
+          ticket,
+          {
+            ...(labels ? { labels } : {}),
+            ...(state
+              ? { state: String(state).toUpperCase() as "OPEN" | "CLOSED" }
+              : {}),
+          },
+          actor,
+        );
+        const current = this.store.workflow.get(ticket);
+        return response({
+          number: current.issueNumber,
+          node_id: current.issueId,
+          title: current.title,
+          body: current.body,
+          html_url: current.url,
+          state: current.state.toLowerCase(),
+          labels: current.labels.map((name) => ({ name })),
+        });
+      }
+    }
+    if (path !== "/graphql") {
+      const result = await this.upstream.request(project, request);
+      if (
+        request.method === "POST" &&
+        path === `/repos/${project}/issues` &&
+        result.status === 201
+      )
+        await this.adoptIssue(project, JSON.parse(result.body).node_id);
+      return result;
+    }
+    const doc = parse(body.query),
+      operations = doc.definitions.filter(
+        (d) => d.kind === Kind.OPERATION_DEFINITION,
+      ) as OperationDefinitionNode[];
+    const operation = body.operationName
+      ? operations.find((o) => o.name?.value === body.operationName)
+      : operations.length === 1
+        ? operations[0]
+        : undefined;
+    if (!operation) throw new Error("Select one GraphQL operation");
+    const variables = body.variables ?? {};
+    if (operation.operation !== "mutation") {
+      const result = await this.upstream.request(project, request);
+      if (result.status !== 200) return result;
+      const payload = JSON.parse(result.body),
+        labels = await this.labels(project);
+      this.overlay(
+        payload.data,
+        operation.selectionSet,
+        variables,
+        project,
+        labels,
+        doc.definitions,
+      );
+      return { ...result, body: JSON.stringify(payload) };
+    }
+    const output: Record<string, unknown> = {};
+    for (const selection of operation.selectionSet.selections) {
+      if (selection.kind !== Kind.FIELD)
+        throw new Error(
+          "Mutation fragments are not supported by the workflow bridge",
+        );
+      const field = selection.name.value,
+        key = selection.alias?.value ?? field;
+      const input: any =
+        valueFromASTUntyped(
+          selection.arguments?.find((a) => a.name.value === "input")?.value!,
+          variables,
+        ) ?? {};
+      let found = this.store.workflow.find(
+        input.labelableId ??
+          input.issueId ??
+          input.id ??
+          input.itemId ??
+          input.subjectId ??
+          "",
+      );
+      let pullRequestLabel = false;
+      if (
+        !found &&
+        ["addLabelsToLabelable", "removeLabelsFromLabelable"].includes(field)
+      ) {
+        const result = JSON.parse(
+          (
+            await this.checked(project, {
+              method: "POST",
+              path: "/graphql",
+              body: JSON.stringify({
+                query:
+                  "query($id:ID!){node(id:$id){__typename ... on Issue{id repository{nameWithOwner}}}}",
+                variables: { id: input.labelableId },
+              }),
+            })
+          ).body,
+        );
+        const node = result.data?.node;
+        if (node?.__typename === "PullRequest") pullRequestLabel = true;
+        else if (
+          node?.__typename === "Issue" &&
+          node.repository.nameWithOwner === project
+        ) {
+          await this.adoptIssue(project, node.id);
+          found = this.store.workflow.find(node.id);
+        }
+      }
+      let change: WorkflowChange | undefined;
+      if (
+        !pullRequestLabel &&
+        ["addLabelsToLabelable", "removeLabelsFromLabelable"].includes(field)
+      )
+        change = {
+          [field === "addLabelsToLabelable" ? "addLabels" : "removeLabels"]:
+            await this.names(project, input.labelIds),
+        };
+      if (
+        field === "updateIssue" &&
+        (input.labelIds !== undefined || input.state !== undefined)
+      ) {
+        change = {
+          ...(input.labelIds !== undefined
+            ? { labels: await this.names(project, input.labelIds) }
+            : {}),
+          ...(input.state ? { state: input.state } : {}),
+        };
+        const { id, labelIds, state, clientMutationId, ...other } = input;
+        if (Object.keys(other).length) {
+          if (!found || !actor)
+            throw new Error("Workflow edit requires an admitted owner");
+          this.store.authorizeWorkflow(
+            actor.machine,
+            actor.session,
+            found.ticket,
+            actor.runId,
+          );
+          const result = JSON.parse(
+            (
+              await this.checked(project, {
+                method: "POST",
+                path: "/graphql",
+                body: JSON.stringify({
+                  query:
+                    "mutation($input:UpdateIssueInput!){updateIssue(input:$input){issue{id}}}",
+                  variables: { input: { id, ...other } },
+                }),
+              })
+            ).body,
+          );
+          if (result.errors?.length)
+            throw new Error("Issue content edit failed");
+          await this.adoptIssue(project, id);
+        }
+      }
+      if (field === "closeIssue" || field === "reopenIssue")
+        change = { state: field === "closeIssue" ? "CLOSED" : "OPEN" };
+      if (field === "updateProjectV2ItemFieldValue") {
+        const config = this.store.workflow.config(project)!;
+        if (
+          input.projectId === config.projectId &&
+          input.fieldId === config.statusFieldId
+        ) {
+          const status = Object.keys(config.options).find(
+            (name) =>
+              config.options[name] === input.value?.singleSelectOptionId,
+          );
+          if (!status) throw new Error("Unknown workflow stage option");
+          change = { status };
+        }
+      }
+      if (
+        field === "updateProjectV2ItemPosition" &&
+        input.projectId === this.store.workflow.config(project)!.projectId
+      ) {
+        if (input.afterId)
+          throw new Error(
+            "Use orchestrator priority controls to reorder tickets",
+          );
+        change = { top: true };
+      }
+      if (field === "addBlockedBy" || field === "removeBlockedBy") {
+        const blocker = this.store.workflow.find(input.blockingIssueId);
+        if (!found || !blocker)
+          throw new Error("Both dependency tickets must be imported");
+        change = {
+          blockedBy: found.item.blockedBy.filter((b) =>
+            b.url
+              ? b.url !== blocker.item.url
+              : b.number !== blocker.item.issueNumber ||
+                blocker.ticket.split("#")[0] !== project,
+          ),
+        };
+        if (field === "addBlockedBy")
+          change.blockedBy!.push({
+            number: blocker.item.issueNumber,
+            state: blocker.item.state,
+            url: blocker.item.url,
+          });
+      }
+      if (change) {
+        if (!found)
+          throw new Error("Import the ticket before changing its workflow");
+        const item = this.mutate(project, found.ticket, change, actor),
+          node = this.node(item, this.catalog.get(project) ?? []);
+        output[key] = {
+          clientMutationId: input.clientMutationId,
+          issue: node,
+          labelable: node,
+          projectV2Item: { id: item.id },
+          items: { nodes: [{ id: item.id }] },
+        };
+      } else if (field === "addComment" && found) {
+        if (!actor) throw new Error("Workflow comment requires a run");
+        this.store.authorizeWorkflow(
+          actor.machine,
+          actor.session,
+          found.ticket,
+          actor.runId,
+        );
+        const id = randomUUID();
+        this.store.workflowComment(
+          actor.machine,
+          actor.session,
+          actor.runId,
+          found.ticket,
+          input.body,
+          id,
+        );
+        output[key] = {
+          clientMutationId: input.clientMutationId,
+          commentEdge: { node: { id, body: input.body, url: found.item.url } },
+        };
+      } else {
+        const single = {
+          ...operation,
+          selectionSet: { ...operation.selectionSet, selections: [selection] },
+        };
+        // Keep only variables used by this root field.
+        const declarations = (single.variableDefinitions ?? []).filter((v) =>
+          new RegExp("\\$" + v.variable.name.value + "\\b").test(
+            print(selection),
+          ),
+        );
+        const query = print({
+          ...doc,
+          definitions: [
+            { ...single, variableDefinitions: declarations },
+            ...doc.definitions.filter(
+              (d) => d.kind === Kind.FRAGMENT_DEFINITION,
+            ),
+          ],
+        });
+        const result = await this.checked(project, {
+          ...request,
+          body: JSON.stringify({ ...body, query }),
+        });
+        const payload = JSON.parse(result.body);
+        if (payload.errors?.length) return result;
+        output[key] = payload.data?.[key];
+        if (
+          (field === "createIssue" || field === "updateIssue") &&
+          payload.data?.[key]?.issue?.id
+        )
+          await this.adoptIssue(project, payload.data[key].issue.id);
+        if (
+          field === "addProjectV2ItemById" &&
+          input.projectId === this.store.workflow.config(project)!.projectId
+        )
+          await this.adoptIssue(project, input.contentId);
+      }
+    }
+    return response({ data: output });
+  }
+  async adoptIssue(project: string, id: string): Promise<void> {
+    if (!id)
+      throw new Error("Issue identity required for workflow registration");
+    const config = this.store.workflow.config(project)!;
+    const query =
+      'query($id:ID!){node(id:$id){... on Issue{id number title body url state repository{nameWithOwner} labels(first:100){nodes{name} pageInfo{hasNextPage}} blockedBy(first:100){nodes{number state url} pageInfo{hasNextPage}} parent{number parent{number}} subIssuesSummary{total completed} projectItems(first:100){nodes{id project{id} fieldValueByName(name:"Status"){... on ProjectV2ItemFieldSingleSelectValue{name}}} pageInfo{hasNextPage}}}}}';
+    const payload = JSON.parse(
+      (
+        await this.checked(project, {
+          method: "POST",
+          path: "/graphql",
+          body: JSON.stringify({ query, variables: { id } }),
+          fresh: true,
+        })
+      ).body,
+    );
+    const issue = payload.data?.node;
+    if (
+      payload.errors?.length ||
+      !issue ||
+      issue.repository?.nameWithOwner !== project ||
+      issue.labels.pageInfo.hasNextPage ||
+      issue.blockedBy.pageInfo.hasNextPage ||
+      issue.projectItems.pageInfo.hasNextPage
+    )
+      throw new Error("Cannot import incomplete issue metadata");
+    let board = issue.projectItems.nodes.find(
+      (p: any) => p.project.id === config.projectId,
+    );
+    if (!board) {
+      const added = JSON.parse(
+        (
+          await this.checked(project, {
+            method: "POST",
+            path: "/graphql",
+            body: JSON.stringify({
+              query:
+                "mutation($project:ID!,$issue:ID!){addProjectV2ItemById(input:{projectId:$project,contentId:$issue}){item{id}}}",
+              variables: { project: config.projectId, issue: id },
+            }),
+          })
+        ).body,
+      );
+      if (added.errors?.length || !added.data?.addProjectV2ItemById?.item?.id)
+        throw new Error("Could not register workflow board item");
+      board = { id: added.data.addProjectV2ItemById.item.id };
+    }
+    this.store.workflow.observe(project, [
+      {
+        id: board.id,
+        issueId: issue.id,
+        issueNumber: issue.number,
+        title: issue.title,
+        body: issue.body,
+        url: issue.url,
+        state: issue.state,
+        status: board.fieldValueByName?.name ?? "Inbox",
+        labels: issue.labels.nodes.map((l: any) => l.name),
+        blockedBy: issue.blockedBy.nodes,
+        parentNumber: issue.parent?.number ?? null,
+        grandparentNumber: issue.parent?.parent?.number ?? null,
+        subIssues: issue.subIssuesSummary,
+        revision: 1,
+        position: 0,
+      },
+    ]);
+  }
+  private async checked(project: string, request: GitHubRequest) {
+    const r = await this.upstream.request(project, request);
+    if (r.status < 200 || r.status >= 300)
+      throw new Error(`GitHub unavailable: ${r.status}`);
+    return r;
+  }
+  private overlay(
+    data: any,
+    set: SelectionSetNode,
+    variables: any,
+    project: string,
+    labels: Array<{ node_id: string; name: string }>,
+    definitions: readonly any[],
+    context?: WorkflowItem,
+  ): void {
+    if (!data || typeof data !== "object") return;
+    if (Array.isArray(data)) {
+      for (const value of data)
+        this.overlay(
+          value,
+          set,
+          variables,
+          project,
+          labels,
+          definitions,
+          context,
+        );
+      return;
+    }
+    context = this.store.workflow.find(data.id ?? "")?.item ?? context;
+    for (const selection of set.selections) {
+      if (selection.kind === Kind.FRAGMENT_SPREAD) {
+        const f = definitions.find(
+          (d) =>
+            d.kind === Kind.FRAGMENT_DEFINITION &&
+            d.name.value === selection.name.value,
+        );
+        if (f)
+          this.overlay(
+            data,
+            f.selectionSet,
+            variables,
+            project,
+            labels,
+            definitions,
+            context,
+          );
+        continue;
+      }
+      if (selection.kind === Kind.INLINE_FRAGMENT) {
+        this.overlay(
+          data,
+          selection.selectionSet,
+          variables,
+          project,
+          labels,
+          definitions,
+          context,
+        );
+        continue;
+      }
+      const key = selection.alias?.value ?? selection.name.value,
+        name = selection.name.value;
+      let child: WorkflowItem | undefined,
+        childProject = project;
+      if (name === "node") {
+        const argument = selection.arguments?.find(
+          (a) => a.name.value === "id",
+        );
+        if (argument)
+          child = this.store.workflow.find(
+            String(valueFromASTUntyped(argument.value, variables)),
+          )?.item;
+      }
+      if (name === "repository") {
+        const values = Object.fromEntries(
+          (selection.arguments ?? []).map((a) => [
+            a.name.value,
+            valueFromASTUntyped(a.value, variables),
+          ]),
+        );
+        if (values.owner && values.name)
+          childProject = `${values.owner}/${values.name}`;
+      }
+      if (name === "issue") {
+        const argument = selection.arguments?.find(
+          (a) => a.name.value === "number",
+        );
+        const n = argument
+          ? valueFromASTUntyped(argument.value, variables)
+          : data[key]?.number;
+        child = this.store.workflow
+          .list(project)
+          .find((i) => i.issueNumber === n);
+      }
+      if (context && name === "labels")
+        data[key] = this.node(context, labels).labels;
+      if (context && name === "state") data[key] = context.state;
+      if (context && name === "comments") {
+        const remote = data[key];
+        if (remote && !remote.pageInfo?.hasNextPage) {
+          const nodes =
+            remote.nodes ?? remote.edges?.map((e: any) => e.node) ?? [];
+          const pending = this.store.workflow
+            .unpublishedComments(`${project}#${context.issueNumber}`)
+            .filter(
+              (c) =>
+                !nodes.some((n: any) =>
+                  n.body?.includes(`<!-- orchestrator-comment:${c.id} -->`),
+                ),
+            )
+            .map((c) => ({
+              id: c.id,
+              body: c.body,
+              createdAt: c.created_at,
+              author: null,
+              url: context!.url,
+            }));
+          if (remote.nodes) remote.nodes.push(...pending);
+          if (remote.edges)
+            remote.edges.push(...pending.map((node) => ({ node })));
+          if (typeof remote.totalCount === "number")
+            remote.totalCount += pending.length;
+        }
+      }
+      if (context && name === "blockedBy") {
+        const nodes = context.blockedBy.map((b) => ({
+          number: b.number,
+          state: b.state,
+          url: b.url,
+          id: this.store.workflow
+            .list(project)
+            .find((i) => i.issueNumber === b.number)?.issueId,
+        }));
+        data[key] = {
+          nodes,
+          edges: nodes.map((node) => ({ node })),
+          totalCount: nodes.length,
+          pageInfo: { hasNextPage: false },
+        };
+      }
+      if (context && data.id === context.id && name === "fieldValueByName") {
+        const argument = selection.arguments?.find(
+          (a) => a.name.value === "name",
+        );
+        if (
+          argument &&
+          valueFromASTUntyped(argument.value, variables) === "Status"
+        )
+          data[key] = { name: context.status };
+      }
+      if (selection.selectionSet)
+        this.overlay(
+          data[key],
+          selection.selectionSet,
+          variables,
+          childProject,
+          labels,
+          definitions,
+          child,
+        );
+    }
+  }
+}

@@ -1,6 +1,6 @@
 # agent-dispatcher
 
-Dispatch agent runs against a GitHub Project board. Label-driven state machine, worktree isolation, salvage on `max_turns`.
+Dispatch agent runs through the shared orchestrator, with GitHub boards displaying workflow progress. Worktree isolation and recovery preserve unfinished work.
 
 Built for [pyrycode](https://github.com/pyrycode); reused across multiple agents repos.
 
@@ -8,7 +8,7 @@ Built for [pyrycode](https://github.com/pyrycode); reused across multiple agents
 
 The dispatcher polls a GitHub Project (v2) board, reads the current column + labels of each item, and decides whether to run an agent against it. Each agent is a `claude -p` invocation with a per-agent CLAUDE.md system prompt. Agents work in isolated `git worktree` checkouts, push to feature branches, and open pull requests.
 
-The state machine is driven entirely by **labels** + **board column**. No queue, no scheduler, no daemon-side state — restart-safe by design.
+Managed projects can adopt the central SQLite workflow authority. After import, stage and label decisions read the database. GitHub labels and columns are display only. Existing unmanaged and not-yet-imported projects retain their current behaviour. See [workflow authority and migration](docs/workflow-authority.md).
 
 ### Pipeline (default)
 

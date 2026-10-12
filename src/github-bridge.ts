@@ -42,7 +42,7 @@ export function configureGitHubCLI(directory: string, socket: string, env: NodeJ
   writeFileSync(join(directory, "config.yml"), `${prior}\nhttp_unix_socket: ${JSON.stringify(socket)}\n`, { mode: 0o600 });
 }
 
-export async function startGitHubBridge(env: NodeJS.ProcessEnv): Promise<ChildProcess | undefined> {
+export async function startGitHubBridge(env: NodeJS.ProcessEnv, actor?:{session:string;runId?:string}): Promise<ChildProcess | undefined> {
   if (env.PYRY_SHARED_GITHUB !== "1") return;
   if (!env.PYRY_MANAGER_URL || !env.PYRY_MANAGER_TOKEN) throw new Error("Shared GitHub requires managed dispatch");
   const directory = mkdtempSync(join(tmpdir(), "pyry-github-"));
@@ -57,16 +57,18 @@ export async function startGitHubBridge(env: NodeJS.ProcessEnv): Promise<ChildPr
     child.once("error", reject);
     child.once("exit", () => { clearTimeout(timer); reject(new Error("Shared GitHub bridge exited before startup")); });
     child.once("message", message => { clearTimeout(timer); if (message === "ready") resolve(); else reject(new Error("Shared GitHub bridge startup failed")); });
-    child.send({ socket, url: env.PYRY_MANAGER_URL, token: env.PYRY_MANAGER_TOKEN });
+    child.send({ socket, url: env.PYRY_MANAGER_URL, token: env.PYRY_MANAGER_TOKEN, actor });
   });
   env.GH_CONFIG_DIR = directory;
   configureGitHubTransport(env.PYRY_MANAGER_URL, env.PYRY_MANAGER_TOKEN);
   child.unref(); child.disconnect();
-  process.once("exit", () => child.kill());
+  const stop=()=>{child.kill();};
+  process.once("exit",stop);
+  child.once("exit",()=>process.removeListener("exit",stop));
   return child;
 }
 
-export async function runGitHubBridge(config: { socket: string; url: string; token: string }): Promise<Server> {
+export async function runGitHubBridge(config: { socket: string; url: string; token: string; actor?:{session:string;runId?:string} }): Promise<Server> {
   const client = new JsonClient(config.url, config.token);
-  return serveGitHubBridge(config.socket, request => client.call("/github", request));
+  return serveGitHubBridge(config.socket, request => client.call("/github", {...request,actor:config.actor}));
 }

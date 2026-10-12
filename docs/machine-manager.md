@@ -440,3 +440,7 @@ verifier must recreate its own judgment and required checks.
 After a worker loads assessment policy version 1, the existing recovery cycle revisits its old unclassified escalations once. The claim database saves that policy version per incident, so restarting does not repeat the migration. Controller-first rollout waits for the updated worker observation before queuing this work. The policy version does not change a ticket's workflow fingerprint.
 
 The fresh assessment uses current native execution capabilities. Classified human decisions, known operator pauses, denied permissions, running work and possibly applied repair handbacks stay protected. Fresh escalations always carry a category. Ordinary errored tickets remain eligible for diagnosis even with exhausted transient retries. Unknown-pause provenance checks share the existing idle assessment lane with dependency and Inbox checks. No new reporter or scheduler is created.
+
+## Workflow authority
+
+Imported projects use the central database for workflow decisions. See [workflow authority](workflow-authority.md) for migration, operator commands, compatibility and display publication. Update controllers and consumers before import. Preserve existing project drains and ticket reservations.

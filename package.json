@@ -12,7 +12,7 @@
     "typecheck": "tsc --noEmit -p .",
     "test:helpers": "python3 -m unittest discover -s codex-helpers -p 'test_*.py' && python3 -m unittest discover -s scripts -p 'test_*.py'",
     "eval:report": "tsx src/eval/report.ts",
-    "drain": "pkill -TERM -f 'tsx.*src/dispatch-bin\\.ts' && echo 'SIGTERM sent \u2014 dispatcher will exit after current dispatch completes.'",
+    "drain": "pkill -TERM -f 'tsx.*src/dispatch-bin\\.ts' && echo 'SIGTERM sent — dispatcher will exit after current dispatch completes.'",
     "test:slow": "PYRY_SLOW_TESTS=1 tsx --test --test-concurrency=4 src/*.test.ts src/eval/*.test.ts"
   },
   "devDependencies": {
@@ -23,6 +23,7 @@
   "dependencies": {
     "@octokit/graphql": "^9.0.3",
     "dotenv": "^17.3.1",
-    "fast-xml-parser": "^5.11.1"
+    "fast-xml-parser": "^5.11.1",
+    "graphql": "^16.14.2"
   }
 }

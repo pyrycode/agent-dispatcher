@@ -5,6 +5,7 @@ export interface GitHubRequest {
   headers?: Record<string, string>;
   body?: string;
   fresh?: boolean;
+  actor?: {session:string;runId?:string};
 }
 export interface GitHubResponse { status: number; headers: Record<string, string>; body: string }
 interface Budget { remaining: number; reset: number; heldUntil?: number }
