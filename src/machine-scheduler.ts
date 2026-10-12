@@ -1,6 +1,7 @@
 import type { FleetSnapshot, MachineLimits, ResourceClass } from "./fleet-store.js";
 
 export interface WorkOffer {
+  workflowVersion?: 1;
   project: string;
   ticket: string;
   role: string;

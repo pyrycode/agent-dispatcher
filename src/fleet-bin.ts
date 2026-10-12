@@ -1,3 +1,8 @@
+import {WorkflowGitHub} from "./workflow-github.js";
+import {WorkflowPublisher} from "./workflow-publisher.js";
+import {GitHubProjectClient} from "./github.js";
+import {randomUUID} from "node:crypto";
+import {writeFileSync} from "node:fs";
 // Explicit executable only. Importable libraries never start services or touch GitHub.
 import {execFileSync} from "node:child_process";
 import {fileURLToPath} from "node:url";
@@ -20,10 +25,29 @@ function secret(name: string): string {
 }
 async function main(): Promise<void> {
   const [command, configPath, ...args] = process.argv.slice(2);
-  if (!configPath || !["control", "recovery-task", "claims", "manager", "status", "runner", "desired", "attention", "report-attention", "pause", "coordination", "recovery", "drain", "drain-project", "resume-project", "free"].includes(command)) {
+  if (!configPath || !["workflow", "control", "recovery-task", "claims", "manager", "status", "runner", "desired", "attention", "report-attention", "pause", "coordination", "recovery", "drain", "drain-project", "resume-project", "free"].includes(command)) {
     throw new Error("Usage: fleet-bin.ts claims|manager|status|runner|recovery|drain|drain-project|resume-project|free CONFIG [claude|codex|local | PROJECT | TICKET GENERATION --confirmed-stopped]");
   }
   const config = JSON.parse(readFileSync(configPath, "utf8"));
+  if(command==='workflow') {
+    const [action,project,file,boardNumber]=args;
+    if(!['read','export','import','change','prepare','activate','cancel-preparation'].includes(action)||!project)throw new Error('workflow read|export|import|change|prepare|activate|cancel-preparation PROJECT [JSON_FILE]');
+    if(action==='export') {
+      if(!file)throw new Error('Export output path required');
+      const entry=config.projects?.find((p:any)=>p.repo===project);
+      const projectNumber=Number(boardNumber??entry?.projectNumber);
+      if(!Number.isSafeInteger(projectNumber)||projectNumber<1)throw new Error('Export requires a project number as the final argument or in project configuration');
+      const [owner,repo]=project.split('/');
+      const client=new GitHubProjectClient({owner,repo,projectNumber,ownerType:entry?.ownerType??'organization',token:secret(config.githubTokenEnv??config.github?.tokenEnv??'GH_TOKEN')});
+      await client.initialize();writeFileSync(file,JSON.stringify(await client.workflowExport()),{mode:0o600});return;
+    }
+    const claims=new JsonClient(config.claimsUrl,secret(config.claimsOperatorTokenEnv??config.claimsTokenEnv));
+    if(['prepare','activate','cancel-preparation'].includes(action)) {console.log(JSON.stringify(await claims.call('/workflow/'+action,{project})));return;}
+    if(action==='read') {console.log(JSON.stringify(await claims.call('/workflow/read',{project})));return;}
+    if(!file)throw new Error('Saved workflow request required');
+    const input=JSON.parse(readFileSync(file,'utf8'));
+    console.log(JSON.stringify(await claims.call(action==='import'?'/workflow/import':'/workflow/operator', {...input,project,commandId:input.commandId??randomUUID()})));return;
+  }
   if(command==='control') {
     const claims=new JsonClient(config.claimsUrl,secret(config.claimsOperatorTokenEnv ?? config.claimsTokenEnv));
     console.log(JSON.stringify(await claims.call(args.length?'/operations/control-ready':'/operations/control',args.length?JSON.parse(readFileSync(args[0],'utf8')):undefined)));
@@ -63,7 +87,8 @@ async function main(): Promise<void> {
     if (github && config.github.socketPath) {
       const socket = resolve(config.github.socketPath);
       configureGitHubCLI(resolve(config.github.cliConfigDir ?? dirname(socket)), socket);
-      cli = await serveGitHubBridge(socket, request => github.request(request.path.match(/^\/repos\/([^/]+\/[^/?]+)/)?.[1] ?? config.github.projects[0], request));
+      const workflowCLI=new WorkflowGitHub(store,github);
+      cli = await serveGitHubBridge(socket, request => workflowCLI.request(request.path.match(/^\/repos\/([^/]+\/[^/?]+)/)?.[1] ?? config.github.projects[0], request));
     }
     const labelFetch: typeof fetch = github ? async (input, init) => {
       const req = new Request(input, init);
@@ -75,8 +100,10 @@ async function main(): Promise<void> {
         headers: { accept: req.headers.get("accept") ?? "application/vnd.github+json", "content-type": "application/json" },
         ...(!["GET", "HEAD"].includes(req.method) ? { body: await req.text() } : {}) }));
     } : fetch;
-    const stopLabels = startClaimLabelSync(config.githubLabels, () => store.snapshot().claims, process.env, labelFetch, () => store.recovery.escalatedTickets());
-    const close = () => { if (updateTimer) clearInterval(updateTimer); stopLabels(); cli?.close(); server.close(() => { store.close(); process.exit(0); }); };
+    const workflowPublisher=github?new WorkflowPublisher(store,github):undefined;
+    const workflowTimer=workflowPublisher?setInterval(()=>{void workflowPublisher.tick().catch(e=>console.warn(e.message));},30_000):undefined;
+    const stopLabels = startClaimLabelSync(config.githubLabels, () => store.snapshot().claims, process.env, labelFetch, () => store.recovery.escalatedTickets(), project=>store.workflow.enabled(project));
+    const close = () => { if (updateTimer) clearInterval(updateTimer); if(workflowTimer)clearInterval(workflowTimer); stopLabels(); cli?.close(); server.close(() => { store.close(); process.exit(0); }); };
     process.on("SIGTERM", close); process.on("SIGINT", close);
     console.log("Claim service listening", server.address());
     return;

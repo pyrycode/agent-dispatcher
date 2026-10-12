@@ -1,3 +1,4 @@
+import { WorkflowStore, type WorkflowChange } from "./workflow-store.js";
 // The one authority for fleet ownership. No heartbeat expires a claim or run.
 // Keep this file on the claim server's local disk, never on a shared filesystem.
 import { DatabaseSync } from "node:sqlite";
@@ -21,6 +22,7 @@ export function validateLimits(limits: MachineLimits): void {
   }
 }
 export interface StartRequest {
+  workflowVersion?: 1;
   id: string;
   machine: string;
   session: string;
@@ -36,7 +38,7 @@ export interface StartRequest {
 }
 export interface Claim { ticket: string; machine: string; generation: string; created: number }
 export interface FleetRun extends StartRequest { generation: string; created: number; runnerPolicy?: RunnerPolicy }
-export interface FleetSnapshot { claims: Claim[]; runs: FleetRun[]; runnerPolicy?: RunnerPolicy; idleRecoveryTickets?: string[]; releasedAssessmentClaims?: Claim[]; features?: {recoveryTasks:boolean}; requiredRepairs?: Record<string,string[]> }
+export interface FleetSnapshot { workflowProjects?: string[]; claims: Claim[]; runs: FleetRun[]; runnerPolicy?: RunnerPolicy; idleRecoveryTickets?: string[]; releasedAssessmentClaims?: Claim[]; features?: {recoveryTasks:boolean}; requiredRepairs?: Record<string,string[]> }
 export type StartResult = { ok: true; generation: string } | {
   ok: false; reason: "foreign-claim" | "running" | "capacity" | "locked" | "finished";
 };
@@ -64,6 +66,7 @@ export function validateStart(req: StartRequest): void {
 export class FleetStore {
   private readonly db: DatabaseSync;
   readonly recovery: RecoveryLedger;
+  readonly workflow: WorkflowStore;
   readonly facts: RecoveryFacts;
   readonly operations: OperationReports;
   readonly tasks: RecoveryTasks;
@@ -93,6 +96,7 @@ export class FleetStore {
         revision INTEGER NOT NULL CHECK(revision>0)
       ) STRICT;
     `);
+    this.workflow = new WorkflowStore(this.db);
     this.recovery = new RecoveryLedger(this.db);
     this.facts = new RecoveryFacts(this.db);
     this.tasks = new RecoveryTasks(this.db);
@@ -223,6 +227,26 @@ export class FleetStore {
     });
   }
 
+  workflowChange(machine: string, session: string, runId: string | undefined, ticket: string, change: WorkflowChange, commandId: string, revision?: number) {
+    return this.transaction(() => {
+      this.authorizeWorkflow(machine, session, ticket, runId);
+      return this.workflow.change(ticket, change, machine + ':' + session, commandId, revision);
+    });
+  }
+  authorizeWorkflow(machine:string,session:string,ticket:string,runId?:string):void {
+    if(runId && !this.db.prepare('SELECT 1 FROM fleet_runs WHERE id=? AND machine=? AND session=? AND finished IS NULL').get(runId,machine,session)) throw new Error('Workflow run has finished or lost ownership');
+    this.authorize(machine,session,ticket,runId);
+  }
+  workflowComment(machine:string,session:string,runId:string|undefined,ticket:string,body:string,id:string):void {
+    this.transaction(()=>{this.authorizeWorkflow(machine,session,ticket,runId);this.workflow.comment(ticket,body,id);});
+  }
+  workflowOperator(ticket: string, change: WorkflowChange, commandId: string, revision: number) {
+    return this.transaction(() => {
+      if (!Number.isSafeInteger(revision)) throw new Error('Expected workflow revision required');
+      if (this.snapshot().runs.some(r=>r.ticket===ticket)) throw new Error('Ticket has an active reservation; drain it before changing workflow');
+      return this.workflow.change(ticket, change, 'operator', commandId, revision);
+    });
+  }
   recoveryFacts(tickets: string[]) {
     const evidence = this.facts.getEvidence(tickets);
     return tickets.map(ticket => ({ ticket, pause: this.facts.getPause(ticket),
@@ -269,10 +293,13 @@ export class FleetStore {
     });
   }
 
+  private transactionDepth = 0;
   private transaction<T>(work: () => T): T {
-    this.db.exec("BEGIN IMMEDIATE");
+    if(this.transactionDepth) return work();
+    this.db.exec("BEGIN IMMEDIATE");this.transactionDepth++;
     try { const result = work(); this.db.exec("COMMIT"); return result; }
     catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    finally {this.transactionDepth--;}
   }
 
   start(req: StartRequest): StartResult {
@@ -302,6 +329,13 @@ export class FleetStore {
         if (JSON.stringify(original) !== request) throw new Error("Request ID reused with different contents");
         return previous.finished === null ? { ok: true, generation: String(previous.generation) } : { ok: false, reason: "finished" };
       }
+    if(this.workflow.preparing(req.project))return {ok:false,reason:'locked'};
+    if(this.workflow.enabled(req.project) && !req.supportTaskId && req.workflowVersion!==1) return {ok:false,reason:"locked"};
+    if(this.workflow.enabled(req.project) && /#[1-9]\d*$/.test(req.ticket)) {
+      const item=this.workflow.get(req.ticket);
+      const columns:Record<string,string>={po:'Backlog',refiner:'Backlog',architect:'In Architecture',developer:'In Development',builder:'In Development',qa:'In QA','code-review':'In Code Review',verifier:'In Code Review',documentation:'In Documentation'};
+      if(columns[req.role] && (item.state!=='OPEN' || item.status!==columns[req.role] || item.labels.some(l=>l.startsWith('error:')||l.startsWith('needs-rework:')||l.startsWith('wip:')||l.startsWith('needs-human:')&&l!=='needs-human:sizing') || item.blockedBy.some(b=>b.state==='OPEN'))) return {ok:false,reason:'locked'};
+    }
     if(/#[1-9]\d*$/.test(req.ticket) && req.role!=='recovery') {
       const required=this.requiredRepairs()[req.ticket]??[];
       if(required.some(sha=>!req.readyRepairs?.includes(sha))) return {ok:false,reason:'locked'};
@@ -388,6 +422,7 @@ export class FleetStore {
         if (released.changes) this.db.prepare("INSERT OR IGNORE INTO fleet_assessment_releases VALUES (?,?,?,?)")
           .run(run.ticket, run.machine, run.generation, Date.now());
       }
+      this.workflow.finish(String(run.ticket), request.role, id);
       // Shared maintenance jobs have no long-lived ticket owner.
       if (String(run.ticket).includes("#@")) {
         this.db.prepare("DELETE FROM fleet_claims WHERE ticket=? AND generation=? AND NOT EXISTS (SELECT 1 FROM fleet_runs WHERE ticket=? AND finished IS NULL)")
@@ -420,6 +455,7 @@ export class FleetStore {
       .all(...IDLE_RECOVERY_REASONS).map(r => String(r.ticket));
     const releasedAssessmentClaims = this.db.prepare("SELECT * FROM fleet_assessment_releases").all() as unknown as Claim[];
     return {
+      ...(this.workflow.projects().length ? {workflowProjects:this.workflow.projects().map(p=>p.project)} : {}),
       ...(runnerPolicy ? { runnerPolicy } : {}),
       ...(idleRecoveryTickets.length ? { idleRecoveryTickets } : {}),
       ...(releasedAssessmentClaims.length ? { releasedAssessmentClaims } : {}),

@@ -177,6 +177,11 @@ export async function serveManager(manager: MachineManager, projectTokens: Recor
         return send(200, await manager.claims.call(req.url!, { ...body, project,
           ...(req.url === "/recovery/evidence" ? { records: body.records?.map((r: any) => ({ ...r, machine: manager.config.machine })) } : {}) }));
       }
+      if(req.url?.startsWith('/workflow/')) {
+        if(!['/workflow/read','/workflow/change','/workflow/comments','/workflow/comment'].includes(req.url) || !manager.claims.call) return send(403,{error:'Unsupported project workflow operation'});
+        if(body.ticket && body.ticket.split('#')[0]!==project) return send(403,{error:'Workflow project mismatch'});
+        return send(200,await manager.claims.call(req.url,{...body,project}));
+      }
       if (req.url === "/github") {
         if (!manager.claims.github) return send(403, { error: "Shared GitHub not configured" });
         return send(200, await manager.claims.github(project, body));

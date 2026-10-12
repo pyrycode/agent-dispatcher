@@ -3,6 +3,8 @@ import { JsonClient } from "./fleet-http.js";
 import type { GitHubRequest, GitHubResponse } from "./github-broker.js";
 
 const fresh = new AsyncLocalStorage<boolean>();
+const actor = new AsyncLocalStorage<{session:string;runId?:string}>();
+export function withGitHubActor<T>(identity:{session:string;runId?:string},work:()=>Promise<T>):Promise<T> {return actor.run(identity,work);}
 let connection: JsonClient | undefined;
 export function configureGitHubTransport(url: string, token: string): void { connection = new JsonClient(url, token); }
 export function freshGitHubRead<T>(work: () => Promise<T>): Promise<T> { return fresh.run(true, work); }
@@ -17,7 +19,7 @@ export const githubFetch: typeof fetch = async (input, init) => {
   if (url.origin !== "https://api.github.com") throw new Error("Shared GitHub transport refuses another upstream host");
   const envelope: GitHubRequest = { method: req.method, path: url.pathname + url.search,
     headers: Object.fromEntries(req.headers),
-    ...(!["GET", "HEAD"].includes(req.method) ? { body: await req.text() } : {}), fresh: fresh.getStore() === true };
+    ...(!["GET", "HEAD"].includes(req.method) ? { body: await req.text() } : {}), fresh: fresh.getStore() === true, actor: actor.getStore() };
   // The central service owns the upstream credential. Never send a local
   // GitHub token to the manager or include it in a shared cache key.
   delete envelope.headers!.authorization;

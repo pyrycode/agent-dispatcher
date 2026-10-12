@@ -613,6 +613,44 @@ export class GitHubProjectClient {
     return items;
   }
 
+  initializeFromWorkflow(config:import('./workflow-store.js').WorkflowProject):void {
+    this.projectId=config.projectId;this.statusFieldId=config.statusFieldId;this.statusOptions=new Map(Object.entries(config.options));
+  }
+
+  /** Explicit migration export. Call only after draining the project. */
+  async workflowExport() {
+    if(!this.projectId || !this.statusFieldId) throw new Error('Not initialized');
+    // Migration must fail on an incomplete read, unlike ordinary polling.
+    this.clearItemsCache();
+    const open=await this.fetchOpenIssueItems();
+    if(!open)throw new Error('Complete open-ticket listing required for migration');
+    const project=`${this.config.owner}/${this.config.repo}`;
+    const listing=mergeListingWithOpenIssues(await this.getAllItems(),open).items.filter(i=>i.url?.startsWith(`https://github.com/${project}/issues/`));
+    const items:RawItem[]=[];
+    const fields=ISSUE_FIELDS.replace('labels(first: 10) {','labels(first: 100) { pageInfo { hasNextPage }').replace('blockedBy(first: 10) {','blockedBy(first: 100) { pageInfo { hasNextPage }');
+    for(let start=0;start<listing.length;start+=50) {
+      const batch=listing.slice(start,start+50);
+      const result:any=await this.gql(`query($ids:[ID!]!){nodes(ids:$ids){... on Issue{${fields}}}}`,{ids:batch.map(i=>i.issueId)});
+      for(const item of batch) {
+        const content=result.nodes.find((n:any)=>n?.id===item.issueId);
+        if(!content || content.labels.pageInfo.hasNextPage || content.blockedBy.pageInfo.hasNextPage)throw new Error(`Incomplete migration metadata for issue ${item.issueNumber}`);
+        items.push(toRawItem(item.id,item.status,content));
+      }
+    }
+    const comments:Record<string,any[]>={};
+    for(const item of items) {
+      const history:any[]=[];
+      for(let page=1; ;page++) {
+        const result=await this.fetchIssueCommentsPage(item.issueNumber,page);
+        history.push(...result.comments);
+        if(page>=(result.lastPage??page)) break;
+        if(page>=100) throw new Error('Comment import exceeds safe pagination bound');
+      }
+      comments[String(item.issueNumber)]=history.map(c=>({id:String(c.node_id??c.id),body:c.body,created_at:c.created_at}));
+    }
+    return {project:`${this.config.owner}/${this.config.repo}`,config:{project:`${this.config.owner}/${this.config.repo}`,projectId:this.projectId,statusFieldId:this.statusFieldId,options:Object.fromEntries(this.statusOptions)},items,comments};
+  }
+
   async initialize(): Promise<void> {
     // Support both user and organization project owners
     const ownerField = this.config.ownerType === "organization" ? "organization" : "user";

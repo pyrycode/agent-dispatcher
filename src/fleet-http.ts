@@ -1,3 +1,4 @@
+import {WorkflowGitHub} from "./workflow-github.js";
 import { createServer, request, type IncomingMessage, type Server } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 import { chmodSync } from "node:fs";
@@ -32,6 +33,7 @@ export async function listen(server: Server, port: number | string, host = "127.
 export async function serveFleet(store: FleetStore, machines: Record<string, string>, admin: string, port: number, host = "127.0.0.1", github?: GitHubBroker, desired?: () => unknown, repairRepository?: string, repairConsumers?: Record<string,string>, controlRevision?: string): Promise<Server> {
   const secrets = [...Object.values(machines), admin];
   if (secrets.some(s => !s) || new Set(secrets).size !== secrets.length) throw new Error("Fleet credentials must be non-empty and distinct");
+  const workflowGitHub=github?new WorkflowGitHub(store,github):undefined;
   const repairWrites=new Map<string,Promise<unknown>>();
   const server = createServer(async (req, res) => {
     const send = (status: number, value: unknown) => {
@@ -50,7 +52,7 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
       if (req.method === "GET" && req.url === "/recovery/state") return send(200, store.recovery.list());
       if (req.method === "GET" && req.url === "/github/status" && isAdmin) return send(200, github?.status() ?? { enabled: false });
       if (req.method !== "POST") return send(404, { error: "Unknown operation" });
-      const body = await readJson(req, req.url?.startsWith("/tasks/") ? 8*1024*1024 : 1024*1024);
+      const body = await readJson(req, req.url?.startsWith("/workflow/") ? 32*1024*1024 : req.url?.startsWith("/tasks/") ? 8*1024*1024 : 1024*1024);
       if(req.url==='/operations/control-ready') {
         const actor=isAdmin?body.machine:machine;
         if(!actor) return send(403,{error:'Control worker required'});
@@ -146,9 +148,39 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
         return send(200, store.recoveryStep(machine, body.session, body.project, body.id, body.runId,
           req.url!.split("/")[2] as "begin" | "decide" | "complete", body.decision));
       }
+      if (req.url?.startsWith('/workflow/')) {
+        const project=body.project;
+        if(typeof project!=='string' || !/^[\w.-]+\/[\w.-]+$/.test(project)) throw new Error('Workflow project required');
+        if(req.url==='/workflow/read') return send(200,{enabled:store.workflow.enabled(project),preparing:store.workflow.preparing(project),config:store.workflow.config(project),items:store.workflow.list(project),pending:store.workflow.pending(10000,project).length});
+        if(['/workflow/prepare','/workflow/activate','/workflow/cancel-preparation'].includes(req.url)) {
+          if(!isAdmin)return send(403,{error:'Operator credential required'});
+          if(req.url==='/workflow/prepare')store.workflow.prepare(project);
+          else if(req.url==='/workflow/activate')store.workflow.activate(project);
+          else store.workflow.cancelPreparation(project);
+          return send(200,{ok:true,preparing:store.workflow.preparing(project)});
+        }
+        if(req.url==='/workflow/import') {
+          if(!isAdmin) return send(403,{error:'Operator credential required'});
+          if(body.config?.project!==project) throw new Error('Import project mismatch');
+          store.workflow.import(body.config,body.items,body.comments);return send(200,{ok:true});
+        }
+        if(req.url==='/workflow/operator') {
+          if(!isAdmin) return send(403,{error:'Operator credential required'});
+          if(body.ticket?.split('#')[0]!==project) throw new Error('Workflow project mismatch');
+          return send(200,store.workflowOperator(body.ticket,body.change,body.commandId,body.revision));
+        }
+        if(!machine) return send(403,{error:'Machine credential required'});
+        if(body.ticket?.split('#')[0]!==project) throw new Error('Workflow project mismatch');
+        if(req.url==='/workflow/change') return send(200,store.workflowChange(machine,body.session,body.runId,body.ticket,body.change,body.commandId,body.revision));
+        if(req.url==='/workflow/comments') return send(200,store.workflow.comments(body.ticket));
+        if(req.url==='/workflow/comment') {
+          store.workflowComment(machine,body.session,body.runId,body.ticket,body.body,body.commandId);return send(200,{ok:true});
+        }
+        throw new Error('Unknown workflow operation');
+      }
       if (req.url === "/github") {
         if (!machine || !github) return send(403, { error: "Shared GitHub not configured" });
-        return send(200, await github.request(body.project, body.request));
+        return send(200, await workflowGitHub!.request(body.project, body.request, body.request.actor ? {...body.request.actor,machine} : undefined));
       }
       if (req.url === "/start") {
         if (!machine || body.machine !== machine) return send(403, { error: "Machine identity mismatch" });
@@ -196,7 +228,7 @@ export class JsonClient {
         headers: { Authorization: `Bearer ${this.token}`, "Content-Type": "application/json" },
         signal: AbortSignal.timeout(timeoutMs), agent: false,
       }, response => {
-        void readJson(response, path === "/github" ? 16 * 1024 * 1024 : path.startsWith("/tasks/") ? 8*1024*1024 : 1024 * 1024).then(value => {
+        void readJson(response, path.startsWith("/workflow/") ? 32*1024*1024 : path === "/github" ? 16 * 1024 * 1024 : path.startsWith("/tasks/") ? 8*1024*1024 : 1024 * 1024).then(value => {
           if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
             reject(new Error(`Service ${response.statusCode}: ${JSON.stringify(value).slice(0, 500)}`));
           } else resolve(value as T);
