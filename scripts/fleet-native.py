@@ -251,6 +251,12 @@ print(json.dumps({'startupHealthy': health.get('passed'), 'runtime': receipt, 'p
         if self.config['platform'] == 'linux': execute(['systemctl', '--user', 'start', cfg['service']])
         else:
             env = {k: v for k, v in os.environ.items() if k in SAFE_ENV}
+            # launchd's service PATH omits per-user CLI installations.
+            user_bin = str(Path.home() / '.local' / 'bin')
+            paths = env.get('PATH', os.defpath).split(os.pathsep)
+            if user_bin not in paths:
+                paths.append(user_bin)
+            env['PATH'] = os.pathsep.join(paths)
             env.update(PYRY_AUTOMATION_ACCESS=cfg['access'], PYRY_SKIP_QMD_REFRESH='1', PYRY_SUPERVISED='1')
             with (Path(self.config['stateDirectory']) / (project.replace('/', '_') + '.startup.log')).open('ab') as output:
                 subprocess.Popen([str(Path(cfg['agents']) / 'bin/pyry-start'), '--managed', '--runner', cfg.get('runner', 'codex')],
