@@ -378,8 +378,11 @@ export class FleetStore {
         const released = this.db.prepare(`DELETE FROM fleet_claims WHERE ticket=? AND generation=?
           AND NOT EXISTS (SELECT 1 FROM fleet_runs WHERE ticket=? AND generation=?
             AND (finished IS NULL OR outcome IS NULL OR outcome NOT IN ('completed','unused')
-              OR (json_extract(request,'$.role')!='recovery' AND outcome!='unused')))`)
-          .run(run.ticket, run.generation, run.ticket, run.generation);
+              OR (json_extract(request,'$.role')!='recovery' AND outcome!='unused')))
+          AND NOT EXISTS (SELECT 1 FROM fleet_recovery AS recovery JOIN fleet_runs AS history ON history.id=recovery.run_id
+            WHERE history.ticket=? AND history.generation=?
+            AND json_extract(recovery.decision,'$.action') IN ('retry','rework','resume','refine','unblock','coordinate'))`)
+          .run(run.ticket, run.generation, run.ticket, run.generation, run.ticket, run.generation);
         if (released.changes) this.db.prepare("INSERT OR IGNORE INTO fleet_assessment_releases VALUES (?,?,?,?)")
           .run(run.ticket, run.machine, run.generation, Date.now());
       }

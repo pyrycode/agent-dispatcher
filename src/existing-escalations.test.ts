@@ -81,3 +81,24 @@ test('new dispatcher observations advertise the reassessment policy without chan
  const [incident]=store.recoveryReport('mac',project,[paused]);store.start({id:'review',session:'s',machine:'mac',project,ticket:paused.ticket,role:'recovery',resource:'heavy',locks:[]});
  store.recoveryStep('mac','s',project,incident.id,'review','begin');store.recoveryStep('mac','s',project,incident.id,'review','decide',{action:'escalate',category:'human',reason:'Need the pause decision'});store.finish('mac','s','review',true);assert.equal(store.snapshot().claims.length,1);
 });
+
+test('a delayed old-worker report cannot cancel or consume an upgraded unknown-pause assessment',t=>{
+ const db=new DatabaseSync(':memory:');t.after(()=>db.close());let ledger=new RecoveryLedger(db,()=>1000);const paused={...error,status:'Halted',labels:[]};
+ const [first]=ledger.report('mac',project,[upgraded(paused)],empty);
+ assert.deepEqual(ledger.report('old-worker',project,[paused],empty),[]);
+ assert.equal(ledger.incident(first.id).state,'queued');ledger=new RecoveryLedger(db,()=>2000);
+ assert.equal(ledger.report('mac',project,[upgraded(paused)],empty)[0]?.id,first.id);
+});
+
+test('a pipeline pause cannot hide permission denial or authorise coordination',async t=>{
+ const db=new DatabaseSync(':memory:');t.after(()=>db.close());const ledger=new RecoveryLedger(db,()=>1000);
+ const paused=upgraded({...error,status:'Halted',labels:['error:builder:permission_denied'],pause:{ticket:error.ticket,origin:'pipeline' as const,actor:'mac/builder',reason:'Missing platform',missing:'native run',resumeOn:'native result',resumeStatus:'In Development',revision:'pause-1'}});
+ seed(db,paused,{action:'escalate',reason:'Native platform unavailable'});assert.deepEqual(ledger.report('mac',project,[paused],empty),[]);
+ const current=item(paused);let assessed=0;await runRecoveryWork({...ledger.incident('old'),state:'queued'},{project,agents,readCurrent:async()=>current,begin:async()=>({...ledger.incident('old'),state:'assessing'}),assess:async()=>{assessed++;return {action:'coordinate',reason:'Use the new Mac',task:{recipe:'platform-probe',capability:'macos-arm64',reason:'probe'}};},decide:async d=>d,complete:async()=>{},addLabel:async()=>{},removeLabel:async()=>{},comment:async()=>{},move:async()=>{},notify:async()=>{}});assert.equal(assessed,0);
+});
+
+test('a confirmed provenance assessment retains ownership after an earlier recovery assigned repair',t=>{
+ const store=new FleetStore(':memory:',limits);t.after(()=>store.close());const [repair]=store.recoveryReport('mac',project,[upgraded(error)]);
+ store.start({id:'repair',session:'s',machine:'mac',project,ticket:error.ticket,role:'recovery',resource:'heavy',locks:[]});store.recoveryStep('mac','s',project,repair.id,'repair','begin');store.recoveryStep('mac','s',project,repair.id,'repair','decide',{action:'rework',reason:'Concrete implementation needed'});store.recoveryStep('mac','s',project,repair.id,'repair','complete');store.finish('mac','s','repair',true);
+ const [pause]=store.recoveryReport('mac',project,[upgraded({...error,status:'Halted',labels:[]})]);store.start({id:'review',session:'s',machine:'mac',project,ticket:error.ticket,role:'recovery',resource:'heavy',locks:[]});store.recoveryStep('mac','s',project,pause.id,'review','begin');store.recoveryStep('mac','s',project,pause.id,'review','decide',{action:'escalate',category:'human',reason:'Need the pause decision'});store.finish('mac','s','review',true);assert.equal(store.snapshot().claims.length,1);
+});
