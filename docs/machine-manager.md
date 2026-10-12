@@ -327,7 +327,7 @@ If investigation finds a cleared failure cause or a concrete relevant repair, it
 
 The recorded handoff also starts a new comment-history retry budget. When a counter label cannot be read or written, only retry comments after the newest recorded reset count. The latest retry time follows the same boundary, including comments beyond the first page. Existing comments remain preserved.
 
-The claim database records pause origin, actor, reason, missing prerequisite, reopening condition and previous stage. A pipeline pause can resume after assessment and fresh safety checks. A human hold stays in place. Older Halted cards have unknown origin and appear in the decision report. Moving an old card is never taken as proof that a person intended it to resume.
+The claim database records pause origin, actor, reason, missing prerequisite, reopening condition and previous stage. A pipeline pause can resume after assessment and fresh safety checks. A human hold stays in place. Older Halted cards with unknown origin receive a read-only provenance assessment only when normal work is unavailable. That assessment cannot reopen them. A confirmed assessment releases an investigation-only claim while retaining the escalation and its evidence. Ownership remains when the claim generation has real implementation or uncertain work. Moving an old card is never taken as proof that a person intended it to resume.
 
 Each computer inventories the retained logs needed by its open issues and their related ticket references. The shared inventory contains source name, computer, size, modification time, outcome and digest. It contains no log text. The assessor reads bounded local log and stderr tails and recent comments on related tickets through the shared GitHub connection. It uses remote inventory entries to find retained evidence or specify a portable reproduction for the ordinary code agent. Isolated tests retain ordinary admission and live-test credentials. An inaccessible artifact is not proof that no failure occurred.
 
@@ -434,3 +434,9 @@ persistent private storage. For the installed Mac-path helpers this is
 persistent agents logs. GitHub HTTP 429 publication failures now use the normal
 pending-verdict sweep. If a saved review cannot be recovered, a fresh ordinary
 verifier must recreate its own judgment and required checks.
+
+## Reassessing existing escalations
+
+After a worker loads assessment policy version 1, the existing recovery cycle revisits its old unclassified escalations once. The claim database saves that policy version per incident, so restarting does not repeat the migration. Controller-first rollout waits for the updated worker observation before queuing this work. The policy version does not change a ticket's workflow fingerprint.
+
+The fresh assessment uses current native execution capabilities. Classified human decisions, known operator pauses, denied permissions, running work and possibly applied repair handbacks stay protected. Fresh escalations always carry a category. Ordinary errored tickets remain eligible for diagnosis even with exhausted transient retries. Unknown-pause provenance checks share the existing idle assessment lane with dependency and Inbox checks. No new reporter or scheduler is created.
