@@ -8,6 +8,15 @@ spec=importlib.util.spec_from_file_location('support',Path(__file__).with_name('
 m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 
 class SupportTests(unittest.TestCase):
+ def test_updating_container_admits_no_new_native_helpers(self):
+  with tempfile.TemporaryDirectory() as d:
+   class Adapter:pass
+   route={'capability':'android-emulator','container':'mobile'}
+   s=m.SupportSupervisor(Adapter(),{'stateDirectory':d,'projects':{'org/mobile':{'container':'mobile'}},'recoveryTasks':{}})
+   Path(d,'org_mobile.json').write_text(json.dumps({'phase':'draining'}))
+   with patch.object(m,'route_available',return_value=True):self.assertFalse(s.route_ready(route))
+   Path(d,'org_mobile.json').write_text(json.dumps({'phase':'complete'}))
+   with patch.object(m,'route_available',return_value=True):self.assertTrue(s.route_ready(route))
  def test_probe_never_claims_candidate_execution(self):
   with tempfile.TemporaryDirectory() as d:
    result=m.native_recipe({'request':{'recipe':'platform-probe'}},{},Path(d))

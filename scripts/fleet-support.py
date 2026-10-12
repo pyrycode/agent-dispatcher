@@ -123,6 +123,14 @@ class SupportSupervisor:
         output=subprocess.check_output(self.adapter.operator_command('recovery-task',operation,str(path)),text=True,timeout=150)
         return json.loads(output)
 
+    def route_ready(self,route):
+        if route.get('container'):
+            for project,cfg in self.config.get('projects',{}).items():
+                if cfg.get('container')!=route['container']:continue
+                receipt=Path(self.config['stateDirectory'])/(project.replace('/','_')+'.json')
+                if receipt.exists() and json.loads(receipt.read_text()).get('phase')!='complete':return False
+        return route_available(route)
+
     def tick(self):
         routes=self.config.get('recoveryTasks',{})
         if not routes:return []
@@ -130,7 +138,7 @@ class SupportSupervisor:
         session_file=self.directory/'scheduler-session.json'
         if not session_file.exists():atomic(session_file,{'session':uuid.uuid4().hex})
         scheduler_session=json.loads(session_file.read_text())['session']
-        capabilities=sorted(set(route['capability'] for route in routes.values() if route_available(route)))
+        capabilities=sorted(set(route['capability'] for route in routes.values() if self.route_ready(route)))
         self.rpc('capabilities',{'machine':machine,'record':{'capabilities':capabilities,'ready':not state.get('draining',False)}})
         running=[]
         for receipt in self.directory.glob('*.receipt.json'):
@@ -180,7 +188,7 @@ class SupportSupervisor:
                 root=route['containerDirectory'].rstrip('/')+'/'+task['id']
                 command=['podman','exec',route['container'],'python3',root+'/worker.py','--worker',root]
             else:command=[sys.executable,str(program),'--worker',str(folder)]
-            saved={'id':task['id'],'session':session,'phase':'launch-requested','result':str(result),'created':time.time()}
+            saved={'id':task['id'],'session':session,'phase':'launch-requested','result':str(result),'created':time.time(),'container':route.get('container')}
             receipt=self.directory/(task['id']+'.receipt.json');atomic(receipt,saved)
             with (folder/'worker.log').open('ab') as output:
                 child=subprocess.Popen(command,stdin=subprocess.DEVNULL,stdout=output,stderr=output,start_new_session=True,env=clean_env())

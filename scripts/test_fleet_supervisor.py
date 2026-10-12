@@ -83,6 +83,21 @@ class Adapter:
 class Tests(unittest.TestCase):
     def setUp(self):self.directory=Path(tempfile.mkdtemp());self.adapter=Adapter();self.worker=module.Supervisor(self.directory,self.adapter,lambda:1000)
     def receipt(self):return self.directory/'org_core.json'
+    def test_external_native_helper_does_not_hold_a_drained_product_worker(self):
+        self.worker.tick(PROJECT,'new')
+        self.adapter.current.update(stopped=True,childrenStopped=True)
+        self.adapter.state['runs']=[{'machine':'mac','project':PROJECT,'supportTaskId':'native'}]
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'complete')
+        self.assertEqual(self.adapter.calls,['drain','update','start'])
+    def test_container_helper_finishes_before_first_drain_signal(self):
+        self.adapter.helpers_active=lambda project:True
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'waiting-for-native-task')
+        self.assertEqual(self.adapter.calls,[])
+        self.adapter.helpers_active=lambda project:False
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'draining')
+        self.adapter.current.update(stopped=True,childrenStopped=True)
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'complete')
+        self.assertEqual(self.adapter.calls,['drain','update','start'])
     def test_confirmed_assessment_release_is_not_lost_delivery_work(self):
         self.worker.tick(PROJECT,'new')
         self.adapter.current.update(stopped=True,childrenStopped=True)

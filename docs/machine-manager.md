@@ -379,6 +379,11 @@ age and recovery priority. Foreign helpers follow runnable owned work. Native
 execution uses heavy capacity. Platform-route probes are light and cannot claim
 that candidate tests passed. Helpers do not transfer or claim their product ticket.
 
+Native host helpers do not hold unrelated product restart reservations. A helper
+inside a container must finish before that container receives its drain signal.
+Once an update is waiting or draining, its container route admits no new helpers.
+The existing supervisor retains this wait and sends only its ordinary first stop.
+
 The fixed recipes are `platform-probe`, `memory-runtime-smoke`,
 `android-tool-then-text` and `dispatcher-repair`. Executed recipes require an exact
 candidate revision. There is no model-supplied shell command. Requests are stable

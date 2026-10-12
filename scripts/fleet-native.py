@@ -223,6 +223,20 @@ print(json.dumps({'startupHealthy': health.get('passed'), 'runtime': receipt, 'p
         path = Path(self.config['stateDirectory']) / (project.replace('/', '_') + '.json')
         return json.loads(path.read_text()).get('identity', {}) if path.exists() else {}
 
+    def helpers_active(self, project):
+        if self.config['platform'] != 'linux': return False
+        container=self.config['projects'][project]['container']
+        state=self.status()
+        for run in state['runs']:
+            if run['machine']!=state['machine'] or not run.get('supportTaskId'): continue
+            receipt=Path(self.config['stateDirectory'])/'tasks'/(run['supportTaskId']+'.receipt.json')
+            # Admission can precede its saved launch receipt. Unknown placement
+            # cannot authorise stopping a container that might own the worker.
+            if not receipt.is_file(): return True
+            saved=json.loads(receipt.read_text())
+            if 'container' not in saved or saved['container']==container: return True
+        return False
+
     def preflight(self, project, desired):
         cfg = self.config['projects'][project]
         expected = self.expected(project, refresh=True)
@@ -236,13 +250,13 @@ print(json.dumps({'startupHealthy': health.get('passed'), 'runtime': receipt, 'p
             raise RuntimeError('Dispatcher changed before signalling')
         cfg = self.config['projects'][project]
         if self.config['platform'] == 'linux':
+            self.retain_publish_files(project)
             execute(['podman', 'exec', cfg['container'], 'kill', '-TERM', str(identity['pid'])])
         else: os.kill(identity['pid'], signal.SIGTERM)
 
     def update(self, project, desired):
         cfg = self.config['projects'][project]
         if not self.preflight(project, desired): raise RuntimeError('Update preflight no longer passes')
-        self.retain_publish_files(project)
         execute(['git', '-C', cfg['agents'], 'pull', '--ff-only'])
         if execute(['git', '-C', cfg['agents'], 'rev-parse', 'HEAD']) != desired['consumer']:
             raise RuntimeError('Consumer main changed while the operation was draining')
@@ -253,8 +267,9 @@ print(json.dumps({'startupHealthy': health.get('passed'), 'runtime': receipt, 'p
     def retain_publish_files(self, project):
         cfg = self.config['projects'][project]
         if self.config['platform'] != 'linux' or not cfg.get('publishStorage'): return
-        # Called only after the dispatcher and its children have finished. A
-        # container replacement must retain their final handoffs, not an earlier copy.
+        # Mounted handoffs are already durable. Never copy over a writer's live
+        # file. Legacy installations get a private backup before their first drain.
+        if self.publish_mounted(project):return
         destination=Path(cfg['publishStorage']).resolve()
         backup=Path(tempfile.mkdtemp(prefix='publish-before-restart-',dir=self.config['stateDirectory']))
         snapshot=backup/'container';snapshot.mkdir(mode=0o700)
@@ -270,6 +285,12 @@ print(json.dumps({'startupHealthy': health.get('passed'), 'runtime': receipt, 'p
             if target.is_file() and target.read_bytes()!=source.read_bytes():
                 saved=backup/'previous'/relative;saved.parent.mkdir(parents=True,exist_ok=True,mode=0o700);shutil.copy2(target,saved)
             shutil.copy2(source,target);target.chmod(0o600)
+
+    def publish_mounted(self,project):
+        cfg=self.config['projects'][project]
+        mounts=json.loads(execute(['podman','inspect',cfg['container'],'--format','{{json .Mounts}}']))
+        return any(m.get('Destination')=='/Users/juhanailmoniemi/.codex/publish'
+                   and Path(m.get('Source','')).resolve()==Path(cfg['publishStorage']).resolve() for m in mounts)
 
     def start(self, project):
         cfg = self.config['projects'][project]
@@ -289,7 +310,8 @@ print(json.dumps({'startupHealthy': health.get('passed'), 'runtime': receipt, 'p
 
     def verify(self, project, desired):
         observed = self.observe(project)
-        return observed.get('generation') == desired and observed.get('healthy') is True
+        return observed.get('generation') == desired and observed.get('healthy') is True and (
+            self.config['platform']!='linux' or not self.config['projects'][project].get('publishStorage') or self.publish_mounted(project))
 
 if __name__ == '__main__':
     if len(sys.argv) != 2 or sys.argv[1] != 'probe': raise SystemExit('Credential probe only')
