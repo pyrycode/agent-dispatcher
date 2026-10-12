@@ -170,3 +170,14 @@ test("internal housekeeping is not ticket work and still obeys its locks", () =>
   const maintenance = { ...offer("org/mobile", 2, "light"), ticket: "org/mobile#@reconcile", role: "reconcile", locks: ["org/mobile:reconcile"] };
   assert.deepEqual(capped([check, maintenance], idleState([check])).map(o => o.ticket), [maintenance.ticket, check.ticket]);
 });
+
+test("remote native recovery keeps its parent claim priority without moving ownership", () => {
+  const ordinary=offer("org/core",3257);
+  const helper:WorkOffer={...offer("org/core",2939),ticket:"org/core#@task-android",role:"recovery-task",supportTaskId:"android",parentTicket:"org/core#2939",recovery:true,recoveryError:true,order:-5};
+  const state:FleetSnapshot={claims:[{ticket:helper.parentTicket!,machine:"linux",generation:"parent",created:1},{ticket:ordinary.ticket,machine:"mac",generation:"local",created:2}],runs:[]};
+  const original=structuredClone(state);
+  assert.equal(select([ordinary,helper],state)[0].ticket,helper.ticket);
+  assert.deepEqual(state,original);
+  const busy={...state,runs:[{...ordinary,id:"active",machine:"mac",session:"s",generation:"local",created:3}]};
+  assert.deepEqual(select([helper],busy),[]);
+});
