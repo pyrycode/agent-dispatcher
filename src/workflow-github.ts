@@ -420,11 +420,7 @@ export class WorkflowGitHub {
         field === "updateProjectV2ItemPosition" &&
         input.projectId === this.store.workflow.config(project)!.projectId
       ) {
-        if (input.afterId)
-          throw new Error(
-            "Use orchestrator priority controls to reorder tickets",
-          );
-        change = { top: true };
+        change = input.afterId ? { afterItemId: input.afterId } : { top: true };
       }
       if (field === "addBlockedBy" || field === "removeBlockedBy") {
         const blocker = this.store.workflow.find(input.blockingIssueId);

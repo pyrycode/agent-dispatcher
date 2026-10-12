@@ -6,6 +6,7 @@ export type WorkflowItem = ProjectItem & {
   state: "OPEN" | "CLOSED";
   revision: number;
   position: number;
+  positioned?: boolean;
 };
 export interface WorkflowProject {
   project: string;
@@ -21,6 +22,7 @@ export interface WorkflowChange {
   labels?: string[];
   blockedBy?: ProjectItem["blockedBy"];
   top?: boolean;
+  afterItemId?: string;
 }
 const projectPattern = /^[\w.-]+\/[\w.-]+$/;
 
@@ -305,6 +307,7 @@ export class WorkflowStore {
             "removeLabels",
             "blockedBy",
             "top",
+            "afterItemId",
           ].includes(k),
       )
     )
@@ -366,7 +369,24 @@ export class WorkflowStore {
         blockedBy: change.blockedBy ?? item.blockedBy,
         revision: item.revision + 1,
       };
-      if (change.top)
+      if (change.top && change.afterItemId)
+        throw new Error("Choose top or a preceding item");
+      if (change.afterItemId !== undefined) {
+        const ordered = this.list(config.project).filter(
+          (i) => i.issueNumber !== item.issueNumber,
+        );
+        const index = ordered.findIndex((i) => i.id === change.afterItemId);
+        if (index < 0)
+          throw new Error(
+            "Preceding item must be another ticket in this project",
+          );
+        updated.position =
+          (ordered[index].position +
+            (ordered[index + 1]?.position ?? ordered[index].position + 2)) /
+          2;
+        updated.positioned = true;
+      }
+      if (change.top) {
         updated.position = Number(
           this.db
             .prepare(
@@ -374,6 +394,8 @@ export class WorkflowStore {
             )
             .get(config.project)!.p,
         );
+        updated.positioned = true;
+      }
       this.db
         .prepare(
           "UPDATE workflow_tickets SET item=?,revision=?,position=? WHERE ticket=?",
