@@ -25,7 +25,7 @@ async function main(): Promise<void> {
   }
   const config = JSON.parse(readFileSync(configPath, "utf8"));
   if(command==='control') {
-    const claims=new JsonClient(config.claimsUrl,secret(config.claimsOperatorTokenEnv));
+    const claims=new JsonClient(config.claimsUrl,secret(config.claimsOperatorTokenEnv ?? config.claimsTokenEnv));
     console.log(JSON.stringify(await claims.call(args.length?'/operations/control-ready':'/operations/control',args.length?JSON.parse(readFileSync(args[0],'utf8')):undefined)));
     return;
   }
@@ -36,13 +36,13 @@ async function main(): Promise<void> {
       const local=new JsonClient(config.managerUrl??`unix://${resolve(config.socketPath)}`,secret(config.operatorTokenEnv));
       console.log(JSON.stringify(await local.call('/support-offers',body)));return;
     }
-    const claims = new JsonClient(config.claimsUrl,secret(config.claimsOperatorTokenEnv));
+    const claims = new JsonClient(config.claimsUrl,secret(config.claimsOperatorTokenEnv ?? config.claimsTokenEnv));
     console.log(JSON.stringify(await claims.call('/tasks/'+args[0],body)));
     return;
   }
   if (command === 'runner') {
     if (args.length > 1 || (args.length === 1 && !['claude', 'codex', 'local'].includes(args[0]))) throw new Error('Runner accepts claude, codex or local; omit to show the current choice');
-    const claims = new JsonClient(config.claimsUrl, secret(config.claimsOperatorTokenEnv));
+    const claims = new JsonClient(config.claimsUrl, secret(config.claimsOperatorTokenEnv ?? config.claimsTokenEnv));
     console.log(JSON.stringify(await claims.call('/runner', args.length ? { runner: args[0] === 'local' ? null : args[0] } : undefined)));
     return;
   }
@@ -95,7 +95,7 @@ async function main(): Promise<void> {
   }
   if (command === "free") {
     if (args.length !== 3 || args[2] !== "--confirmed-stopped") throw new Error("Free requires TICKET GENERATION --confirmed-stopped. Stop the old worker and its subprocesses first.");
-    const client = new FleetClient(config.claimsUrl, secret(config.claimsOperatorTokenEnv));
+    const client = new FleetClient(config.claimsUrl, secret(config.claimsOperatorTokenEnv ?? config.claimsTokenEnv));
     await client.free(args[0], args[1], true);
     console.log(`Freed ${args[0]}. Working copies and GitHub workflow state were preserved.`);
     return;
@@ -103,7 +103,7 @@ async function main(): Promise<void> {
   if (command === "pause" || command === "coordination") {
     if (args.length !== 1) throw new Error("Provide a saved JSON receipt file");
     const record = JSON.parse(readFileSync(args[0], "utf8"));
-    const claims = new JsonClient(config.claimsUrl, secret(config.claimsOperatorTokenEnv));
+    const claims = new JsonClient(config.claimsUrl, secret(config.claimsOperatorTokenEnv ?? config.claimsTokenEnv));
     console.log(JSON.stringify(await claims.call(`/recovery/operator-${command}`, { record })));
     return;
   }

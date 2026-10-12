@@ -99,13 +99,13 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
         return send(200,store.readTask(machine,body.session,body.project,body.runId,body.id));
       }
       if(req.url==='/tasks/prepare-repair') {
-        if(!isAdmin) return send(403,{error:'Configured repair executor required'});
-        return send(200,store.prepareRepair(body.machine,body.id,body.session,body.publication));
+        if(!isAdmin&&!machine) return send(403,{error:'Configured repair executor required'});
+        return send(200,store.prepareRepair(isAdmin?body.machine:machine!,body.id,body.session,body.publication));
       }
       if (req.url === '/tasks/publish-repair') {
-        if (!isAdmin || !github || !repairRepository) return send(403,{error:'Configured repair authority required'});
+        if ((!isAdmin&&!machine) || !github || !repairRepository) return send(403,{error:'Configured repair authority required'});
         const task=store.tasks.get(body.id);
-        if(task.machine!==body.machine || task.session!==body.session) return send(403,{error:'Task actor mismatch'});
+        if(task.machine!==(isAdmin?body.machine:machine) || task.session!==body.session) return send(403,{error:'Task actor mismatch'});
         let work=repairWrites.get(task.id);
         if(!work) {
           work=publishRepair(github,repairRepository,task,body.publication,repairConsumers,sha=>{store.controlTarget(sha);return store.controlsReady(sha,controlRevision);}).finally(()=>repairWrites.delete(task.id));
