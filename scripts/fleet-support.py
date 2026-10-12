@@ -96,10 +96,12 @@ def native_recipe(task,paths,directory):
         matches=re.findall(r'#2939 private recovery: (/[^\n]+)',text)
         if len(matches)!=1:raise RuntimeError('Capture returned no unique private recovery directory')
         capture=Path(matches[0])
-        # Portable files stay private. The authority refuses credential-shaped content.
+        # Include the ordered recorder input and launcher diagnostics on failures
+        # as well as passes. The authority refuses credential-shaped content.
         for path in capture.rglob('*'):
-            if path.is_file() and path.suffix in {'.json','.jsonl','.xml'}:
-                files['mobile/'+str(path.relative_to(capture))]=path.read_text()
+            if path.is_file() and path.suffix in {'.json','.jsonl','.xml','.stdout','.stderr'}:
+                with path.open(encoding='utf-8',newline='') as record:
+                    files['mobile/'+str(path.relative_to(capture))]=record.read()
         summary='Android capture completed. Inspect counted XML and recorder admission before accepting evidence.' if code==0 else 'Android capture failed. Returned diagnostic records do not establish a passing method.'
     if sum(len(v.encode()) for v in files.values())>4*1024*1024:
         files={};summary+=' Artifact bundle exceeds transport size; its original private directory remains available.';code=1

@@ -8,6 +8,27 @@ spec=importlib.util.spec_from_file_location('support',Path(__file__).with_name('
 m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 
 class SupportTests(unittest.TestCase):
+ def test_android_failure_returns_ordered_recorder_and_launcher_diagnostics(self):
+  with tempfile.TemporaryDirectory() as d:
+   directory=Path(d);capture=directory/'capture';capture.mkdir()
+   driver=directory/'core/internal/e2e/realclaude/tool_then_text_mobile_capture.py'
+   driver.parent.mkdir(parents=True);driver.write_text('approved driver')
+   records={'daemon-1.stdout':'{"type":"stream_event","event":{"type":"message_start"}}\r\n{"type":"result"}\r\n',
+            'daemon-1.manifest.json':'{"dropped_rows":0}',
+            'driver.json':'{"exit_code":1}',
+            'mobile.xml':'<testsuite tests="1" failures="1"/>',
+            'launcher.stderr':'x86_64 emulation currently requires hardware acceleration!\n',
+            'launcher.stdout':'counted diagnostic output\n'}
+   for name,data in records.items():(capture/name).write_text(data)
+   (capture/'unrelated.bin').write_bytes(b'not portable evidence')
+   def execute(argv,cwd,log,env):
+    log.write_text('#2939 private recovery: '+str(capture)+'\n');return 1
+   with patch.object(m,'clone'),patch.object(m,'execute',side_effect=execute):
+    result=m.native_recipe({'request':{'recipe':'android-tool-then-text','revision':'a'*40}},
+       {'core':'core','mobile':'mobile','mobileAgents':'mobile-agents','coreAgents':'core-agents'},directory)
+   self.assertEqual(result['outcome'],'failed')
+   self.assertEqual(result['files'],{'mobile/'+name:data for name,data in records.items()})
+   self.assertIn('do not establish a passing method',result['summary'])
  def test_updating_container_admits_no_new_native_helpers(self):
   with tempfile.TemporaryDirectory() as d:
    class Adapter:pass
