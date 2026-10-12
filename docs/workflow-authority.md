@@ -95,7 +95,7 @@ An operator change uses the revision returned by `read`:
 
 A stale revision or active reservation rejects the command. Read again and
 resolve the actual state. Reuse the same command identity only for the exact same
-request. The controls also support `state`, `labels`, `blockedBy` and `top`.
+request. The controls also support `state`, `labels`, `blockedBy`, `top` and `afterItemId`.
 Changing a status does not bypass dependency, review, ownership or admission checks.
 
 ## Recovery and rollback

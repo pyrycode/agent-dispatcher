@@ -595,16 +595,80 @@ test("central migration preparation lets existing work finish and blocks new adm
   store.workflow.activate(config.project);
   assert.equal(store.start({ ...run(), id: "next" }).ok, true);
 });
-test('migration exports closed family history instead of resetting its counters',async t=>{
-  const {GitHubProjectClient}=await import('./github.js');
-  const {store}=fixture(t),source=new GitHubProjectClient({owner:'org',repo:'mobile',ownerType:'organization',projectNumber:1,token:'test'});
+test("migration exports closed family history instead of resetting its counters", async (t) => {
+  const { GitHubProjectClient } = await import("./github.js");
+  const { store } = fixture(t),
+    source = new GitHubProjectClient({
+      owner: "org",
+      repo: "mobile",
+      ownerType: "organization",
+      projectNumber: 1,
+      token: "test",
+    });
   source.initializeFromWorkflow(config);
-  const closed={...item(),state:'CLOSED' as const};
-  (source as any).fetchOpenIssueItems=async()=>[];
-  (source as any).getAllItems=async()=>[closed];
-  (source as any).gql=async()=>({nodes:[{...closed,id:closed.issueId,number:closed.issueNumber,labels:{nodes:[],pageInfo:{hasNextPage:false}},blockedBy:{nodes:[],pageInfo:{hasNextPage:false}}}]});
-  (source as any).fetchIssueCommentsPage=async()=>({comments:[{node_id:'closed-history',body:'retained family dispatch receipt',created_at:'2026-10-12T12:00:00Z'}],lastPage:1});
-  const snapshot=await source.workflowExport();
-  store.workflow.import(snapshot.config,snapshot.items as WorkflowItem[],snapshot.comments);
-  assert.equal(store.workflow.comments('org/mobile#1947')[0].body,'retained family dispatch receipt');
+  const closed = { ...item(), state: "CLOSED" as const };
+  (source as any).fetchOpenIssueItems = async () => [];
+  (source as any).getAllItems = async () => [closed];
+  (source as any).gql = async () => ({
+    nodes: [
+      {
+        ...closed,
+        id: closed.issueId,
+        number: closed.issueNumber,
+        labels: { nodes: [], pageInfo: { hasNextPage: false } },
+        blockedBy: { nodes: [], pageInfo: { hasNextPage: false } },
+      },
+    ],
+  });
+  (source as any).fetchIssueCommentsPage = async () => ({
+    comments: [
+      {
+        node_id: "closed-history",
+        body: "retained family dispatch receipt",
+        created_at: "2026-10-12T12:00:00Z",
+      },
+    ],
+    lastPage: 1,
+  });
+  const snapshot = await source.workflowExport();
+  store.workflow.import(
+    snapshot.config,
+    snapshot.items as WorkflowItem[],
+    snapshot.comments,
+  );
+  assert.equal(
+    store.workflow.comments("org/mobile#1947")[0].body,
+    "retained family dispatch receipt",
+  );
+});
+test("existing board-after helper changes authoritative order", async (t) => {
+  const { store } = fixture(t);
+  store.workflow.import(config, [item(), item(2), item(3)]);
+  store.start(run());
+  const upstream = new GitHubBroker({
+    token: "test",
+    projects: ["org/mobile"],
+    fetcher: async () => {
+      throw new Error("Display must not be written inline");
+    },
+  });
+  await new WorkflowGitHub(store, upstream).request(
+    config.project,
+    {
+      method: "POST",
+      path: "/graphql",
+      body: JSON.stringify({
+        query:
+          "mutation($input:UpdateProjectV2ItemPositionInput!){updateProjectV2ItemPosition(input:$input){items{nodes{id}}}}",
+        variables: {
+          input: { projectId: "P", itemId: "P1947", afterId: "P2" },
+        },
+      }),
+    },
+    { machine: "mac", session: "s", runId: "builder" },
+  );
+  assert.deepEqual(
+    store.workflow.list(config.project).map((i) => i.issueNumber),
+    [2, 1947, 3],
+  );
 });
