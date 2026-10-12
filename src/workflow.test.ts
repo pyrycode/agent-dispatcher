@@ -51,6 +51,31 @@ const run = (id = "builder"): StartRequest => ({
   resource: "light",
   locks: [],
 });
+function remoteMetadata(i: WorkflowItem) {
+  return {
+    id: i.issueId,
+    number: i.issueNumber,
+    title: i.title,
+    body: i.body,
+    url: i.url,
+    state: i.state,
+    labels: {
+      nodes: i.labels.map((name) => ({ name })),
+      pageInfo: { hasNextPage: false },
+    },
+    blockedBy: { nodes: i.blockedBy, pageInfo: { hasNextPage: false } },
+    projectItems: {
+      nodes: [
+        {
+          id: i.id,
+          project: { id: "P" },
+          fieldValueByName: { name: i.status },
+        },
+      ],
+      pageInfo: { hasNextPage: false },
+    },
+  };
+}
 function fixture(t: TestContext) {
   const dir = mkdtempSync(join(tmpdir(), "workflow-test-")),
     path = join(dir, "state.sqlite");
@@ -286,6 +311,10 @@ test("partial GitHub publication retains pending state and a retry converges", a
           ),
         );
       }
+      if (body.query?.startsWith("query($ids:"))
+        return new Response(
+          JSON.stringify({ data: { nodes: [remoteMetadata(item())] } }),
+        );
       if (body.query?.startsWith("query($id:ID!)"))
         return new Response(
           JSON.stringify({
@@ -342,6 +371,10 @@ test("a newer database update during publication stays queued", async (t) => {
           }),
         );
       }
+      if (body.query?.startsWith("query($ids:"))
+        return new Response(
+          JSON.stringify({ data: { nodes: [remoteMetadata(item())] } }),
+        );
       if (body.query?.startsWith("query($id:ID!)"))
         return new Response(
           JSON.stringify({
@@ -672,17 +705,81 @@ test("existing board-after helper changes authoritative order", async (t) => {
     [2, 1947, 3],
   );
 });
-test('publication and discovery wait until a prepared migration is activated',async t=>{
-  const {store}=fixture(t);store.workflow.prepare(config.project);store.workflow.import(config,[item()]);
-  let calls=0;
-  const github=new GitHubBroker({token:'test',projects:['org/mobile'],fetcher:async()=>{calls++;throw new Error('Migration is held');}});
-  await new WorkflowPublisher(store,github).tick();
-  assert.equal(calls,0);assert.equal(store.workflow.pending().length,1);
+test("publication and discovery wait until a prepared migration is activated", async (t) => {
+  const { store } = fixture(t);
+  store.workflow.prepare(config.project);
+  store.workflow.import(config, [item()]);
+  let calls = 0;
+  const github = new GitHubBroker({
+    token: "test",
+    projects: ["org/mobile"],
+    fetcher: async () => {
+      calls++;
+      throw new Error("Migration is held");
+    },
+  });
+  await new WorkflowPublisher(store, github).tick();
+  assert.equal(calls, 0);
+  assert.equal(store.workflow.pending().length, 1);
 });
-test('discovery does not re-adopt archived closed board items',async t=>{
-  const {store}=fixture(t);store.workflow.import(config,[]);
-  const issue={id:'I2',number:2,title:'Archived work',body:'',url:item(2).url,state:'CLOSED',labels:{nodes:[{name:'done:builder'}],pageInfo:{hasNextPage:false}},blockedBy:{nodes:[],pageInfo:{hasNextPage:false}},projectItems:{nodes:[{id:'P2',project:{id:'P'},fieldValueByName:{name:'Done'}}],pageInfo:{hasNextPage:false}}};
-  const github=new GitHubBroker({token:'test',projects:['org/mobile'],fetcher:async()=>new Response(JSON.stringify({data:{repository:{issues:{nodes:[issue],pageInfo:{hasNextPage:false}}}}}))});
-  await new WorkflowPublisher(store,github).refresh(config);
-  assert.equal(store.workflow.list(config.project).length,0);
+test("discovery does not re-adopt archived closed board items", async (t) => {
+  const { store } = fixture(t);
+  store.workflow.import(config, []);
+  const issue = {
+    id: "I2",
+    number: 2,
+    title: "Archived work",
+    body: "",
+    url: item(2).url,
+    state: "CLOSED",
+    labels: {
+      nodes: [{ name: "done:builder" }],
+      pageInfo: { hasNextPage: false },
+    },
+    blockedBy: { nodes: [], pageInfo: { hasNextPage: false } },
+    projectItems: {
+      nodes: [
+        { id: "P2", project: { id: "P" }, fieldValueByName: { name: "Done" } },
+      ],
+      pageInfo: { hasNextPage: false },
+    },
+  };
+  const github = new GitHubBroker({
+    token: "test",
+    projects: ["org/mobile"],
+    fetcher: async () =>
+      new Response(
+        JSON.stringify({
+          data: {
+            repository: {
+              issues: { nodes: [issue], pageInfo: { hasNextPage: false } },
+            },
+          },
+        }),
+      ),
+  });
+  await new WorkflowPublisher(store, github).refresh(config);
+  assert.equal(store.workflow.list(config.project).length, 0);
+});
+test("GitHub read overlays do not scan ticket JSON for objects without an identity", (t) => {
+  const { store } = fixture(t);
+  store.workflow.import(config, [item()]);
+  const db = (store.workflow as any).db,
+    original = db.prepare;
+  let calls = 0;
+  db.prepare = function (...args: any[]) {
+    calls++;
+    return original.apply(this, args);
+  };
+  assert.equal(store.workflow.find(""), undefined);
+  assert.equal(calls, 0);
+  db.prepare = original;
+  const plan = db
+    .prepare(
+      "EXPLAIN QUERY PLAN SELECT * FROM workflow_tickets WHERE json_extract(item,'$.id')=? OR json_extract(item,'$.issueId')=?",
+    )
+    .all("P1947", "I1947");
+  assert(
+    !plan.some((row: any) => row.detail.includes("SCAN workflow_tickets")),
+  );
 });
