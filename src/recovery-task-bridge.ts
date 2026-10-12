@@ -13,8 +13,7 @@ export async function taskBridge(connection:JsonClient,run:FleetRun) {
   try {
    if(req.method!=='POST' || !['/request','/read'].includes(req.url??'')) return send(404,{error:'Unknown task action'});
    const body=await readJson(req);
-   const payload=req.url==='/request'?{request:body}:body;
-   send(200,await connection.call('/tasks'+req.url,{...payload,project:run.project,session:run.session,runId:run.id}));
+   send(200,await connection.call('/tasks'+req.url,{...body,project:run.project,session:run.session,runId:run.id}));
   }catch {send(409,{error:'Task request unavailable or outside this admitted ticket'});}
  });
  server.requestTimeout=15000;await listen(server,socket);
