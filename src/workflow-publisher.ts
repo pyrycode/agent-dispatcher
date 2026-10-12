@@ -40,7 +40,7 @@ export class WorkflowPublisher {
     });
   }
   private async publish(): Promise<void> {
-    const configs = this.store.workflow.projects();
+    const configs = this.store.workflow.projects().filter(config=>!this.store.workflow.preparing(config.project));
     if (!configs.length) return;
     const errors: unknown[] = [];
     // Rebuild these display facts from existing authority records.
@@ -66,6 +66,7 @@ export class WorkflowPublisher {
           );
       }
     for (const config of configs) {
+      if(this.store.workflow.preparing(config.project))continue;
       try {
         const pending = this.store.workflow.pending(10, config.project);
         if (!pending.length) continue;
@@ -118,6 +119,7 @@ export class WorkflowPublisher {
       }
     }
     for (const comment of this.store.workflow.pendingComments()) {
+      if(this.store.workflow.preparing(comment.ticket.split('#')[0]))continue;
       try {
         const [project, number] = comment.ticket.split("#"),
           marker = `<!-- orchestrator-comment:${comment.id} -->`;
@@ -210,6 +212,7 @@ export class WorkflowPublisher {
     const [owner, repo] = config.project.split("/");
     let cursor: string | null = null;
     do {
+      if(this.store.workflow.preparing(config.project))return;
       const result = await this.gql(
         config.project,
         `query($owner:String!,$repo:String!,$cursor:String){repository(owner:$owner,name:$repo){issues(first:100,after:$cursor,orderBy:{field:UPDATED_AT,direction:DESC}){nodes{id number title body url state comments(last:8){nodes{id updatedAt body}} parent{number parent{number}} subIssuesSummary{total completed} blockedBy(first:100){nodes{number state url} pageInfo{hasNextPage}} labels(first:100){nodes{name} pageInfo{hasNextPage}} projectItems(first:100){nodes{id project{id} fieldValueByName(name:"Status"){... on ProjectV2ItemFieldSingleSelectValue{name}}} pageInfo{hasNextPage}}}pageInfo{hasNextPage endCursor}}}}`,
@@ -229,7 +232,7 @@ export class WorkflowPublisher {
           (p: any) => p.project.id === config.projectId,
         );
         const known = this.store.workflow.find(issue.id);
-        if (!board && !known && issue.state === "CLOSED") continue;
+        if (!known && issue.state === "CLOSED") continue;
         if (!board) {
           const added = await this.gql(
             config.project,
