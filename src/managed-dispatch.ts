@@ -1,3 +1,5 @@
+import {execFileSync} from "node:child_process";
+import {fileURLToPath} from "node:url";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -9,14 +11,26 @@ import { observationFor } from "./recovery-work.js";
 import type { PauseRecord, EvidenceRecord, CoordinationRecord } from "./recovery-facts.js";
 import type { RecoveryObservation, RecoveryIncident, RecoveryDecision } from "./fleet-recovery.js";
 import type { AgentRunner } from './agent-runner.js';
+import {taskBridge} from "./recovery-task-bridge.js";
 import { offerId } from "./machine-manager.js";
 
 const DEFAULT_RESOURCE_CLASSES: Readonly<Record<string, ResourceClass>> = {
   builder: "medium", developer: "medium", refiner: "light", po: "light", documentation: "light",
 };
-const currentRun = new AsyncLocalStorage<{ run: FleetRun; groups: Set<number> }>();
+const currentRun = new AsyncLocalStorage<{ run: FleetRun; groups: Set<number>; taskSocket?: string }>();
 /** A granted run uses its saved choice even after the global setting changes. */
 export function managedRunRunner(): AgentRunner | undefined { return currentRun.getStore()?.run.runnerPolicy?.runner ?? undefined; }
+export function managedTaskEnv(): NodeJS.ProcessEnv {
+  const socket=currentRun.getStore()?.taskSocket;
+  return socket?{PYRY_TASK_SOCKET:socket}:{};
+}
+/** Native repair recipes use the same tracked-child completion rule as project workers. */
+export async function withManagedTaskRun<T>(run: FleetRun, work: () => Promise<T>): Promise<T> {
+  return currentRun.run({run,groups:new Set()},async()=>{
+    try {return await work();}
+    finally {while([...currentRun.getStore()!.groups].some(managedGroupAlive)) await sleep(1000);}
+  });
+}
 /** Called by the existing spawn sites. Slot release waits for grandchildren too. */
 export function trackManagedChild(pid: number): void { currentRun.getStore()?.groups.add(pid); }
 export function managedGroupAlive(pid: number): boolean {
@@ -46,13 +60,20 @@ export class ManagedDispatch {
   private syncing = false;
   private errorAt = 0;
   private readonly cooldown = new Map<string, number>();
+  private readonly dispatcherRoot=fileURLToPath(new URL("..",import.meta.url));
+  private readonly loadedRevision=execFileSync("git",["rev-parse","HEAD"],{cwd:this.dispatcherRoot,encoding:"utf8"}).trim();
+  private readonly repairProofs=new Map<string,boolean>();
   private recoveryTickets = new Set<string>();
   draining = false;
+  tasksEnabled: boolean;
+  private readonly tasksDisabled: boolean;
 
   constructor(readonly project: string, env: NodeJS.ProcessEnv) {
     if (!env.PYRY_MANAGER_URL || !env.PYRY_MANAGER_TOKEN) throw new Error("Managed dispatch requires PYRY_MANAGER_URL and PYRY_MANAGER_TOKEN");
     this.connection = new JsonClient(env.PYRY_MANAGER_URL, env.PYRY_MANAGER_TOKEN);
     this.classes = resourceClasses(env.PYRY_RESOURCE_CLASSES);
+    this.tasksEnabled = false;
+    this.tasksDisabled = env.PYRY_RECOVERY_TASKS === "0";
   }
   static fromEnv(env: NodeJS.ProcessEnv): ManagedDispatch | null {
     if (!env.PYRY_MANAGER_URL && !env.PYRY_MANAGER_TOKEN && env.PYRY_MANAGED !== "1") return null;
@@ -103,6 +124,14 @@ export class ManagedDispatch {
       pending = { offer: { project: this.project, ticket, role, resource, locks, key: randomUUID(), order } };
       this.pending.set(name, pending);
     }
+    const required=pending.run ? [] : this.state.requiredRepairs?.[ticket]??[];
+    if(!pending.run) pending.offer.readyRepairs=required.filter(sha=>{
+      if(!this.repairProofs.has(sha)) {
+        try {execFileSync('git',['merge-base','--is-ancestor',sha,this.loadedRevision],{cwd:this.dispatcherRoot,stdio:'ignore'});this.repairProofs.set(sha,true);}
+        catch {this.repairProofs.set(sha,false);}
+      }
+      return this.repairProofs.get(sha);
+    });
     pending.retired = false;
     // Order is scheduling metadata, not part of the durable run identity.
     if (!pending.run) {
@@ -153,6 +182,7 @@ export class ManagedDispatch {
       const state = await this.connection.call<FleetSnapshot & { machine: string; draining: boolean }>("/state");
       const runs = await this.connection.call<FleetRun[]>("/offers", { session: this.session, offers: this.offers() });
       this.state = state;
+      this.tasksEnabled = !this.tasksDisabled && state.features?.recoveryTasks === true;
       this.draining = state.draining || this.draining;
       let fresh = false;
       for (const p of this.pending.values()) {
@@ -184,6 +214,8 @@ export class ManagedDispatch {
     this.running.add(run.id);
     return currentRun.run({ run, groups: new Set() }, async () => {
       let completed = false;
+      const bridge = this.tasksEnabled && /#[1-9]\d*$/.test(run.ticket) && ['builder','developer'].includes(run.role) ? await taskBridge(this.connection,run) : undefined;
+      if (bridge) currentRun.getStore()!.taskSocket=bridge.socket;
       try {
         // Fresh authority check before starting, including after a manual release.
         const state = await this.connection.call<FleetSnapshot>("/state");
@@ -192,6 +224,7 @@ export class ManagedDispatch {
         completed = result !== false;
         return result;
       } finally {
+        if (bridge) await bridge.close();
         const groups = currentRun.getStore()!.groups;
         while ([...groups].some(managedGroupAlive)) await sleep(1000);
         if (recovery) {

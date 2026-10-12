@@ -1,4 +1,6 @@
 // Explicit executable only. Importable libraries never start services or touch GitHub.
+import {execFileSync} from "node:child_process";
+import {fileURLToPath} from "node:url";
 import { readFileSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { FleetStore } from "./fleet-store.js";
@@ -18,10 +20,26 @@ function secret(name: string): string {
 }
 async function main(): Promise<void> {
   const [command, configPath, ...args] = process.argv.slice(2);
-  if (!configPath || !["claims", "manager", "status", "runner", "desired", "attention", "report-attention", "pause", "coordination", "recovery", "drain", "drain-project", "resume-project", "free"].includes(command)) {
+  if (!configPath || !["control", "recovery-task", "claims", "manager", "status", "runner", "desired", "attention", "report-attention", "pause", "coordination", "recovery", "drain", "drain-project", "resume-project", "free"].includes(command)) {
     throw new Error("Usage: fleet-bin.ts claims|manager|status|runner|recovery|drain|drain-project|resume-project|free CONFIG [claude|codex|local | PROJECT | TICKET GENERATION --confirmed-stopped]");
   }
   const config = JSON.parse(readFileSync(configPath, "utf8"));
+  if(command==='control') {
+    const claims=new JsonClient(config.claimsUrl,secret(config.claimsOperatorTokenEnv));
+    console.log(JSON.stringify(await claims.call(args.length?'/operations/control-ready':'/operations/control',args.length?JSON.parse(readFileSync(args[0],'utf8')):undefined)));
+    return;
+  }
+  if (command === 'recovery-task') {
+    if (args.length !== 2 || !['capabilities','queue','start','complete','operator-request','publish-repair','prepare-repair','uncertain','schedule'].includes(args[0])) throw new Error('Provide task operation and saved request JSON');
+    const body = JSON.parse(readFileSync(args[1],'utf8'));
+    if(args[0]==='schedule') {
+      const local=new JsonClient(config.managerUrl??`unix://${resolve(config.socketPath)}`,secret(config.operatorTokenEnv));
+      console.log(JSON.stringify(await local.call('/support-offers',body)));return;
+    }
+    const claims = new JsonClient(config.claimsUrl,secret(config.claimsOperatorTokenEnv));
+    console.log(JSON.stringify(await claims.call('/tasks/'+args[0],body)));
+    return;
+  }
   if (command === 'runner') {
     if (args.length > 1 || (args.length === 1 && !['claude', 'codex', 'local'].includes(args[0]))) throw new Error('Runner accepts claude, codex or local; omit to show the current choice');
     const claims = new JsonClient(config.claimsUrl, secret(config.claimsOperatorTokenEnv));
@@ -35,12 +53,12 @@ async function main(): Promise<void> {
     const limits = Object.fromEntries(Object.entries(config.machines).map(([id, value]) => [id, { heavyLimit: (value as any).heavyLimit, combinedLimit: (value as any).combinedLimit }]));
     const store = new FleetStore(database, limits);
     const github = config.github ? new GitHubBroker({ ...config.github,
-      projects: [...new Set([...config.github.projects, ...Object.values(config.updates?.consumers ?? {})])], token: secret(config.github.tokenEnv) }) : undefined;
+      projects: [...new Set([...config.github.projects, ...Object.values(config.updates?.consumers ?? {}), ...(config.updates?.dispatcherRepository ? [config.updates.dispatcherRepository] : [])])], token: secret(config.github.tokenEnv) }) : undefined;
     const updates = config.updates && github ? new FleetUpdates(github, config.updates.consumers, config.updates.dispatcherRepository) : undefined;
     const refresh = () => { void updates?.refresh().catch(() => console.warn("Consumer update lookup paused; running workers preserved")); };
     if (updates) { try { await updates.refresh(); } catch { /* retry without offering any update */ } }
     const updateTimer = updates ? setInterval(refresh, 300_000) : undefined;
-    const server = await serveFleet(store, machines, secret(config.operatorTokenEnv), config.port ?? 7430, config.host ?? "127.0.0.1", github, () => updates?.snapshot() ?? {});
+    const server = await serveFleet(store, machines, secret(config.operatorTokenEnv), config.port ?? 7430, config.host ?? "127.0.0.1", github, () => updates?.snapshot() ?? {}, config.updates?.dispatcherRepository,config.updates?.consumers,execFileSync("git",["rev-parse","HEAD"],{cwd:resolve(fileURLToPath(new URL("..",import.meta.url))),encoding:"utf8"}).trim());
     let cli: Awaited<ReturnType<typeof serveGitHubBridge>> | undefined;
     if (github && config.github.socketPath) {
       const socket = resolve(config.github.socketPath);
@@ -57,7 +75,7 @@ async function main(): Promise<void> {
         headers: { accept: req.headers.get("accept") ?? "application/vnd.github+json", "content-type": "application/json" },
         ...(!["GET", "HEAD"].includes(req.method) ? { body: await req.text() } : {}) }));
     } : fetch;
-    const stopLabels = startClaimLabelSync(config.githubLabels, () => store.snapshot().claims, process.env, labelFetch);
+    const stopLabels = startClaimLabelSync(config.githubLabels, () => store.snapshot().claims, process.env, labelFetch, () => store.recovery.escalatedTickets());
     const close = () => { if (updateTimer) clearInterval(updateTimer); stopLabels(); cli?.close(); server.close(() => { store.close(); process.exit(0); }); };
     process.on("SIGTERM", close); process.on("SIGINT", close);
     console.log("Claim service listening", server.address());
@@ -65,7 +83,7 @@ async function main(): Promise<void> {
   }
   if (command === "manager") {
     const claims = new FleetClient(config.claimsUrl, secret(config.claimsTokenEnv));
-    const manager = new MachineManager({ machine: config.machine, heavyLimit: config.heavyLimit, combinedLimit: config.combinedLimit, ticketLimit: config.ticketLimit ?? 2, projects: config.projects.map((p: any) => p.repo), drainingProjects: config.drainingProjects }, claims);
+    const manager = new MachineManager({ machine: config.machine, heavyLimit: config.heavyLimit, combinedLimit: config.combinedLimit, ticketLimit: config.ticketLimit ?? 2, controlRevision: execFileSync("git",["rev-parse","HEAD"],{cwd:resolve(fileURLToPath(new URL("..",import.meta.url))),encoding:"utf8"}).trim(), projects: config.projects.map((p: any) => p.repo), drainingProjects: config.drainingProjects }, claims);
     const tokens = Object.fromEntries(config.projects.map((p: any) => [p.repo, secret(p.tokenEnv)]));
     const endpoint = config.socketPath ? resolve(config.socketPath) : config.port ?? 7431;
     const server = await serveManager(manager, tokens, secret(config.operatorTokenEnv), endpoint, config.host ?? "127.0.0.1", projects => persistProjectDrains(configPath, projects));

@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { FleetSnapshot } from "./fleet-store.js";
+import {validateTaskRequest, type RecoveryTaskRequest} from "./recovery-tasks.js";
 import type { PauseRecord } from "./recovery-facts.js";
 
 export interface RecoveryObservation {
@@ -10,11 +11,11 @@ export interface RecoveryObservation {
   pause?: PauseRecord;
   familyHold?: string;
 }
-export type RecoveryAction = "wait" | "retry" | "rework" | "resume" | "refine" | "unblock" | "propose-close" | "escalate";
-export interface RecoveryDecision { action: RecoveryAction; reason: string; blocker?: string; retryReset?: string }
+export type RecoveryAction = "wait" | "retry" | "rework" | "resume" | "refine" | "unblock" | "propose-close" | "coordinate" | "escalate";
+export interface RecoveryDecision { action: RecoveryAction; reason: string; blocker?: string; retryReset?: string; recheckAt?: number; task?: RecoveryTaskRequest; category?: "operational" | "human" }
 export interface RecoveryIncident {
   id: string; ticket: string; fingerprint: string; reason: string;
-  state: "queued" | "assessing" | "applying" | "complete" | "escalated" | "resolved";
+  state: "queued" | "assessing" | "applying" | "waiting" | "complete" | "escalated" | "resolved";
   created: number; updated: number; runId: string | null; decision: RecoveryDecision | null;
   current?: boolean;
 }
@@ -73,11 +74,13 @@ export function recoveryTrigger(o: RecoveryObservation): { reason: string; manua
 }
 export function validateRecoveryDecision(value: unknown): RecoveryDecision {
   const d = value as RecoveryDecision;
-  if (!d || !["wait", "retry", "rework", "resume", "refine", "unblock", "propose-close", "escalate"].includes(d.action) || typeof d.reason !== "string" || !d.reason.trim() || d.reason.length > 6000) throw new Error("Invalid recovery decision");
+  if (!d || !["wait", "retry", "rework", "resume", "refine", "unblock", "propose-close", "coordinate", "escalate"].includes(d.action) || typeof d.reason !== "string" || !d.reason.trim() || d.reason.length > 6000) throw new Error("Invalid recovery decision");
   if (d.action === "unblock" && !/^[\w.-]+\/[\w.-]+#[1-9]\d*$/.test(d.blocker ?? "")) throw new Error("Unblock requires a full blocker ticket");
   if (d.retryReset !== undefined && (!['retry', 'rework', 'refine', 'resume'].includes(d.action)
     || typeof d.retryReset !== "string" || !d.retryReset.trim() || d.retryReset.length > 6000)) throw new Error("Invalid retry reset finding");
-  return { action: d.action, reason: d.reason, ...(d.action === "unblock" ? { blocker: d.blocker } : {}),
+  if (d.category !== undefined && !["operational","human"].includes(d.category)) throw new Error("Invalid escalation category");
+  const task = d.action === "coordinate" ? validateTaskRequest(d.task) : undefined;
+  return { action: d.action, reason: d.reason, ...(task ? {task} : {}), ...(d.action === "escalate" && d.category ? {category:d.category} : {}), ...(d.action === "unblock" ? { blocker: d.blocker } : {}),
     ...(d.retryReset !== undefined ? { retryReset: d.retryReset } : {}) };
 }
 
@@ -94,6 +97,9 @@ export class RecoveryLedger {
       ticket TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, since INTEGER NOT NULL
     ) STRICT;
     CREATE TABLE IF NOT EXISTS fleet_recovery_workflow (ticket TEXT PRIMARY KEY, fingerprint TEXT NOT NULL) STRICT;`);
+  }
+  escalatedTickets():string[] {
+    return this.db.prepare("SELECT ticket FROM fleet_recovery WHERE present=1 AND state='escalated' ORDER BY ticket").all().map(r=>String(r.ticket));
   }
   list(project?: string): RecoveryIncident[] {
     const rows = project ? this.db.prepare("SELECT * FROM fleet_recovery WHERE ticket LIKE ? ORDER BY created DESC LIMIT 500").all(`${project}#%`)
@@ -161,13 +167,23 @@ export class RecoveryLedger {
         "Automatic repair budget exhausted: two fleet repairs and one per ticket per day"].includes(String(old.reason));
       const waited = !o.blocked && trigger && !IDLE_RECOVERY_REASONS.includes(trigger.reason)
         && old?.state === "complete" && old.decision && JSON.parse(String(old.decision)).action === "wait"
-        && this.now() - Number(old.updated) >= RECOVERY_RECHECK_MS;
+        && this.now() >= (JSON.parse(String(old.decision)).recheckAt ?? Number(old.updated)+RECOVERY_RECHECK_MS);
       const workflow = recoveryFingerprint({ ...o, evidenceRevision: undefined, artifactRevision: undefined, pause: undefined });
       const assessedWorkflow = this.db.prepare("SELECT fingerprint FROM fleet_recovery_workflow WHERE ticket=?").get(o.ticket);
-      const evidenceChanged = trigger && old && old.fingerprint !== fingerprint && assessedWorkflow?.fingerprint === workflow
+      const taskFinished = old?.state === 'waiting' && !this.db.prepare("SELECT 1 FROM fleet_recovery_tasks WHERE ticket=? AND state IN ('queued','running','publishing','attention')").get(o.ticket);
+      const evidenceChanged = !taskFinished && trigger && old && old.fingerprint !== fingerprint && assessedWorkflow?.fingerprint === workflow
         && this.now() - Number(old.updated) < RECOVERY_RECHECK_MS;
       if (evidenceChanged && trigger && !trigger.manual) continue;
-      const recheck = (legacyLimit || waited) && trigger && !trigger.manual && !wip;
+      if(old?.state==='waiting' && trigger?.manual) {
+        this.db.prepare("UPDATE fleet_recovery SET state='escalated',reason=?,decision=?,updated=? WHERE id=?")
+          .run(trigger.reason,JSON.stringify({action:'escalate',category:'human',reason:trigger.reason}),this.now(),old.id);
+        newAlerts.add(String(old.id));continue;
+      }
+      if (old?.state === 'waiting' && this.db.prepare("SELECT 1 FROM fleet_recovery_tasks WHERE ticket=? AND state IN ('queued','running','publishing','attention')").get(o.ticket)) continue;
+      const coordinated = old?.state === 'waiting' && !this.db.prepare("SELECT 1 FROM fleet_recovery_tasks WHERE ticket=? AND state IN ('queued','running','publishing','attention')").get(o.ticket);
+      const operational = old?.state === 'escalated' && old.decision && JSON.parse(String(old.decision)).category === 'operational'
+        && this.now() >= (JSON.parse(String(old.decision)).recheckAt ?? Number(old.updated)+RECOVERY_RECHECK_MS);
+      const recheck = (legacyLimit || waited || coordinated || operational) && trigger && !trigger.manual && !wip;
       if (old && (!trigger || old.fingerprint !== fingerprint || recheck)) this.db.prepare("UPDATE fleet_recovery SET present=0, updated=CASE WHEN state='queued' THEN ? ELSE updated END, state=CASE WHEN state='queued' THEN 'resolved' ELSE state END WHERE id=?").run(this.now(), old.id);
       if (!trigger || old?.fingerprint === fingerprint && !recheck || (wip && !trigger.manual)) continue;
       const id = randomUUID();
@@ -208,10 +224,13 @@ export class RecoveryLedger {
     let decision = validateRecoveryDecision(value);
     if (["retry", "rework", "resume", "refine", "unblock"].includes(decision.action)) {
       const repairs = this.db.prepare("SELECT count(*) AS n FROM fleet_recovery WHERE ticket=? AND decision IS NOT NULL AND updated>? AND json_extract(decision,'$.action') IN ('retry','rework','resume','refine','unblock')").get(incident.ticket, this.now() - 86400000)!;
-      if (Number(repairs.n) >= RECOVERY_REPAIRS_PER_TICKET) decision = { action: "escalate", reason: "Automatic repair budget exhausted: three repairs per ticket per rolling day" };
+      if (Number(repairs.n) >= RECOVERY_REPAIRS_PER_TICKET) {
+        const first=this.db.prepare("SELECT min(updated) AS at FROM fleet_recovery WHERE ticket=? AND decision IS NOT NULL AND updated>? AND json_extract(decision,'$.action') IN ('retry','rework','resume','refine','unblock')").get(incident.ticket,this.now()-86400000)!;
+        decision={action:'escalate',category:'operational',reason:'Automatic repair budget exhausted: three repairs per ticket per rolling day',recheckAt:Number(first.at)+86400001};
+      }
     }
     this.db.prepare("UPDATE fleet_recovery SET state=?, decision=?, updated=? WHERE id=?").run(
-      ["retry", "rework", "resume", "refine", "unblock"].includes(decision.action) ? "applying" : decision.action === "wait" ? "complete" : "escalated", JSON.stringify(decision), this.now(), id);
+      ["retry", "rework", "resume", "refine", "unblock"].includes(decision.action) ? "applying" : decision.action === "coordinate" ? "waiting" : decision.action === "wait" ? "complete" : "escalated", JSON.stringify(decision), this.now(), id);
     return decision;
   }
   complete(id: string, runId: string): void {

@@ -2,6 +2,7 @@ import { createServer, request, type IncomingMessage, type Server } from "node:h
 import { timingSafeEqual } from "node:crypto";
 import { chmodSync } from "node:fs";
 import type { GitHubBroker, GitHubRequest, GitHubResponse } from "./github-broker.js";
+import {publishRepair} from "./recovery-repair-publication.js";
 import type { Claim, FleetStore, FleetSnapshot, StartRequest, StartResult } from "./fleet-store.js";
 
 export async function readJson(req: IncomingMessage, maxBytes = 1024 * 1024): Promise<any> {
@@ -28,9 +29,10 @@ export async function listen(server: Server, port: number | string, host = "127.
   if (typeof port === "string") chmodSync(port, 0o600);
   return server;
 }
-export async function serveFleet(store: FleetStore, machines: Record<string, string>, admin: string, port: number, host = "127.0.0.1", github?: GitHubBroker, desired?: () => unknown): Promise<Server> {
+export async function serveFleet(store: FleetStore, machines: Record<string, string>, admin: string, port: number, host = "127.0.0.1", github?: GitHubBroker, desired?: () => unknown, repairRepository?: string, repairConsumers?: Record<string,string>, controlRevision?: string): Promise<Server> {
   const secrets = [...Object.values(machines), admin];
   if (secrets.some(s => !s) || new Set(secrets).size !== secrets.length) throw new Error("Fleet credentials must be non-empty and distinct");
+  const repairWrites=new Map<string,Promise<unknown>>();
   const server = createServer(async (req, res) => {
     const send = (status: number, value: unknown) => {
       res.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store" });
@@ -41,13 +43,19 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
     if (!isAdmin && !machine) return send(401, { error: "Authentication required" });
     try {
       if (req.method === "GET" && req.url === "/operations/desired") return send(200, desired?.() ?? {});
+      if (req.method === "GET" && req.url === "/operations/control") return send(200,{desired:store.controlTarget(),centralLoaded:controlRevision});
       if (req.method === "GET" && req.url === "/operations/reports") return send(200, store.operations.list());
-      if (req.method === "GET" && req.url === "/state") return send(200, store.snapshot());
+      if (req.method === "GET" && req.url === "/state") return send(200, {...store.snapshot(), features:{recoveryTasks:true},requiredRepairs:store.requiredRepairs()});
       if (req.method === "GET" && req.url === "/runner") return send(200, store.runnerPolicy() ?? null);
       if (req.method === "GET" && req.url === "/recovery/state") return send(200, store.recovery.list());
       if (req.method === "GET" && req.url === "/github/status" && isAdmin) return send(200, github?.status() ?? { enabled: false });
       if (req.method !== "POST") return send(404, { error: "Unknown operation" });
-      const body = await readJson(req);
+      const body = await readJson(req, req.url?.startsWith("/tasks/") ? 8*1024*1024 : 1024*1024);
+      if(req.url==='/operations/control-ready') {
+        const actor=isAdmin?body.machine:machine;
+        if(!actor) return send(403,{error:'Control worker required'});
+        store.recordControlReady(actor,body.revision);return send(200,{ok:true});
+      }
       if (req.url === '/runner') {
         if (!isAdmin) return send(403, { error: 'Operator credential required' });
         return send(200, store.setRunner(body.runner));
@@ -56,6 +64,59 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
         if (!isAdmin && body.machine !== machine) return send(403, {error:'Machine identity mismatch'});
         store.operations.record(isAdmin ? body.machine : machine!, body.report);
         return send(200, {ok:true});
+      }
+      if (req.url === '/tasks/capabilities') {
+        const actor = isAdmin ? body.machine : machine;
+        if (!actor || !Object.hasOwn(machines, actor)) return send(403,{error:'Unknown capability owner'});
+        store.tasks.report(actor,body.record); return send(200,{ok:true});
+      }
+      if(req.url==='/tasks/active') {
+        const actor=isAdmin?body.machine:machine;
+        return send(200,store.tasks.list().filter(t=>t.machine===actor&&t.session===body.session&&t.state==='running'));
+      }
+      if (req.url === '/tasks/queue') {
+        const actor = isAdmin ? body.machine : machine;
+        if (!actor) return send(403,{error:'Task worker required'});
+        return send(200,store.tasks.list().filter(t => store.tasks.available(actor,t.id)));
+      }
+      if (req.url === '/tasks/uncertain') {
+        const actor=isAdmin?body.machine:machine;
+        if(!actor || typeof body.reason!=='string' || body.reason.length>2000) return send(403,{error:'Task owner required'});
+        store.tasks.uncertain(body.id,actor,body.session,body.reason);return send(200,{ok:true});
+      }
+      if (req.url === '/tasks/start' || req.url === '/tasks/complete') {
+        const actor = isAdmin ? body.machine : machine;
+        if (!actor) return send(403,{error:'Task worker required'});
+        return send(200,req.url === '/tasks/start' ? store.taskStart(actor,body.id,body.session)
+          : store.taskComplete(actor,body.id,body.session,body.result));
+      }
+      if (req.url === '/tasks/request') {
+        if (!machine) return send(403,{error:'Admitted source worker required'});
+        return send(200,store.requestTask(machine,body.session,body.project,body.runId,body.request));
+      }
+      if (req.url === '/tasks/read') {
+        if (!machine) return send(403,{error:'Admitted source worker required'});
+        return send(200,store.readTask(machine,body.session,body.project,body.runId,body.id));
+      }
+      if(req.url==='/tasks/prepare-repair') {
+        if(!isAdmin) return send(403,{error:'Configured repair executor required'});
+        return send(200,store.prepareRepair(body.machine,body.id,body.session,body.publication));
+      }
+      if (req.url === '/tasks/publish-repair') {
+        if (!isAdmin || !github || !repairRepository) return send(403,{error:'Configured repair authority required'});
+        const task=store.tasks.get(body.id);
+        if(task.machine!==body.machine || task.session!==body.session) return send(403,{error:'Task actor mismatch'});
+        let work=repairWrites.get(task.id);
+        if(!work) {
+          work=publishRepair(github,repairRepository,task,body.publication,repairConsumers,sha=>{store.controlTarget(sha);return store.controlsReady(sha,controlRevision);}).finally(()=>repairWrites.delete(task.id));
+          repairWrites.set(task.id,work);
+        }
+        return send(200,await work);
+      }
+      if (req.url === '/tasks/operator-request') {
+        if (!isAdmin) return send(403,{error:'Operator credential required'});
+        if (!/^[\w.-]+\/[\w.-]+#[1-9]\d*$/.test(body.ticket)) throw new Error('Invalid source ticket');
+        return send(200,store.tasks.request(body.ticket,body.request));
       }
       if (req.url === "/recovery/facts") return send(200, store.recoveryFacts(body.tickets));
       if (req.url === "/recovery/evidence") {
@@ -129,13 +190,13 @@ export class JsonClient {
     } else if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("Invalid service connection");
   }
   async call<T>(path: string, body?: unknown): Promise<T> {
-    const timeoutMs = path === "/github" ? 60_000 : 10_000;
+    const timeoutMs = path === "/tasks/publish-repair" ? 120_000 : path === "/github" ? 60_000 : 10_000;
     if (this.socketPath) return new Promise<T>((resolve, reject) => {
       const req = request({ socketPath: this.socketPath, path, method: body === undefined ? "GET" : "POST",
         headers: { Authorization: `Bearer ${this.token}`, "Content-Type": "application/json" },
         signal: AbortSignal.timeout(timeoutMs), agent: false,
       }, response => {
-        void readJson(response, path === "/github" ? 16 * 1024 * 1024 : 1024 * 1024).then(value => {
+        void readJson(response, path === "/github" ? 16 * 1024 * 1024 : path.startsWith("/tasks/") ? 8*1024*1024 : 1024 * 1024).then(value => {
           if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
             reject(new Error(`Service ${response.statusCode}: ${JSON.stringify(value).slice(0, 500)}`));
           } else resolve(value as T);

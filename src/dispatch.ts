@@ -13,7 +13,7 @@ import { verifyCoordination } from "./recovery-coordination.js";
 import { recoveryInventory, relatedTickets, relatedEvidence } from "./recovery-evidence.js";
 import { recoveryLogContext } from "./recovery-context.js";
 import { RECOVERY_RETURNED_INBOX, type RecoveryIncident, type RecoveryDecision } from "./fleet-recovery.js";
-import { ManagedDispatch, managedRunRunner, trackManagedChild } from "./managed-dispatch.js";
+import { ManagedDispatch, managedTaskEnv, managedRunRunner, trackManagedChild } from "./managed-dispatch.js";
 import { DispatchPool, excludeInFlight, freeSeats, launchCandidates, liveGateRunnerFor, mayStartMainSweep, resolvePollIntervalMs } from "./dispatch-pool.js";
 import { countVerdictsSince, isStaleBaseFinding, parseBuilderCompletions, parseVerdictArtifacts, pickVerdictPr, shouldFlagMissingVerdict } from "./verdict-guard.js";
 import { countOpenPrs, shouldFlagMissingPr } from "./pr-guard.js";
@@ -2775,6 +2775,12 @@ export function makeDispatchContext(
 // human triage; today's behavior). Same for `handlePostRun` returning
 // `{ ok: false }` from inside the try block — push-failure and
 // empty-branch-guard preserve the worktree on purpose.
+function nativeTaskNote(): string {
+  if (!managedTaskEnv().PYRY_TASK_SOCKET) return '';
+  const helper = resolve(fileURLToPath(new URL('../scripts/fleet-task.py', import.meta.url)));
+  return `\n\n## Managed native checks\nUse python3 ${helper} request REQUEST.json to schedule a missing native check. The fixed request fields are recipe, capability, revision and reason. Recipes: platform-probe, memory-runtime-smoke, android-tool-then-text. Capabilities: linux-amd64, macos-arm64, android-emulator. Execution requires the full pushed candidate commit. Use python3 ${helper} await TASK_ID --out FRESH_DIRECTORY to retrieve exact artifacts. Jobs use ordinary heavy admission on the required computer and preserve this ticket's ownership. Inspect the executed results and commit the required evidence. An available native route is not proof that the candidate passes. Do not escalate merely because this computer lacks the required platform. A queued task is tracked work, not a failed test.\n`;
+}
+
 export async function dispatchToAgent(
   agent: AgentConfig,
   item: ProjectItem,
@@ -2810,7 +2816,7 @@ export async function dispatchToAgent(
   const reReview = prepareReReviewNote(ctx);
   const handoffNote = prepareVerdictHandoff(ctx);
   const findingsNote = prepareReworkFindingsNote(ctx);
-  const spawn = await prepareAgentSpawn(ctx, gates.promptNote + baseNote + mergeNote + reReview + handoffNote + findingsNote);
+  const spawn = await prepareAgentSpawn(ctx, gates.promptNote + baseNote + mergeNote + reReview + handoffNote + findingsNote + nativeTaskNote());
   if (!spawn.ok) return;
   // The gates ran before the agent's clock started, so the review gets its
   // whole budget. The overlapped review keeps its own record below.
@@ -4013,7 +4019,7 @@ export async function prepareAgentSpawn(
       // before handing the env to the spawned agent — claude has its own
       // gh-auth credential store and doesn't need ours. See
       // `SPAWN_ENV_DENYLIST` in lib.ts for the full list + rationale.
-      env: agentSpawnEnv(process.env, agent.name),
+      env: {...agentSpawnEnv(process.env, agent.name),...managedTaskEnv()},
     },
   };
 }

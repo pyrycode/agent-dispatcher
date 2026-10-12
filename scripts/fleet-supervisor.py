@@ -158,6 +158,15 @@ def main():
         module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
         adapter = module.NativeAdapter(config)
         supervisor = Supervisor(state, adapter)
+        support = None
+        control_module = None
+        if config.get('recoveryTasks'):
+            support_spec = importlib.util.spec_from_file_location('fleet_support', Path(__file__).with_name('fleet-support.py'))
+            support_module = importlib.util.module_from_spec(support_spec); support_spec.loader.exec_module(support_module)
+            support = support_module.SupportSupervisor(adapter, config)
+        if config.get('control'):
+            control_spec = importlib.util.spec_from_file_location('fleet_control', Path(__file__).with_name('fleet-control.py'))
+            control_module = importlib.util.module_from_spec(control_spec); control_spec.loader.exec_module(control_module)
         # SIGHUP requests a fresh credential lookup, without stopping dispatchers.
         refresh_requested = False
         def request_refresh(signum, frame):
@@ -170,6 +179,9 @@ def main():
                 if refresh_requested:
                     adapter.refresh_credentials()
                     refresh_requested = False
+                if control_module and control_module.sync_control(adapter,config):
+                    # Re-read the verified supervisor source without terminating any worker process.
+                    os.execv(sys.executable,[sys.executable,*sys.argv])
                 desired = adapter.desired()
                 for project in config['projects']:
                     try:
@@ -181,7 +193,9 @@ def main():
                     except Exception as error:
                         results.append({'phase': 'attention', 'project': project,
                                         'reason': 'Configured workload observation failed. ' + type(error).__name__})
+                support_results = support.tick() if support else []
                 attention = adapter.attention()
+                attention["recoveryTasks"] = support_results
                 attention['operations'] = results
                 atomic(Path(config['reportFile']), attention)
                 adapter.publish_attention()

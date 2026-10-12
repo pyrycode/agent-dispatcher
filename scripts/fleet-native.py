@@ -63,6 +63,7 @@ class NativeAdapter:
             with salt.open('x') as stream:
                 os.chmod(salt, 0o600); stream.write(secrets.token_hex(32))
         self.salt = salt.read_text()
+        self.loaded_control_revision = execute(['git','-C',config['control']['repository'],'rev-parse','HEAD']) if config.get('control') else None
         self.local = {}
         self.expected_cache = {}
 
