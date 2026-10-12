@@ -2513,6 +2513,8 @@ export type DispatchContext = {
    *  one that runs out of time can say so on the ticket. See
    *  verifier-out-of-time.ts. */
   review?: ReviewProgress;
+  /** An unexcused red gate prevents completion, including after verdict recovery. */
+  failedPreSpawnGate?: string;
 };
 
 /**
@@ -4827,6 +4829,10 @@ async function recoverSavedVerdict(
   } catch {
     handoff = null;
   }
+  if (ctx.failedPreSpawnGate && handoff?.ok && handoff.handoff.decision === "PASS") {
+    ctx.deps.writeLog(logFile, "VERDICT_HANDOFF_UNUSED", "Required checks remain incomplete or failing; PASS recovery refused");
+    return null;
+  }
   const pr = lookupVerdictPr(ctx.deps.execSync, { branch: ctx.branchName, pr: null, cwd: ctx.agentCwd });
   const marker = handoffMarker({ agent: agent.name, issueNumber: item.issueNumber, startedAtMs: startTime });
   const decision = decideVerdictRecovery({ handoff, pr, startedAtMs: startTime, firstAttempt: true, marker });
@@ -5066,6 +5072,23 @@ export async function handlePostRun(
       console.warn(`   ⚠️  Failed to check post-run labels: ${e}`);
     }
     postLabels = [...new Set([...postLabels, ...appliedLabels])];
+  }
+
+  if (ctx.failedPreSpawnGate && item.issueNumber > 0 && !saferSalvaged) {
+    // The agent may already have applied its ready label. Remove it even
+    // when the label read failed; failure to remove must stop this dispatch.
+    await client.removeLabel(item.issueNumber, `done:${agent.name}`);
+    if (!postLabels.some(label => label.startsWith("needs-rework:"))) {
+      await client.addLabel(item.issueNumber, `error:${agent.name}`);
+      await client.addComment(item.issueNumber,
+        `## Required checks remain incomplete or failing\n\n` +
+        `The dispatcher stopped at \`${ctx.failedPreSpawnGate}\`. This review cannot advance the ticket. ` +
+        `A focused rerun or a written PASS does not replace the unfinished required checks. ` +
+        `Resolve the gate failure, then remove \`error:${agent.name}\` to run the configured checks again. ` +
+        `The worktree is retained at \`${agentCwd}\`.`);
+      return { ok: false };
+    }
+    postLabels = postLabels.filter(label => label !== `done:${agent.name}`);
   }
 
   // Empty-branch guard: agents that are supposed to produce commits
@@ -5998,6 +6021,7 @@ function readDocsOnlyGateReuse(
 export async function maybeRunPreSpawnGates(
   ctx: DispatchContext,
 ): Promise<{ promptNote: string }> {
+  delete ctx.failedPreSpawnGate;
   const { agent, item, agentCwd, logFile } = ctx;
   const preSpawnGate = activeStageSet().preSpawnGate;
   if (preSpawnGate === null || !preSpawnGate.agentNames.has(agent.name)) {
@@ -6179,6 +6203,7 @@ export async function maybeRunPreSpawnGates(
     };
   }
 
+  ctx.failedPreSpawnGate = result.failedGate ?? "unknown gate";
   console.log(
     `   ❌ Pre-${agent.name} gate red (${result.failedGate}) — spawning ${agent.name} in TRIAGE MODE`,
   );
@@ -6199,7 +6224,7 @@ export async function maybeRunPreSpawnGates(
     result.outputTail || "(no output captured)",
     "```",
     "",
-    "Triage this failure before reviewing: determine whether it is caused by this ticket's changes or already present on the merge base, then route per your triage contract (bounce vs advance). The dispatcher deliberately did not apply any rework label — that call is yours.",
+    "Triage this failure before reviewing. Route demonstrated code regressions to rework. Required checks remain incomplete or failing, so this run cannot advance or publish PASS. A focused rerun cannot replace unfinished checks. Fix the test environment or arrange a complete dispatcher rerun before approval.",
     ...flakyNoteLines(result.baseline),
     ...baselineNoteLines(result.baseline, baselineTicket),
     ...remainingNoteLines(result),
