@@ -13,7 +13,7 @@ class SupportTests(unittest.TestCase):
    directory=Path(d);capture=directory/'capture';capture.mkdir()
    driver=directory/'core/internal/e2e/realclaude/tool_then_text_mobile_capture.py'
    driver.parent.mkdir(parents=True);driver.write_text('approved driver')
-   records={'daemon-1.stdout':'{"type":"stream_event","event":{"type":"message_start"}}\n{"type":"result"}\n',
+   records={'daemon-1.stdout':'{"type":"stream_event","event":{"type":"message_start"}}\r\n{"type":"result"}\r\n',
             'daemon-1.manifest.json':'{"dropped_rows":0}',
             'driver.json':'{"exit_code":1}',
             'mobile.xml':'<testsuite tests="1" failures="1"/>',

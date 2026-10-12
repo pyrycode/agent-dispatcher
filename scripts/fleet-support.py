@@ -100,7 +100,8 @@ def native_recipe(task,paths,directory):
         # as well as passes. The authority refuses credential-shaped content.
         for path in capture.rglob('*'):
             if path.is_file() and path.suffix in {'.json','.jsonl','.xml','.stdout','.stderr'}:
-                files['mobile/'+str(path.relative_to(capture))]=path.read_text()
+                with path.open(encoding='utf-8',newline='') as record:
+                    files['mobile/'+str(path.relative_to(capture))]=record.read()
         summary='Android capture completed. Inspect counted XML and recorder admission before accepting evidence.' if code==0 else 'Android capture failed. Returned diagnostic records do not establish a passing method.'
     if sum(len(v.encode()) for v in files.values())>4*1024*1024:
         files={};summary+=' Artifact bundle exceeds transport size; its original private directory remains available.';code=1
