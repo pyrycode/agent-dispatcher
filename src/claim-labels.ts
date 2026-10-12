@@ -1,6 +1,8 @@
 import type { Claim } from "./fleet-store.js";
 
 const PREFIX = "claim:";
+export const ESCALATED_LABEL = "orchestrator:escalated";
+const managedLabel = (l: string) => l.startsWith(PREFIX) || l === ESCALATED_LABEL;
 interface LabelledIssue { number: number; labels: string[] }
 interface ClaimLabelApi {
   listLabels(project: string): Promise<string[]>;
@@ -14,7 +16,7 @@ interface SyncResult { added: number; removed: number; errors: string[] }
 /** One central display-only writer. It never changes claims or grants. */
 export class ClaimLabelMirror {
   private pending: Promise<SyncResult> | undefined;
-  constructor(private readonly projects: string[], private readonly claims: () => readonly Claim[], private readonly api: ClaimLabelApi) {
+  constructor(private readonly projects: string[], private readonly claims: () => readonly Claim[], private readonly api: ClaimLabelApi, private readonly escalated: () => readonly string[] = () => []) {
     if (!Array.isArray(projects) || projects.some(p => typeof p !== "string" || !/^[\w.-]+\/[\w.-]+$/.test(p)) || new Set(projects).size !== projects.length) throw new Error("Invalid claim-label projects");
   }
   sync(): Promise<SyncResult> {
@@ -25,7 +27,7 @@ export class ClaimLabelMirror {
     const result: SyncResult = { added: 0, removed: 0, errors: [] };
     for (const project of this.projects) {
       try {
-        const catalog = new Set((await this.api.listLabels(project)).filter(l => l.startsWith(PREFIX)));
+        const catalog = new Set((await this.api.listLabels(project)).filter(managedLabel));
         const actual = new Map<number, string[]>();
         // Query every existing claim label, including retired machine names.
         // This recovers freed tickets after a restart without a local cache.
@@ -36,18 +38,23 @@ export class ClaimLabelMirror {
           const number = claim.ticket.slice(project.length + 1);
           if (/^[1-9]\d*$/.test(number)) numbers.add(Number(number));
         }
+        for (const ticket of this.escalated()) {
+          if (ticket.startsWith(`${project}#`) && /^[1-9]\d*$/.test(ticket.slice(project.length + 1))) numbers.add(Number(ticket.slice(project.length + 1)));
+        }
         for (const number of numbers) {
           // GitHub reads can take time. Use the current owner, including frees
           // made during this pass. A concurrent change converges next pass.
           const owner = this.claims().find(c => c.ticket === `${project}#${number}`);
-          const wanted = owner ? `${PREFIX}${owner.machine}` : undefined;
-          const labels = (actual.get(number) ?? []).filter(l => l.startsWith(PREFIX));
-          if (wanted && !labels.includes(wanted)) {
-            if (!catalog.has(wanted)) { await this.api.createLabel(project, wanted); catalog.add(wanted); }
-            await this.api.addLabel(project, number, wanted);
+          const wanted = new Set<string>();
+          if (owner) wanted.add(`${PREFIX}${owner.machine}`);
+          if (this.escalated().includes(`${project}#${number}`)) wanted.add(ESCALATED_LABEL);
+          const labels = (actual.get(number) ?? []).filter(managedLabel);
+          for (const label of wanted) if (!labels.includes(label)) {
+            if (!catalog.has(label)) { await this.api.createLabel(project, label); catalog.add(label); }
+            await this.api.addLabel(project, number, label);
             result.added++;
           }
-          for (const label of labels) if (label !== wanted) {
+          for (const label of labels) if (!wanted.has(label)) {
             await this.api.removeLabel(project, number, label);
             result.removed++;
           }
@@ -92,7 +99,7 @@ export class GitHubClaimLabels implements ClaimLabelApi {
   }
   async createLabel(project: string, label: string): Promise<void> {
     try {
-      await this.request(`${project}/labels`, "POST", { name: label, color: "1D76DB", description: "Computer owning this ticket. Managed by the fleet claim service." });
+      await this.request(`${project}/labels`, "POST", { name: label, color: label === ESCALATED_LABEL ? "D93F0B" : "1D76DB", description: label === ESCALATED_LABEL ? "Recovery escalated. See the latest orchestrator decision for the missing action." : "Computer owning this ticket. Managed by the fleet claim service." });
     } catch (error) {
       // Another writer may have created the same label. Verify it exists;
       // failures still reach the next periodic retry without touching claims.
@@ -108,10 +115,10 @@ export class GitHubClaimLabels implements ClaimLabelApi {
 }
 
 /** Visibility failures never prevent the authority from serving work. */
-export function startClaimLabelSync(config: { tokenEnv: string; projects: string[] } | undefined, claims: () => readonly Claim[], env = process.env, fetcher: typeof fetch = fetch): () => void {
+export function startClaimLabelSync(config: { tokenEnv: string; projects: string[] } | undefined, claims: () => readonly Claim[], env = process.env, fetcher: typeof fetch = fetch, escalated: () => readonly string[] = () => []): () => void {
   if (!config) return () => {};
   try {
-    const mirror = new ClaimLabelMirror(config.projects, claims, new GitHubClaimLabels(env[config.tokenEnv] ?? "", fetcher));
+    const mirror = new ClaimLabelMirror(config.projects, claims, new GitHubClaimLabels(env[config.tokenEnv] ?? "", fetcher), escalated);
     const tick = () => void mirror.sync().then(result => {
       if (result.added || result.removed) console.log(`Claim labels: added ${result.added}, removed ${result.removed}`);
       for (const error of result.errors) console.warn(`Claim label sync will retry: ${error}`);

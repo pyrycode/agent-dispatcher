@@ -104,7 +104,7 @@ export function isVerdictPublishFailure(text: string, opts: { approvalRejected: 
   if (/\bapproval\b|unacceptable risk|permission denied/i.test(text)) return false;
   const github = /github|graphql|\bgh\b|pipeline-action/i.test(text);
   const write = /\b(post|posting|posted|publish|publishing|comment|review|verdict|label)s?\b/i.test(text);
-  const failure = /\bHTTP\s*5\d\d\b|\b50[0-4]\b|timed?\s?out|timeout|rate.?limit|unavailable|bad gateway|server error|connection (?:reset|refused)|ECONNRESET|ETIMEDOUT|\bfailed\b|\bfailure\b/i.test(text);
+  const failure = /\bHTTP\s*(?:429|5\d\d)\b|\b50[0-4]\b|timed?\s?out|timeout|rate.?limit|unavailable|bad gateway|server error|connection (?:reset|refused)|ECONNRESET|ETIMEDOUT|\bfailed\b|\bfailure\b/i.test(text);
   return github && write && failure;
 }
 

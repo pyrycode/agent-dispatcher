@@ -12,6 +12,8 @@ export interface WorkOffer {
   recovery?: boolean;
   recoveryError?: boolean;
   requiresRecovery?: boolean;
+  readyRepairs?: string[];
+  supportTaskId?:string; parentTicket?:string;
 }
 
 /** The authority classifies queued checks, including offers from older workers. */
@@ -21,7 +23,8 @@ function idleAssessment(offer: WorkOffer, state: FleetSnapshot): boolean {
 
 /** Draining stops new tickets, while reconciliation can still advance owned work. */
 export function acceptsDuringProjectDrain(offer: WorkOffer, machine: string, drainingProjects: readonly string[], state: FleetSnapshot): boolean {
-  return !drainingProjects.includes(offer.project)
+  return offer.role==="recovery-task" && !!offer.supportTaskId
+    || !drainingProjects.includes(offer.project)
     || (offer.role === "reconcile" && offer.ticket === `${offer.project}#@reconcile`)
     || (/#[1-9]\d*$/.test(offer.ticket) && state.claims.some(c => c.ticket === offer.ticket && c.machine === machine));
 }
@@ -52,7 +55,8 @@ export function scheduleMachine(opts: {
   const ready = opts.offers.filter(o => rank.has(o.project) && (!claims.has(o.ticket) || claims.get(o.ticket)!.machine === opts.machine)
     && acceptsDuringProjectDrain(o, opts.machine, opts.drainingProjects ?? [], opts.state));
   ready.sort((a, b) => {
-    const ac = claims.get(a.ticket), bc = claims.get(b.ticket);
+    const parentClaim=(o:WorkOffer)=>{const p=o.parentTicket?claims.get(o.parentTicket):undefined;return p?.machine===opts.machine?p:undefined;};
+    const ac=claims.get(a.ticket)??parentClaim(a),bc=claims.get(b.ticket)??parentClaim(b);
     return Number(idleAssessment(a, opts.state)) - Number(idleAssessment(b, opts.state))
       || Number(!ac) - Number(!bc)
       || Number(!(a.role === "recovery" || a.recovery)) - Number(!(b.role === "recovery" || b.recovery))

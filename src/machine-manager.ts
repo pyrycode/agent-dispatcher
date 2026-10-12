@@ -1,10 +1,11 @@
+import type {RecoveryTask} from "./recovery-tasks.js";
 import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { listen, readJson, tokenMatches, type FleetClient } from "./fleet-http.js";
 import { validateStart, validateLimits, type MachineLimits, type FleetRun } from "./fleet-store.js";
 import { scheduleMachine, runnableTickets, acceptsDuringProjectDrain, type WorkOffer } from "./machine-scheduler.js";
 
-export interface MachineConfig extends MachineLimits { machine: string; projects: string[]; drainingProjects?: string[]; ticketLimit?: number }
+export interface MachineConfig extends MachineLimits { machine: string; projects: string[]; drainingProjects?: string[]; ticketLimit?: number; controlRevision?: string }
 type ClaimService = Pick<FleetClient, "snapshot" | "start" | "finish"> & Partial<Pick<FleetClient, "authorize" | "github" | "call">>;
 interface Offers { session: string; work: WorkOffer[]; at: number }
 export function offerId(machine: string, session: string, offer: WorkOffer): string {
@@ -12,6 +13,7 @@ export function offerId(machine: string, session: string, offer: WorkOffer): str
 }
 
 export class MachineManager {
+  private supportOffers:Offers|undefined;
   private readonly offers = new Map<string, Offers>();
   private tickPromise: Promise<void> | undefined;
   private readonly finished = new Set<string>();
@@ -37,6 +39,7 @@ export class MachineManager {
   }
   offer(project: string, session: string, work: WorkOffer[]): void {
     if (!this.config.projects.includes(project) || !session || session.length > 200 || !Array.isArray(work) || work.length > 5000) throw new Error("Invalid offers");
+    if(work.some(w=>w.supportTaskId!==undefined||w.role==="recovery-task")) throw new Error("Support tasks use the operator lane");
     const keys = new Set<string>();
     for (const item of work) {
       if (item.project !== project || typeof item.key !== "string" || !item.key || item.key.length > 200 || keys.has(item.key) || !Number.isFinite(item.order)) throw new Error("Invalid offer");
@@ -61,13 +64,13 @@ export class MachineManager {
     while (!this.draining) {
       const state = await this.claims.snapshot();
       if (this.draining) break;
-      const offers = [...this.offers.values()].filter(o => this.now() - o.at < 180_000).flatMap(o => o.work)
+      const offers = [...this.offers.values(),...(this.supportOffers?[this.supportOffers]:[])].filter(o => this.now() - o.at < 180_000).flatMap(o => o.work)
         .filter(o => !this.finished.has(`${o.project}/${o.key}`) && !attempted.has(`${o.project}/${o.key}`));
       const job = scheduleMachine({ ...this.config, offers, state })[0];
       if (!job) break;
       attempted.add(`${job.project}/${job.key}`);
       if (!acceptsDuringProjectDrain(job, this.config.machine, this.config.drainingProjects ?? [], state)) continue;
-      const current = this.offers.get(job.project);
+      const current=job.supportTaskId?this.supportOffers:this.offers.get(job.project);
       if (!current || !current.work.some(w => w.key === job.key) || this.now() - current.at >= 180_000) continue;
       // A lost reply leaves a durable reservation. grants() recovers that exact
       // run from the server; it never guesses that a timed-out start failed.
@@ -75,6 +78,17 @@ export class MachineManager {
       const result = await this.claims.start({ ...request, id: offerId(this.config.machine, current.session, job), machine: this.config.machine, session: current.session });
       if (!result.ok && result.reason === "finished") this.finished.add(`${job.project}/${job.key}`);
     }
+  }
+  async support(session:string):Promise<Array<{task:RecoveryTask;run:FleetRun}>> {
+    if(!this.claims.call||!session||session.length>200) throw new Error('Support scheduling requires a configured operator');
+    const tasks=await this.claims.call<RecoveryTask[]>('/tasks/queue',{});
+    const project=this.config.projects.includes('pyrycode/pyrycode')?'pyrycode/pyrycode':this.config.projects[0];
+    this.supportOffers={session,at:this.now(),work:tasks.map(task=>({project,ticket:`${project}#@task-${task.id}`,role:'recovery-task',resource:task.request.recipe==='platform-probe'?'light':'heavy',locks:[],key:task.id,order:-5,recovery:true,recoveryError:true,supportTaskId:task.id,parentTicket:task.ticket}))};
+    await this.tick();
+    const state=await this.claims.snapshot();
+    const active=state.runs.filter(r=>r.machine===this.config.machine&&r.session===session&&r.supportTaskId);
+    const current=await this.claims.call<RecoveryTask[]>('/tasks/active',{session});
+    return active.flatMap(run=>{const task=current.find(t=>t.id===run.supportTaskId);return task?[{task,run}]:[];});
   }
   async replace(project: string, session: string, work: WorkOffer[]): Promise<FleetRun[]> {
     // Survivors remain published while an already-sent admission settles.
@@ -95,10 +109,10 @@ export class MachineManager {
   }
   async status() {
     const state = await this.claims.snapshot();
-    const available = [...this.offers.values()].filter(o => this.now() - o.at < 180_000).flatMap(o => o.work);
+    const available = [...this.offers.values(),...(this.supportOffers?[this.supportOffers]:[])].filter(o => this.now() - o.at < 180_000).flatMap(o => o.work);
     const runnableOffers = available.filter(o => !this.finished.has(`${o.project}/${o.key}`));
     const eligible = new Set(scheduleMachine({ ...this.config, offers: runnableOffers, state }).map(o => `${o.project}/${o.key}`));
-    return { machine: this.config.machine, heavyLimit: this.config.heavyLimit, combinedLimit: this.config.combinedLimit, ticketLimit: this.config.ticketLimit ?? null, runnableTicketCount: runnableTickets(this.config.machine, runnableOffers, state).size, draining: this.draining, drainingProjects: this.config.drainingProjects ?? [], ...state,
+    return { ...(this.config.controlRevision?{controlRevision:this.config.controlRevision}:{}), machine: this.config.machine, heavyLimit: this.config.heavyLimit, combinedLimit: this.config.combinedLimit, ticketLimit: this.config.ticketLimit ?? null, runnableTicketCount: runnableTickets(this.config.machine, runnableOffers, state).size, draining: this.draining, drainingProjects: this.config.drainingProjects ?? [], ...state,
       projects: this.config.projects.map(project => ({ project, draining: this.config.drainingProjects?.includes(project) ?? false, lastSeen: this.offers.get(project)?.at ?? null, health: !this.offers.has(project) ? "not-registered" : this.now() - this.offers.get(project)!.at >= 180_000 ? "dispatcher-unreachable" : "reporting" })),
       attention: state.runs.filter(r => r.machine === this.config.machine && this.now() - r.created >= 3 * 3600000)
         .map(r => ({ ticket: r.ticket, runId: r.id, reason: "Reservation older than three hours; verify worker progress before intervening" })),
@@ -142,6 +156,10 @@ export async function serveManager(manager: MachineManager, projectTokens: Recor
       }
       if (req.method !== "POST") return send(404, { error: "Unknown operation" });
       const body = await readJson(req);
+      if(req.url==='/support-offers') {
+        if(!admin) return send(403,{error:'Support scheduling requires the local operator'});
+        return send(200,await manager.support(body.session));
+      }
       if (req.url === "/drain") {
         if (!admin) return send(403, { error: "Operator credential required" });
         manager.draining = true;
@@ -154,7 +172,7 @@ export async function serveManager(manager: MachineManager, projectTokens: Recor
         return send(200, { ok: true, drainingProjects: manager.config.drainingProjects });
       }
       if (!project) return send(403, { error: "Project credential required" });
-      if (["/recovery/facts", "/recovery/evidence", "/recovery/pause", "/recovery/coordination", "/recovery/report", "/recovery/begin", "/recovery/decide", "/recovery/complete"].includes(req.url ?? "")) {
+      if (["/tasks/request", "/tasks/read", "/recovery/facts", "/recovery/evidence", "/recovery/pause", "/recovery/coordination", "/recovery/report", "/recovery/begin", "/recovery/decide", "/recovery/complete"].includes(req.url ?? "")) {
         if (!manager.claims.call) throw new Error("Recovery service unavailable");
         return send(200, await manager.claims.call(req.url!, { ...body, project,
           ...(req.url === "/recovery/evidence" ? { records: body.records?.map((r: any) => ({ ...r, machine: manager.config.machine })) } : {}) }));

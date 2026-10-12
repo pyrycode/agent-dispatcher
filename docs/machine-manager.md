@@ -361,3 +361,71 @@ A durable receipt is written before one graceful stop signal. Existing jobs fini
 A crash after an uncertain stop or start acknowledgement never causes another signal or start. That operation appears in the consolidated report. Inspection is required before clearing its receipt. No branch, local work, claim or retry counter is reset.
 
 Supervisor operation summaries are published to the existing claim authority. Only the authenticated computer can submit its summary. Reports contain phases and reasons, without commands, credentials or ownership records. The existing five-minute board-watch timer reads the consolidated decision report and uses its existing Pyrycode-client delivery path. No Codex reporting heartbeat is needed.
+
+## Executable recovery work
+
+An admitted recovery can return `coordinate` with a fixed `task` request instead
+of escalating an available platform to a person. Admitted builders and developers
+can request the same native checks through `scripts/fleet-task.py`. Each run gets
+a private socket. The parent supplies the ticket and run identity. The child
+receives no fleet credential and cannot read another ticket's artifacts.
+
+The existing local supervisor advertises its configured capabilities after
+checking the required executables. Records expire after three minutes for new
+admission. An expired record never releases an existing worker or ownership.
+The supervisor submits helpers to its existing machine manager. Owned work keeps
+its normal priority. A helper for a locally owned ticket uses its parent's claim
+age and recovery priority. Foreign helpers follow runnable owned work. Native
+execution uses heavy capacity. Platform-route probes are light and cannot claim
+that candidate tests passed. Helpers do not transfer or claim their product ticket.
+
+The fixed recipes are `platform-probe`, `memory-runtime-smoke`,
+`android-tool-then-text` and `dispatcher-repair`. Executed recipes require an exact
+candidate revision. There is no model-supplied shell command. Requests are stable
+within the admitted source run or recovery incident. A lost acknowledgement does
+not launch another worker. Private text artifacts are limited to 4 MiB, reject
+path traversal and credential-shaped content, and return through the source's
+admitted writer. A failed check returns diagnostic evidence, never a passing gate.
+
+A coordinating incident waits while its helper is queued, running or publishing.
+The terminal result queues a new assessment without the usual evidence cooldown.
+A real operator hold or denied permission stops new helper admission. A worker
+that disappears without a terminal result escalates its source and retains the
+uncertain reservation. The supervisor never repeats an uncertain launch.
+
+Dispatcher repair uses the central run's saved Codex or Claude choice. Its fixed
+parent creates an isolated branch, runs the full shared suite and helper checks,
+then obtains an independent source review. Models cannot publish or deploy. The
+parent submits the exact checked files through the configured GitHub connection.
+Fresh PR and main reads, a stable task marker and a fixed new branch prevent
+replacement of unrelated work or duplicate publication. No force update is used.
+A moved base requires fresh checks. The merged tree must match the reviewed tree.
+
+Verified controller source is loaded before consumer pins advance. Each supervisor
+updates only a clean main controller checkout through a fast-forward. It backs up
+the central database and reloads only its configured controller services. Running
+product workers finish through their normal supervised updates. The helper's
+compute reservation ends before publication and rollout waits. The source ticket
+cannot start on a dispatcher that has not loaded the recorded repair. Existing
+intentionally stopped services and project drains remain intact.
+
+A `human` escalation remains held for an actual decision, denied permission or
+uncertain worker. An `operational` escalation rechecks after a bounded delay.
+Repair-budget exhaustion records its next available time and rechecks then.
+This uses the existing recovery cycle and supervisor. No new reporter or cron is
+created.
+
+## Escalation visibility
+
+The central claim-label publisher also maintains `orchestrator:escalated` from
+current recovery incidents. It backfills existing escalations after startup and
+removes the label when an incident resumes or resolves. History cannot keep it
+on a ticket. GitHub failures retry on the existing minute cycle. Label changes
+never grant ownership, reset a counter or authorise a retry.
+
+Container deployments must bind the configured pipeline publish directory to
+persistent private storage. For the installed Mac-path helpers this is
+`/Users/juhanailmoniemi/.codex/publish`. Pending verdicts are also kept in the
+persistent agents logs. GitHub HTTP 429 publication failures now use the normal
+pending-verdict sweep. If a saved review cannot be recovered, a fresh ordinary
+verifier must recreate its own judgment and required checks.

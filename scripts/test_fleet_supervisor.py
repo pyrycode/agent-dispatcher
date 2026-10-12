@@ -14,6 +14,30 @@ module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
 PROJECT='org/core'
 
 class CredentialRefreshSignalTests(unittest.TestCase):
+    def test_verified_control_update_reloads_supervisor_source(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder)
+            (root/'fleet-supervisor.py').write_bytes(Path(__file__).with_name('fleet-supervisor.py').read_bytes())
+            (root/'fleet-native.py').write_text('''from pathlib import Path
+class NativeAdapter:
+    def __init__(self, config): self.marker=Path(config['marker']); self.reloaded=self.marker.exists()
+    def desired(self): return {}
+    def attention(self): return {'reloaded': self.reloaded}
+    def publish_attention(self): pass
+''')
+            (root/'fleet-control.py').write_text('''def sync_control(adapter, config):
+    if adapter.reloaded: return False
+    adapter.marker.write_text('verified')
+    return True
+''')
+            report=root/'report.json'
+            config=root/'config.json'
+            config.write_text(json.dumps({'stateDirectory':str(root/'state'),'reportFile':str(report),'projects':{},'control':{'enabled':True},'marker':str(root/'marker')}))
+            config.chmod(0o600)
+            result=subprocess.run([sys.executable,str(root/'fleet-supervisor.py'),str(config),'--once'],capture_output=True,text=True,timeout=5)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertTrue(json.loads(report.read_text()).get('reloaded'),report.read_text())
+
     def test_signal_refreshes_without_restarting_supervisor(self):
         with tempfile.TemporaryDirectory() as folder:
             root=Path(folder)

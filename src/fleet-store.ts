@@ -5,6 +5,8 @@ import { randomUUID } from "node:crypto";
 import { RecoveryFacts, type PauseRecord, type EvidenceRecord, type CoordinationRecord } from "./recovery-facts.js";
 import { RecoveryLedger, validateObservations, IDLE_RECOVERY_REASONS, type RecoveryObservation, type RecoveryDecision, type RecoveryIncident } from "./fleet-recovery.js";
 import { OperationReports } from './operation-reports.js';
+import {RecoveryTasks, type RecoveryTaskRequest, type RecoveryTaskResult} from './recovery-tasks.js';
+import {createHash} from 'node:crypto';
 import type { AgentRunner } from './agent-runner.js';
 
 /** An operator choice, frozen into each new grant. Null restores local settings. */
@@ -29,10 +31,12 @@ export interface StartRequest {
   locks: string[];
   roleLimit?: number;
   requiresRecovery?: boolean;
+  readyRepairs?: string[];
+  supportTaskId?: string; parentTicket?: string;
 }
 export interface Claim { ticket: string; machine: string; generation: string; created: number }
 export interface FleetRun extends StartRequest { generation: string; created: number; runnerPolicy?: RunnerPolicy }
-export interface FleetSnapshot { claims: Claim[]; runs: FleetRun[]; runnerPolicy?: RunnerPolicy; idleRecoveryTickets?: string[]; releasedAssessmentClaims?: Claim[] }
+export interface FleetSnapshot { claims: Claim[]; runs: FleetRun[]; runnerPolicy?: RunnerPolicy; idleRecoveryTickets?: string[]; releasedAssessmentClaims?: Claim[]; features?: {recoveryTasks:boolean}; requiredRepairs?: Record<string,string[]> }
 export type StartResult = { ok: true; generation: string } | {
   ok: false; reason: "foreign-claim" | "running" | "capacity" | "locked" | "finished";
 };
@@ -50,6 +54,8 @@ export function validateStart(req: StartRequest): void {
   if (req.resource !== "heavy" && req.resource !== "medium" && req.resource !== "light") throw new Error("Invalid resource class");
   if (req.roleLimit !== undefined && (!Number.isSafeInteger(req.roleLimit) || req.roleLimit < 1)) throw new Error("Invalid role limit");
   if (req.requiresRecovery !== undefined && (typeof req.requiresRecovery !== 'boolean' || req.role !== 'recovery')) throw new Error('Invalid recovery requirement');
+  if(req.readyRepairs!==undefined && (!Array.isArray(req.readyRepairs)||req.readyRepairs.length>10||req.readyRepairs.some(s=>! /^[a-f0-9]{40}$/.test(s)))) throw new Error("Invalid repair readiness");
+  if(req.supportTaskId!==undefined && (req.role!=="recovery-task"||! /^[a-f0-9]{64}$/.test(req.supportTaskId)||! /^[\w.-]+\/[\w.-]+#[1-9]\d*$/.test(req.parentTicket??""))) throw new Error("Invalid support task admission");
   if (!Array.isArray(req.locks) || req.locks.length > 16 || req.locks.some(k => typeof k !== "string" || !k.startsWith(`${req.project}:`) || k.length > 300)) {
     throw new Error("Invalid project locks");
   }
@@ -60,6 +66,7 @@ export class FleetStore {
   readonly recovery: RecoveryLedger;
   readonly facts: RecoveryFacts;
   readonly operations: OperationReports;
+  readonly tasks: RecoveryTasks;
   constructor(path: string, private readonly limits: Readonly<Record<string, MachineLimits>>) {
     for (const value of Object.values(limits)) validateLimits(value);
     this.db = new DatabaseSync(path);
@@ -88,7 +95,9 @@ export class FleetStore {
     `);
     this.recovery = new RecoveryLedger(this.db);
     this.facts = new RecoveryFacts(this.db);
+    this.tasks = new RecoveryTasks(this.db);
     this.db.exec("CREATE TABLE IF NOT EXISTS fleet_assessment_releases (ticket TEXT NOT NULL, machine TEXT NOT NULL, generation TEXT NOT NULL, created INTEGER NOT NULL, PRIMARY KEY(ticket,generation)) STRICT");
+    this.db.exec("CREATE TABLE IF NOT EXISTS fleet_control_target (singleton INTEGER PRIMARY KEY,revision TEXT NOT NULL) STRICT; CREATE TABLE IF NOT EXISTS fleet_control_ready (machine TEXT PRIMARY KEY,revision TEXT NOT NULL) STRICT;");
     this.operations = new OperationReports(this.db, Object.keys(limits));
   }
   close(): void { this.db.close(); }
@@ -112,7 +121,7 @@ export class FleetStore {
   recoveryReport(machine: string, project: string, observations: RecoveryObservation[]) {
     if (!Object.hasOwn(this.limits, machine)) throw new Error("Unknown machine");
     return this.transaction(() => this.recovery.report(machine, project, observations.map(o => ({ ...o,
-      pause: this.facts.getPause(o.ticket), artifactRevision: this.facts.revision([o.ticket]) })), this.snapshot()));
+      pause: this.facts.getPause(o.ticket), artifactRevision: this.artifactRevision(o.ticket) })), this.snapshot()));
   }
   recoveryStep(machine: string, session: string, project: string, id: string, runId: string, step: "begin" | "decide" | "complete", decision?: RecoveryDecision) {
     const incident = this.recovery.incident(id);
@@ -121,16 +130,103 @@ export class FleetStore {
     this.authorize(machine, session, incident.ticket, runId);
     return this.transaction(() => {
       if (step === "begin") return this.recovery.begin(id, runId);
-      if (step === "decide") return this.recovery.decide(id, runId, decision!);
+      if (step === "decide") {
+        const selected = this.recovery.decide(id, runId, decision!);
+        if (selected.action === 'coordinate') this.tasks.request(incident.ticket, selected.task!,incident.id);
+        return selected;
+      }
       if (step === "complete") { this.recovery.complete(id, runId); return { ok: true }; }
       throw new Error("Invalid recovery operation");
+    });
+  }
+
+  controlTarget(revision?: string): string | undefined {
+    if(revision!==undefined) {
+      if(!/^[a-f0-9]{40}$/.test(revision)) throw new Error('Invalid control revision');
+      this.db.prepare('INSERT INTO fleet_control_target VALUES (1,?) ON CONFLICT(singleton) DO UPDATE SET revision=excluded.revision').run(revision);
+    }
+    return this.db.prepare('SELECT revision FROM fleet_control_target WHERE singleton=1').get()?.revision as string|undefined;
+  }
+  recordControlReady(machine:string,revision:string):void {
+    if(!Object.hasOwn(this.limits,machine)||! /^[a-f0-9]{40}$/.test(revision)) throw new Error('Invalid control readiness');
+    this.db.prepare('INSERT INTO fleet_control_ready VALUES (?,?) ON CONFLICT(machine) DO UPDATE SET revision=excluded.revision').run(machine,revision);
+  }
+  controlsReady(revision:string,centralRevision?:string):boolean {
+    return centralRevision===revision && Object.keys(this.limits).every(machine=>this.db.prepare('SELECT revision FROM fleet_control_ready WHERE machine=?').get(machine)?.revision===revision);
+  }
+  artifactRevision(ticket: string): string | undefined {
+    const revisions = [this.facts.revision([ticket]), this.tasks.revision(ticket)].filter(Boolean);
+    if(revisions.length===1) return revisions[0];
+    return revisions.length ? createHash('sha256').update(JSON.stringify(revisions)).digest('hex') : undefined;
+  }
+  requestTask(machine: string, session: string, project: string, runId: string, request: RecoveryTaskRequest) {
+    const run = this.snapshot().runs.find(r => r.id === runId && r.machine === machine && r.session === session && r.project === project);
+    if (!run || !['builder','developer','recovery'].includes(run.role) || !/#[1-9]\d*$/.test(run.ticket)) throw new Error('Task needs an admitted source worker');
+    this.authorize(machine, session, run.ticket, runId);
+    return this.transaction(() => this.tasks.request(run.ticket, request,run.id));
+  }
+  taskStart(machine: string, id: string, session: string): StartResult & {runnerPolicy?: RunnerPolicy;run?:FleetRun} {
+    if(!Object.hasOwn(this.limits,machine)) throw new Error('Unknown machine');
+    const task=this.tasks.get(id);
+    if(!this.tasks.available(machine,id)) return {ok:false,reason:'locked'};
+    const project=task.ticket.split('#')[0],runId=`task-${id}`;
+    const started=this.start({id:runId,machine,session,project,ticket:`${project}#@task-${id}`,role:'recovery-task',resource:task.request.recipe==='platform-probe'?'light':'heavy',locks:[],supportTaskId:id,parentTicket:task.ticket});
+    return {...started,...(started.ok?{runnerPolicy:this.snapshot().runs.find(r=>r.id===runId)?.runnerPolicy,run:this.snapshot().runs.find(r=>r.id===runId)}:{})};
+  }
+  readTask(machine:string,session:string,project:string,runId:string,id:string) {
+    const task=this.tasks.get(id);
+    const run=this.snapshot().runs.find(r=>r.id===runId&&r.machine===machine&&r.session===session&&r.project===project&&r.ticket===task.ticket);
+    if(!run) throw new Error('Artifact read needs its admitted source ticket');
+    this.authorize(machine,session,task.ticket,runId);
+    return task;
+  }
+  requiredRepairs():Record<string,string[]> {
+    const required:Record<string,string[]>={};
+    for(const task of this.tasks.list()) if(task.state==='complete' && task.result?.dispatcherRevision) {
+      if(!required[task.ticket]) required[task.ticket]=[task.result.dispatcherRevision];
+    }
+    return required;
+  }
+  prepareRepair(machine:string,id:string,session:string,publication:unknown) {
+    return this.transaction(()=>{
+      const task=this.tasks.get(id);
+      if(task.machine!==machine||task.session!==session||task.request.recipe!=='dispatcher-repair'||!task.runId) throw new Error('Repair actor mismatch');
+      const serialized=JSON.stringify(publication);
+      if(task.state==='publishing') {
+        if(task.result?.files['publication.json']!==serialized) throw new Error('Prepared repair changed');
+        return task;
+      }
+      if(task.state!=='running') throw new Error('Repair is not running');
+      const result={outcome:'completed' as const,summary:'Verified repair prepared; publication and deployment remain pending.',files:{'publication.json':serialized}};
+      this.tasks.complete(id,machine,session,result);
+      this.db.prepare("UPDATE fleet_recovery_tasks SET state='publishing' WHERE id=?").run(id);
+      this.releaseTaskRun(task.runId,machine,session,true);
+      return this.tasks.get(id);
+    });
+  }
+  private releaseTaskRun(runId:string,machine:string,session:string,completed:boolean):void {
+    const row=this.db.prepare('SELECT ticket FROM fleet_runs WHERE id=? AND machine=? AND session=?').get(runId,machine,session);
+    if(!row) throw new Error('Task run changed');
+    this.db.prepare("UPDATE fleet_runs SET finished=?,outcome=? WHERE id=? AND finished IS NULL")
+      .run(Date.now(),completed?'completed':'errored',runId);
+    this.db.prepare('DELETE FROM fleet_locks WHERE run_id=?').run(runId);
+    this.db.prepare('DELETE FROM fleet_claims WHERE ticket=? AND NOT EXISTS (SELECT 1 FROM fleet_runs WHERE ticket=? AND finished IS NULL)')
+      .run(row.ticket,row.ticket);
+  }
+  taskComplete(machine: string, id: string, session: string, result: RecoveryTaskResult) {
+    return this.transaction(() => {
+      const task=this.tasks.get(id);
+      if (task.machine!==machine || task.session!==session || !task.runId) throw new Error('Task actor mismatch');
+      const completed=this.tasks.complete(id,machine,session,result);
+      this.releaseTaskRun(task.runId,machine,session,result.outcome==='completed');
+      return completed;
     });
   }
 
   recoveryFacts(tickets: string[]) {
     const evidence = this.facts.getEvidence(tickets);
     return tickets.map(ticket => ({ ticket, pause: this.facts.getPause(ticket),
-      artifactRevision: this.facts.revision([ticket]), evidence: evidence.filter(e => e.ticket === ticket),
+      artifactRevision: this.artifactRevision(ticket), evidence: evidence.filter(e => e.ticket === ticket), capabilities:this.tasks.capabilities(), tasks: this.tasks.list(ticket).map(t => ({...t,result:t.result ? {...t.result,files:Object.fromEntries(Object.keys(t.result.files).map(p=>[p,"retained private artifact"]))} : null})),
       coordination: this.facts.getCoordination(ticket) }));
   }
   recordPause(machine: string, session: string, project: string, runId: string, record: PauseRecord) {
@@ -180,16 +276,37 @@ export class FleetStore {
   }
 
   start(req: StartRequest): StartResult {
+    return this.transaction(() => {
+      const prior=this.db.prepare('SELECT id FROM fleet_runs WHERE id=?').get(req.id);
+      if(req.supportTaskId && !prior) {
+        validateStart(req);
+        const task=this.tasks.get(req.supportTaskId);
+        if(!this.tasks.available(req.machine,task.id)) return {ok:false,reason:'locked'};
+        if(req.parentTicket!==task.ticket || req.ticket!==`${req.project}#@task-${task.id}`
+          || req.project!==task.ticket.split('#')[0] && req.project!=='pyrycode/pyrycode'
+          || req.resource!==(task.request.recipe==='platform-probe'?'light':'heavy')) throw new Error('Support task grant does not match its fixed request');
+        const admitted=this.startAdmitted(req);
+        if(admitted.ok) this.tasks.begin(task.id,req.machine,req.session,req.id);
+        return admitted;
+      }
+      return this.startAdmitted(req);
+    });
+  }
+  private startAdmitted(req: StartRequest): StartResult {
     validateStart(req);
     if (!Object.hasOwn(this.limits, req.machine)) throw new Error("Unknown machine");
     const request = JSON.stringify({ ...req, locks: [...new Set(req.locks)].sort() });
-    return this.transaction(() => {
       const previous = this.db.prepare("SELECT request,generation,finished FROM fleet_runs WHERE id=?").get(req.id);
       if (previous) {
         const { runnerPolicy: _policy, ...original } = JSON.parse(String(previous.request));
         if (JSON.stringify(original) !== request) throw new Error("Request ID reused with different contents");
         return previous.finished === null ? { ok: true, generation: String(previous.generation) } : { ok: false, reason: "finished" };
       }
+    if(/#[1-9]\d*$/.test(req.ticket) && req.role!=='recovery') {
+      const required=this.requiredRepairs()[req.ticket]??[];
+      if(required.some(sha=>!req.readyRepairs?.includes(sha))) return {ok:false,reason:'locked'};
+      if(this.tasks.list(req.ticket).some(t=>['queued','running','publishing','attention'].includes(t.state))) return {ok:false,reason:'locked'};
+    }
       if (req.ticket.includes("#@main-sweep-") && this.db.prepare("SELECT 1 FROM fleet_runs WHERE ticket=? AND finished IS NOT NULL AND outcome='completed'").get(req.ticket)) return { ok: false, reason: "finished" };
       if (req.role === "reconcile" && (req.ticket !== `${req.project}#@reconcile` || !req.locks.includes(`${req.project}:reconcile`))) throw new Error("Housekeeping requires the project lock");
       if (req.role === "recovery") {
@@ -225,7 +342,6 @@ export class FleetStore {
       this.db.prepare("INSERT INTO fleet_runs VALUES (?,?,?,?,?,?,?,?,NULL,NULL)").run(req.id, req.machine, req.session, req.ticket, generation, req.resource, admitted, now);
       for (const lock of new Set(req.locks)) this.db.prepare("INSERT INTO fleet_locks VALUES (?,?)").run(lock, req.id);
       return { ok: true, generation };
-    });
   }
 
   finish(machine: string, session: string, id: string, completed?: boolean, unused?: boolean): void;
@@ -275,7 +391,7 @@ export class FleetStore {
       // must never retire incidents belonging to other tickets in the project.
       if (!observation) return [];
       return this.recovery.report(machine, request.project, [{ ...observation,
-        pause: this.facts.getPause(observation.ticket), artifactRevision: this.facts.revision([observation.ticket]) }], this.snapshot(), true);
+        pause: this.facts.getPause(observation.ticket), artifactRevision: this.artifactRevision(observation.ticket) }], this.snapshot(), true);
     });
   }
 
