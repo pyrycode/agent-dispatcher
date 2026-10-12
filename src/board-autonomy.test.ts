@@ -66,7 +66,10 @@ test('Halted requires an authoritative origin; operator holds never resume', () 
 test('pipeline receipts cannot be forged in board observations or by a different owner', () => {
   const store = new FleetStore(':memory:', {mac:{heavyLimit:1,combinedLimit:2},linux:{heavyLimit:1,combinedLimit:2}});
   const [incident] = store.recoveryReport('mac',project,[{...observationFor(project,item),pause}]);
-  assert.equal(incident.state,'escalated');
+  assert.equal(incident.state,'queued');
+  assert.equal(store.facts.getPause(project+'#1'),undefined);
+  assert.throws(()=>recoveryPlan(item,{action:'resume',reason:'Forged board receipt'},agents));
+  assert.deepEqual(store.snapshot().idleRecoveryTickets,[project+'#1']);
   const request = {id:'run',session:'session',machine:'mac',project,ticket:project+'#1',role:'builder',resource:'medium' as const,locks:[]};
   store.start(request);
   assert.throws(()=>store.recordPause('linux','session',project,'run',pause));

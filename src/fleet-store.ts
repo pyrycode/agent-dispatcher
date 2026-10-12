@@ -3,7 +3,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { RecoveryFacts, type PauseRecord, type EvidenceRecord, type CoordinationRecord } from "./recovery-facts.js";
-import { RecoveryLedger, validateObservations, IDLE_RECOVERY_REASONS, type RecoveryObservation, type RecoveryDecision, type RecoveryIncident } from "./fleet-recovery.js";
+import { RecoveryLedger, validateObservations, IDLE_RECOVERY_REASONS, RECOVERY_UNKNOWN_PAUSE_REASON, type RecoveryObservation, type RecoveryDecision, type RecoveryIncident } from "./fleet-recovery.js";
 import { OperationReports } from './operation-reports.js';
 import {RecoveryTasks, type RecoveryTaskRequest, type RecoveryTaskResult} from './recovery-tasks.js';
 import {createHash} from 'node:crypto';
@@ -370,15 +370,21 @@ export class FleetStore {
             AND (finished IS NULL OR outcome IS NULL OR outcome!='unused'))`)
           .run(run.ticket, run.generation, run.ticket, run.generation);
       }
-      // A completed read-only check that says wait owns no delivery work.
+      // Confirmed read-only waits and pause-provenance reviews own no delivery work.
       // Preserve ownership if this generation has any normal or uncertain run.
       if (completed && request.role === "recovery" && this.db.prepare(`SELECT 1 FROM fleet_recovery
-        WHERE run_id=? AND state='complete' AND json_extract(decision,'$.action')='wait'`).get(id)) {
+        WHERE run_id=? AND ((state='complete' AND json_extract(decision,'$.action')='wait')
+          OR (reason=? AND state='escalated' AND json_extract(decision,'$.action') IN ('escalate','propose-close')))`).get(id, RECOVERY_UNKNOWN_PAUSE_REASON)) {
         const released = this.db.prepare(`DELETE FROM fleet_claims WHERE ticket=? AND generation=?
           AND NOT EXISTS (SELECT 1 FROM fleet_runs WHERE ticket=? AND generation=?
             AND (finished IS NULL OR outcome IS NULL OR outcome NOT IN ('completed','unused')
-              OR (json_extract(request,'$.role')!='recovery' AND outcome!='unused')))`)
-          .run(run.ticket, run.generation, run.ticket, run.generation);
+              OR (json_extract(request,'$.role')!='recovery' AND outcome!='unused')))
+          AND NOT EXISTS (SELECT 1 FROM fleet_recovery AS recovery JOIN fleet_runs AS history ON history.id=recovery.run_id
+            WHERE history.ticket=? AND history.generation=?
+            AND json_extract(recovery.decision,'$.action') IN ('retry','rework','resume','refine','unblock','coordinate'))
+          AND NOT EXISTS (SELECT 1 FROM fleet_recovery_tasks AS tasks WHERE tasks.ticket=fleet_claims.ticket
+            AND (tasks.created>=fleet_claims.created OR tasks.state IN ('queued','running','publishing','attention')))`)
+          .run(run.ticket, run.generation, run.ticket, run.generation, run.ticket, run.generation);
         if (released.changes) this.db.prepare("INSERT OR IGNORE INTO fleet_assessment_releases VALUES (?,?,?,?)")
           .run(run.ticket, run.machine, run.generation, Date.now());
       }
@@ -410,7 +416,7 @@ export class FleetStore {
 
   snapshot(): FleetSnapshot {
     const runnerPolicy = this.runnerPolicy();
-    const idleRecoveryTickets = this.db.prepare("SELECT ticket FROM fleet_recovery WHERE present=1 AND state='queued' AND reason IN (?,?)")
+    const idleRecoveryTickets = this.db.prepare(`SELECT ticket FROM fleet_recovery WHERE present=1 AND state='queued' AND reason IN (${IDLE_RECOVERY_REASONS.map(() => '?').join(',')})`)
       .all(...IDLE_RECOVERY_REASONS).map(r => String(r.ticket));
     const releasedAssessmentClaims = this.db.prepare("SELECT * FROM fleet_assessment_releases").all() as unknown as Claim[];
     return {

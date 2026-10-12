@@ -10,6 +10,7 @@ export interface RecoveryObservation {
   artifactRevision?: string;
   pause?: PauseRecord;
   familyHold?: string;
+  assessmentPolicy?: number;
 }
 export type RecoveryAction = "wait" | "retry" | "rework" | "resume" | "refine" | "unblock" | "propose-close" | "coordinate" | "escalate";
 export interface RecoveryDecision { action: RecoveryAction; reason: string; blocker?: string; retryReset?: string; recheckAt?: number; task?: RecoveryTaskRequest; category?: "operational" | "human" }
@@ -23,13 +24,20 @@ export interface RecoveryIncident {
 export const RECOVERY_RECHECK_MS = 30 * 60_000;
 export const RECOVERY_DEPENDENCY_REASON = "Dependency evidence and coordination reassessment";
 export const RECOVERY_INBOX_REASON = "Inbox readiness reassessment";
-export const IDLE_RECOVERY_REASONS = [RECOVERY_DEPENDENCY_REASON, RECOVERY_INBOX_REASON];
+export const RECOVERY_UNKNOWN_PAUSE_REASON = "Pause origin unknown; record who paused this ticket and the reopening condition";
+export const RECOVERY_ASSESSMENT_POLICY = 1;
+export const IDLE_RECOVERY_REASONS = [RECOVERY_DEPENDENCY_REASON, RECOVERY_INBOX_REASON, RECOVERY_UNKNOWN_PAUSE_REASON];
 export const RECOVERY_RETURNED_INBOX = "orchestrator:returned-inbox";
 export const RECOVERY_REPAIRS_PER_TICKET = 3;
 export const RECOVERY_STALLED_RUN_MS = 3 * 3600000;
 const RETAINED_RUN_REASON = "Retained reservation without workflow progress for three hours; inspect local child processes before intervening";
 export function hasOperatorHold(labels: readonly string[]): boolean {
   return labels.some(l => l.startsWith("needs-human:") && l !== "needs-human:sizing");
+}
+/** Inspection can establish pause provenance, but cannot authorise reopening. */
+export function canInspectUnknownPause(o: RecoveryObservation): boolean {
+  return o.status === "Halted" && !o.pause && !hasOperatorHold(o.labels)
+    && !o.labels.some(l => /permission_denied/.test(l) || l.startsWith("wip:"));
 }
 
 export function validateObservations(project: string, observations: RecoveryObservation[]): void {
@@ -41,6 +49,7 @@ export function validateObservations(project: string, observations: RecoveryObse
       || !Array.isArray(o.labels) || o.labels.length > 200 || o.labels.some(l => typeof l !== "string" || l.length > 200)) throw new Error("Invalid recovery observation");
     if (o.artifactRevision !== undefined && !/^[a-f0-9]{64}$/.test(o.artifactRevision)) throw new Error("Invalid artifact revision");
     if (o.evidenceRevision !== undefined && !/^[a-f0-9]{64}$/.test(o.evidenceRevision)) throw new Error("Invalid evidence revision");
+    if (o.assessmentPolicy !== undefined && (!Number.isSafeInteger(o.assessmentPolicy) || o.assessmentPolicy < 1)) throw new Error("Invalid assessment policy");
     if (o.familyHold !== undefined && (typeof o.familyHold !== "string" || !o.familyHold.startsWith(`${project}#`) || !/^[1-9]\d*$/.test(o.familyHold.slice(project.length + 1)))) throw new Error("Invalid family hold");
     seen.add(o.ticket);
   }
@@ -53,10 +62,10 @@ export function recoveryFingerprint(o: RecoveryObservation): string {
 export function recoveryTrigger(o: RecoveryObservation): { reason: string; manual: boolean } | null {
   if (o.status === "Done") return null;
   if (hasOperatorHold(o.labels) || o.status === "Halted" && o.pause?.origin === "operator") return { reason: "Explicit operator hold", manual: true };
+  if (o.labels.some(l => /permission_denied/.test(l))) return { reason: "Denied permission needs an operator", manual: true };
   if (o.status === "Halted") return o.pause?.origin === "pipeline"
     ? { reason: `Pipeline pause: ${o.pause.reason}`, manual: false }
-    : { reason: "Pause origin unknown; record who paused this ticket and the reopening condition", manual: true };
-  if (o.labels.some(l => /permission_denied/.test(l))) return { reason: "Denied permission needs an operator", manual: true };
+    : { reason: RECOVERY_UNKNOWN_PAUSE_REASON, manual: true };
   // Health holds and pending transient retries keep their existing recovery.
   // A stage error means retries have stopped, so it needs diagnosis, not a blind retry.
   if (o.labels.some(l => l.startsWith("health-hold:"))) return null;
@@ -96,7 +105,8 @@ export class RecoveryLedger {
     CREATE TABLE IF NOT EXISTS fleet_recovery_progress (
       ticket TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, since INTEGER NOT NULL
     ) STRICT;
-    CREATE TABLE IF NOT EXISTS fleet_recovery_workflow (ticket TEXT PRIMARY KEY, fingerprint TEXT NOT NULL) STRICT;`);
+    CREATE TABLE IF NOT EXISTS fleet_recovery_workflow (ticket TEXT PRIMARY KEY, fingerprint TEXT NOT NULL) STRICT;
+    CREATE TABLE IF NOT EXISTS fleet_recovery_assessment_policy (incident_id TEXT PRIMARY KEY, version INTEGER NOT NULL) STRICT;`);
   }
   escalatedTickets():string[] {
     return this.db.prepare("SELECT ticket FROM fleet_recovery WHERE present=1 AND state='escalated' ORDER BY ticket").all().map(r=>String(r.ticket));
@@ -154,11 +164,16 @@ export class RecoveryLedger {
       }
       let trigger = recoveryTrigger(o);
       const wip = o.labels.some(l => l.startsWith("wip:"));
+      const upgraded = (o.assessmentPolicy ?? 0) >= RECOVERY_ASSESSMENT_POLICY;
+      const policyRecorded = old && this.db.prepare("SELECT 1 FROM fleet_recovery_assessment_policy WHERE incident_id=? AND version>=?").get(old.id, RECOVERY_ASSESSMENT_POLICY);
+      // A delayed old-worker observation cannot undo upgraded assessment work.
+      // Only an upgraded worker receives that queued read-only offer below.
+      const pauseInspection = (upgraded || !!policyRecorded) && canInspectUnknownPause(o);
       const workflowColumn = o.status === "Inbox" || o.status.startsWith("In ") || o.status === "Backlog" && (wip || !!owner);
       if ((!trigger || wip) && !o.blocked && workflowColumn && this.now() - Number(progress.since) >= (wip ? 3 : 24) * 3600000) {
         trigger = { reason: wip ? "Running label without a reservation; verify the worker stopped" : "No workflow progress for 24 hours", manual: wip };
       }
-      if (old && trigger?.manual && old.state === "queued" && old.fingerprint === fingerprint) {
+      if (old && trigger?.manual && !pauseInspection && old.state === "queued" && old.fingerprint === fingerprint) {
         this.db.prepare("UPDATE fleet_recovery SET state='escalated',reason=?,updated=? WHERE id=?").run(trigger.reason, this.now(), old.id);
         newAlerts.add(String(old.id));
         continue;
@@ -183,13 +198,22 @@ export class RecoveryLedger {
       const coordinated = old?.state === 'waiting' && !this.db.prepare("SELECT 1 FROM fleet_recovery_tasks WHERE ticket=? AND state IN ('queued','running','publishing','attention')").get(o.ticket);
       const operational = old?.state === 'escalated' && old.decision && JSON.parse(String(old.decision)).category === 'operational'
         && this.now() >= (JSON.parse(String(old.decision)).recheckAt ?? Number(old.updated)+RECOVERY_RECHECK_MS);
-      const recheck = (legacyLimit || waited || coordinated || operational) && trigger && !trigger.manual && !wip;
+      const previousDecision = old?.decision ? JSON.parse(String(old.decision)) as RecoveryDecision : null;
+      // Wait for the reporting worker to load the policy. Revisit only legacy
+      // assessments, never a possibly applied repair or a classified human hold.
+      const legacyAssessment = upgraded && old?.state === "escalated" && old.reason !== RETAINED_RUN_REASON
+        && (!previousDecision || previousDecision.action === "escalate" && !previousDecision.category)
+        && !policyRecorded;
+      const recheck = (legacyLimit || waited || coordinated || operational || legacyAssessment)
+        && trigger && (!trigger.manual || pauseInspection) && !wip;
       if (old && (!trigger || old.fingerprint !== fingerprint || recheck)) this.db.prepare("UPDATE fleet_recovery SET present=0, updated=CASE WHEN state='queued' THEN ? ELSE updated END, state=CASE WHEN state='queued' THEN 'resolved' ELSE state END WHERE id=?").run(this.now(), old.id);
       if (!trigger || old?.fingerprint === fingerprint && !recheck || (wip && !trigger.manual)) continue;
       const id = randomUUID();
       this.db.prepare("INSERT INTO fleet_recovery_workflow VALUES (?,?) ON CONFLICT(ticket) DO UPDATE SET fingerprint=excluded.fingerprint").run(o.ticket, workflow);
-      this.db.prepare("INSERT INTO fleet_recovery VALUES (?,?,?,?,?,?,?,NULL,NULL,1)").run(id, o.ticket, fingerprint, trigger.reason, trigger.manual ? "escalated" : "queued", this.now(), this.now());
-      if (trigger.manual) newAlerts.add(id);
+      const manual = trigger.manual && !pauseInspection;
+      this.db.prepare("INSERT INTO fleet_recovery VALUES (?,?,?,?,?,?,?,NULL,NULL,1)").run(id, o.ticket, fingerprint, trigger.reason, manual ? "escalated" : "queued", this.now(), this.now());
+      if (upgraded || pauseInspection) this.db.prepare("INSERT INTO fleet_recovery_assessment_policy VALUES (?,?)").run(id, RECOVERY_ASSESSMENT_POLICY);
+      if (manual) newAlerts.add(id);
     }
     for (const row of partial ? [] : this.db.prepare("SELECT id,ticket FROM fleet_recovery WHERE ticket LIKE ? AND present=1").all(`${project}#%`)) {
       const ticket = String(row.ticket);
@@ -198,6 +222,7 @@ export class RecoveryLedger {
       }
     }
     return this.list(project).filter(i => newAlerts.has(i.id) || (i.state === "queued" && seen.has(i.ticket)
+      && (i.reason !== RECOVERY_UNKNOWN_PAUSE_REASON || (observations.find(o => o.ticket === i.ticket)?.assessmentPolicy ?? 0) >= RECOVERY_ASSESSMENT_POLICY)
       && !observations.find(o => o.ticket === i.ticket)?.labels.some(l => l.startsWith("wip:"))
       && (!active.has(i.ticket) || fleet.runs.some(r => r.ticket === i.ticket && r.role === "recovery" && r.machine === machine))));
   }
