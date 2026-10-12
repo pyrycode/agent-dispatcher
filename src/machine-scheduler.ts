@@ -55,7 +55,7 @@ export function scheduleMachine(opts: {
   const ready = opts.offers.filter(o => rank.has(o.project) && (!claims.has(o.ticket) || claims.get(o.ticket)!.machine === opts.machine)
     && acceptsDuringProjectDrain(o, opts.machine, opts.drainingProjects ?? [], opts.state));
   ready.sort((a, b) => {
-    const parentClaim=(o:WorkOffer)=>{const p=o.parentTicket?claims.get(o.parentTicket):undefined;return p?.machine===opts.machine?p:undefined;};
+    const parentClaim=(o:WorkOffer)=>o.supportTaskId&&o.parentTicket?claims.get(o.parentTicket):undefined;
     const ac=claims.get(a.ticket)??parentClaim(a),bc=claims.get(b.ticket)??parentClaim(b);
     return Number(idleAssessment(a, opts.state)) - Number(idleAssessment(b, opts.state))
       || Number(!ac) - Number(!bc)
