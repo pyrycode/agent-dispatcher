@@ -12,6 +12,29 @@ spec=importlib.util.spec_from_file_location('native',Path(__file__).with_name('f
 module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
 
 class Tests(unittest.TestCase):
+    def test_legacy_handoff_snapshot_precedes_the_drain_signal(self):
+        with tempfile.TemporaryDirectory() as d:
+            adapter=module.NativeAdapter({'stateDirectory':d,'platform':'linux','projects':{'org/core':{'container':'core'}}})
+            adapter.observe=lambda project:{'identity':{'pid':20}}
+            calls=[]
+            with patch.object(adapter,'retain_publish_files',side_effect=lambda project:calls.append('snapshot')),patch.object(module,'execute',side_effect=lambda args:calls.append('signal')):
+                adapter.drain('org/core',{'pid':20})
+            self.assertEqual(calls,['snapshot','signal'])
+    def test_update_can_proceed_after_the_old_container_was_removed(self):
+        with tempfile.TemporaryDirectory() as d:
+            adapter=module.NativeAdapter({'stateDirectory':d,'platform':'linux','projects':{'org/core':{'container':'core','agents':d+'/agents','publishStorage':d+'/publish'}}})
+            adapter.preflight=lambda project,desired:True
+            def execute(args,**kwargs):
+                if args[0]=='podman':raise RuntimeError('old container was removed')
+                return 'dispatcher' if str(args[2]).endswith('/dispatcher') else 'consumer'
+            with patch.object(module,'execute',side_effect=execute):adapter.update('org/core',{'consumer':'consumer','dispatcher':'dispatcher'})
+    def test_restart_verification_requires_the_configured_persistent_publish_mount(self):
+        with tempfile.TemporaryDirectory() as d:
+            adapter=module.NativeAdapter({'stateDirectory':d,'platform':'linux','projects':{'org/core':{'container':'core','publishStorage':d+'/publish'}}})
+            adapter.observe=lambda project:{'generation':'new','healthy':True}
+            with patch.object(module,'execute',return_value='[]'):self.assertFalse(adapter.verify('org/core','new'))
+            mounts=json.dumps([{'Destination':'/Users/juhanailmoniemi/.codex/publish','Source':d+'/publish'}])
+            with patch.object(module,'execute',return_value=mounts):self.assertTrue(adapter.verify('org/core','new'))
     def test_only_a_native_helpers_actual_container_delays_restart(self):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d);(root/'tasks').mkdir()
@@ -28,6 +51,7 @@ class Tests(unittest.TestCase):
             (destination/'verdict.md').write_text('older retained verdict')
             adapter=module.NativeAdapter({'stateDirectory':str(root/'state'),'platform':'linux','projects':{'org/core':{'container':'fixed','publishStorage':str(destination)}}})
             def copy(args,**kwargs):
+                if args[1]=='inspect':return '[]'
                 snapshot=Path(args[-1]);(snapshot/'verdict.md').write_text('completed before drain')
                 return ''
             with patch.object(module,'execute',side_effect=copy):adapter.retain_publish_files('org/core')
