@@ -26,7 +26,7 @@ def main():
     p.add_argument('value');p.add_argument('--out');p.add_argument('--timeout',type=int,default=3600)
     a=p.parse_args()
     if a.action=='request':
-        t=request('request',json.loads(Path(a.value).read_text()))
+        t=request('request',{'request':json.loads(Path(a.value).read_text())})
     else:
         end=time.monotonic()+a.timeout
         while True:
