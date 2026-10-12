@@ -76,7 +76,9 @@ export class RecoveryTasks {
  available(machine:string,id:string):boolean {
   const task=this.get(id), host=this.capabilities().find(c=>c.machine===machine);
   const incident=this.db.prepare('SELECT reason,decision,state FROM fleet_recovery WHERE ticket=? AND present=1').get(task.ticket);
-  if(incident?.state==='escalated' && (/Explicit operator hold|Denied permission|Pause origin unknown/.test(String(incident.reason)) || incident.decision && JSON.parse(String(incident.decision)).category==='human')) return false;
+  // A read-only provenance assessment never authorises a previously queued task.
+  if(incident && (/Explicit operator hold|Denied permission|Pause origin unknown/.test(String(incident.reason))
+    || incident.state==='escalated' && incident.decision && JSON.parse(String(incident.decision)).category==='human')) return false;
   return task.state==='queued' && !!host?.ready && this.now()-host.updated<180000 && host.capabilities.includes(task.request.capability);
  }
  begin(id:string,machine:string,session:string,runId:string):void {

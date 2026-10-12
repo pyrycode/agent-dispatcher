@@ -102,3 +102,21 @@ test('a confirmed provenance assessment retains ownership after an earlier recov
  store.start({id:'repair',session:'s',machine:'mac',project,ticket:error.ticket,role:'recovery',resource:'heavy',locks:[]});store.recoveryStep('mac','s',project,repair.id,'repair','begin');store.recoveryStep('mac','s',project,repair.id,'repair','decide',{action:'rework',reason:'Concrete implementation needed'});store.recoveryStep('mac','s',project,repair.id,'repair','complete');store.finish('mac','s','repair',true);
  const [pause]=store.recoveryReport('mac',project,[upgraded({...error,status:'Halted',labels:[]})]);store.start({id:'review',session:'s',machine:'mac',project,ticket:error.ticket,role:'recovery',resource:'heavy',locks:[]});store.recoveryStep('mac','s',project,pause.id,'review','begin');store.recoveryStep('mac','s',project,pause.id,'review','decide',{action:'escalate',category:'human',reason:'Need the pause decision'});store.finish('mac','s','review',true);assert.equal(store.snapshot().claims.length,1);
 });
+
+function coordinatedThenHalted(store:FleetStore,finishedTask=false) {
+ const [incident]=store.recoveryReport('mac',project,[upgraded(error)]);
+ store.start({id:'coordinate',session:'s',machine:'mac',project,ticket:error.ticket,role:'recovery',resource:'heavy',locks:[]});store.recoveryStep('mac','s',project,incident.id,'coordinate','begin');store.recoveryStep('mac','s',project,incident.id,'coordinate','decide',{action:'coordinate',reason:'Assigned dispatcher repair',task:{recipe:'dispatcher-repair',capability:'dispatcher-repair',revision:'a'.repeat(40),reason:'Concrete dispatcher repair'}});store.finish('mac','s','coordinate',true);
+ if(finishedTask){store.tasks.report('mac',{capabilities:['dispatcher-repair'],ready:true});const task=store.tasks.list(error.ticket)[0];assert.equal(store.taskStart('mac',task.id,'helper').ok,true);store.taskComplete('mac',task.id,'helper',{outcome:'failed',summary:'Repair retained without publication',files:{}});}
+ const paused=upgraded({...error,status:'Halted',labels:[]});store.recoveryReport('mac',project,[paused]);const [provenance]=store.recoveryReport('mac',project,[paused]);assert.equal(provenance.state,'queued');return provenance;
+}
+
+test('pause-provenance review preserves a previously coordinated repair even when its incident decision was replaced',t=>{
+ const store=new FleetStore(':memory:',limits);t.after(()=>store.close());const incident=coordinatedThenHalted(store,true);
+ store.start({id:'review',session:'s',machine:'mac',project,ticket:error.ticket,role:'recovery',resource:'heavy',locks:[]});store.recoveryStep('mac','s',project,incident.id,'review','begin');store.recoveryStep('mac','s',project,incident.id,'review','decide',{action:'escalate',category:'human',reason:'Pause needs an explicit decision'});store.finish('mac','s','review',true);assert.equal(store.snapshot().claims.length,1);
+});
+
+test('previously assigned support tasks remain paused throughout unknown-provenance review',t=>{
+ const store=new FleetStore(':memory:',limits);t.after(()=>store.close());const incident=coordinatedThenHalted(store);store.tasks.report('mac',{capabilities:['dispatcher-repair'],ready:true});const task=store.tasks.list(error.ticket)[0];
+ assert.equal(store.tasks.available('mac',task.id),false,'queued provenance');store.start({id:'review',session:'s',machine:'mac',project,ticket:error.ticket,role:'recovery',resource:'heavy',locks:[]});store.recoveryStep('mac','s',project,incident.id,'review','begin');assert.equal(store.tasks.available('mac',task.id),false,'active provenance');
+ store.recoveryStep('mac','s',project,incident.id,'review','decide',{action:'wait',reason:'No current authority to reopen'});assert.equal(store.tasks.available('mac',task.id),false,'completed provenance');
+});

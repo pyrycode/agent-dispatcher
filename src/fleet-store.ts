@@ -381,7 +381,9 @@ export class FleetStore {
               OR (json_extract(request,'$.role')!='recovery' AND outcome!='unused')))
           AND NOT EXISTS (SELECT 1 FROM fleet_recovery AS recovery JOIN fleet_runs AS history ON history.id=recovery.run_id
             WHERE history.ticket=? AND history.generation=?
-            AND json_extract(recovery.decision,'$.action') IN ('retry','rework','resume','refine','unblock','coordinate'))`)
+            AND json_extract(recovery.decision,'$.action') IN ('retry','rework','resume','refine','unblock','coordinate'))
+          AND NOT EXISTS (SELECT 1 FROM fleet_recovery_tasks AS tasks WHERE tasks.ticket=fleet_claims.ticket
+            AND (tasks.created>=fleet_claims.created OR tasks.state IN ('queued','running','publishing','attention')))`)
           .run(run.ticket, run.generation, run.ticket, run.generation, run.ticket, run.generation);
         if (released.changes) this.db.prepare("INSERT OR IGNORE INTO fleet_assessment_releases VALUES (?,?,?,?)")
           .run(run.ticket, run.machine, run.generation, Date.now());
