@@ -4808,14 +4808,19 @@ describe("decideGateVerdict", () => {
     assert.match(d.reason, /outrun its budget/);
   });
 
-  test("a failing test outranks the executed floor", () => {
-    // A run with one failure and only 3 executed is a FAIL, routed to the
-    // developer — not an environment park. Ordering decides which.
+  test("an incomplete failing run cannot be excused by a subset rerun", () => {
     const d = decideGateVerdict({
       ...base,
       tally: { executed: 3, failed: 1, packageFailed: true, recognizedLines: 10 },
     });
-    assert.equal(d.verdict, "fail");
+    assert.equal(d.verdict, "zero-executed");
+    for (const rerunFailures of [[], ["suite.failed"]]) {
+      const adjusted = decideBaselineAdjustedVerdict({
+        ...d, branchFailures: ["suite.failed"], baselineFailures: ["suite.failed"], rerunFailures,
+      });
+      assert.equal(adjusted.verdict, "zero-executed");
+      assert.deepEqual(adjusted.flaky, []);
+    }
   });
 
   test("a suite-level failure with no failing test is still a fail", () => {

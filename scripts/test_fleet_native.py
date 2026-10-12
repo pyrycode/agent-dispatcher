@@ -1,6 +1,8 @@
 import base64
 import importlib.util
 import json
+import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +12,25 @@ spec=importlib.util.spec_from_file_location('native',Path(__file__).with_name('f
 module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
 
 class Tests(unittest.TestCase):
+    def test_mac_start_finds_user_cli_with_service_path_and_keeps_secrets_out(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user_bin = root / '.local' / 'bin'
+            user_bin.mkdir(parents=True)
+            claude = user_bin / 'claude'
+            claude.write_text('#!/bin/sh\nexit 0\n')
+            claude.chmod(0o755)
+            adapter = module.NativeAdapter({'stateDirectory': str(root), 'platform': 'mac',
+                'projects': {'org/mobile': {'agents': str(root / 'agents'), 'access': 'workload-access'}}})
+            parent = {'HOME': str(root), 'PATH': '/usr/bin:/bin', 'OP_SERVICE_ACCOUNT_TOKEN': 'fixture-secret'}
+            with patch.dict(os.environ, parent, clear=True), patch.object(module.subprocess, 'Popen') as launch:
+                adapter.start('org/mobile')
+            child = launch.call_args.kwargs['env']
+            self.assertEqual(shutil.which('claude', path=child['PATH']), str(claude))
+            self.assertIn('/usr/bin', child['PATH'].split(os.pathsep))
+            self.assertNotIn('OP_SERVICE_ACCOUNT_TOKEN', child)
+            self.assertEqual(child['PYRY_AUTOMATION_ACCESS'], 'workload-access')
+
     def test_linux_preflight_reads_canonical_container_secret(self):
         root=Path(tempfile.mkdtemp())
         adapter=module.NativeAdapter({'stateDirectory':str(root),'platform':'linux','projects':{'org/core':{'githubSecret':'canonical-secret'}}})

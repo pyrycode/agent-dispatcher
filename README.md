@@ -988,3 +988,16 @@ The consumer launcher exposes it as `bin/pyry-test --slow`.
 ## Multiple computers
 
 Optional [managed dispatch](docs/machine-manager.md) shares heavy capacity across projects on each computer and reserves tickets across computers. The guide covers configuration, Linux and macOS services, draining and manual ticket release.
+
+### Incomplete verification
+
+A configured execution floor applies before failure attribution. A partial full
+run cannot become a pass by rerunning only its failed tests.
+
+An unexcused red pre-verifier gate still starts a reviewer for diagnosis. The
+reviewer can route demonstrated regressions to rework. It cannot advance the
+ticket, including through saved-verdict recovery. The dispatcher removes any
+ready label and parks the review with its error label unless rework was requested.
+After fixing the gate or its environment, remove that error label to rerun the
+configured checks. Existing machine-checked flaky and baseline assessments still
+continue through the remaining gates before review.

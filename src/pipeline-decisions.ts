@@ -754,46 +754,9 @@ export interface GateVerdictDecision {
   reason: string;
 }
 
-/**
- * Turn one gate run into a verdict. This function IS the safety property;
- * everything else around it is plumbing.
- *
- * **The invariant: a zero exit code never upgrades anything.** The exit
- * status is consulted at exactly one point, step 7, and only to make a
- * verdict WORSE. It can never turn a non-pass into a pass, because every
- * check that could reject has already run by then. That ordering is the
- * exact inversion of the 2026-07-22 failure, where a 0 was read first and
- * treated as sufficient. `lib.test.ts` pins it with a table-driven test
- * over every input shape.
- *
- * Strict evaluation order, worst evidence first:
- *
- *   1. **Run error** — the command never really ran. Nothing to judge.
- *   2. **Timeout** — the run was cut off mid-flight, so the artifact is a
- *      prefix of the truth, not the truth. A prefix with no failures in it
- *      is not a pass.
- *   3. **Unreadable artifact** — zero recognisable events. "Nothing to
- *      judge" and "nothing failed" look identical to an exit code and must
- *      never look identical here.
- *   4. **The test binary's own deadline** — `go test -timeout` fired with
- *      tests still running. The suite outran its budget; the test holding
- *      the floor when the alarm went off is not the regression, and every
- *      parallel test parked behind it never ran at all. Unusable like the
- *      outer timeout, and checked BEFORE failures because the parser counts
- *      the killed test as a failure. On 2026-09-09 pyrycode #2279 spent a
- *      rework leg on a 361-second test its diff never touched, because a
- *      base re-run of that test alone had the whole budget and passed.
- *   5. **Any failure** — a failed test, or a suite-level failure with no
- *      test to attribute it to (a build error or panic).
- *   6. **Below the executed floor** — the suite ran and verified nothing.
- *      This is the check the whole mechanism exists for.
- *   7. **Non-zero exit with a clean artifact** — the belt. The report says
- *      green and the process says red, so the two disagree and neither can
- *      be trusted. Unusable rather than fail: there is no failing test to
- *      hand a developer, and sending one a contradiction burns rework
- *      cycles it cannot resolve.
- *   8. Otherwise: pass.
- */
+/** Reject incomplete evidence before attributing named failures. A subset
+ * retry cannot supply the tests missing from the original full run. Exit
+ * status can reject an otherwise clean report, but cannot make one pass. */
 export function decideGateVerdict(input: GateVerdictInput): GateVerdictDecision {
   if (input.runError) {
     return { verdict: "unusable", reason: `gate run failed to complete: ${input.runError}` };
@@ -834,13 +797,6 @@ export function decideGateVerdict(input: GateVerdictInput): GateVerdictDecision 
     };
   }
 
-  if (tally.failed > 0 || tally.packageFailed) {
-    const detail = tally.failed > 0
-      ? `${tally.failed} test(s) failed`
-      : "a suite-level failure with no failing test (build error, panic, or harness crash)";
-    return { verdict: "fail", reason: detail };
-  }
-
   // A floor of 0 would disable the guard this whole file exists for, so a
   // misconfigured fork gets 1 rather than an unguarded gate.
   const floor = Math.max(1, input.minExecuted);
@@ -849,8 +805,15 @@ export function decideGateVerdict(input: GateVerdictInput): GateVerdictDecision 
       verdict: "zero-executed",
       reason:
         `only ${tally.executed} test(s) actually executed, below the floor of ${floor}. ` +
-        "A suite that skips everything still exits 0; that is exactly the false green this gate exists to catch",
+        "The full run is incomplete; rerunning only its failures cannot establish a pass",
     };
+  }
+
+  if (tally.failed > 0 || tally.packageFailed) {
+    const detail = tally.failed > 0
+      ? `${tally.failed} test(s) failed`
+      : "a suite-level failure with no failing test (build error, panic, or harness crash)";
+    return { verdict: "fail", reason: detail };
   }
 
   if (input.exitCode !== 0) {
