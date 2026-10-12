@@ -35,6 +35,10 @@ to find an earlier successful POST after an uncertain response. Workflow counter
 read saved history. Issue discussion remains available through GitHub. A five
 minute content scan discovers issues and repairs display drift. Initial import
 publication may take several cycles. Current changes take priority over history.
+Archived GitHub cards stay archived. Their issue labels still update, but GitHub
+refuses column and position changes while archived. Restoring a card allows the
+next content scan to resume its column display updates. Archiving is a display
+choice and does not change the database workflow or pause scheduling.
 
 ## Migration
 

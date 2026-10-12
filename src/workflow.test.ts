@@ -783,3 +783,64 @@ test("GitHub read overlays do not scan ticket JSON for objects without an identi
     !plan.some((row: any) => row.detail.includes("SCAN workflow_tickets")),
   );
 });
+
+test("archived cards do not stall publication and restored cards regain their column", async (t) => {
+  const { store } = fixture(t);
+  const closed = { ...item(), state: "CLOSED" as const, status: "Done", positioned: true };
+  store.workflow.import(config, [closed, item(2)]);
+  let archived = true, positions = 0;
+  const mutations: string[] = [];
+  const github = new GitHubBroker({
+    token: "test", projects: [config.project],
+    fetcher: async (input, init) => {
+      const body = init?.body ? JSON.parse(String(init.body)) : {};
+      const query: string = body.query ?? "";
+      if (String(input).includes("/labels")) return new Response("[]");
+      if (query.startsWith("mutation {")) {
+        mutations.push(query);
+        if (archived && query.includes("s0:"))
+          return Response.json({ errors: [{ message: "The item is archived and cannot be updated" }] });
+        const data: Record<string, unknown> = {};
+        for (const [n, i] of store.workflow.pending(10, config.project).entries()) {
+          data[`i${n}`] = { issue: { id: i.item.issueId } };
+          if (query.includes(`s${n}:`)) data[`s${n}`] = { projectV2Item: { id: i.item.id } };
+        }
+        return Response.json({ data });
+      }
+      if (query.startsWith("mutation($input:")) {
+        assert.equal(archived, false);
+        positions++;
+        return Response.json({ data: { updateProjectV2ItemPosition: { items: { nodes: [] } } } });
+      }
+      if (query.startsWith("query($ids:")) {
+        assert.match(query, /isArchived/);
+        const old = remoteMetadata({ ...closed, status: archived ? "Inbox" : "Done" });
+        Object.assign(old.projectItems.nodes[0], { isArchived: archived });
+        return Response.json({ data: { nodes: [old, remoteMetadata(item(2))] } });
+      }
+      if (query.startsWith("query($id:ID!)"))
+        return Response.json({ data: { node: { blockedBy: { nodes: [], pageInfo: { hasNextPage: false } } } } });
+      if (query.includes("repository"))
+        return Response.json({ data: { repository: { issues: { nodes: [], pageInfo: { hasNextPage: false } } } } });
+      throw new Error("Unexpected request: " + query);
+    },
+  });
+  const publisher = new WorkflowPublisher(store, github);
+  await assert.rejects(publisher.tick(), /incomplete/);
+  assert.equal(store.workflow.get("org/mobile#1947").archived, true);
+  assert.equal(store.workflow.get("org/mobile#1947").status, "Done");
+  await publisher.tick();
+  assert.equal(store.workflow.pending().length, 0);
+  assert.doesNotMatch(mutations[1], /s0:/);
+  assert.match(mutations[1], /i0:/);
+  assert.match(mutations[1], /s1:/);
+  assert.equal(positions, 0);
+  await publisher.refresh(config);
+  assert.equal(store.workflow.pending().length, 0, "archived column mismatch must not queue forever");
+  archived = false;
+  await publisher.refresh(config);
+  await publisher.tick();
+  assert.match(mutations.at(-1)!, /s0:/);
+  assert.equal(positions, 1);
+  assert.equal(store.workflow.pending().length, 0);
+});

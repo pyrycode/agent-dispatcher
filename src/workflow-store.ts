@@ -7,6 +7,7 @@ export type WorkflowItem = ProjectItem & {
   revision: number;
   position: number;
   positioned?: boolean;
+  archived?: boolean;
 };
 export interface WorkflowProject {
   project: string;
@@ -269,6 +270,7 @@ export class WorkflowStore {
             subIssues: observed.subIssues,
             evidenceRevision:
               observed.evidenceRevision ?? current.evidenceRevision,
+            archived: observed.archived,
           };
           const changed = JSON.stringify(content) !== JSON.stringify(current);
           // A human edited the display. Republish authority; never import that edit.
@@ -277,7 +279,7 @@ export class WorkflowStore {
           const drift =
             JSON.stringify(dependencies(observed.blockedBy)) !==
               JSON.stringify(dependencies(current.blockedBy)) ||
-            observed.status !== current.status ||
+            (!observed.archived && observed.status !== current.status) ||
             observed.state !== current.state ||
             JSON.stringify([...observed.labels].sort()) !==
               JSON.stringify([...current.labels].sort());
