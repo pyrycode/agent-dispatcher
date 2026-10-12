@@ -40,7 +40,9 @@ export class WorkflowPublisher {
     });
   }
   private async publish(): Promise<void> {
-    const configs = this.store.workflow.projects().filter(config=>!this.store.workflow.preparing(config.project));
+    const configs = this.store.workflow
+      .projects()
+      .filter((config) => !this.store.workflow.preparing(config.project));
     if (!configs.length) return;
     const errors: unknown[] = [];
     // Rebuild these display facts from existing authority records.
@@ -66,7 +68,7 @@ export class WorkflowPublisher {
           );
       }
     for (const config of configs) {
-      if(this.store.workflow.preparing(config.project))continue;
+      if (this.store.workflow.preparing(config.project)) continue;
       try {
         const pending = this.store.workflow.pending(10, config.project);
         if (!pending.length) continue;
@@ -119,7 +121,7 @@ export class WorkflowPublisher {
       }
     }
     for (const comment of this.store.workflow.pendingComments()) {
-      if(this.store.workflow.preparing(comment.ticket.split('#')[0]))continue;
+      if (this.store.workflow.preparing(comment.ticket.split("#")[0])) continue;
       try {
         const [project, number] = comment.ticket.split("#"),
           marker = `<!-- orchestrator-comment:${comment.id} -->`;
@@ -209,77 +211,108 @@ export class WorkflowPublisher {
   }
   /** Read content and discover issues. Existing workflow fields are only compared, never adopted. */
   async refresh(config: WorkflowProject): Promise<void> {
+    if (this.store.workflow.preparing(config.project)) return;
+    const fields = `id number title body url state comments(last:8){nodes{id updatedAt body}} parent{number parent{number}} subIssuesSummary{total completed} blockedBy(first:100){nodes{number state url} pageInfo{hasNextPage}} labels(first:100){nodes{name} pageInfo{hasNextPage}} projectItems(first:100){nodes{id project{id} fieldValueByName(name:"Status"){... on ProjectV2ItemFieldSingleSelectValue{name}}} pageInfo{hasNextPage}}`;
+    const known = this.store.workflow.list(config.project);
+    // Read known tickets by identity, including any a person closed in GitHub.
+    for (let start = 0; start < known.length; start += 50) {
+      if (this.store.workflow.preparing(config.project)) return;
+      const ids = known.slice(start, start + 50).map((i) => i.issueId);
+      const result = await this.gql(
+        config.project,
+        `query($ids:[ID!]!){nodes(ids:$ids){... on Issue{${fields}}}}`,
+        { ids },
+      );
+      const nodes = result.data?.nodes;
+      if (
+        !nodes ||
+        nodes.length !== ids.length ||
+        nodes.some((n: any) => !n?.id)
+      )
+        throw new Error("Incomplete known-ticket content read");
+      await this.observeIssues(config, nodes);
+    }
+    // Discovery only scans open issues, never the repository's full archive.
     const [owner, repo] = config.project.split("/");
     let cursor: string | null = null;
     do {
-      if(this.store.workflow.preparing(config.project))return;
+      if (this.store.workflow.preparing(config.project)) return;
       const result = await this.gql(
         config.project,
-        `query($owner:String!,$repo:String!,$cursor:String){repository(owner:$owner,name:$repo){issues(first:100,after:$cursor,orderBy:{field:UPDATED_AT,direction:DESC}){nodes{id number title body url state comments(last:8){nodes{id updatedAt body}} parent{number parent{number}} subIssuesSummary{total completed} blockedBy(first:100){nodes{number state url} pageInfo{hasNextPage}} labels(first:100){nodes{name} pageInfo{hasNextPage}} projectItems(first:100){nodes{id project{id} fieldValueByName(name:"Status"){... on ProjectV2ItemFieldSingleSelectValue{name}}} pageInfo{hasNextPage}}}pageInfo{hasNextPage endCursor}}}}`,
+        `query($owner:String!,$repo:String!,$cursor:String){repository(owner:$owner,name:$repo){issues(states:OPEN,first:100,after:$cursor,orderBy:{field:UPDATED_AT,direction:DESC}){nodes{${fields}}pageInfo{hasNextPage endCursor}}}}`,
         { owner, repo, cursor },
       );
       const connection = result.data?.repository?.issues;
       if (!connection) throw new Error("Incomplete workflow source read");
-      const observations: WorkflowItem[] = [];
-      for (const issue of connection.nodes) {
-        if (
-          issue.labels.pageInfo.hasNextPage ||
-          issue.projectItems.pageInfo.hasNextPage ||
-          issue.blockedBy.pageInfo.hasNextPage
-        )
-          throw new Error("Incomplete issue metadata");
-        let board = issue.projectItems.nodes.find(
-          (p: any) => p.project.id === config.projectId,
-        );
-        const known = this.store.workflow.find(issue.id);
-        if (!known && issue.state === "CLOSED") continue;
-        if (!board) {
-          const added = await this.gql(
-            config.project,
-            "mutation($project:ID!,$issue:ID!){addProjectV2ItemById(input:{projectId:$project,contentId:$issue}){item{id}}}",
-            { project: config.projectId, issue: issue.id },
-          );
-          board = { id: added.data.addProjectV2ItemById.item.id };
-        }
-        const evidenceRevision = createHash("sha256")
-          .update(
-            JSON.stringify([
-              issue.body,
-              (issue.comments?.nodes ?? [])
-                .filter(
-                  (c: any) =>
-                    !/^(<!-- (?:fleet-recovery|family-dispatch|stranded-wip|auto-retry)|## Orchestrator recovery)/.test(
-                      c.body ?? "",
-                    ),
-                )
-                .map((c: any) => [c.id, c.updatedAt]),
-            ]),
-          )
-          .digest("hex");
-        observations.push({
-          ...known?.item,
-          evidenceRevision,
-          id: board.id,
-          issueId: issue.id,
-          issueNumber: issue.number,
-          title: issue.title,
-          body: issue.body,
-          url: issue.url,
-          state: issue.state,
-          status: board.fieldValueByName?.name ?? "Inbox",
-          labels: issue.labels.nodes.map((l: any) => l.name),
-          blockedBy: issue.blockedBy.nodes,
-          parentNumber: issue.parent?.number ?? null,
-          grandparentNumber: issue.parent?.parent?.number ?? null,
-          subIssues: issue.subIssuesSummary,
-          position: 0,
-          revision: 1,
-        });
-      }
-      this.store.workflow.observe(config.project, observations);
+      await this.observeIssues(
+        config,
+        connection.nodes.filter((i: any) => !this.store.workflow.find(i.id)),
+      );
       cursor = connection.pageInfo.hasNextPage
         ? connection.pageInfo.endCursor
         : null;
     } while (cursor);
+  }
+  private async observeIssues(
+    config: WorkflowProject,
+    issues: any[],
+  ): Promise<void> {
+    const observations: WorkflowItem[] = [];
+    for (const issue of issues) {
+      if (
+        issue.labels.pageInfo.hasNextPage ||
+        issue.projectItems.pageInfo.hasNextPage ||
+        issue.blockedBy.pageInfo.hasNextPage
+      )
+        throw new Error("Incomplete issue metadata");
+      let board = issue.projectItems.nodes.find(
+        (p: any) => p.project.id === config.projectId,
+      );
+      const known = this.store.workflow.find(issue.id);
+      if (!known && issue.state === "CLOSED") continue;
+      if (!board) {
+        const added = await this.gql(
+          config.project,
+          "mutation($project:ID!,$issue:ID!){addProjectV2ItemById(input:{projectId:$project,contentId:$issue}){item{id}}}",
+          { project: config.projectId, issue: issue.id },
+        );
+        board = { id: added.data.addProjectV2ItemById.item.id };
+      }
+      const evidenceRevision = createHash("sha256")
+        .update(
+          JSON.stringify([
+            issue.body,
+            (issue.comments?.nodes ?? [])
+              .filter(
+                (c: any) =>
+                  !/^(<!-- (?:fleet-recovery|family-dispatch|stranded-wip|auto-retry)|## Orchestrator recovery)/.test(
+                    c.body ?? "",
+                  ),
+              )
+              .map((c: any) => [c.id, c.updatedAt]),
+          ]),
+        )
+        .digest("hex");
+      observations.push({
+        ...known?.item,
+        evidenceRevision,
+        id: board.id,
+        issueId: issue.id,
+        issueNumber: issue.number,
+        title: issue.title,
+        body: issue.body,
+        url: issue.url,
+        state: issue.state,
+        status: board.fieldValueByName?.name ?? "Inbox",
+        labels: issue.labels.nodes.map((l: any) => l.name),
+        blockedBy: issue.blockedBy.nodes,
+        parentNumber: issue.parent?.number ?? null,
+        grandparentNumber: issue.parent?.parent?.number ?? null,
+        subIssues: issue.subIssuesSummary,
+        position: 0,
+        revision: 1,
+      });
+    }
+    this.store.workflow.observe(config.project, observations);
   }
 }

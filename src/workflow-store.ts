@@ -38,6 +38,10 @@ export class WorkflowStore {
       CREATE TABLE IF NOT EXISTS workflow_commands (id TEXT PRIMARY KEY, ticket TEXT NOT NULL, request TEXT NOT NULL, result TEXT NOT NULL) STRICT;
       CREATE TABLE IF NOT EXISTS workflow_events (id INTEGER PRIMARY KEY, ticket TEXT NOT NULL, actor TEXT NOT NULL, at INTEGER NOT NULL, change TEXT NOT NULL) STRICT;
       CREATE TABLE IF NOT EXISTS workflow_comments (id TEXT PRIMARY KEY, ticket TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL, published INTEGER NOT NULL DEFAULT 0) STRICT;`);
+    db.exec(`CREATE INDEX IF NOT EXISTS workflow_item_id ON workflow_tickets(json_extract(item,'$.id'));
+      CREATE INDEX IF NOT EXISTS workflow_issue_id ON workflow_tickets(json_extract(item,'$.issueId'));
+      CREATE INDEX IF NOT EXISTS workflow_parent ON workflow_tickets(project,json_extract(item,'$.parentNumber'));
+      CREATE INDEX IF NOT EXISTS workflow_order ON workflow_tickets(project,position);`);
   }
   projects(): WorkflowProject[] {
     return this.db
@@ -205,6 +209,7 @@ export class WorkflowStore {
     return this.decode(row);
   }
   find(id: string): { ticket: string; item: WorkflowItem } | undefined {
+    if (!id) return undefined;
     const row = this.db
       .prepare(
         "SELECT * FROM workflow_tickets WHERE json_extract(item,'$.id')=? OR json_extract(item,'$.issueId')=?",
