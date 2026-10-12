@@ -8611,6 +8611,26 @@ describe("pre-verifier gates — dispatchToAgent wiring", () => {
     }));
   });
 
+  test("red verifier gates cannot advance after a claimed pass", async () => {
+    await withStageSet("builder", () => withVerifierGates("make ui;make scripted", async () => {
+      const client = new MockGitHubClient({ status: { 916: "In Code Review" }, labels: { 916: ["done:verifier"] } });
+      const { ctx, calls } = makeTestContext({
+        agent: builderAgent("verifier"), item: { issueNumber: 916 }, client,
+        mockOptions: {
+          execImpls: fullHappyExecImpls("feature/916"),
+          gateImpl: () => ({ exitCode: 1, timedOut: true, spawnError: null }),
+        },
+      });
+      await maybeRunPreSpawnGates(ctx);
+      assert.deepEqual(await handlePostRun(STREAM_OK(), ctx, false), { ok: false });
+      assert.deepEqual(calls.gates.map(g => g.command), ["make ui"]);
+      assert.ok(client.addLabelCalls.some(c => c.label === "error:verifier"));
+      assert.ok(client.removeLabelCalls.some(c => c.label === "done:verifier"));
+      assert.ok(!client.addLabelCalls.some(c => c.label === "done:verifier"));
+      assert.ok(client.comments.some(c => c.body.includes("Required checks remain incomplete or failing")));
+    }));
+  });
+
   test("maybeRunPreSpawnGates red: output tail (capped at 4000) is embedded in the triage note", async () => {
     await withStageSet("builder", () => withVerifierGates("make check", async () => {
       const logsTail = "Z".repeat(120) + "-END";
@@ -10824,6 +10844,7 @@ describe("verdict handoff (#118)", () => {
   function fixture(opts: {
     handoff?: string | null;
     head?: string;
+    redGate?: boolean;
     stream?: Partial<StreamResult>;
   } = {}) {
     const client = new MockGitHubClient({
@@ -10848,6 +10869,7 @@ describe("verdict handoff (#118)", () => {
           : execError({ stderr: "HTTP 503" }),
       },
       fsMap,
+      gateImpl: () => ({ exitCode: opts.redGate ? 1 : 0, timedOut: false, spawnError: null }),
       streamResult: () => streamResult({
         runner: "codex", isError: true, terminalReason: "codex_blocked", sessionId: "codex-thread",
         output: publishBlock, ...opts.stream,
@@ -10862,7 +10884,7 @@ describe("verdict handoff (#118)", () => {
         return written ? written.content : deps.readFileSync(path, enc);
       }) as DispatchDeps["readFileSync"],
     };
-    const run = () => withStageSet("builder", () => withVerifierGates("", () =>
+    const run = () => withStageSet("builder", () => withVerifierGates(opts.redGate ? "make ui;make scripted" : "", () =>
       dispatchToAgent(builderAgent("verifier"), makeProjectItem({ issueNumber: ISSUE, status: "In Code Review" }), client, deps)));
     const sweep = () => withStageSet("builder", async () => {
       await runPendingVerdictPublish(client, sweepDeps);
@@ -10903,6 +10925,22 @@ describe("verdict handoff (#118)", () => {
     assert.ok(!f.client.addLabelCalls.some(c => c.label.startsWith("error:")));
     assert.ok(!f.client.comments.some(c => c.body.includes("Agent Error")));
     assert.ok(!f.labels().some(l => l.startsWith("pending-")));
+  });
+
+  test("an unexcused red gate cannot recover or queue a saved PASS", async () => {
+    const f = fixture({ redGate: true });
+    await f.run();
+    parkedAsToday(f);
+    assert.ok(!f.calls.fs.some(c => c.kind === "write" && c.path === pendingVerdictStatePath("verifier", ISSUE)));
+  });
+
+  test("an unexcused red gate still permits a saved FAIL to route rework", async () => {
+    const f = fixture({ redGate: true, handoff: handoffFile("FAIL", "needs-rework:builder") });
+    await f.run();
+    assert.equal(f.prComments().length, 1);
+    assert.ok(f.labels().includes("needs-rework:builder"));
+    assert.ok(!f.labels().includes("done:verifier"));
+    assert.ok(!f.labels().includes("error:verifier"));
   });
 
   test("FAIL: body posted, needs-rework:builder added, routed to the builder as a normal rework", async () => {
