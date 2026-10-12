@@ -1,6 +1,7 @@
 import { recoveryFingerprint, recoveryTrigger, hasOperatorHold, validateRecoveryDecision, RECOVERY_RETURNED_INBOX, type RecoveryDecision, type RecoveryIncident } from "./fleet-recovery.js";
 import type { AgentConfig, ProjectItem } from "./types.js";
 import { AUTO_RETRY_RESET_COMMENT_MARKER } from "./pipeline-decisions.js";
+import { githubPauseMs } from "./github-transport.js";
 
 export const RECOVERY_INVESTIGATING = "orchestrator:investigating";
 export const RECOVERY_FIXING = "orchestrator:fixing";
@@ -123,6 +124,8 @@ export async function runRecoveryWork(incident: RecoveryIncident, deps: Recovery
   let fixing = false;
   let handedOff = false;
   let escalated = false;
+  let deciding = false;
+  let decision: RecoveryDecision | undefined;
   try {
     let item = await deps.readCurrent();
     if (!recoveryStillCurrent(deps.project, item, incident)) {
@@ -130,9 +133,11 @@ export async function runRecoveryWork(incident: RecoveryIncident, deps: Recovery
       return;
     }
     await deps.addLabel(issue, RECOVERY_INVESTIGATING);
-    let decision: RecoveryDecision;
     try { decision = validateRecoveryDecision(await deps.assess(item)); }
-    catch { decision = { action: "escalate", reason: "Recovery assessment failed or returned an invalid result; inspect the recovery log" }; }
+    catch (error) {
+      if (githubPauseMs(error) !== null) throw error;
+      decision = { action: "escalate", reason: "Recovery assessment failed or returned an invalid result; inspect the recovery log" };
+    }
     item = await deps.readCurrent();
     if (!recoveryStillCurrent(deps.project, item, incident)) {
       await deps.decide({ action: "wait", reason: "Ticket changed during assessment; no action taken" });
@@ -145,6 +150,7 @@ export async function runRecoveryWork(incident: RecoveryIncident, deps: Recovery
       decision = { action: "escalate", reason: "No recorded coordination purpose and fresh non-overlapping changes prove this blocker removable. " + decision.reason };
     }
     // Reserve the repair budget BEFORE any GitHub mutation. Lost acknowledgements are idempotent.
+    deciding = true; // A lost decision reply may already have reserved a handback.
     decision = await deps.decide(decision);
     escalated = decision.action === "escalate";
     const plan = recoveryPlan(item, decision, deps.agents);
@@ -163,6 +169,15 @@ export async function runRecoveryWork(incident: RecoveryIncident, deps: Recovery
     handedOff = fixing;
     await deps.complete();
     if (decision.action !== "wait") await deps.notify(`${incident.ticket}: recovery ${decision.action}. ${decision.reason}`);
+  } catch (error) {
+    if (deciding || githubPauseMs(error) === null) throw error;
+    // Only assessment work and its temporary investigating label preceded this
+    // failure. Reassess after the durable operational cooldown, never replay an
+    // unconfirmed handback or replace a diagnosed permission/operator hold.
+    await deps.decide(decision?.action === "escalate" && decision.category !== "operational" ? decision : {
+      action: "escalate", category: "operational",
+      reason: `Temporary GitHub transport failure before recovery handback; reassess after cooldown. ${error instanceof Error ? error.message : String(error)}`.slice(0, 6000),
+    });
   } finally {
     // A failed cleanup is retried by owned, idle-ticket reconciliation next cycle.
     for (const label of [RECOVERY_INVESTIGATING, ...(escalated || fixing && !handedOff ? [RECOVERY_FIXING] : [])]) {

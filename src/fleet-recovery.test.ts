@@ -527,29 +527,162 @@ test("a policy upgrade reassesses old safe escalations without overriding manual
   db.close();
 });
 
-test("a partial GitHub handback is never replayed and retains its repair budget", async () => {
-  const store = new FleetStore(":memory:", limits);
-  const current = item(["error:rework-loop", "done:builder", "rework-count:6"]);
-  const [incident] = store.recoveryReport("mac", project, [observationFor(project, current)]);
-  store.start(request());
-  let assessed = 0;
-  await assert.rejects(runRecoveryWork(incident, {
-    project, agents, addLabel: async () => {}, readCurrent: async () => current,
-    begin: async () => store.recoveryStep("mac", "session", project, incident.id, "run-1", "begin") as RecoveryIncident,
-    assess: async () => { assessed++; return { action: "rework", reason: "Fix common cause" }; },
-    decide: async d => store.recoveryStep("mac", "session", project, incident.id, "run-1", "decide", d) as any,
-    complete: async () => { throw new Error("must not complete"); },
-    comment: async () => {}, move: async () => { throw new Error("GitHub unavailable"); }, removeLabel: async () => { throw new Error("must not clear the error"); }, notify: async () => {},
-  }), /GitHub unavailable/);
-  assert.equal(assessed, 1);
-  assert.equal(store.recovery.incident(incident.id).state, "applying");
-  store.finish("mac", "session", "run-1", false);
-  const [alert] = store.recoveryReport("mac", project, [observationFor(project, current)]);
-  assert.equal(alert.state, "escalated");
-  assert.equal(store.recoveryReport("mac", project, [observationFor(project, current)]).length, 0);
-  assert.ok(current.labels.includes("error:rework-loop"));
-  store.close();
+for (const phase of ["initial read", "assessment evidence read", "post-assessment read"] as const) {
+  test(`a transient GitHub failure at the ${phase} durably waits for safe reassessment`, async t => {
+    const db = new DatabaseSync(":memory:"); t.after(() => db.close());
+    let now = 100000000;
+    let ledger = new RecoveryLedger(db, () => now);
+    const current = item(["error:builder", "error-retry-count:4", "rework-count:2"]);
+    const observed = observationFor(project, current);
+    const empty = { claims: [], runs: [] };
+    const [incident] = ledger.report("mac", project, [observed], empty);
+    const active = { claims: [], runs: [{ ...request(), generation: "generation", created: now }] };
+    const outage = Object.assign(new Error("Shared GitHub temporarily unavailable (504)"), { status: 504 });
+    let reads = 0, assessments = 0;
+    const writes: string[] = [];
+    await runRecoveryWork(incident, {
+      project, agents, begin: async () => ledger.begin(incident.id, "run-1"),
+      readCurrent: async () => {
+        reads++;
+        if (phase === "initial read" || phase === "post-assessment read" && reads === 2) throw outage;
+        return structuredClone(current);
+      },
+      assess: async () => {
+        assessments++;
+        if (phase === "assessment evidence read") throw outage;
+        return { action: "retry", reason: "The diagnosed temporary fault cleared", retryReset: "The credential probe now passes" };
+      },
+      decide: async d => ledger.decide(incident.id, "run-1", d),
+      complete: async () => { assert.fail("No handback completed"); },
+      addLabel: async (_n, label) => { writes.push(`add:${label}`); },
+      removeLabel: async (_n, label) => { writes.push(`remove:${label}`); },
+      comment: async () => { assert.fail("No recovery mutation may be applied"); },
+      move: async () => { assert.fail("No recovery mutation may be applied"); },
+      notify: async () => { assert.fail("A transient outage must not request inspection"); },
+    });
+    assert.equal(assessments, phase === "initial read" ? 0 : 1);
+    const recorded = ledger.incident(incident.id);
+    assert.equal(recorded.state, "escalated");
+    assert.equal(recorded.decision?.action, "escalate");
+    assert.equal(recorded.decision?.category, "operational");
+    assert.match(recorded.decision!.reason, /GitHub.*504/);
+    assert.equal(recorded.decision?.retryReset, undefined);
+    assert.deepEqual(writes, [...(phase === "initial read" ? [] : ["add:orchestrator:investigating"]), "remove:orchestrator:investigating"]);
+    assert.deepEqual(current.labels, ["error:builder", "error-retry-count:4", "rework-count:2"]);
+    ledger = new RecoveryLedger(db, () => now);
+    now += RECOVERY_RECHECK_MS - 1;
+    assert.deepEqual(ledger.report("mac", project, [observed], empty), []);
+    now++;
+    assert.deepEqual(ledger.report("mac", project, [observed], active), [], "a live or uncertain worker keeps its reservation");
+    assert.deepEqual(ledger.report("linux", project, [observed], {
+      claims: [{ ticket: incident.ticket, machine: "mac", generation: "generation", created: now }], runs: [],
+    }), [], "another machine cannot reassess an owned ticket");
+    const [next] = ledger.report("mac", project, [observed], empty);
+    assert.notEqual(next.id, incident.id);
+    assert.equal(next.state, "queued");
+    assert.equal(ledger.report("mac", project, [observed], empty)[0].id, next.id, "one fresh assessment is queued");
+  });
+}
+
+test("transport deferral never overrides a human assessment or an assessment failure", async t => {
+  for (const mode of ["human", "invalid"] as const) {
+    const db = new DatabaseSync(":memory:"); t.after(() => db.close());
+    let now = 100000000;
+    const ledger = new RecoveryLedger(db, () => now);
+    const current = item();
+    const observed = observationFor(project, current), empty = { claims: [], runs: [] };
+    const [incident] = ledger.report("mac", project, [observed], empty);
+    let reads = 0;
+    await runRecoveryWork(incident, {
+      project, agents, begin: async () => ledger.begin(incident.id, "run-1"),
+      readCurrent: async () => {
+        if (++reads === 2) throw new Error("Shared GitHub temporarily unavailable (504)");
+        return current;
+      },
+      assess: async () => {
+        if (mode === "invalid") throw new Error("Recovery assessment failed");
+        return { action: "escalate", category: "human", reason: "A permission was denied; an operator must resolve it" };
+      },
+      decide: async d => ledger.decide(incident.id, "run-1", d),
+      complete: async () => { assert.fail("No handback completed"); },
+      addLabel: async () => {}, removeLabel: async () => {},
+      comment: async () => { assert.fail("No ticket mutation"); }, move: async () => { assert.fail("No ticket mutation"); }, notify: async () => {},
+    });
+    const decision = ledger.incident(incident.id).decision!;
+    assert.equal(decision.action, "escalate");
+    assert.notEqual(decision.category, "operational");
+    assert.match(decision.reason, mode === "human" ? /permission was denied/ : /assessment failed/);
+    now += RECOVERY_RECHECK_MS;
+    assert.deepEqual(ledger.report("mac", project, [observed], empty), []);
+  }
 });
+
+test("operational transport waits still obey fresh permission, operator and running-label holds", () => {
+  for (const hold of ["error:builder:permission_denied", "needs-human:decision", "operator pause", "unknown pause", "wip:builder"]) {
+    const db = new DatabaseSync(":memory:"); let now = 100000000;
+    const ledger = new RecoveryLedger(db, () => now), empty = { claims: [], runs: [] };
+    const observed = observation();
+    const [incident] = ledger.report("mac", project, [observed], empty);
+    ledger.begin(incident.id, "run-1");
+    ledger.decide(incident.id, "run-1", { action: "escalate", category: "operational", reason: "Temporary GitHub outage" });
+    now += RECOVERY_RECHECK_MS;
+    const held: RecoveryObservation = hold.endsWith("pause") ? { ...observed, status: "Halted",
+      ...(hold === "operator pause" ? { pause: { ticket: observed.ticket, origin: "operator" as const, actor: "operator", reason: "Manual pause",
+        missing: "Operator decision", resumeOn: "Operator approval", resumeStatus: observed.status, revision: "pause-1" } } : {}) }
+      : { ...observed, labels: [...observed.labels, hold] };
+    const results = ledger.report("mac", project, [held], empty);
+    assert.ok(results.every(i => i.state === "escalated"), `${hold} must not queue recovery`);
+    db.close();
+  }
+});
+
+for (const failure of ["move", "label removal", "decision reply"] as const) {
+  test(`a transient failure at ${failure} after repair reservation is never replayed and retains its budget`, async t => {
+    const store = new FleetStore(":memory:", limits); t.after(() => store.close());
+    const current = item(["error:rework-loop", "done:builder", "rework-count:6"]);
+    const [incident] = store.recoveryReport("mac", project, [observationFor(project, current)]);
+    store.start(request());
+    let assessed = 0, decisions = 0;
+    const outage = Object.assign(new Error("Shared GitHub temporarily unavailable (504)"), { status: 504 });
+    await assert.rejects(runRecoveryWork(incident, {
+      project, agents, addLabel: async () => {}, readCurrent: async () => current,
+      begin: async () => store.recoveryStep("mac", "session", project, incident.id, "run-1", "begin") as RecoveryIncident,
+      assess: async () => { assessed++; return { action: "rework", reason: "Fix common cause" }; },
+      decide: async d => {
+        decisions++;
+        const selected = store.recoveryStep("mac", "session", project, incident.id, "run-1", "decide", d) as any;
+        if (failure === "decision reply") throw outage;
+        return selected;
+      },
+      complete: async () => { throw new Error("must not complete"); },
+      comment: async () => {},
+      move: async () => { if (failure === "move") throw outage; },
+      removeLabel: async (_n, label) => {
+        if (label.startsWith("orchestrator:")) return;
+        assert.equal(label, "done:builder", "the error must be removed last");
+        current.labels = current.labels.filter(l => l !== label); // Applied, but its acknowledgement was lost.
+        throw outage;
+      }, notify: async () => {},
+    }), /Shared GitHub temporarily unavailable/);
+    assert.equal(assessed, 1);
+    assert.equal(decisions, 1, "an uncertain decision must not be replaced by an operational wait");
+    assert.equal(store.recovery.incident(incident.id).state, "applying");
+    assert.equal(store.recovery.incident(incident.id).decision?.action, "rework");
+    store.finish("mac", "session", "run-1", false);
+    const [alert] = store.recoveryReport("mac", project, [observationFor(project, current)]);
+    assert.equal(alert.state, "escalated");
+    assert.notEqual(alert.decision?.category, "operational");
+    assert.equal(store.snapshot().claims[0].machine, "mac");
+    const next = store.recoveryReport("mac", project, [observationFor(project, current)]);
+    if (failure === "label removal") {
+      assert.notEqual(next[0].id, incident.id, "changed evidence can only request a fresh assessment");
+      assert.equal(next[0].state, "queued");
+      assert.equal(next[0].decision, null, "the partial handback must not be replayed");
+    } else assert.deepEqual(next, []);
+    assert.equal(store.recovery.incident(incident.id).decision?.action, "rework", "the original repair reservation remains spent");
+    assert.ok(current.labels.includes("error:rework-loop"));
+  });
+}
 
 test("project credentials cannot report or decide another project's recovery", async t => {
   const store = new FleetStore(":memory:", limits);
