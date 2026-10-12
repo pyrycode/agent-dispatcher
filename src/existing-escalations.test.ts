@@ -120,3 +120,9 @@ test('previously assigned support tasks remain paused throughout unknown-provena
  assert.equal(store.tasks.available('mac',task.id),false,'queued provenance');store.start({id:'review',session:'s',machine:'mac',project,ticket:error.ticket,role:'recovery',resource:'heavy',locks:[]});store.recoveryStep('mac','s',project,incident.id,'review','begin');assert.equal(store.tasks.available('mac',task.id),false,'active provenance');
  store.recoveryStep('mac','s',project,incident.id,'review','decide',{action:'wait',reason:'No current authority to reopen'});assert.equal(store.tasks.available('mac',task.id),false,'completed provenance');
 });
+
+test('old reports preserve activated provenance review through changed evidence and restart',t=>{
+ const db=new DatabaseSync(':memory:');t.after(()=>db.close());let ledger=new RecoveryLedger(db,()=>1000);const paused={...error,status:'Halted',labels:[]};const [first]=ledger.report('mac',project,[upgraded(paused)],empty);
+ const changed={...paused,artifactRevision:'a'.repeat(64)};assert.deepEqual(ledger.report('old-worker',project,[changed],empty),[]);const next=ledger.list(project).find(r=>r.current)!;assert.notEqual(next.id,first.id);assert.equal(next.state,'queued');
+ assert.deepEqual(ledger.report('old-worker',project,[changed],empty),[]);assert.equal(ledger.incident(next.id).state,'queued');ledger=new RecoveryLedger(db,()=>2000);assert.equal(ledger.report('mac',project,[upgraded(changed)],empty)[0]?.id,next.id);
+});

@@ -212,7 +212,7 @@ export class RecoveryLedger {
       this.db.prepare("INSERT INTO fleet_recovery_workflow VALUES (?,?) ON CONFLICT(ticket) DO UPDATE SET fingerprint=excluded.fingerprint").run(o.ticket, workflow);
       const manual = trigger.manual && !pauseInspection;
       this.db.prepare("INSERT INTO fleet_recovery VALUES (?,?,?,?,?,?,?,NULL,NULL,1)").run(id, o.ticket, fingerprint, trigger.reason, manual ? "escalated" : "queued", this.now(), this.now());
-      if (upgraded) this.db.prepare("INSERT INTO fleet_recovery_assessment_policy VALUES (?,?)").run(id, RECOVERY_ASSESSMENT_POLICY);
+      if (upgraded || pauseInspection) this.db.prepare("INSERT INTO fleet_recovery_assessment_policy VALUES (?,?)").run(id, RECOVERY_ASSESSMENT_POLICY);
       if (manual) newAlerts.add(id);
     }
     for (const row of partial ? [] : this.db.prepare("SELECT id,ticket FROM fleet_recovery WHERE ticket LIKE ? AND present=1").all(`${project}#%`)) {
