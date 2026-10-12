@@ -223,6 +223,20 @@ print(json.dumps({'startupHealthy': health.get('passed'), 'runtime': receipt, 'p
         path = Path(self.config['stateDirectory']) / (project.replace('/', '_') + '.json')
         return json.loads(path.read_text()).get('identity', {}) if path.exists() else {}
 
+    def helpers_active(self, project):
+        if self.config['platform'] != 'linux': return False
+        container=self.config['projects'][project]['container']
+        state=self.status()
+        for run in state['runs']:
+            if run['machine']!=state['machine'] or not run.get('supportTaskId'): continue
+            receipt=Path(self.config['stateDirectory'])/'tasks'/(run['supportTaskId']+'.receipt.json')
+            # Admission can precede its saved launch receipt. Unknown placement
+            # cannot authorise stopping a container that might own the worker.
+            if not receipt.is_file(): return True
+            saved=json.loads(receipt.read_text())
+            if 'container' not in saved or saved['container']==container: return True
+        return False
+
     def preflight(self, project, desired):
         cfg = self.config['projects'][project]
         expected = self.expected(project, refresh=True)

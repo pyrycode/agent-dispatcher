@@ -41,6 +41,7 @@ class Supervisor:
     def tick(self, project, desired):
         receipt = self.directory / (project.replace('/', '_') + '.json')
         state = json.loads(receipt.read_text()) if receipt.exists() else None
+        helpers_active=getattr(self.adapter,'helpers_active',lambda project:False)
         if state and state['phase'] == 'attention':
             return state
         try:
@@ -49,6 +50,9 @@ class Supervisor:
             if state and state['phase'] in {'start-requested', 'verifying'} and self.clock() - state['created'] < 6 * 3600:
                 return state
             raise
+        if state and state['phase']=='waiting-for-native-task':
+            if helpers_active(project): return state
+            state=None
         if state and state['phase'] == 'complete':
             if observed.get('generation') == desired and observed.get('healthy'):
                 return state
@@ -64,6 +68,10 @@ class Supervisor:
                 return {'phase': 'stopped', 'project': project}
             if observed.get('generation') == desired and observed.get('healthy'):
                 return {'phase': 'current', 'project': project}
+            if helpers_active(project):
+                state={'phase':'waiting-for-native-task','project':project,'desired':desired,'created':self.clock()}
+                atomic(receipt,state)
+                return state
             if not self.adapter.preflight(project, desired):
                 return {'phase': 'preflight-failed', 'project': project}
             before = self.adapter.status()
@@ -93,6 +101,7 @@ class Supervisor:
                 # Finish exactly the pinned operation. New revisions wait for its verified completion.
                 desired = state['desired']
             if state['phase'] == 'draining':
+                if helpers_active(project): return state
                 if not observed.get('stopped'):
                     groups = sorted(set(state.get('childGroups', []) + observed.get('childGroups', [])))
                     if groups != state.get('childGroups', []):
@@ -101,7 +110,7 @@ class Supervisor:
                 if not observed.get('childrenStopped'):
                     return state
                 before = self.adapter.status()
-                if any(r['project'] == project and r['machine'] == before['machine'] for r in before['runs']):
+                if any(r['project'] == project and r['machine'] == before['machine'] and not r.get('supportTaskId') for r in before['runs']):
                     raise RuntimeError('Worker reservation remains. Ownership was preserved.')
                 if policy(before) != state['policy']:
                     raise RuntimeError('Operator drain policy changed during operation.')

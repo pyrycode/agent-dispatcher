@@ -12,6 +12,16 @@ spec=importlib.util.spec_from_file_location('native',Path(__file__).with_name('f
 module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
 
 class Tests(unittest.TestCase):
+    def test_only_a_native_helpers_actual_container_delays_restart(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);(root/'tasks').mkdir()
+            adapter=module.NativeAdapter({'stateDirectory':d,'platform':'linux','projects':{'org/core':{'container':'core'}}})
+            adapter.status=lambda:{'machine':'box','runs':[{'machine':'box','supportTaskId':'helper'}]}
+            receipt=root/'tasks/helper.receipt.json'
+            receipt.write_text(json.dumps({'container':'mobile'}));self.assertFalse(adapter.helpers_active('org/core'))
+            receipt.write_text(json.dumps({'container':'core'}));self.assertTrue(adapter.helpers_active('org/core'))
+            adapter.config['platform']='mac';self.assertFalse(adapter.helpers_active('org/core'))
+
     def test_publish_snapshot_retains_late_verdict_and_archives_old_copy(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);destination=root/'publish';destination.mkdir();(root/'state').mkdir()
