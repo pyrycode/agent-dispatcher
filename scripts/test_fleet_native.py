@@ -12,6 +12,18 @@ spec=importlib.util.spec_from_file_location('native',Path(__file__).with_name('f
 module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
 
 class Tests(unittest.TestCase):
+    def test_publish_snapshot_retains_late_verdict_and_archives_old_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);destination=root/'publish';destination.mkdir();(root/'state').mkdir()
+            (destination/'verdict.md').write_text('older retained verdict')
+            adapter=module.NativeAdapter({'stateDirectory':str(root/'state'),'platform':'linux','projects':{'org/core':{'container':'fixed','publishStorage':str(destination)}}})
+            def copy(args,**kwargs):
+                snapshot=Path(args[-1]);(snapshot/'verdict.md').write_text('completed before drain')
+                return ''
+            with patch.object(module,'execute',side_effect=copy):adapter.retain_publish_files('org/core')
+            self.assertEqual((destination/'verdict.md').read_text(),'completed before drain')
+            self.assertIn('older retained verdict',[p.read_text() for p in (root/'state').rglob('verdict.md')])
+
     def test_mac_start_finds_user_cli_with_service_path_and_keeps_secrets_out(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

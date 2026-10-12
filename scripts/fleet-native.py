@@ -5,9 +5,11 @@ import json
 import os
 import re
 import secrets
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -240,12 +242,34 @@ print(json.dumps({'startupHealthy': health.get('passed'), 'runtime': receipt, 'p
     def update(self, project, desired):
         cfg = self.config['projects'][project]
         if not self.preflight(project, desired): raise RuntimeError('Update preflight no longer passes')
+        self.retain_publish_files(project)
         execute(['git', '-C', cfg['agents'], 'pull', '--ff-only'])
         if execute(['git', '-C', cfg['agents'], 'rev-parse', 'HEAD']) != desired['consumer']:
             raise RuntimeError('Consumer main changed while the operation was draining')
         execute(['git', '-C', cfg['agents'], 'submodule', 'update', '--init', 'dispatcher'])
         if execute(['git', '-C', Path(cfg['agents']) / 'dispatcher', 'rev-parse', 'HEAD']) != desired['dispatcher']:
             raise RuntimeError('Dispatcher pin does not match the queued update')
+
+    def retain_publish_files(self, project):
+        cfg = self.config['projects'][project]
+        if self.config['platform'] != 'linux' or not cfg.get('publishStorage'): return
+        # Called only after the dispatcher and its children have finished. A
+        # container replacement must retain their final handoffs, not an earlier copy.
+        destination=Path(cfg['publishStorage'])
+        backup=Path(tempfile.mkdtemp(prefix='publish-before-restart-',dir=self.config['stateDirectory']))
+        snapshot=backup/'container';snapshot.mkdir(mode=0o700)
+        execute(['podman','cp',cfg['container']+':/Users/juhanailmoniemi/.codex/publish/.',snapshot])
+        destination.mkdir(parents=True,exist_ok=True,mode=0o700)
+        for source in snapshot.rglob('*'):
+            relative=source.relative_to(snapshot);target=destination/relative
+            if source.is_symlink() or target.is_symlink() or any(p.is_symlink() for p in target.parents):
+                raise RuntimeError('Publish storage contains a symbolic link; snapshot retained for inspection')
+            if source.is_dir():target.mkdir(parents=True,exist_ok=True,mode=0o700);continue
+            if not source.is_file():raise RuntimeError('Publish storage contains a non-regular file')
+            target.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+            if target.is_file() and target.read_bytes()!=source.read_bytes():
+                saved=backup/'previous'/relative;saved.parent.mkdir(parents=True,exist_ok=True,mode=0o700);shutil.copy2(target,saved)
+            shutil.copy2(source,target);target.chmod(0o600)
 
     def start(self, project):
         cfg = self.config['projects'][project]
