@@ -373,10 +373,10 @@ receives no fleet credential and cannot read another ticket's artifacts.
 The existing local supervisor advertises its configured capabilities after
 checking the required executables. Records expire after three minutes for new
 admission. An expired record never releases an existing worker or ownership.
-The supervisor submits helpers to its existing machine manager. Owned work keeps
-its normal priority. A helper for a locally owned ticket uses its parent's claim
-age and recovery priority. Foreign helpers follow runnable owned work. Native
-execution uses heavy capacity. Platform-route probes are light and cannot claim
+The supervisor submits helpers to its existing machine manager. A helper uses
+its parent's existing claim age and recovery priority on every configured computer.
+This prevents a remote check from being treated as new unclaimed work. Active
+workers keep their reservations. Native execution uses heavy capacity. Platform-route probes are light and cannot claim
 that candidate tests passed. Helpers do not transfer or claim their product ticket.
 
 Native host helpers do not hold unrelated product restart reservations. A helper

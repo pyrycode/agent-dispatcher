@@ -43,7 +43,7 @@ test('operational escalation rechecks with delay while human decisions remain he
  }finally{store.close();}
 });
 
-test('native helpers use the normal machine queue and do not jump ahead of runnable owned tickets',async t=>{
+test('native helpers wait for active owned work through ordinary machine capacity',async t=>{
  const {MachineManager}=await import('./machine-manager.js');
  const {FleetClient}=await import('./fleet-http.js');
  const store=new FleetStore(':memory:',limits),server=await serveFleet(store,{box:'b',mac:'m'},'a',0);
@@ -57,6 +57,7 @@ test('native helpers use the normal machine queue and do not jump ahead of runna
  store.finish('mac','p','owned-before');
  const manager=new MachineManager({machine:'mac',projects:['org/core'],heavyLimit:1,combinedLimit:2},new FleetClient(url,'m'));
  manager.offer('org/core','product',[{project:'org/core',ticket:'org/core#9',role:'verifier',resource:'heavy',locks:[],key:'owned',order:0}]);
+ await manager.tick(); // The product worker was already admitted when native work arrived.
  assert.equal((await manager.support('native')).length,0);
  assert.equal(store.tasks.get(task.id).state,'queued');
  const own=store.snapshot().runs.find(r=>r.ticket==='org/core#9');assert.ok(own);
