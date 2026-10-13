@@ -10,6 +10,7 @@ import {FleetStore} from './fleet-store.js';
 import {serveFleet,FleetClient,JsonClient} from './fleet-http.js';
 import {MachineManager,serveManager} from './machine-manager.js';
 import {taskBridge} from './recovery-task-bridge.js';
+import {ARTIFACT_LIMITS,artifactManifest,manifestHash,sha256} from './recovery-artifacts.js';
 
 const execute=promisify(execFile);
 test('the credential-free Python helper requests and retrieves native evidence through real admission',async t=>{
@@ -36,17 +37,40 @@ test('the credential-free Python helper requests and retrieves native evidence t
  store.tasks.report('hp',{capabilities:['android-emulator'],ready:true});
  assert.equal(store.taskStart('hp',task.id,'capture').ok,true);
  const recording='{"type":"stream_event"}\r\n{"type":"result"}\r\n';
- store.taskComplete('hp',task.id,'capture',{outcome:'failed',summary:'Diagnostic recording retained; cause is not established',files:{'mobile/daemon.stdout':recording}});
+ const files={'mobile/daemon.stdout':recording.repeat(100000),'mobile/shared-harness-redacted.json':'{"counts":{"executed":1}}',
+  'mobile/mobile.xml':'<testsuite tests="1" failures="1"/>','mobile/driver.json':'{"exit_code":1}',
+  ...Object.fromEntries(['__proto__','constructor','toString'].map(name=>[name,name+'\r\né\n'])),
+  ...Object.fromEntries(Array.from({length:33},(_,i)=>[[`mobile/child-${i}.stdout`,'event\r\n'],[`mobile/child-${i}.manifest.json`,'{"dropped_rows":0,"tail_bytes":0}']]).flat())};
+ const manifest=artifactManifest(files),digest=manifestHash(manifest);
+ assert.ok(manifest.totalBytes>4*1024*1024);assert.ok(manifest.files.length>64);
+ const hp=new JsonClient('http://127.0.0.1:'+address.port,'hp-token');
+ const actor={id:task.id,session:'capture'};
+ const begin=await hp.call<{digest:string;missing:Record<string,number[]>}>('/tasks/artifacts-begin',{...actor,manifest});
+ assert.equal(begin.digest,digest);
+ for(const entry of manifest.files) for(const part of begin.missing[entry.path]) await hp.call('/tasks/artifacts-put',{...actor,digest,path:entry.path,part,
+  data:Buffer.from(files[entry.path]).subarray(part*ARTIFACT_LIMITS.chunkBytes,(part+1)*ARTIFACT_LIMITS.chunkBytes).toString('base64')});
+ await hp.call('/tasks/artifacts-commit',{...actor,digest,result:{outcome:'failed',summary:'Diagnostic recording retained; cause is not established',files:{}}});
  const output=join(directory,'evidence');
  assert.equal((await call('await',task.id,'--out',output)).state,'failed');
- assert.equal(readFileSync(join(output,'mobile/daemon.stdout'),'utf8'),recording);
+ for(const entry of manifest.files) {
+  const data=readFileSync(join(output,entry.path));assert.equal(data.length,entry.bytes);assert.equal(sha256(data),entry.sha256);
+ }
+ assert.equal(JSON.parse(readFileSync(join(output,'.fleet-task-manifest.json'),'utf8')).digest,digest);
  assert.equal(statSync(join(output,'mobile/daemon.stdout')).mode&0o777,0o600);
+ assert.equal((await call('read',task.id,'--out',output)).artifacts.files.length,manifest.files.length,'verified retrieval is idempotent');
+ const project=new JsonClient('http://127.0.0.1:'+localAddress.port,'project-token');
+ await assert.rejects(project.call('/tasks/artifacts-put',{...actor,digest,path:manifest.files[0].path,part:0,data:''}),/Unknown operation/);
+ const box=new JsonClient('http://127.0.0.1:'+address.port,'box-token');
+ await assert.rejects(box.call('/tasks/artifacts-begin',{...actor,machine:'hp',manifest}),/actor mismatch/);
+ await assert.rejects(new JsonClient('http://127.0.0.1:'+address.port,'unknown').call('/tasks/artifact',{id:task.id}),/401/);
  assert.equal(store.snapshot().claims.find(c=>c.ticket===source.ticket)?.machine,'box');
  writeFileSync(file,JSON.stringify({...request,command:'echo denied'}));
  await assert.rejects(call('request',file),/Task request unavailable/);
  const foreign=store.tasks.request('org/core#9',request);
  await assert.rejects(call('read',foreign.id),/outside this admitted ticket/);
+ await assert.rejects(project.call('/tasks/artifact',{id:foreign.id,digest,path:manifest.files[0].path,part:0,runId:'builder',session:'s'}),/admitted source ticket/);
  store.finish('box','s','builder');writeFileSync(file,JSON.stringify(request));
  await assert.rejects(call('request',file),/outside this admitted ticket/);
+ await assert.rejects(call('read',task.id,'--out',output),/outside this admitted ticket/);
  assert.equal(store.tasks.list(source.ticket).length,1);
 });

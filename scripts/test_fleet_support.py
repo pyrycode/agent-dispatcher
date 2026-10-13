@@ -1,4 +1,6 @@
 import importlib.util
+import base64
+import hashlib
 import json
 import tempfile
 import unittest
@@ -12,7 +14,93 @@ spec=importlib.util.spec_from_file_location('support',Path(__file__).with_name('
 m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 NATIVE_CENSUS_AVAILABLE=m.process_snapshot() is not None
 
+
+def artifact_reply(operation,body):
+ if operation=='artifacts-begin':
+  manifest=body['manifest']
+  return {'digest':hashlib.sha256(json.dumps(manifest,separators=(',',':')).encode()).hexdigest(),
+          'missing':{entry['path']:list(range(len(entry['chunks']))) for entry in manifest['files']}}
+ return []
+
 class SupportTests(unittest.TestCase):
+ def test_android_bundle_over_four_mib_keeps_every_record_and_execution_outcome(self):
+  with tempfile.TemporaryDirectory() as d:
+   directory=Path(d);capture=directory/'capture';capture.mkdir()
+   driver=directory/'core/internal/e2e/realclaude/tool_then_text_mobile_capture.py'
+   driver.parent.mkdir(parents=True);driver.write_text('approved driver')
+   records={'shared-harness-redacted.json':'{}','driver.json':'{"exit_code":0}',
+            'mobile.xml':'<testsuite tests="1" failures="0"/>',
+            'child.stdout':'row\r\n'*(850000),'child.manifest.json':'{"dropped_rows":0,"tail_bytes":0}'}
+   for name,data in records.items():(capture/name).write_bytes(data.encode())
+   def execute(argv,cwd,log,env):
+    log.write_text('#2939 private recovery: '+str(capture)+'\n');return 0
+   with patch.object(m,'clone'),patch.object(m,'execute',side_effect=execute):
+    result=m.native_recipe({'request':{'recipe':'android-tool-then-text','revision':'a'*40}},
+       {'core':'core','mobile':'mobile','mobileAgents':'mobile-agents','coreAgents':'core-agents'},directory)
+   self.assertGreater(sum(len(v.encode()) for v in records.values()),4*1024*1024)
+   self.assertEqual(result['files'],{'mobile/'+name:data for name,data in records.items()})
+   self.assertEqual(result['outcome'],'completed')
+ def test_terminal_receipt_recovers_original_oversized_file_rich_bundle_without_execution(self):
+  with tempfile.TemporaryDirectory() as d:
+   directory=Path(d);capture=directory/'original-capture';capture.mkdir()
+   task_id='c02a547f02bb3c7548c17198150b7acc5e290ef937d1ef495d8a1651f454d58e'
+   records={'shared-harness-redacted.json':'{"executed":1}', 'mobile.xml':'<testsuite tests="1" failures="1"/>',
+            'driver.json':'{"exit_code":1}', 'child-0.stdout':'row\r\n'*850000,
+            'child-0.manifest.json':'{"dropped_rows":3,"tail_bytes":11}'}
+   for i in range(1,33):
+    records[f'child-{i}.stdout']='event\r\n';records[f'child-{i}.manifest.json']='{"dropped_rows":0,"tail_bytes":0}'
+   for name,content in records.items():(capture/name).write_bytes(content.encode())
+   (capture/'execution-logcat.stdout').write_text('raw logcat stays private')
+   (capture/'logcats').mkdir();(capture/'logcats'/'raw.stdout').write_text('nested raw logcat stays private')
+   (directory/'execution.log').write_text('#2939 private recovery: '+str(capture)+'\n')
+   m.atomic(directory/'task.json',{'id':task_id,'request':{'recipe':'android-tool-then-text','revision':'a'*40}})
+   original={'outcome':'failed','summary':'Android capture completed. Artifact bundle exceeds transport size; its original private directory remains available.','files':{}}
+   result=directory/'result.json';m.atomic(result,original)
+   class Adapter:
+    def status(self):return {'machine':'build-hp-1','draining':True}
+   s=m.SupportSupervisor(Adapter(),{'stateDirectory':d,'recoveryTasks':{'android-tool-then-text:android-emulator':{'capability':'android-emulator'}}})
+   receipt=s.directory/(task_id+'.receipt.json');m.atomic(receipt,{'id':task_id,'session':'original-session','phase':'complete','result':str(result),'pid':123})
+   retained={};manifests=[];commits=[];interrupt=[True]
+   def rpc(op,body):
+    if op=='capabilities':return {}
+    self.assertEqual(body['machine'],'build-hp-1');self.assertEqual(body['session'],'original-session');self.assertEqual(body['id'],task_id)
+    if op=='artifacts-begin':
+     manifest=body['manifest'];manifests.append(manifest)
+     digest=hashlib.sha256(json.dumps(manifest,separators=(',',':')).encode()).hexdigest()
+     return {'digest':digest,'missing':{entry['path']:[i for i in range(len(entry['chunks'])) if (entry['path'],i) not in retained] for entry in manifest['files']}}
+    if op=='artifacts-put':
+     if body['part']==1 and interrupt[0]:interrupt[0]=False;raise RuntimeError('Lost connection')
+     data=base64.b64decode(body['data']);self.assertLessEqual(len(data),m.CHUNK_BYTES)
+     retained[body['path'],body['part']]=data;return {}
+    if op=='artifacts-commit':commits.append(body);return {}
+    self.fail('Unexpected operation '+op)
+   s.rpc=rpc
+   with patch.object(s,'route_ready',return_value=False),patch.object(m,'execute') as execute,patch.object(m,'clone') as clone,patch.object(m.subprocess,'Popen') as spawn:
+    with self.assertRaisesRegex(RuntimeError,'Lost connection'):s.tick()
+    self.assertNotIn('artifactDigest',json.loads(receipt.read_text()))
+    s.tick();s.tick();execute.assert_not_called();clone.assert_not_called();spawn.assert_not_called()
+   self.assertEqual(manifests[0],manifests[1]);self.assertGreater(manifests[0]['totalBytes'],4*1024*1024)
+   self.assertEqual(len(manifests[0]['files']),len(records));self.assertGreater(len(records),64)
+   self.assertEqual(len(commits),1);self.assertEqual(commits[0]['result'],original)
+   self.assertEqual(json.loads(result.read_text()),original)
+   self.assertEqual(json.loads(receipt.read_text())['artifactDigest'],commits[0]['digest'])
+   for entry in manifests[0]['files']:
+    data=b''.join(retained[entry['path'],i] for i in range(len(entry['chunks'])))
+    self.assertEqual(data,records[entry['path'].removeprefix('mobile/')].encode())
+    self.assertEqual(hashlib.sha256(data).hexdigest(),entry['sha256']);self.assertEqual(len(data),entry['bytes'])
+ def test_capture_inventory_keeps_more_than_64_files_and_refuses_escaping_symlinks(self):
+  with tempfile.TemporaryDirectory() as d,tempfile.TemporaryDirectory() as outside:
+   capture=Path(d)/'capture';capture.mkdir();log=Path(d)/'execution.log';log.write_text('#2939 private recovery: '+str(capture)+'\n')
+   for i in range(65):(capture/f'child-{i}.stdout').write_bytes(b'event\r\n')
+   self.assertEqual(len(m.capture_records(log)),65)
+   escaped=Path(outside)/'escaped.stdout';escaped.write_text('private')
+   (capture/'escaped.stdout').symlink_to(escaped)
+   with self.assertRaisesRegex(RuntimeError,'escapes'):m.capture_records(log)
+ def test_manifest_explicit_total_bounds_and_path_validation(self):
+  with self.assertRaisesRegex(RuntimeError,'bounds'):m.artifact_manifest({f'f-{i}':'' for i in range(m.ARTIFACT_FILES+1)})
+  with patch.object(m,'ARTIFACT_BYTES',3),self.assertRaisesRegex(RuntimeError,'bounds'):m.artifact_manifest({'file':'four'})
+  for path in ['../outside','/absolute','a//b','.fleet-task-cache/overwrite']:
+   with self.subTest(path=path),self.assertRaisesRegex(RuntimeError,'path'):m.artifact_manifest({path:'data'})
  def test_cleanup_observes_grandchild_before_poll_reaps_its_group_leader(self):
   root={'pid':123,'identity':'root','pgid':123,'sid':123,'ppid':1,'state':'S'}
   grandchild={'pid':125,'identity':'grandchild','pgid':123,'sid':123,'ppid':1,'state':'S'}
@@ -147,11 +235,11 @@ class SupportTests(unittest.TestCase):
    supervisor=m.SupportSupervisor(Adapter(),{'stateDirectory':d,'recoveryTasks':{'probe':{'capability':'macos-arm64'}}})
    receipt=supervisor.directory/'job.receipt.json'
    m.atomic(receipt,{'id':'job','session':'s','phase':'running','pid':123,'custody':{'root':root,'owned':{'123':'root'},'phase':'alive'},'result':str(Path(d)/'result.json')})
-   calls=[];supervisor.rpc=lambda op,body:calls.append(op) or []
+   calls=[];supervisor.rpc=lambda op,body:calls.append(op) or artifact_reply(op,body)
    with patch.object(m,'process_snapshot',return_value={123:root}):
     supervisor.tick();supervisor.tick()
    self.assertNotIn('uncertain',calls)
-   self.assertNotIn('complete',calls)
+   self.assertNotIn('artifacts-commit',calls)
    self.assertEqual(json.loads(receipt.read_text())['phase'],'running')
  def test_supervisor_observes_worker_descendants_before_reaping_and_restart(self):
   root={'pid':123,'identity':'root','pgid':123,'sid':123,'ppid':1,'state':'S'}
@@ -169,15 +257,15 @@ class SupportTests(unittest.TestCase):
    m.atomic(Path(d)/'task.json',{'request':{'recipe':'platform-probe'}})
    receipt=supervisor.directory/'job.receipt.json'
    m.atomic(receipt,{'id':'job','session':'s','phase':'running','pid':123,'custody':{'root':root,'owned':{'123':'root'},'phase':'alive'},'result':str(result)})
-   calls=[];supervisor.rpc=lambda op,body:calls.append(op) or []
+   calls=[];supervisor.rpc=lambda op,body:calls.append(op) or artifact_reply(op,body)
    def snapshot():return {125:descendant} if child.reaped else {123:{**root,'state':'Z'},125:descendant}
    with patch.object(m,'process_snapshot',side_effect=snapshot):supervisor.tick()
    self.assertEqual(json.loads(receipt.read_text())['custody']['owned'].get('125'),'child')
    restarted=m.SupportSupervisor(Adapter(),config);restarted.rpc=supervisor.rpc
    with patch.object(m,'process_snapshot',return_value={125:{**descendant,'pgid':125,'sid':125}}):restarted.tick()
-   self.assertNotIn('complete',calls)
+   self.assertNotIn('artifacts-commit',calls)
    with patch.object(m,'process_snapshot',return_value={}):restarted.tick()
-   self.assertEqual(calls.count('complete'),1)
+   self.assertEqual(calls.count('artifacts-commit'),1)
  def test_refused_command_preserves_descendants_discovered_in_its_admission_check(self):
   root={'pid':123,'identity':'root','pgid':123,'sid':123,'ppid':1,'state':'S'}
   descendant={'pid':125,'identity':'child','pgid':123,'sid':123,'ppid':1,'state':'S'}
@@ -205,16 +293,16 @@ class SupportTests(unittest.TestCase):
    class Child:
     def poll(self):return 0
    supervisor.children[123]=Child()
-   calls=[];supervisor.rpc=lambda op,body:calls.append(op) or []
+   calls=[];supervisor.rpc=lambda op,body:calls.append(op) or artifact_reply(op,body)
    with patch.object(m,'process_snapshot',return_value={123:{**root,'state':'Z'},125:grandchild}):
     supervisor.tick();supervisor.tick()
-   self.assertNotIn('complete',calls)
+   self.assertNotIn('artifacts-commit',calls)
    self.assertEqual(calls.count('uncertain'),1)
    # Also retain this newly seen child when it subsequently changes session.
    with patch.object(m,'process_snapshot',return_value={125:{**grandchild,'pgid':125,'sid':125}}):supervisor.tick()
-   self.assertNotIn('complete',calls)
+   self.assertNotIn('artifacts-commit',calls)
    with patch.object(m,'process_snapshot',return_value={}):supervisor.tick()
-   self.assertEqual(calls.count('complete'),1)
+   self.assertEqual(calls.count('artifacts-commit'),1)
  def test_final_worker_census_persists_new_descendants_even_when_already_in_attention(self):
   root={'pid':123,'identity':'root','pgid':123,'sid':123,'ppid':1,'state':'S'}
   descendant={'pid':125,'identity':'child','pgid':123,'sid':123,'ppid':1,'state':'S'}
@@ -225,11 +313,11 @@ class SupportTests(unittest.TestCase):
    result=Path(d)/'result.json';m.atomic(result,{'outcome':'completed','summary':'probe','files':{}})
    receipt=supervisor.directory/'job.receipt.json'
    m.atomic(receipt,{'id':'job','session':'s','phase':'attention','pid':123,'custody':{'root':root,'owned':{'123':'root'},'phase':'uncertain'},'result':str(result)})
-   calls=[];supervisor.rpc=lambda op,body:calls.append(op) or []
+   calls=[];supervisor.rpc=lambda op,body:calls.append(op) or artifact_reply(op,body)
    with patch.object(m,'process_snapshot',side_effect=[{}, {123:{**root,'state':'Z'},125:descendant}]):supervisor.tick()
    self.assertEqual(json.loads(receipt.read_text())['custody']['owned']['125'],'child')
    with patch.object(m,'process_snapshot',return_value={125:{**descendant,'pgid':125,'sid':125}}):supervisor.tick()
-   self.assertNotIn('complete',calls)
+   self.assertNotIn('artifacts-commit',calls)
  @unittest.skipUnless(NATIVE_CENSUS_AVAILABLE,'Native integration requires a census in the child PID namespace')
  def test_normal_exit_retains_output_and_private_identity_journal(self):
   with tempfile.TemporaryDirectory() as d:
@@ -270,16 +358,19 @@ class SupportTests(unittest.TestCase):
    class Child:
     def poll(self):return 0
    supervisor.children[custody['root']['pid']]=Child()
-   operations=[];supervisor.rpc=lambda op,body:operations.append((op,body)) or []
+   operations=[];supervisor.rpc=lambda op,body:operations.append((op,body)) or artifact_reply(op,body)
    supervisor.tick();supervisor.tick()
    self.assertEqual([op for op,body in operations].count('uncertain'),1)
-   self.assertNotIn('complete',[op for op,body in operations])
+   self.assertNotIn('artifacts-commit',[op for op,body in operations])
    self.assertEqual(json.loads(receipt.read_text())['phase'],'attention')
    time.sleep(.7)
    supervisor.tick()
-   complete=[body for op,body in operations if op=='complete']
+   complete=[body for op,body in operations if op=='artifacts-commit']
    self.assertEqual(len(complete),1);self.assertEqual(complete[0]['result']['outcome'],'failed')
-   self.assertEqual(complete[0]['result']['files'],{'report.json':'available report'})
+   self.assertEqual(complete[0]['result']['files'],{})
+   uploaded=[body for op,body in operations if op=='artifacts-put']
+   self.assertEqual(len(uploaded),1);self.assertEqual(uploaded[0]['path'],'report.json')
+   self.assertEqual(base64.b64decode(uploaded[0]['data']),b'available report')
  @unittest.skipUnless(NATIVE_CENSUS_AVAILABLE,'Native integration requires a census in the child PID namespace')
  def test_denied_probe_without_independent_census_is_uncertain(self):
   with tempfile.TemporaryDirectory() as d:
@@ -455,11 +546,11 @@ class SupportTests(unittest.TestCase):
    s=m.SupportSupervisor(Adapter(),{'stateDirectory':d,'recoveryTasks':{'platform-probe:macos-arm64':{'capability':'macos-arm64'}}})
    result=Path(d)/'result.json';result.write_text(json.dumps({'outcome':'completed','summary':'probe','files':{}}))
    receipt=s.directory/'job.receipt.json';m.atomic(receipt,{'id':'job','session':'s','phase':'running','pid':123,'result':str(result)})
-   calls=[];s.rpc=lambda op,body:calls.append(op) or []
+   calls=[];s.rpc=lambda op,body:calls.append(op) or artifact_reply(op,body)
    class Child:
     def poll(self):return None
    s.children[123]=Child();s.tick()
-   self.assertNotIn('complete',calls)
+   self.assertNotIn('artifacts-commit',calls)
    self.assertEqual(json.loads(receipt.read_text())['phase'],'running')
  def test_missing_terminal_result_escalates_without_repeating_the_worker(self):
   with tempfile.TemporaryDirectory() as d:
@@ -467,7 +558,7 @@ class SupportTests(unittest.TestCase):
     def status(self):return {'machine':'mac','draining':False}
    s=m.SupportSupervisor(Adapter(),{'stateDirectory':d,'recoveryTasks':{'platform-probe:macos-arm64':{'capability':'macos-arm64'}}})
    receipt=s.directory/'job.receipt.json';m.atomic(receipt,{'id':'job','session':'s','phase':'launch-requested','result':str(Path(d)/'absent')})
-   calls=[];s.rpc=lambda op,body:calls.append(op) or []
+   calls=[];s.rpc=lambda op,body:calls.append(op) or artifact_reply(op,body)
    with patch.object(m,'route_available',return_value=True),patch.object(m.subprocess,'Popen') as spawn:s.tick();s.tick();spawn.assert_not_called()
    self.assertEqual(calls.count('uncertain'),1)
    self.assertEqual(json.loads(receipt.read_text())['phase'],'attention')

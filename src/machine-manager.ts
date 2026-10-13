@@ -172,7 +172,7 @@ export async function serveManager(manager: MachineManager, projectTokens: Recor
         return send(200, { ok: true, drainingProjects: manager.config.drainingProjects });
       }
       if (!project) return send(403, { error: "Project credential required" });
-      if (["/tasks/request", "/tasks/read", "/recovery/facts", "/recovery/evidence", "/recovery/pause", "/recovery/coordination", "/recovery/report", "/recovery/begin", "/recovery/decide", "/recovery/complete"].includes(req.url ?? "")) {
+      if (["/tasks/request", "/tasks/read", "/tasks/artifact", "/recovery/facts", "/recovery/evidence", "/recovery/pause", "/recovery/coordination", "/recovery/report", "/recovery/begin", "/recovery/decide", "/recovery/complete"].includes(req.url ?? "")) {
         if (!manager.claims.call) throw new Error("Recovery service unavailable");
         return send(200, await manager.claims.call(req.url!, { ...body, project,
           ...(req.url === "/recovery/evidence" ? { records: body.records?.map((r: any) => ({ ...r, machine: manager.config.machine })) } : {}) }));
