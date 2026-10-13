@@ -6,6 +6,26 @@ import {recoveryFingerprint} from './fleet-recovery.js';
 
 const limits={box:{heavyLimit:1,combinedLimit:2},mac:{heavyLimit:1,combinedLimit:2}};
 const revision='9950e6fbd28aac7ec3f6772e2deeebbcf83b52a2';
+test('failed-task excerpts require the owning recovery run over HTTP',async t=>{
+ const store=new FleetStore(':memory:',limits),server=await serveFleet(store,{box:'b',mac:'m'},'a',0);
+ t.after(async()=>{await new Promise<void>(r=>server.close(()=>r()));store.close();});
+ const address=server.address();assert.ok(address&&typeof address!=='string');
+ const url='http://127.0.0.1:'+address.port,box=new JsonClient(url,'b'),mac=new JsonClient(url,'m');
+ const ticket='org/core#1947';
+ store.tasks.report('mac',{capabilities:['dispatcher-repair'],ready:true});
+ const task=store.tasks.request(ticket,{recipe:'dispatcher-repair',capability:'dispatcher-repair',revision,reason:'failed check'});
+ store.taskStart('mac',task.id,'native');
+ store.taskComplete('mac',task.id,'native',{outcome:'failed',summary:'failed',files:{'test.diagnostic.log':'AssertionError: read happened','raw.log':'private record'}});
+ store.start({id:'assessment',machine:'box',session:'s',project:'org/core',ticket,role:'recovery',resource:'heavy',locks:[]});
+ const request={tickets:[ticket],project:'org/core',session:'s',runId:'assessment'};
+ const [facts]=await box.call<any[]>('/recovery/facts',request);
+ assert.equal(facts.tasks[0].result.files['test.diagnostic.log'],'AssertionError: read happened');
+ assert.equal(facts.tasks[0].result.files['raw.log'],'retained private artifact');
+ await assert.rejects(mac.call('/recovery/facts',request));
+ const [ordinary]=await box.call<any[]>('/recovery/facts',{tickets:[ticket]});
+ assert.equal(ordinary.tasks[0].result.files['test.diagnostic.log'],'retained private artifact');
+});
+
 test('real HTTP source admission, native result, ownership and reassessment work together',async t=>{
  const store=new FleetStore(':memory:',limits),server=await serveFleet(store,{box:'b',mac:'m'},'a',0);
  t.after(async()=>{await new Promise<void>(r=>server.close(()=>r()));store.close();});

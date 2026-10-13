@@ -11,6 +11,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from contextlib import contextmanager
 
 RECIPES={'platform-probe','memory-runtime-smoke','android-tool-then-text','dispatcher-repair'}
 
@@ -23,41 +24,212 @@ def clean_env():
     # Trusted launchers retain their own authentication. Build/test processes cannot access fleet administrators.
     return {k:v for k,v in os.environ.items() if not k.startswith('FLEET_') and k not in {'GITHUB_TOKEN','GH_TOKEN','OP_SERVICE_ACCOUNT_TOKEN','PYRY_MANAGER_TOKEN','PYRY_MANAGER_URL','PYRY_DEV_AGENTS_TOKEN','PYRY_LIVE_CLAUDE_TOKEN','ANTHROPIC_API_KEY','CLAUDE_CODE_OAUTH_TOKEN'}}
 
-def execute(argv,cwd,log,env=None,timeout=3600):
-    """Only the new session created here can receive cleanup signals."""
-    with log.open('ab') as out:
-        child=subprocess.Popen(argv,cwd=cwd,env=env or clean_env(),stdin=subprocess.DEVNULL,stdout=out,stderr=out,start_new_session=True)
+def process_snapshot():
+    """Read identities, never commands/environments. Failure is uncertainty, not absence."""
+    try:
+        records={}
+        if sys.platform.startswith('linux'):
+            # A procfs mounted from another PID namespace cannot prove our child's absence.
+            if int(Path('/proc/self/stat').read_text().split(' ',1)[0])!=os.getpid():return None
+            boot=Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+            for path in Path('/proc').iterdir():
+                if not path.name.isdigit():continue
+                try:
+                    fields=(path/'stat').read_text().rsplit(')',1)[1].split()
+                except FileNotFoundError:continue
+                pid=int(path.name)
+                records[pid]={'pid':pid,'ppid':int(fields[1]),'pgid':int(fields[2]),'sid':int(fields[3]),
+                              'identity':boot+':'+fields[19],'state':fields[0]}
+        else:
+            output=subprocess.check_output(['ps','-axo','pid=,ppid=,pgid=,lstart=,stat='],text=True,timeout=5)
+            for line in output.splitlines():
+                fields=line.split()
+                if len(fields)!=9:raise ValueError('Incomplete process census')
+                pid=int(fields[0])
+                records[pid]={'pid':pid,'ppid':int(fields[1]),'pgid':int(fields[2]),'sid':None,
+                              'identity':' '.join(fields[3:8]),'state':fields[8]}
+        if os.getpid() not in records:return None
+        return records
+    except (OSError,ValueError,IndexError,subprocess.SubprocessError):return None
+
+def observe_custody(record,snapshot):
+    """Keep observed descendants across reparenting and reject PID/group reuse."""
+    if snapshot is None or not record.get('root'):return 'uncertain'
+    root=record['root'];pid=root['pid'];current=snapshot.get(pid)
+    if current and current['identity']!=root['identity']:return 'uncertain'
+    owned=record.setdefault('owned',{})
+    unproved=record.setdefault('unproved',{})
+    parents={pid} if current else set()
+    for key,identity in owned.items():
+        row=snapshot.get(int(key))
+        if row and row['identity']==identity:parents.add(row['pid'])
+    # A group number can be reused after its last member exits. Only a matching
+    # recorded identity anchors ownership and permits discovering group members.
+    group={p for p,row in snapshot.items() if row['pgid']==pid or (root.get('sid')==pid and row.get('sid')==pid)}
+    anchored=bool(group&parents)
+    members=parents|(group if anchored else set())
+    while True:
+        descendants={p for p,row in snapshot.items() if row['ppid'] in members}
+        expanded=members|descendants
+        if expanded==members:break
+        members=expanded
+    for p in members:
+        if p in snapshot:
+            owned[str(p)]=snapshot[p]['identity'];unproved.pop(str(p),None)
+    # Unanchored members cannot receive signals. Preserve their identity across
+    # reparenting too: disappearance from the old group alone proves no drainage.
+    possible={int(key) for key,identity in unproved.items() if int(key) in snapshot and snapshot[int(key)]['identity']==identity}
+    if not anchored:possible.update(group)
+    while True:
+        expanded=possible|{p for p,row in snapshot.items() if row['ppid'] in possible}
+        if expanded==possible:break
+        possible=expanded
+    for p in possible-members:unproved[str(p)]=snapshot[p]['identity']
+    alive=any(p in snapshot and snapshot[p]['identity']==identity and not snapshot[p]['state'].startswith(('Z','X'))
+              for key,identity in owned.items() for p in [int(key)])
+    unknown=any(p in snapshot and snapshot[p]['identity']==identity and not snapshot[p]['state'].startswith(('Z','X'))
+                for key,identity in unproved.items() for p in [int(key)])
+    return 'alive' if alive else 'uncertain' if unknown else 'drained'
+
+def new_custody(pid):
+    snapshot=process_snapshot()
+    root=snapshot.get(pid) if snapshot is not None else None
+    record={'root':root,'owned':{},'phase':'uncertain','denied':False}
+    observe_custody(record,snapshot)
+    return record
+
+def custody_file(log):return log.with_suffix('.custody.json')
+
+def poll_with_custody(child,observe):
+    # WNOWAIT leaves an exited leader in the census until its descendants have
+    # been recorded. This closes the exit window between a census and poll().
+    if getattr(child,'pid',None) and hasattr(os,'waitid') and hasattr(os,'WNOWAIT'):
         try:
-            code=child.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            os.killpg(child.pid,signal.SIGTERM)
-            try:code=child.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                os.killpg(child.pid,signal.SIGKILL);code=child.wait()
-        # Fixture children are owned by the isolated command group, even after their parent exits.
-        try:os.killpg(child.pid,signal.SIGTERM)
-        except ProcessLookupError:pass
-        end=time.monotonic()+15
-        while time.monotonic()<end:
-            try:os.killpg(child.pid,0)
-            except ProcessLookupError:return code
-            time.sleep(.1)
-        try:os.killpg(child.pid,signal.SIGKILL)
-        except ProcessLookupError:pass
-        while True:
-            try:os.killpg(child.pid,0)
-            except ProcessLookupError:return code
-            time.sleep(.2)
+            if os.waitid(os.P_PID,child.pid,os.WEXITED|os.WNOHANG|os.WNOWAIT) is None:return None
+        except OSError:
+            # Already-reaped children and unavailable waitid still require the
+            # independent identity census; this error never proves drainage.
+            pass
+    observe()
+    return child.poll()
+
+def reassess_commands(journal,snapshot):
+    states=[]
+    for record in journal['commands']:
+        state=observe_custody(record,snapshot) if record['phase']!='drained' else 'drained'
+        record['phase']=state;states.append(state)
+    return states
+
+def command_custody(directory):
+    """Reassess and retain command identities after worker exit, without signalling."""
+    path=custody_file(directory/'execution.log')
+    if not path.is_file():return 'uncertain'
+    try:
+        journal=json.loads(path.read_text())
+        states=reassess_commands(journal,process_snapshot())
+        # Reassessment can discover descendants that later leave the original session.
+        # Their identities must survive the next supervisor poll/restart.
+        atomic(path,journal)
+        return 'alive' if 'alive' in states else 'drained' if states and all(state=='drained' for state in states) else 'uncertain'
+    except (OSError,ValueError,KeyError,TypeError):return 'uncertain'
+
+def directory_custody(directory):
+    if custody_file(directory/'execution.log').is_file():return command_custody(directory)
+    # Only this fixed recipe creates no command workers.
+    try:return 'drained' if json.loads((directory/'task.json').read_text())['request']['recipe']=='platform-probe' else 'uncertain'
+    except (OSError,ValueError,KeyError,TypeError):return 'uncertain'
+
+@contextmanager
+def cancellation_guard():
+    cancelled=[];handlers={}
+    def cancel(sig,frame):
+        if not cancelled:cancelled.append(sig)
+    try:
+        for sig in (signal.SIGTERM,signal.SIGINT):
+            handlers[sig]=signal.getsignal(sig);signal.signal(sig,cancel)
+        yield cancelled
+    finally:
+        for sig,handler in handlers.items():signal.signal(sig,handler)
+
+def execute(argv,cwd,log,env=None,timeout=3600,*,cleanup_timeout=15):
+    """Only this new group receives signals. Denial stops signalling, but not report collection."""
+    path=custody_file(log)
+    journal=json.loads(path.read_text()) if path.is_file() else {'commands':[]}
+    if journal['commands']:
+        states=reassess_commands(journal,process_snapshot())
+        atomic(path,journal)
+        if any(state!='drained' for state in states):return 1
+    with cancellation_guard() as cancelled,log.open('ab') as out:
+        # Retain uncertain launch intent before spawning. A crash between Popen
+        # and recording the identity cannot authorize another command.
+        record={'root':None,'owned':{},'phase':'uncertain','denied':False}
+        journal['commands'].append(record);atomic(path,journal)
+        try:
+            child=subprocess.Popen(argv,cwd=cwd,env=env if env is not None else clean_env(),stdin=subprocess.DEVNULL,stdout=out,stderr=out,start_new_session=True)
+        except OSError:
+            # Popen reaps an exec-failed child before raising. No worker launched.
+            record['phase']='drained';atomic(path,journal)
+            raise
+        record.update(new_custody(child.pid))
+        def save():atomic(path,journal)
+        def observe():
+            state=observe_custody(record,process_snapshot());record['phase']=state
+            save();return state
+        def group_signal(sig):
+            if record['denied']:return False
+            if sig!=0:
+                snapshot=process_snapshot()
+                if observe_custody(record,snapshot)!='alive':return False
+                if not any(row['pgid']==child.pid and record['owned'].get(str(pid))==row['identity'] for pid,row in snapshot.items()):return False
+            try:os.killpg(child.pid,sig);return True
+            except ProcessLookupError:return False
+            except OSError:
+                record['denied']=True;record['reason']='Group signal/probe denied or unavailable';save();return False
+        try:
+            save()
+            deadline=time.monotonic()+timeout
+            timed_out=False
+            # poll() reaps an exited leader. Census first so its identity still
+            # anchors ownership of grandchildren born just before it exited.
+            while True:
+                observe()
+                code=poll_with_custody(child,observe)
+                if code is not None or cancelled:break
+                if time.monotonic()>=deadline:timed_out=True;break
+                time.sleep(.05)
+            # Probe once even after a successful leader exit: EPERM needs independent drainage evidence.
+            group_signal(0)
+            state=observe()
+            if state!='drained' and not record['denied']:
+                # Do not signal a group whose ownership cannot be independently established.
+                if state=='alive':group_signal(signal.SIGTERM)
+                end=time.monotonic()+cleanup_timeout
+                while state!='drained' and not record['denied'] and time.monotonic()<end:
+                    time.sleep(.05);poll_with_custody(child,observe);state=observe()
+                if state=='alive' and not record['denied']:group_signal(signal.SIGKILL)
+                end=time.monotonic()+cleanup_timeout
+                while state!='drained' and not record['denied'] and time.monotonic()<end:
+                    time.sleep(.05);poll_with_custody(child,observe);state=observe()
+            record['phase']=state;save()
+            code=poll_with_custody(child,observe) if code is None else code
+            return code if state=='drained' and not timed_out and not cancelled and code is not None else 1
+        finally:
+            # Persist custody even if a non-signal failure interrupts report collection.
+            save()
 
 def clone(source,destination,revision=None):
     if destination.exists():raise RuntimeError('A task checkout already exists; it must not be overwritten')
-    subprocess.run(['git','clone','--no-checkout',str(source),str(destination)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    log=destination.parent/'execution.log'
+    def git(*args):
+        if execute(['git',*args],destination.parent,log,timeout=300)!=0:
+            raise RuntimeError('Checkout setup failed or has incomplete custody; private logs retained')
+    git('clone','--no-checkout',str(source),str(destination))
     if revision:
-        subprocess.run(['git','-C',str(destination),'remote','set-url','origin','https://github.com/pyrycode/pyrycode.git'],check=True)
-        subprocess.run(['git','-C',str(destination),'fetch','origin',revision],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-        subprocess.run(['git','-C',str(destination),'switch','--detach',revision],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        git('-C',str(destination),'remote','set-url','origin','https://github.com/pyrycode/pyrycode.git')
+        git('-C',str(destination),'fetch','origin',revision)
+        git('-C',str(destination),'switch','--detach',revision)
     else:
-        subprocess.run(['git','-C',str(destination),'switch','main'],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        git('-C',str(destination),'switch','main')
 
 
 def native_recipe(task,paths,directory):
@@ -70,7 +242,11 @@ def native_recipe(task,paths,directory):
         code=execute([paths['node'], '--import', paths['tsx'], paths['repairProgram'],str(directory/'task.json')],directory,log,timeout=5400)
         record=directory/'repair-result.json'
         if not record.is_file():raise RuntimeError('Repair did not retain its independent review result')
-        return json.loads(record.read_text())
+        result=json.loads(record.read_text())
+        if code!=0:
+            result['outcome']='failed';result['files'].pop('publication.json',None)
+            result['summary']='Repair command did not complete with confirmed drainage. '+result['summary']
+        return result
     core=directory/'core'
     clone(paths['core'],core,request['revision'])
     env=clean_env()
@@ -133,6 +309,31 @@ class SupportSupervisor:
                 if receipt.exists() and json.loads(receipt.read_text()).get('phase')!='complete':return False
         return route_available(route)
 
+    def drained(self,old,receipt):
+        if old.get('drainConfirmed'):return True
+        custody=old.get('custody')
+        if not custody:return False
+        custody['phase']=observe_custody(custody,process_snapshot())
+        # This final census may discover a child absent from the earlier tick census.
+        atomic(receipt,old)
+        if custody['phase']!='drained':return False
+        # A session leader's exit says nothing about its separately launched command groups.
+        if old.get('container'):
+            root=old.get('containerDirectory')
+            if not root:return False
+            try:
+                result=subprocess.check_output(['podman','exec',old['container'],'python3',root+'/worker.py','--custody',root],text=True,timeout=15)
+                drained=json.loads(result).get('phase')=='drained'
+            except (OSError,ValueError,subprocess.SubprocessError):return False
+        else:
+            directory=Path(old.get('directory',str(Path(old['result']).parent)))
+            drained=directory_custody(directory)=='drained'
+        if drained:
+            # Completion and publication can be retried after a restart. Once
+            # every group drained, PID reuse cannot revoke that proof.
+            old['drainConfirmed']=True;atomic(receipt,old)
+        return drained
+
     def tick(self):
         routes=self.config.get('recoveryTasks',{})
         if not routes:return []
@@ -148,12 +349,27 @@ class SupportSupervisor:
             if old['phase']=='complete':continue
             result=Path(old['result'])
             child=self.children.get(old.get('pid'))
-            if child is not None:alive=child.poll() is None
-            elif old.get('pid'):
-                observed=subprocess.run(['ps','-p',str(old['pid']),'-o','stat='],capture_output=True,text=True).stdout.strip()
-                alive=bool(observed) and not observed.startswith('Z')
-            else:alive=False
-            if result.is_file() and not alive:
+            custody=old.get('custody')
+            def observe_worker():
+                nonlocal snapshot,custody_state
+                if old.get('drainConfirmed'):
+                    custody_state='drained';return
+                snapshot=process_snapshot()
+                custody_state=observe_custody(custody,snapshot) if custody else 'uncertain'
+                if custody:
+                    custody['phase']=custody_state
+                    atomic(receipt,old)
+            snapshot=None;custody_state='uncertain'
+            observe_worker()
+            # Preserve the leader as an ownership anchor until its descendants
+            # have been recorded; poll() can reap it immediately.
+            root_alive=not old.get('drainConfirmed') and child is not None and poll_with_custody(child,observe_worker) is None
+            root=custody.get('root') if custody else None
+            observed=snapshot.get(old.get('pid')) if snapshot is not None else None
+            worker_alive=root_alive or bool(child is None and root and observed and
+                observed['identity']==root['identity'] and not observed['state'].startswith(('Z','X')))
+            alive=root_alive or custody_state!='drained'
+            if result.is_file() and not alive and self.drained(old,receipt):
                 value=json.loads(result.read_text())
                 publication=value.get('files',{}).pop('publication.json',None)
                 if publication:
@@ -168,9 +384,9 @@ class SupportSupervisor:
                 old['phase']='complete';atomic(receipt,old)
             elif old['phase']=='attention':
                 running.append(old)
-            elif old['phase']=='launch-requested' or not alive:
+            elif old['phase']=='launch-requested' or not worker_alive:
                 # Delivery could have happened before a crash. Never create another worker.
-                old['phase']='attention';old['reason']='Task worker ended without confirmed terminal evidence; inspect the retained process and reservation';atomic(receipt,old)
+                old['phase']='attention';old['reason']='Task worker or descendants have no confirmed drainage; inspect the retained process and reservation';atomic(receipt,old)
                 self.rpc('uncertain',{'machine':machine,'id':old['id'],'session':old['session'],'reason':old['reason']})
                 running.append(old)
             else:running.append(old)
@@ -190,19 +406,22 @@ class SupportSupervisor:
                 root=route['containerDirectory'].rstrip('/')+'/'+task['id']
                 command=['podman','exec',route['container'],'python3',root+'/worker.py','--worker',root]
             else:command=[sys.executable,str(program),'--worker',str(folder)]
-            saved={'id':task['id'],'session':session,'phase':'launch-requested','result':str(result),'created':time.time(),'container':route.get('container')}
+            saved={'id':task['id'],'session':session,'phase':'launch-requested','result':str(result),'created':time.time(),'container':route.get('container'),'directory':str(folder)}
+            if route.get('container'):saved['containerDirectory']=root
             receipt=self.directory/(task['id']+'.receipt.json');atomic(receipt,saved)
             with (folder/'worker.log').open('ab') as output:
                 child=subprocess.Popen(command,stdin=subprocess.DEVNULL,stdout=output,stderr=output,start_new_session=True,env=clean_env())
             self.children[child.pid]=child
-            saved.update(phase='running',pid=child.pid);atomic(receipt,saved)
+            saved.update(phase='running',pid=child.pid,custody=new_custody(child.pid));atomic(receipt,saved)
             return running+[saved]
-        return []
+        return running
 
 def main():
     os.umask(0o077)
-    if len(sys.argv)!=3 or sys.argv[1]!='--worker':raise SystemExit('Worker requires a saved private task directory')
+    if len(sys.argv)!=3 or sys.argv[1] not in {'--worker','--custody'}:raise SystemExit('Worker requires a saved private task directory')
     directory=Path(sys.argv[2])
+    if sys.argv[1]=='--custody':
+        print(json.dumps({'phase':directory_custody(directory)}));return
     try:result=native_recipe(json.loads((directory/'task.json').read_text()),json.loads((directory/'paths.json').read_text()),directory)
     except Exception as error:result={'outcome':'failed','summary':'Native execution failed: '+type(error).__name__+'. Private logs retained.','files':{}}
     atomic(directory/'result.json',result)

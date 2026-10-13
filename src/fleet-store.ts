@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { RecoveryFacts, type PauseRecord, type EvidenceRecord, type CoordinationRecord } from "./recovery-facts.js";
 import { RecoveryLedger, validateObservations, IDLE_RECOVERY_REASONS, RECOVERY_UNKNOWN_PAUSE_REASON, type RecoveryObservation, type RecoveryDecision, type RecoveryIncident } from "./fleet-recovery.js";
 import { OperationReports } from './operation-reports.js';
-import {RecoveryTasks, type RecoveryTaskRequest, type RecoveryTaskResult} from './recovery-tasks.js';
+import {RecoveryTasks, assessmentTasks, type RecoveryTaskRequest, type RecoveryTaskResult} from './recovery-tasks.js';
 import {createHash} from 'node:crypto';
 import type { AgentRunner } from './agent-runner.js';
 
@@ -193,19 +193,9 @@ export class FleetStore {
   }
   prepareRepair(machine:string,id:string,session:string,publication:unknown) {
     return this.transaction(()=>{
-      const task=this.tasks.get(id);
-      if(task.machine!==machine||task.session!==session||task.request.recipe!=='dispatcher-repair'||!task.runId) throw new Error('Repair actor mismatch');
-      const serialized=JSON.stringify(publication);
-      if(task.state==='publishing') {
-        if(task.result?.files['publication.json']!==serialized) throw new Error('Prepared repair changed');
-        return task;
-      }
-      if(task.state!=='running') throw new Error('Repair is not running');
-      const result={outcome:'completed' as const,summary:'Verified repair prepared; publication and deployment remain pending.',files:{'publication.json':serialized}};
-      this.tasks.complete(id,machine,session,result);
-      this.db.prepare("UPDATE fleet_recovery_tasks SET state='publishing' WHERE id=?").run(id);
-      this.releaseTaskRun(task.runId,machine,session,true);
-      return this.tasks.get(id);
+      const task=this.tasks.prepareRepair(id,machine,session,publication);
+      this.releaseTaskRun(task.runId!,machine,session,true);
+      return task;
     });
   }
   private releaseTaskRun(runId:string,machine:string,session:string,completed:boolean):void {
@@ -247,10 +237,17 @@ export class FleetStore {
       return this.workflow.change(ticket, change, 'operator', commandId, revision);
     });
   }
-  recoveryFacts(tickets: string[]) {
+  recoveryFacts(tickets: string[], assessment?: {machine:string;session:string;project:string;runId:string}) {
+    let diagnosticTicket: string | undefined;
+    if(assessment) {
+      const run=this.snapshot().runs.find(r=>r.id===assessment.runId && r.machine===assessment.machine && r.session===assessment.session && r.project===assessment.project && r.role==='recovery');
+      if(!run) throw new Error('Diagnostics require the owning admitted recovery assessment');
+      this.authorize(assessment.machine,assessment.session,run.ticket,run.id);
+      diagnosticTicket=run.ticket;
+    }
     const evidence = this.facts.getEvidence(tickets);
     return tickets.map(ticket => ({ ticket, pause: this.facts.getPause(ticket),
-      artifactRevision: this.artifactRevision(ticket), evidence: evidence.filter(e => e.ticket === ticket), capabilities:this.tasks.capabilities(), tasks: this.tasks.list(ticket).map(t => ({...t,result:t.result ? {...t.result,files:Object.fromEntries(Object.keys(t.result.files).map(p=>[p,"retained private artifact"]))} : null})),
+      artifactRevision: this.artifactRevision(ticket), evidence: evidence.filter(e => e.ticket === ticket), capabilities:this.tasks.capabilities(), tasks: assessmentTasks(this.tasks.list(ticket),ticket===diagnosticTicket),
       coordination: this.facts.getCoordination(ticket) }));
   }
   recordPause(machine: string, session: string, project: string, runId: string, record: PauseRecord) {
