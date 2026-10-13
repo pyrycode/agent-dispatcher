@@ -124,3 +124,24 @@ test("failed persistence leaves admission unchanged and invalid saved projects a
   assert.equal((await manager.grants(mobile, "s")).length, 1);
   assert.throws(() => new MachineManager({ ...config, drainingProjects: ["unknown"] }, client), /Invalid.*drain/);
 });
+
+test("operator drain and resume commands are recorded, persisted and reported for supervisors", async t => {
+  const { store, client, config } = fixture();
+  const dir = mkdtempSync("/tmp/drain-");
+  const path = join(dir, "manager.json");
+  writeFileSync(path, JSON.stringify({ ...config, projects: [{ repo: mobile, tokenEnv: "MOBILE_TOKEN" }] }));
+  let now = 1_000;
+  const manager = new MachineManager(config, client, () => now);
+  const server = await serveManager(manager, { [mobile]: "mobile-token" }, "operator-token", join(dir, "manager.sock"), "127.0.0.1", (projects, changes) => persistProjectDrains(path, projects, changes));
+  t.after(async () => { await new Promise<void>(r => server.close(() => r())); store.close(); rmSync(dir, { recursive: true }); });
+  const admin = new JsonClient(`unix://${join(dir, "manager.sock")}`, "operator-token");
+  await admin.call("/project-drain", { project: mobile, draining: true });
+  now = 2_000;
+  await admin.call("/project-drain", { project: mobile, draining: false });
+  const expected = [{ project: mobile, draining: true, at: 1_000 }, { project: mobile, draining: false, at: 2_000 }];
+  assert.deepEqual(JSON.parse(readFileSync(path, "utf8")).projectDrainChanges, expected);
+  assert.deepEqual((await manager.status()).projectDrainChanges, expected);
+  // A restarted manager keeps the record.
+  const restarted = new MachineManager({ ...config, projectDrainChanges: JSON.parse(readFileSync(path, "utf8")).projectDrainChanges }, client);
+  assert.deepEqual((await restarted.status()).projectDrainChanges, expected);
+});

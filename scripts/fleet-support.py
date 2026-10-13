@@ -332,6 +332,7 @@ class SupportSupervisor:
         self.skips_file=Path(config['stateDirectory'])/'native-task-skips.json'
         try:self.reported_errors=json.loads(self.skips_file.read_text())
         except (OSError,ValueError):self.reported_errors={}
+        if not isinstance(self.reported_errors,dict):self.reported_errors={}
         self.directory.mkdir(parents=True,exist_ok=True,mode=0o700)
 
     def rpc(self,operation,body):

@@ -193,15 +193,38 @@ class Supervisor:
         return cleared
 
     def ownership_problem(self, state):
-        """The same comparison the verifying branch makes before it completes."""
+        """The verifying branch's comparison, for retiring a superseded record.
+
+        Ownership must match exactly. A drain policy difference is accepted only
+        where a recorded operator drain or resume command, made after the record
+        was saved, explains each changed project."""
         after = self.adapter.status()
         current = real_claims(after)
         releases = {(c['ticket'], c['machine'], c['generation']) for c in after.get('releasedAssessmentClaims', [])}
-        if any(current.get(ticket) != owner and (ticket, *owner) not in releases for ticket, owner in state['claims'].items()):
+        # A claim that no longer exists was released or withdrawn. Only a claim now
+        # held by another machine or generation is an ownership change.
+        if any(ticket in current and current[ticket] != owner and (ticket, *owner) not in releases
+               for ticket, owner in state['claims'].items()):
             return 'Existing ticket ownership changed. Inspect the retained comparison.'
-        if policy(after) != state['policy']:
+        if policy(after) != state['policy'] and not self.recorded_policy_change(state, after):
             return 'Operator drain policy changed during verification.'
         return None
+
+    def recorded_policy_change(self, state, after):
+        saved, current = state['policy'], policy(after)
+        if saved[:2] != current[:2]:
+            # Machine and machine-wide drain have no recorded operator command.
+            return False
+        created = state.get('created')
+        if not isinstance(created, (int, float)):
+            return False
+        changes = [c for c in after.get('projectDrainChanges', []) if isinstance(c, dict)
+                   and isinstance(c.get('at'), (int, float)) and c['at'] > created * 1000]
+        for project in set(saved[2]) ^ set(current[2]):
+            recorded = [c for c in changes if c.get('project') == project]
+            if not recorded or recorded[-1].get('draining') is not (project in current[2]):
+                return False
+        return True
 
     def superseded(self, project, desired, state, observed):
         """Retire a record a later verified start has made obsolete.

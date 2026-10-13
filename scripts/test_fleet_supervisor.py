@@ -361,7 +361,7 @@ class ReviewFollowUpTests(StaleStateTests):
             self.setUp()
             self.open_record(phase)
             state=json.loads(self.receipt().read_text());state['claims']={PROJECT+'#1':['mac','owner']};module.atomic(self.receipt(),state)
-            self.adapter.state['claims']=[]
+            self.adapter.state['claims']=[{'ticket':PROJECT+'#1','machine':'mac','generation':'other'}]
             self.started_elsewhere()
             result=self.worker.tick(PROJECT,'new')
             self.assertEqual(result['phase'],'attention');self.assertIn('ownership changed',result['reason'])
@@ -376,10 +376,65 @@ class ReviewFollowUpTests(StaleStateTests):
         self.assertEqual(result['phase'],'attention');self.assertIn('drain policy changed',result['reason'])
         self.assertEqual(self.archives('retired'),[])
 
+    def fractal_relay_record(self):
+        # Fractal Relay: start record saved at 16:51 while the project was drained.
+        self.open_record('verifying')
+        state=json.loads(self.receipt().read_text());state['policy']=['mac',False,['other/repo',PROJECT]];module.atomic(self.receipt(),state)
+        self.adapter.state['drainingProjects']=['other/repo']
+        self.started_elsewhere()
+
+    def test_operator_resume_after_the_record_does_not_block_retirement(self):
+        self.fractal_relay_record()
+        # The operator resume at 19:44, about three hours after the record.
+        self.adapter.state['projectDrainChanges']=[{'project':PROJECT,'draining':False,'at':(1000+3*3600)*1000}]
+        result=self.worker.tick(PROJECT,'new')
+        self.assertEqual(result['phase'],'current');self.assertIn('Retired verifying record',result['reason'])
+        self.assertEqual(len(self.archives('retired')),1)
+
+    def test_policy_change_without_an_operator_record_stays_in_attention(self):
+        for changes in [[],[{'project':PROJECT,'draining':False,'at':500*1000}],[{'project':PROJECT,'draining':True,'at':(1000+3600)*1000}],
+                        [{'project':'other/repo','draining':False,'at':(1000+3600)*1000}]]:
+            with self.subTest(changes=changes):
+                self.setUp();self.fractal_relay_record()
+                self.adapter.state['projectDrainChanges']=changes
+                result=self.worker.tick(PROJECT,'new')
+                self.assertEqual(result['phase'],'attention');self.assertIn('drain policy changed',result['reason'])
+                self.assertEqual(self.archives('retired'),[])
+
+    def test_recorded_resume_does_not_excuse_changed_ownership_or_machine_drain(self):
+        self.fractal_relay_record()
+        self.adapter.state['projectDrainChanges']=[{'project':PROJECT,'draining':False,'at':(1000+3600)*1000}]
+        self.adapter.state['draining']=True
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'attention')
+        self.setUp();self.fractal_relay_record()
+        self.adapter.state['projectDrainChanges']=[{'project':PROJECT,'draining':False,'at':(1000+3600)*1000}]
+        state=json.loads(self.receipt().read_text());state['claims']={PROJECT+'#1':['mac','owner']};module.atomic(self.receipt(),state)
+        self.adapter.state['claims']=[{'ticket':PROJECT+'#1','machine':'mac','generation':'other'}]
+        result=self.worker.tick(PROJECT,'new')
+        self.assertEqual(result['phase'],'attention');self.assertIn('ownership changed',result['reason'])
+
+    def test_claims_released_since_the_drain_do_not_block_retirement(self):
+        self.open_record('verifying')
+        state=json.loads(self.receipt().read_text())
+        state['claims']={PROJECT+'#1':['mac','owner'],PROJECT+'#2':['mac','unused']};module.atomic(self.receipt(),state)
+        # #1 kept its owner, #2 was a withdrawn unused reservation and is gone.
+        self.adapter.state['claims']=[{'ticket':PROJECT+'#1','machine':'mac','generation':'owner'}]
+        self.started_elsewhere()
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'current')
+        self.assertEqual(len(self.archives('retired')),1)
+
+    def test_a_claim_now_held_by_another_machine_blocks_retirement(self):
+        self.open_record('verifying')
+        state=json.loads(self.receipt().read_text());state['claims']={PROJECT+'#1':['mac','owner']};module.atomic(self.receipt(),state)
+        self.adapter.state['claims']=[{'ticket':PROJECT+'#1','machine':'linux','generation':'owner'}]
+        self.started_elsewhere()
+        result=self.worker.tick(PROJECT,'new')
+        self.assertEqual(result['phase'],'attention');self.assertIn('ownership changed',result['reason'])
+
     def test_legacy_six_hour_record_keeps_its_alert_when_ownership_changed(self):
         self.open_record('attention');state=json.loads(self.receipt().read_text())
         state['reason']=module.SIX_HOUR_REASON;state['claims']={PROJECT+'#1':['mac','owner']};module.atomic(self.receipt(),state)
-        self.adapter.state['claims']=[];self.started_elsewhere()
+        self.adapter.state['claims']=[{'ticket':PROJECT+'#1','machine':'linux','generation':'owner'}];self.started_elsewhere()
         result=self.worker.tick(PROJECT,'new')
         self.assertEqual(result['reason'],module.SIX_HOUR_REASON);self.assertEqual(self.archives('retired'),[])
 

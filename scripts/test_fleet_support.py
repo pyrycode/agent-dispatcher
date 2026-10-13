@@ -161,6 +161,14 @@ class SupportTests(unittest.TestCase):
     self.assertEqual('artifactUnrecoverable' in saved,marked)
     self.assertEqual(entries,[] if marked else [entries[0]])
     self.assertIn('schedule',calls)
+ def test_a_malformed_skip_record_is_treated_as_empty(self):
+  for content in ['[1,2]','"text"','null','{broken']:
+   with self.subTest(content=content),tempfile.TemporaryDirectory() as d:
+    (Path(d)/'native-task-skips.json').write_text(content)
+    s,logged,calls=self.support_with(d,[('a','complete')])
+    self.assertEqual(s.reported_errors,{})
+    with patch.object(s,'route_ready',return_value=False),patch.object(s,'artifact_files',side_effect=PermissionError(13,'denied')):s.tick()
+    self.assertEqual(logged,[('native-task-skipped','a')])
  def test_a_supervisor_restart_does_not_log_the_same_skip_again(self):
   with tempfile.TemporaryDirectory() as d:
    s,logged,calls=self.support_with(d,[('a','complete')])
