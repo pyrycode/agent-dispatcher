@@ -184,10 +184,12 @@ export async function launchCandidates<C extends { agent: { name: string }; item
  * The runner the live test gate may use this round, or null to skip it. A
  * missing environment variable or a failing live-gate health check holds it,
  * and so does the stop signal: in drain mode the gate starts no new run,
- * like the agents, and the drain waits only for one already going.
+ * like the agents, and the drain waits only for one already going. An
+ * infrastructure pause holds it too, after a run failed in the shape of a
+ * shared environment failure (infra-failure.ts), until its cooldown ends.
  */
-export function liveGateRunnerFor<R>(opts: { runner: R | null; draining: boolean; envHeld: boolean; healthFailures: number }): R | null {
-  return opts.draining || opts.envHeld || opts.healthFailures > 0 ? null : opts.runner;
+export function liveGateRunnerFor<R>(opts: { runner: R | null; draining: boolean; envHeld: boolean; healthFailures: number; infraPaused?: boolean }): R | null {
+  return opts.draining || opts.envHeld || opts.healthFailures > 0 || opts.infraPaused === true ? null : opts.runner;
 }
 
 /**

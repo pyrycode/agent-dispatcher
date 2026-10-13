@@ -1,7 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {execFileSync} from 'node:child_process';
-import {readFileSync,statSync} from 'node:fs';
+import {readFileSync} from 'node:fs';
 import fs from 'node:fs';
 import childProcess from 'node:child_process';
 import {tmpdir} from 'node:os';
@@ -276,10 +276,16 @@ test('original source package is refused as a diagnostic but prepares without ch
 });
 
 test('the complete exact submitted package, including tests and new files, prepares over HTTP',async t=>{
- const names=new Set([...execFileSync('git',['diff','--name-only',revision],{encoding:'utf8'}).trim().split('\n'),...execFileSync('git',['ls-files','--others','--exclude-standard'],{encoding:'utf8'}).trim().split('\n')].filter(Boolean));
+ // The package as submitted for pyrycode/pyrycode#3236, read from its own
+ // commit. Reading the working tree instead made this test fail for any later
+ // change to a file whose unrelated lines the scanner refuses, such as the
+ // GitHub client setup in dispatch.ts.
+ const submitted='be414ca678e0bbbaaaacb48517a1091033576b8d';
+ const names=new Set(execFileSync('git',['diff','--name-only',revision,submitted],{encoding:'utf8'}).trim().split('\n').filter(Boolean));
  assert.ok(names.has('src/recovery-source-publication.test.ts'));
- const files=Object.fromEntries([...names].map(path=>[path,readFileSync(path,'utf8')]));
- const value={...publication(files),modes:Object.fromEntries([...names].map(path=>[path,statSync(path).mode&0o111?'100755':'100644']))};
+ const files=Object.fromEntries([...names].map(path=>[path,execFileSync('git',['show',`${submitted}:${path}`],{encoding:'utf8',maxBuffer:64*1024*1024})]));
+ const modeOf=(path:string)=>execFileSync('git',['ls-tree',submitted,'--',path],{encoding:'utf8'}).split(/\s/)[0];
+ const value={...publication(files),modes:Object.fromEntries([...names].map(path=>[path,modeOf(path)==='100755'?'100755':'100644']))};
  const {store,id}=admitted(),server=await serveFleet(store,{box:'b-test',mac:'m-test'},'a-test',0);
  t.after(async()=>{await new Promise<void>(resolve=>server.close(()=>resolve()));store.close();});
  const address=server.address();assert.ok(address&&typeof address!=='string');

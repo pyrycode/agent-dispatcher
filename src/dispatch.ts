@@ -112,6 +112,7 @@ import {
 } from "./main-sweep.js";
 import { recordFlakyTests, type FlakyTicketClient } from "./flaky-tickets.js";
 import { recordInheritedTests } from "./inherited-tickets.js";
+import { activeInfraPause, classifyGateFailure, extractFailureMessages, branchToolchainChanges, findAdmissionRejections, findToolchainMismatch, judgeBaseCheck, pickBaseCheckTests, testSourceTerm, INFRA_PAUSE_STATE_FILE, nextInfraPause, readInfraBreakerConfig, serializeInfraPause, type InfraBreakerConfig, type InfraPauseState } from "./infra-failure.js";
 import { dropStillHeld, HealthChecker, type HealthEnvFor, healthEnvForAgent, holdUnhealthyCandidates, liveGateHealthFailures, newHealthNoticeState, parseHealthCacheMs, parseHealthChecks, startupHealthCheck } from "./health-check.js";
 import {
   decideDocsOnlyGateReuse,
@@ -143,6 +144,7 @@ import { resolveEffort } from "./effort-policy.js";
 import {
   REAL_CLAUDE_GATE_FAIL_COLUMN,
   REAL_CLAUDE_GATE_RUN_FROM_COLUMN,
+  INFRA_FAILURE_LABEL,
   decideRealClaudeGateRun,
   decideDoneCleanup,
   decideMergeRetry,
@@ -2519,6 +2521,9 @@ export type DispatchContext = {
   review?: ReviewProgress;
   /** An unexcused red gate prevents completion, including after verdict recovery. */
   failedPreSpawnGate?: string;
+  /** Set when a pre-spawn gate failed on the host, not the change (a
+   *  toolchain mismatch). The dispatch halts with `error:infra`. */
+  infraGateFailure?: { gate: string; reason: string; samples: string[] };
 };
 
 /**
@@ -2817,6 +2822,11 @@ export async function dispatchToAgent(
   const gatesStartedAt = Date.now();
   const gates = parallelReview ? { promptNote: "" } : await maybeRunPreSpawnGates(ctx);
   const gatesMs = gates.promptNote ? Date.now() - gatesStartedAt : undefined;
+  if (ctx.infraGateFailure) {
+    await haltForInfraGate(ctx);
+    await cleanupAfterDispatch(ctx);
+    return;
+  }
 
   const mergeNote = ctx.pendingMerge ? mergeHandoffNote(defaultBranch, ctx.pendingMerge.paths) : "";
   const reReview = prepareReReviewNote(ctx);
@@ -2849,6 +2859,12 @@ export async function dispatchToAgent(
     const postRun = await handlePostRun(streamResult, ctx, saferSalvaged);
     if (!postRun.ok) return;
   } catch (error: any) {
+    // The overlapped review's gates hit a host problem: halt, never rework.
+    if (error instanceof InfraGateHaltError) {
+      await haltForInfraGate(ctx);
+      await cleanupAfterDispatch(ctx);
+      return;
+    }
     // A verdict run whose only failure was GitHub refusing the verdict:
     // publish the saved verdict and carry on as a success, or hold the
     // ticket for the next cycle. Anything else falls through and parks as
@@ -4111,6 +4127,7 @@ async function runParallelVerifierReview(
   ]);
   const [gates, review] = results;
   if (gates.status === "rejected") throw gates.reason;
+  if (ctx.infraGateFailure) throw new InfraGateHaltError(ctx.infraGateFailure.reason);
   if (review.status === "rejected") throw review.reason;
   const source = review.value;
   ctx.deps.writeLog(ctx.logFile, "SOURCE REVIEW RESULT", source.output);
@@ -5469,6 +5486,13 @@ export interface VerifierGatesOutcome {
    *  because all their failures also fail on main, then the failing gate's
    *  own reading when there was one. Empty when nothing was read. */
   baseline: GateBaselineAssessment[];
+  /**
+   * Set when the red gate failed because the host is wrong, not the change:
+   * a toolchain mismatch such as `go: go.mod requires go >= 1.26.9 (running
+   * go 1.26.2; GOTOOLCHAIN=local)`. Nothing was re-run or compared, and the
+   * caller halts the ticket with `error:infra` instead of spawning the agent.
+   */
+  infra?: { reason: string; samples: string[] };
 }
 
 /**
@@ -5503,6 +5527,9 @@ export async function runVerifierGates(opts: {
    *  rerun keeps a gate's number in the full list, so it never overwrites a
    *  reused gate's log. */
   logNumbers?: readonly number[];
+  /** Look for a toolchain mismatch in a red gate's output. Defaults to the
+   *  infrastructure breaker's switch, `PYRY_INFRA_BREAKER`. */
+  detectInfra?: boolean;
   deps: Pick<DispatchDeps, "spawnGate" | "readFileSync">;
 }): Promise<VerifierGatesOutcome> {
   const logsDir = opts.logsDir ?? LOGS_DIR;
@@ -5532,6 +5559,29 @@ export async function runVerifierGates(opts: {
         ? `timed out after ${VERIFIER_GATE_TIMEOUT_MS / 60_000}min` +
           (outcome.waitCreditMs ? ` plus ${formatMinutes(outcome.waitCreditMs)} credited for waiting` : "")
         : `exit ${outcome.exitCode}`;
+    const readTail = (path: string): string => {
+      try {
+        return String(opts.deps.readFileSync(path, "utf-8")).trim();
+      } catch {
+        return "";
+      }
+    };
+    // A toolchain the host lacks is no fault of the change, and a re-run or a
+    // base run would hit the same wall. Relay #167's verifier on HP,
+    // 2026-10-13: `make check` stopped at `go vet` on a Go version mismatch,
+    // and the verifier was spawned to triage it anyway.
+    if (failed && (opts.detectInfra ?? INFRA_BREAKER.enabled) && outcome.spawnError === null && !outcome.timedOut) {
+      const toolchain = findToolchainMismatch(`${readTail(stdoutPath)}\n${readTail(stderrPath)}`);
+      if (toolchain.count > 0) {
+        summary.push(`✗ ${gate} (${verdict}; toolchain mismatch on this host, not a result)`);
+        const combined = [readTail(stdoutPath), readTail(stderrPath)].filter((t) => t.length > 0).join("\n");
+        return {
+          ok: false, failedGate: gate, summary, logPaths, baseline,
+          outputTail: combined.length > VERIFIER_GATE_TAIL_CAP ? combined.slice(-VERIFIER_GATE_TAIL_CAP) : combined,
+          infra: { reason: `the host's toolchain does not match what the repository requires: ${toolchain.samples[0]}`, samples: toolchain.samples },
+        };
+      }
+    }
     let assessment: GateBaselineAssessment | null = null;
     if (failed && opts.assessRed && outcome.spawnError === null && !outcome.timedOut) {
       try {
@@ -5554,13 +5604,6 @@ export async function runVerifierGates(opts: {
     }
     summary.push(`${failed ? "✗" : "✓"} ${gate} (${verdict})`);
     if (failed) {
-      const readTail = (path: string): string => {
-        try {
-          return String(opts.deps.readFileSync(path, "utf-8")).trim();
-        } catch {
-          return "";
-        }
-      };
       const combined = [readTail(stdoutPath), readTail(stderrPath)]
         .filter((s) => s.length > 0)
         .join("\n");
@@ -6028,10 +6071,69 @@ function readDocsOnlyGateReuse(
  *   the gate counts as green and the next gate runs. See
  *   verifier-gate-baseline.ts.
  */
+/** Thrown out of the overlapped verifier review when its gates found a host problem. */
+export class InfraGateHaltError extends Error {}
+
+/**
+ * Halt a ticket whose required check failed on the host rather than on the
+ * change. Adds `error:infra`, which blocks every stage until a person removes
+ * it, explains on the ticket, and alerts. No rework label, so the rework
+ * count does not move; no re-run, since the same host fails the same way.
+ */
+export async function haltForInfraGate(ctx: DispatchContext): Promise<void> {
+  const failure = ctx.infraGateFailure;
+  if (!failure) return;
+  const { agent, item, client } = ctx;
+  if (item.issueNumber <= 0) return;
+  try { await client.addLabel(item.issueNumber, INFRA_FAILURE_LABEL); } catch (e) {
+    console.warn(`   ⚠️  Failed to add ${INFRA_FAILURE_LABEL} to #${item.issueNumber}: ${e}`);
+  }
+  try {
+    await client.addComment(item.issueNumber, [
+      `## 🧯 Infrastructure failure in a required check`,
+      "",
+      `\`${failure.gate}\` failed before ${agent.name} started, because ${failure.reason}.`,
+      "",
+      "```",
+      ...failure.samples,
+      "```",
+      "",
+      `This looks like a host problem rather than the change: the branch does not touch go.mod, package engines or ` +
+      `other toolchain files. ${agent.name} was not started, no rework is requested or counted, and the check was not ` +
+      `re-run, since the same host fails the same way. Fix the toolchain on the dispatcher host, then remove ` +
+      `\`${INFRA_FAILURE_LABEL}\` to run the checks again. If the change does need the newer toolchain, say so here ` +
+      `and route it to the builder instead.`,
+    ].join("\n"));
+  } catch (e) {
+    console.warn(`   ⚠️  Failed to explain the infrastructure halt on #${item.issueNumber}: ${e}`);
+  }
+  try {
+    await ctx.deps.notifyDiscord(
+      `🧯 **${agent.name} not started on #${item.issueNumber}: infrastructure failure in \`${failure.gate}\`.** ` +
+      `${failure.reason}. Halted with \`${INFRA_FAILURE_LABEL}\`; no rework counted, no re-run.\n${item.url}`,
+    );
+  } catch (e) {
+    console.warn(`   ⚠️  Could not send the infrastructure alert for #${item.issueNumber}: ${e}`);
+  }
+}
+
+/**
+ * Run git with an argument vector and no shell, for arguments that come from
+ * a branch (file paths) and so must never be interpreted. Throws on a
+ * non-zero exit, like `execSync`.
+ */
+export function gitNoShell(spawn: typeof spawnSync, cwd: string, args: string[], timeout = 120_000): string {
+  const result = spawn("git", args, { cwd, encoding: "utf-8", stdio: "pipe", timeout });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error(`git ${args[0]} exited ${result.status}: ${String(result.stderr ?? "").trim()}`);
+  return String(result.stdout ?? "");
+}
+
 export async function maybeRunPreSpawnGates(
   ctx: DispatchContext,
 ): Promise<{ promptNote: string }> {
   delete ctx.failedPreSpawnGate;
+  delete ctx.infraGateFailure;
   const { agent, item, agentCwd, logFile } = ctx;
   const preSpawnGate = activeStageSet().preSpawnGate;
   if (preSpawnGate === null || !preSpawnGate.agentNames.has(agent.name)) {
@@ -6213,6 +6315,34 @@ export async function maybeRunPreSpawnGates(
     };
   }
 
+  // A mismatch the branch asked for, by changing go.mod, engines and the
+  // like, is the branch's: the verifier triages it like any red gate.
+  let toolchainNote: string[] = [];
+  if (result.infra) {
+    // Argv, no shell: the paths come from the branch.
+    const git = (args: string[]): string => gitNoShell(ctx.deps.spawnSync, agentCwd, args, 30_000);
+    let changed: string[] = [];
+    try { changed = git(["diff", "--name-only", `${defaultBranch}...HEAD`]).split("\n").filter((p) => p !== ""); } catch {}
+    const paths = branchToolchainChanges(changed, (path) => git(["diff", `${defaultBranch}...HEAD`, "--", path]));
+    if (paths.length > 0) {
+      console.log(`   🧪 Pre-${agent.name} gate \`${result.failedGate}\` hit a toolchain mismatch the branch asked for (${paths.join(", ")}); triaging as a red gate`);
+      toolchainNote = [
+        "",
+        `The failure is a toolchain mismatch (${result.infra.samples[0] ?? result.infra.reason}), and this branch changes the toolchain ` +
+        `requirement in ${paths.map((p) => `\`${p}\``).join(", ")}. The host cannot run what the branch asks for, so this is the branch's ` +
+        `to resolve: route it to rework unless the requirement change is wanted and the hosts must be upgraded first.`,
+      ];
+      delete result.infra;
+    }
+  }
+  if (result.infra) {
+    // Not the change's failure: halt with `error:infra` and spawn nothing.
+    // `dispatchToAgent` reads this before the agent starts.
+    ctx.infraGateFailure = { gate: result.failedGate ?? "unknown gate", ...result.infra };
+    console.log(`   🧯 Pre-${agent.name} gate \`${result.failedGate}\` hit an infrastructure failure; not spawning ${agent.name}: ${result.infra.reason}`);
+    return { promptNote: "" };
+  }
+
   ctx.failedPreSpawnGate = result.failedGate ?? "unknown gate";
   console.log(
     `   ❌ Pre-${agent.name} gate red (${result.failedGate}) — spawning ${agent.name} in TRIAGE MODE`,
@@ -6235,6 +6365,7 @@ export async function maybeRunPreSpawnGates(
     "```",
     "",
     "Triage this failure before reviewing. Route demonstrated code regressions to rework. Required checks remain incomplete or failing, so this run cannot advance or publish PASS. A focused rerun cannot replace unfinished checks. Fix the test environment or arrange a complete dispatcher rerun before approval.",
+    ...toolchainNote,
     ...flakyNoteLines(result.baseline),
     ...baselineNoteLines(result.baseline, baselineTicket),
     ...remainingNoteLines(result),
@@ -7033,6 +7164,12 @@ export async function runRealClaudeGateSuite(opts: {
   selection?: GateSelectionConfig | null;
   /** The fork's floor, which a full run must clear to count as the backstop's pass. */
   minExecuted?: number;
+  /**
+   * Infrastructure-failure classifier settings (infra-failure.ts). Absent or
+   * null classifies nothing, and a failed first pass always goes on to the
+   * re-run and base comparison as before.
+   */
+  infraBreaker?: InfraBreakerConfig | null;
   /** Overridable for tests; defaults to the module-level target repo. */
   repoRoot?: string;
   defaultBranch?: string;
@@ -7268,6 +7405,113 @@ export async function runRealClaudeGateSuite(opts: {
         deps.writeGateFullState(JSON.stringify({ lastFullPassSha: report.baseSha }));
       } catch (e: any) {
         console.warn(`   ⚠️  Real-claude gate: could not record the full run: ${e?.message ?? e}`);
+      }
+    }
+
+    // Infrastructure-shaped failure: stop here. On 2026-10-13 mobile #2138's
+    // first pass failed 64 of 65 tests on phone reconnection, daemon and
+    // readiness waits while the production relay refused the host, and the
+    // same-tree re-run that followed only met the same refusals until a
+    // person stopped it. A re-run and a base comparison tell a flake or a
+    // regression from the branch's own failure; neither means anything
+    // while the environment is failing. Judged on the first pass's own
+    // output, with the diagnostic log, where Android keeps the failure text.
+    // A toolchain the host lacks (`go: go.mod requires go >= ...`) counts
+    // too, even with no test named, since nothing ran on the right toolchain.
+    const firstPass = report.tally;
+    const red = (firstPass?.failed ?? 0) > 0 || report.exitCode !== 0;
+    if (opts.infraBreaker?.enabled && red && report.runError === null && !report.timedOut) {
+      let stderrRaw = "";
+      try { stderrRaw = deps.readFileSync(stderrPath, "utf-8").toString(); } catch {}
+      const stdoutRaw = raw ?? "";
+      const combined = `${stdoutRaw}\n${stderrRaw}`;
+      report.infraFailure = classifyGateFailure({
+        tally: firstPass,
+        messages: firstPass === null ? new Map() : extractFailureMessages({ stdout: stdoutRaw, stderr: stderrRaw, format: opts.format, failedNames: firstPass.failedNames }),
+        admission: findAdmissionRejections(combined),
+        toolchain: findToolchainMismatch(combined),
+        config: opts.infraBreaker,
+      });
+      const infra = report.infraFailure;
+      // A toolchain mismatch the branch asked for (it bumped go.mod, engines
+      // and the like) is the branch's failure: carry on as a normal red run.
+      if (infra.infra && infra.path === "toolchain") {
+        let changed: string[] = [];
+        // Argv, no shell: the paths come from the branch.
+        const range = `${report.baseSha}...${report.headSha}`;
+        try { changed = gitNoShell(deps.spawnSync, targetRepo, ["diff", "--name-only", range]).split("\n").filter(p => p !== ""); } catch {}
+        const paths = branchToolchainChanges(changed, path => gitNoShell(deps.spawnSync, targetRepo, ["diff", range, "--", path]));
+        if (paths.length > 0) {
+          report.toolchainChange = { paths, line: infra.samples[0] ?? "" };
+          report.infraFailure = {
+            ...infra, infra: false,
+            reason: `${infra.reason}; the branch itself changes the toolchain requirement in ${paths.join(", ")}, so the mismatch is the branch's`,
+          };
+        }
+      }
+      // The shape path is provisional: a branch that breaks daemon startup or
+      // the relay client fails in the same shape. Re-run a few of the failing
+      // tests on the base, bounded, and blame the environment only when they
+      // fail there the same way.
+      if (report.infraFailure.infra && report.infraFailure.path === "shape") {
+        const shaped = report.infraFailure;
+        // Prefer tests the base has: a connection test the branch added
+        // cannot fail on a base that lacks it.
+        const tests = pickBaseCheckTests(shaped, opts.infraBreaker.baseCheckTests, name => {
+          const term = testSourceTerm(name, opts.format);
+          if (term === null) return null;
+          const found = deps.spawnSync("git", ["grep", "-q", "-F", "-e", term, report.baseSha, "--"], { cwd: targetRepo, encoding: "utf-8", timeout: 30_000 });
+          return found.status === 0 ? true : found.status === 1 ? false : null;
+        });
+        let judged: { confirmed: boolean; note: string };
+        let failedOnBase: string[] | null = null;
+        let checkOutput: string | null = null;
+        if (!opts.baselineCommand) {
+          judged = { confirmed: false, note: "no baseline command is configured, so the base check could not run and nothing confirms an environment failure" };
+        } else {
+          const check = await runFailuresOnBase({
+            failedNames: tests,
+            baselineCommand: opts.baselineCommand,
+            baseSha: report.baseSha,
+            format: opts.format,
+            timeoutMs: Math.min(opts.timeoutMs, opts.infraBreaker.baseCheckTimeoutMs),
+            issueNumber: opts.issueNumber,
+            targetRepo,
+            logsDir,
+            stamp,
+            label: "real-claude-gate-infra-check",
+            who: "Real-claude gate infrastructure check",
+            deps,
+          });
+          failedOnBase = check.failures;
+          checkOutput = check.outputPath;
+          let baseMessages = new Map<string, string>();
+          if (check.outputPath !== null) {
+            let baseOut = "";
+            let baseErr = "";
+            try { baseOut = deps.readFileSync(check.outputPath, "utf-8").toString(); } catch {}
+            try { baseErr = deps.readFileSync(check.outputPath.replace(/\.log$/, ".stderr.log"), "utf-8").toString(); } catch {}
+            baseMessages = extractFailureMessages({ stdout: baseOut, stderr: baseErr, format: opts.format, failedNames: tests });
+          }
+          judged = judgeBaseCheck({ tests, failedOnBase, baseMessages, skipReason: check.skipReason });
+        }
+        report.infraFailure = {
+          ...shaped,
+          infra: judged.confirmed,
+          reason: judged.confirmed ? `${shaped.reason}. Confirmed on the base commit: ${judged.note}` : `${shaped.reason}, but ${judged.note}`,
+          baseCheck: { tests, failedOnBase, confirmed: judged.confirmed, note: judged.note, outputPath: checkOutput },
+        };
+        console.log(`   🔎 Real-claude gate: #${opts.issueNumber} infrastructure check on the base: ${judged.note}`);
+      }
+      if (report.infraFailure.infra) {
+        const why = "the first pass failed in an infrastructure shape, so a re-run would only meet the same failure";
+        report.rerunSkipReason = why;
+        report.baselineSkipReason = why;
+        console.log(
+          `   🧯 Real-claude gate: #${opts.issueNumber} failed in an infrastructure shape; ` +
+          `no same-tree re-run or base comparison. ${report.infraFailure.reason}`,
+        );
+        return finish();
       }
     }
 
@@ -7590,10 +7834,92 @@ export function makeRealClaudeGateRunner(): RealClaudeGateRunner | null {
       timeoutMs: REAL_CLAUDE_GATE_TIMEOUT_MS,
       selection: REAL_CLAUDE_GATE_SELECTION,
       minExecuted: REAL_CLAUDE_GATE_MIN_EXECUTED,
+      infraBreaker: INFRA_BREAKER,
     });
+    if (shouldPauseLiveGate(report, INFRA_BREAKER.cooldownMs)) {
+      report.infraFailure!.pausedUntil = recordInfraPause({
+        issueNumber, reason: report.infraFailure!.reason, cooldownMs: INFRA_BREAKER.cooldownMs,
+      });
+    }
     recordGateRunMeta(report);
     return report;
   };
+}
+
+// --------- Live gate pause after an infrastructure failure ---------
+//
+// The cause of an infrastructure-shaped failure is shared: on 2026-10-13 the
+// relay refused HP's public address for every daemon and phone on it. So
+// after one, this dispatcher starts no live gate run until the cooldown ends.
+// A file, like the selection backstop's state, so the pause survives a
+// restart and an operator can read it or delete it to end it early.
+// `PYRY_INFRA_PAUSE_FILE` moves it; point every dispatcher on one computer at
+// the same writable path to pause them all together.
+const INFRA_BREAKER = readInfraBreakerConfig(process.env);
+const INFRA_PAUSE_FILE = (process.env.PYRY_INFRA_PAUSE_FILE ?? "").trim() || resolve(LOGS_DIR, INFRA_PAUSE_STATE_FILE);
+
+/**
+ * Whether a finished run pauses the live gate: an infrastructure verdict that
+ * is not a toolchain mismatch, with a cooldown above 0. A toolchain mismatch
+ * is fixed on the host, not waited out.
+ */
+export function shouldPauseLiveGate(report: Pick<GateRunReport, "infraFailure">, cooldownMs: number): boolean {
+  return report.infraFailure?.infra === true && report.infraFailure.toolchain !== true && cooldownMs > 0;
+}
+
+export interface InfraPauseDeps {
+  readFileSync: typeof readFileSync;
+  writeFileSync: typeof writeFileSync;
+  mkdirSync: typeof mkdirSync;
+  now: () => number;
+}
+const DEFAULT_INFRA_PAUSE_DEPS: InfraPauseDeps = { readFileSync, writeFileSync, mkdirSync, now: Date.now };
+
+/**
+ * Start or extend the live gate pause. Returns when it ends, as an ISO time,
+ * or null when it could not be written. Never throws.
+ */
+export function recordInfraPause(
+  opts: { issueNumber: number; reason: string; cooldownMs: number; path?: string },
+  deps: InfraPauseDeps = DEFAULT_INFRA_PAUSE_DEPS,
+): string | null {
+  const path = opts.path ?? INFRA_PAUSE_FILE;
+  let existing: string | null = null;
+  try { existing = deps.readFileSync(path, "utf-8").toString(); } catch {}
+  try {
+    const state = nextInfraPause({ existing, nowMs: deps.now(), cooldownMs: opts.cooldownMs, issueNumber: opts.issueNumber, reason: opts.reason });
+    deps.mkdirSync(dirname(path), { recursive: true });
+    deps.writeFileSync(path, serializeInfraPause(state));
+    return state.pausedUntil;
+  } catch (e: any) {
+    console.warn(`   ⚠️  Could not record the live gate pause at ${path}: ${e?.message ?? e}`);
+    return null;
+  }
+}
+
+/** The live gate pause in force now, or null. */
+export function readInfraPause(
+  path: string = INFRA_PAUSE_FILE,
+  deps: Pick<InfraPauseDeps, "readFileSync" | "now"> = DEFAULT_INFRA_PAUSE_DEPS,
+): InfraPauseState | null {
+  let raw: string | null = null;
+  try { raw = deps.readFileSync(path, "utf-8").toString(); } catch {}
+  // A pause ending beyond one cooldown from now was not written under these
+  // settings; ignore it rather than stop the gate for days.
+  return activeInfraPause(raw, deps.now(), INFRA_BREAKER.cooldownMs);
+}
+
+/** Announce a pause once when it starts and once when it ends, not every cycle. */
+let announcedInfraPause: string | null = null;
+function announceInfraPause(pause: InfraPauseState | null): void {
+  const until = pause?.pausedUntil ?? null;
+  if (until === announcedInfraPause) return;
+  if (pause) {
+    console.log(`   🧯 Live gate paused until ${pause.pausedUntil} after an infrastructure failure on #${pause.issueNumber}. Delete ${INFRA_PAUSE_FILE} to end it early.`);
+  } else {
+    console.log(`   🧯 Live gate infrastructure pause has ended`);
+  }
+  announcedInfraPause = until;
 }
 
 /**
@@ -9117,6 +9443,13 @@ export async function pollLoop(): Promise<void> {
   }
   console.log("   Family dispatch counts: history only; no family limit");
   console.log(`   Rework breaker: ${REWORK_ROUTING_OPTIONS.hardCap} builder reworks, or a repeated verifier finding (PYRY_BUILDER_REWORK_CAP)`);
+  if (REAL_CLAUDE_GATE_CMD !== "") {
+    console.log(INFRA_BREAKER.enabled
+      ? `   Infrastructure breaker: halts a live gate with ${INFRA_BREAKER.minFailed}+ failures and ${Math.round(INFRA_BREAKER.minFailedShare * 100)}%+ failed ` +
+        `when ${INFRA_BREAKER.minSignatures}+ name a connection failure and ${Math.round(INFRA_BREAKER.waitShare * 100)}%+ are connection or timeout waits, ` +
+        `or on ${INFRA_BREAKER.minSignatures}+ admission rejections; then pauses the live gate ${formatMinutes(INFRA_BREAKER.cooldownMs)} (PYRY_INFRA_BREAKER*, PYRY_INFRA_COOLDOWN_MS, ${INFRA_PAUSE_FILE})`
+      : `   Infrastructure breaker: off (PYRY_INFRA_BREAKER=0)`);
+  }
   console.log(
     `   Required environment: ${REQUIRED_ENV_NAMES.length > 0 ? REQUIRED_ENV_NAMES.join(", ") : "none declared"} (PYRY_REQUIRED_ENV)`,
   );
@@ -9387,12 +9720,17 @@ export async function pollLoop(): Promise<void> {
     // The live-login and daemon health checks guard the live gate too. A
     // failure skips the gate this cycle; its tickets keep waiting.
     // In drain mode the gate starts nothing, so its checks are skipped too.
-    const gateHealthFailures = drainMode || envHeld || realClaudeGateRunner === null ? [] : await liveGateHealthFailures({
+    // An infrastructure-shaped gate failure pauses the live gate for its
+    // cooldown (infra-failure.ts). Tickets keep waiting in Inbox meanwhile.
+    const infraPause = realClaudeGateRunner === null ? null : readInfraPause();
+    if (realClaudeGateRunner !== null) announceInfraPause(infraPause);
+    const infraPaused = infraPause !== null;
+    const gateHealthFailures = drainMode || envHeld || infraPaused || realClaudeGateRunner === null ? [] : await liveGateHealthFailures({
       checks: HEALTH_CHECKS, checker: healthChecker, env: {...buildGateSpawnEnv(process.env),...managedTaskEnv()}, notify: notifyDiscord, state: healthNotices,
     });
     // Read after the checks, so a stop signal that landed during them counts.
     const gateRunner = liveGateRunnerFor({
-      runner: realClaudeGateRunner, draining: drainMode, envHeld, healthFailures: gateHealthFailures.length,
+      runner: realClaudeGateRunner, draining: drainMode, envHeld, healthFailures: gateHealthFailures.length, infraPaused,
     });
     let gateHeld = false;
     if (managed) {

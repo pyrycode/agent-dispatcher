@@ -29,6 +29,8 @@ import type { GateRunReport, GateTally } from "./gate-output.js";
 import type { ProjectItem } from "./types.js";
 import { resetActiveStageSetForTests } from "./stage-sets.js";
 import { REAL_CLAUDE_GATE_RUNNING_LABEL } from "./pipeline-decisions.js";
+import { parseGateOutput } from "./gate-output.js";
+import { DEFAULT_INFRA_BREAKER_CONFIG, classifyGateFailure, extractFailureMessages, findAdmissionRejections } from "./infra-failure.js";
 
 /**
  * Minimal in-memory ReconcileClient. Records every call to
@@ -1012,6 +1014,127 @@ describe("runRealClaudeGateExecution — in the background", () => {
     await handed!();
     assert.ok(client.addLabelCalls.some(c => c.label === "error:real-claude-gate"), "a thrown runner still parks");
     assert.ok(client.removeLabelCalls.some(c => c.label === REAL_CLAUDE_GATE_RUNNING_LABEL));
+  });
+});
+
+/**
+ * The runner's report for mobile #2138's first pass on 2026-10-13, built from
+ * the real output: 65 executed, 64 failed on connection and readiness waits
+ * while the relay refused HP. The runner skipped the re-run and base run.
+ */
+function infraReport(pausedUntil: string | null): GateRunReport {
+  const fixture = (name: string) => readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf8");
+  const stdout = fixture("mobile-2138-live-gate.xml");
+  const stderr = fixture("mobile-2138-live-gate.stderr.txt");
+  const t = parseGateOutput(stdout, "junit-xml");
+  const infraFailure = classifyGateFailure({
+    tally: t,
+    messages: extractFailureMessages({ stdout, stderr, format: "junit-xml", failedNames: t.failedNames }),
+    admission: findAdmissionRejections(`${stdout}\n${stderr}`),
+    config: DEFAULT_INFRA_BREAKER_CONFIG,
+  });
+  assert.equal(infraFailure.infra, true, "fixture precondition");
+  const why = "the first pass failed in an infrastructure shape, so a re-run would only meet the same failure";
+  return report({
+    exitCode: 1, tally: t, command: "ANDROID_GATE_WAIT_SECONDS=2700 python3 scripts/android-test-gate.py live",
+    branchName: "feature/2138", rerunSkipReason: why, baselineSkipReason: why,
+    infraFailure: { ...infraFailure, pausedUntil },
+  });
+}
+
+describe("runRealClaudeGateExecution: infrastructure failure", () => {
+  test("halts with error:infra in place, counts no rework, and says the live gate is paused", async () => {
+    await withStageSet("builder", async () => {
+      const item = parkedItem({ issueNumber: 2138, labels: ["done:verifier", "needs-real-claude", "rework-count:1"] });
+      const client = new MockClient([item]);
+      const sent: string[] = [];
+      let flakyCalls = 0;
+      let inheritedCalls = 0;
+      await runRealClaudeGateExecution(client, async () => infraReport("2026-10-13T16:18:00.000Z"), 1, async m => { sent.push(m); }, 0,
+        async () => { flakyCalls++; return { filed: [], commented: [], untracked: [] }; }, undefined,
+        async () => { inheritedCalls++; return { blockers: [], untracked: [] }; });
+      await runReworkRouting(client);
+
+      assert.equal(item.status, "Inbox", "not moved to the builder");
+      assert.deepEqual(client.updateItemStatusCalls, []);
+      assert.ok(item.labels.includes("error:infra"));
+      assert.ok(!item.labels.includes("error:real-claude-gate"), "distinct from an unusable run");
+      assert.ok(!item.labels.some(l => l.startsWith("needs-rework:")), "no rework requested");
+      assert.ok(item.labels.includes("rework-count:1") && !item.labels.includes("rework-count:2"), "rework count untouched");
+      assert.ok(item.labels.includes("needs-real-claude"), "it must still pass the gate later");
+      assert.equal(flakyCalls, 0);
+      assert.equal(inheritedCalls, 0);
+
+      const comment = client.addCommentCalls[0].body;
+      assert.match(comment, /INFRASTRUCTURE FAILURE/);
+      assert.match(comment, /None of these failures is attributed to this branch/);
+      assert.match(comment, /relay=Offline daemon=Down/);
+      assert.match(comment, /paused until 2026-10-13T16:18:00\.000Z/);
+
+      assert.equal(sent.length, 1);
+      assert.match(sent[0], /infrastructure failure on #2138/);
+      assert.match(sent[0], /error:infra/);
+      assert.match(sent[0], /paused until 2026-10-13T16:18:00\.000Z/);
+
+      // The error label keeps the ticket out of the next gate selection.
+      let ran = false;
+      await runRealClaudeGateExecution(client, async () => { ran = true; return report(); }, 1, async () => {});
+      assert.equal(ran, false);
+    });
+  });
+
+  test("says so when the pause could not be recorded", async () => {
+    const client = new MockClient([parkedItem()]);
+    const sent: string[] = [];
+    await runRealClaudeGateExecution(client, async () => infraReport(null), 1, async m => { sent.push(m); });
+    assert.match(sent[0], /pause could not be recorded/);
+  });
+
+  test("a toolchain mismatch with no readable report halts as infrastructure, not as an unusable run", async () => {
+    const item = parkedItem();
+    const client = new MockClient([item]);
+    const sent: string[] = [];
+    const line = "go: go.mod requires go >= 1.26.9 (running go 1.26.2; GOTOOLCHAIN=local)";
+    await runRealClaudeGateExecution(client, async () => report({
+      exitCode: 1, tally: null,
+      infraFailure: { infra: true, toolchain: true, reason: `the host's toolchain does not match what the repository requires: ${line}`,
+        executed: 0, failed: 0, connection: 0, wait: 0, other: 0, admissionLines: 0, samples: [line] },
+    }), 1, async m => { sent.push(m); });
+    assert.ok(item.labels.includes("error:infra"));
+    assert.ok(!item.labels.includes("error:real-claude-gate"));
+    assert.match(client.addCommentCalls[0].body, /Toolchain mismatch/);
+    assert.match(sent[0], /not paused: a toolchain mismatch is fixed on the host/);
+  });
+
+  test("a toolchain mismatch the branch asked for routes to rework, not infra (review finding 3)", async () => {
+    const item = parkedItem();
+    const client = new MockClient([item]);
+    const line = "go: go.mod requires go >= 1.26.9 (running go 1.26.2; GOTOOLCHAIN=local)";
+    await runRealClaudeGateExecution(client, async () => report({
+      exitCode: 1, tally: null, toolchainChange: { paths: ["go.mod"], line },
+    }), 1, async () => {});
+    assert.equal(item.status, "In Development");
+    assert.ok(item.labels.includes("needs-rework:developer"));
+    assert.ok(!item.labels.includes("error:infra"));
+    assert.ok(!item.labels.includes("error:real-claude-gate"));
+    assert.match(client.addCommentCalls[0].body, /changes the toolchain requirement in go\.mod/);
+  });
+
+  test("with PYRY_INFRA_COOLDOWN_MS=0 the alert says no pause is configured (review finding 7)", async () => {
+    const client = new MockClient([parkedItem()]);
+    const sent: string[] = [];
+    const r = infraReport(null);
+    delete r.infraFailure!.pausedUntil;
+    await runRealClaudeGateExecution(client, async () => r, 1, async m => { sent.push(m); });
+    assert.match(sent[0], /No live gate pause is configured/);
+  });
+
+  test("an infra classification never overrides an unusable run", async () => {
+    const item = parkedItem();
+    const client = new MockClient([item]);
+    await runRealClaudeGateExecution(client, async () => ({ ...infraReport("2026-10-13T16:18:00.000Z"), timedOut: true }), 1, async () => {});
+    assert.ok(item.labels.includes("error:real-claude-gate"));
+    assert.ok(!item.labels.includes("error:infra"));
   });
 });
 

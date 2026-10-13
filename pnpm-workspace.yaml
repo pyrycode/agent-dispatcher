@@ -3,3 +3,10 @@
 # pulled within hours. For an urgent fix, list the package under
 # minimumReleaseAgeExclude.
 minimumReleaseAge: 2880
+
+# Remove a node_modules built against another store without asking. Launchers
+# install with no terminal, so pnpm's question cannot be answered and the
+# install fails with no message under `--silent`. That stopped pyrybox's
+# Desktop dispatcher 139 times on 2026-10-13, after `.npmrc` moved the store
+# into the checkout. See scripts/install-deps.sh.
+confirmModulesPurge: false
