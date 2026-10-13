@@ -35,7 +35,10 @@ ticket's alias, or a failed position or dependency write, keeps only that ticket
 pending. It then waits 30 seconds, doubling to at most 15 minutes, unless a newer
 database revision arrives first. Waiting tickets do not take one of the ten batch
 places. The log names the ticket, its revision and GitHub's error text. An error
-GitHub does not tie to one alias still holds the whole project batch. If GitHub
+GitHub does not tie to one alias, and a 5xx or 429 answer on any call, including
+the shared budget's own pause, still hold the whole project batch without a
+per-ticket backoff. A link GitHub calls already present is accepted only after a
+fresh read shows it. If GitHub
 refuses a dependency as a cycle because it still shows the reverse link, the
 publisher removes that link when the blocker's own database record does not want
 it. A cycle recorded in the database itself is reported and left for an operator.

@@ -54,6 +54,10 @@ function fakeGitHub(
     edges?: Record<string, string[]>;
     failAdd?: Set<string>;
     failAlias?: Set<string>;
+    /** Answer requests whose query contains this text with an HTTP status instead. */
+    unavailable?: { match: string; status: number };
+    /** Answer addBlockedBy with "already been taken" without linking. */
+    falselyTaken?: boolean;
   } = {},
 ) {
   const edges = new Map<string, Set<string>>(
@@ -77,6 +81,14 @@ function fakeGitHub(
       const query: string = body.query ?? "",
         v = body.variables ?? {};
       if (String(input).includes("/labels")) return new Response("[]");
+      if (options.unavailable && query.includes(options.unavailable.match)) {
+        calls.push(`unavailable ${options.unavailable.status}`);
+        return new Response("unavailable", {
+          status: options.unavailable.status,
+          headers:
+            options.unavailable.status === 429 ? { "retry-after": "60" } : {},
+        });
+      }
       if (query.startsWith("mutation {")) {
         const data: Record<string, unknown> = {},
           errors: unknown[] = [];
@@ -137,7 +149,7 @@ function fakeGitHub(
             "addBlockedBy",
             "Resource not accessible by integration",
           );
-        if (blockersOf(v.issue).has(v.blocker))
+        if (options.falselyTaken || blockersOf(v.issue).has(v.blocker))
           return validation(
             "addBlockedBy",
             "An error occurred while adding the blocking issue to the issue. Validation failed: Target issue has already been taken",
@@ -348,4 +360,37 @@ test("a link another writer added first is accepted", async (t) => {
   };
   await new WorkflowPublisher(store, github, { now: () => 1000 }).tick();
   assert.deepEqual(pendingTickets(store), []);
+});
+
+for (const status of [502, 504, 429])
+  test(`a GitHub ${status} on a per-ticket call holds the project's pass instead of each ticket`, async (t) => {
+    const store = fixture(t);
+    store.workflow.import(config, [
+      item(1, { positioned: true }),
+      item(2, { positioned: true }),
+      item(3, { positioned: true }),
+    ]);
+    const { github, calls } = fakeGitHub(store, {
+      unavailable: { match: "updateProjectV2ItemPosition", status },
+    });
+    const publisher = new WorkflowPublisher(store, github, { now: () => 1000 });
+    await assert.rejects(publisher.tick(), {
+      message: `Workflow display update deferred: GitHub ${status}`,
+    });
+    assert.equal(calls.filter((c) => c.startsWith("unavailable")).length, 1);
+    assert.deepEqual(publisher.retrying(), []);
+    assert.equal(pendingTickets(store).length, 3);
+  });
+
+test("an already-linked answer is only accepted when a re-read shows the link", async (t) => {
+  const store = fixture(t);
+  store.workflow.import(config, [item(1, { blockedBy: blocked(2) }), item(2)]);
+  const { github, calls } = fakeGitHub(store, { falselyTaken: true });
+  const publisher = new WorkflowPublisher(store, github, { now: () => 1000 });
+  await assert.rejects(
+    publisher.tick(),
+    /org\/relay#1 .*has already been taken/,
+  );
+  assert.deepEqual(pendingTickets(store), ["org/relay#1"]);
+  assert.ok(calls.includes("add I1<-I2"));
 });

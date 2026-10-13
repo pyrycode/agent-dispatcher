@@ -18,6 +18,9 @@ export function graphqlErrorText(errors: GraphQLError[]): string {
   return text.length > 600 ? `${text.slice(0, 600)}...` : text;
 }
 
+/** GitHub did not answer the request (5xx, or a 429 from GitHub or the shared budget). */
+export class WorkflowDisplayDeferred extends Error {}
+
 const RETRY_BASE_MS = 30_000,
   RETRY_MAX_MS = 15 * 60_000;
 
@@ -57,7 +60,7 @@ export class WorkflowPublisher {
   private async call(project: string, request: GitHubRequest): Promise<any> {
     const result = await this.github.request(project, request);
     if (result.status < 200 || result.status >= 300)
-      throw new Error(
+      throw new WorkflowDisplayDeferred(
         `Workflow display update deferred: GitHub ${result.status}`,
       );
     const payload = JSON.parse(result.body || "null");
@@ -84,7 +87,7 @@ export class WorkflowPublisher {
       fresh: true,
     });
     if (result.status < 200 || result.status >= 300)
-      throw new Error(
+      throw new WorkflowDisplayDeferred(
         `Workflow display update deferred: GitHub ${result.status}`,
       );
     return JSON.parse(result.body || "null") ?? {};
@@ -273,11 +276,17 @@ export class WorkflowPublisher {
         this.store.workflow.published(ticket, item.revision);
         this.retry.delete(ticket);
       } catch (error) {
+        // GitHub not answering is not this ticket's fault. Hold the project's pass
+        // instead of letting every ticket make its own failing call and backoff.
+        if (error instanceof WorkflowDisplayDeferred) throw error;
         errors.push(this.failed(ticket, item.revision, error));
       }
     }
   }
-  private async publishBlockers(config: WorkflowProject, item: WorkflowItem) {
+  private async readBlockers(
+    config: WorkflowProject,
+    item: WorkflowItem,
+  ): Promise<{ nodes: Array<{ id: string }> }> {
     const result = await this.gql(
       config.project,
       "query($id:ID!){node(id:$id){... on Issue{blockedBy(first:100){nodes{id number url} pageInfo{hasNextPage}}}}}",
@@ -286,6 +295,10 @@ export class WorkflowPublisher {
     const blockers = result.data?.node?.blockedBy;
     if (!blockers || blockers.pageInfo.hasNextPage)
       throw new Error("Incomplete dependency display read");
+    return blockers;
+  }
+  private async publishBlockers(config: WorkflowProject, item: WorkflowItem) {
+    const blockers = await this.readBlockers(config, item);
     const desired = await Promise.all(
       item.blockedBy.map(async (b) => {
         const project =
@@ -338,8 +351,12 @@ export class WorkflowPublisher {
       await add();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      // Another writer linked it between the read and this write. The display already matches.
-      if (/has already been taken/i.test(message)) return;
+      // Another writer may have linked it after our read. Confirm before acknowledging.
+      if (/has already been taken/i.test(message)) {
+        const now = await this.readBlockers(config, item);
+        if (now.nodes.some((n) => n.id === blocker.issueId)) return;
+        throw error;
+      }
       if (!/would create a cycle/i.test(message)) throw error;
       // GitHub still shows the reverse link. Remove it only when the blocker's own
       // database record does not want it, then add the wanted direction. A blocker
