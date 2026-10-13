@@ -864,6 +864,12 @@ export interface GateRunReport {
    * execution step halts the ticket with `error:infra` instead of judging it.
    */
   infraFailure?: InfraFailureClassification;
+  /**
+   * Set when the run met a toolchain mismatch that the branch itself asked
+   * for, by changing go.mod, engines or similar. Not infrastructure: the
+   * execution step routes it to rework even when no test report was read.
+   */
+  toolchainChange?: { paths: string[]; line: string };
 }
 
 /**
@@ -969,6 +975,14 @@ export function formatGateEvidenceComment(opts: {
           (infra.admissionLines > 0 ? `, and the output holds ${infra.admissionLines} admission rejection line(s)` : "") + ".",
     );
     lines.push("");
+    if (infra.baseCheck) {
+      lines.push(
+        `Checked on \`${report.baseRef}\` first, since a branch that breaks the connection fails in the same shape: ` +
+        `${infra.baseCheck.note}. Tests: ${infra.baseCheck.tests.map(t => `\`${t}\``).join(", ")}. ` +
+        `Output: \`${infra.baseCheck.outputPath ?? "(none)"}\`.`,
+      );
+      lines.push("");
+    }
     lines.push(
       `The same-tree re-run and the base comparison were skipped, since neither means anything while the ` +
       `environment is failing. **None of these failures is attributed to this branch** and no rework is counted.`,

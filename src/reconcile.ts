@@ -847,8 +847,20 @@ export async function runRealClaudeGateExecution(
       // Otherwise re-judge a failure against what the base commit already
       // fails, so a branch is not blamed for breakage it inherited. No-op for
       // every other verdict, and a no-op when no baseline ran.
+      // A toolchain mismatch the branch asked for (it changed go.mod, engines
+      // and the like) is the branch's to fix, even when the run left no test
+      // report and would otherwise park as unusable.
+      const toolchainRework = infra === null && raw.verdict !== "pass" && report.runError === null && !report.timedOut
+        && report.toolchainChange !== undefined ? report.toolchainChange : null;
       let { verdict, reason, introduced, preExisting, flaky }: BaselineAdjustedVerdict = infra
         ? { verdict: "infra-failure", reason: infra.reason, introduced: [], preExisting: [], flaky: [] }
+        : toolchainRework
+        ? {
+          verdict: "fail",
+          reason: `the branch changes the toolchain requirement in ${toolchainRework.paths.join(", ")}, and the host's ` +
+            `toolchain refused it: ${toolchainRework.line}`,
+          introduced: report.tally?.failedNames ?? [], preExisting: [], flaky: [],
+        }
         : decideBaselineAdjustedVerdict({
           verdict: raw.verdict,
           reason: raw.reason,
@@ -857,10 +869,14 @@ export async function runRealClaudeGateExecution(
           rerunFailures: report.rerunFailures,
         });
       const infraPauseNote = infra === null ? ""
+        : infra.toolchain
+          ? `The live gate is not paused: a toolchain mismatch is fixed on the host, not waited out. `
         : infra.pausedUntil
           ? `Further live gate runs from this dispatcher are paused until ${infra.pausedUntil}, because the cause ` +
             `is shared by every live run on this host. `
-          : `The live gate pause could not be recorded, so the next gated ticket may meet the same failure. `;
+        : infra.pausedUntil === null
+          ? `The live gate pause could not be recorded, so the next gated ticket may meet the same failure. `
+          : `No live gate pause is configured (\`PYRY_INFRA_COOLDOWN_MS=0\`). `;
       if (conflictParkNote !== "") reason = `${reason} ${conflictParkNote.replace(/\.$/, "")}`;
       let inheritedTickets: InheritedTicketResult = { blockers: [], untracked: [] };
       if (preExisting.length > 0) {

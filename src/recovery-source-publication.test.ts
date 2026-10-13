@@ -278,8 +278,8 @@ test('original source package is refused as a diagnostic but prepares without ch
 test('the complete exact submitted package, including tests and new files, prepares over HTTP',async t=>{
  // The package as submitted for pyrycode/pyrycode#3236, read from its own
  // commit. Reading the working tree instead made this test fail for any later
- // change to a file whose unrelated lines the scanner refuses, such as
- // dispatch.ts, which carries `token: process.env.GITHUB_TOKEN!`.
+ // change to a file whose unrelated lines the scanner refuses, such as the
+ // GitHub client setup in dispatch.ts.
  const submitted='be414ca678e0bbbaaaacb48517a1091033576b8d';
  const names=new Set(execFileSync('git',['diff','--name-only',revision,submitted],{encoding:'utf8'}).trim().split('\n').filter(Boolean));
  assert.ok(names.has('src/recovery-source-publication.test.ts'));

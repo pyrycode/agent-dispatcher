@@ -11,6 +11,10 @@ import {
   extractFailureMessages,
   findAdmissionRejections,
   findToolchainMismatch,
+  branchToolchainChanges,
+  judgeBaseCheck,
+  pickBaseCheckTests,
+  MAX_INFRA_COOLDOWN_MS,
   nextInfraPause,
   readInfraBreakerConfig,
   type InfraBreakerConfig,
@@ -38,6 +42,9 @@ describe("classifyGateFailure on real mobile gate output", () => {
     // The JUnit report has empty <failure /> elements; the text comes from Gradle's console.
     assert.equal(messages.size, 64, "every failing test's text is found in the diagnostic log");
     assert.equal(result.infra, true);
+    assert.equal(result.path, "shape", "provisional until the base check confirms it");
+    assert.equal(result.connectionTests?.length, 8);
+    assert.deepEqual(pickBaseCheckTests(result, 3), result.connectionTests!.slice(0, 3));
     assert.equal(result.connection, 8);
     assert.equal(result.wait, 56);
     assert.equal(result.other, 0);
@@ -74,20 +81,36 @@ describe("classifyGateFailure on real mobile gate output", () => {
     assert.match(result.reason, /not enough connection evidence/);
   });
 
-  test("relay admission rejections in the output trip it on their own", () => {
-    const stderr = RUN_2138.stderr.replace(
-      /^\t(?:kotlinx|java|androidx)\.[^\n]*$/gm,
-      "\tjava.lang.AssertionError: phone never opened its thread",
-    ) + [
+  test("admission lines beside assertion failures do not trip it (review finding 2)", () => {
+    // pyrycode's liveness test logs a tolerated rate_limited frame on passing
+    // runs; eight assertion failures next to it are the branch's.
+    const names = Array.from({ length: 8 }, (_, i) => `p.TestThing${i}`);
+    const messages = new Map(names.map(n => [n, "    thing_test.go:40: got 2 replies, want 1"]));
+    const text = "rate_limited frame TOLERATED (not a failure)\n" +
+      "dial: expected handshake response status code 101 but got 429\n".repeat(3);
+    const result = classifyGateFailure({
+      tally: { executed: 10, failed: 8, failedNames: names }, messages,
+      admission: findAdmissionRejections(text), config: DEFAULT_INFRA_BREAKER_CONFIG,
+    });
+    assert.equal(result.admissionLines, 3);
+    assert.equal(result.infra, false);
+    assert.match(result.reason, /not connection-shaped/);
+  });
+
+  test("a tolerated rate_limited log line is not an admission rejection", () => {
+    assert.equal(findAdmissionRejections("liveness: rate_limited frame TOLERATED (not a failure)").count, 0);
+  });
+
+  test("admission lines with connection-shaped failures decide on the spot, with no base check", () => {
+    const stderr = RUN_2138.stderr + [
       "[e2e] daemon dial: failed to WebSocket dial: expected handshake response status code 101 but got 503",
       "[e2e] daemon dial: failed to WebSocket dial: expected handshake response status code 101 but got 429",
       "java.net.ProtocolException: Expected HTTP 101 response but was '503 Service Unavailable'",
     ].join("\n");
     const { result } = classify({ stdout: RUN_2138.stdout, stderr });
-    assert.equal(result.connection, 0);
     assert.equal(result.admissionLines, 3);
     assert.equal(result.infra, true);
-    assert.match(result.reason, /admission rejection/);
+    assert.equal(result.path, "admission");
   });
 
   test("thresholds come from the environment", () => {
@@ -147,7 +170,13 @@ describe("readInfraBreakerConfig", () => {
       PYRY_INFRA_BREAKER_WAIT_SHARE: "0.9",
       PYRY_INFRA_BREAKER_MIN_SIGNATURES: "5",
       PYRY_INFRA_COOLDOWN_MS: "600000",
-    }), { enabled: true, minFailed: 10, minFailedShare: 0.6, waitShare: 0.9, minSignatures: 5, cooldownMs: 600000 });
+    }), { enabled: true, minFailed: 10, minFailedShare: 0.6, waitShare: 0.9, minSignatures: 5, cooldownMs: 600000, baseCheckTests: 3, baseCheckTimeoutMs: 15 * 60_000 });
+  });
+
+  test("a cooldown of 0 means no pause, and a huge one is capped at a day", () => {
+    assert.equal(readInfraBreakerConfig({ PYRY_INFRA_COOLDOWN_MS: "0" }).cooldownMs, 0);
+    assert.equal(readInfraBreakerConfig({ PYRY_INFRA_COOLDOWN_MS: "9".repeat(15) }).cooldownMs, MAX_INFRA_COOLDOWN_MS);
+    assert.equal(readInfraBreakerConfig({ PYRY_INFRA_BASE_CHECK_TESTS: "5", PYRY_INFRA_BASE_CHECK_TIMEOUT_MS: "60000" }).baseCheckTimeoutMs, 60000);
   });
 });
 
@@ -205,11 +234,60 @@ describe("live gate pause state", () => {
   });
 
   test("a second trip extends the pause but never shortens it", () => {
-    const first = JSON.stringify(nextInfraPause({ existing: null, nowMs: T0, cooldownMs: 60 * 60_000, issueNumber: 1, reason: "a" }));
-    const shorter = nextInfraPause({ existing: first, nowMs: T0 + 60_000, cooldownMs: 5 * 60_000, issueNumber: 2, reason: "b" });
-    assert.equal(shorter.issueNumber, 1, "the longer pause stands");
-    const longer = nextInfraPause({ existing: first, nowMs: T0 + 59 * 60_000, cooldownMs: 30 * 60_000, issueNumber: 2, reason: "b" });
-    assert.equal(longer.issueNumber, 2);
-    assert.equal(longer.pausedUntil, new Date(T0 + 89 * 60_000).toISOString());
+    const first = JSON.stringify(nextInfraPause({ existing: null, nowMs: T0, cooldownMs: 30 * 60_000, issueNumber: 1, reason: "a" }));
+    const sooner = nextInfraPause({ existing: first, nowMs: T0 + 60_000, cooldownMs: 5 * 60_000, issueNumber: 2, reason: "b" });
+    assert.equal(sooner.issueNumber, 2, "a pause beyond this trip's own cooldown is not kept");
+    const same = nextInfraPause({ existing: first, nowMs: T0 + 60_000, cooldownMs: 30 * 60_000, issueNumber: 2, reason: "b" });
+    assert.equal(same.pausedUntil, new Date(T0 + 31 * 60_000).toISOString());
+    const longer = nextInfraPause({ existing: first, nowMs: T0 + 29 * 60_000, cooldownMs: 30 * 60_000, issueNumber: 2, reason: "b" });
+    assert.equal(longer.pausedUntil, new Date(T0 + 59 * 60_000).toISOString());
+    const kept = nextInfraPause({ existing: JSON.stringify(longer), nowMs: T0 + 30 * 60_000, cooldownMs: 30 * 60_000, issueNumber: 3, reason: "c" });
+    assert.equal(kept.issueNumber, 3, "a later trip may extend");
+  });
+
+  test("an absurd pause in the file is ignored, and a huge cooldown is clamped rather than thrown", () => {
+    const far = JSON.stringify({ pausedAt: "", pausedUntil: new Date(T0 + 10 * 24 * 3600_000).toISOString(), issueNumber: 9, reason: "x" });
+    assert.equal(activeInfraPause(far, T0, 30 * 60_000), null);
+    assert.equal(activeInfraPause(far, T0), null, "beyond the one-day cap too");
+    const fresh = nextInfraPause({ existing: far, nowMs: T0, cooldownMs: 30 * 60_000, issueNumber: 2, reason: "b" });
+    assert.equal(fresh.issueNumber, 2);
+    const huge = nextInfraPause({ existing: null, nowMs: T0, cooldownMs: Number.MAX_SAFE_INTEGER, issueNumber: 1, reason: "a" });
+    assert.equal(huge.pausedUntil, new Date(T0 + MAX_INFRA_COOLDOWN_MS).toISOString());
+  });
+});
+
+describe("judgeBaseCheck (review finding 1)", () => {
+  const tests = ["a.T#one", "a.T#two"];
+
+  test("confirmed only when every sampled test fails on the base with a connection or timeout failure", () => {
+    const baseMessages = new Map([["a.T#one", "relay=Offline daemon=Down"], ["a.T#two", "Timed out waiting for 30000 ms"]]);
+    assert.equal(judgeBaseCheck({ tests, failedOnBase: [...tests], baseMessages, skipReason: null }).confirmed, true);
+  });
+
+  test("a sampled test passing on the base is the branch's regression", () => {
+    const j = judgeBaseCheck({ tests, failedOnBase: ["a.T#one"], baseMessages: new Map(), skipReason: null });
+    assert.equal(j.confirmed, false);
+    assert.match(j.note, /passed on the base commit/);
+  });
+
+  test("an ordinary assertion on the base confirms nothing, and neither does a base check that could not run", () => {
+    assert.equal(judgeBaseCheck({ tests, failedOnBase: [...tests], baseMessages: new Map([["a.T#one", "AssertionError: want 1 got 2"]]), skipReason: null }).confirmed, false);
+    const skipped = judgeBaseCheck({ tests, failedOnBase: null, baseMessages: new Map(), skipReason: "timed out" });
+    assert.equal(skipped.confirmed, false);
+    assert.match(skipped.note, /could not run \(timed out\)/);
+  });
+});
+
+describe("branchToolchainChanges (review finding 3)", () => {
+  test("go.mod and similar files count outright", () => {
+    assert.deepEqual(branchToolchainChanges(["internal/x.go", "go.mod", ".nvmrc"], () => ""), ["go.mod", ".nvmrc"]);
+  });
+
+  test("package.json counts only when its diff touches engines or the package manager", () => {
+    const engines = '--- a/package.json\n+++ b/package.json\n-    "node": ">=20"\n+    "node": ">=22"';
+    const deps = '--- a/package.json\n+++ b/package.json\n-    "react": "18.2.0"\n+    "react": "18.3.0"';
+    assert.deepEqual(branchToolchainChanges(["package.json"], () => engines), ["package.json"]);
+    assert.deepEqual(branchToolchainChanges(["package.json"], () => deps), []);
+    assert.deepEqual(branchToolchainChanges(["gradle/libs.versions.toml"], () => '+agp = "8.9.0"'), ["gradle/libs.versions.toml"]);
   });
 });

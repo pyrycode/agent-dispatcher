@@ -112,7 +112,7 @@ import {
 } from "./main-sweep.js";
 import { recordFlakyTests, type FlakyTicketClient } from "./flaky-tickets.js";
 import { recordInheritedTests } from "./inherited-tickets.js";
-import { activeInfraPause, classifyGateFailure, extractFailureMessages, findAdmissionRejections, findToolchainMismatch, INFRA_PAUSE_STATE_FILE, nextInfraPause, readInfraBreakerConfig, serializeInfraPause, type InfraBreakerConfig, type InfraPauseState } from "./infra-failure.js";
+import { activeInfraPause, classifyGateFailure, extractFailureMessages, branchToolchainChanges, findAdmissionRejections, findToolchainMismatch, judgeBaseCheck, pickBaseCheckTests, INFRA_PAUSE_STATE_FILE, nextInfraPause, readInfraBreakerConfig, serializeInfraPause, type InfraBreakerConfig, type InfraPauseState } from "./infra-failure.js";
 import { dropStillHeld, HealthChecker, type HealthEnvFor, healthEnvForAgent, holdUnhealthyCandidates, liveGateHealthFailures, newHealthNoticeState, parseHealthCacheMs, parseHealthChecks, startupHealthCheck } from "./health-check.js";
 import {
   decideDocsOnlyGateReuse,
@@ -6098,9 +6098,11 @@ export async function haltForInfraGate(ctx: DispatchContext): Promise<void> {
       ...failure.samples,
       "```",
       "",
-      `This is not the change's failure. ${agent.name} was not started, no rework is requested or counted, and the ` +
-      `check was not re-run, since the same host fails the same way. Fix the toolchain on the dispatcher host, then ` +
-      `remove \`${INFRA_FAILURE_LABEL}\` to run the checks again.`,
+      `This looks like a host problem rather than the change: the branch does not touch go.mod, package engines or ` +
+      `other toolchain files. ${agent.name} was not started, no rework is requested or counted, and the check was not ` +
+      `re-run, since the same host fails the same way. Fix the toolchain on the dispatcher host, then remove ` +
+      `\`${INFRA_FAILURE_LABEL}\` to run the checks again. If the change does need the newer toolchain, say so here ` +
+      `and route it to the builder instead.`,
     ].join("\n"));
   } catch (e) {
     console.warn(`   ⚠️  Failed to explain the infrastructure halt on #${item.issueNumber}: ${e}`);
@@ -6301,6 +6303,27 @@ export async function maybeRunPreSpawnGates(
     };
   }
 
+  // A mismatch the branch asked for, by changing go.mod, engines and the
+  // like, is the branch's: the verifier triages it like any red gate.
+  let toolchainNote: string[] = [];
+  if (result.infra) {
+    const git = (args: string): string => String(ctx.deps.execSync(`git ${args}`, {
+      cwd: agentCwd, encoding: "utf-8", stdio: "pipe", timeout: 30_000,
+    })).trim();
+    let changed: string[] = [];
+    try { changed = git(`diff --name-only ${defaultBranch}...HEAD`).split("\n").filter((p) => p !== ""); } catch {}
+    const paths = branchToolchainChanges(changed, (path) => git(`diff ${defaultBranch}...HEAD -- "${path}"`));
+    if (paths.length > 0) {
+      console.log(`   🧪 Pre-${agent.name} gate \`${result.failedGate}\` hit a toolchain mismatch the branch asked for (${paths.join(", ")}); triaging as a red gate`);
+      toolchainNote = [
+        "",
+        `The failure is a toolchain mismatch (${result.infra.samples[0] ?? result.infra.reason}), and this branch changes the toolchain ` +
+        `requirement in ${paths.map((p) => `\`${p}\``).join(", ")}. The host cannot run what the branch asks for, so this is the branch's ` +
+        `to resolve: route it to rework unless the requirement change is wanted and the hosts must be upgraded first.`,
+      ];
+      delete result.infra;
+    }
+  }
   if (result.infra) {
     // Not the change's failure: halt with `error:infra` and spawn nothing.
     // `dispatchToAgent` reads this before the agent starts.
@@ -6331,6 +6354,7 @@ export async function maybeRunPreSpawnGates(
     "```",
     "",
     "Triage this failure before reviewing. Route demonstrated code regressions to rework. Required checks remain incomplete or failing, so this run cannot advance or publish PASS. A focused rerun cannot replace unfinished checks. Fix the test environment or arrange a complete dispatcher rerun before approval.",
+    ...toolchainNote,
     ...flakyNoteLines(result.baseline),
     ...baselineNoteLines(result.baseline, baselineTicket),
     ...remainingNoteLines(result),
@@ -7397,6 +7421,68 @@ export async function runRealClaudeGateSuite(opts: {
         toolchain: findToolchainMismatch(combined),
         config: opts.infraBreaker,
       });
+      const infra = report.infraFailure;
+      // A toolchain mismatch the branch asked for (it bumped go.mod, engines
+      // and the like) is the branch's failure: carry on as a normal red run.
+      if (infra.infra && infra.path === "toolchain") {
+        let changed: string[] = [];
+        try { changed = git(`diff --name-only ${report.baseSha}...${report.headSha}`).split("\n").filter(p => p !== ""); } catch {}
+        const paths = branchToolchainChanges(changed, path => git(`diff ${report.baseSha}...${report.headSha} -- "${path}"`));
+        if (paths.length > 0) {
+          report.toolchainChange = { paths, line: infra.samples[0] ?? "" };
+          report.infraFailure = {
+            ...infra, infra: false,
+            reason: `${infra.reason}; the branch itself changes the toolchain requirement in ${paths.join(", ")}, so the mismatch is the branch's`,
+          };
+        }
+      }
+      // The shape path is provisional: a branch that breaks daemon startup or
+      // the relay client fails in the same shape. Re-run a few of the failing
+      // tests on the base, bounded, and blame the environment only when they
+      // fail there the same way.
+      if (report.infraFailure.infra && report.infraFailure.path === "shape") {
+        const shaped = report.infraFailure;
+        const tests = pickBaseCheckTests(shaped, opts.infraBreaker.baseCheckTests);
+        let judged: { confirmed: boolean; note: string };
+        let failedOnBase: string[] | null = null;
+        let checkOutput: string | null = null;
+        if (!opts.baselineCommand) {
+          judged = { confirmed: false, note: "no baseline command is configured, so the base check could not run and nothing confirms an environment failure" };
+        } else {
+          const check = await runFailuresOnBase({
+            failedNames: tests,
+            baselineCommand: opts.baselineCommand,
+            baseSha: report.baseSha,
+            format: opts.format,
+            timeoutMs: Math.min(opts.timeoutMs, opts.infraBreaker.baseCheckTimeoutMs),
+            issueNumber: opts.issueNumber,
+            targetRepo,
+            logsDir,
+            stamp,
+            label: "real-claude-gate-infra-check",
+            who: "Real-claude gate infrastructure check",
+            deps,
+          });
+          failedOnBase = check.failures;
+          checkOutput = check.outputPath;
+          let baseMessages = new Map<string, string>();
+          if (check.outputPath !== null) {
+            let baseOut = "";
+            let baseErr = "";
+            try { baseOut = deps.readFileSync(check.outputPath, "utf-8").toString(); } catch {}
+            try { baseErr = deps.readFileSync(check.outputPath.replace(/\.log$/, ".stderr.log"), "utf-8").toString(); } catch {}
+            baseMessages = extractFailureMessages({ stdout: baseOut, stderr: baseErr, format: opts.format, failedNames: tests });
+          }
+          judged = judgeBaseCheck({ tests, failedOnBase, baseMessages, skipReason: check.skipReason });
+        }
+        report.infraFailure = {
+          ...shaped,
+          infra: judged.confirmed,
+          reason: judged.confirmed ? `${shaped.reason}. Confirmed on the base commit: ${judged.note}` : `${shaped.reason}, but ${judged.note}`,
+          baseCheck: { tests, failedOnBase, confirmed: judged.confirmed, note: judged.note, outputPath: checkOutput },
+        };
+        console.log(`   🔎 Real-claude gate: #${opts.issueNumber} infrastructure check on the base: ${judged.note}`);
+      }
       if (report.infraFailure.infra) {
         const why = "the first pass failed in an infrastructure shape, so a re-run would only meet the same failure";
         report.rerunSkipReason = why;
@@ -7730,9 +7816,9 @@ export function makeRealClaudeGateRunner(): RealClaudeGateRunner | null {
       minExecuted: REAL_CLAUDE_GATE_MIN_EXECUTED,
       infraBreaker: INFRA_BREAKER,
     });
-    if (report.infraFailure?.infra) {
-      report.infraFailure.pausedUntil = recordInfraPause({
-        issueNumber, reason: report.infraFailure.reason, cooldownMs: INFRA_BREAKER.cooldownMs,
+    if (shouldPauseLiveGate(report, INFRA_BREAKER.cooldownMs)) {
+      report.infraFailure!.pausedUntil = recordInfraPause({
+        issueNumber, reason: report.infraFailure!.reason, cooldownMs: INFRA_BREAKER.cooldownMs,
       });
     }
     recordGateRunMeta(report);
@@ -7751,6 +7837,15 @@ export function makeRealClaudeGateRunner(): RealClaudeGateRunner | null {
 // the same writable path to pause them all together.
 const INFRA_BREAKER = readInfraBreakerConfig(process.env);
 const INFRA_PAUSE_FILE = (process.env.PYRY_INFRA_PAUSE_FILE ?? "").trim() || resolve(LOGS_DIR, INFRA_PAUSE_STATE_FILE);
+
+/**
+ * Whether a finished run pauses the live gate: an infrastructure verdict that
+ * is not a toolchain mismatch, with a cooldown above 0. A toolchain mismatch
+ * is fixed on the host, not waited out.
+ */
+export function shouldPauseLiveGate(report: Pick<GateRunReport, "infraFailure">, cooldownMs: number): boolean {
+  return report.infraFailure?.infra === true && report.infraFailure.toolchain !== true && cooldownMs > 0;
+}
 
 export interface InfraPauseDeps {
   readFileSync: typeof readFileSync;
@@ -7771,8 +7866,8 @@ export function recordInfraPause(
   const path = opts.path ?? INFRA_PAUSE_FILE;
   let existing: string | null = null;
   try { existing = deps.readFileSync(path, "utf-8").toString(); } catch {}
-  const state = nextInfraPause({ existing, nowMs: deps.now(), cooldownMs: opts.cooldownMs, issueNumber: opts.issueNumber, reason: opts.reason });
   try {
+    const state = nextInfraPause({ existing, nowMs: deps.now(), cooldownMs: opts.cooldownMs, issueNumber: opts.issueNumber, reason: opts.reason });
     deps.mkdirSync(dirname(path), { recursive: true });
     deps.writeFileSync(path, serializeInfraPause(state));
     return state.pausedUntil;
@@ -7789,7 +7884,9 @@ export function readInfraPause(
 ): InfraPauseState | null {
   let raw: string | null = null;
   try { raw = deps.readFileSync(path, "utf-8").toString(); } catch {}
-  return activeInfraPause(raw, deps.now());
+  // A pause ending beyond one cooldown from now was not written under these
+  // settings; ignore it rather than stop the gate for days.
+  return activeInfraPause(raw, deps.now(), INFRA_BREAKER.cooldownMs);
 }
 
 /** Announce a pause once when it starts and once when it ends, not every cycle. */

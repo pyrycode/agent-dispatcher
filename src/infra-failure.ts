@@ -38,9 +38,20 @@ export interface InfraBreakerConfig {
   waitShare: number;
   /** `PYRY_INFRA_BREAKER_MIN_SIGNATURES`: explicit infrastructure evidence needed. */
   minSignatures: number;
-  /** `PYRY_INFRA_COOLDOWN_MS`: how long the host's live gate pauses after a trip. */
+  /**
+   * `PYRY_INFRA_COOLDOWN_MS`: how long this dispatcher's live gate pauses
+   * after a trip. `0` classifies and halts but never pauses. Capped at
+   * `MAX_INFRA_COOLDOWN_MS`.
+   */
   cooldownMs: number;
+  /** `PYRY_INFRA_BASE_CHECK_TESTS`: failing tests the shape path re-runs on the base to confirm. */
+  baseCheckTests: number;
+  /** `PYRY_INFRA_BASE_CHECK_TIMEOUT_MS`: wall clock for that base check, at most the gate's own. */
+  baseCheckTimeoutMs: number;
 }
+
+/** The longest pause a setting or a state file can ask for: one day. */
+export const MAX_INFRA_COOLDOWN_MS = 24 * 60 * 60_000;
 
 export const DEFAULT_INFRA_BREAKER_CONFIG: InfraBreakerConfig = {
   enabled: true,
@@ -49,9 +60,15 @@ export const DEFAULT_INFRA_BREAKER_CONFIG: InfraBreakerConfig = {
   waitShare: 0.8,
   minSignatures: 3,
   cooldownMs: 30 * 60_000,
+  baseCheckTests: 3,
+  baseCheckTimeoutMs: 15 * 60_000,
 };
 
-/** Read the breaker settings. Garbage, zero or out-of-range values keep the default. */
+/**
+ * Read the breaker settings. Garbage, zero or out-of-range values keep the
+ * default, except the cooldown, where `0` turns the pause off and anything
+ * over a day is capped at a day.
+ */
 export function readInfraBreakerConfig(env: NodeJS.ProcessEnv): InfraBreakerConfig {
   const d = DEFAULT_INFRA_BREAKER_CONFIG;
   const int = (name: string, fallback: number): number => {
@@ -68,7 +85,14 @@ export function readInfraBreakerConfig(env: NodeJS.ProcessEnv): InfraBreakerConf
     minFailedShare: share("PYRY_INFRA_BREAKER_MIN_FAILED_SHARE", d.minFailedShare),
     waitShare: share("PYRY_INFRA_BREAKER_WAIT_SHARE", d.waitShare),
     minSignatures: int("PYRY_INFRA_BREAKER_MIN_SIGNATURES", d.minSignatures),
-    cooldownMs: int("PYRY_INFRA_COOLDOWN_MS", d.cooldownMs),
+    cooldownMs: (() => {
+      const raw = (env.PYRY_INFRA_COOLDOWN_MS ?? "").trim();
+      const n = Number(raw);
+      if (raw === "" || !Number.isSafeInteger(n) || n < 0) return d.cooldownMs;
+      return Math.min(n, MAX_INFRA_COOLDOWN_MS);
+    })(),
+    baseCheckTests: int("PYRY_INFRA_BASE_CHECK_TESTS", d.baseCheckTests),
+    baseCheckTimeoutMs: int("PYRY_INFRA_BASE_CHECK_TIMEOUT_MS", d.baseCheckTimeoutMs),
   };
 }
 
@@ -118,7 +142,8 @@ const ADMISSION_SIGNATURES: readonly RegExp[] = [
   /\b503 Service Unavailable\b/i,
   /\btoo many phones for server-id\b/i,
   /\b(?:status|code)[ =:]+4429\b/i,
-  /\brate_limited\b/,
+  // No bare `rate_limited`: pyrycode's liveness test logs "rate_limited frame
+  // TOLERATED (not a failure)" on passing runs.
   /\bconnection cap (?:reached|exceeded)\b/i,
 ];
 
@@ -332,6 +357,15 @@ export interface InfraFailureClassification {
   samples: string[];
   /** True when the cause is a toolchain mismatch rather than a connection failure. */
   toolchain?: boolean;
+  /**
+   * Which rule fired. `shape` is provisional until a short base run confirms
+   * it (`confirmInfraOnBase`); the other two decide on the spot.
+   */
+  path?: "admission" | "shape" | "toolchain";
+  /** Connection-shaped failing tests, in report order, for the base check to sample. */
+  connectionTests?: string[];
+  /** The shape path's base check, once it ran or was skipped. */
+  baseCheck?: { tests: string[]; failedOnBase: string[] | null; confirmed: boolean; note: string; outputPath: string | null };
   /** Set by the runner once the host pause is written; null when it could not be. */
   pausedUntil?: string | null;
 }
@@ -341,18 +375,22 @@ export interface InfraFailureClassification {
  *
  * Every path needs a mass failure first: at least `minFailed` tests, and at
  * least `minFailedShare` of those executed. A handful of red tests is the
- * branch's to explain, whatever they say. Then either of two:
+ * branch's to explain, whatever they say. The failing tests must also be
+ * connection-shaped: connection failures plus bare timeouts at least
+ * `waitShare` of all failures. Bare timeouts alone never count, because an
+ * app hung by a regression times out too. Then either of two:
  *
- * 1. **Admission.** At least `minSignatures` admission-rejection lines (429,
- *    503, the relay's 4429 close) anywhere in the output.
+ * 1. **Admission.** At least one failing test names a connection failure,
+ *    and the output holds at least `minSignatures` admission-rejection lines
+ *    (429, 503, the relay's 4429 close). Decided on the spot.
  * 2. **Shape.** At least `minSignatures` failing tests name a connection,
- *    readiness or daemon-unavailable failure, and those plus the bare
- *    timeouts are at least `waitShare` of all failures. Bare timeouts alone
- *    never trip it, because an app hung by a regression times out too.
+ *    readiness or daemon-unavailable failure. **Provisional**: a branch that
+ *    breaks daemon startup or the relay client fails in exactly this shape
+ *    (pyrycode's `realclaude: daemon not ready`, mobile's `relay=Offline`).
+ *    The runner confirms it by re-running a few of the failing tests on the
+ *    base commit; only failures that reproduce there are the environment's.
  *
- * Known limit: a branch that breaks the connection itself fails in exactly
- * this shape. The outcome for that case is a halted ticket and a human,
- * which is the safe direction: nothing advances on an infra verdict.
+ * A toolchain mismatch line decides on its own, before any of that.
  */
 export function classifyGateFailure(opts: {
   tally: Pick<GateTally, "executed" | "failed" | "failedNames"> | null;
@@ -372,17 +410,19 @@ export function classifyGateFailure(opts: {
   // and whatever else failed ran on the wrong toolchain.
   if (opts.toolchain && opts.toolchain.count > 0) {
     return {
-      ...base, infra: true, toolchain: true, samples: opts.toolchain.samples,
+      ...base, infra: true, toolchain: true, path: "toolchain", samples: opts.toolchain.samples,
       reason: `the host's toolchain does not match what the repository requires: ${opts.toolchain.samples[0]}`,
     };
   }
   if (tally === null || tally.failed === 0) return { ...base, reason: "nothing failed" };
 
   const samples: string[] = [...opts.admission.samples];
+  const connectionTests: string[] = [];
   for (const name of tally.failedNames) {
     const text = opts.messages.get(name);
     const shape = text === undefined ? "other" : classifyFailureMessage(text);
     base[shape]++;
+    if (shape === "connection") connectionTests.push(name);
     if (shape === "connection" && samples.length < 5) {
       const first = text!.split("\n").find(l => CONNECTION_SIGNATURES.some(re => re.test(l)) || ADMISSION_SIGNATURES.some(re => re.test(l))) ?? text!;
       const line = first.trim();
@@ -391,6 +431,7 @@ export function classifyGateFailure(opts: {
     }
   }
   base.samples = samples;
+  base.connectionTests = connectionTests;
 
   const share = tally.executed > 0 ? tally.failed / tally.executed : 0;
   const counts = `${tally.failed} of ${tally.executed} executed tests failed: ${base.connection} on connection, readiness or admission, ` +
@@ -398,16 +439,19 @@ export function classifyGateFailure(opts: {
   if (tally.failed < config.minFailed || share < config.minFailedShare) {
     return { ...base, reason: `${counts}; not a mass failure (needs at least ${config.minFailed} failed and ${Math.round(config.minFailedShare * 100)}% of executed)` };
   }
-  if (opts.admission.count >= config.minSignatures) {
+  const waitShare = (base.connection + base.wait) / tally.failed;
+  if (waitShare < config.waitShare) {
+    return { ...base, reason: `${counts}; under ${Math.round(config.waitShare * 100)}% connection or timeout waits, so the failures are not connection-shaped` };
+  }
+  if (base.connection >= 1 && opts.admission.count >= config.minSignatures) {
     return {
-      ...base, infra: true,
+      ...base, infra: true, path: "admission",
       reason: `${counts}, and the output holds ${opts.admission.count} admission rejection line(s) from a shared service, such as the relay's connection cap or rate limit`,
     };
   }
-  const waitShare = (base.connection + base.wait) / tally.failed;
-  if (base.connection >= config.minSignatures && waitShare >= config.waitShare) {
+  if (base.connection >= config.minSignatures) {
     return {
-      ...base, infra: true,
+      ...base, infra: true, path: "shape",
       reason: `${counts}. ${Math.round(waitShare * 100)}% of the failures are connection, readiness or timeout waits, ` +
         `which is the shape of a shared environment failure rather than of this branch`,
     };
@@ -428,13 +472,18 @@ export function serializeInfraPause(state: InfraPauseState): string {
   return JSON.stringify(state, null, 2) + "\n";
 }
 
-/** The pause in force at `nowMs`, or null. An unreadable file is no pause. */
-export function activeInfraPause(raw: string | null, nowMs: number): InfraPauseState | null {
+/**
+ * The pause in force at `nowMs`, or null. An unreadable file is no pause, and
+ * so is one ending later than `maxAheadMs` from now: no trip can have written
+ * it under the current settings, so it is a stale or hand-edited file, and
+ * honouring it could stop the live gate for days.
+ */
+export function activeInfraPause(raw: string | null, nowMs: number, maxAheadMs: number = MAX_INFRA_COOLDOWN_MS): InfraPauseState | null {
   if (raw === null) return null;
   try {
     const s = JSON.parse(raw);
     const until = Date.parse(s?.pausedUntil);
-    if (!Number.isFinite(until) || until <= nowMs) return null;
+    if (!Number.isFinite(until) || until <= nowMs || until > nowMs + maxAheadMs) return null;
     return {
       pausedAt: String(s.pausedAt ?? ""),
       pausedUntil: new Date(until).toISOString(),
@@ -448,7 +497,9 @@ export function activeInfraPause(raw: string | null, nowMs: number): InfraPauseS
 
 /**
  * The pause to write after a trip. An existing later pause is kept, so a
- * second trip never shortens the first.
+ * second trip never shortens the first, unless it ends beyond this trip's
+ * own cooldown from now, which no trip under these settings could have
+ * written. The cooldown is clamped to `MAX_INFRA_COOLDOWN_MS`.
  */
 export function nextInfraPause(opts: {
   existing: string | null;
@@ -457,8 +508,9 @@ export function nextInfraPause(opts: {
   issueNumber: number;
   reason: string;
 }): InfraPauseState {
-  const until = opts.nowMs + opts.cooldownMs;
-  const current = activeInfraPause(opts.existing, opts.nowMs);
+  const cooldownMs = Math.max(0, Math.min(opts.cooldownMs, MAX_INFRA_COOLDOWN_MS));
+  const until = opts.nowMs + cooldownMs;
+  const current = activeInfraPause(opts.existing, opts.nowMs, cooldownMs);
   if (current && Date.parse(current.pausedUntil) >= until) return current;
   return {
     pausedAt: new Date(opts.nowMs).toISOString(),
@@ -466,4 +518,68 @@ export function nextInfraPause(opts: {
     issueNumber: opts.issueNumber,
     reason: opts.reason,
   };
+}
+
+// --------- Confirming the shape path on the base ---------
+
+/** Which failing tests the shape path's base check re-runs. */
+export function pickBaseCheckTests(c: InfraFailureClassification, limit: number): string[] {
+  return (c.connectionTests ?? []).slice(0, Math.max(1, limit));
+}
+
+/**
+ * Judge the shape path's base check. The environment is to blame only when
+ * every sampled test also fails on the base commit and none of those base
+ * failures reads as an ordinary assertion. A sampled test that passes on the
+ * base means the branch broke it, which is a regression, not an outage. A
+ * base check that could not run confirms nothing.
+ */
+export function judgeBaseCheck(opts: {
+  tests: readonly string[];
+  failedOnBase: readonly string[] | null;
+  baseMessages: ReadonlyMap<string, string>;
+  skipReason: string | null;
+}): { confirmed: boolean; note: string } {
+  if (opts.failedOnBase === null) {
+    return { confirmed: false, note: `the base check could not run (${opts.skipReason ?? "unknown reason"}), so nothing confirms an environment failure` };
+  }
+  const failed = new Set(opts.failedOnBase);
+  const passed = opts.tests.filter(name => !failed.has(name));
+  if (passed.length > 0) {
+    return { confirmed: false, note: `${passed.length} of ${opts.tests.length} sampled test(s) passed on the base commit, so the branch broke them` };
+  }
+  const asserted = opts.tests.filter(name => {
+    const text = opts.baseMessages.get(name);
+    return text !== undefined && classifyFailureMessage(text) === "other";
+  });
+  if (asserted.length > 0) {
+    return { confirmed: false, note: `${asserted.length} sampled test(s) failed on the base commit with an ordinary assertion, not a connection failure` };
+  }
+  return { confirmed: true, note: `all ${opts.tests.length} sampled test(s) fail on the base commit the same way` };
+}
+
+// --------- Toolchain changes on the branch ---------
+
+/** Files whose change moves the toolchain a repository asks for. */
+const TOOLCHAIN_FILES = /(?:^|\/)(?:go\.mod|go\.work|\.go-version|\.tool-versions|\.nvmrc|\.node-version|\.java-version|rust-toolchain(?:\.toml)?|gradle-wrapper\.properties)$/;
+/** In these files only some lines name a toolchain; the diff is checked for them. */
+const TOOLCHAIN_LINE_FILES = /(?:^|\/)(?:package\.json|libs\.versions\.toml)$/;
+const TOOLCHAIN_DIFF_LINE = /^[+-]\s*"?(?:engines|packageManager|node|pnpm|npm|agp|androidGradlePlugin|android-gradle-plugin|jvmTarget|jdk|java)"?\s*[:=]/;
+
+/**
+ * The branch's own files that change the toolchain the repository requires,
+ * or an empty list. `diffOf` returns the branch's diff of one file. A branch
+ * that bumped `go.mod` and then met an older toolchain on the host broke
+ * the check itself: that is rework, not infrastructure.
+ */
+export function branchToolchainChanges(changedPaths: readonly string[], diffOf: (path: string) => string): string[] {
+  const out: string[] = [];
+  for (const path of changedPaths) {
+    if (TOOLCHAIN_FILES.test(path)) { out.push(path); continue; }
+    if (!TOOLCHAIN_LINE_FILES.test(path)) continue;
+    let diff = "";
+    try { diff = diffOf(path); } catch {}
+    if (diff.split("\n").some(line => !line.startsWith("+++") && !line.startsWith("---") && TOOLCHAIN_DIFF_LINE.test(line))) out.push(path);
+  }
+  return out;
 }

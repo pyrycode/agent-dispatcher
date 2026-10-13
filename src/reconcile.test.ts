@@ -1093,15 +1093,40 @@ describe("runRealClaudeGateExecution: infrastructure failure", () => {
   test("a toolchain mismatch with no readable report halts as infrastructure, not as an unusable run", async () => {
     const item = parkedItem();
     const client = new MockClient([item]);
+    const sent: string[] = [];
     const line = "go: go.mod requires go >= 1.26.9 (running go 1.26.2; GOTOOLCHAIN=local)";
     await runRealClaudeGateExecution(client, async () => report({
       exitCode: 1, tally: null,
       infraFailure: { infra: true, toolchain: true, reason: `the host's toolchain does not match what the repository requires: ${line}`,
-        executed: 0, failed: 0, connection: 0, wait: 0, other: 0, admissionLines: 0, samples: [line], pausedUntil: "2026-10-13T16:18:00.000Z" },
-    }), 1, async () => {});
+        executed: 0, failed: 0, connection: 0, wait: 0, other: 0, admissionLines: 0, samples: [line] },
+    }), 1, async m => { sent.push(m); });
     assert.ok(item.labels.includes("error:infra"));
     assert.ok(!item.labels.includes("error:real-claude-gate"));
     assert.match(client.addCommentCalls[0].body, /Toolchain mismatch/);
+    assert.match(sent[0], /not paused: a toolchain mismatch is fixed on the host/);
+  });
+
+  test("a toolchain mismatch the branch asked for routes to rework, not infra (review finding 3)", async () => {
+    const item = parkedItem();
+    const client = new MockClient([item]);
+    const line = "go: go.mod requires go >= 1.26.9 (running go 1.26.2; GOTOOLCHAIN=local)";
+    await runRealClaudeGateExecution(client, async () => report({
+      exitCode: 1, tally: null, toolchainChange: { paths: ["go.mod"], line },
+    }), 1, async () => {});
+    assert.equal(item.status, "In Development");
+    assert.ok(item.labels.includes("needs-rework:developer"));
+    assert.ok(!item.labels.includes("error:infra"));
+    assert.ok(!item.labels.includes("error:real-claude-gate"));
+    assert.match(client.addCommentCalls[0].body, /changes the toolchain requirement in go\.mod/);
+  });
+
+  test("with PYRY_INFRA_COOLDOWN_MS=0 the alert says no pause is configured (review finding 7)", async () => {
+    const client = new MockClient([parkedItem()]);
+    const sent: string[] = [];
+    const r = infraReport(null);
+    delete r.infraFailure!.pausedUntil;
+    await runRealClaudeGateExecution(client, async () => r, 1, async m => { sent.push(m); });
+    assert.match(sent[0], /No live gate pause is configured/);
   });
 
   test("an infra classification never overrides an unusable run", async () => {
