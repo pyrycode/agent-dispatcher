@@ -523,8 +523,42 @@ export function nextInfraPause(opts: {
 // --------- Confirming the shape path on the base ---------
 
 /** Which failing tests the shape path's base check re-runs. */
-export function pickBaseCheckTests(c: InfraFailureClassification, limit: number): string[] {
-  return (c.connectionTests ?? []).slice(0, Math.max(1, limit));
+/**
+ * Which failing tests the shape path's base check re-runs. Tests known to
+ * exist on the base come first, then unknown ones, then tests the branch
+ * added: a new connection test cannot fail on a base that lacks it, so
+ * sampling one would defeat the confirmation. `existsOnBase` answers true,
+ * false or null (unknown); at most `maxLookups` candidates are looked up.
+ */
+export function pickBaseCheckTests(
+  c: InfraFailureClassification,
+  limit: number,
+  existsOnBase?: (name: string) => boolean | null,
+  maxLookups = 20,
+): string[] {
+  const n = Math.max(1, limit);
+  const candidates = c.connectionTests ?? [];
+  if (!existsOnBase) return candidates.slice(0, n);
+  const known: string[] = [], unknown: string[] = [], absent: string[] = [];
+  candidates.forEach((name, i) => {
+    const found = i < maxLookups ? existsOnBase(name) : null;
+    (found === true ? known : found === false ? absent : unknown).push(name);
+  });
+  return [...known, ...unknown, ...absent].slice(0, n);
+}
+
+/**
+ * The identifier to search the base's source for: the method of a JUnit
+ * `Class#method`, the top-level Go test function, or the last Playwright
+ * title. Null when no safe plain identifier can be found.
+ */
+export function testSourceTerm(name: string, format: GateOutputFormat): string | null {
+  let term: string | undefined;
+  if (format === "junit-xml") term = name.split("#").pop()?.replace(/\[.*$/, "");
+  else if (format === "go-json") term = name.match(/(?:^|[./])((?:Test|Benchmark|Example|Fuzz)\w*)(?:\/|$)/)?.[1];
+  else term = name.split(" › ").pop();
+  term = term?.trim();
+  return term && term.length >= 3 && !/[\x00-\x1f]/.test(term) ? term : null;
 }
 
 /**
@@ -561,10 +595,18 @@ export function judgeBaseCheck(opts: {
 // --------- Toolchain changes on the branch ---------
 
 /** Files whose change moves the toolchain a repository asks for. */
-const TOOLCHAIN_FILES = /(?:^|\/)(?:go\.mod|go\.work|\.go-version|\.tool-versions|\.nvmrc|\.node-version|\.java-version|rust-toolchain(?:\.toml)?|gradle-wrapper\.properties)$/;
+const TOOLCHAIN_FILES = /(?:^|\/)(?:\.go-version|\.tool-versions|\.nvmrc|\.node-version|\.java-version|rust-toolchain(?:\.toml)?|gradle-wrapper\.properties)$/;
 /** In these files only some lines name a toolchain; the diff is checked for them. */
 const TOOLCHAIN_LINE_FILES = /(?:^|\/)(?:package\.json|libs\.versions\.toml)$/;
 const TOOLCHAIN_DIFF_LINE = /^[+-]\s*"?(?:engines|packageManager|node|pnpm|npm|agp|androidGradlePlugin|android-gradle-plugin|jvmTarget|jdk|java)"?\s*[:=]/;
+/**
+ * In go.mod and go.work only the `go` and `toolchain` directives move the
+ * toolchain. A branch that adds a require line on a main whose `go` line is
+ * already above the host did not cause the mismatch, and must not be sent
+ * back for something it cannot fix.
+ */
+const GO_DIRECTIVE_FILES = /(?:^|\/)go\.(?:mod|work)$/;
+const GO_DIRECTIVE_LINE = /^[+-]\s*(?:go|toolchain)\s+\S+\s*(?:\/\/.*)?$/;
 
 /**
  * The branch's own files that change the toolchain the repository requires,
@@ -576,10 +618,11 @@ export function branchToolchainChanges(changedPaths: readonly string[], diffOf: 
   const out: string[] = [];
   for (const path of changedPaths) {
     if (TOOLCHAIN_FILES.test(path)) { out.push(path); continue; }
-    if (!TOOLCHAIN_LINE_FILES.test(path)) continue;
+    const lineRule = GO_DIRECTIVE_FILES.test(path) ? GO_DIRECTIVE_LINE : TOOLCHAIN_LINE_FILES.test(path) ? TOOLCHAIN_DIFF_LINE : null;
+    if (lineRule === null) continue;
     let diff = "";
     try { diff = diffOf(path); } catch {}
-    if (diff.split("\n").some(line => !line.startsWith("+++") && !line.startsWith("---") && TOOLCHAIN_DIFF_LINE.test(line))) out.push(path);
+    if (diff.split("\n").some(line => !line.startsWith("+++") && !line.startsWith("---") && lineRule.test(line))) out.push(path);
   }
   return out;
 }

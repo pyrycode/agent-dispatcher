@@ -14,6 +14,7 @@ import {
   branchToolchainChanges,
   judgeBaseCheck,
   pickBaseCheckTests,
+  testSourceTerm,
   MAX_INFRA_COOLDOWN_MS,
   nextInfraPause,
   readInfraBreakerConfig,
@@ -256,6 +257,20 @@ describe("live gate pause state", () => {
   });
 });
 
+describe("pickBaseCheckTests prefers tests the base has", () => {
+  const c = { connectionTests: ["a.T#new1", "a.T#old1", "a.T#new2", "a.T#old2", "a.T#unsure"] } as any;
+  test("known first, then unknown, then branch-only", () => {
+    const exists = (n: string) => n.includes("old") ? true : n.includes("new") ? false : null;
+    assert.deepEqual(pickBaseCheckTests(c, 3, exists), ["a.T#old1", "a.T#old2", "a.T#unsure"]);
+    assert.deepEqual(pickBaseCheckTests(c, 3), ["a.T#new1", "a.T#old1", "a.T#new2"], "no lookup keeps report order");
+  });
+  test("source terms", () => {
+    assert.equal(testSourceTerm("de.pyryco.E2ETest#interactiveTurn_ping[0]", "junit-xml"), "interactiveTurn_ping");
+    assert.equal(testSourceTerm("github.com/pyrycode/pyrycode/internal/e2e.TestDaemon/sub_case", "go-json"), "TestDaemon");
+    assert.equal(testSourceTerm("chat.spec.ts › sends a message", "playwright-json"), "sends a message");
+  });
+});
+
 describe("judgeBaseCheck (review finding 1)", () => {
   const tests = ["a.T#one", "a.T#two"];
 
@@ -279,8 +294,15 @@ describe("judgeBaseCheck (review finding 1)", () => {
 });
 
 describe("branchToolchainChanges (review finding 3)", () => {
-  test("go.mod and similar files count outright", () => {
-    assert.deepEqual(branchToolchainChanges(["internal/x.go", "go.mod", ".nvmrc"], () => ""), ["go.mod", ".nvmrc"]);
+  test(".nvmrc and similar files count outright", () => {
+    assert.deepEqual(branchToolchainChanges(["internal/x.go", ".nvmrc", "gradle/wrapper/gradle-wrapper.properties"], () => ""), [".nvmrc", "gradle/wrapper/gradle-wrapper.properties"]);
+  });
+
+  test("go.mod and go.work count only for a changed go or toolchain directive (re-review finding 2)", () => {
+    const diff = (body: string) => () => `--- a/go.mod\n+++ b/go.mod\n${body}`;
+    assert.deepEqual(branchToolchainChanges(["go.mod"], diff("+\tgolang.org/x/net v0.30.0\n+\tgo.opentelemetry.io/otel v1.2.0")), []);
+    assert.deepEqual(branchToolchainChanges(["go.mod"], diff("-go 1.26.2\n+go 1.26.9")), ["go.mod"]);
+    assert.deepEqual(branchToolchainChanges(["go.work"], diff("+toolchain go1.26.9 // security fix")), ["go.work"]);
   });
 
   test("package.json counts only when its diff touches engines or the package manager", () => {

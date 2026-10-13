@@ -7218,9 +7218,54 @@ describe("runRealClaudeGateSuite: infrastructure-shaped first pass", () => {
     assert.equal(shouldPauseLiveGate(report, 30 * 60_000), false, "a toolchain mismatch never pauses the gate (review finding 3)");
   });
 
+  function toolchainBranchRun(changed: string, diffs: Record<string, string>) {
+    const argvCalls: string[][] = [];
+    const harness = makeGateDeps({
+      gitOut: (cmd) => GATE_SHAS[cmd] ?? "",
+      spawnOutcome: { exitCode: 1 },
+      spawnSync: ((cmd: string, args: string[]) => {
+        argvCalls.push([cmd, ...args]);
+        if (args[0] === "diff" && args[1] === "--name-only") return { status: 0, stdout: changed, stderr: "" };
+        if (args[0] === "diff") return { status: 0, stdout: diffs[args[args.length - 1]] ?? "", stderr: "" };
+        return { status: 0, stdout: "", stderr: "" };
+      }) as any,
+      readFileSync: ((path: string) => (path.endsWith(".stderr.log")
+        ? "go: go.mod requires go >= 1.26.9 (running go 1.26.2; GOTOOLCHAIN=local)\n"
+        : "")) as any,
+    });
+    return {
+      argvCalls, harness,
+      run: () => runRealClaudeGateSuite({
+        issueNumber: 1382, command: "go test -json ./...", baselineCommand: "go test -json -run {{TESTS}} ./...",
+        format: "go-json", timeoutMs: 60_000, infraBreaker: DEFAULT_INFRA_BREAKER_CONFIG,
+        repoRoot: "/tmp/fake-repo", defaultBranch: "main", logsDir: "/tmp/fake-logs", deps: harness.deps,
+      }),
+    };
+  }
+
+  test("a branch file path reaches git as one argument, never through a shell (re-review finding 1)", async () => {
+    const evil = "x$(touch /tmp/pwned)/package.json";
+    const { run, argvCalls, harness } = toolchainBranchRun(`${evil}\n`, { [evil]: '+  "engines": { "node": ">=22" }' });
+    const report = await run();
+    assert.deepEqual(report.toolchainChange?.paths, [evil]);
+    assert.ok(argvCalls.some(a => a[0] === "git" && a[a.length - 1] === evil && a[a.length - 2] === "--"), "the path is its own argv entry");
+    assert.ok(!harness.calls.some(c => c.includes("touch")), "no shell string carries the path");
+  });
+
+  test("a go.mod change counts only when it moves the go or toolchain line (re-review finding 2)", async () => {
+    const requireOnly = await toolchainBranchRun("go.mod\n", { "go.mod": "--- a/go.mod\n+++ b/go.mod\n+\tgolang.org/x/net v0.30.0\n" }).run();
+    assert.equal(requireOnly.infraFailure?.infra, true, "main's go line is the host's problem, not the branch's");
+    assert.equal(requireOnly.toolchainChange, undefined);
+    const bumped = await toolchainBranchRun("go.mod\n", { "go.mod": "--- a/go.mod\n+++ b/go.mod\n-go 1.26.2\n+go 1.26.9\n" }).run();
+    assert.deepEqual(bumped.toolchainChange?.paths, ["go.mod"]);
+  });
+
   test("a toolchain mismatch the branch asked for, by changing go.mod, is the branch's (review finding 3)", async () => {
     const harness = makeGateDeps({
-      gitOut: (cmd) => cmd === `git diff --name-only ${GATE_BASE_SHA}...${GATE_HEAD_SHA}` ? "go.mod\ninternal/x.go\n" : (GATE_SHAS[cmd] ?? ""),
+      gitOut: (cmd) => GATE_SHAS[cmd] ?? "",
+      spawnSync: ((cmd: string, args: string[]) => args[0] === "diff"
+        ? { status: 0, stdout: args[1] === "--name-only" ? "go.mod\ninternal/x.go\n" : "+toolchain go1.26.9\n", stderr: "" }
+        : { status: 0, stdout: "", stderr: "" }) as any,
       spawnOutcome: { exitCode: 1 },
       readFileSync: ((path: string) => (path.endsWith(".stderr.log")
         ? "go: go.mod requires go >= 1.26.9 (running go 1.26.2; GOTOOLCHAIN=local)\n"
@@ -8790,7 +8835,11 @@ describe("pre-verifier gates — dispatchToAgent wiring", () => {
       const client = new MockGitHubClient({ status: { 168: "In Code Review" }, labels: { 168: [] } });
       const item = makeProjectItem({ issueNumber: 168 });
       const { deps, calls } = makeMockDeps({
-        execImpls: { ...fullHappyExecImpls("feature/168"), "git diff --name-only main...HEAD": () => "go.mod\n" },
+        execImpls: fullHappyExecImpls("feature/168"),
+        spawnImpls: {
+          "git diff --name-only main...HEAD": () => ({ status: 0, stdout: "go.mod\n" }),
+          "git diff main...HEAD -- go.mod": () => ({ status: 0, stdout: "--- a/go.mod\n+++ b/go.mod\n-go 1.26.2\n+go 1.26.9\n" }),
+        },
         fsMap: {
           [claudeMd]: "verifier system prompt",
           [resolve(logsDir, "verifier-gate_#168_1.log")]: "go vet ./...\n",

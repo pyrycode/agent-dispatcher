@@ -112,7 +112,7 @@ import {
 } from "./main-sweep.js";
 import { recordFlakyTests, type FlakyTicketClient } from "./flaky-tickets.js";
 import { recordInheritedTests } from "./inherited-tickets.js";
-import { activeInfraPause, classifyGateFailure, extractFailureMessages, branchToolchainChanges, findAdmissionRejections, findToolchainMismatch, judgeBaseCheck, pickBaseCheckTests, INFRA_PAUSE_STATE_FILE, nextInfraPause, readInfraBreakerConfig, serializeInfraPause, type InfraBreakerConfig, type InfraPauseState } from "./infra-failure.js";
+import { activeInfraPause, classifyGateFailure, extractFailureMessages, branchToolchainChanges, findAdmissionRejections, findToolchainMismatch, judgeBaseCheck, pickBaseCheckTests, testSourceTerm, INFRA_PAUSE_STATE_FILE, nextInfraPause, readInfraBreakerConfig, serializeInfraPause, type InfraBreakerConfig, type InfraPauseState } from "./infra-failure.js";
 import { dropStillHeld, HealthChecker, type HealthEnvFor, healthEnvForAgent, holdUnhealthyCandidates, liveGateHealthFailures, newHealthNoticeState, parseHealthCacheMs, parseHealthChecks, startupHealthCheck } from "./health-check.js";
 import {
   decideDocsOnlyGateReuse,
@@ -6117,6 +6117,18 @@ export async function haltForInfraGate(ctx: DispatchContext): Promise<void> {
   }
 }
 
+/**
+ * Run git with an argument vector and no shell, for arguments that come from
+ * a branch (file paths) and so must never be interpreted. Throws on a
+ * non-zero exit, like `execSync`.
+ */
+export function gitNoShell(spawn: typeof spawnSync, cwd: string, args: string[], timeout = 120_000): string {
+  const result = spawn("git", args, { cwd, encoding: "utf-8", stdio: "pipe", timeout });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error(`git ${args[0]} exited ${result.status}: ${String(result.stderr ?? "").trim()}`);
+  return String(result.stdout ?? "");
+}
+
 export async function maybeRunPreSpawnGates(
   ctx: DispatchContext,
 ): Promise<{ promptNote: string }> {
@@ -6307,12 +6319,11 @@ export async function maybeRunPreSpawnGates(
   // like, is the branch's: the verifier triages it like any red gate.
   let toolchainNote: string[] = [];
   if (result.infra) {
-    const git = (args: string): string => String(ctx.deps.execSync(`git ${args}`, {
-      cwd: agentCwd, encoding: "utf-8", stdio: "pipe", timeout: 30_000,
-    })).trim();
+    // Argv, no shell: the paths come from the branch.
+    const git = (args: string[]): string => gitNoShell(ctx.deps.spawnSync, agentCwd, args, 30_000);
     let changed: string[] = [];
-    try { changed = git(`diff --name-only ${defaultBranch}...HEAD`).split("\n").filter((p) => p !== ""); } catch {}
-    const paths = branchToolchainChanges(changed, (path) => git(`diff ${defaultBranch}...HEAD -- "${path}"`));
+    try { changed = git(["diff", "--name-only", `${defaultBranch}...HEAD`]).split("\n").filter((p) => p !== ""); } catch {}
+    const paths = branchToolchainChanges(changed, (path) => git(["diff", `${defaultBranch}...HEAD`, "--", path]));
     if (paths.length > 0) {
       console.log(`   🧪 Pre-${agent.name} gate \`${result.failedGate}\` hit a toolchain mismatch the branch asked for (${paths.join(", ")}); triaging as a red gate`);
       toolchainNote = [
@@ -7426,8 +7437,10 @@ export async function runRealClaudeGateSuite(opts: {
       // and the like) is the branch's failure: carry on as a normal red run.
       if (infra.infra && infra.path === "toolchain") {
         let changed: string[] = [];
-        try { changed = git(`diff --name-only ${report.baseSha}...${report.headSha}`).split("\n").filter(p => p !== ""); } catch {}
-        const paths = branchToolchainChanges(changed, path => git(`diff ${report.baseSha}...${report.headSha} -- "${path}"`));
+        // Argv, no shell: the paths come from the branch.
+        const range = `${report.baseSha}...${report.headSha}`;
+        try { changed = gitNoShell(deps.spawnSync, targetRepo, ["diff", "--name-only", range]).split("\n").filter(p => p !== ""); } catch {}
+        const paths = branchToolchainChanges(changed, path => gitNoShell(deps.spawnSync, targetRepo, ["diff", range, "--", path]));
         if (paths.length > 0) {
           report.toolchainChange = { paths, line: infra.samples[0] ?? "" };
           report.infraFailure = {
@@ -7442,7 +7455,14 @@ export async function runRealClaudeGateSuite(opts: {
       // fail there the same way.
       if (report.infraFailure.infra && report.infraFailure.path === "shape") {
         const shaped = report.infraFailure;
-        const tests = pickBaseCheckTests(shaped, opts.infraBreaker.baseCheckTests);
+        // Prefer tests the base has: a connection test the branch added
+        // cannot fail on a base that lacks it.
+        const tests = pickBaseCheckTests(shaped, opts.infraBreaker.baseCheckTests, name => {
+          const term = testSourceTerm(name, opts.format);
+          if (term === null) return null;
+          const found = deps.spawnSync("git", ["grep", "-q", "-F", "-e", term, report.baseSha, "--"], { cwd: targetRepo, encoding: "utf-8", timeout: 30_000 });
+          return found.status === 0 ? true : found.status === 1 ? false : null;
+        });
         let judged: { confirmed: boolean; note: string };
         let failedOnBase: string[] | null = null;
         let checkOutput: string | null = null;
