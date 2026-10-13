@@ -298,7 +298,10 @@ export class ManagedDispatch {
     await this.connection.call<Claim>("/authorize", { session: this.session, ticket: `${this.project}#${issue}`, runId: currentRun.getStore()?.run.id });
   }
   async recoveryFacts(tickets: string[]) {
-    return this.connection.call<Array<{ ticket: string; pause?: PauseRecord; artifactRevision?: string; evidence: EvidenceRecord[]; coordination: CoordinationRecord[] }>>("/recovery/facts", { tickets });
+    const run=currentRun.getStore()?.run;
+    return this.connection.call<Array<{ ticket: string; pause?: PauseRecord; artifactRevision?: string; evidence: EvidenceRecord[]; coordination: CoordinationRecord[] }>>("/recovery/facts", {
+      tickets,...(run?.role==='recovery'?{project:this.project,session:run.session,runId:run.id}:{}),
+    });
   }
   async hydrateRecovery(item: ProjectItem): Promise<ProjectItem> {
     const [facts] = await this.recoveryFacts([`${this.project}#${item.issueNumber}`]);
