@@ -23,6 +23,7 @@ def load(path, name):
 
 
 install = load(HERE / 'install', 'codex_helpers_install')
+REAL_BRIDGED = {}
 
 
 class Helper:
@@ -34,10 +35,49 @@ class Helper:
         path = Path(cls.tmp.name) / (cls.P + '-pipeline-action')
         path.write_text(install.render(cls.P, HOME))
         cls.m = load(path, 'pipeline_' + cls.P.replace('-', '_'))
+        REAL_BRIDGED[cls.P] = cls.m.bridged
 
     @classmethod
     def tearDownClass(cls):
         cls.tmp.cleanup()
+
+    def setUp(self):
+        # Workflow actions run inside an admitted worker, behind the bridge.
+        bridge = patch.object(self.m, 'bridged', return_value=True)
+        bridge.start()
+        self.addCleanup(bridge.stop)
+
+    def test_workflow_actions_require_the_bridge(self):
+        m = self.m
+        with patch.object(m, 'bridged', return_value=False), patch.object(m, 'gh') as gh, \
+                patch.object(m, 'graphql') as gql:
+            for args in [['board-add', '2266'], ['board-status', '2266', 'Backlog'], ['board-after', '2266', 'top'],
+                         ['add-child', '1984', '2148'], ['remove-child', '1984', '2148'],
+                         ['add-blocker', '2149', '2148'], ['remove-blocker', '2149', '2148']]:
+                with self.subTest(args=args), self.assertRaisesRegex(ValueError, 'bridge'):
+                    m.perform(args)
+            gh.assert_not_called()
+            gql.assert_not_called()
+
+    def test_bridge_detection_reads_gh_socket_config(self):
+        m = self.m
+        with tempfile.TemporaryDirectory() as tmp:
+            import socket as sockets
+            path = Path(tmp) / 'api.sock'
+            server = sockets.socket(sockets.AF_UNIX)
+            server.bind(str(path))
+            self.addCleanup(server.close)
+            config = Path(tmp) / 'config.yml'
+            cases = [(None, False), ('git_protocol: https\n', False),
+                     ('http_unix_socket: ' + json.dumps(str(Path(tmp) / 'missing.sock')) + '\n', False),
+                     ('git_protocol: https\nhttp_unix_socket: ' + json.dumps(str(path)) + '\n', True),
+                     ('http_unix_socket: ' + str(path) + '\n', True)]
+            for text, expected in cases:
+                if text is not None:
+                    config.write_text(text)
+                env = {'GH_CONFIG_DIR': tmp} if text is not None else {}
+                with self.subTest(text=text), patch.dict(os.environ, env, clear=True):
+                    self.assertEqual(REAL_BRIDGED[self.P](), expected)
 
     def test_rendered_for_this_pipeline(self):
         m = self.m

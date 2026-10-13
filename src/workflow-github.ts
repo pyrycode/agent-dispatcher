@@ -4,6 +4,7 @@ import {
   Kind,
   valueFromASTUntyped,
   type FieldNode,
+  type FragmentDefinitionNode,
   type SelectionSetNode,
   type OperationDefinitionNode,
 } from "graphql";
@@ -26,6 +27,66 @@ const response = (value: unknown): GitHubResponse => ({
   headers: { "content-type": "application/json" },
   body: JSON.stringify(value),
 });
+
+// Interfaces each synthetic object type implements, for fragment type conditions.
+const IMPLEMENTS: Record<string, readonly string[]> = {
+  Issue: ["Node", "Labelable", "Closable", "Assignable", "Comment", "Deletable", "Lockable", "Reactable", "RepositoryNode", "Subscribable", "SubscribableThread", "UniformResourceLocatable", "Updatable", "UpdatableComment", "ProjectV2Owner"],
+  IssueComment: ["Node", "Comment", "Deletable", "Minimizable", "Reactable", "RepositoryNode", "Updatable", "UpdatableComment", "UniformResourceLocatable"],
+  ProjectV2Item: ["Node"],
+};
+function collectFields(
+  value: Record<string, unknown>,
+  set: SelectionSetNode,
+  fragments: ReadonlyMap<string, FragmentDefinitionNode>,
+  fields = new Map<string, FieldNode[]>(),
+): Map<string, FieldNode[]> {
+  const applies = (type?: string) => {
+    const actual = value.__typename;
+    return !type || typeof actual !== "string" || actual === type || (IMPLEMENTS[actual] ?? []).includes(type);
+  };
+  for (const selection of set.selections) {
+    if (selection.kind === Kind.FIELD) {
+      const key = selection.alias?.value ?? selection.name.value;
+      fields.set(key, [...(fields.get(key) ?? []), selection]);
+    } else if (selection.kind === Kind.INLINE_FRAGMENT) {
+      if (applies(selection.typeCondition?.name.value))
+        collectFields(value, selection.selectionSet, fragments, fields);
+    } else {
+      const fragment = fragments.get(selection.name.value);
+      if (fragment && applies(fragment.typeCondition.name.value))
+        collectFields(value, fragment.selectionSet, fragments, fields);
+    }
+  }
+  return fields;
+}
+/**
+ * Return only what the caller selected, as GitHub would. gh decodes GraphQL
+ * strictly: one unrequested field fails the command after the write was saved.
+ */
+export function selectResponse(
+  value: unknown,
+  set: SelectionSetNode | undefined,
+  fragments: ReadonlyMap<string, FragmentDefinitionNode> = new Map(),
+): unknown {
+  if (value === undefined || value === null) return null;
+  if (!set) return value;
+  if (Array.isArray(value)) return value.map((v) => selectResponse(v, set, fragments));
+  if (typeof value !== "object") return null;
+  const object = value as Record<string, unknown>,
+    output: Record<string, unknown> = {};
+  for (const [key, nodes] of collectFields(object, set, fragments)) {
+    const name = nodes[0].name.value,
+      selections = nodes.flatMap((n) => n.selectionSet?.selections ?? []);
+    output[key] = selectResponse(
+      name === "__typename" ? (object.__typename ?? null) : object[name],
+      selections.length ? { kind: Kind.SELECTION_SET, selections } : undefined,
+      fragments,
+    );
+  }
+  return output;
+}
+const payloadType = (field: string) =>
+  field[0].toUpperCase() + field.slice(1) + "Payload";
 
 /** Compatibility at the existing GitHub bridge. Workflow writes commit only to SQLite. */
 export class WorkflowGitHub {
@@ -304,7 +365,12 @@ export class WorkflowGitHub {
       );
       return { ...result, body: JSON.stringify(payload) };
     }
-    const output: Record<string, unknown> = {};
+    const output: Record<string, unknown> = {},
+      fragments = new Map(
+        doc.definitions
+          .filter((d) => d.kind === Kind.FRAGMENT_DEFINITION)
+          .map((d) => [d.name.value, d] as const),
+      );
     for (const selection of operation.selectionSet.selections) {
       if (selection.kind !== Kind.FIELD)
         throw new Error(
@@ -445,14 +511,24 @@ export class WorkflowGitHub {
         if (!found)
           throw new Error("Import the ticket before changing its workflow");
         const item = this.mutate(project, found.ticket, change, actor),
-          node = this.node(item, this.catalog.get(project) ?? []);
-        output[key] = {
-          clientMutationId: input.clientMutationId,
-          issue: node,
-          labelable: node,
-          projectV2Item: { id: item.id },
-          items: { nodes: [{ id: item.id }] },
-        };
+          node = {
+            __typename: "Issue",
+            ...this.node(item, this.catalog.get(project) ?? []),
+            repository: { nameWithOwner: project },
+          },
+          card = { __typename: "ProjectV2Item", id: item.id, content: node };
+        output[key] = selectResponse(
+          {
+            __typename: payloadType(field),
+            clientMutationId: input.clientMutationId ?? null,
+            issue: node,
+            labelable: node,
+            projectV2Item: card,
+            items: { nodes: [card] },
+          },
+          selection.selectionSet,
+          fragments,
+        );
       } else if (field === "addComment" && found) {
         if (!actor) throw new Error("Workflow comment requires a run");
         this.store.authorizeWorkflow(
@@ -470,10 +546,22 @@ export class WorkflowGitHub {
           input.body,
           id,
         );
-        output[key] = {
-          clientMutationId: input.clientMutationId,
-          commentEdge: { node: { id, body: input.body, url: found.item.url } },
-        };
+        output[key] = selectResponse(
+          {
+            __typename: payloadType(field),
+            clientMutationId: input.clientMutationId ?? null,
+            commentEdge: {
+              node: {
+                __typename: "IssueComment",
+                id,
+                body: input.body,
+                url: found.item.url,
+              },
+            },
+          },
+          selection.selectionSet,
+          fragments,
+        );
       } else {
         const single = {
           ...operation,

@@ -31,6 +31,16 @@ a half-written helper.
 Edit `pipeline-action` here, never the installed copies; the next install
 overwrites them. The source copy refuses to run.
 
+## Workflow actions need the bridge
+
+Board membership, column moves, ordering, blockers and sub-issue links are
+orchestrator workflow. `board-add`, `board-status`, `board-after`, `add-child`,
+`remove-child`, `add-blocker` and `remove-blocker` run only when `gh` is
+configured with the managed GitHub bridge's socket, as it is in every admitted
+worker. Anywhere else they would edit the GitHub display directly, and
+reconciliation would overwrite the change. Operators use the protected
+operator command instead.
+
 ## Test
 
 ```sh
