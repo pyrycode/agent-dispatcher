@@ -37,6 +37,8 @@ import {
   REWORK_LOOP_THRESHOLD,
   decideAutoAdvance,
   decideBaselineAdjustedVerdict,
+  INFRA_FAILURE_LABEL,
+  type BaselineAdjustedVerdict,
   decideGateOutcome,
   decideGateVerdict,
   decideRealClaudeGate,
@@ -834,16 +836,31 @@ export async function runRealClaudeGateExecution(
         exitCode: report.exitCode,
         minExecuted: gateRunFloor(report, minExecuted),
       });
-      // Re-judge a failure against what the base commit already fails, so a
-      // branch is not blamed for breakage it inherited. No-op for every other
-      // verdict, and a no-op when no baseline ran.
-      let { verdict, reason, introduced, preExisting, flaky } = decideBaselineAdjustedVerdict({
-        verdict: raw.verdict,
-        reason: raw.reason,
-        branchFailures: report.tally?.failedNames ?? [],
-        baselineFailures: report.baselineFailures,
-        rerunFailures: report.rerunFailures,
-      });
+      // A failure in the shape of a shared environment failure is not judged
+      // at all: the runner skipped the re-run and the base comparison, and
+      // the ticket halts with `error:infra` instead of going to rework.
+      // A run that errored or hit the outer timeout keeps its own park. A
+      // toolchain mismatch can leave no readable report at all, so any other
+      // non-pass verdict qualifies when the runner classified it.
+      const infra = raw.verdict !== "pass" && report.runError === null && !report.timedOut
+        && report.infraFailure?.infra === true ? report.infraFailure : null;
+      // Otherwise re-judge a failure against what the base commit already
+      // fails, so a branch is not blamed for breakage it inherited. No-op for
+      // every other verdict, and a no-op when no baseline ran.
+      let { verdict, reason, introduced, preExisting, flaky }: BaselineAdjustedVerdict = infra
+        ? { verdict: "infra-failure", reason: infra.reason, introduced: [], preExisting: [], flaky: [] }
+        : decideBaselineAdjustedVerdict({
+          verdict: raw.verdict,
+          reason: raw.reason,
+          branchFailures: report.tally?.failedNames ?? [],
+          baselineFailures: report.baselineFailures,
+          rerunFailures: report.rerunFailures,
+        });
+      const infraPauseNote = infra === null ? ""
+        : infra.pausedUntil
+          ? `Further live gate runs from this dispatcher are paused until ${infra.pausedUntil}, because the cause ` +
+            `is shared by every live run on this host. `
+          : `The live gate pause could not be recorded, so the next gated ticket may meet the same failure. `;
       if (conflictParkNote !== "") reason = `${reason} ${conflictParkNote.replace(/\.$/, "")}`;
       let inheritedTickets: InheritedTicketResult = { blockers: [], untracked: [] };
       if (preExisting.length > 0) {
@@ -884,6 +901,11 @@ export async function runRealClaudeGateExecution(
             `No rework requested and no retry consumed. The live gate runs again against current main after the blockers close.`
           : `could not confirm every shared-failure blocker. Left it in **${REAL_CLAUDE_GATE_RUN_FROM_COLUMN}** ` +
             `with \`error:real-claude-gate\` for recovery.${blockerNote} No rework requested.`
+        : verdict === "infra-failure"
+        ? `left it in **${REAL_CLAUDE_GATE_RUN_FROM_COLUMN}** and added \`${INFRA_FAILURE_LABEL}\`. No rework is requested ` +
+          `or counted, and no same-tree re-run or base comparison ran. ${infraPauseNote}` +
+          `Check the environment (relay admission, daemon, device), then remove \`${INFRA_FAILURE_LABEL}\` and the ` +
+          `gate runs again once the pause has ended.`
         : outcome.toColumn === null
         ? `left it in ${REAL_CLAUDE_GATE_RUN_FROM_COLUMN} and added \`${outcome.addLabels.join("`, `")}\`. ` +
           `This needs a human: the gate could not produce a trustworthy answer, and no agent can fix that by ` +
@@ -975,6 +997,10 @@ export async function runRealClaudeGateExecution(
             : verdict === "inherited-failure"
               ? `⚠️ **Real-claude gate found failures on main for #${candidate.issueNumber}.** ${reason}. ` +
                 action
+            : verdict === "infra-failure"
+              ? `🧯 **Live gate infrastructure failure on #${candidate.issueNumber}.** ${reason}.\n` +
+                `Halted in ${REAL_CLAUDE_GATE_RUN_FROM_COLUMN} with \`${INFRA_FAILURE_LABEL}\`. No rework counted, and the ` +
+                `same-tree re-run and base comparison were skipped. ${infraPauseNote}See the evidence comment.`
             : `🚨 **Real-claude gate could not judge #${candidate.issueNumber}** (${verdict}): ${reason}\n` +
               `Parked in ${REAL_CLAUDE_GATE_RUN_FROM_COLUMN} with \`${outcome.addLabels.join("`, `")}\`. ` +
               `Needs a human — see the evidence comment.`,

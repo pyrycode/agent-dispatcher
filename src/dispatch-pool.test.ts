@@ -200,6 +200,8 @@ describe("the live gate and the main sweep do not start once draining", () => {
     assert.equal(liveGateRunnerFor({ runner, draining: false, envHeld: true, healthFailures: 0 }), null);
     assert.equal(liveGateRunnerFor({ runner, draining: false, envHeld: false, healthFailures: 1 }), null);
     assert.equal(liveGateRunnerFor({ runner: null, draining: false, envHeld: false, healthFailures: 0 }), null);
+    assert.equal(liveGateRunnerFor({ runner, draining: false, envHeld: false, healthFailures: 0, infraPaused: true }), null, "an infrastructure pause holds the gate");
+    assert.equal(liveGateRunnerFor({ runner, draining: false, envHeld: false, healthFailures: 0, infraPaused: false }), runner);
   });
 
   test("the main sweep does not start while draining", () => {

@@ -81,6 +81,8 @@ import {
   type SigintState,
   buildGateSpawnEnv,
   runRealClaudeGateSuite,
+  recordInfraPause,
+  readInfraPause,
   clearGateWorktreePath,
   worktreePath,
   spawnGateCommand,
@@ -104,6 +106,7 @@ import {
   recordGateRunMeta,
   refreshStaleBaseBranch,
 } from "./dispatch.js";
+import { DEFAULT_INFRA_BREAKER_CONFIG, type InfraBreakerConfig } from "./infra-failure.js";
 import { parseGateRunMeta } from "./gate-report.js";
 import { serializeLastVerdict } from "./verdict-handoff.js";
 import { formatGateEvidenceComment } from "./gate-output.js";
@@ -7114,6 +7117,123 @@ describe("runRealClaudeGateSuite — same-tree re-run before the base comparison
   });
 });
 
+describe("runRealClaudeGateSuite: infrastructure-shaped first pass", () => {
+  // pyrycode-mobile #2138, 2026-10-13: 64 of 65 live tests failed on phone
+  // reconnection, daemon and readiness waits while the production relay
+  // refused HP, and the gate went on to a full same-tree re-run that only a
+  // person stopped. The fixtures are that run's report and diagnostic log.
+  const fixture = (name: string) => readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf8");
+  const stdout = fixture("mobile-2138-live-gate.xml");
+  const stderr = fixture("mobile-2138-live-gate.stderr.txt");
+
+  function infraHarness(infraBreaker: InfraBreakerConfig | null) {
+    const harness = makeGateDeps({
+      gitOut: (cmd) => ({ ...GATE_SHAS, "git rev-parse origin/feature/2138": GATE_HEAD_SHA })[cmd] ?? "",
+      spawnOutcome: { exitCode: 1 },
+      readFileSync: ((path: string) => (path.endsWith(".stderr.log") ? stderr : stdout)) as any,
+    });
+    return {
+      ...harness,
+      run: () => runRealClaudeGateSuite({
+        issueNumber: 2138,
+        command: "python3 scripts/android-test-gate.py live",
+        baselineCommand: "python3 scripts/android-test-gate.py live --tests {{TESTS}}",
+        format: "junit-xml",
+        timeoutMs: 60_000,
+        minExecuted: 65,
+        infraBreaker,
+        repoRoot: "/tmp/fake-repo",
+        defaultBranch: "main",
+        logsDir: "/tmp/fake-logs",
+        deps: harness.deps,
+      }),
+    };
+  }
+
+  test("stops after the first pass: no same-tree re-run, no base comparison", async () => {
+    const { run, spawnRequests, calls } = infraHarness(DEFAULT_INFRA_BREAKER_CONFIG);
+    const report = await run();
+
+    assert.equal(spawnRequests.length, 1, "only the first pass ran");
+    assert.equal(report.infraFailure?.infra, true);
+    assert.equal(report.infraFailure?.failed, 64);
+    assert.equal(report.rerunFailures, null);
+    assert.equal(report.baselineFailures, null);
+    assert.match(report.rerunSkipReason ?? "", /infrastructure shape/);
+    assert.match(report.baselineSkipReason ?? "", /infrastructure shape/);
+    assert.ok(calls.some(c => c.startsWith("git worktree remove")), "the worktree is still removed");
+  });
+
+  test("with the breaker off, the same run goes on to the re-run as before", async () => {
+    const { run, spawnRequests } = infraHarness(null);
+    const report = await run();
+    assert.equal(report.infraFailure, undefined);
+    assert.ok(spawnRequests.length >= 2, "the same-tree re-run was started");
+  });
+
+  test("a Go toolchain mismatch with no test events halts as infrastructure, with no re-run", async () => {
+    const harness = makeGateDeps({
+      gitOut: (cmd) => GATE_SHAS[cmd] ?? "",
+      spawnOutcome: { exitCode: 1 },
+      readFileSync: ((path: string) => (path.endsWith(".stderr.log")
+        ? "go: go.mod requires go >= 1.26.9 (running go 1.26.2; GOTOOLCHAIN=local)\n"
+        : "")) as any,
+    });
+    const report = await runRealClaudeGateSuite({
+      issueNumber: 1382, command: "go test -json ./...", baselineCommand: "go test -json -run {{TESTS}} ./...",
+      format: "go-json", timeoutMs: 60_000, infraBreaker: DEFAULT_INFRA_BREAKER_CONFIG,
+      repoRoot: "/tmp/fake-repo", defaultBranch: "main", logsDir: "/tmp/fake-logs", deps: harness.deps,
+    });
+    assert.equal(harness.spawnRequests.length, 1);
+    assert.equal(report.infraFailure?.infra, true);
+    assert.equal(report.infraFailure?.toolchain, true);
+  });
+
+  test("a disabled breaker classifies nothing", async () => {
+    const { run, spawnRequests } = infraHarness({ ...DEFAULT_INFRA_BREAKER_CONFIG, enabled: false });
+    await run();
+    assert.ok(spawnRequests.length >= 2);
+  });
+});
+
+describe("live gate infrastructure pause file", () => {
+  function fakeFs(start: string | null, now: number) {
+    const files = new Map<string, string>();
+    if (start !== null) files.set("/state/pause.json", start);
+    const deps = {
+      readFileSync: ((path: string) => {
+        if (!files.has(path)) throw new Error("ENOENT");
+        return files.get(path)!;
+      }) as any,
+      writeFileSync: ((path: string, text: string) => { files.set(path, String(text)); }) as any,
+      mkdirSync: (() => undefined) as any,
+      now: () => now,
+    };
+    return { files, deps };
+  }
+  const T0 = Date.parse("2026-10-13T15:48:00.000Z");
+
+  test("a trip writes the pause, which holds the gate until the cooldown ends", () => {
+    const { files, deps } = fakeFs(null, T0);
+    const until = recordInfraPause({ issueNumber: 2138, reason: "64 of 65 failed", cooldownMs: 30 * 60_000, path: "/state/pause.json" }, deps);
+    assert.equal(until, "2026-10-13T16:18:00.000Z");
+    assert.ok(files.has("/state/pause.json"));
+    assert.equal(readInfraPause("/state/pause.json", deps)?.issueNumber, 2138);
+    assert.equal(readInfraPause("/state/pause.json", { ...deps, now: () => T0 + 30 * 60_000 }), null);
+  });
+
+  test("a write failure returns null rather than throwing", () => {
+    const { deps } = fakeFs(null, T0);
+    deps.writeFileSync = (() => { throw new Error("EROFS"); }) as any;
+    assert.equal(recordInfraPause({ issueNumber: 1, reason: "r", cooldownMs: 60_000, path: "/state/pause.json" }, deps), null);
+  });
+
+  test("no file means no pause", () => {
+    const { deps } = fakeFs(null, T0);
+    assert.equal(readInfraPause("/state/pause.json", deps), null);
+  });
+});
+
 describe("runRealClaudeGateSuite — refusing to run", () => {
   // Until 2026-10-04 a probe conflict ended the run before any worktree
   // existed, and the ticket parked with `error:real-claude-gate`. The
@@ -8414,6 +8534,37 @@ describe("runVerifierGates — deterministic gate execution", () => {
     assert.ok(!result.outputTail.startsWith("HEAD-"), "the head is what gets cut");
   });
 
+  test("a toolchain mismatch is reported as infrastructure and never read against main", async () => {
+    const logsDir = "/gate-logs";
+    const { deps } = gateDeps({
+      gateImpl: () => ({ exitCode: 2, timedOut: false, spawnError: null }),
+      fsMap: {
+        [resolve(logsDir, "verifier-gate_#167_1.log")]: "go vet ./...",
+        [resolve(logsDir, "verifier-gate_#167_1.stderr.log")]: "go: go.mod requires go >= 1.26.9 (running go 1.26.2; GOTOOLCHAIN=local)\nmake: *** [Makefile:24: vet] Error 1",
+      },
+    });
+    let assessed = 0;
+    const result = await runVerifierGates({
+      gates: ["make check", "make build"], cwd: "/wt", issueNumber: 167, logsDir, deps,
+      assessRed: async () => { assessed++; return null; },
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.failedGate, "make check");
+    assert.match(result.infra?.reason ?? "", /requires go >= 1\.26\.9/);
+    assert.equal(assessed, 0, "no same-tree re-run or base run");
+    assert.match(result.summary[0]!, /toolchain mismatch/);
+  });
+
+  test("with detection off, a toolchain mismatch is an ordinary red gate", async () => {
+    const logsDir = "/gate-logs";
+    const { deps } = gateDeps({
+      gateImpl: () => ({ exitCode: 2, timedOut: false, spawnError: null }),
+      fsMap: { [resolve(logsDir, "verifier-gate_#167_1.stderr.log")]: "go: go.mod requires go >= 1.26.9 (running go 1.26.2; GOTOOLCHAIN=local)" },
+    });
+    const result = await runVerifierGates({ gates: ["make check"], cwd: "/wt", issueNumber: 167, logsDir, detectInfra: false, deps });
+    assert.equal(result.infra, undefined);
+  });
+
   test("timeout counts as red", async () => {
     const { deps } = gateDeps({
       gateImpl: () => ({ exitCode: null, timedOut: true, spawnError: null }),
@@ -8532,6 +8683,47 @@ describe("pre-verifier gates — dispatchToAgent wiring", () => {
       assert.match(promptWrite!.content!, /go vet \.\/\.\.\./, "note must name the failing gate");
       assert.match(promptWrite!.content!, /exit 1/, "note must carry the exit code");
     }));
+  });
+
+  // Relay #167's verifier on HP, 2026-10-13: `make check` stopped at `go vet`
+  // because the host's Go was older than go.mod asked for, and the verifier
+  // was spawned to triage a failure no change could fix.
+  const TOOLCHAIN_STDERR = "go: go.mod requires go >= 1.26.9 (running go 1.26.2; GOTOOLCHAIN=local)\nmake: *** [Makefile:24: vet] Error 1\n";
+
+  test("builder set, a toolchain mismatch → verifier NOT spawned, halted with error:infra, no rework, alerted", async () => {
+    await withStageSet("builder", () => withVerifierGates("make check;make build", async () => {
+      const claudeMd = claudeMdAbsPath("verifier/CLAUDE.md");
+      const logsDir = resolve(TEST_AGENTS_REPO_ROOT, "logs");
+      const client = new MockGitHubClient({ status: { 167: "In Code Review" }, labels: { 167: ["rework-count:1"] } });
+      const item = makeProjectItem({ issueNumber: 167 });
+      const { deps, calls } = makeMockDeps({
+        execImpls: fullHappyExecImpls("feature/167"),
+        fsMap: {
+          [claudeMd]: "verifier system prompt",
+          [resolve(logsDir, "verifier-gate_#167_1.log")]: "go vet ./...\n",
+          [resolve(logsDir, "verifier-gate_#167_1.stderr.log")]: TOOLCHAIN_STDERR,
+        },
+        gateImpl: (req) => req.command === "make check"
+          ? { exitCode: 2, timedOut: false, spawnError: null }
+          : { exitCode: 0, timedOut: false, spawnError: null },
+      });
+
+      await dispatchToAgent(builderAgent("verifier"), item, client, deps);
+
+      assert.equal(calls.claudeStreams, 0, "no verifier run on a host problem");
+      assert.deepEqual(calls.gates.map((g) => g.command), ["make check"], "no re-run and no later gate");
+      assert.ok(client.addLabelCalls.some((c) => c.label === "error:infra"));
+      assert.ok(!client.addLabelCalls.some((c) => c.label.startsWith("needs-rework:")), "nothing counts against the builder");
+      assert.ok(!client.addLabelCalls.some((c) => c.label === "error:verifier"));
+      assert.ok(client.comments.some((c) => /Infrastructure failure in a required check/.test(c.body) && c.body.includes("requires go >= 1.26.9")));
+      assert.equal(calls.discord.length, 1);
+      assert.match(calls.discord[0]!, /verifier not started on #167: infrastructure failure in `make check`/);
+    }));
+  });
+
+  test("error:infra blocks every stage until a person removes it", () => {
+    assert.equal(shouldSkipDispatch(["error:infra"], "verifier"), true);
+    assert.equal(shouldSkipDispatch(["error:infra"], "builder"), true);
   });
 
   test("builder set, PYRY_VERIFIER_GATES='' → gating opted out, verifier spawns with no note", async () => {
@@ -9640,7 +9832,7 @@ describe("runEnvPreflight — a required variable missing from the dispatcher ho
 
   test("the poll loop holds the live gate, the main sweep and selection on it (source tripwire)", () => {
     const src = readDispatchSource();
-    assert.match(src, /const gateRunner = liveGateRunnerFor\(\{\s*runner: realClaudeGateRunner, draining: drainMode, envHeld, healthFailures: gateHealthFailures\.length,\s*\}\);/);
+    assert.match(src, /const gateRunner = liveGateRunnerFor\(\{\s*runner: realClaudeGateRunner, draining: drainMode, envHeld, healthFailures: gateHealthFailures\.length, infraPaused,\s*\}\);/);
     assert.equal((src.match(/^\s+gateRunner,$/gm) ?? []).length, 2, "both gate calls take the held runner");
     assert.match(src, /envHeld\s*\?\s*\{ candidates: \[\], tallies: new Map<number, number>\(\) \}\s*:\s*await selectWithFamilyAccounting/);
     assert.match(src, /if \(mainSweep !== null && mayStartMainSweep\(\{ configured: true, sweepRunning: sweepRun !== null, gateActive, envHeld, draining: drainMode \}\)\)/);

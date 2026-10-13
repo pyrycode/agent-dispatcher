@@ -1,0 +1,137 @@
+Starting 65 tests on pixel2Api33Atd
+pixel2Api33Atd Tests 1/65 completed. (0 skipped) (0 failed)
+
+> Task :app:pixel2Api33AtdDebugAndroidTest
+
+pixel2Api33Atd Tests 3/65 completed. (0 skipped) (0 failed)
+pixel2Api33Atd Tests 4/65 completed. (0 skipped) (0 failed)
+pixel2Api33Atd Tests 6/65 completed. (0 skipped) (0 failed)
+pixel2Api33Atd Tests 7/65 completed. (0 skipped) (0 failed)
+pixel2Api33Atd Tests 8/65 completed. (0 skipped) (0 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_offlineRead_reconcilesPeerTurnOnReconnect[pixel2Api33Atd] [31mFAILED [0m
+	androidx.compose.ui.test.ComposeTimeoutException: Condition still not satisfied after 30000 ms
+	at androidx.compose.ui.test.AndroidComposeUiTestEnvironment$AndroidComposeUiTestImpl.waitUntil(ComposeUiTest.android.kt:809)
+pixel2Api33Atd Tests 9/65 completed. (0 skipped) (1 failed)
+pixel2Api33Atd Tests 10/65 completed. (0 skipped) (1 failed)
+pixel2Api33Atd Tests 12/65 completed. (0 skipped) (1 failed)
+pixel2Api33Atd Tests 13/65 completed. (0 skipped) (1 failed)
+pixel2Api33Atd Tests 15/65 completed. (0 skipped) (1 failed)
+pixel2Api33Atd Tests 17/65 completed. (0 skipped) (1 failed)
+pixel2Api33Atd Tests 18/65 completed. (0 skipped) (1 failed)
+pixel2Api33Atd Tests 19/65 completed. (0 skipped) (1 failed)
+pixel2Api33Atd Tests 20/65 completed. (0 skipped) (1 failed)
+pixel2Api33Atd Tests 21/65 completed. (0 skipped) (1 failed)
+pixel2Api33Atd Tests 22/65 completed. (0 skipped) (1 failed)
+pixel2Api33Atd Tests 23/65 completed. (0 skipped) (1 failed)
+pixel2Api33Atd Tests 24/65 completed. (0 skipped) (1 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_sendQueuedNow_reachesRunningTurn[pixel2Api33Atd] [31mFAILED [0m
+	java.lang.AssertionError: Send now step 'observe peer queue removal' timed out; phone host=true selected=true relay=Connected daemon=Connected repository=true; peer=session open (link 1, replaced 0×)
+	at de.pyryco.mobile.e2e.InteractiveStreamE2ETest.interactiveTurn_sendQueuedNow_reachesRunningTurn$step(InteractiveStreamE2ETest.kt:10638)
+pixel2Api33Atd Tests 25/65 completed. (0 skipped) (2 failed)
+pixel2Api33Atd Tests 26/65 completed. (0 skipped) (2 failed)
+pixel2Api33Atd Tests 28/65 completed. (0 skipped) (2 failed)
+pixel2Api33Atd Tests 29/65 completed. (0 skipped) (2 failed)
+pixel2Api33Atd Tests 30/65 completed. (0 skipped) (2 failed)
+pixel2Api33Atd Tests 31/65 completed. (0 skipped) (2 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_attentionDot_followsARealTurn[pixel2Api33Atd] [31mFAILED [0m
+	java.lang.AssertionError: event=phone_read_probe rows=3 unidentified=0 malformed=0 gaps=0 versions=3 checkpoint_reaches_target=false read_reaches_target=false
+	at de.pyryco.mobile.e2e.InteractiveStreamE2ETest$interactiveTurn_attentionDot_followsARealTurn$4$1.invokeSuspend(InteractiveStreamE2ETest.kt:4632)
+pixel2Api33Atd Tests 32/65 completed. (0 skipped) (3 failed)
+pixel2Api33Atd Tests 33/65 completed. (0 skipped) (3 failed)
+pixel2Api33Atd Tests 34/65 completed. (0 skipped) (3 failed)
+pixel2Api33Atd Tests 35/65 completed. (0 skipped) (3 failed)
+pixel2Api33Atd Tests 36/65 completed. (0 skipped) (3 failed)
+pixel2Api33Atd Tests 37/65 completed. (0 skipped) (3 failed)
+pixel2Api33Atd Tests 38/65 completed. (0 skipped) (3 failed)
+pixel2Api33Atd Tests 40/65 completed. (0 skipped) (3 failed)
+pixel2Api33Atd Tests 41/65 completed. (0 skipped) (3 failed)
+pixel2Api33Atd Tests 44/65 completed. (0 skipped) (3 failed)
+pixel2Api33Atd Tests 46/65 completed. (0 skipped) (3 failed)
+pixel2Api33Atd Tests 47/65 completed. (0 skipped) (3 failed)
+pixel2Api33Atd Tests 48/65 completed. (0 skipped) (3 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_backgroundTurnEnd_pushPostsOneAlertThatOpensThread[pixel2Api33Atd] [31mFAILED [0m
+	java.lang.AssertionError: peer step 'await the held command's permission prompt' timed out; no open session: link 1 ended (clean close); redialing
+	at de.pyryco.mobile.e2e.PeerWaitKt.withTimeoutDiagnostic(PeerWait.kt:66)
+pixel2Api33Atd Tests 49/65 completed. (0 skipped) (4 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_renameConversation_relabelsTopBarAndListRow[pixel2Api33Atd] [31mFAILED [0m
+	androidx.compose.ui.test.ComposeTimeoutException: Condition still not satisfied after 30000 ms
+	at androidx.compose.ui.test.AndroidComposeUiTestEnvironment$AndroidComposeUiTestImpl.waitUntil(ComposeUiTest.android.kt:809)
+pixel2Api33Atd Tests 50/65 completed. (0 skipped) (5 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_hostSystemPrompt_editsResetsAndCancels[pixel2Api33Atd] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+pixel2Api33Atd Tests 51/65 completed. (0 skipped) (6 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_reconnect_slashCommandsAndCompactStillWork[pixel2Api33Atd] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+pixel2Api33Atd Tests 52/65 completed. (0 skipped) (7 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_markdownReply_rendersFormattedBody[pixel2Api33Atd] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+pixel2Api33Atd Tests 53/65 completed. (0 skipped) (8 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_rememberedModelAppliesToNewChatBeforeFirstMessage[pixel2Api33Atd] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+pixel2Api33Atd Tests 54/65 completed. (0 skipped) (9 failed)
+pixel2Api33Atd Tests 55/65 completed. (0 skipped) (9 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_replySuggestion_longPressSends[pixel2Api33Atd] [31mFAILED [0m
+	java.lang.AssertionError: the phone's live repository never listed its conversation list within 30000 ms
+	at de.pyryco.mobile.e2e.InteractiveStreamE2ETest.hostConversationIds(InteractiveStreamE2ETest.kt:8569)
+pixel2Api33Atd Tests 56/65 completed. (0 skipped) (10 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_backgroundPrompt_pushPostsExactlyOneAlertAcrossReconnect[pixel2Api33Atd] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+pixel2Api33Atd Tests 57/65 completed. (0 skipped) (11 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_rememberedEffort_recalledAfterRestartIntoFreshChatAndChannel[pixel2Api33Atd] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+pixel2Api33Atd Tests 58/65 completed. (0 skipped) (12 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_backgroundAgentProgress_showsOnRunningCard[pixel2Api33Atd] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+pixel2Api33Atd Tests 59/65 completed. (0 skipped) (13 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_stopRunningTurn_showsInterruptedThenRepliesAgain[pixel2Api33Atd] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+pixel2Api33Atd Tests 60/65 completed. (0 skipped) (14 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_attachmentsFromPhone_arriveAtPeerWithTheirBytes[pixel2Api33Atd] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+pixel2Api33Atd Tests 61/65 completed. (0 skipped) (15 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_channelInfo_listsBuiltInMcpServerAfterShowBuiltIn[pixel2Api33Atd] [31mFAILED [0m
+	androidx.compose.ui.test.ComposeTimeoutException: Condition still not satisfied after 30000 ms
+	at androidx.compose.ui.test.AndroidComposeUiTestEnvironment$AndroidComposeUiTestImpl.waitUntil(ComposeUiTest.android.kt:809)
+pixel2Api33Atd Tests 62/65 completed. (0 skipped) (16 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_peerAttachment_opensAndSavesAfterHistoryReload[pixel2Api33Atd] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+pixel2Api33Atd Tests 63/65 completed. (0 skipped) (17 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_offlineRetry_reconnectsSameHostAndReplies[pixel2Api33Atd] [31mFAILED [0m
+	java.lang.AssertionError: the phone's live repository never listed its conversation list within 30000 ms
+	at de.pyryco.mobile.e2e.InteractiveStreamE2ETest.hostConversationIds(InteractiveStreamE2ETest.kt:8569)
+pixel2Api33Atd Tests 64/65 completed. (0 skipped) (18 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_archiveTwoChats_listsSecondArchivedFirst[pixel2Api33Atd] [31mFAILED [0m
+	java.lang.AssertionError: the phone's live repository never listed its conversation list within 30000 ms
+	at de.pyryco.mobile.e2e.InteractiveStreamE2ETest.hostConversationIds(InteractiveStreamE2ETest.kt:8569)
+Tests on pixel2Api33Atd failed: There was 19 failure(s).
+Finished 65 tests on pixel2Api33Atd
+Android gate: 65 executed; 46 passed; 19 failed; process exit 1

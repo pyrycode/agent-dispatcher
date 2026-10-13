@@ -26,6 +26,7 @@
 /** Artifact shapes the gate knows how to read. */
 import { XMLParser, XMLValidator } from "fast-xml-parser";
 import type { GateSelection } from "./gate-selection.js";
+import type { InfraFailureClassification } from "./infra-failure.js";
 
 export type GateOutputFormat = "go-json" | "playwright-json" | "junit-xml";
 
@@ -856,6 +857,13 @@ export interface GateRunReport {
    * own merge before the run. Absent or empty when the merge was clean.
    */
   importResolvedPaths?: string[];
+  /**
+   * How the first pass's failures were classified (infra-failure.ts). Absent
+   * when nothing failed or the fork has no classifier. When `infra` is true
+   * the same-tree re-run and the base comparison were skipped, and the
+   * execution step halts the ticket with `error:infra` instead of judging it.
+   */
+  infraFailure?: InfraFailureClassification;
 }
 
 /**
@@ -898,6 +906,7 @@ export function formatGateEvidenceComment(opts: {
     "zero-executed": "🚨 Real-claude gate — NOTHING EXECUTED",
     unusable: "🚨 Real-claude gate — NO USABLE RESULT",
     "inherited-failure": "⚠️ Real-claude gate — FAILURES THIS BRANCH DID NOT CAUSE",
+    "infra-failure": "🚨 Real-claude gate: INFRASTRUCTURE FAILURE, NOT JUDGED",
   };
 
   const lines: string[] = [];
@@ -949,6 +958,31 @@ export function formatGateEvidenceComment(opts: {
     lines.push("");
   }
 
+  const infra = report.infraFailure?.infra === true ? report.infraFailure : null;
+  if (infra) {
+    lines.push(
+      infra.toolchain
+        ? `**Toolchain mismatch.** The host's toolchain does not match what the repository requires, so nothing ran ` +
+          `on the right toolchain.`
+        : `**Infrastructure-shaped failure.** Of ${infra.failed} failing tests, ${infra.connection} failed on a connection, ` +
+          `readiness, daemon or admission problem, ${infra.wait} on a bare timeout and ${infra.other} otherwise` +
+          (infra.admissionLines > 0 ? `, and the output holds ${infra.admissionLines} admission rejection line(s)` : "") + ".",
+    );
+    lines.push("");
+    lines.push(
+      `The same-tree re-run and the base comparison were skipped, since neither means anything while the ` +
+      `environment is failing. **None of these failures is attributed to this branch** and no rework is counted.`,
+    );
+    lines.push("");
+    if (infra.samples.length > 0) {
+      lines.push("Example lines:");
+      lines.push("```");
+      for (const sample of infra.samples) lines.push(sample);
+      lines.push("```");
+      lines.push("");
+    }
+  }
+
   const tally = report.tally;
   if (tally) {
     lines.push("**Result**");
@@ -984,7 +1018,13 @@ export function formatGateEvidenceComment(opts: {
 
     const flakySet = new Set(flaky);
     const remaining = tally.failedNames.filter(name => !flakySet.has(name));
-    if (remaining.length > 0) {
+    if (remaining.length > 0 && infra) {
+      lines.push(`**Failed (${remaining.length})**, not judged:`);
+      lines.push("");
+      for (const name of remaining.slice(0, 25)) lines.push(`- \`${name}\``);
+      if (remaining.length > 25) lines.push(`- …and ${remaining.length - 25} more, see the full output`);
+      lines.push("");
+    } else if (remaining.length > 0) {
       const introduced = opts.introduced ?? [];
       const preExisting = opts.preExisting ?? [];
       const compared = report.baselineFailures !== null;

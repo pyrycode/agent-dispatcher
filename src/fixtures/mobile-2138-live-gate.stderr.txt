@@ -1,0 +1,326 @@
+Starting 65 tests on dev33_google_atd_x86_64_Pixel_2(AVD) - 13
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 0/65 completed. (0 skipped) (0 failed)
+> Task :app:connectedDebugAndroidTest
+
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_pingPrompt_footerShowsContextUsage[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 1/65 completed. (0 skipped) (1 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_backgroundAgent_followsBottomUntilFinished[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 2/65 completed. (0 skipped) (2 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_finishedReply_systemCopyCopiesSelectedWord[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 3/65 completed. (0 skipped) (3 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_peerQueue_staysConsistentAcrossClients[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 4/65 completed. (0 skipped) (4 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_twoHostsArchive_staysPerHost[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 5/65 completed. (0 skipped) (5 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_deleteConversation_removesFromListAndClosesThread[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 6/65 completed. (0 skipped) (6 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_twoHostsCollidingConversationId_stayPerHost[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 7/65 completed. (0 skipped) (7 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_secondHostRenameAndUnpair_leavesFirstHostUntouched[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 8/65 completed. (0 skipped) (8 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_offlineRead_reconcilesPeerTurnOnReconnect[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 9/65 completed. (0 skipped) (9 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_stopBackgroundTask_completesThenRepliesAgain[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 10/65 completed. (0 skipped) (10 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_claudeOfferedFile_opensAndSavesAfterRestart[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 11/65 completed. (0 skipped) (11 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_muteChannel_roundTripsThroughTheHost[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 12/65 completed. (0 skipped) (12 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_reopenAfterReconnect_footerShowsContextUsageBeforeAnyTurn[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 13/65 completed. (0 skipped) (13 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_permissionHeldTool_statusAreaNamesRunningTool[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	java.lang.AssertionError: peer step 'open prior running-tool peer' timed out; no open session: none settled yet; redialing
+	at de.pyryco.mobile.e2e.PeerWaitKt.withTimeoutDiagnostic(PeerWait.kt:66)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 14/65 completed. (0 skipped) (14 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_diagnosticBundles_stayOnTheirOwningHosts[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 15/65 completed. (0 skipped) (15 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_sessionError_recoversDroppedAndRetainedBacklog[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	java.lang.IllegalStateException: session-error fixture retained/start failed; inspect retained control/daemon evidence
+	at de.pyryco.mobile.e2e.SessionErrorRecoveryScenario.request(SessionErrorRecoveryScenario.kt:294)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 16/65 completed. (0 skipped) (16 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_toolPrompt_rendersToolStepInThread[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 17/65 completed. (0 skipped) (17 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_compactWithAttachment_compactsAndClearsTheStrip[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 18/65 completed. (0 skipped) (18 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_permissionPrompts_heldPerConversation[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	java.lang.AssertionError: permission-isolation step 'pair answer host on phone' timed out; no open session: none settled yet; redialing
+	at de.pyryco.mobile.e2e.InteractiveStreamE2ETest.interactiveTurn_permissionPrompts_heldPerConversation$step$341(InteractiveStreamE2ETest.kt:10891)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 19/65 completed. (0 skipped) (19 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_pingPrompt_statusSheetShowsRunningModel[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 20/65 completed. (0 skipped) (20 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_createEditArchiveChannel_readsPromptBack[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 21/65 completed. (0 skipped) (21 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_modelChange_roundTripsAndStaysPerConversation[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 22/65 completed. (0 skipped) (22 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_reconnect_footerReadingsAndModelChangeSurvive[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 23/65 completed. (0 skipped) (23 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_interruptedUpload_retriesIntoOneMessageWithItsBytes[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	java.lang.AssertionError: event=interrupted_upload stage=PeerAdmission outcome=timeout; host=true selected=true relay=Reconnecting daemon=Down repository=false; peer=no open session: none settled yet; redialing
+	at de.pyryco.mobile.e2e.InteractiveStreamE2ETest$interactiveTurn_interruptedUpload_retriesIntoOneMessageWithItsBytes$step$1.invokeSuspend(InteractiveStreamE2ETest.kt:9860)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 24/65 completed. (0 skipped) (24 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_sendQueuedNow_reachesRunningTurn[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	java.lang.AssertionError: Send now step 'await phone connection' timed out; phone host=true selected=true relay=Offline daemon=Down repository=false; peer=no open session: none settled yet; redialing
+	at de.pyryco.mobile.e2e.InteractiveStreamE2ETest.interactiveTurn_sendQueuedNow_reachesRunningTurn$step(InteractiveStreamE2ETest.kt:10848)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 25/65 completed. (0 skipped) (25 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_inheritedEffort_footerShowsAppliedValueAfterTurn[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 26/65 completed. (0 skipped) (26 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_chosenEffort_appliesFromTheFirstTurn[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 27/65 completed. (0 skipped) (27 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_directShareShortcut_arrivesAtPeerWithItsBytes[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 28/65 completed. (0 skipped) (28 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_questionAnswer_reachesTheAskingConversation[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	java.lang.AssertionError: question-answer step 'pair answer host on phone' timed out; no open session: none settled yet; redialing
+	at de.pyryco.mobile.e2e.InteractiveStreamE2ETest.interactiveTurn_questionAnswer_reachesTheAskingConversation$step$371(InteractiveStreamE2ETest.kt:10898)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 29/65 completed. (0 skipped) (29 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_markdownLink_opensLiveNoteInReader[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 30/65 completed. (0 skipped) (30 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_permissionAnswer_reachesOnlyTheAskingConversation[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	androidx.compose.ui.test.ComposeTimeoutException: Condition still not satisfied after 60000 ms
+	at androidx.compose.ui.test.AndroidComposeUiTestEnvironment$AndroidComposeUiTestImpl.waitUntil(ComposeUiTest.android.kt:809)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 31/65 completed. (0 skipped) (31 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_attentionDot_followsARealTurn[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	androidx.compose.ui.test.ComposeTimeoutException: Condition still not satisfied after 60000 ms
+	at androidx.compose.ui.test.AndroidComposeUiTestEnvironment$AndroidComposeUiTestImpl.waitUntil(ComposeUiTest.android.kt:809)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 32/65 completed. (0 skipped) (32 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_collidingConversationId_phoneFileStaysOnItsHost[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	java.lang.AssertionError: peer step 'open host-isolation peer on A' timed out; no open session: none settled yet; redialing
+	at de.pyryco.mobile.e2e.PeerWaitKt.withTimeoutDiagnostic(PeerWait.kt:66)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 33/65 completed. (0 skipped) (33 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_newSession_rendersSessionBoundaryDelimiter[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 34/65 completed. (0 skipped) (34 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_backgroundTask_countsInActionsMenuAndPanel[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 35/65 completed. (0 skipped) (35 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_scannerConfirm_waitsForHostThenOpensList[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 36/65 completed. (0 skipped) (36 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_interruptedRetrieval_retryLoadsThePeersFile[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 37/65 completed. (0 skipped) (37 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_pingPrompt_streamsPingReplyIntoThread[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 38/65 completed. (0 skipped) (38 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_peerStartedTurn_continuesOnPhone[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 40/65 completed. (0 skipped) (39 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_offscreenReply_survivesReconnectThroughNewestPageAsk[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 41/65 completed. (0 skipped) (40 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_backgroundAgent_replyStaysUnderAgent[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 42/65 completed. (0 skipped) (41 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_dormantChannel_opensWithStoredHistoryWithoutSend[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 43/65 completed. (0 skipped) (42 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_saveAsChannel_promotesToChannelTier[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 44/65 completed. (0 skipped) (43 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_toolThenText_statusBandNeverEmptyWhileBusy[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 45/65 completed. (0 skipped) (44 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_archiveRestore_roundTripsListMembership[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 46/65 completed. (0 skipped) (45 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_operatorBypass_permissionControlReflectsTheRunningChild[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 47/65 completed. (0 skipped) (46 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_sharedContentFromAndroid_arrivesAtPeerWithItsBytes[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 48/65 completed. (0 skipped) (47 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_backgroundTurnEnd_pushPostsOneAlertThatOpensThread[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 49/65 completed. (0 skipped) (48 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_renameConversation_relabelsTopBarAndListRow[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 50/65 completed. (0 skipped) (49 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_hostSystemPrompt_editsResetsAndCancels[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 51/65 completed. (0 skipped) (50 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_reconnect_slashCommandsAndCompactStillWork[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 52/65 completed. (0 skipped) (51 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_markdownReply_rendersFormattedBody[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 53/65 completed. (0 skipped) (52 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_rememberedModelAppliesToNewChatBeforeFirstMessage[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 54/65 completed. (0 skipped) (53 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_otherConversationAttentionPills_waitingAndFinished[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	androidx.compose.ui.test.ComposeTimeoutException: Condition still not satisfied after 60000 ms
+	at androidx.compose.ui.test.AndroidComposeUiTestEnvironment$AndroidComposeUiTestImpl.waitUntil(ComposeUiTest.android.kt:809)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 55/65 completed. (0 skipped) (54 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_replySuggestion_longPressSends[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 56/65 completed. (0 skipped) (55 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_backgroundPrompt_pushPostsExactlyOneAlertAcrossReconnect[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 57/65 completed. (0 skipped) (56 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_rememberedEffort_recalledAfterRestartIntoFreshChatAndChannel[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	java.lang.AssertionError: remembered effort stage=FixtureSetup failed
+	at de.pyryco.mobile.e2e.InteractiveStreamE2ETest.interactiveTurn_rememberedEffort_recalledAfterRestartIntoFreshChatAndChannel$step$305(InteractiveStreamE2ETest.kt:10880)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 58/65 completed. (0 skipped) (57 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_backgroundAgentProgress_showsOnRunningCard[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 59/65 completed. (0 skipped) (58 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_stopRunningTurn_showsInterruptedThenRepliesAgain[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 60/65 completed. (0 skipped) (59 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_attachmentsFromPhone_arriveAtPeerWithTheirBytes[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 61/65 completed. (0 skipped) (60 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_channelInfo_listsBuiltInMcpServerAfterShowBuiltIn[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 62/65 completed. (0 skipped) (61 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_peerAttachment_opensAndSavesAfterHistoryReload[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 63/65 completed. (0 skipped) (62 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_offlineRetry_reconnectsSameHostAndReplies[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+dev33_google_atd_x86_64_Pixel_2(AVD) - 13 Tests 64/65 completed. (0 skipped) (63 failed)
+
+de.pyryco.mobile.e2e.InteractiveStreamE2ETest > interactiveTurn_archiveTwoChats_listsSecondArchivedFirst[dev33_google_atd_x86_64_Pixel_2(AVD) - 13] [31mFAILED [0m
+	kotlinx.coroutines.TimeoutCancellationException: Timed out waiting for 30000 ms
+	at kotlinx.coroutines.TimeoutKt.TimeoutCancellationException(Timeout.kt:189)
+Tests on dev33_google_atd_x86_64_Pixel_2(AVD) - 13 failed: There was 64 failure(s).
+Finished 65 tests on dev33_google_atd_x86_64_Pixel_2(AVD) - 13
+Android gate: 65 executed; 1 passed; 64 failed; process exit 1

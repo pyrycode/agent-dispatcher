@@ -642,6 +642,19 @@ export const REAL_CLAUDE_GATE_FAIL_COLUMN = "In Development";
  */
 export const REAL_CLAUDE_GATE_ERROR_LABEL = "error:real-claude-gate";
 
+/**
+ * Applied when the live gate's first pass failed in an infrastructure shape:
+ * mostly connection, readiness or daemon-unavailable waits, or admission
+ * rejections from a shared service such as the relay (infra-failure.ts).
+ *
+ * Separate from `error:real-claude-gate` so a human, and the board watch,
+ * can tell "the environment failed" from "the gate could not judge". Same
+ * `error:` prefix for the same reasons: out of the WIP count, out of gate
+ * re-selection, and never a rework, so it counts nothing against the code
+ * owner. Added after pyrycode-mobile #2138 on 2026-10-13.
+ */
+export const INFRA_FAILURE_LABEL = "error:infra";
+
 /** The label a failed gate adds in the CLASSIC set, routing the ticket
  *  back to the developer. Default for `decideGateOutcome`; other stage
  *  sets pass their own (`activeStageSet().realClaudeGate.failReworkLabel`,
@@ -709,7 +722,13 @@ export type GateVerdict =
    * the branch introduced none of them. Not a pass, because the suite is
    * genuinely red; not the branch's fault either.
    */
-  | "inherited-failure";
+  | "inherited-failure"
+  /**
+   * The first pass failed in an infrastructure shape, so nothing was judged
+   * and no re-run or base comparison ran. Halts with `error:infra`; never a
+   * rework, never a pass.
+   */
+  | "infra-failure";
 
 /** Everything `decideGateVerdict` is allowed to look at. */
 export interface GateVerdictInput {
@@ -975,6 +994,7 @@ export interface GateOutcome {
  *   inherited-failure → stays at the live gate behind separate fix-ticket blockers
  *   zero-executed → stays in Inbox, add `error:real-claude-gate`, notify
  *   unusable      → stays in Inbox, add `error:real-claude-gate`, notify
+ *   infra-failure → stays in Inbox, add `error:infra`, notify
  *
  * **A failure deliberately KEEPS `needs-real-claude`.** The ticket must
  * re-gate once the developer fixes it; dropping the label would let the
@@ -1030,6 +1050,15 @@ export function decideGateOutcome(
       return {
         toColumn: null,
         addLabels: [REAL_CLAUDE_GATE_ERROR_LABEL],
+        removeLabels: [],
+        notify: true,
+      };
+    case "infra-failure":
+      // Halt where it is. No rework label, so the rework router never sees
+      // it and `rework-count` is untouched: the developer did nothing wrong.
+      return {
+        toColumn: null,
+        addLabels: [INFRA_FAILURE_LABEL],
         removeLabels: [],
         notify: true,
       };
@@ -1737,6 +1766,11 @@ export const GLOBAL_BLOCK_LABELS: ReadonlySet<string> = new Set([
   // Rework routing leaves the ticket in its current column at the threshold.
   // Block that column's agent too, or it reviews the same branch every cycle.
   "error:rework-loop",
+  // The environment failed, not the change: a live gate in the shape of a
+  // relay or daemon outage, or a check that hit a toolchain the host does
+  // not have. Every stage waits for a person, or the verifier would run
+  // into the same host problem every cycle (infra-failure.ts).
+  INFRA_FAILURE_LABEL,
 ]);
 
 /**
