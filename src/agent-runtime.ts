@@ -1510,7 +1510,7 @@ const REDACTED = "[REDACTED]";
  */
 const CREDENTIAL_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
   // `Authorization: Bearer <token>` and friends.
-  [/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, `Bearer ${REDACTED}`],
+  [/\bBearer(?:\s|\\+[nrt])+[A-Za-z0-9._~+/=-]{8,}/gi, `Bearer ${REDACTED}`],
   // Anthropic API and OAuth keys: sk-ant-api03-..., sk-ant-oat01-...
   [/\bsk-ant-[A-Za-z0-9_-]+/g, `sk-ant-${REDACTED}`],
   // GitHub tokens: classic and OAuth/app/refresh (gh[pousr]_), fine-grained (github_pat_).
@@ -1519,7 +1519,9 @@ const CREDENTIAL_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
   [/(\bhttps?:\/\/[^\s:/@]+:)[^\s@/]+@/gi, `$1${REDACTED}@`],
   // A long base64-looking value after token=, key=, secret= or password=
   // (also `:` and quoted forms, e.g. CLAUDE_CODE_OAUTH_TOKEN=..., "api_key": "...").
-  [/(\b[A-Za-z0-9_-]*(?:token|key|secret|password)["']?\s*[=:]\s*["']?)[A-Za-z0-9+/_.=-]{16,}/gi, `$1${REDACTED}`],
+  // Streaming diagnostics can contain several nested JSON string envelopes.
+  // Recognise escaped quotes/whitespace while redacting the same assignment value.
+  [/(\b[A-Za-z0-9_-]*(?:token|key|secret|password)(?:\\*["'])?(?:\s|\\+[nrt])*[=:](?:\s|\\+[nrt])*(?:\\*["'])?)[A-Za-z0-9+/_.=-]{16,}/gi, `$1${REDACTED}`],
 ];
 
 /**

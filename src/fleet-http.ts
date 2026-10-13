@@ -120,7 +120,8 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
         if (!/^[\w.-]+\/[\w.-]+#[1-9]\d*$/.test(body.ticket)) throw new Error('Invalid source ticket');
         return send(200,store.tasks.request(body.ticket,body.request));
       }
-      if (req.url === "/recovery/facts") return send(200, store.recoveryFacts(body.tickets));
+      if (req.url === "/recovery/facts") return send(200, store.recoveryFacts(body.tickets,
+        machine && body.runId ? {machine,session:body.session,project:body.project,runId:body.runId} : undefined));
       if (req.url === "/recovery/evidence") {
         if (!machine) return send(403, { error: "Machine credential required" });
         return send(200, store.recordEvidence(machine, body.project, body.records));

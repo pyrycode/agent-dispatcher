@@ -327,7 +327,7 @@ describe("trimMemoryIndexFile", () => {
 
   test("missing file is a no-op with no writes", () => {
     const fs = new MockFs();
-    const result = trimMemoryIndexFile({ repoRoot, homeDir, fs });
+    const result = trimMemoryIndexFile({ repoRoot, homeDir, fs, env: {} });
     assert.equal(result.changed, false);
     assert.equal(result.overCap, false);
     assert.deepEqual(fs.writeCalls(), [], "no write or rename");
@@ -336,7 +336,7 @@ describe("trimMemoryIndexFile", () => {
   test("under cap reads but does not write", () => {
     const fs = new MockFs();
     fs.files.set(path, "# Index\n" + ticket(1) + "\n");
-    const result = trimMemoryIndexFile({ repoRoot, homeDir, capBytes: 10_000, fs });
+    const result = trimMemoryIndexFile({ repoRoot, homeDir, capBytes: 10_000, fs, env: {} });
     assert.equal(result.changed, false);
     assert.ok(fs.calls.includes(`read:${path}`), "read happened");
     assert.deepEqual(fs.writeCalls(), [], "no write or rename");
@@ -347,7 +347,7 @@ describe("trimMemoryIndexFile", () => {
     const content = ["# Index", ticket(3), ticket(2), ticket(1)].join("\n") + "\n";
     fs.files.set(path, content);
     const cap = bytes(["# Index", ticket(3)].join("\n") + "\n");
-    const result = trimMemoryIndexFile({ repoRoot, homeDir, capBytes: cap, fs });
+    const result = trimMemoryIndexFile({ repoRoot, homeDir, capBytes: cap, fs, env: {} });
     assert.equal(result.changed, true);
     const tmp = `${path}.tmp`;
     assert.deepEqual(
@@ -365,7 +365,7 @@ describe("trimMemoryIndexFile", () => {
     const fs = new MockFs();
     const content = [lesson("a"), lesson("b"), lesson("c")].join("\n") + "\n";
     fs.files.set(path, content);
-    const result = trimMemoryIndexFile({ repoRoot, homeDir, capBytes: 10, fs });
+    const result = trimMemoryIndexFile({ repoRoot, homeDir, capBytes: 10, fs, env: {} });
     assert.equal(result.changed, false);
     assert.equal(result.overCap, true);
     assert.deepEqual(fs.writeCalls(), [], "no write when nothing can be dropped");
@@ -383,7 +383,7 @@ describe("trimMemoryIndexFile", () => {
     const content = [ticket(2), ticket(1), lesson("a"), lesson("b")].join("\n");
     fs.files.set(path, content);
     const cap = bytes([ticket(2), lesson("a"), lesson("b")].join("\n"));
-    const result = trimMemoryIndexFile({ repoRoot, homeDir, capBytes: cap, fs });
+    const result = trimMemoryIndexFile({ repoRoot, homeDir, capBytes: cap, fs, env: {} });
     assert.equal(result.lessonFloor, bytes([lesson("a"), lesson("b")].join("\n")));
   });
 });
