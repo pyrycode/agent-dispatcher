@@ -1,6 +1,7 @@
 import ts from 'typescript';
 import {scrubCredentials} from './agent-runtime.js';
 import type {RepairPublication} from './recovery-repair-publication.js';
+import {scanSourcePackage} from './gitleaks.js';
 
 const PRIVATE_LIMIT=4*1024*1024;
 const sensitiveName=/(?:token|key|secret|password)$/i;
@@ -75,5 +76,6 @@ export function validateRepairPublication(value:unknown):RepairPublication {
  for(const [path,mode] of Object.entries(p.modes??{})) {
   if(!Object.hasOwn(p.files,path)||!['100644','100755'].includes(mode)) throw new Error('Unsupported repair file mode');
  }
+ scanSourcePackage(p.files);
  return p;
 }

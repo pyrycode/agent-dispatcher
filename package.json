@@ -5,6 +5,7 @@
   "type": "module",
   "description": "Dispatch agent runs against a GitHub Project board. Label-driven state machine, worktree isolation, salvage on max_turns.",
   "scripts": {
+    "postinstall": "python3 scripts/install-gitleaks.py",
     "start": "tsx src/dispatch-bin.ts",
     "fleet": "node --import tsx src/fleet-bin.ts",
     "watch": "tsx --watch src/dispatch-bin.ts",

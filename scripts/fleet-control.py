@@ -35,6 +35,10 @@ def sync_control(adapter,config):
         dependencies=command(['git','diff','--name-only',current,revision,'--','package.json','pnpm-lock.yaml'],repo)
         command(['git','merge','--ff-only',revision],repo)
         if dependencies:command(settings.get('install',['pnpm','install','--frozen-lockfile']),repo)
+    # Also retry installation after a failed install on an already updated
+    # checkout. No controller receipt or consumer advancement precedes it.
+    scanner_install=repo/'scripts/install-gitleaks.py'
+    if scanner_install.is_file():command(['python3',str(scanner_install)],repo)
     for component in settings.get('components',[]):
         name=component['name']
         observed=adapter.operator('control') if name=='claims' else adapter.status()
