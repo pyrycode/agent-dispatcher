@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Existing fleet supervisor's admitted native work. Requests cannot supply shell commands."""
 import hashlib
+import base64
 import json
 import os
 import platform
@@ -14,6 +15,34 @@ from pathlib import Path
 from contextlib import contextmanager
 
 RECIPES={'platform-probe','memory-runtime-smoke','android-tool-then-text','dispatcher-repair'}
+ARTIFACT_BYTES=64*1024*1024
+ARTIFACT_FILES=1024
+CHUNK_BYTES=256*1024
+
+def capture_records(log):
+    matches=re.findall(r'#2939 private recovery: (/[^\n]+)',log.read_text(errors='replace'))
+    if len(matches)!=1:raise RuntimeError('Capture returned no unique private recovery directory')
+    capture=Path(matches[0]).resolve(strict=True);files={};total=0
+    for path in sorted(capture.rglob('*')):
+        if path.is_file() and path.suffix in {'.json','.jsonl','.xml','.stdout','.stderr'} and not any('logcat' in part.lower() for part in path.relative_to(capture).parts):
+            if capture not in path.resolve(strict=True).parents:raise RuntimeError('Capture artifact escapes its private directory')
+            total+=path.stat().st_size
+            if len(files)>=ARTIFACT_FILES or total>ARTIFACT_BYTES:raise RuntimeError('Capture artifacts exceed total bounds; private inventory retained')
+            # Decode strictly and preserve CRLF and exact UTF-8 bytes.
+            files['mobile/'+str(path.relative_to(capture))]=path.read_bytes().decode('utf-8')
+    return files
+
+def artifact_manifest(files):
+    entries=[];total=0
+    for name,content in sorted(files.items()):
+        if not re.fullmatch(r'[\w./-]+',name,flags=re.ASCII) or len(name)>240 or name.startswith('/') or any(p in {'','.','..'} for p in name.split('/')) or name.split('/')[0].startswith('.fleet-task-'):
+            raise RuntimeError('Invalid artifact path')
+        data=content.encode('utf-8');total+=len(data)
+        entries.append({'path':name,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),
+                        'chunks':[hashlib.sha256(data[i:i+CHUNK_BYTES]).hexdigest() for i in range(0,len(data),CHUNK_BYTES)]})
+    manifest={'version':1,'chunkBytes':CHUNK_BYTES,'totalBytes':total,'files':entries}
+    if len(entries)>ARTIFACT_FILES or total>ARTIFACT_BYTES or len(json.dumps(manifest,separators=(',',':')))>1024*1024:raise RuntimeError('Task artifacts exceed total bounds')
+    return manifest
 
 def atomic(path,value):
     path.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
@@ -268,19 +297,11 @@ def native_recipe(task,paths,directory):
         if not driver.is_file():raise RuntimeError('The exact candidate does not supply the approved capture recipe')
         # No credentials are copied. Each configured admitted launcher owns its existing login.
         code=execute([sys.executable,str(driver),'--mobile',str(mobile),'--mobile-agents',paths['mobileAgents'],'--daemon-agents',paths['coreAgents']],core,log,env)
-        text=log.read_text(errors='replace')
-        matches=re.findall(r'#2939 private recovery: (/[^\n]+)',text)
-        if len(matches)!=1:raise RuntimeError('Capture returned no unique private recovery directory')
-        capture=Path(matches[0])
         # Include the ordered recorder input and launcher diagnostics on failures
         # as well as passes. The authority refuses credential-shaped content.
-        for path in capture.rglob('*'):
-            if path.is_file() and path.suffix in {'.json','.jsonl','.xml','.stdout','.stderr'}:
-                with path.open(encoding='utf-8',newline='') as record:
-                    files['mobile/'+str(path.relative_to(capture))]=record.read()
+        files=capture_records(log)
         summary='Android capture completed. Inspect counted XML and recorder admission before accepting evidence.' if code==0 else 'Android capture failed. Returned diagnostic records do not establish a passing method.'
-    if sum(len(v.encode()) for v in files.values())>4*1024*1024:
-        files={};summary+=' Artifact bundle exceeds transport size; its original private directory remains available.';code=1
+    artifact_manifest(files)
     return {'outcome':'completed' if code==0 else 'failed','summary':summary,'files':files}
 
 def route_available(route):
@@ -334,6 +355,30 @@ class SupportSupervisor:
             old['drainConfirmed']=True;atomic(receipt,old)
         return drained
 
+    def return_artifacts(self,machine,receipt,value):
+        files=value.get('files',{})
+        # The old helper discarded oversized capture records but retained their
+        # directory in its private execution log. Recover that saved execution.
+        if not files and 'Artifact bundle exceeds transport size;' in value['summary']:
+            directory=Path(receipt['result']).parent
+            task=json.loads((directory/'task.json').read_text())
+            if task['id']!=receipt['id'] or task['request']['recipe']!='android-tool-then-text':raise RuntimeError('Retained task receipt mismatch')
+            files=capture_records(directory/'execution.log')
+        manifest=artifact_manifest(files)
+        identity={'machine':machine,'id':receipt['id'],'session':receipt['session']}
+        transfer=self.rpc('artifacts-begin',{**identity,'manifest':manifest})
+        digest=hashlib.sha256(json.dumps(manifest,separators=(',',':')).encode()).hexdigest()
+        if transfer['digest']!=digest:raise RuntimeError('Artifact manifest hash mismatch')
+        # The authority records each acknowledged part. An interrupted supervisor
+        # restart asks for missing parts and never repeats the native execution.
+        for entry in manifest['files']:
+            data=files[entry['path']].encode()
+            for part in transfer['missing'][entry['path']]:
+                self.rpc('artifacts-put',{**identity,'digest':digest,'path':entry['path'],'part':part,
+                    'data':base64.b64encode(data[part*CHUNK_BYTES:(part+1)*CHUNK_BYTES]).decode('ascii')})
+        self.rpc('artifacts-commit',{**identity,'digest':digest,'result':{**value,'files':{}}})
+        return digest
+
     def tick(self):
         routes=self.config.get('recoveryTasks',{})
         if not routes:return []
@@ -346,8 +391,18 @@ class SupportSupervisor:
         running=[]
         for receipt in self.directory.glob('*.receipt.json'):
             old=json.loads(receipt.read_text())
-            if old['phase']=='complete':continue
+            if old['phase']=='complete' and old.get('artifactDigest'):continue
             result=Path(old['result'])
+            if old['phase']=='complete' and not result.is_file():continue
+            if old['phase']=='complete':
+                # This trusted supervisor receipt records the prior terminal
+                # acknowledgement. Recover bytes only, without launching or
+                # signalling workers or changing the already released outcome.
+                value=json.loads(Path(old.get('artifactResult',str(result))).read_text())
+                if 'publication.json' in value.get('files',{}):continue
+                old['artifactDigest']=self.return_artifacts(machine,old,value)
+                atomic(receipt,old)
+                continue
             child=self.children.get(old.get('pid'))
             custody=old.get('custody')
             def observe_worker():
@@ -370,7 +425,7 @@ class SupportSupervisor:
                 observed['identity']==root['identity'] and not observed['state'].startswith(('Z','X')))
             alive=root_alive or custody_state!='drained'
             if result.is_file() and not alive and self.drained(old,receipt):
-                value=json.loads(result.read_text())
+                value=json.loads(Path(old.get('artifactResult',str(result))).read_text())
                 publication=value.get('files',{}).pop('publication.json',None)
                 if publication:
                     self.rpc('prepare-repair',{'machine':machine,'id':old['id'],'session':old['session'],'publication':json.loads(publication)})
@@ -380,7 +435,13 @@ class SupportSupervisor:
                     value['summary']='Dispatcher repair '+published['url']+'. '+('Merged; supervised rollout is pending.' if published.get('merged') else published.get('reason','Review remains pending.'))
                     value['files']={'publication-result.json':json.dumps(published)}
                     if published.get('dispatcherSHA'):value['dispatcherRevision']=published['dispatcherSHA']
-                self.rpc('complete' ,{'machine':machine,'id':old['id'],'session':old['session'],'result':value})
+                    # A later publication retry can return different consumer
+                    # receipts. Freeze the exact upload before its first part,
+                    # so a lost acknowledgement never changes its manifest.
+                    artifact_result=result.with_name('artifact-result.json')
+                    atomic(artifact_result,value)
+                    old['artifactResult']=str(artifact_result);atomic(receipt,old)
+                old['artifactDigest']=self.return_artifacts(machine,old,value)
                 old['phase']='complete';atomic(receipt,old)
             elif old['phase']=='attention':
                 running.append(old)

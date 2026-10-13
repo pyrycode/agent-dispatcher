@@ -8,6 +8,7 @@ import { RecoveryLedger, validateObservations, IDLE_RECOVERY_REASONS, RECOVERY_U
 import { OperationReports } from './operation-reports.js';
 import {RecoveryTasks, assessmentTasks, type RecoveryTaskRequest, type RecoveryTaskResult} from './recovery-tasks.js';
 import {createHash} from 'node:crypto';
+import {manifestHash} from './recovery-artifacts.js';
 import type { AgentRunner } from './agent-runner.js';
 
 /** An operator choice, frozen into each new grant. Null restores local settings. */
@@ -177,12 +178,38 @@ export class FleetStore {
     const started=this.start({id:runId,machine,session,project,ticket:`${project}#@task-${id}`,role:'recovery-task',resource:task.request.recipe==='platform-probe'?'light':'heavy',locks:[],supportTaskId:id,parentTicket:task.ticket});
     return {...started,...(started.ok?{runnerPolicy:this.snapshot().runs.find(r=>r.id===runId)?.runnerPolicy,run:this.snapshot().runs.find(r=>r.id===runId)}:{})};
   }
-  readTask(machine:string,session:string,project:string,runId:string,id:string) {
+  readTask(machine:string,session:string,project:string,runId:string,id:string,format?:string) {
     const task=this.tasks.get(id);
     const run=this.snapshot().runs.find(r=>r.id===runId&&r.machine===machine&&r.session===session&&r.project===project&&r.ticket===task.ticket);
     if(!run) throw new Error('Artifact read needs its admitted source ticket');
     this.authorize(machine,session,task.ticket,runId);
-    return task;
+    const artifacts=this.tasks.manifest(id);
+    if(format==='manifest-v1') return {...task,result:task.result?{...task.result,files:{}}:null,artifacts};
+    if(format!==undefined) throw new Error('Unsupported artifact read format');
+    if(task.artifactsPending) throw new Error('Retained task artifacts are still transferring');
+    // Workers already running during rollout can still read small legacy results.
+    // An old helper must fail explicitly instead of silently receiving no files.
+    if(artifacts && artifacts.totalBytes>4*1024*1024) throw new Error('Artifact bundle requires the manifest-v1 client');
+    let legacy=task;
+    if(task.artifacts && task.result) {
+      const digest=manifestHash(task.artifacts);
+      const files=Object.fromEntries(task.artifacts.files.map(file=>[file.path,Buffer.concat(file.chunks.map((_,part)=>
+        Buffer.from(this.tasks.artifact(id,digest,file.path,part).data,'base64'))).toString('utf8')]));
+      legacy={...task,result:{...task.result,files}};
+    }
+    if(Buffer.byteLength(JSON.stringify(legacy))>8*1024*1024) throw new Error('Artifact bundle requires the manifest-v1 client');
+    return legacy;
+  }
+  readTaskArtifact(machine:string,session:string,project:string,runId:string,id:string,digest:string,path:string,part:number) {
+    this.readTask(machine,session,project,runId,id,'manifest-v1');
+    return this.tasks.artifact(id,digest,path,part);
+  }
+  commitTaskArtifacts(machine:string,id:string,session:string,digest:string,result:RecoveryTaskResult) {
+    return this.transaction(()=>{
+      const task=this.tasks.commitArtifacts(id,machine,session,digest,result);
+      this.releaseTaskRun(task.runId!,machine,session,task.result!.outcome==='completed');
+      return task;
+    });
   }
   requiredRepairs():Record<string,string[]> {
     const required:Record<string,string[]>={};
@@ -246,9 +273,25 @@ export class FleetStore {
       diagnosticTicket=run.ticket;
     }
     const evidence = this.facts.getEvidence(tickets);
-    return tickets.map(ticket => ({ ticket, pause: this.facts.getPause(ticket),
-      artifactRevision: this.artifactRevision(ticket), evidence: evidence.filter(e => e.ticket === ticket), capabilities:this.tasks.capabilities(), tasks: assessmentTasks(this.tasks.list(ticket),ticket===diagnosticTicket),
-      coordination: this.facts.getCoordination(ticket) }));
+    const facts=tickets.map(ticket => {
+      const totalCount=this.tasks.count(ticket);
+      return {ticket,pause:this.facts.getPause(ticket),artifactRevision:this.artifactRevision(ticket),evidence:evidence.filter(e=>e.ticket===ticket),capabilities:this.tasks.capabilities(),
+        tasks:[] as ReturnType<typeof assessmentTasks>,taskHistory:{totalCount,returnedCount:0,omittedCount:totalCount},coordination:this.facts.getCoordination(ticket)};
+    });
+    // The Unix client permits 1 MiB for /recovery/facts. Reserve the existing
+    // metadata first, then share the remaining bytes across all task histories.
+    const budget={bytes:1024*1024-Buffer.byteLength(JSON.stringify(facts))-tickets.length*2,diagnosticCharacters:48000};
+    if(budget.bytes<0) throw new Error('Recovery facts exceed response bounds; request fewer tickets');
+    // Related-ticket order cannot starve the owning assessment of its diagnostics.
+    for(const fact of [...facts].sort((a,b)=>Number(b.ticket===diagnosticTicket)-Number(a.ticket===diagnosticTicket))) {
+      fact.tasks=assessmentTasks(this.tasks.list(fact.ticket),fact.ticket===diagnosticTicket,(task,path)=>{
+        const file=task.artifacts!.files.find(f=>f.path===path)!,digest=manifestHash(task.artifacts!);
+        return Buffer.concat(file.chunks.map((_,part)=>Buffer.from(this.tasks.artifact(task.id,digest,path,part).data,'base64'))).toString('utf8');
+      },budget);
+      fact.taskHistory.returnedCount=fact.tasks.length;
+      fact.taskHistory.omittedCount-=fact.tasks.length;
+    }
+    return facts;
   }
   recordPause(machine: string, session: string, project: string, runId: string, record: PauseRecord) {
     if (!record?.ticket?.startsWith(`${project}#`) || record.origin !== "pipeline") throw new Error("Pipeline pause required");

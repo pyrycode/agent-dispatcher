@@ -79,7 +79,10 @@ export function runRecoveryCheck(program:string,args:string[],options:{cwd:strin
  try {
   // Both streams write directly to the private file, preserving order and avoiding
   // buffered-output limits that can hide a check's actual failure.
-  execFileSync(program,args,{cwd:options.cwd,env:options.env,stdio:['ignore',fd,fd],timeout:options.timeout});
+  // pnpm otherwise aborts or prompts before replacing a mismatched modules store
+  // with ignored stdin. Keep CI confined to installation, preserving test policy.
+  const env=program==='pnpm' && args[0]==='install'?{...options.env,CI:'true'}:options.env;
+  execFileSync(program,args,{cwd:options.cwd,env,stdio:['ignore',fd,fd],timeout:options.timeout});
  }catch(error) {
   const failure=error as {status?:number|null;signal?:string|null;code?:string;stdout?:Buffer|string;stderr?:Buffer|string};
   terminal={outcome:'failed',status:failure.status??null,signal:failure.signal??null,...(failure.code?{errorCode:failure.code}:{})};
