@@ -7,6 +7,7 @@ import hmac
 import importlib.util
 import json
 import os
+import re
 import secrets
 import signal
 import subprocess
@@ -15,6 +16,12 @@ import time
 from pathlib import Path
 
 TERMINAL = {'complete', 'attention'}
+HOUSEKEEPING_BYTES = 256 * 1024
+# Host paths stay in the local log. Published reasons carry only their shape.
+HOST_PATH = re.compile(r'(?<![\w:/])/(?:[\w.@+-]+/)*[\w.@+-]+')
+
+def redact_paths(text):
+    return HOST_PATH.sub('<path>', text)
 HEALTH_LATCH_REASON = 'Health failed again after a verified restart. No repeat restart within twenty-four hours.'
 SIX_HOUR_REASON = 'Operation exceeded six hours. No forced stop or second signal sent.'
 # Configurable through the supervisor configuration file.
@@ -55,6 +62,9 @@ class Housekeeping:
         if archive:
             entry['archive'] = str(archive)
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if self.path.exists() and self.path.stat().st_size > HOUSEKEEPING_BYTES:
+            # One previous generation is kept. The archive folders remain the full record.
+            os.replace(self.path, self.path.with_name(self.path.name + '.1'))
         with self.path.open('a') as stream:
             os.chmod(self.path, 0o600)
             stream.write(json.dumps(entry) + '\n')
@@ -66,13 +76,20 @@ class Housekeeping:
             return []
         cutoff = self.clock() - window
         entries = []
-        for line in self.path.read_text().splitlines():
+        with self.path.open('rb') as stream:
+            size = stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, size - 64 * 1024))
+            lines = stream.read().decode('utf-8', errors='replace').splitlines()
+        if size > 64 * 1024:
+            lines = lines[1:]  # The first line can be partial.
+        for line in lines:
             try:
                 entry = json.loads(line)
             except ValueError:
                 continue
             if isinstance(entry, dict) and isinstance(entry.get('at'), (int, float)) and entry['at'] >= cutoff:
-                entries.append({k: entry[k] for k in ('at', 'kind', 'subject', 'reason') if k in entry})
+                entries.append({k: redact_paths(entry[k]) if isinstance(entry[k], str) else entry[k]
+                                for k in ('at', 'kind', 'subject', 'reason') if k in entry})
         return entries[-limit:]
 
     def archive(self, kind, name, note, move=(), copy=None):
@@ -99,7 +116,7 @@ def health_latched(state):
 
 class Supervisor:
     """A restart survives this supervisor crashing. An uncertain signal is never repeated."""
-    def __init__(self, directory, adapter, clock=time.time, settings=None, housekeeping=None):
+    def __init__(self, directory, adapter, clock=time.time, settings=None, housekeeping=None, monotonic=time.monotonic):
         self.directory = Path(directory)
         self.adapter = adapter
         self.clock = clock
@@ -108,6 +125,7 @@ class Supervisor:
         # In memory on purpose: a supervisor restart restarts the confirmation,
         # which only delays action on a failing dispatcher.
         self.unhealthy_since = {}
+        self.monotonic = monotonic
         self.notices = {}
 
     def tick(self, project, desired):
@@ -119,7 +137,7 @@ class Supervisor:
         return result
 
     def unhealthy_confirmed(self, project):
-        now = self.clock()
+        now = self.monotonic()
         since = self.unhealthy_since.setdefault(project, now)
         return now - since >= self.settings['healthFailureConfirmSeconds']
 
@@ -132,7 +150,7 @@ class Supervisor:
                 observed = self.adapter.observe(project)
             except Exception:
                 return state
-            if self.superseded(project, desired, state, observed):
+            if self.superseded(project, desired, state, observed) == 'retired':
                 return None
         return state
 
@@ -174,40 +192,71 @@ class Supervisor:
         self.notices[project].append(reason)
         return cleared
 
+    def ownership_problem(self, state):
+        """The same comparison the verifying branch makes before it completes."""
+        after = self.adapter.status()
+        current = real_claims(after)
+        releases = {(c['ticket'], c['machine'], c['generation']) for c in after.get('releasedAssessmentClaims', [])}
+        if any(current.get(ticket) != owner and (ticket, *owner) not in releases for ticket, owner in state['claims'].items()):
+            return 'Existing ticket ownership changed. Inspect the retained comparison.'
+        if policy(after) != state['policy']:
+            return 'Operator drain policy changed during verification.'
+        return None
+
     def superseded(self, project, desired, state, observed):
-        """Retire a record a later verified start has made obsolete. Returns True when retired."""
+        """Retire a record a later verified start has made obsolete.
+
+        Returns 'retired', 'attention' when the record's own checks fail, or None."""
         phase = state['phase']
+        # A six-hour record written before attentionFrom existed may come from a start.
+        origin = state.get('attentionFrom') or (None if phase == 'attention' else phase)
         if phase == 'attention':
             # Six-hour records only. Ownership checks never ran on the pinned target.
             if state.get('reason') != SIX_HOUR_REASON or state.get('desired') == desired:
-                return False
+                return None
         elif phase in {'start-requested', 'verifying'}:
             # The supervisor's own start of the current target completes normally, with its checks.
             if state.get('desired') == desired:
-                return False
+                return None
         elif phase not in {'draining', 'waiting-for-native-task'}:
             # drain-requested and every other phase still need inspection.
-            return False
+            return None
         if observed.get('stopped') or observed.get('generation') != desired or observed.get('healthy') is not True:
-            return False
+            return None
         # The process the record drained or started must be gone.
         if state.get('identity') and observed.get('identity') == state['identity']:
-            return False
+            return None
         try:
             if not self.adapter.verify(project, desired):
-                return False
+                return None
         except Exception:
-            return False
+            return None
         receipt = self.directory / (project.replace('/', '_') + '.json')
+        if origin in {'start-requested', 'verifying', None} and 'claims' in state and 'policy' in state:
+            # The supervisor may have started this process itself. Retiring must
+            # not skip the ownership comparison its verification would have made.
+            problem = self.ownership_problem(state)
+            if problem:
+                if phase != 'attention':
+                    state['attentionFrom'] = phase
+                    state['phase'] = 'attention'
+                    state['reason'] = problem
+                    atomic(receipt, state)
+                return 'attention'
         created = state.get('created')
         when = time.strftime('%Y-%m-%d %H:%M:%SZ', time.gmtime(created)) if isinstance(created, (int, float)) else 'unknown time'
-        reason = ('Retired ' + phase + ' record from ' + when + ' automatically: the dispatcher is verified healthy on the desired versions'
-                  + (', past the record\'s target.' if state.get('desired') != desired else ' after a later start.'))
+        if not state.get('identity'):
+            ending = ': the dispatcher recovered and is verified healthy on the desired versions.'
+        elif state.get('desired') != desired:
+            ending = ': the dispatcher is verified healthy on the desired versions, past the record\'s target.'
+        else:
+            ending = ': the dispatcher is verified healthy on the desired versions after a later start.'
+        reason = 'Retired ' + phase + ' record from ' + when + ' automatically' + ending
         folder = self.housekeeping.archive('retired', project.replace('/', '_'),
                                            {'reason': reason, 'project': project, 'phase': phase}, move=[receipt])
         self.housekeeping.record('operation-retired', project, reason, folder)
         self.notices[project].append(reason)
-        return True
+        return 'retired'
 
     def step(self, project, desired):
         receipt = self.directory / (project.replace('/', '_') + '.json')
@@ -223,8 +272,14 @@ class Supervisor:
             if state and state['phase'] in {'start-requested', 'verifying'} and self.clock() - state['created'] < 6 * 3600:
                 return state
             raise
+        # Any healthy sample ends a failure confirmation, whatever version it runs.
+        if observed.get('healthy') is True:
+            self.unhealthy_since.pop(project, None)
         # Checked before the six-hour limit: a superseded record raises no alert.
-        if state and self.superseded(project, desired, state, observed):
+        outcome = self.superseded(project, desired, state, observed) if state else None
+        if outcome == 'attention':
+            return state
+        if outcome == 'retired':
             state = None
         if state and state['phase']=='waiting-for-native-task':
             if helpers_active(project): return state
@@ -275,6 +330,7 @@ class Supervisor:
                      'claims': real_claims(before), 'policy': policy(before)}
             # Write BEFORE signalling. If the host dies here, inspection replaces a second signal.
             atomic(receipt, state)
+            self.unhealthy_since.pop(project, None)
             try:
                 self.adapter.drain(project, observed['identity'])
                 state['phase'] = 'draining'
@@ -336,6 +392,7 @@ class Supervisor:
                 state['phase'] = 'complete'
                 state['verified'] = self.clock()
                 atomic(receipt, state)
+                self.unhealthy_since.pop(project, None)
         except Exception as error:
             state['attentionFrom'] = state['phase']
             state['phase'] = 'attention'
@@ -404,7 +461,7 @@ def main():
                 except Exception as error:
                     # The native-task pass must not hide the operation report.
                     support_results = []
-                    support_failure = 'Native task pass failed. ' + type(error).__name__ + ': ' + str(error)[:300]
+                    support_failure = 'Native task pass failed. ' + type(error).__name__ + ': ' + redact_paths(str(error))[:300]
                 attention = adapter.attention()
                 attention["recoveryTasks"] = support_results
                 attention['operations'] = results

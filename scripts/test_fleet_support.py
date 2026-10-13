@@ -123,6 +123,51 @@ class SupportTests(unittest.TestCase):
    self.assertNotIn(bad_id,[task for op,task in calls if op.startswith('artifacts')])
    # The pass reached scheduling on both ticks.
    self.assertEqual([op for op,_ in calls].count('schedule'),2)
+ def support_with(self,d,receipts,draining=False):
+  class Adapter:
+   def status(self):return {'machine':'build-hp-1','draining':draining}
+  s=m.SupportSupervisor(Adapter(),{'stateDirectory':d,'recoveryTasks':{'probe:macos-arm64':{'capability':'macos-arm64'}}})
+  logged=[];s.housekeeping=lambda kind,subject,reason:logged.append((kind,subject))
+  calls=[];s.rpc=lambda op,body:calls.append(op) or artifact_reply(op,body)
+  result=Path(d)/'result.json';m.atomic(result,{'outcome':'completed','summary':'Probe.','files':{'platform.json':'{}'}})
+  for task,phase in receipts:m.atomic(s.directory/(task+'.receipt.json'),{'id':task,'session':'s','phase':phase,'result':str(result),'pid':1})
+  return s,logged,calls
+ def test_a_non_artifact_record_error_skips_scheduling_for_that_pass(self):
+  with tempfile.TemporaryDirectory() as d:
+   s,logged,calls=self.support_with(d,[('a','running')])
+   with patch.object(s,'route_ready',return_value=False),patch.object(m,'process_snapshot',side_effect=RuntimeError('census unavailable')):
+    [entry]=s.tick()
+   self.assertEqual(entry['phase'],'error');self.assertIn('census unavailable',entry['reason'])
+   self.assertNotIn('schedule',calls)
+ def test_an_artifact_transfer_error_is_retried_and_scheduling_continues(self):
+  with tempfile.TemporaryDirectory() as d:
+   s,logged,calls=self.support_with(d,[('a','complete')])
+   def rpc(op,body):
+    calls.append(op)
+    if op=='artifacts-begin':raise RuntimeError('Lost connection')
+    return artifact_reply(op,body)
+   s.rpc=rpc
+   with patch.object(s,'route_ready',return_value=False):[entry]=s.tick()
+   self.assertIn('Lost connection',entry['reason']);self.assertIn('schedule',calls)
+   self.assertNotIn('artifactUnrecoverable',json.loads((s.directory/'a.receipt.json').read_text()))
+ def test_only_known_local_artifact_failures_are_unrecoverable(self):
+  for error,marked in [(PermissionError(13,'denied'),False),(OSError(5,'io'),False),(RuntimeError('other'),False),
+                       (KeyError('id'),True),(FileNotFoundError(2,'gone'),True),(RuntimeError('Capture returned no unique private recovery directory'),True)]:
+   with self.subTest(error=error),tempfile.TemporaryDirectory() as d:
+    s,logged,calls=self.support_with(d,[('a','complete')])
+    with patch.object(s,'route_ready',return_value=False),patch.object(s,'artifact_files',side_effect=error):
+     entries=s.tick()
+    saved=json.loads((s.directory/'a.receipt.json').read_text())
+    self.assertEqual('artifactUnrecoverable' in saved,marked)
+    self.assertEqual(entries,[] if marked else [entries[0]])
+    self.assertIn('schedule',calls)
+ def test_a_supervisor_restart_does_not_log_the_same_skip_again(self):
+  with tempfile.TemporaryDirectory() as d:
+   s,logged,calls=self.support_with(d,[('a','complete')])
+   with patch.object(s,'route_ready',return_value=False),patch.object(s,'artifact_files',side_effect=PermissionError(13,'denied')):s.tick();s.tick()
+   restarted,relogged,_=self.support_with(d,[])
+   with patch.object(restarted,'route_ready',return_value=False),patch.object(restarted,'artifact_files',side_effect=PermissionError(13,'denied')):restarted.tick()
+   self.assertEqual(logged,[('native-task-skipped','a')]);self.assertEqual(relogged,[])
  def test_capture_inventory_keeps_more_than_64_files_and_refuses_escaping_symlinks(self):
   with tempfile.TemporaryDirectory() as d,tempfile.TemporaryDirectory() as outside:
    capture=Path(d)/'capture';capture.mkdir();log=Path(d)/'execution.log';log.write_text('#2939 private recovery: '+str(capture)+'\n')

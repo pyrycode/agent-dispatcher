@@ -142,7 +142,7 @@ class Tests(unittest.TestCase):
         self.adapter.preflight=lambda p,d:False
         self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'preflight-failed');self.assertEqual(self.adapter.calls,[])
     def test_repeated_health_failure_does_not_restart_again(self):
-        now=[1000];self.worker=module.Supervisor(self.directory,self.adapter,lambda:now[0],housekeeping=quiet(self.directory,lambda:now[0]))
+        now=[1000];self.worker=module.Supervisor(self.directory,self.adapter,lambda:now[0],housekeeping=quiet(self.directory,lambda:now[0]),monotonic=lambda:now[0])
         self.worker.tick(PROJECT,'new');self.adapter.current.update(stopped=True,childrenStopped=True)
         self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'complete')
         self.adapter.current.update(healthy=False)
@@ -189,7 +189,7 @@ class StaleStateTests(unittest.TestCase):
         self.worker=self.supervisor()
     def supervisor(self):
         clock=lambda:self.now[0]
-        return module.Supervisor(self.directory,self.adapter,clock,housekeeping=quiet(self.directory,clock))
+        return module.Supervisor(self.directory,self.adapter,clock,housekeeping=quiet(self.directory,clock),monotonic=clock)
     def receipt(self):return self.directory/'org_core.json'
     def verified(self,desired='new'):
         self.worker.tick(PROJECT,desired);self.adapter.current.update(stopped=True,childrenStopped=True)
@@ -330,6 +330,75 @@ class StaleStateTests(unittest.TestCase):
         self.adapter.current={'identity':{'pid':30,'start':'later'},'generation':'new','healthy':True,'stopped':False,'childrenStopped':False}
         self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'complete')
         self.assertEqual(self.archives('retired'),[])
+
+class ReviewFollowUpTests(StaleStateTests):
+    def test_failure_timer_ends_when_an_update_completes(self):
+        # Reviewer's sequence: an old confirmation must not latch a later verified restart.
+        self.adapter.current.update(healthy=False)
+        self.assertEqual(self.worker.tick(PROJECT,'old')['phase'],'current')
+        self.now[0]=1060;self.adapter.current.update(healthy=True)
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'draining')
+        self.now[0]=1120;self.adapter.current.update(stopped=True,childrenStopped=True)
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'complete')
+        self.now[0]=1700;self.adapter.current.update(healthy=False)
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'complete')
+        self.assertEqual(self.adapter.calls,['drain','update','start'])
+
+    def test_a_healthy_sample_on_any_version_ends_the_confirmation(self):
+        self.verified()
+        self.adapter.current.update(healthy=False)
+        self.worker.tick(PROJECT,'new')
+        self.now[0]+=CONFIRM//2;self.adapter.current.update(healthy=True,generation='other')
+        self.worker.tick(PROJECT,'new')
+        self.now[0]+=CONFIRM//2;self.adapter.current.update(healthy=False,generation='new')
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'complete')
+
+    def started_elsewhere(self):
+        self.adapter.current={'identity':{'pid':30,'start':'later'},'generation':'new','healthy':True,'stopped':False,'childrenStopped':False}
+
+    def test_retiring_an_own_start_record_still_compares_ownership(self):
+        for phase in ['verifying','start-requested']:
+            self.setUp()
+            self.open_record(phase)
+            state=json.loads(self.receipt().read_text());state['claims']={PROJECT+'#1':['mac','owner']};module.atomic(self.receipt(),state)
+            self.adapter.state['claims']=[]
+            self.started_elsewhere()
+            result=self.worker.tick(PROJECT,'new')
+            self.assertEqual(result['phase'],'attention');self.assertIn('ownership changed',result['reason'])
+            self.assertEqual(json.loads(self.receipt().read_text())['attentionFrom'],phase)
+            self.assertEqual(self.archives('retired'),[])
+
+    def test_retiring_an_own_start_record_still_compares_drain_policy(self):
+        self.open_record('verifying')
+        self.adapter.state['drainingProjects']=[]
+        self.started_elsewhere()
+        result=self.worker.tick(PROJECT,'new')
+        self.assertEqual(result['phase'],'attention');self.assertIn('drain policy changed',result['reason'])
+        self.assertEqual(self.archives('retired'),[])
+
+    def test_legacy_six_hour_record_keeps_its_alert_when_ownership_changed(self):
+        self.open_record('attention');state=json.loads(self.receipt().read_text())
+        state['reason']=module.SIX_HOUR_REASON;state['claims']={PROJECT+'#1':['mac','owner']};module.atomic(self.receipt(),state)
+        self.adapter.state['claims']=[];self.started_elsewhere()
+        result=self.worker.tick(PROJECT,'new')
+        self.assertEqual(result['reason'],module.SIX_HOUR_REASON);self.assertEqual(self.archives('retired'),[])
+
+    def test_recovered_waiting_record_says_the_dispatcher_recovered(self):
+        module.atomic(self.receipt(),{'phase':'waiting-for-native-task','project':PROJECT,'desired':'new','created':1000})
+        self.adapter.helpers_active=lambda project:True
+        self.adapter.current.update(generation='new')
+        result=self.worker.tick(PROJECT,'new')
+        self.assertEqual(result['phase'],'current');self.assertIn('the dispatcher recovered',result['reason'])
+
+    def test_housekeeping_log_is_bounded_and_published_without_host_paths(self):
+        log=quiet(self.directory,lambda:self.now[0])
+        log.record('native-task-skipped','task','FileNotFoundError: /tmp/pyry-2939-mobile-lzcyx2qe/x.json in org/core')
+        self.assertEqual(log.recent()[0]['reason'],'FileNotFoundError: <path> in org/core')
+        filler='x'*1000
+        for _ in range(300):log.record('operation-retired',PROJECT,filler)
+        self.assertLessEqual(log.path.stat().st_size,module.HOUSEKEEPING_BYTES+2000)
+        self.assertTrue(log.path.with_name('housekeeping.jsonl.1').exists())
+        self.assertEqual(len(log.recent()),20)
 
 class SupervisorReportTests(unittest.TestCase):
     def test_failed_native_task_pass_still_publishes_operations(self):

@@ -15,6 +15,13 @@ from pathlib import Path
 from contextlib import contextmanager
 
 RECIPES={'platform-probe','memory-runtime-smoke','android-tool-then-text','dispatcher-repair'}
+# Deterministic local failures of retained artifacts. Anything else is retried next pass.
+UNRECOVERABLE_ARTIFACTS=('Capture returned no unique private recovery directory','Capture artifact escapes its private directory',
+    'Capture artifacts exceed total bounds','Retained task receipt mismatch','Invalid artifact path','Task artifacts exceed total bounds')
+
+def artifacts_unrecoverable(error):
+    if isinstance(error,(FileNotFoundError,KeyError)):return True
+    return type(error) is RuntimeError and str(error).startswith(UNRECOVERABLE_ARTIFACTS)
 ARTIFACT_BYTES=64*1024*1024
 ARTIFACT_FILES=1024
 CHUNK_BYTES=256*1024
@@ -304,6 +311,10 @@ def native_recipe(task,paths,directory):
     artifact_manifest(files)
     return {'outcome':'completed' if code==0 else 'failed','summary':summary,'files':files}
 
+class ArtifactPassError(Exception):
+    """A completed record's artifact recovery failed. No worker or host state is involved."""
+    def __init__(self,error):super().__init__(type(error).__name__+': '+str(error));self.error=error
+
 def route_available(route):
     capability=route['capability']
     required=['go'] if capability in {'linux-amd64','macos-arm64'} else ['go','java','adb'] if capability=='android-emulator' else ['node','pnpm','codex']
@@ -316,7 +327,11 @@ class SupportSupervisor:
     def __init__(self,adapter,config):
         self.adapter=adapter;self.config=config;self.children={};self.directory=Path(config['stateDirectory'])/'tasks'
         # Optional callable(kind, subject, reason) for automatic state changes.
-        self.housekeeping=None;self.reported_errors={}
+        self.housekeeping=None
+        # Persisted so a supervisor re-exec does not log the same skip again.
+        self.skips_file=Path(config['stateDirectory'])/'native-task-skips.json'
+        try:self.reported_errors=json.loads(self.skips_file.read_text())
+        except (OSError,ValueError):self.reported_errors={}
         self.directory.mkdir(parents=True,exist_ok=True,mode=0o700)
 
     def rpc(self,operation,body):
@@ -401,6 +416,7 @@ class SupportSupervisor:
                 if 'publication.json' in value.get('files',{}):return
                 files=self.artifact_files(old,value)
             except Exception as error:
+                if not artifacts_unrecoverable(error):raise ArtifactPassError(error) from error
                 # The retained inputs are gone or invalid, for example a capture
                 # folder in a recreated container's temporary space. The outcome
                 # was already acknowledged, so only the artifacts are lost.
@@ -408,7 +424,8 @@ class SupportSupervisor:
                 old['artifactUnrecoverable']={'at':time.time(),'reason':reason};atomic(receipt,old)
                 if self.housekeeping:self.housekeeping('native-task-unrecoverable',old['id'],reason)
                 return
-            old['artifactDigest']=self.return_artifacts(machine,old,value,files)
+            try:old['artifactDigest']=self.return_artifacts(machine,old,value,files)
+            except Exception as error:raise ArtifactPassError(error) from error
             atomic(receipt,old)
             return
         child=self.children.get(old.get('pid'))
@@ -469,19 +486,26 @@ class SupportSupervisor:
         scheduler_session=json.loads(session_file.read_text())['session']
         capabilities=sorted(set(route['capability'] for route in routes.values() if self.route_ready(route)))
         self.rpc('capabilities',{'machine':machine,'record':{'capabilities':capabilities,'ready':not state.get('draining',False)}})
-        running=[]
+        running=[];host_uncertain=False;errors={}
         for receipt in sorted(self.directory.glob('*.receipt.json')):
+            task=receipt.name[:-len('.receipt.json')]
             # One bad record must not stop the pass, later records or the operation report.
             try:self.receipt_pass(machine,receipt,running)
             except Exception as error:
-                task=receipt.name[:-len('.receipt.json')]
-                reason='Native task record skipped this pass. '+type(error).__name__+': '+str(error)[:300]
+                detail=str(error) if isinstance(error,ArtifactPassError) else type(error).__name__+': '+str(error)
+                reason='Native task record skipped this pass. '+detail[:300]
                 running.append({'id':task,'phase':'error','reason':reason})
+                errors[task]=reason
+                # Only a completed record's artifact transfer is known to be local
+                # to that record. Anything else may be host-wide, such as an
+                # unavailable process census, so no new worker starts this pass.
+                if not isinstance(error,ArtifactPassError):host_uncertain=True
                 # Logged once per distinct failure, not on every pass.
-                if self.reported_errors.get(task)!=reason:
-                    self.reported_errors[task]=reason
-                    if self.housekeeping:self.housekeeping('native-task-skipped',task,reason)
-        if state.get('draining'):return running
+                if self.reported_errors.get(task)!=reason and self.housekeeping:
+                    self.housekeeping('native-task-skipped',task,reason)
+        if errors!=self.reported_errors:
+            self.reported_errors=errors;atomic(self.skips_file,errors)
+        if state.get('draining') or host_uncertain:return running
         for grant in self.rpc('schedule',{'session':scheduler_session}):
             task=grant['task'];session=grant['run']['session']
             receipt=self.directory/(task['id']+'.receipt.json')
