@@ -15,7 +15,11 @@ in the database. Authenticated operator commands are the way to change workflow.
 
 A worker must own its active reservation to write. Each admitted worker gets a
 GitHub bridge carrying its run identity. Existing agent `gh` label, stage, issue
-state and dependency commands are translated into database changes. Finished
+state and dependency commands are translated into database changes. A
+translated mutation answers with only the fields the caller selected, as GitHub
+would. `gh` decodes GraphQL strictly, so one unrequested field makes it report
+a failure for a change that was already saved. That happened to every status,
+label, comment and close command in Mobile #1984's split on 2026-10-13. Finished
 workers cannot publish a late verdict or change workflow. Cross-ticket writes
 retain the existing ownership rules.
 

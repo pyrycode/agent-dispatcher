@@ -844,3 +844,82 @@ test("archived cards do not stall publication and restored cards regain their co
   assert.equal(positions, 1);
   assert.equal(store.workflow.pending().length, 0);
 });
+test("bridge mutation responses carry only the fields the caller selected", async (t) => {
+  const { store } = fixture(t);
+  store.workflow.import(config, [item(), item(2)]);
+  store.start(run());
+  const github = new GitHubBroker({
+    token: "test",
+    projects: ["org/mobile"],
+    fetcher: async (input) => {
+      if (String(input).includes("/labels"))
+        return Response.json([{ id: 1, node_id: "L", name: "done:refiner" }]);
+      throw new Error("Display must not be written inline");
+    },
+  });
+  const bridge = new WorkflowGitHub(store, github);
+  const actor = { machine: "mac", session: "s", runId: "builder" };
+  const send = async (query: string, input: Record<string, unknown>) =>
+    JSON.parse(
+      (
+        await bridge.request(
+          config.project,
+          { method: "POST", path: "/graphql", body: JSON.stringify({ query, variables: { input } }) },
+          actor,
+        )
+      ).body,
+    ).data;
+  // The documents gh 2.88 sends for these commands, trimmed to their shape.
+  assert.deepEqual(
+    await send(
+      "mutation UpdateItemValues($input:UpdateProjectV2ItemFieldValueInput!){updateProjectV2ItemFieldValue(input:$input){projectV2Item{content{__typename,... on DraftIssue{id,body,title},... on PullRequest{body,title,number,url,repository{nameWithOwner}},... on Issue{body,title,number,url,repository{nameWithOwner}}},id,fieldValues(first: 100){nodes{__typename}}}}}",
+      { projectId: "P", itemId: "P1947", fieldId: "S", value: { singleSelectOptionId: "review" } },
+    ),
+    {
+      updateProjectV2ItemFieldValue: {
+        projectV2Item: {
+          content: {
+            __typename: "Issue",
+            body: "Fix stale context",
+            title: "Context reset",
+            number: 1947,
+            url: "https://github.com/org/mobile/issues/1947",
+            repository: { nameWithOwner: "org/mobile" },
+          },
+          id: "P1947",
+          fieldValues: null,
+        },
+      },
+    },
+  );
+  assert.deepEqual(
+    await send("mutation AddLabels($input:AddLabelsToLabelableInput!){addLabelsToLabelable(input:$input){__typename}}", { labelableId: "I1947", labelIds: ["L"] }),
+    { addLabelsToLabelable: { __typename: "AddLabelsToLabelablePayload" } },
+  );
+  assert.deepEqual(
+    await send("mutation CommentCreate($input:AddCommentInput!){addComment(input: $input){commentEdge{node{url}}}}", { subjectId: "I1947", body: "Split" }),
+    { addComment: { commentEdge: { node: { url: "https://github.com/org/mobile/issues/1947" } } } },
+  );
+  assert.deepEqual(
+    await send("mutation($input:UpdateProjectV2ItemPositionInput!){updateProjectV2ItemPosition(input:$input){clientMutationId}}", { projectId: "P", itemId: "P1947", afterId: "P2" }),
+    { updateProjectV2ItemPosition: { clientMutationId: null } },
+  );
+  assert.deepEqual(
+    await send("mutation($input:AddBlockedByInput!){addBlockedBy(input:$input){issue{number} blockingIssue{number url}}}", { issueId: "I1947", blockingIssueId: "I2" }),
+    { addBlockedBy: { issue: { number: 1947 }, blockingIssue: { number: 2, url: "https://github.com/org/mobile/issues/2" } } },
+  );
+  assert.deepEqual(
+    await send("mutation($input:UpdateProjectV2ItemPositionInput!){updateProjectV2ItemPosition(input:$input){items(first:1){nodes{id type}}}}", { projectId: "P", itemId: "P1947", afterId: "P2" }),
+    { updateProjectV2ItemPosition: { items: { nodes: [{ id: "P1947", type: "ISSUE" }] } } },
+  );
+  assert.deepEqual(
+    await send("mutation IssueClose($input:CloseIssueInput!){c:closeIssue(input: $input){issue{id ...on Labelable{labels(first:5){nodes{name}}}}}}", { issueId: "I1947", stateReason: "COMPLETED" }),
+    { c: { issue: { id: "I1947", labels: { nodes: [{ name: "done:refiner" }] } } } },
+  );
+  const saved = store.workflow.get("org/mobile#1947");
+  assert.equal(saved.status, "In Code Review");
+  assert.equal(saved.state, "CLOSED");
+  assert.deepEqual(saved.labels, ["done:refiner"]);
+  assert.deepEqual(saved.blockedBy.map((b) => b.number), [2]);
+  assert.equal(store.workflow.pendingComments().length, 1);
+});

@@ -40,6 +40,32 @@ ACTIONS = COMMENT_ACTIONS | {'label-edit', 'push', 'issue-create', 'issue-edit',
            'pr-review', 'board-add', 'board-status', 'board-after',
            'relations', 'add-child', 'remove-child', 'add-blocker', 'remove-blocker'}
 
+# Workflow state (column, order, dependencies) belongs to the orchestrator.
+# These actions reach it only through the managed GitHub bridge an admitted
+# worker's gh is configured with. Outside it they would write the GitHub
+# display directly, and reconciliation would silently overwrite them.
+# Sub-issue links are GitHub content the orchestrator reads back, so
+# add-child and remove-child work anywhere.
+WORKFLOW_ACTIONS = {'board-add', 'board-status', 'board-after', 'add-blocker', 'remove-blocker'}
+
+
+def bridged():
+    directory = os.environ.get('GH_CONFIG_DIR')
+    if not directory:
+        return False
+    try:
+        text = Path(directory, 'config.yml').read_text(encoding='utf-8')
+    except OSError:
+        return False
+    found = re.search(r'^http_unix_socket:[ \t]*(\S.*?)[ \t]*$', text, re.M)
+    if not found:
+        return False
+    socket = found.group(1).strip('"\'')
+    try:
+        return stat.S_ISSOCK(os.stat(socket).st_mode)
+    except OSError:
+        return False
+
 
 def number(value):
     if not re.fullmatch(r'[1-9][0-9]{0,9}', value):
@@ -158,6 +184,10 @@ def perform(args):
     counts.update({a: 1 if a.endswith('-delete-last') else 2 for a in COMMENT_ACTIONS})
     if len(values) != counts[action]:
         raise ValueError('Wrong argument count for ' + action)
+    if action in WORKFLOW_ACTIONS and not bridged():
+        raise ValueError(action + ' changes orchestrator workflow and needs the managed GitHub bridge, '
+                         'which this process does not have. Run it from an admitted pipeline worker; '
+                         'an operator uses the protected operator command instead.')
     if action in COMMENT_ACTIONS:
         n = number(values[0])
         kind = action.split('-')[0]
