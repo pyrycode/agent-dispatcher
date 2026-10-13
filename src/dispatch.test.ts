@@ -29,6 +29,7 @@ import { homedir, tmpdir } from "node:os";
 import { FleetStore } from './fleet-store.js';
 import { MachineManager, serveManager } from './machine-manager.js';
 import { ManagedDispatch } from './managed-dispatch.js';
+import { completeGo, completePlaywright, loggedArtifacts, loggedFailures, mixedGoCommands, singleWrappedGoCommands, repeatedGo } from "./fixtures/gate-completeness.js";
 
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -108,9 +109,10 @@ import {
   refreshStaleBaseBranch,
 } from "./dispatch.js";
 import { DEFAULT_INFRA_BREAKER_CONFIG, type InfraBreakerConfig } from "./infra-failure.js";
-import { parseGateRunMeta } from "./gate-report.js";
+import { parseGateRunMeta, serializeGateRunMeta } from "./gate-report.js";
 import { serializeLastVerdict } from "./verdict-handoff.js";
-import { formatGateEvidenceComment } from "./gate-output.js";
+import { formatGateEvidenceComment, gateRunFloor, gateRunRequiredTests } from "./gate-output.js";
+import { decideGateVerdict } from "./pipeline-decisions.js";
 import { flakyMarker } from "./flaky-tickets.js";
 import { FINAL_MERGE_HANDOFF_MARKER, MERGE_RESOLUTION_NOTE_MARKER, mergeResolutionComment } from "./merge-handoff.js";
 import { runReworkRouting } from "./reconcile.js";
@@ -147,7 +149,9 @@ resetActiveStageSetForTests();
 
 // Recompute agentsRepoRoot the same way dispatch.ts does so test
 // fsMaps can use the absolute paths the production code resolves.
-const TEST_AGENTS_REPO_ROOT = resolveAgentsRepoRoot(dirname(fileURLToPath(import.meta.url)));
+const TEST_AGENTS_REPO_ROOT = process.env.AGENTS_REPO_PATH
+  ? resolve(process.env.AGENTS_REPO_PATH)
+  : resolveAgentsRepoRoot(dirname(fileURLToPath(import.meta.url)));
 // Mirror dispatch.ts:63's env-precedence pattern so tests can compute
 // the same `repoRoot` the production code resolves.
 const TEST_REPO_ROOT = process.env.TARGET_REPO_PATH
@@ -6897,6 +6901,81 @@ describe("runRealClaudeGateSuite — worktree safety", () => {
 });
 
 describe("runRealClaudeGateSuite — evidence gathering", () => {
+  for (const mode of ["full", "selected"] as const) test(`fresh invocation provenance guards ${mode} judgments and backstop writes`, async () => {
+    const ordinary = "ok  fixture/ordinary 0.001s\n";
+    const failed = completeGo.replace('"Action":"pass","Package":"fixture","Test":"TestOther0"',
+      '"Action":"fail","Package":"fixture","Test":"TestOther0"');
+    for (const [command, format, output, verdict] of [
+      ...mixedGoCommands.map(command => [command, "go-json", command.startsWith("go test -json") ? completeGo + "\n" + ordinary : ordinary + completeGo, "unusable"] as const),
+      ...singleWrappedGoCommands.map(command => [`echo "$BUILD_STEP"; ${command}`, "go-json", completeGo, "pass"] as const),
+      ...singleWrappedGoCommands.map(command => [command, "go-json", failed, "fail"] as const),
+      ...[["pass", "fail"], ["fail", "pass"]].map(statuses => ["command env go -C /tmp/fixture test -json -count=2", "go-json", repeatedGo(statuses as ("pass" | "fail")[]), "fail"] as const),
+      ["go test -json ./...; go test ./ordinary", "go-json", completeGo + "\n" + ordinary, "unusable"],
+      ["go test ./ordinary; go test -json ./...", "go-json", completeGo + "\n" + ordinary, "unusable"],
+      ["playwright test --reporter=json; playwright test", "playwright-json", completePlaywright, "unusable"],
+      ["playwright test; playwright test --reporter=json", "playwright-json", completePlaywright, "unusable"],
+      ['echo "$BUILD_STEP"; go test -json ./...', "go-json", completeGo, "pass"],
+      ['echo "$BUILD_STEP"; go test -json ./...', "go-json", failed, "fail"],
+      ['echo "$BUILD_STEP"; "$TEST_RUNNER" test -json ./...', "go-json", completeGo, "unusable"],
+      ['go test -json ./...; exec "$TEST_RUNNER" test ./ordinary', "go-json", completeGo + "\n" + ordinary, "unusable"],
+      ['go test "$JSON_FLAG" ./...', "go-json", completeGo, "unusable"],
+      ['playwright test --reporter="$REPORTER"', "playwright-json", completePlaywright, "unusable"],
+      ['echo "$BUILD_STEP"; go test -json ./... > "$LOG" 2>&1', "go-json", completeGo, "pass"],
+      ["go test -json ./...", "playwright-json", completePlaywright, "unusable"],
+    ] as const) {
+      const selected = format === "go-json" ? "fixture.TestOther0" : "fixture.spec.ts › other 0";
+      const writes: string[] = [];
+      const harness = makeGateDeps({ fileContents: output,
+        gitOut: cmd => cmd.startsWith("gh pr list") ? `## Live tests\n- \`${selected}\``
+          : cmd.startsWith("git rev-list --count --merges") ? "0" : GATE_SHAS[cmd] ?? "",
+        readGateFullState: () => mode === "full" ? null : JSON.stringify({ lastFullPassSha: GATE_BASE_SHA }),
+        writeGateFullState: text => { writes.push(text); },
+      });
+      const report = await runRealClaudeGateSuite({ issueNumber: 1382, command, format,
+        baselineCommand: command + (format === "go-json" ? " -run {{TESTS}}" : " -g {{TESTS}}"),
+        timeoutMs: 60_000, minExecuted: 10,
+        selection: { alwaysTests: [], fullPaths: [], fullEvery: 10 },
+        repoRoot: "/tmp/fake-repo", logsDir: "/tmp/fake-logs", deps: harness.deps, defaultBranch: "main",
+      });
+      assert.equal(report.selection?.mode, mode);
+      assert.equal(decideGateVerdict({ ...report, minExecuted: gateRunFloor(report, 10),
+        requiredTests: gateRunRequiredTests(report) }).verdict, verdict, `${mode}: ${command}`);
+      assert.equal(writes.length, mode === "full" && verdict === "pass" ? 1 : 0, `${mode}: ${command}`);
+      if (verdict === "fail") assert.deepEqual(report.tally?.failedNames, [command.includes("-count=2") ? "fixture.TestRepeated/case:Low,confirmed" : "fixture.TestOther0"]);
+    }
+  });
+
+  test("tagged logs preserve full and selected execution judgments and backstop writes", async () => {
+    for (const artifact of [...loggedArtifacts, ...loggedFailures]) {
+      for (const mode of ["full", "selected"] as const) {
+        const selected = artifact.format === "go-json" ? "fixture.TestOther0" : "fixture.spec.ts › other 0";
+        const writes: string[] = [];
+        const harness = makeGateDeps({
+          fileContents: artifact.raw,
+          gitOut: cmd => cmd.startsWith("gh pr list") ? `## Live tests\n- \`${selected}\``
+            : cmd.startsWith("git rev-list --count --merges") ? "0" : GATE_SHAS[cmd] ?? "",
+          readGateFullState: () => mode === "full" ? null : JSON.stringify({ lastFullPassSha: GATE_BASE_SHA }),
+          writeGateFullState: text => { writes.push(text); },
+        });
+        const report = await runRealClaudeGateSuite({
+          issueNumber: 1382, command: artifact.format === "go-json" ? "go test -json" : "playwright test --reporter=json",
+          format: artifact.format, timeoutMs: 60_000, minExecuted: 10,
+          selection: { alwaysTests: [], fullPaths: [], fullEvery: 10 },
+          baselineCommand: artifact.format === "go-json" ? "go test -json -run {{TESTS}}" : "playwright test --reporter=json -g {{TESTS}}",
+          repoRoot: "/tmp/fake-repo", logsDir: "/tmp/fake-logs", deps: harness.deps,
+          defaultBranch: "main",
+        });
+        assert.equal(report.tally?.completeParse, true, `${artifact.name}, ${mode}`);
+        assert.equal(report.selection?.mode, mode);
+        assert.deepEqual(report.requiredTests, [selected]);
+        const expected = "failedName" in artifact ? "fail" : "pass";
+        assert.equal(decideGateVerdict({ ...report, minExecuted: gateRunFloor(report, 10), requiredTests: gateRunRequiredTests(report) }).verdict, expected);
+        if ("failedName" in artifact) assert.deepEqual(report.tally?.failedNames, [artifact.failedName]);
+        assert.equal(writes.length, expected === "pass" && report.selection?.mode === "full" ? 1 : 0);
+      }
+    }
+  });
+
   test("records how many commits behind the base the branch was", async () => {
     const report = await gateRun().run();
     assert.equal(report.commitsBehind, 29);
@@ -6943,6 +7022,51 @@ describe("runRealClaudeGateSuite — evidence gathering", () => {
 });
 
 describe("runRealClaudeGateSuite — per-ticket selection", () => {
+  test("comma and colon titles survive execution and persistence for passing, skipped and absent results", async () => {
+    const captured = JSON.parse(readFileSync(new URL("./fixtures/desktop-1809-live-report.json", import.meta.url), "utf8"));
+    const retained = captured.suites.find((s: any) => s.title === "real-claude-effort-default.spec.ts");
+    for (const title of [retained.specs[0].title, "applied effort: Low, confirmed preference: yes"]) {
+      const name = `${retained.title} › ${title}`;
+      for (const mode of ["off", "selected", "all", "shared"] as const) {
+        for (const status of ["passed", "skipped", "absent"] as const) {
+          // Parser fixtures retain the real effort result; other scenarios are synthetic.
+          const suite = JSON.parse(JSON.stringify(retained));
+          suite.specs[0].title = title;
+          if (status === "skipped") suite.specs[0].tests = [{ status: "skipped", annotations: [{ type: "skip", description: "fixture: unavailable" }] }];
+          const output = JSON.stringify({ suites: [
+            ...(status === "absent" ? [] : [suite]),
+            { title: "other.spec.ts", specs: [{ title: "unrelated pass", tests: [{ status: "expected", results: [{ status: "passed" }] }] }] },
+          ] });
+          const body = `## Live tests\n${mode === "all" ? "- all\n" : ""}- \`${name}\``;
+          const writes: string[] = [];
+          const harness = makeGateDeps({
+            gitOut: cmd => cmd.startsWith("gh pr list") ? body : cmd.startsWith("git diff --name-only") ? (mode === "shared" ? "net/Relay.ts" : "ui/Settings.ts") : cmd.includes("--count --merges") ? "2" : GATE_SHAS[cmd] ?? "",
+            fileContents: output,
+            readGateFullState: () => JSON.stringify({ lastFullPassSha: "f".repeat(40) }),
+            writeGateFullState: json => { writes.push(json); },
+          });
+          const report = await runRealClaudeGateSuite({
+            issueNumber: 1382, command: "playwright test --reporter=json", baselineCommand: "playwright test --reporter=json -g {{TESTS}}",
+            format: "playwright-json", timeoutMs: 60_000, minExecuted: 1,
+            selection: mode === "off" ? null : { alwaysTests: [], fullPaths: ["net/"], fullEvery: 10 },
+            repoRoot: "/tmp/fake-repo", logsDir: "/tmp/fake-logs", defaultBranch: "main", deps: harness.deps,
+          });
+          assert.equal(report.runError, null);
+          assert.deepEqual(report.requiredTests, [name]);
+          assert.equal(report.selection?.mode, mode === "off" ? undefined : mode === "selected" ? "selected" : "full");
+          if (mode === "selected") {
+            assert.deepEqual(report.selection?.mode === "selected" && report.selection.tests, [name]);
+            assert.ok(harness.spawnRequests[0].command.includes(title));
+          }
+          const saved = JSON.parse(JSON.stringify(report));
+          assert.equal(decideGateVerdict({ ...saved, minExecuted: gateRunFloor(saved, 1), requiredTests: gateRunRequiredTests(saved) }).verdict, status === "passed" ? "pass" : "unusable");
+          assert.deepEqual(parseGateRunMeta(serializeGateRunMeta(saved, {}, new Date()))?.requiredTests, [name]);
+          assert.equal(writes.length, status === "passed" && (mode === "all" || mode === "shared") ? 1 : 0);
+        }
+      }
+    }
+  });
+
   const LAST_FULL = "f".repeat(40);
   const body = "## Summary\nx\n\n## Live tests\n- p.TestRename\n";
 
@@ -6953,6 +7077,7 @@ describe("runRealClaudeGateSuite — per-ticket selection", () => {
     merges?: string;
     fileContents?: string;
     selection?: Parameters<typeof runRealClaudeGateSuite>[0]["selection"];
+    requiredTests?: string[];
   } = {}) {
     const writes: string[] = [];
     const out: Record<string, string> = {
@@ -6978,6 +7103,7 @@ describe("runRealClaudeGateSuite — per-ticket selection", () => {
         selection: over.selection === undefined
           ? { alwaysTests: ["p.TestPing"], fullPaths: ["net/"], fullEvery: 10 }
           : over.selection,
+        requiredTests: over.requiredTests,
         minExecuted: 1,
         repoRoot: "/tmp/fake-repo",
         defaultBranch: "main",
@@ -6992,6 +7118,7 @@ describe("runRealClaudeGateSuite — per-ticket selection", () => {
     const report = await run();
 
     assert.equal(report.selection?.mode, "selected");
+    assert.deepEqual(report.requiredTests, ["p.TestPing", "p.TestRename"]);
     assert.match(spawnRequests[0].command, /-run '\^\(TestPing\|TestRename\)\$'/);
     assert.equal(report.command, spawnRequests[0].command, "the evidence shows the command that actually ran");
     assert.deepEqual(writes, [], "a selected run never resets the backstop");
@@ -7001,11 +7128,13 @@ describe("runRealClaudeGateSuite — per-ticket selection", () => {
     const { run, spawnRequests } = selectionRun({ changed: "net/Relay.kt\n" });
     const report = await run();
     assert.equal(report.selection?.mode, "full");
+    assert.deepEqual(report.requiredTests, ["p.TestPing", "p.TestRename"]);
     assert.equal(spawnRequests[0].command, "go test -json ./...");
   });
 
   test("with no full pass on record, runs the full command and records it when it is clean", async () => {
-    const { run, spawnRequests, writes } = selectionRun({ lastFull: null });
+    const { run, spawnRequests, writes } = selectionRun({ lastFull: null,
+      fileContents: ["TestPing", "TestRename"].map(Test => JSON.stringify({ Action: "pass", Package: "p", Test })).join("\n") });
     await run();
     assert.equal(spawnRequests[0].command, "go test -json ./...");
     assert.deepEqual(writes, [JSON.stringify({ lastFullPassSha: GATE_BASE_SHA })]);
@@ -7028,12 +7157,32 @@ describe("runRealClaudeGateSuite — per-ticket selection", () => {
     assert.equal(spawnRequests[0].command, "go test -json ./...");
   });
 
-  test("selection off reads no pull request and records nothing", async () => {
+  test("selection off still reads explicit requirements and records no backstop", async () => {
     const { run, calls, writes } = selectionRun({ selection: null, lastFull: null });
     const report = await run();
     assert.equal(report.selection, undefined);
-    assert.ok(!calls.some(c => c.startsWith("gh pr list")));
+    assert.ok(calls.some(c => c.startsWith("gh pr list")));
+    assert.deepEqual(report.requiredTests, ["p.TestRename"]);
     assert.deepEqual(writes, []);
+  });
+
+  test("a full run missing required names cannot record a passing backstop", async () => {
+    const { run, writes } = selectionRun({ lastFull: null });
+    const report = await run();
+    assert.deepEqual(report.requiredTests, ["p.TestPing", "p.TestRename"]);
+    assert.deepEqual(writes, []);
+  });
+
+  test("always-required names remain when selection is disabled", async () => {
+    const { run } = selectionRun({ selection: null, requiredTests: ["p.TestPing"] });
+    assert.deepEqual((await run()).requiredTests, ["p.TestPing", "p.TestRename"]);
+  });
+
+  test("an unreadable PR requirement list cannot silently become a passing full run", async () => {
+    const { run, spawnRequests } = gateRun({ gitFail: cmd => cmd.startsWith("gh pr list") });
+    const report = await run();
+    assert.match(report.runError ?? "", /could not read required live tests/);
+    assert.deepEqual(spawnRequests, []);
   });
 });
 
@@ -7107,6 +7256,22 @@ describe("runRealClaudeGateSuite — same-tree re-run before the base comparison
     assert.equal(report.rerunFailures, null);
     assert.match(report.rerunSkipReason ?? "", /executed nothing/);
     assert.deepEqual(report.baselineFailures, ["p.TestFlaky"], "the base comparison still runs over the full set");
+  });
+
+  test("an unfinished re-run cannot excuse a named failure using its passing fragment", async () => {
+    const incomplete = `${rerunGreen}\n${JSON.stringify({ Action: "run", Package: "p", Test: "TestLuna" })}`;
+    const report = await rerunHarness(contents(incomplete, rerunRed)).run();
+    assert.equal(report.rerunFailures, null);
+    assert.match(report.rerunSkipReason ?? "", /incomplete/);
+    assert.deepEqual(report.baselineFailures, ["p.TestFlaky"]);
+  });
+
+  test("an unfinished base comparison cannot establish an inherited failure", async () => {
+    const incomplete = `${rerunRed}\n${JSON.stringify({ Action: "run", Package: "p", Test: "TestLuna" })}`;
+    const report = await rerunHarness(contents(rerunRed, incomplete)).run();
+    assert.deepEqual(report.rerunFailures, ["p.TestFlaky"]);
+    assert.equal(report.baselineFailures, null);
+    assert.match(report.baselineSkipReason ?? "", /incomplete/);
   });
 
   test("a hang killed by the test binary's own timeout is neither re-tried nor compared", async () => {
@@ -9636,6 +9801,14 @@ describe("Codex blocked on a missing tool or variable — auto-retry", () => {
     assert.deepEqual(client.addLabelCalls.map(c => c.label), ["error-retry-count:1"]);
   });
 
+  test("operator Codex provisioning parks despite an unset capture variable", async () => {
+    const { ctx, client } = makeTestContext({ item: { issueNumber: 1809 } });
+    await handleDispatchError(new Error("PYRY_CODEX_CAPTURE_HOME is unset. A separately provisioned Codex sign-in is required; the operator must provision the dedicated home."),
+      ctx, streamResult({ runner: "codex", isError: true, terminalReason: "codex_blocked" }));
+    assert.ok(client.addLabelCalls.some(c => c.label === "error:developer"));
+    assert.ok(!client.addLabelCalls.some(c => c.label.startsWith("error-retry-count:")));
+  });
+
   test("at the retry cap it parks with error:<agent>, as any transient does", async () => {
     const { ctx, client } = makeTestContext({ item: { issueNumber: 1668, labels: ["error-retry-count:4"] } });
     await handleDispatchError(new Error(figma), ctx,
@@ -11153,6 +11326,7 @@ describe("pre-verifier gates — failures already on main (#123)", () => {
             : { exitCode: 0, timedOut: false, spawnError: null },
       }],
       ["cannot be read", { rerunOutput: "BUILD FAILED" }],
+      ["contains incomplete evidence", { rerunOutput: junit([], [Z]).replace("</testsuite>", "<testcase/></testsuite>") }],
       ["has no template", { formats: JSON.stringify({ [UI]: "junit-xml" }), rerunOutput: junit([], [Z]) }],
     ];
     for (const [label, over] of unknown) {
@@ -12238,6 +12412,7 @@ describe("recordGateRunMeta: the live gate keeps a run record beside its output"
       outputBytes: 1, baselineFailures: null, baselineSkipReason: null, baselineOutputPath: null,
       rerunFailures: null, rerunSkipReason: null, rerunOutputPath: null,
       selection: { mode: "full" as const, reason: "every run" },
+      requiredTests: ["required.spec.ts › live acceptance"],
     };
     recordGateRunMeta(report, deps, { PYRY_BIN: "/usr/local/bin/pyry" });
     const write = calls.fs.find(f => f.kind === "write");
@@ -12247,6 +12422,7 @@ describe("recordGateRunMeta: the live gate keeps a run record beside its output"
     assert.equal(meta!.headSha, report.headSha);
     assert.equal(meta!.baseSha, report.baseSha);
     assert.equal(meta!.selection, "full");
+    assert.deepEqual(meta!.requiredTests, report.requiredTests);
     assert.equal(meta!.pyryBin, "/usr/local/bin/pyry");
     assert.equal(meta!.exitCode, 0);
   });

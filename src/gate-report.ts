@@ -27,9 +27,10 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { parseVerifierGates } from "./agent-runtime.js";
-import { isGateOutputFormat, parseGateOutput, parseGateTestDetails, stripPackageQualifier, type GateOutputFormat, type GateRunReport, type GateTally, type GateTestDetail } from "./gate-output.js";
+import { gateRunRequiredTests, isGateOutputFormat, parseGateOutput, parseGateTestDetails, stripPackageQualifier, type GateOutputFormat, type GateRunReport, type GateTally, type GateTestDetail } from "./gate-output.js";
 import { parseVerifierGateFormats } from "./verifier-gate-baseline.js";
 import { parseVerifierGatePass, verifierGatePassFileName, type VerifierGatePass } from "./verifier-gate-reuse.js";
+import { decideGateVerdict } from "./pipeline-decisions.js";
 
 /** Most named tests listed; the rest are counted. */
 export const MAX_NAMED_TESTS = 25;
@@ -67,12 +68,6 @@ function wordPattern(method: string): RegExp {
   return new RegExp(`(?<![\\w$])${escaped}(?![\\w$])`);
 }
 
-/** The test name of a skip; every parser writes one as `<name>: <reason>`. */
-function skipName(reason: string): string {
-  const end = reason.indexOf(": ");
-  return end < 0 ? reason : reason.slice(0, end);
-}
-
 /** Tests the text names that no log may contain: `Class#method` references
  *  and Go `TestName` functions. Without these, a named test that never ran
  *  would not be listed at all. */
@@ -89,7 +84,7 @@ function outcomeIn(method: string, format: GateOutputFormat, tally: GateTally): 
   const has = (names: readonly string[]) => names.some((n) => testMethod(n, format) === method);
   if (has(tally.failedNames)) return "failed";
   if (has(tally.passedNames)) return "passed";
-  if (has(tally.skipReasons.map(skipName))) return "skipped";
+  if (has((tally.skippedTests ?? []).map(t => t.name))) return "skipped";
   return "not run";
 }
 
@@ -129,9 +124,9 @@ export function buildGateReportSection(input: {
       lines.push(`- ${head}: log missing, so no per-test counts.`);
     } else {
       tally = parseGateOutput(run.raw, run.format);
-      if (tally.recognizedLines === 0) {
+      if (tally.completeParse !== true) {
         tally = null;
-        lines.push(`- ${head}: unreadable, so no per-test counts.`);
+        lines.push(`- ${head}: unreadable or incomplete, so no per-test counts.`);
       } else {
         lines.push(`- ${head}: ${tally.executed} executed, ${tally.passed} passed, ${tally.failed} failed, ${tally.skipped} skipped.`);
       }
@@ -149,7 +144,7 @@ export function buildGateReportSection(input: {
   input.runs.forEach((run, i) => {
     const tally = tallies[i];
     if (tally === null || run.format === null) return;
-    for (const n of [...tally.passedNames, ...tally.failedNames, ...tally.skipReasons.map(skipName)]) {
+    for (const n of [...tally.passedNames, ...tally.failedNames, ...(tally.skippedTests ?? []).map(t => t.name)]) {
       candidates.add(testMethod(n, run.format));
     }
   });
@@ -264,6 +259,9 @@ export interface LiveGateRun {
  * suffix keeps it under the log rotation.
  */
 export interface GateRunMeta {
+  outputFormat?: GateOutputFormat;
+  /** Explicit live requirements, retained even for full-suite runs. */
+  requiredTests: string[];
   branchName: string;
   headSha: string;
   baseRef: string;
@@ -290,6 +288,8 @@ export function gateRunMetaPath(outputPath: string): string {
 
 export function serializeGateRunMeta(report: GateRunReport, env: NodeJS.ProcessEnv, now: Date): string {
   const meta: GateRunMeta = {
+    outputFormat: report.outputFormat,
+    requiredTests: gateRunRequiredTests(report),
     branchName: report.branchName,
     headSha: report.headSha,
     baseRef: report.baseRef,
@@ -313,7 +313,16 @@ export function parseGateRunMeta(raw: string): GateRunMeta | null {
   let m: any;
   try { m = JSON.parse(raw); } catch { return null; }
   if (!m || typeof m !== "object" || typeof m.headSha !== "string" || typeof m.baseSha !== "string") return null;
+  if (m.outputFormat !== undefined && !isGateOutputFormat(m.outputFormat)) return null;
+  const validNames = (value: unknown) => Array.isArray(value) && value.every(t => typeof t === "string" && t.trim() !== "");
+  if (m.requiredTests !== undefined && !validNames(m.requiredTests)) return null;
+  if (m.selection === "selected" && !validNames(m.selectedTests)) return null;
   return {
+    ...(isGateOutputFormat(m.outputFormat) ? { outputFormat: m.outputFormat } : {}),
+    requiredTests: [...new Set<string>([
+      ...(Array.isArray(m.requiredTests) ? m.requiredTests.filter((t: unknown) => typeof t === "string") : []),
+      ...(m.selection === "selected" && Array.isArray(m.selectedTests) ? m.selectedTests.filter((t: unknown) => typeof t === "string") : []),
+    ])],
     branchName: typeof m.branchName === "string" ? m.branchName : "",
     headSha: m.headSha,
     baseRef: typeof m.baseRef === "string" ? m.baseRef : "",
@@ -383,8 +392,22 @@ export function liveGateLines(live: LiveGateRun, namingText: string): string[] {
   }
   const details = parseGateTestDetails(live.raw, live.format);
   if (details === null) {
-    lines.push("- The output is unreadable, so there are no per-test results.");
+    lines.push("- The output is unreadable or incomplete, so there are no per-test results. Live acceptance remains missing; `needs-real-claude` must remain and this run cannot advance to documentation.");
     return lines;
+  }
+
+  const requiredTests = meta?.requiredTests ?? [];
+  // Do not present aggregate passes as acceptance when a required named
+  // result or its live evidence is missing. Also covers legacy Luna reports
+  // with no requirements recorded, using the named test in their output.
+  const acceptance = decideGateVerdict({
+    runError: meta?.runError ?? null, timedOut: meta?.timedOut ?? false,
+    exitCode: meta?.exitCode ?? null, minExecuted: 1,
+    tally: parseGateOutput(live.raw, live.format), requiredTests,
+  });
+  if (requiredTests.length > 0) lines.push(`- Required live tests: ${requiredTests.map(n => `\`${n}\``).join(", ")}.`);
+  if (acceptance.verdict === "unusable" || acceptance.verdict === "zero-executed") {
+    lines.push(`- Live acceptance remains missing: ${acceptance.reason}. \`needs-real-claude\` must remain; this run cannot advance to documentation.`);
   }
 
   // Daemon revision.
@@ -436,6 +459,7 @@ export function liveGateLines(live: LiveGateRun, namingText: string): string[] {
     if (d.status !== "skipped" && d.status !== "flaky" && d.attempts !== undefined) parts.push(`${d.attempts} attempt${d.attempts === 1 ? "" : "s"}`);
     if (d.status !== "skipped" && d.durationMs !== undefined) parts.push(formatSeconds(d.durationMs));
     if (d.daemonRevisions?.length) parts.push(`daemon ${d.daemonRevisions.join(", ")}`);
+    if (d.passingAttempt?.publishedModelRow) parts.push(`published-model-row on passing attempt ${d.passingAttempt.attempt}`);
     lines.push(`  - \`${displayName(d.name, live.format)}\`: ${parts.join(", ")}`);
   }
   if (shown.length < details.length) {

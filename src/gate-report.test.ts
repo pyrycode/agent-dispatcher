@@ -127,7 +127,7 @@ describe("gateReportSection", () => {
       issueNumber: ISSUE, logsDir: dir, env: env({ PYRY_REAL_CLAUDE_GATE_FORMAT: "playwright-json" }),
       namingText: "TestSessionResume",
     });
-    assert.match(asPlaywright, /real-claude gate, latest output 2026-10-05T10-00-00-000Z \(playwright-json\): unreadable, so no per-test counts/);
+    assert.match(asPlaywright, /real-claude gate, latest output 2026-10-05T10-00-00-000Z \(playwright-json\): unreadable or incomplete, so no per-test counts/);
     assert.match(asPlaywright, /- `TestSessionResume`: real-claude gate no per-test counts\./);
     assert.doesNotMatch(asPlaywright, /gate passed/);
 
@@ -260,7 +260,7 @@ describe("gate report: the latest live gate run, test by test", () => {
   test("an unreadable output or an unknown format gives no per-test results", () => {
     const dir = logsDir({ [liveLog]: "not json at all" });
     const text = gateReportSection({ issueNumber: ISSUE, logsDir: dir, env: env({ PYRY_REAL_CLAUDE_GATE_FORMAT: "playwright-json" }), namingText: "" });
-    assert.match(text, /- The output is unreadable, so there are no per-test results\./);
+    assert.match(text, /- The output is unreadable or incomplete, so there are no per-test results\./);
     assert.doesNotMatch(text, /- Results:/);
     const unknown = gateReportSection({ issueNumber: ISSUE, logsDir: dir, env: env({ PYRY_REAL_CLAUDE_GATE_FORMAT: "tap" }), namingText: "" });
     assert.match(unknown, /- No known format is configured for the live gate, so there are no per-test results\./);

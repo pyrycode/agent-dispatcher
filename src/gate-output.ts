@@ -27,11 +27,16 @@
 import { XMLParser, XMLValidator } from "fast-xml-parser";
 import type { GateSelection } from "./gate-selection.js";
 import type { InfraFailureClassification } from "./infra-failure.js";
+import { parseLiveTestEntries } from "./live-tests.js";
 
 export type GateOutputFormat = "go-json" | "playwright-json" | "junit-xml";
 
 /** Every format the parser accepts, for env validation at the caller. */
 export const GATE_OUTPUT_FORMATS: readonly GateOutputFormat[] = ["go-json", "playwright-json", "junit-xml"];
+
+/** Bump when completeness validation changes. A saved completeParse flag
+ * certifies only its reader's rules, so older tallies must be reparsed. */
+export const GATE_PARSER_VERSION = 4;
 
 /**
  * Type guard for the env-configured format string. An unrecognised value
@@ -43,8 +48,203 @@ export function isGateOutputFormat(value: string): value is GateOutputFormat {
   return (GATE_OUTPUT_FORMATS as readonly string[]).includes(value);
 }
 
+export type GateCommandProvenance =
+  | { kind: "missing" }
+  | { kind: "single"; format: GateOutputFormat }
+  | { kind: "ambiguous" };
+
+interface GateCommandWord { value: string; dynamic: boolean }
+
+/** Split literal shell words without executing expansions. Separators end a
+ * command even without spaces; quoted separators belong to one argument.
+ * Null words mark redirections, whose operands cannot supply reporter flags. */
+function gateCommandWords(command: string): (GateCommandWord | null)[][] | null {
+  const commands: (GateCommandWord | null)[][] = [];
+  let words: (GateCommandWord | null)[] = [], word = "", started = false, dynamic = false, quoted = false;
+  let quote = "";
+  const flush = () => {
+    if (started) words.push({ value: word, dynamic });
+    word = ""; started = false; dynamic = false; quoted = false;
+  };
+  const finish = () => { flush(); if (words.length) commands.push(words); words = []; };
+  for (let i = 0; i < command.length; i++) {
+    const c = command[i];
+    // Substitutions execute nested commands; their output cannot identify a
+    // literal executable or reporter. Parameter expansions stay in one word.
+    if (quote !== "'" && (c === "`" || (c === "$" && command[i + 1] === "("))) return null;
+    if (quote !== "'" && c === "$" && command[i + 1] === "{") {
+      const end = command.indexOf("}", i + 2);
+      if (end < 0 || /\$\(|`|\$\{/.test(command.slice(i + 2, end))) return null;
+      word += command.slice(i, end + 1); started = true; dynamic = true; i = end;
+      continue;
+    }
+    if (quote) {
+      if (c === quote) { quote = ""; continue; }
+      if (quote === '"' && c === "$") dynamic = true;
+      if (quote === '"' && c === "\\" && /[\\"$`\n]/.test(command[i + 1] ?? "")) {
+        if (++i >= command.length) return null;
+        if (command[i] !== "\n") word += command[i];
+      } else word += c;
+    } else if (c === "'" || c === '"') {
+      quote = c; started = true; quoted = true;
+    } else if (c === "\\") {
+      if (++i >= command.length) return null;
+      if (command[i] !== "\n") { word += command[i]; started = true; }
+    } else if (c === "#" && !started) {
+      while (i + 1 < command.length && command[i + 1] !== "\n") i++;
+    } else if (c === "<" || c === ">" || (c === "&" && command[i + 1] === ">")) {
+      // Here-documents and process substitutions need a shell grammar, not
+      // word inference. Reject them rather than reading their body as flags.
+      if (c === "<" && ["<", "("].includes(command[i + 1])) return null;
+      if (c === ">" && command[i + 1] === "(") return null;
+      if (!quoted && /^\d+$/.test(word)) { word = ""; started = false; }
+      flush(); words.push(null);
+      if (c === "&") i++;
+      if (command[i + 1] === ">") i++;
+      if (["&", "|"].includes(command[i + 1])) i++;
+    } else if (/[;&|()\n]/.test(c)) {
+      finish();
+    } else if (/\s/.test(c)) {
+      flush();
+    } else {
+      if (c === "$" || /[*?\[]/.test(c) || (c === "~" && !started)) dynamic = true;
+      word += c; started = true;
+    }
+  }
+  if (quote) return null;
+  finish();
+  return commands;
+}
+
+/** Only explicit reporter flags identify old bytes. Missing flags can be
+ * supplied by bound metadata for one invocation; a second default reporter
+ * cannot borrow another invocation's JSON flag. */
+export function gateCommandProvenance(command: string): GateCommandProvenance {
+  const parsed = gateCommandWords(command);
+  if (!parsed) return { kind: "ambiguous" };
+  const invocations: { runner: string; format: GateOutputFormat | null }[] = [];
+  for (const words of parsed) {
+    const args: GateCommandWord[] = [];
+    for (let i = 0; i < words.length; i++) {
+      if (words[i] === null) {
+        if (!words[++i]) return { kind: "ambiguous" };
+        continue;
+      }
+      args.push(words[i]!);
+    }
+    let start = 0;
+    const value = (i: number) => args[i]?.value ?? "";
+    while (/^[A-Za-z_][A-Za-z_0-9]*=/.test(value(start))) start++;
+    const executable = () => value(start).split("/").at(-1)!;
+    // Wrappers can compose in either order. Resolve the executable for each
+    // invocation before looking for its subcommand or reporter. An unknown
+    // wrapper option remains ambiguous instead of hiding a potential test.
+    while (true) {
+      if (args[start]?.dynamic) return { kind: "ambiguous" };
+      const wrapper = executable();
+      if (["command", "exec", "time"].includes(wrapper)) {
+        start++;
+        if ((wrapper === "command" || wrapper === "time") && value(start) === "-p") start++;
+        if (value(start) === "--") start++;
+        else if (value(start).startsWith("-")) return { kind: "ambiguous" };
+      } else if (wrapper === "env") {
+        start++;
+        while (value(start).startsWith("-")) {
+          const option = value(start++);
+          if (option === "--") break;
+          if (["-i", "--ignore-environment"].includes(option)) continue;
+          if (["-u", "--unset", "-C", "--chdir"].includes(option)) {
+            if (!args[start] || args[start].dynamic) return { kind: "ambiguous" };
+            start++;
+          } else if (!/^--(?:unset|chdir)=.+/.test(option)) return { kind: "ambiguous" };
+        }
+        while (/^[A-Za-z_][A-Za-z_0-9]*=/.test(value(start))) start++;
+      } else if (wrapper === "npx") {
+        start++;
+        while (["--no-install", "--yes", "-y", "--quiet"].includes(value(start))) start++;
+        if (value(start) === "--") start++;
+        else if (value(start).startsWith("-")) return { kind: "ambiguous" };
+      } else if (["pnpm", "npm", "yarn"].includes(wrapper) && value(start + 1) === "exec") {
+        start += 2;
+        if (value(start) === "--") start++;
+        else if (value(start).startsWith("-")) return { kind: "ambiguous" };
+      } else if (["pnpm", "npm", "yarn"].includes(wrapper) &&
+          (args[start + 1]?.dynamic || value(start + 1).startsWith("-"))) {
+        return { kind: "ambiguous" };
+      } else break;
+      if (!args[start]) return { kind: "ambiguous" };
+    }
+    if (["sh", "bash", "zsh", "eval", "if", "then", "else", "elif", "for", "while", "do", "case", "function", "!", "{"].includes(executable())) return { kind: "ambiguous" };
+    if (args[start]?.dynamic) return { kind: "ambiguous" };
+    const runner = executable();
+    if (runner !== "go" && runner !== "playwright") continue;
+    let subcommand = start + 1;
+    if (runner === "go" && value(subcommand).startsWith("-")) {
+      if (value(subcommand) === "-C") {
+        if (!args[++subcommand] || args[subcommand].dynamic) return { kind: "ambiguous" };
+      } else if (!/^-C=.+/.test(value(subcommand)) || args[subcommand].dynamic) return { kind: "ambiguous" };
+      subcommand++;
+    }
+    if (args[subcommand]?.dynamic || value(subcommand).startsWith("-")) return { kind: "ambiguous" };
+    if (!value(subcommand)) return { kind: "ambiguous" };
+    if (value(subcommand) !== "test") continue;
+    if (args.some(arg => arg.dynamic)) return { kind: "ambiguous" };
+    let format: GateOutputFormat | null = null;
+    const valueFlags = runner === "go" ? ["-run", "-bench", "-tags", "-timeout", "-count", "-parallel", "-exec", "-coverprofile", "-vet"]
+      : ["--grep", "-g", "--grep-invert", "--config", "-c", "--project", "--workers", "-j", "--timeout", "--retries", "--output", "--shard"];
+    for (let i = subcommand + 1; i < args.length && value(i) !== "--" && value(i) !== "-args"; i++) {
+      if (valueFlags.includes(value(i))) { i++; continue; }
+      if (runner === "go" && /^-json(?:=|$)/.test(value(i))) {
+        if (value(i) !== "-json" && value(i) !== "-json=true") return { kind: "ambiguous" };
+        format = "go-json";
+      } else if (runner === "playwright" && /^--reporter(?:=|$)/.test(value(i))) {
+        const reporter = value(i) === "--reporter" ? value(++i) : value(i).slice("--reporter=".length);
+        if (reporter !== "json") return { kind: "ambiguous" };
+        format = "playwright-json";
+      }
+    }
+    invocations.push({ runner, format });
+  }
+  if (new Set(invocations.map(i => i.runner)).size > 1 ||
+      (invocations.length > 1 && invocations.some(i => i.format === null))) return { kind: "ambiguous" };
+  const format = invocations[0]?.format;
+  return format ? { kind: "single", format } : { kind: "missing" };
+}
+
+/** All consumers use the same command/metadata agreement, including fresh
+ * runs before they write a full-suite backstop and retained report recovery. */
+export function validateGateOutputProvenance(command: string, recordedFormats: readonly unknown[]):
+  { format: GateOutputFormat; error: null } | { format: null; error: string } {
+  const provenance = gateCommandProvenance(command);
+  if (recordedFormats.some(format => format !== undefined && (typeof format !== "string" || !isGateOutputFormat(format)))) {
+    return { format: null, error: "live evidence has invalid output-format metadata" };
+  }
+  const formats = new Set(recordedFormats.filter((format): format is GateOutputFormat =>
+    typeof format === "string" && isGateOutputFormat(format)));
+  if (provenance.kind === "single") formats.add(provenance.format);
+  if (provenance.kind === "ambiguous" || formats.size > 1) {
+    return { format: null, error: "live evidence has mixed or conflicting output-format provenance" };
+  }
+  if (formats.size === 0) return { format: null, error: "live evidence has missing output-format provenance" };
+  return { format: [...formats][0], error: null };
+}
+
+export function gateOutputFormatFromCommand(command: string): GateOutputFormat | null {
+  const provenance = gateCommandProvenance(command);
+  return provenance.kind === "single" ? provenance.format : null;
+}
+
 /** What the parser extracted from one gate run's artifact. */
 export interface GateTally {
+  /** Current readers validate all structured records. Older saved tallies
+   * may have counted only a passing fragment; recover them from raw bytes. */
+  completeParse?: boolean;
+  parserVersion?: number;
+  /** Attempt evidence retained with Playwright tallies, including saved reports. */
+  testDetails?: GateTestDetail[];
+  /** Skip identities and reasons, kept separate from their display strings.
+   * Absent on legacy tallies; reparse retained output rather than split titles. */
+  skippedTests?: { name: string; reason: string }[];
   /**
    * Leaf tests that actually ran a body: passed + failed. Skips are
    * deliberately NOT counted — a skip is the exact failure mode this
@@ -102,6 +302,7 @@ export interface GateTally {
 
 function emptyTally(): GateTally {
   return {
+    completeParse: false,
     executed: 0,
     passed: 0,
     failed: 0,
@@ -109,6 +310,7 @@ function emptyTally(): GateTally {
     failedNames: [],
     passedNames: [],
     timedOutTests: [],
+    skippedTests: [],
     skipReasons: [],
     packageFailed: false,
     packageFailures: [],
@@ -129,15 +331,16 @@ const GO_RUNNING_TEST_LINE = /^\s+((?:Test|Benchmark|Example|Fuzz)\S*) \(([^)]*)
 /**
  * Parse a gate command's raw output into a tally.
  *
- * Never throws. A malformed artifact comes back as a tally with
- * `recognizedLines === 0`, which the verdict function reads as unusable.
+ * Never throws. Malformed or unfinished evidence has completeParse false;
+ * readable fragments can still be retained for diagnostics, never acceptance.
  * Throwing here would turn a bad artifact into a dispatcher crash, and a
  * crashed dispatcher parks nothing at all.
  */
 export function parseGateOutput(raw: string, format: GateOutputFormat): GateTally {
-  if (format === "playwright-json") return parsePlaywrightJson(raw);
-  if (format === "junit-xml") return parseJUnitXml(raw);
-  return parseGoJson(raw);
+  const tally = format === "playwright-json" ? parsePlaywrightJson(raw)
+    : format === "junit-xml" ? parseJUnitXml(raw) : parseGoJson(raw);
+  tally.parserVersion = GATE_PARSER_VERSION;
+  return tally;
 }
 
 // Android/Gradle emits JUnit XML. The consumer wrapper joins only fresh
@@ -157,6 +360,7 @@ function parseJUnitXml(raw: string): GateTally {
   } catch { return tally; }
   if (!doc || (!doc.testsuite && !doc.testsuites)) return tally;
   tally.recognizedLines = 1;
+  tally.completeParse = true;
   type Result = { status: "passed" | "failed" | "skipped"; reason: string };
   const cases = new Map<string, Result>();
   const brokenSuite = (name: string) => {
@@ -164,14 +368,22 @@ function parseJUnitXml(raw: string): GateTally {
     if (!tally.packageFailures.includes(name)) tally.packageFailures.push(name);
   };
   const walk = (suite: any): { count: number; failed: number; skipped: number } => {
-    if (!suite || typeof suite !== "object") return { count: 0, failed: 0, skipped: 0 };
+    if (!isRecord(suite)) {
+      if (suite !== "") tally.completeParse = false;
+      return { count: 0, failed: 0, skipped: 0 };
+    }
     const suiteName = String(suite["@_name"] || "JUnit runner");
     const leaves = Array.isArray(suite.testcase) ? suite.testcase : [];
     let reportedFailures = 0;
     let reportedSkips = 0;
     for (const test of leaves) {
       const method = test?.["@_name"];
-      if (typeof method !== "string" || !method.trim()) { brokenSuite(suiteName); continue; }
+      if (typeof method !== "string" || !method.trim() ||
+          (test["@_classname"] !== undefined && (typeof test["@_classname"] !== "string" || !test["@_classname"].trim()))) {
+        tally.completeParse = false;
+        brokenSuite(suiteName);
+        continue;
+      }
       const name = `${test["@_classname"] || suiteName}#${method}`;
       const failed = test.failure !== undefined || test.error !== undefined;
       if (failed) reportedFailures++;
@@ -192,7 +404,10 @@ function parseJUnitXml(raw: string): GateTally {
     }
     if (suite.error !== undefined || suite.failure !== undefined) brokenSuite(suiteName);
     const declared = suite["@_tests"];
-    if (declared !== undefined && (!/^\d+$/.test(String(declared)) || Number(declared) !== count)) brokenSuite(suiteName);
+    if (declared !== undefined && (!/^\d+$/.test(String(declared)) || Number(declared) !== count)) {
+      tally.completeParse = false;
+      brokenSuite(suiteName);
+    }
     // A runner error can appear only in the summary, with no failing testcase.
     const failures = Number(suite["@_failures"] ?? 0) + Number(suite["@_errors"] ?? 0);
     const skips = Number(suite["@_skipped"] ?? 0);
@@ -204,6 +419,7 @@ function parseJUnitXml(raw: string): GateTally {
   for (const [name, result] of cases) {
     if (result.status === "skipped") {
       tally.skipped++;
+      tally.skippedTests!.push({ name, reason: result.reason });
       tally.skipReasons.push(`${name}: ${result.reason}`);
     } else {
       tally.executed++;
@@ -229,12 +445,13 @@ interface GoTestEvent {
  *
  * Two rules carry the weight here.
  *
- * **Non-JSON lines are ignored, not fatal.** A build error, a panic
+ * **Plain non-JSON lines are ignored, not fatal.** A build error, a panic
  * trace, or a stray `fmt.Println` from a test interleaves raw text into
  * the stream. Treating that as a parse failure would discard a run that
  * is otherwise fully readable — and, worse, would turn a genuine test
  * failure into an "unusable" park, hiding the failure from the developer
- * agent that should be fixing it.
+ * agent that should be fixing it. Foreign or malformed structured records
+ * are rejected; every observed test run must reach a terminal outcome.
  *
  * **Counting is leaf-only.** A test counts only when no event names a
  * subtest beneath it. Without this, a parent whose subtests all skipped
@@ -252,14 +469,21 @@ function parseGoJson(raw: string): GateTally {
 
   for (const line of raw.split("\n")) {
     const trimmed = line.trim();
+    if (trimmed[0] !== "{" && isForeignStructuredLine(trimmed)) return emptyTally();
     if (trimmed === "" || trimmed[0] !== "{") continue;
     let event: GoTestEvent;
     try {
       event = JSON.parse(trimmed);
     } catch {
-      continue; // interleaved non-JSON — expected, not exceptional
+      return emptyTally(); // malformed/foreign structured evidence cannot be ignored
     }
-    if (typeof event !== "object" || event === null || typeof event.Action !== "string") continue;
+    if (typeof event !== "object" || event === null || typeof event.Action !== "string" ||
+        !["start", "run", "pause", "cont", "pass", "bench", "fail", "output", "skip", "build-output", "build-fail"].includes(event.Action)) return emptyTally();
+    if ((event.Package !== undefined && (typeof event.Package !== "string" || !event.Package.trim())) ||
+        (event.Test !== undefined && (typeof event.Test !== "string" || !event.Test.trim())) ||
+        (event.Output !== undefined && typeof event.Output !== "string") ||
+        (["output", "build-output"].includes(event.Action) && typeof event.Output !== "string") ||
+        (["run", "pause", "cont", "bench"].includes(event.Action) && event.Test === undefined)) return emptyTally();
     events.push(event);
     tally.recognizedLines++;
     if (typeof event.Test === "string" && event.Test !== "") {
@@ -283,13 +507,24 @@ function parseGoJson(raw: string): GateTally {
     return false;
   };
 
-  // Pass 2: tally terminal events. `seen` guards against a duplicated
-  // terminal event double-counting a test.
-  const seen = new Set<string>();
-  // Last few output lines per test, so a skip can report WHY it skipped.
-  // Bounded at 3 lines per in-flight test and dropped at the terminal
-  // event, so a long run cannot grow this without bound.
-  const outputTail = new Map<string, string[]>();
+  // Validate each run/terminal lifecycle, then reduce completed leaf
+  // occurrences by identity. -count can legitimately pass and fail the same
+  // name; every failure survives, while retries never inflate the floor.
+  type Occurrence = {
+    pkg: string; test: string; explicit: boolean; hasChildren: boolean;
+    terminal?: string; tail: string[];
+  };
+  const occurrences: Occurrence[] = [];
+  const active = new Map<string, Occurrence>();
+  const last = new Map<string, Occurrence>();
+  const pendingPackages = new Set<string>();
+  let consistent = true;
+  const begin = (pkg: string, test: string, explicit: boolean): Occurrence => {
+    const occurrence = { pkg, test, explicit, hasChildren: false, tail: [] };
+    occurrences.push(occurrence);
+    active.set(`${pkg}\t${test}`, occurrence);
+    return occurrence;
+  };
 
   // Tests still running when `go test`'s own deadline fired. They get no
   // terminal event, so without this the run reads as a package failure with
@@ -304,6 +539,16 @@ function parseGoJson(raw: string): GateTally {
     const pkg = event.Package ?? "";
     const test = event.Test ?? "";
     const key = `${pkg}\t${test}`;
+
+    if (test === "") {
+      if (event.Action === "start") {
+        if (pendingPackages.has(pkg)) consistent = false;
+        pendingPackages.add(pkg);
+        // A new package execution may contain terminal-only cached records.
+        for (const [name, occurrence] of last) if (occurrence.pkg === pkg) last.delete(name);
+      }
+      if (["pass", "fail", "skip", "build-fail"].includes(event.Action!)) pendingPackages.delete(pkg);
+    }
 
     if (event.Action === "output") {
       const text = event.Output ?? "";
@@ -323,47 +568,78 @@ function parseGoJson(raw: string): GateTally {
 
     if (test === "") {
       // Package-level event.
-      if (event.Action === "fail") {
+      if (event.Action === "fail" || event.Action === "build-fail") {
         tally.packageFailed = true;
         if (!tally.packageFailures.includes(pkg)) tally.packageFailures.push(pkg);
       }
       continue;
     }
 
+    // A subtest belongs to the parent currently running, not to every later
+    // occurrence of that parent name in this artifact.
+    for (let slash = test.indexOf("/"); slash >= 0; slash = test.indexOf("/", slash + 1)) {
+      const parent = active.get(`${pkg}\t${test.slice(0, slash)}`);
+      if (parent) parent.hasChildren = true;
+    }
+    if (event.Action === "run") {
+      const pending = active.get(key);
+      if (pending?.explicit) consistent = false;
+      if (pending && !pending.explicit) pending.explicit = true;
+      else begin(pkg, test, true);
+      continue;
+    }
+
     if (event.Action === "output") {
+      const occurrence = active.get(key) ?? (last.has(key) ? null : begin(pkg, test, false));
+      if (!occurrence) continue; // trailing diagnostics do not start a run
       const text = (event.Output ?? "").replace(/\n+$/, "");
       if (text.trim() === "") continue;
-      const tail = outputTail.get(key) ?? [];
-      tail.push(text);
-      if (tail.length > 3) tail.shift();
-      outputTail.set(key, tail);
+      occurrence.tail.push(text);
+      if (occurrence.tail.length > 3) occurrence.tail.shift();
       continue;
     }
 
     const isTerminal = event.Action === "pass" || event.Action === "fail" || event.Action === "skip";
-    if (!isTerminal) continue;
+    if (!isTerminal) {
+      if (!active.has(key)) begin(pkg, test, false);
+      continue;
+    }
+    const previous = last.get(key);
+    if (!active.has(key) && previous) {
+      if (previous.terminal !== event.Action) consistent = false;
+      continue; // only a new run starts another occurrence
+    }
+    const occurrence = active.get(key) ?? begin(pkg, test, false);
+    occurrence.terminal = event.Action;
+    active.delete(key);
+    last.set(key, occurrence);
+  }
 
-    const tail = outputTail.get(key) ?? [];
-    outputTail.delete(key);
-
-    // Parents are reported for completeness by `go test` but verify
-    // nothing themselves; only leaves count.
-    if (hasChildren(pkg, test)) continue;
-    if (seen.has(key)) continue;
-    seen.add(key);
-
+  const outcomes = new Map<string, { status: string; reason: string }>();
+  const rank = (status: string) => status === "fail" ? 2 : status === "pass" ? 1 : 0;
+  for (const occurrence of occurrences) {
+    const { pkg, test, terminal } = occurrence;
+    if (!terminal || (occurrence.explicit ? occurrence.hasChildren : hasChildren(pkg, test))) continue;
     const qualified = pkg === "" ? test : `${pkg}.${test}`;
-    if (event.Action === "pass") {
+    const previous = outcomes.get(qualified);
+    if (!previous || rank(terminal) > rank(previous.status)) {
+      outcomes.set(qualified, { status: terminal, reason: extractSkipReason(occurrence.tail) });
+    }
+  }
+
+  for (const [qualified, { status, reason }] of outcomes) {
+    if (status === "pass") {
       tally.passed++;
       tally.executed++;
       tally.passedNames.push(qualified);
-    } else if (event.Action === "fail") {
+    } else if (status === "fail") {
       tally.failed++;
       tally.executed++;
       tally.failedNames.push(qualified);
     } else {
       tally.skipped++;
-      tally.skipReasons.push(`${qualified}: ${extractSkipReason(tail)}`);
+      tally.skippedTests!.push({ name: qualified, reason });
+      tally.skipReasons.push(`${qualified}: ${reason}`);
     }
   }
 
@@ -371,17 +647,28 @@ function parseGoJson(raw: string): GateTally {
   // Same leaf-only and seen-once rules as a terminal event, so a parent
   // listed alongside its hung subtest is not a second failure.
   for (const { pkg, test, runningFor } of timedOut) {
-    const key = `${pkg}\t${test}`;
-    if (hasChildren(pkg, test) || seen.has(key)) continue;
-    seen.add(key);
     const qualified = pkg === "" ? test : `${pkg}.${test}`;
-    tally.failed++;
-    tally.executed++;
-    tally.failedNames.push(qualified);
+    if (hasChildren(pkg, test) || tally.timedOutTests.includes(qualified)) continue;
+    const previous = outcomes.get(qualified)?.status;
+    if (previous === "pass") {
+      tally.passed--;
+      tally.passedNames = tally.passedNames.filter(name => name !== qualified);
+    } else if (previous === "skip") {
+      tally.skipped--;
+      tally.skippedTests = tally.skippedTests!.filter(test => test.name !== qualified);
+      tally.skipReasons = tally.skippedTests.map(test => `${test.name}: ${test.reason}`);
+    }
+    if (previous !== "fail") {
+      tally.failed++;
+      if (previous !== "pass") tally.executed++;
+      tally.failedNames.push(qualified);
+    }
     tally.timedOutTests.push(qualified);
     (tally.timedOutRunningFor ??= {})[qualified] = runningFor;
   }
 
+  tally.completeParse = tally.recognizedLines > 0 && consistent &&
+    occurrences.every(occurrence => occurrence.terminal !== undefined) && pendingPackages.size === 0;
   return tally;
 }
 
@@ -422,6 +709,7 @@ function extractSkipReason(tail: readonly string[]): string {
  */
 function parsePlaywrightJson(raw: string): GateTally {
   const tally = emptyTally();
+  tally.testDetails = playwrightTestDetails(raw) ?? [];
 
   const doc = parseLooseJsonDocument(raw);
   if (doc === null || typeof doc !== "object") return tally;
@@ -429,6 +717,7 @@ function parsePlaywrightJson(raw: string): GateTally {
   const suites = (doc as any).suites;
   if (!Array.isArray(suites)) return tally;
   tally.recognizedLines = 1;
+  tally.completeParse = validPlaywrightReport(doc);
 
   // Top-level `errors` is where Playwright reports a failure with no test
   // to hang it on: a config error, a global-setup throw, a worker crash.
@@ -455,7 +744,9 @@ function parsePlaywrightJson(raw: string): GateTally {
           const status = typeof test.status === "string" ? test.status : "";
           if (status === "skipped") {
             tally.skipped++;
-            tally.skipReasons.push(`${name}: ${extractPlaywrightSkipReason(test)}`);
+            const reason = extractPlaywrightSkipReason(test);
+            tally.skippedTests!.push({ name, reason });
+            tally.skipReasons.push(`${name}: ${reason}`);
           } else if (status === "unexpected") {
             tally.failed++;
             tally.executed++;
@@ -465,9 +756,8 @@ function parsePlaywrightJson(raw: string): GateTally {
             tally.executed++;
             tally.passedNames.push(name);
           }
-          // Any other status is left uncounted on purpose: an unknown
-          // outcome must not become an executed test, because executed
-          // tests are what clear the floor.
+          // Unknown outcomes invalidate the whole report above. Retain
+          // readable records here only to describe the incomplete evidence.
         }
       }
     }
@@ -479,6 +769,43 @@ function parsePlaywrightJson(raw: string): GateTally {
 
   for (const suite of suites) walk(suite, []);
   return tally;
+}
+
+function isRecord(value: any): value is Record<string, any> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Aggregate counts/statuses cannot hide malformed children or unfinished
+ * attempts. Expected failures remain supported; named acceptance separately
+ * requires an actual passing attempt. */
+function validPlaywrightReport(doc: any): boolean {
+  const terminal = ["passed", "failed", "timedOut", "skipped", "interrupted"];
+  if (!isRecord(doc) || !Array.isArray(doc.suites) ||
+      (doc.errors !== undefined && (!Array.isArray(doc.errors) || !doc.errors.every(isRecord)))) return false;
+  const walk = (suite: any): boolean => {
+    if (!isRecord(suite) || (suite.title !== undefined && typeof suite.title !== "string") ||
+        (suite.specs === undefined && suite.suites === undefined) ||
+        (suite.specs !== undefined && !Array.isArray(suite.specs)) ||
+        (suite.suites !== undefined && !Array.isArray(suite.suites))) return false;
+    for (const spec of suite.specs ?? []) {
+      if (!isRecord(spec) || typeof spec.title !== "string" || !spec.title.trim() ||
+          !Array.isArray(spec.tests) || spec.tests.length === 0) return false;
+      for (const test of spec.tests) {
+        if (!isRecord(test) || !["expected", "unexpected", "flaky", "skipped"].includes(test.status) ||
+            !Array.isArray(test.results) ||
+            test.results.some((r: any) => !isRecord(r) || !terminal.includes(r.status)) ||
+            (test.expectedStatus !== undefined && !terminal.includes(test.expectedStatus))) return false;
+        const last = test.results.at(-1)?.status;
+        const expected = test.expectedStatus ?? "passed";
+        if (test.status === "skipped") {
+          if (last !== undefined && last !== "skipped") return false;
+        } else if (last === undefined || last === "skipped" ||
+            (test.status === "unexpected" ? last === expected : last !== expected)) return false;
+      }
+    }
+    return (suite.suites ?? []).every(walk);
+  };
+  return doc.suites.every(walk);
 }
 
 function extractPlaywrightSkipReason(test: any): string {
@@ -507,6 +834,38 @@ export interface GateTestDetail {
   daemonRevisions?: string[];
   /** Why it skipped, for a skipped test. */
   skipReason?: string;
+  /** Evidence from the final, actually passing attempt only. Earlier failed
+   * retries and aggregate annotations cannot supply this proof. */
+  passingAttempt?: {
+    attempt: number;
+    daemonRevision: string | null;
+    publishedModelRow: boolean;
+  };
+}
+
+function attachmentText(result: any, name: string): string | null {
+  const attachment = (Array.isArray(result?.attachments) ? result.attachments : [])
+    .find((a: any) => a?.name === name && typeof a.body === "string" && a.body.trim() !== "");
+  if (!attachment) return null;
+  const text = Buffer.from(attachment.body, "base64").toString("utf8").trim();
+  return text || null;
+}
+
+function hasPublishedLunaRow(result: any): boolean {
+  const text = attachmentText(result, "published-model-row");
+  if (text === null) return false;
+  try {
+    const row = JSON.parse(text);
+    const model = row?.model;
+    return typeof row.serverId === "string" && row.serverId.trim() !== "" &&
+      typeof row.conversationId === "string" && row.conversationId.trim() !== "" &&
+      model?.agent === "codex" && model.display_name === "GPT-6 Luna" &&
+      typeof model.value === "string" && model.value.trim() !== "" && model.value !== "default" &&
+      Array.isArray(model.effort_levels) && model.effort_levels.includes("low") &&
+      Array.isArray(row.models) && row.models.some((m: any) =>
+        m?.agent === model.agent && m.value === model.value && m.display_name === model.display_name &&
+        Array.isArray(m.effort_levels) && m.effort_levels.includes("low"));
+  } catch { return false; }
 }
 
 /**
@@ -516,17 +875,13 @@ export interface GateTestDetail {
  * `flaky` is a pass there and `flaky` here; Go counts leaves only.
  */
 export function parseGateTestDetails(raw: string, format: GateOutputFormat): GateTestDetail[] | null {
-  if (format === "playwright-json") return playwrightTestDetails(raw);
   const tally = parseGateOutput(raw, format);
-  if (tally.recognizedLines === 0) return null;
+  if (tally.completeParse !== true) return null;
+  if (format === "playwright-json") return tally.testDetails ?? null;
   const elapsed = format === "go-json" ? goElapsedByName(raw) : new Map<string, number>();
   const withTime = (name: string) => (elapsed.has(name) ? { durationMs: elapsed.get(name)! } : {});
-  const skipped = tally.skipReasons.map((entry) => {
-    // Go and JUnit names carry no ": ", so the first one ends the name.
-    const end = entry.indexOf(": ");
-    const name = end < 0 ? entry : entry.slice(0, end);
-    return { name, status: "skipped" as const, skipReason: end < 0 ? "no reason recorded" : entry.slice(end + 2), ...withTime(name) };
-  });
+  const skipped = (tally.skippedTests ?? []).map(({ name, reason }) =>
+    ({ name, status: "skipped" as const, skipReason: reason, ...withTime(name) }));
   return [
     ...tally.failedNames.map((name) => ({ name, status: "failed" as const, ...withTime(name) })),
     ...tally.passedNames.map((name) => ({ name, status: "passed" as const, ...withTime(name) })),
@@ -584,6 +939,9 @@ function playwrightTestDetails(raw: string): GateTestDetail[] | null {
         const revisions = new Set<string>();
         revisionsOf(test.annotations, revisions);
         for (const r of results) revisionsOf(r?.annotations, revisions);
+        const passingRevisions = new Set<string>();
+        revisionsOf(last?.annotations, passingRevisions);
+        const attachedRevision = attachmentText(last, "daemon-revision");
         out.push({
           name,
           status,
@@ -591,6 +949,13 @@ function playwrightTestDetails(raw: string): GateTestDetail[] | null {
           ...(status !== "skipped" && typeof last?.duration === "number" ? { durationMs: Math.round(last.duration) } : {}),
           ...(revisions.size > 0 ? { daemonRevisions: [...revisions] } : {}),
           ...(status === "skipped" ? { skipReason: extractPlaywrightSkipReason(test) } : {}),
+          ...((status === "passed" || status === "flaky") && last?.status === "passed" ? {
+            passingAttempt: {
+              attempt: results.length,
+              daemonRevision: attachedRevision !== null && passingRevisions.has(attachedRevision) ? attachedRevision : null,
+              publishedModelRow: hasPublishedLunaRow(last),
+            },
+          } : {}),
         });
       }
     }
@@ -776,6 +1141,10 @@ export function buildBaselineCommand(template: string, filter: string): string |
  * read when auditing that decision.
  */
 export interface GateRunReport {
+  /** Format needed to recover structured evidence from retained raw output. */
+  outputFormat?: GateOutputFormat;
+  /** Explicit named live acceptance, independent of full/subset selection. */
+  requiredTests?: string[];
   /** Non-null when the run could not be started or completed at all. */
   runError: string | null;
   timedOut: boolean;
@@ -878,6 +1247,17 @@ export interface GateRunReport {
  */
 export function gateRunFloor(report: GateRunReport, forkFloor: number): number {
   return report.selection?.mode === "selected" ? report.selection.tests.length : forkFloor;
+}
+
+/** Preserve selected names from older saved reports as requirements too. */
+export function gateRunRequiredTests(report: Pick<GateRunReport, "requiredTests" | "selection">): string[] {
+  return [...new Set([...(report.requiredTests ?? []),
+    ...(report.selection?.mode === "selected" ? report.selection.tests : [])])];
+}
+
+/** Read named entries even when `all` requests a full suite alongside them. */
+export function requiredLiveTests(body: string): string[] {
+  return parseLiveTestEntries(body).names;
 }
 
 /**
@@ -1149,6 +1529,7 @@ function parseLooseJsonDocument(raw: string): unknown {
   }
   const lines = trimmed.split("\n");
   for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].trimStart().startsWith("{") && isForeignStructuredLine(lines[i].trimStart())) return null;
     if (lines[i].trimStart().startsWith("{")) {
       try {
         return JSON.parse(lines.slice(i).join("\n"));
@@ -1158,4 +1539,17 @@ function parseLooseJsonDocument(raw: string): unknown {
     }
   }
   return null;
+}
+
+/** XML comments/declarations may precede its root on the same line. A
+ * bracket can open a JSON array or a prose log tag; only a closed text tag
+ * followed by a message is a diagnostic. JSON literals, incomplete tags
+ * and structured content after a tag must still invalidate the artifact. */
+function isForeignStructuredLine(line: string): boolean {
+  if (/<\s*(?:[!?]|\/?(?:testsuites?|testcase)\b)/i.test(line)) return true;
+  if (!line.startsWith("[")) return false;
+  const tag = line.match(/^\[([A-Za-z][A-Za-z0-9_.:-]*(?:[ \t]+[A-Za-z0-9_.:-]+)*)\][ \t]+/);
+  if (!tag || /^(?:true|false|null)$/.test(tag[1])) return true;
+  const message = line.slice(tag[0].length).trimStart();
+  return message === "" || /^[\[{]/.test(message);
 }

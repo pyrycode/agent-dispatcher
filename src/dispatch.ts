@@ -146,6 +146,7 @@ import {
   REAL_CLAUDE_GATE_RUN_FROM_COLUMN,
   INFRA_FAILURE_LABEL,
   decideRealClaudeGateRun,
+  decideGateVerdict,
   decideDoneCleanup,
   decideMergeRetry,
   decidePostRunLabels,
@@ -215,8 +216,11 @@ import {
   BASELINE_TESTS_PLACEHOLDER,
   buildBaselineCommand,
   buildBaselineFilter,
+  gateRunRequiredTests,
+  requiredLiveTests,
   isGateOutputFormat,
   parseGateOutput,
+  validateGateOutputProvenance,
   type GateOutputFormat,
   type GateRunReport,
 } from "./gate-output.js";
@@ -5676,6 +5680,7 @@ async function rerunVerifierGateFailures(
     }
     const tally = parseGateOutput(raw, format);
     if (tally.recognizedLines === 0) return skip("the re-run produced no readable test events");
+    if (tally.completeParse !== true) return skip("the re-run produced incomplete test evidence");
     // A re-run that SKIPPED the tests proves nothing; accepting it would excuse every failure.
     if (tally.executed === 0) return skip(`the re-run executed nothing (${tally.skipped} skipped)`);
     return { passed: tally.passedNames, skipReason: null, outputPath };
@@ -7173,6 +7178,8 @@ export async function runRealClaudeGateSuite(opts: {
   timeoutMs: number;
   /** Per-ticket selection. Absent or null runs the full command every time. */
   selection?: GateSelectionConfig | null;
+  /** Always-required named acceptance, including when subset selection is off. */
+  requiredTests?: readonly string[];
   /** The fork's floor, which a full run must clear to count as the backstop's pass. */
   minExecuted?: number;
   /**
@@ -7206,6 +7213,8 @@ export async function runRealClaudeGateSuite(opts: {
 
   const started = deps.now();
   const report: GateRunReport = {
+    outputFormat: opts.format,
+    requiredTests: [...new Set([...(opts.requiredTests ?? []), ...(opts.selection?.alwaysTests ?? [])])],
     runError: null,
     timedOut: false,
     exitCode: null,
@@ -7267,8 +7276,20 @@ export async function runRealClaudeGateSuite(opts: {
   }
 
   // 2b. The whole suite, or the tests the pull request names. Decided before
-  // any worktree exists; every input that cannot be read resolves to full.
+  // any worktree exists. Unknown selection inputs resolve to full; unknown
+  // acceptance requirements cannot establish a pass.
   let command = opts.command;
+  let section: LiveTestsSection;
+  try {
+    const body = deps.execSync(
+      `gh pr list --head ${branchName} --state open --json body --jq '.[0].body // ""'`,
+      { cwd: targetRepo, encoding: "utf-8", timeout: 60_000, stdio: "pipe" },
+    ).toString();
+    section = parseLiveTestsSection(body);
+    report.requiredTests = [...new Set([...(report.requiredTests ?? []), ...requiredLiveTests(body)])];
+  } catch (e: any) {
+    return finish(`could not read required live tests from the pull request: ${e?.message ?? e}`);
+  }
   if (opts.selection) {
     let changedPaths: string[] | null = null;
     try {
@@ -7282,13 +7303,6 @@ export async function runRealClaudeGateSuite(opts: {
         mergesSinceFull = Number.isFinite(n) ? n : null;
       } catch {}
     }
-    let section: LiveTestsSection = { kind: "missing" };
-    try {
-      section = parseLiveTestsSection(deps.execSync(
-        `gh pr list --head ${branchName} --state open --json body --jq '.[0].body // ""'`,
-        { cwd: targetRepo, encoding: "utf-8", timeout: 60_000, stdio: "pipe" },
-      ).toString());
-    } catch {}
     let selection = decideGateSelection({
       config: opts.selection, section, changedPaths, mergesSinceFull, format: opts.format,
     });
@@ -7401,16 +7415,17 @@ export async function runRealClaudeGateSuite(opts: {
       // as unusable — never as "nothing failed".
       console.warn(`   ⚠️  Real-claude gate: could not read ${stdoutPath} back: ${e?.message ?? e}`);
     }
-    if (raw !== null) report.tally = parseGateOutput(raw, opts.format);
+    const provenance = validateGateOutputProvenance(report.command, [report.outputFormat]);
+    if (provenance.error !== null) report.runError ||= provenance.error;
+    else if (raw !== null) report.tally = parseGateOutput(raw, provenance.format);
 
     // A clean full run resets the selection backstop's merge count. Only a
     // clean one: a red full run leaves the count where it was, so the next
     // gated ticket runs the full suite again until main is green.
-    const tally = report.tally;
     if (
-      report.selection?.mode === "full" && report.runError === null && !report.timedOut &&
-      report.exitCode === 0 && tally !== null && tally.failed === 0 &&
-      tally.executed >= Math.max(1, opts.minExecuted ?? 1)
+      report.selection?.mode === "full" && decideGateVerdict({
+        ...report, minExecuted: opts.minExecuted ?? 1, requiredTests: gateRunRequiredTests(report),
+      }).verdict === "pass"
     ) {
       try {
         deps.writeGateFullState(JSON.stringify({ lastFullPassSha: report.baseSha }));
@@ -7716,6 +7731,9 @@ async function runFailuresOnBase(opts: {
     if (baseTally.recognizedLines === 0) {
       return skip("the base re-run produced no readable test events", stdoutPath);
     }
+    if (baseTally.completeParse !== true) {
+      return skip("the base re-run produced incomplete test evidence", stdoutPath);
+    }
     // A base run where the tests SKIPPED tells us nothing. It is the same
     // false green the whole gate exists to reject, and accepting it here
     // would exonerate every branch by default.
@@ -7809,6 +7827,10 @@ async function runBranchRerun(opts: {
       report.rerunSkipReason = "the re-run produced no readable test events";
       return;
     }
+    if (tally.completeParse !== true) {
+      report.rerunSkipReason = "the re-run produced incomplete test evidence";
+      return;
+    }
     // A re-run that SKIPPED the tests proves nothing, the same false green
     // the gate exists to reject. Accepting it would excuse every failure.
     if (tally.executed === 0) {
@@ -7844,6 +7866,7 @@ export function makeRealClaudeGateRunner(): RealClaudeGateRunner | null {
       format,
       timeoutMs: REAL_CLAUDE_GATE_TIMEOUT_MS,
       selection: REAL_CLAUDE_GATE_SELECTION,
+      requiredTests: (process.env.PYRY_REAL_CLAUDE_GATE_ALWAYS_TESTS ?? "").split(",").map(s => s.trim()).filter(Boolean),
       minExecuted: REAL_CLAUDE_GATE_MIN_EXECUTED,
       infraBreaker: INFRA_BREAKER,
     });

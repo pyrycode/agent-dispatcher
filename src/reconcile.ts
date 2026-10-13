@@ -24,6 +24,7 @@
 // `process.exit(1)` on missing config — fine for production, fatal for
 // tests).
 
+import { readFileSync } from "node:fs";
 import type { GitHubProjectClient } from "./github.js";
 import { type ProjectItem } from "./types.js";
 import { activeStageSet } from "./stage-sets.js";
@@ -62,7 +63,8 @@ import {
 } from "./merge-handoff.js";
 import { selectDispatches } from "./dispatch-selection.js";
 import { findRepeatedMustFix, newestFailVerdict, parseVerdictArtifacts, staleBaseFindings, type VerdictArtifact } from "./verdict-guard.js";
-import { formatGateEvidenceComment, gateRunFloor, type GateRunReport } from "./gate-output.js";
+import { GATE_PARSER_VERSION, formatGateEvidenceComment, gateRunFloor, gateRunRequiredTests, parseGateOutput, validateGateOutputProvenance, type GateRunReport } from "./gate-output.js";
+import { gateRunMetaPath, parseGateRunMeta } from "./gate-report.js";
 import type { FlakyRunContext, FlakyTicketResult } from "./flaky-tickets.js";
 import type { InheritedTicketResult } from "./inherited-tickets.js";
 
@@ -829,12 +831,48 @@ export async function runRealClaudeGateExecution(
         conflictParkNote = handoff.reason;
       }
 
+      // Saved reports from before structured skips/attempt evidence must use
+      // the retained artifact. Never recover identities from display strings,
+      // or fall back to an old green tally when that artifact cannot be read.
+      let format = report.outputFormat;
+      // Check all available provenance even on complete tallies. An absent
+      // command flag is recoverable; a conflicting reporter is never absent.
+      if (report.tally) {
+        let meta = null, invalidMeta = false;
+        try {
+          meta = parseGateRunMeta(readFileSync(gateRunMetaPath(report.outputPath), "utf8"));
+          invalidMeta = !meta || meta.headSha !== report.headSha || meta.baseSha !== report.baseSha || meta.command !== report.command;
+        } catch (error: any) { invalidMeta = error?.code !== "ENOENT"; }
+        const provenance = validateGateOutputProvenance(report.command, [format, meta?.outputFormat]);
+        if (invalidMeta || provenance.error !== null) {
+          report.tally = null;
+          report.runError ||= invalidMeta ? "retained live evidence metadata is invalid or does not match the report"
+            : provenance.error;
+        } else {
+          format = provenance.format;
+          const needsRecovery = report.tally.parserVersion !== GATE_PARSER_VERSION || report.tally.completeParse !== true || report.outputFormat === undefined || report.tally.skippedTests === undefined ||
+            (format === "playwright-json" && report.tally.testDetails === undefined);
+          report.outputFormat = format;
+          report.requiredTests = [...new Set([...gateRunRequiredTests(report), ...(meta?.requiredTests ?? [])])];
+          if (needsRecovery) {
+            try {
+              report.tally = parseGateOutput(readFileSync(report.outputPath, "utf8"), format);
+            } catch {
+              report.tally = null;
+            }
+          }
+        }
+      }
+
       const raw = decideGateVerdict({
         runError: report.runError,
         timedOut: report.timedOut,
         tally: report.tally,
         exitCode: report.exitCode,
         minExecuted: gateRunFloor(report, minExecuted),
+        command: report.command,
+        requiredTests: gateRunRequiredTests(report),
+        outputFormat: format,
       });
       // A failure in the shape of a shared environment failure is not judged
       // at all: the runner skipped the re-run and the base comparison, and
@@ -877,6 +915,10 @@ export async function runRealClaudeGateExecution(
         : infra.pausedUntil === null
           ? `The live gate pause could not be recorded, so the next gated ticket may meet the same failure. `
           : `No live gate pause is configured (\`PYRY_INFRA_COOLDOWN_MS=0\`). `;
+      if (verdict === "flaky-pass" && raw.missingLiveAcceptance) {
+        verdict = "unusable";
+        reason = `${raw.missingLiveAcceptance}; a failure-only re-run cannot supply missing live acceptance`;
+      }
       if (conflictParkNote !== "") reason = `${reason} ${conflictParkNote.replace(/\.$/, "")}`;
       let inheritedTickets: InheritedTicketResult = { blockers: [], untracked: [] };
       if (preExisting.length > 0) {

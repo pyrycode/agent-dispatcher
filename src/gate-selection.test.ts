@@ -9,7 +9,7 @@ import {
   readGateSelectionConfig,
   type GateSelectionConfig,
 } from "./gate-selection.js";
-import { gateRunFloor, type GateRunReport } from "./gate-output.js";
+import { gateRunFloor, requiredLiveTests, type GateRunReport } from "./gate-output.js";
 
 const LIVE = "de.pyryco.mobile.e2e.InteractiveStreamE2ETest";
 const config: GateSelectionConfig = {
@@ -52,6 +52,20 @@ describe("readGateSelectionConfig", () => {
 });
 
 describe("parseLiveTestsSection", () => {
+  test("keeps backticked comma and colon titles intact beside plain names and all", () => {
+    const name = "real-claude-effort-default.spec.ts › applied effort, confirmed preference, restart, chat recall and channel creation choice";
+    const colon = "required.spec.ts › preference: Low, confirmed: yes";
+    const entries = `- \`${name}\`, a.B#one, \`\`${colon}\`\`, a.B#two\n- \`${name}\``;
+    const body = `## Live tests\n${entries}\n## Testing\n- ignored`;
+    const names = [name, "a.B#one", colon, "a.B#two"];
+    assert.deepEqual(parseLiveTestsSection(body), { kind: "list", names });
+    assert.deepEqual(requiredLiveTests(body), names);
+    for (const body of [`## Live tests\n- all\n${entries}`, `## Live tests\n${entries}\n- ALL`]) {
+      assert.deepEqual(parseLiveTestsSection(body), { kind: "all" });
+      assert.deepEqual(requiredLiveTests(body), names);
+    }
+  });
+
   test("reads list items, backticks and commas, up to the next heading", () => {
     const body = [
       "## Summary",

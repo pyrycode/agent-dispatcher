@@ -131,7 +131,7 @@ import {
   missingRequiredEnv,
   parseRequiredEnv,
 } from "./pipeline-decisions.js";
-import { buildBaselineCommand, buildBaselineFilter, formatGateEvidenceComment, parseGateOutput, stripPackageQualifier } from "./gate-output.js";
+import { GATE_PARSER_VERSION, buildBaselineCommand, buildBaselineFilter, formatGateEvidenceComment, parseGateOutput, stripPackageQualifier } from "./gate-output.js";
 import { mapParentChain } from "./github.js";
 import {
   decideBranchSetup,
@@ -4703,13 +4703,13 @@ describe("parseGateOutput — playwright-json", () => {
       suites: [{
         title: "gate.spec.ts",
         specs: [
-          { title: "passes", tests: [{ status: "expected" }] },
-          { title: "breaks", tests: [{ status: "unexpected" }] },
-          { title: "declines", tests: [{ status: "skipped", annotations: [{ type: "skip", description: "no token" }] }] },
+          { title: "passes", tests: [{ status: "expected", results: [{ status: "passed" }] }] },
+          { title: "breaks", tests: [{ status: "unexpected", results: [{ status: "failed" }] }] },
+          { title: "declines", tests: [{ status: "skipped", results: [], annotations: [{ type: "skip", description: "no token" }] }] },
         ],
         suites: [{
           title: "nested",
-          specs: [{ title: "deep", tests: [{ status: "flaky" }] }],
+          specs: [{ title: "deep", tests: [{ status: "flaky", results: [{ status: "failed" }, { status: "passed" }] }] }],
         }],
       }],
     });
@@ -4744,6 +4744,7 @@ describe("parseGateOutput — playwright-json", () => {
 
 describe("decideGateVerdict", () => {
   const clean = {
+    completeParse: true, parserVersion: GATE_PARSER_VERSION,
     executed: 176, failed: 0, packageFailed: false, recognizedLines: 400,
   };
   const base = { runError: null, timedOut: false, tally: clean, exitCode: 0, minExecuted: 150 };
@@ -4826,7 +4827,7 @@ describe("decideGateVerdict", () => {
   test("a suite-level failure with no failing test is still a fail", () => {
     const d = decideGateVerdict({
       ...base,
-      tally: { executed: 176, failed: 0, packageFailed: true, recognizedLines: 400 },
+      tally: { ...clean, packageFailed: true },
     });
     assert.equal(d.verdict, "fail");
     assert.match(d.reason, /build error, panic, or harness crash/);

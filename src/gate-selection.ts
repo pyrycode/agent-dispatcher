@@ -22,6 +22,7 @@
 // request body, the branch diff and the state file, and hands them here.
 
 import { buildBaselineFilter, type GateOutputFormat } from "./gate-output.js";
+import { parseLiveTestEntries } from "./live-tests.js";
 
 export interface GateSelectionConfig {
   /** Tests every selected run includes, as qualified names. */
@@ -58,23 +59,12 @@ export type LiveTestsSection =
 
 /**
  * Read the `## Live tests` section of a pull request body. Entries are one per
- * line, as list items or bare, with optional backticks; commas also separate.
+ * line, as list items or bare. Commas outside backticks also separate names.
  * An empty section reads as missing, so a forgotten list runs the full suite.
  */
 export function parseLiveTestsSection(body: string): LiveTestsSection {
-  const lines = body.split(/\r?\n/);
-  const start = lines.findIndex(l => /^##\s+live tests\s*$/i.test(l.trim()));
-  if (start === -1) return { kind: "missing" };
-  const names: string[] = [];
-  for (const line of lines.slice(start + 1)) {
-    if (/^#{1,2}\s/.test(line.trim())) break;
-    for (const part of line.replace(/^\s*[-*]\s*/, "").split(",")) {
-      const name = part.trim().replace(/^`+|`+$/g, "").trim();
-      if (name === "") continue;
-      if (name.toLowerCase() === "all") return { kind: "all" };
-      if (!names.includes(name)) names.push(name);
-    }
-  }
+  const { all, names } = parseLiveTestEntries(body);
+  if (all) return { kind: "all" };
   return names.length === 0 ? { kind: "missing" } : { kind: "list", names };
 }
 

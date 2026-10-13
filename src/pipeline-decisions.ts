@@ -10,6 +10,7 @@
 import { hasOpenBlockers } from "./blockers.js";
 import { byTicketPriority } from "./ticket-priority.js";
 import { MERGE_HANDOFF_LABEL } from "./merge-handoff.js";
+import { GATE_PARSER_VERSION, parseGateOutput, validateGateOutputProvenance, type GateOutputFormat, type GateTestDetail } from "./gate-output.js";
 
 // --------- Auto-advance rules ---------
 
@@ -732,6 +733,13 @@ export type GateVerdict =
 
 /** Everything `decideGateVerdict` is allowed to look at. */
 export interface GateVerdictInput {
+  /** When supplied, each invocation must agree with the recorded format. */
+  command?: string;
+  /** Retained raw evidence takes precedence over a legacy/incomplete tally. */
+  rawOutput?: string | null;
+  outputFormat?: GateOutputFormat;
+  /** Named live acceptance survives a full-suite selection. */
+  requiredTests?: readonly string[];
   /** Non-null when the run could not be started or completed at all. */
   runError: string | null;
   /** True when the outer wall clock fired. */
@@ -745,12 +753,18 @@ export interface GateVerdictInput {
 }
 
 /**
- * The slice of `GateTally` the verdict depends on. Declared structurally so
- * pipeline-decisions.ts stays free of a runtime import on the parser — this
- * file is the pure decision layer and has no business knowing how a Go test
- * event is shaped.
+ * The slice of `GateTally` the verdict depends on. Raw artifacts, when
+ * supplied, go through the same pure parser as freshly executed runs.
  */
 export interface GateTallyLike {
+  completeParse?: boolean;
+  parserVersion?: number;
+  skipped?: number;
+  skippedTests?: readonly { name: string; reason: string }[];
+  passedNames?: readonly string[];
+  failedNames?: readonly string[];
+  skipReasons?: readonly string[];
+  testDetails?: readonly GateTestDetail[];
   executed: number;
   failed: number;
   packageFailed: boolean;
@@ -769,8 +783,26 @@ export interface GateTallyLike {
 
 export interface GateVerdictDecision {
   verdict: GateVerdict;
+  /** A named failure can route to repair, but a failure-only retry cannot
+   * establish the live proof this full report never supplied. */
+  missingLiveAcceptance?: string;
   /** One line, suitable for a log and for the evidence comment. */
   reason: string;
+}
+
+function isLunaLiveTest(name: string): boolean {
+  return /\bLuna\b/i.test(name);
+}
+
+/** Go filters may name a parent while its report counts only leaf tests.
+ * Bare Go function names also omit the package qualifier the parser adds. */
+function matchesRequiredTest(actual: string, required: string): boolean {
+  if (/^(Test|Benchmark|Example|Fuzz)/.test(required)) {
+    const boundary = actual.search(/\.(Test|Benchmark|Example|Fuzz)/);
+    if (boundary >= 0) actual = actual.slice(boundary + 1);
+  }
+  return actual === required ||
+    (!required.includes(" › ") && /(?:^|\.)(Test|Benchmark|Example|Fuzz)/.test(required) && actual.startsWith(`${required}/`));
 }
 
 /** Reject incomplete evidence before attributing named failures. A subset
@@ -788,7 +820,13 @@ export function decideGateVerdict(input: GateVerdictInput): GateVerdictDecision 
     };
   }
 
-  const tally = input.tally;
+  const format = input.outputFormat;
+  if (input.command !== undefined) {
+    const provenance = validateGateOutputProvenance(input.command, [format]);
+    if (provenance.error !== null) return { verdict: "unusable", reason: provenance.error };
+  }
+  const tally = input.rawOutput === undefined ? input.tally
+    : input.rawOutput !== null && format ? parseGateOutput(input.rawOutput, format) : null;
   if (tally === null || tally.recognizedLines <= 0) {
     return {
       verdict: "unusable",
@@ -816,6 +854,10 @@ export function decideGateVerdict(input: GateVerdictInput): GateVerdictDecision 
     };
   }
 
+  if (tally.completeParse === false) {
+    return { verdict: "unusable", reason: "gate output contains malformed, mixed or unfinished test records; the readable passing fragment cannot establish acceptance" };
+  }
+
   // A floor of 0 would disable the guard this whole file exists for, so a
   // misconfigured fork gets 1 rather than an unguarded gate.
   const floor = Math.max(1, input.minExecuted);
@@ -828,11 +870,52 @@ export function decideGateVerdict(input: GateVerdictInput): GateVerdictDecision 
     };
   }
 
+  // Suite totals cannot replace a required named result. Treat incomplete
+  // acceptance as unusable before baseline/rerun failure attribution, which
+  // could otherwise turn a different failure into a flaky pass.
+  if (tally.parserVersion !== GATE_PARSER_VERSION || tally.completeParse !== true ||
+      (tally.passedNames !== undefined && tally.skippedTests === undefined)) {
+    return { verdict: "unusable", reason: "test identities and attempt evidence use a legacy tally; reparse retained raw evidence before judging live acceptance" };
+  }
+  const skippedNames = tally.skippedTests?.map(t => t.name)
+    ?? tally.testDetails?.filter(d => d.status === "skipped").map(d => d.name) ?? [];
+  const skipCount = Math.max(tally.skipped ?? 0, tally.skipReasons?.length ?? 0);
+  if (skippedNames.length !== skipCount) {
+    return { verdict: "unusable", reason: "skipped test identities are incomplete; reparse retained raw evidence before judging live acceptance" };
+  }
+  const observed = [...(tally.passedNames ?? []), ...(tally.failedNames ?? []),
+    ...(tally.testDetails ?? []).map(d => d.name), ...skippedNames];
+  const required = new Set([...(input.requiredTests ?? []), ...observed.filter(isLunaLiveTest)]);
+  let missingLiveAcceptance: string | undefined;
+  for (const name of required) {
+    const matches = (actual: string) => matchesRequiredTest(actual, name);
+    const details = (tally.testDetails ?? []).filter(d => matches(d.name));
+    const skipped = details.some(d => d.status === "skipped") ||
+      skippedNames.some(matches);
+    const failed = tally.failedNames?.some(matches) === true;
+    // A genuine named failure still routes to repair. Missing execution or
+    // Luna proof must park; failure reruns cannot invent the missing evidence.
+    const passed = tally.passedNames?.some(matches) === true && !failed && !skipped;
+    if (!passed && failed && !skipped) {
+      if (isLunaLiveTest(name)) missingLiveAcceptance = `required live test ${name} has no passing attempt with daemon-revision and published-model-row evidence in the full run`;
+      continue;
+    }
+    if (!passed) return { verdict: "unusable", reason: `required live test ${name} ${skipped ? "skipped" : "has no passing execution"}; live acceptance remains missing` };
+    if ((tally.testDetails || format === "playwright-json" || name.includes(" › ")) &&
+      (details.length === 0 || details.some(d => !d.passingAttempt))) {
+      return { verdict: "unusable", reason: `required live test ${name} has no actual passing attempt; live acceptance remains missing` };
+    }
+    if (isLunaLiveTest(name) && (details.length === 0 || details.some(d =>
+      !d.passingAttempt?.daemonRevision || !d.passingAttempt.publishedModelRow))) {
+      return { verdict: "unusable", reason: `required live test ${name} lacks same-attempt passing execution, daemon-revision or published-model-row evidence` };
+    }
+  }
+
   if (tally.failed > 0 || tally.packageFailed) {
     const detail = tally.failed > 0
       ? `${tally.failed} test(s) failed`
       : "a suite-level failure with no failing test (build error, panic, or harness crash)";
-    return { verdict: "fail", reason: detail };
+    return { verdict: "fail", reason: detail, ...(missingLiveAcceptance ? { missingLiveAcceptance } : {}) };
   }
 
   if (input.exitCode !== 0) {
@@ -2267,6 +2350,10 @@ export const BLOCKED_RETRY_PATTERNS: readonly { signature: string; pattern: RegE
  */
 export const BLOCKED_NEVER_RETRY = /\bapproval\b|unacceptable risk|permission denied|\bhuman\b|\bmaintainer\b|\bdecision\b/i;
 
+/** Operator authentication and provisioning are not a transient missing tool
+ * or variable. A failed approval reviewer cannot clear these blockers either. */
+const BLOCKED_OPERATOR_AUTH = /\b(?:sign[ -]?in|log[ -]?in|authentication|credentials?)\s+(?:(?:is|are|remains)\s+)?(?:still\s+)?(?:required|missing|unavailable|absent|not (?:provisioned|configured|available)|must be (?:provisioned|configured))\b|\b(?:missing|absent|unavailable|unprovisioned|requires?)\s+(?:(?:a|the|separate|dedicated|provisioned|Codex|Claude|operator)\s+){0,4}(?:sign[ -]?in|log[ -]?in|authentication|credentials?)\b|\b(?:must|needs? to|required to)\s+provision\b|\bprovisioning\s+(?:is\s+)?(?:required|missing|incomplete)\b/i;
+
 /**
  * Classify a Codex run that stopped with `status: blocked`. Transient only
  * when its stated reason is a missing or unavailable tool, MCP server or
@@ -2293,6 +2380,7 @@ export function classifyBlockedRun(
   opts?: { approvalRejected?: boolean; approvalReviewFailed?: boolean },
 ): { transient: boolean; signature: string } {
   if (opts?.approvalRejected) return { transient: false, signature: "" };
+  if (text && BLOCKED_OPERATOR_AUTH.test(text)) return { transient: false, signature: "" };
   // Before BLOCKED_NEVER_RETRY: the summary of such a block always says
   // "approval". The flag comes from Codex's own words, not the summary.
   if (opts?.approvalReviewFailed) return { transient: true, signature: "approval review failed" };

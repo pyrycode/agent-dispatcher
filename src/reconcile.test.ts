@@ -24,13 +24,16 @@ import {
   type ReconcileClient,
   type StaleBaseRefresh,
 } from "./reconcile.js";
-import { readFileSync } from "node:fs";
-import type { GateRunReport, GateTally } from "./gate-output.js";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { GATE_PARSER_VERSION, parseGateOutput, requiredLiveTests, type GateRunReport, type GateTally } from "./gate-output.js";
+import { gateRunMetaPath, serializeGateRunMeta } from "./gate-report.js";
 import type { ProjectItem } from "./types.js";
 import { resetActiveStageSetForTests } from "./stage-sets.js";
 import { REAL_CLAUDE_GATE_RUNNING_LABEL } from "./pipeline-decisions.js";
-import { parseGateOutput } from "./gate-output.js";
 import { DEFAULT_INFRA_BREAKER_CONFIG, classifyGateFailure, extractFailureMessages, findAdmissionRejections } from "./infra-failure.js";
+import { completeGo, completeJUnit, completePlaywright, incompleteArtifacts, loggedArtifacts, loggedFailures, mixedGoCommands, singleWrappedGoCommands, repeatedGo } from "./fixtures/gate-completeness.js";
 
 /**
  * Minimal in-memory ReconcileClient. Records every call to
@@ -759,6 +762,8 @@ describe("runRealClaudeGate — parks gated tickets in Inbox", () => {
 /** Build a tally with only the fields a test cares about. */
 function tally(overrides: Partial<GateTally> = {}): GateTally {
   return {
+    completeParse: true,
+    parserVersion: GATE_PARSER_VERSION,
     executed: 0,
     passed: 0,
     failed: 0,
@@ -766,6 +771,7 @@ function tally(overrides: Partial<GateTally> = {}): GateTally {
     failedNames: [],
     passedNames: [],
     timedOutTests: [],
+    skippedTests: [],
     skipReasons: [],
     packageFailed: false,
     packageFailures: [],
@@ -776,11 +782,13 @@ function tally(overrides: Partial<GateTally> = {}): GateTally {
 
 function report(overrides: Partial<GateRunReport> = {}): GateRunReport {
   return {
+    outputFormat: "go-json",
     runError: null,
     timedOut: false,
     exitCode: 0,
-    tally: tally({ executed: 176, passed: 176, skipped: 14 }),
-    command: "go test -tags e2e_realclaude -json ./...",
+    tally: tally({ executed: 176, passed: 176, skipped: 14,
+      skippedTests: Array.from({ length: 14 }, (_, i) => ({ name: `pkg.TestOptional${i}`, reason: "fixture: optional" })) }),
+    command: overrides.outputFormat === "playwright-json" ? "playwright test --reporter=json" : "go test -tags e2e_realclaude -json ./...",
     branchName: "feature/1382",
     baseRef: "origin/main",
     baseSha: "b".repeat(40),
@@ -1139,6 +1147,419 @@ describe("runRealClaudeGateExecution: infrastructure failure", () => {
 });
 
 describe("runRealClaudeGateExecution — outcomes", () => {
+  for (const mode of [undefined, "full", "selected"] as const) {
+    for (const legacy of [false, true]) {
+      for (const persisted of [false, true]) {
+        test(`invocation provenance survives ${mode ?? "configured"} recovery, legacy=${legacy}, persisted=${persisted}, without releasing ownership`, () => withStageSet("classic", async () => {
+          const dir = mkdtempSync(join(tmpdir(), "invocation-gate-recovery-"));
+          const failed = completeGo.replace('"Action":"pass","Package":"fixture","Test":"TestOther0"',
+            '"Action":"fail","Package":"fixture","Test":"TestOther0"');
+          for (const [command, output, expected] of [
+            ...mixedGoCommands.map(command => [command, command.startsWith("go test -json") ? completeGo + "\nok fixture/ordinary 0.001s\n" : "ok fixture/ordinary 0.001s\n" + completeGo, "Inbox"] as const),
+            ...singleWrappedGoCommands.map(command => [`echo "$BUILD_STEP"; ${command}`, completeGo, "In Documentation"] as const),
+            ...singleWrappedGoCommands.map(command => [command, failed, "In Development"] as const),
+            ...[["pass", "fail"], ["fail", "pass"]].map(statuses => ["command env go -C /tmp/fixture test -json -count=2", repeatedGo(statuses as ("pass" | "fail")[]), "In Development"] as const),
+            ["go test -json ./...; go test ./ordinary", completeGo + "\nok fixture/ordinary 0.001s\n", "Inbox"],
+            ["go test ./ordinary; go test -json ./...", completeGo + "\nok fixture/ordinary 0.001s\n", "Inbox"],
+            ["playwright test --reporter=json; playwright test", completePlaywright, "Inbox"],
+            ["playwright test; playwright test --reporter=json", completePlaywright, "Inbox"],
+            ['echo "$BUILD_STEP"; go test -json ./...', completeGo, "In Documentation"],
+            ['echo "$BUILD_STEP"; go test -json ./...', failed, "In Development"],
+            ['echo "$BUILD_STEP"; go test "-json" ./... > "$LOG" 2>&1', failed, "In Development"],
+            ['echo "$BUILD_STEP"; "$TEST_RUNNER" test -json ./...', completeGo, "Inbox"],
+            ['go test -json ./...; exec "$TEST_RUNNER" test ./ordinary', completeGo + "\nok fixture/ordinary 0.001s\n", "Inbox"],
+            ['go test "$JSON_FLAG" ./...', completeGo, "Inbox"],
+          ] as const) {
+            const outputPath = join(dir, "gate.log");
+            writeFileSync(outputPath, output);
+            const format = command.includes("playwright") ? "playwright-json" : "go-json";
+            const selected = format === "go-json" ? "fixture.TestOther0" : "fixture.spec.ts › other 0";
+            const selection = mode === "selected" ? { mode, tests: [selected], filter: "fixture", reason: "named" }
+              : mode === "full" ? { mode, reason: "all" } : undefined;
+            let saved = report({ outputPath, command, selection, outputFormat: format, requiredTests: [selected],
+              tally: parseGateOutput(output, format), exitCode: expected === "In Development" ? 1 : 0 });
+            writeFileSync(gateRunMetaPath(outputPath), serializeGateRunMeta(saved, {}, new Date()));
+            if (legacy) {
+              delete saved.outputFormat;
+              if (command.includes("-count=2")) saved.tally = parseGateOutput(completeGo, "go-json");
+              saved.tally!.parserVersion = GATE_PARSER_VERSION - 1;
+              delete saved.tally!.completeParse;
+              delete saved.tally!.skippedTests;
+            }
+            if (persisted) {
+              const reportPath = join(dir, "saved-report.json");
+              writeFileSync(reportPath, JSON.stringify(saved));
+              saved = JSON.parse(readFileSync(reportPath, "utf8"));
+            }
+            const item = parkedItem({ labels: ["done:code-review", "needs-real-claude", "claim:mac", "rework-count:3", "error-retry-count:2"] });
+            const client = new MockClient([item]);
+            await runRealClaudeGateExecution(client, async () => saved, 10, async () => {});
+            assert.equal(item.status, expected, `${command}, ${mode}, legacy=${legacy}, persisted=${persisted}`);
+            assert.equal(item.labels.includes("needs-real-claude"), expected !== "In Documentation");
+            for (const label of ["claim:mac", "rework-count:3", "error-retry-count:2"]) assert.ok(item.labels.includes(label));
+            if (expected === "Inbox") {
+              assert.deepEqual(client.updateItemStatusCalls, []);
+              assert.ok(item.labels.includes("error:real-claude-gate"));
+              assert.match(client.addCommentCalls[0].body, /NO USABLE RESULT/);
+            } else if (expected === "In Development") {
+              assert.ok(item.labels.includes("needs-rework:developer"));
+              const failure = command.includes("-count=2") ? "fixture.TestRepeated/case:Low,confirmed" : "fixture.TestOther0";
+              assert.deepEqual(saved.tally?.failedNames, [failure]);
+              assert.ok(client.addCommentCalls[0].body.includes(failure));
+            }
+          }
+        }));
+      }
+    }
+  }
+
+  test("legacy recovery rejects both reporter orders and mixed artifacts without advancing or releasing ownership", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mixed-gate-recovery-"));
+    const captured = readFileSync(new URL("./fixtures/desktop-1809-live-report.json", import.meta.url), "utf8");
+    const go = Array.from({ length: 10 }, (_, i) => JSON.stringify({ Action: "pass", Package: "fixture", Test: `TestOther${i}` })).join("\n");
+    const commands = ["playwright test --reporter=json", "go test -json ./..."];
+    let index = 0;
+    for (const separator of ["; ", ";", "&&", "||", "|", "\n"]) {
+      for (const order of [commands, [...commands].reverse()]) {
+        for (const source of ["missing", "report", "sidecar"] as const) {
+          const outputPath = join(dir, `${index++}.log`);
+          writeFileSync(outputPath, order[0].startsWith("playwright") ? `${captured}\n${go}` : `${go}\n${captured}`);
+          const saved = report({ outputPath, command: order.join(separator), outputFormat: "go-json",
+            selection: { mode: "full", reason: "all" }, tally: parseGateOutput(go, "go-json") });
+          if (source === "sidecar") writeFileSync(gateRunMetaPath(outputPath), serializeGateRunMeta(saved, {}, new Date()));
+          if (source !== "report") delete saved.outputFormat;
+          delete saved.requiredTests; delete saved.tally!.testDetails; delete saved.tally!.skippedTests;
+          const item = parkedItem({ labels: ["done:code-review", "needs-real-claude", "claim:mac", "rework-count:3", "error-retry-count:2"] });
+          const client = new MockClient([item]);
+          await runRealClaudeGateExecution(client, async () => saved, 10, async () => {});
+          assert.equal(item.status, "Inbox", `${source}: ${saved.command}`);
+          assert.deepEqual(client.updateItemStatusCalls, []);
+          for (const label of ["needs-real-claude", "claim:mac", "rework-count:3", "error-retry-count:2", "error:real-claude-gate"]) assert.ok(item.labels.includes(label));
+          assert.match(client.addCommentCalls[0].body, /NO USABLE RESULT/);
+          assert.ok(!client.removeLabelCalls.some(c => /claim:|retry-count|rework-count|needs-real-claude/.test(c.label)));
+        }
+      }
+    }
+    for (const command of commands) {
+      const outputPath = join(dir, `${index++}.log`);
+      writeFileSync(outputPath, `${captured}\n${go}`);
+      const saved = report({ outputPath, command, selection: { mode: "full", reason: "all" }, tally: parseGateOutput(go, "go-json") });
+      delete saved.outputFormat; delete saved.tally!.skippedTests;
+      const item = parkedItem();
+      const client = new MockClient([item]);
+      await runRealClaudeGateExecution(client, async () => saved, 10, async () => {});
+      assert.equal(item.status, "Inbox", command);
+      assert.ok(item.labels.includes("needs-real-claude"));
+    }
+  });
+
+  test("complete saved tallies cannot bypass conflicting command or sidecar provenance", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "conflicting-gate-recovery-"));
+    const go = JSON.stringify({ Action: "pass", Package: "fixture", Test: "TestRequired" });
+    for (const source of ["command", "sidecar", "invalid-sidecar", "invalid-requirements", "wrong-head", "wrong-base", "wrong-command"] as const) {
+      const outputPath = join(dir, `${source}.log`);
+      writeFileSync(outputPath, go);
+      const saved = report({ outputPath, tally: parseGateOutput(go, "go-json"), requiredTests: ["fixture.TestRequired"],
+        command: source === "command" ? "playwright test --reporter=json" : "go test -json ./..." });
+      if (source !== "command") {
+        const meta = JSON.parse(serializeGateRunMeta(saved, {}, new Date()));
+        if (source === "sidecar") meta.outputFormat = "playwright-json";
+        if (source === "invalid-sidecar") meta.outputFormat = "unknown-format";
+        if (source === "invalid-requirements") meta.requiredTests = [null];
+        if (source === "wrong-head") meta.headSha = "wrong";
+        if (source === "wrong-base") meta.baseSha = "wrong";
+        if (source === "wrong-command") meta.command = "pnpm other";
+        writeFileSync(gateRunMetaPath(outputPath), JSON.stringify(meta));
+      }
+      const item = parkedItem();
+      const client = new MockClient([item]);
+      await runRealClaudeGateExecution(client, async () => saved, 1, async () => {});
+      assert.equal(item.status, "Inbox", source);
+      assert.ok(item.labels.includes("needs-real-claude"));
+      assert.match(client.addCommentCalls[0].body, /NO USABLE RESULT/);
+    }
+  });
+
+  test("saved tallies from partial readers require raw recovery even when identities and format were recorded", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "partial-tally-recovery-"));
+    const captured = readFileSync(new URL("./fixtures/desktop-1809-live-report.json", import.meta.url), "utf8");
+    const go = Array.from({ length: 10 }, (_, i) => JSON.stringify({ Action: "pass", Test: `TestOther${i}` })).join("\n");
+    const outputPath = join(dir, "gate.log");
+    writeFileSync(outputPath, `${captured}\n${go}`);
+    const saved = report({ outputPath, requiredTests: [], tally: parseGateOutput(go, "go-json") });
+    delete saved.tally!.completeParse;
+    const item = parkedItem();
+    const client = new MockClient([item]);
+    await runRealClaudeGateExecution(client, async () => saved, 10, async () => {});
+    assert.equal(item.status, "Inbox");
+    assert.ok(item.labels.includes("needs-real-claude"));
+    assert.match(client.addCommentCalls[0].body, /NO USABLE RESULT/);
+  });
+
+  test("full and selected recovery reparses old completeParse markers instead of accepting passing fragments", () => withStageSet("classic", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "complete-marker-recovery-"));
+    const valid = [
+      ...loggedArtifacts,
+      { name: "complete Go", format: "go-json" as const, raw: completeGo, green: completeGo },
+      { name: "complete Playwright", format: "playwright-json" as const, raw: completePlaywright, green: completePlaywright },
+      { name: "complete JUnit", format: "junit-xml" as const, raw: completeJUnit, green: completeJUnit },
+    ];
+    for (const artifact of [...incompleteArtifacts, ...valid]) {
+      for (const mode of [undefined, "full", "selected"] as const) {
+        const selected = artifact.format === "go-json" ? "fixture.TestOther0"
+          : artifact.format === "playwright-json" ? "fixture.spec.ts › other 0" : "fixture#other0";
+        const selection = mode === "selected" ? { mode, tests: [selected], filter: "fixture", reason: "named" }
+          : mode === "full" ? { mode, reason: "all" } : undefined;
+        for (const persisted of [false, true]) {
+          const outputPath = join(dir, "gate.log");
+          writeFileSync(outputPath, artifact.raw);
+          let saved = report({ outputPath, outputFormat: artifact.format, selection,
+            command: artifact.format === "go-json" ? "go test -json" : artifact.format === "playwright-json" ? "playwright test --reporter=json" : "junit-wrapper",
+            tally: parseGateOutput(artifact.green, artifact.format), rerunFailures: [] });
+          // Model the old reader: it counted only the green fragment and
+          // claimed completeness without a current validator version.
+          delete saved.requiredTests;
+          saved.tally!.parserVersion = GATE_PARSER_VERSION - 1;
+          assert.equal(saved.tally!.completeParse, true);
+          if (persisted) {
+            const reportPath = join(dir, "saved-report.json");
+            writeFileSync(reportPath, JSON.stringify(saved));
+            saved = JSON.parse(readFileSync(reportPath, "utf8"));
+          }
+          const item = parkedItem({ labels: ["done:code-review", "needs-real-claude", "claim:mac", "rework-count:3", "error-retry-count:2"] });
+          const client = new MockClient([item]);
+          await runRealClaudeGateExecution(client, async () => saved, 10, async () => {});
+          const usable = valid.includes(artifact);
+          assert.equal(item.status, usable ? "In Documentation" : "Inbox", `${artifact.name}, ${mode}, persisted=${persisted}`);
+          for (const label of ["claim:mac", "rework-count:3", "error-retry-count:2"]) assert.ok(item.labels.includes(label));
+          assert.equal(item.labels.includes("needs-real-claude"), !usable);
+          if (!usable) {
+            assert.ok(item.labels.includes("error:real-claude-gate"));
+            assert.match(client.addCommentCalls[0].body, /NO USABLE RESULT/);
+            assert.deepEqual(client.updateItemStatusCalls, []);
+          }
+        }
+      }
+    }
+  }));
+
+  test("tagged logs beside named failures recover to repair in full, selected and persisted reports", () => withStageSet("classic", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "logged-failure-recovery-"));
+    for (const artifact of loggedFailures) {
+      for (const mode of ["full", "selected"] as const) {
+        for (const persisted of [false, true]) {
+          const outputPath = join(dir, "gate.log");
+          writeFileSync(outputPath, artifact.raw);
+          const selected = artifact.format === "go-json" ? "fixture.TestOther0" : "fixture.spec.ts › other 0";
+          let saved = report({ outputPath, outputFormat: artifact.format, requiredTests: [selected],
+            selection: mode === "full" ? { mode, reason: "all" } : { mode, tests: [selected], filter: "fixture", reason: "named" },
+            command: artifact.format === "go-json" ? "go test -json" : "playwright test --reporter=json",
+            tally: parseGateOutput(artifact.green, artifact.format) });
+          saved.tally!.parserVersion = GATE_PARSER_VERSION - 1;
+          if (persisted) {
+            const reportPath = join(dir, "saved-report.json");
+            writeFileSync(reportPath, JSON.stringify(saved));
+            saved = JSON.parse(readFileSync(reportPath, "utf8"));
+          }
+          const item = parkedItem({ labels: ["done:code-review", "needs-real-claude", "claim:mac", "rework-count:3", "error-retry-count:2"] });
+          const client = new MockClient([item]);
+          await runRealClaudeGateExecution(client, async () => saved, 10, async () => {});
+          assert.equal(item.status, "In Development", `${artifact.name}, ${mode}, persisted=${persisted}`);
+          assert.ok(item.labels.includes("needs-rework:developer"));
+          assert.ok(item.labels.includes("needs-real-claude"));
+          for (const label of ["claim:mac", "rework-count:3", "error-retry-count:2"]) assert.ok(item.labels.includes(label));
+          assert.deepEqual(saved.tally?.failedNames, [artifact.failedName]);
+          assert.ok(client.addCommentCalls.some(c => c.body.includes(artifact.failedName)));
+          assert.ok(!item.labels.includes("error:real-claude-gate"));
+        }
+      }
+    }
+  }));
+
+  test("old completeParse markers cannot fall back to cached green counts when retained bytes are unavailable", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "missing-marker-recovery-"));
+    for (const mode of ["full", "selected"] as const) {
+      const saved = report({ outputPath: join(dir, "absent.log"), tally: parseGateOutput(completeGo, "go-json"),
+        selection: mode === "full" ? { mode, reason: "all" } : { mode, tests: ["fixture.TestOther0"], filter: "fixture", reason: "named" } });
+      delete saved.tally!.parserVersion;
+      const item = parkedItem();
+      const client = new MockClient([item]);
+      await runRealClaudeGateExecution(client, async () => JSON.parse(JSON.stringify(saved)), 10, async () => {});
+      assert.equal(item.status, "Inbox");
+      assert.ok(item.labels.includes("needs-real-claude"));
+      assert.ok(item.labels.includes("error:real-claude-gate"));
+      assert.match(client.addCommentCalls[0].body, /NO USABLE RESULT/);
+    }
+  });
+
+  test("single-format Go recovery uses literal flags or bound metadata and preserves named requirements", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "single-format-recovery-"));
+    const output = JSON.stringify({ Action: "pass", Package: "fixture", Test: "TestRequired/case:_one,two" });
+    for (const mode of ["full", "selected"] as const) {
+      for (const source of ["command", "report", "sidecar", "missing"] as const) {
+        for (const required of ["fixture.TestRequired/case:_one,two", "fixture.TestAbsent"] as const) {
+          const outputPath = join(dir, `${mode}-${source}-${required.length}.log`);
+          writeFileSync(outputPath, output);
+          const saved = report({ outputPath, command: source === "command" ? "go test '-json'>gate.log;echo done" : "pnpm live-tests",
+            outputFormat: "go-json", requiredTests: [required], tally: parseGateOutput(output, "go-json"),
+            selection: mode === "full" ? { mode, reason: "all" } : { mode, tests: [required], filter: "fixture", reason: "named" } });
+          if (source === "sidecar") {
+            writeFileSync(gateRunMetaPath(outputPath), serializeGateRunMeta(saved, {}, new Date()));
+            delete saved.requiredTests;
+          }
+          if (source !== "report") delete saved.outputFormat;
+          delete saved.tally!.completeParse;
+          const item = parkedItem({ labels: ["done:code-review", "needs-real-claude", "claim:mac", "rework-count:3", "error-retry-count:2"] });
+          const client = new MockClient([item]);
+          await runRealClaudeGateExecution(client, async () => saved, 1, async () => {});
+          const passes = source !== "missing" && required.includes("TestRequired");
+          assert.equal(item.status, passes ? "In Documentation" : "Inbox", `${mode}: ${source}: ${required}`);
+          for (const label of ["claim:mac", "rework-count:3", "error-retry-count:2"]) assert.ok(item.labels.includes(label));
+          assert.equal(item.labels.includes("needs-real-claude"), !passes);
+          if (source === "missing") assert.match(client.addCommentCalls[0].body, /missing output-format provenance/);
+        }
+      }
+    }
+  });
+
+  test("legacy full zero-skip tallies need recorded provenance and retained passing-attempt evidence", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "legacy-zero-skip-gate-"));
+    const name = "required.spec.ts › real codex: GPT-6 Luna replies";
+    const model = { agent: "codex", value: "gpt-6-luna", display_name: "GPT-6 Luna", effort_levels: ["low"] };
+    const attachments = [
+      { name: "daemon-revision", body: Buffer.from("fixture-revision").toString("base64") },
+      { name: "published-model-row", body: Buffer.from(JSON.stringify({ serverId: "fixture-server", conversationId: "fixture-channel", model, models: [model] })).toString("base64") },
+    ];
+    const evidence = (complete: boolean) => JSON.stringify({ suites: [{ title: "required.spec.ts", specs: [{ title: "real codex: GPT-6 Luna replies", tests: [{
+      status: "expected", results: [{ status: "passed", annotations: [{ type: "daemon-revision", description: "fixture-revision" }], attachments: complete ? attachments : [] }],
+    }] }] }] });
+    const unrelated = JSON.stringify({ suites: [{ title: "other.spec.ts", specs: [{ title: "unrelated", tests: [{ status: "expected", results: [{ status: "passed" }] }] }] }] });
+    for (const [source, output, expected] of [
+      ["command", evidence(false), "Inbox"], ["command", evidence(true), "In Documentation"],
+      ["sidecar", evidence(false), "Inbox"], ["sidecar", evidence(true), "In Documentation"],
+      ["sidecar", unrelated, "Inbox"], ["command", "truncated {", "Inbox"], ["command", null, "Inbox"],
+      ["missing", evidence(true), "Inbox"], ["conflicting", evidence(true), "Inbox"], ["mismatched", evidence(true), "Inbox"],
+    ] as const) {
+      const outputPath = join(dir, `gate-${source}-${output?.length ?? 0}.log`);
+      if (output !== null) writeFileSync(outputPath, output);
+      const saved = JSON.parse(JSON.stringify(report({ outputPath, command: source === "command" || source === "conflicting" ? "playwright test --reporter=json" : "pnpm live-tests",
+        outputFormat: "playwright-json", requiredTests: [name], selection: { mode: "full", reason: "all" }, tally: parseGateOutput(evidence(false), "playwright-json") }))) as GateRunReport;
+      assert.equal(saved.tally!.skipped, 0);
+      if (source === "sidecar" || source === "conflicting" || source === "mismatched") {
+        const meta = JSON.parse(serializeGateRunMeta(saved, {}, new Date()));
+        if (source === "conflicting") meta.outputFormat = "go-json";
+        if (source === "mismatched") meta.headSha = "wrong-head";
+        writeFileSync(gateRunMetaPath(outputPath), JSON.stringify(meta));
+      }
+      delete saved.outputFormat; delete saved.requiredTests; delete saved.tally!.testDetails; delete saved.tally!.skippedTests;
+      const item = parkedItem({ labels: ["done:code-review", "needs-real-claude", "claim:mac", "rework-count:3", "error-retry-count:2"] });
+      const client = new MockClient([item]);
+      await runRealClaudeGateExecution(client, async () => saved, 1, async () => {});
+      assert.equal(item.status, expected, `${source}: ${output}`);
+      for (const label of ["claim:mac", "rework-count:3", "error-retry-count:2"]) assert.ok(item.labels.includes(label));
+      if (expected === "Inbox") {
+        assert.ok(item.labels.includes("needs-real-claude"));
+        assert.ok(item.labels.includes("error:real-claude-gate"));
+        assert.equal(client.updateItemStatusCalls.length, 0);
+      }
+    }
+  });
+
+  test("saved comma and colon requirements recover passing, skipped and absent results", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "named-gate-recovery-"));
+    const captured = JSON.parse(readFileSync(new URL("./fixtures/desktop-1809-live-report.json", import.meta.url), "utf8"));
+    const retained = captured.suites.find((s: any) => s.title === "real-claude-effort-default.spec.ts");
+    for (const title of [retained.specs[0].title, "applied effort: Low, confirmed preference: yes"]) {
+      const name = `${retained.title} › ${title}`;
+      for (const mode of ["full", "selected"] as const) {
+        for (const status of ["passed", "skipped", "absent"] as const) {
+          const suite = JSON.parse(JSON.stringify(retained));
+          suite.specs[0].title = title;
+          if (status === "skipped") suite.specs[0].tests = [{ status: "skipped", annotations: [{ type: "skip", description: "fixture: unavailable" }] }];
+          const output = JSON.stringify({ suites: [...(status === "absent" ? [] : [suite]), { title: "other.spec.ts", specs: [{ title: "unrelated", tests: [{ status: "expected", results: [{ status: "passed" }] }] }] }] });
+          const outputPath = join(dir, `gate-${mode}-${status}-${title.length}.log`);
+          writeFileSync(outputPath, output);
+          const saved = JSON.parse(JSON.stringify(report({ outputPath, outputFormat: "playwright-json",
+            requiredTests: requiredLiveTests(`## Live tests\n${mode === "full" ? "- all\n" : ""}- \`${name}\``),
+            selection: mode === "full" ? { mode, reason: "all" } : { mode, tests: [name], filter: "fixture", reason: "named" }, tally: parseGateOutput(output, "playwright-json") }))) as GateRunReport;
+          // Force raw-artifact recovery of a saved report.
+          delete saved.tally!.testDetails; delete saved.tally!.skippedTests;
+          const item = parkedItem({ labels: ["done:code-review", "needs-real-claude", "claim:mac", "rework-count:3", "error-retry-count:2"] });
+          const client = new MockClient([item]);
+          await runRealClaudeGateExecution(client, async () => saved, 1, async () => {});
+          assert.equal(item.status, status === "passed" ? "In Documentation" : "Inbox");
+          for (const label of ["claim:mac", "rework-count:3", "error-retry-count:2"]) assert.ok(item.labels.includes(label));
+          if (status !== "passed") {
+            assert.ok(item.labels.includes("needs-real-claude"));
+            assert.match(client.addCommentCalls[0].body, status === "skipped" ? /skipped/ : /has no passing execution/);
+          }
+        }
+      }
+    }
+  });
+
+  test("legacy saved reports recover raw evidence without changing claims or retry counts", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "legacy-gate-"));
+    const captured = JSON.parse(readFileSync(new URL("./fixtures/desktop-1809-live-report.json", import.meta.url), "utf8"));
+    const suite = captured.suites.find((s: any) => s.title === "real-claude-codex-channel.spec.ts");
+    suite.specs[0].title = "real codex: GPT-6 Luna replies";
+    const skipped = JSON.stringify(captured);
+    const generic = JSON.stringify({ suites: [{ title: "required.spec.ts", specs: [{ title: "required: case", tests: [
+      { status: "expected", results: [{ status: "passed" }] },
+    ] }] }] });
+    for (const [output, expected] of [[skipped, "Inbox"], [generic, "In Documentation"], ["truncated {", "Inbox"], [null, "Inbox"]] as const) {
+      const outputPath = join(dir, `gate-${expected}-${output?.length ?? 0}.log`);
+      if (output !== null) writeFileSync(outputPath, output);
+      const saved = JSON.parse(JSON.stringify(report({ outputPath, outputFormat: "playwright-json", tally: parseGateOutput(skipped, "playwright-json") }))) as GateRunReport;
+      if (output === generic) saved.requiredTests = ["required.spec.ts › required: case"];
+      else delete saved.requiredTests;
+      delete saved.tally!.testDetails;
+      delete saved.tally!.skippedTests;
+      const item = parkedItem({ labels: ["done:code-review", "needs-real-claude", "claim:mac", "rework-count:3", "error-retry-count:2"] });
+      const client = new MockClient([item]);
+      await runRealClaudeGateExecution(client, async () => saved, output === generic ? 1 : 10, async () => {});
+      assert.equal(item.status, expected);
+      for (const label of ["claim:mac", "rework-count:3", "error-retry-count:2"]) assert.ok(item.labels.includes(label));
+      if (expected === "Inbox") {
+        assert.ok(item.labels.includes("error:real-claude-gate"));
+        assert.ok(item.labels.includes("needs-real-claude"));
+      }
+      if (output === skipped) assert.match(client.addCommentCalls[0].body, /real codex: GPT-6 Luna replies skipped/);
+    }
+  });
+
+  test("saved #1809 skipped, absent or incomplete required acceptance parks without changing ownership or retries", async () => {
+    const captured = readFileSync(new URL("./fixtures/desktop-1809-live-report.json", import.meta.url), "utf8");
+    const luna = "real-claude-codex-channel.spec.ts › real GPT-6 Luna channel replies with Low effort from creation";
+    const absent = JSON.parse(captured);
+    absent.suites = absent.suites.filter((s: any) => s.title !== "real-claude-codex-channel.spec.ts");
+    const incomplete = JSON.parse(captured);
+    // A synthetic parser fixture with a pass but no live attachments.
+    incomplete.suites.find((s: any) => s.title === "real-claude-codex-channel.spec.ts").specs[0].tests = [
+      { status: "expected", results: [{ status: "passed", attachments: [], annotations: [] }] },
+    ];
+    const scenarios = [
+      { output: captured, reason: /Luna.*skipped/ },
+      { output: JSON.stringify(absent), reason: /Luna.*has no passing execution/ },
+      { output: JSON.stringify(incomplete), reason: /Luna.*lacks same-attempt/ },
+    ];
+    for (const selection of [undefined, { mode: "full" as const, reason: "full" },
+      { mode: "selected" as const, tests: [luna], filter: "x", reason: "named" }]) {
+      for (const { output, reason } of scenarios) {
+        const item = parkedItem({ labels: ["done:code-review", "needs-real-claude", "rework-count:3", "claim:mac"] });
+        const client = new MockClient([item]);
+        const saved = JSON.parse(JSON.stringify(report({ selection, requiredTests: [luna], tally: parseGateOutput(output, "playwright-json") })));
+        await runRealClaudeGateExecution(client, async () => saved, 10, async () => {});
+        assert.equal(item.status, "Inbox");
+        for (const label of ["needs-real-claude", "rework-count:3", "claim:mac", "done:code-review"]) assert.ok(item.labels.includes(label));
+        assert.ok(item.labels.includes("error:real-claude-gate"));
+        assert.ok(!client.updateItemStatusCalls.length);
+        assert.ok(!client.removeLabelCalls.some(c => c.label === "needs-real-claude" || c.label === "claim:mac"));
+        assert.match(client.addCommentCalls[0].body, reason);
+      }
+    }
+  });
+
   test("pass advances the ticket and clears the gate label", async () => {
     const item = parkedItem();
     const client = new MockClient([item]);
@@ -1149,6 +1570,23 @@ describe("runRealClaudeGateExecution — outcomes", () => {
     assert.deepEqual(client.removeLabelCalls, [{ issueNumber: 1382, label: "needs-real-claude" }, { issueNumber: 1382, label: REAL_CLAUDE_GATE_RUNNING_LABEL }]);
     assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1382, label: REAL_CLAUDE_GATE_RUNNING_LABEL }]);
     assert.equal(item.status, "In Documentation");
+  });
+
+  test("a genuine Luna failure routes to repair and a retry cannot supply missing live proof", async () => {
+    const doc = JSON.parse(readFileSync(new URL("./fixtures/desktop-1809-live-report.json", import.meta.url), "utf8"));
+    const suite = doc.suites.find((s: any) => s.title === "real-claude-codex-channel.spec.ts");
+    suite.specs[0].tests = [{ status: "unexpected", results: [{ status: "failed" }] }];
+    const requiredTests = ["real-claude-codex-channel.spec.ts › real GPT-6 Luna channel replies with Low effort from creation"];
+    for (const rerunFailures of [null, []]) {
+      const item = parkedItem();
+      const client = new MockClient([item]);
+      await runRealClaudeGateExecution(client, async () => report({
+        requiredTests, exitCode: 1, tally: parseGateOutput(JSON.stringify(doc), "playwright-json"), rerunFailures,
+      }), 10, async () => {});
+      assert.equal(item.status, rerunFailures === null ? "In Development" : "Inbox");
+      assert.ok(item.labels.includes("needs-real-claude"));
+      assert.ok(item.labels.includes(rerunFailures === null ? "needs-rework:developer" : "error:real-claude-gate"));
+    }
   });
 
   test("failure routes to the developer and KEEPS needs-real-claude", async () => {
@@ -1421,6 +1859,7 @@ describe("runRealClaudeGateExecution — evidence and cache", () => {
         executed: 176,
         passed: 176,
         skipped: 2,
+        skippedTests: [{ name: "pkg.TestExternal", reason: "no network" }, { name: "pkg.TestBilling", reason: "metered key absent" }],
         skipReasons: ["pkg.TestExternal: no network", "pkg.TestBilling: metered key absent"],
       }),
     });
