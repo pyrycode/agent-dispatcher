@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import os
 import signal
@@ -66,6 +67,9 @@ class NativeAdapter:
                 self.assertIsNone(process.poll())
             finally:
                 process.terminate();process.wait(timeout=5);process.stderr.close()
+
+def quiet(directory,clock):
+    return module.Housekeeping(directory,clock,stream=io.StringIO())
 
 class Adapter:
     def __init__(self):
@@ -138,9 +142,12 @@ class Tests(unittest.TestCase):
         self.adapter.preflight=lambda p,d:False
         self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'preflight-failed');self.assertEqual(self.adapter.calls,[])
     def test_repeated_health_failure_does_not_restart_again(self):
+        now=[1000];self.worker=module.Supervisor(self.directory,self.adapter,lambda:now[0],housekeeping=quiet(self.directory,lambda:now[0]))
         self.worker.tick(PROJECT,'new');self.adapter.current.update(stopped=True,childrenStopped=True)
         self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'complete')
         self.adapter.current.update(healthy=False)
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'complete')
+        now[0]+=module.DEFAULTS['healthFailureConfirmSeconds']
         self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'attention')
         self.assertEqual(self.adapter.calls,['drain','update','start'])
     def test_startup_probe_can_wait_without_repeating_the_start(self):
@@ -171,5 +178,187 @@ class Tests(unittest.TestCase):
     def test_changed_pid_before_drain_is_preserved(self):
         self.adapter.preflight=lambda p,d:self.adapter.current.update(identity={'pid':22}) or True
         self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'changed-before-drain');self.assertEqual(self.adapter.calls,[])
+
+CONFIRM=module.DEFAULTS['healthFailureConfirmSeconds']
+CLEAR=module.DEFAULTS['healthLatchClearSeconds']
+
+class StaleStateTests(unittest.TestCase):
+    """Modelled on the stale supervisor state cleared by hand on 2026-10-13."""
+    def setUp(self):
+        self.directory=Path(tempfile.mkdtemp());self.adapter=Adapter();self.now=[1000]
+        self.worker=self.supervisor()
+    def supervisor(self):
+        clock=lambda:self.now[0]
+        return module.Supervisor(self.directory,self.adapter,clock,housekeeping=quiet(self.directory,clock))
+    def receipt(self):return self.directory/'org_core.json'
+    def verified(self,desired='new'):
+        self.worker.tick(PROJECT,desired);self.adapter.current.update(stopped=True,childrenStopped=True)
+        self.assertEqual(self.worker.tick(PROJECT,desired)['phase'],'complete')
+    def latch(self):
+        self.verified()
+        self.adapter.current.update(healthy=False)
+        self.worker.tick(PROJECT,'new');self.now[0]+=CONFIRM
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'attention')
+    def archives(self,kind):return sorted(self.directory.glob('auto-'+kind+'-*'))
+    def log(self):return [json.loads(line) for line in (self.directory/'housekeeping.jsonl').read_text().splitlines()]
+
+    def test_manager_restart_reporting_gap_is_not_a_health_failure(self):
+        # pyrybox: manager restarted 17:14:53 for a controller update, Core latched 17:14:55.
+        self.verified()
+        self.adapter.current.update(healthy=False,reportingGap=True)
+        for _ in range(4):
+            self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'complete');self.now[0]+=CONFIRM
+        self.adapter.current.update(healthy=True,reportingGap=False)
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'complete')
+        self.assertEqual(self.adapter.calls,['drain','update','start'])
+        self.assertEqual(json.loads(self.receipt().read_text())['phase'],'complete')
+
+    def test_reporting_gap_without_a_receipt_does_not_restart_a_current_dispatcher(self):
+        self.adapter.current.update(generation='new',healthy=False,reportingGap=True)
+        for _ in range(3):
+            result=self.worker.tick(PROJECT,'new');self.now[0]+=CONFIRM
+            self.assertEqual(result['phase'],'current')
+        self.assertEqual(self.adapter.calls,[])
+
+    def test_short_reporting_blip_from_an_older_manager_does_not_latch(self):
+        # A manager without its start time reports the gap as not-registered only.
+        self.verified()
+        self.adapter.current.update(healthy=False)
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'complete')
+        self.now[0]+=120;self.adapter.current.update(healthy=True)
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'complete')
+        self.now[0]+=CONFIRM;self.adapter.current.update(healthy=False)
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'complete')
+        self.assertEqual(self.adapter.calls,['drain','update','start'])
+
+    def test_genuine_repeated_health_failure_stays_latched_and_is_not_restarted(self):
+        self.latch()
+        # Short healthy spells do not clear it. The window starts over each time.
+        for healthy in [False,True,False,True,False]:
+            self.adapter.current.update(healthy=healthy);self.now[0]+=CLEAR//2
+            self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'attention')
+        self.worker=self.supervisor()
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'attention')
+        self.assertEqual(self.adapter.calls,['drain','update','start'])
+        self.assertEqual(self.archives('latch-cleared'),[])
+
+    def test_latch_clears_after_sustained_health_and_unblocks_the_update(self):
+        # Mac Core and Mobile: false latch on the old pins blocked the newer desired versions.
+        self.latch()
+        state=json.loads(self.receipt().read_text());state.pop('latch');module.atomic(self.receipt(),state)  # A record from before this change.
+        self.adapter.current.update(healthy=True)
+        for _ in range(3):
+            self.assertEqual(self.worker.tick(PROJECT,'newer')['phase'],'attention');self.now[0]+=CLEAR//3
+        result=self.worker.tick(PROJECT,'newer')
+        self.assertEqual(result['phase'],'draining')
+        self.assertIn('Health latch cleared automatically',result['reason'])
+        self.assertEqual(self.adapter.calls,['drain','update','start','drain'])
+        [folder]=self.archives('latch-cleared')
+        self.assertEqual(json.loads((folder/'org_core.json').read_text())['reason'],module.HEALTH_LATCH_REASON)
+        note=json.loads((folder/'archive.json').read_text())
+        self.assertTrue(note['automatic']);self.assertIn('cleared automatically',note['reason'])
+        self.assertEqual([e['kind'] for e in self.log()],['health-latch-cleared'])
+        self.assertEqual(self.worker.housekeeping.recent()[0]['subject'],PROJECT)
+
+    def test_paused_sampling_does_not_count_as_continuous_health(self):
+        self.latch()
+        self.adapter.current.update(healthy=True)
+        self.worker.tick(PROJECT,'new');self.now[0]+=module.DEFAULTS['healthSampleGapSeconds']+1
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'attention')
+        self.now[0]+=CLEAR-1
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'attention')
+
+    def test_cleared_latch_keeps_the_no_repeat_restart_window(self):
+        self.latch()
+        self.adapter.current.update(healthy=True)
+        self.worker.tick(PROJECT,'new');self.now[0]+=CLEAR//2
+        self.worker.tick(PROJECT,'new');self.now[0]+=CLEAR//2
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'complete')
+        self.adapter.current.update(healthy=False)
+        self.worker.tick(PROJECT,'new');self.now[0]+=CONFIRM
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'attention')
+        self.assertEqual(self.adapter.calls,['drain','update','start'])
+
+    def open_record(self,phase,target='old-target',created=1000):
+        module.atomic(self.receipt(),{'phase':phase,'project':PROJECT,'desired':target,'identity':{'pid':20,'start':'birth'},
+            'childGroups':[],'created':created,'claims':{},'policy':['mac',False,['other/repo']]})
+
+    def test_superseded_start_record_is_retired_without_the_six_hour_alert(self):
+        # Fractal Relay: a 16:51 start record for older pins, after a later verified start.
+        self.open_record('verifying')
+        self.adapter.current={'identity':{'pid':30,'start':'later'},'generation':'new','healthy':True,'stopped':False,'childrenStopped':False}
+        self.now[0]=1000+7*3600
+        result=self.worker.tick(PROJECT,'new')
+        self.assertEqual(result['phase'],'current')
+        self.assertIn('Retired verifying record',result['reason'])
+        self.assertFalse(self.receipt().exists())
+        [folder]=self.archives('retired')
+        self.assertEqual(json.loads((folder/'org_core.json').read_text())['desired'],'old-target')
+        self.assertTrue(json.loads((folder/'archive.json').read_text())['automatic'])
+        self.assertEqual([e['kind'] for e in self.log()],['operation-retired'])
+        self.assertEqual(self.adapter.calls,[])
+
+    def test_existing_six_hour_alert_for_superseded_pins_is_retired(self):
+        self.open_record('attention');state=json.loads(self.receipt().read_text())
+        state['reason']=module.SIX_HOUR_REASON;module.atomic(self.receipt(),state)
+        self.adapter.current={'identity':{'pid':30,'start':'later'},'generation':'new','healthy':True,'stopped':False,'childrenStopped':False}
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'current')
+        self.assertEqual(len(self.archives('retired')),1)
+
+    def test_unfinished_record_still_alerts_when_not_superseded(self):
+        self.open_record('verifying')
+        self.adapter.current={'identity':{'pid':30,'start':'later'},'generation':'new','healthy':False,'stopped':False,'childrenStopped':False}
+        self.now[0]=1000+7*3600
+        result=self.worker.tick(PROJECT,'new')
+        self.assertEqual(result['phase'],'attention');self.assertEqual(result['reason'],module.SIX_HOUR_REASON)
+        self.assertEqual(self.archives('retired'),[])
+
+    def test_drained_process_still_running_is_not_retired(self):
+        self.open_record('draining',target='new')
+        self.adapter.current={'identity':{'pid':20,'start':'birth'},'generation':'new','healthy':True,'stopped':False,'childrenStopped':False}
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'draining')
+        self.assertTrue(self.receipt().exists());self.assertEqual(self.archives('retired'),[])
+
+    def test_uncertain_drain_signal_is_never_retired(self):
+        self.open_record('drain-requested')
+        self.adapter.current={'identity':{'pid':30,'start':'later'},'generation':'new','healthy':True,'stopped':False,'childrenStopped':False}
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'attention')
+        self.assertEqual(self.archives('retired'),[])
+
+    def test_own_start_of_the_current_target_completes_with_its_checks(self):
+        self.open_record('verifying',target='new')
+        self.adapter.current={'identity':{'pid':30,'start':'later'},'generation':'new','healthy':True,'stopped':False,'childrenStopped':False}
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'complete')
+        self.assertEqual(self.archives('retired'),[])
+
+class SupervisorReportTests(unittest.TestCase):
+    def test_failed_native_task_pass_still_publishes_operations(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder)
+            for name in ['fleet-supervisor.py']:
+                (root/name).write_bytes(Path(__file__).with_name(name).read_bytes())
+            (root/'fleet-native.py').write_text('''class NativeAdapter:
+    def __init__(self, config): pass
+    def desired(self): return {}
+    def attention(self): return {}
+    def publish_attention(self): pass
+''')
+            (root/'fleet-support.py').write_text('''class SupportSupervisor:
+    def __init__(self, adapter, config): pass
+    def tick(self): raise FileNotFoundError('/tmp/pyry-2939-mobile-lzcyx2qe')
+''')
+            state=root/'state';state.mkdir()
+            (state/'housekeeping.jsonl').write_text(json.dumps({'at':time.time(),'kind':'operation-retired','subject':PROJECT,'reason':'Retired verifying record','archive':'x'})+'\n')
+            report=root/'report.json'
+            config=root/'config.json'
+            config.write_text(json.dumps({'stateDirectory':str(state),'reportFile':str(report),'projects':{PROJECT:{}},'recoveryTasks':{'probe':{}}}))
+            config.chmod(0o600)
+            result=subprocess.run([sys.executable,str(root/'fleet-supervisor.py'),str(config),'--once'],capture_output=True,text=True,timeout=5)
+            self.assertEqual(result.returncode,0,result.stderr)
+            published=json.loads(report.read_text())
+            self.assertEqual([o['project'] for o in published['operations']],[PROJECT])
+            self.assertEqual(published['service'],'attention')
+            self.assertIn('Native task pass failed. FileNotFoundError',published['reason'])
+            self.assertEqual(published['housekeeping'],[{k:v for k,v in json.loads((state/'housekeeping.jsonl').read_text()).items() if k!='archive'}])
 
 if __name__=='__main__':unittest.main()

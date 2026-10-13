@@ -18,7 +18,10 @@ export class MachineManager {
   private tickPromise: Promise<void> | undefined;
   private readonly finished = new Set<string>();
   draining = false;
+  /** A fresh manager has heard from no dispatcher yet. Supervisors read this as a reporting gap, not a health failure. */
+  readonly startedAt: number;
   constructor(readonly config: MachineConfig, readonly claims: ClaimService, private readonly now = Date.now) {
+    this.startedAt = now();
     validateLimits(config);
     if (config.ticketLimit !== undefined && (!Number.isSafeInteger(config.ticketLimit) || config.ticketLimit < 1)) throw new Error("Invalid ticket limit");
     if (!config.machine || new Set(config.projects).size !== config.projects.length) throw new Error("Invalid machine configuration");
@@ -112,7 +115,7 @@ export class MachineManager {
     const available = [...this.offers.values(),...(this.supportOffers?[this.supportOffers]:[])].filter(o => this.now() - o.at < 180_000).flatMap(o => o.work);
     const runnableOffers = available.filter(o => !this.finished.has(`${o.project}/${o.key}`));
     const eligible = new Set(scheduleMachine({ ...this.config, offers: runnableOffers, state }).map(o => `${o.project}/${o.key}`));
-    return { ...(this.config.controlRevision?{controlRevision:this.config.controlRevision}:{}), machine: this.config.machine, heavyLimit: this.config.heavyLimit, combinedLimit: this.config.combinedLimit, ticketLimit: this.config.ticketLimit ?? null, runnableTicketCount: runnableTickets(this.config.machine, runnableOffers, state).size, draining: this.draining, drainingProjects: this.config.drainingProjects ?? [], ...state,
+    return { ...(this.config.controlRevision?{controlRevision:this.config.controlRevision}:{}), managerStartedAt: this.startedAt, machine: this.config.machine, heavyLimit: this.config.heavyLimit, combinedLimit: this.config.combinedLimit, ticketLimit: this.config.ticketLimit ?? null, runnableTicketCount: runnableTickets(this.config.machine, runnableOffers, state).size, draining: this.draining, drainingProjects: this.config.drainingProjects ?? [], ...state,
       projects: this.config.projects.map(project => ({ project, draining: this.config.drainingProjects?.includes(project) ?? false, lastSeen: this.offers.get(project)?.at ?? null, health: !this.offers.has(project) ? "not-registered" : this.now() - this.offers.get(project)!.at >= 180_000 ? "dispatcher-unreachable" : "reporting" })),
       attention: state.runs.filter(r => r.machine === this.config.machine && this.now() - r.created >= 3 * 3600000)
         .map(r => ({ ticket: r.ticket, runId: r.id, reason: "Reservation older than three hours; verify worker progress before intervening" })),

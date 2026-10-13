@@ -55,6 +55,22 @@ test('operation reports accept every phase the supervisor writes', async t => {
   assert.deepEqual(records[0].operations,[{project,phase:'waiting-for-native-task'},{project:'org/desktop',phase:'complete'}]);
 });
 
+test('supervisor reports keep automatic clears and retirements visible without risking the report', async t => {
+  const store = new FleetStore(':memory:', {mac:{heavyLimit:1,combinedLimit:2}});
+  const server = await serveFleet(store,{mac:'mac-fixture'},'admin-fixture',0);
+  t.after(async () => {await new Promise<void>(r=>server.close(()=>r()));store.close();});
+  const address=server.address(); assert.ok(address && typeof address !== 'string');
+  const client=new JsonClient(`http://127.0.0.1:${address.port}`,'mac-fixture');
+  const retired={at:1791915253,kind:'operation-retired',subject:project,reason:'Retired verifying record automatically',archive:'/private/path'};
+  const housekeeping=[retired,{at:'soon',kind:'operation-retired',subject:project,reason:'bad time'},{at:1,kind:'run-command',subject:project,reason:'unknown kind'},
+    {at:1791915300,kind:'native-task-unrecoverable',subject:'c02a547f',reason:'Retained artifacts unrecoverable. FileNotFoundError'}];
+  await client.call('/operations/report',{machine:'mac',report:{operations:[{project,phase:'current'}],housekeeping}});
+  const [record]=await client.call<any[]>('/operations/reports');
+  assert.deepEqual(record.operations,[{project,phase:'current'}]);
+  assert.deepEqual(record.housekeeping,[{at:1791915253,kind:'operation-retired',subject:project,reason:'Retired verifying record automatically'},
+    {at:1791915300,kind:'native-task-unrecoverable',subject:'c02a547f',reason:'Retained artifacts unrecoverable. FileNotFoundError'}]);
+});
+
 test('unavailable optional related evidence preserves the other ticket evidence', async () => {
   const original = globalThis.fetch;
   globalThis.fetch = async input => {

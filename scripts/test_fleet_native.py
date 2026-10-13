@@ -12,6 +12,16 @@ spec=importlib.util.spec_from_file_location('native',Path(__file__).with_name('f
 module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
 
 class Tests(unittest.TestCase):
+    def test_reporting_gap_only_while_a_restarted_manager_has_not_heard_from_the_dispatcher(self):
+        started=1_000_000_000
+        state={'managerStartedAt':started}
+        gap=lambda health,seconds_after,state=state:module.reporting_gap(state,{'health':health},300,now=lambda:started/1000+seconds_after)
+        self.assertTrue(gap('not-registered',2))
+        self.assertFalse(gap('not-registered',301))
+        self.assertFalse(gap('dispatcher-unreachable',2))
+        self.assertFalse(gap('reporting',2))
+        # An older manager does not report its start time. Confirmation covers that case.
+        self.assertFalse(gap('not-registered',2,{}))
     def test_legacy_handoff_snapshot_precedes_the_drain_signal(self):
         with tempfile.TemporaryDirectory() as d:
             adapter=module.NativeAdapter({'stateDirectory':d,'platform':'linux','projects':{'org/core':{'container':'core'}}})

@@ -135,7 +135,10 @@ class SetupCustodyTests(unittest.TestCase):
             # signals or invalidate drainage already proved before publication.
             with patch.object(m, 'process_snapshot', return_value={123: {**root, 'identity': 'unrelated'}}), \
                  patch.object(m.os, 'killpg') as send:
-                with self.assertRaisesRegex(RuntimeError, 'Interrupted artifact upload'): restarted.tick()
+                # The interrupted record is skipped and reported; the pass continues.
+                skipped = [e for e in restarted.tick() if e.get('phase') == 'error']
+                self.assertEqual([e['id'] for e in skipped], ['job'])
+                self.assertIn('Interrupted artifact upload', skipped[0]['reason'])
                 resumed = m.SupportSupervisor(Adapter(), config); resumed.rpc = rpc
                 resumed.tick()
                 send.assert_not_called()
