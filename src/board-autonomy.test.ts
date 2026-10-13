@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { RecoveryFacts, type PauseRecord } from './recovery-facts.js';
 import { RecoveryLedger, recoveryTrigger } from './fleet-recovery.js';
 import { FleetStore } from './fleet-store.js';
+import { OPERATION_PHASES } from './operation-reports.js';
 import { serveFleet, JsonClient } from './fleet-http.js';
 import { recoveryPlan, observationFor, runRecoveryWork } from './recovery-work.js';
 import { recoveryInventory, relatedTickets, relatedEvidence } from './recovery-evidence.js';
@@ -37,6 +38,21 @@ test('supervisor reports are machine-scoped and contain no executable or ownersh
   assert.deepEqual(records[0].operations,[{project,phase:'attention',reason:'Restart needs inspection'}]);
   assert.equal(records[0].machine,'mac');
   await assert.rejects(client.call('/operations/report',{machine:'mac',report:{operations:[{project,phase:'arbitrary-command'}]}}));
+});
+
+test('operation reports accept every phase the supervisor writes', async t => {
+  const source = readFileSync(join(import.meta.dirname, '..', 'scripts', 'fleet-supervisor.py'), 'utf8');
+  const written = new Set([...source.matchAll(/'phase'\]?\s*[:=]\s*'([a-z-]+)'/g)].map(m => m[1]));
+  assert.ok(written.has('waiting-for-native-task'));
+  assert.deepEqual([...written].filter(phase => !OPERATION_PHASES.includes(phase)), []);
+  const store = new FleetStore(':memory:', {linux:{heavyLimit:1,combinedLimit:2}});
+  const server = await serveFleet(store,{linux:'linux-fixture'},'admin-fixture',0);
+  t.after(async () => {await new Promise<void>(r=>server.close(()=>r()));store.close();});
+  const address=server.address(); assert.ok(address && typeof address !== 'string');
+  const client=new JsonClient(`http://127.0.0.1:${address.port}`,'linux-fixture');
+  await client.call('/operations/report',{machine:'linux',report:{operations:[{project,phase:'waiting-for-native-task'},{project:'org/desktop',phase:'complete'}]}});
+  const records=await client.call<any[]>('/operations/reports');
+  assert.deepEqual(records[0].operations,[{project,phase:'waiting-for-native-task'},{project:'org/desktop',phase:'complete'}]);
 });
 
 test('unavailable optional related evidence preserves the other ticket evidence', async () => {
