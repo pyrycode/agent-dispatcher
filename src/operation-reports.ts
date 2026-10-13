@@ -1,13 +1,17 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { scrubCredentials } from './agent-runtime.js';
 
+export const OPERATION_PHASES: readonly string[] = ['current','stopped','drain-requested','draining','start-requested','verifying','complete','attention','preflight-failed','changed-before-drain','waiting-for-native-task'];
+
 export class OperationReports {
   constructor(private db: DatabaseSync, private machines: string[], private now = Date.now) {
     db.exec('CREATE TABLE IF NOT EXISTS fleet_operation_reports (machine TEXT PRIMARY KEY, received INTEGER NOT NULL, report TEXT NOT NULL) STRICT;');
   }
   record(machine: string, value: any): void {
     if (!this.machines.includes(machine) || !value || !Array.isArray(value.operations) || value.operations.length > 20) throw new Error('Invalid operation report');
-    const phases = ['current','stopped','drain-requested','draining','start-requested','verifying','complete','attention','preflight-failed','changed-before-drain'];
+    // Every phase scripts/fleet-supervisor.py writes. A missing one rejects the
+    // whole report, so the machine publishes only a generic control-service error.
+    const phases = OPERATION_PHASES;
     const operations = value.operations.map((o: any) => {
       if (!o || !/^[\w.-]+\/[\w.-]+$/.test(o.project ?? '') || !phases.includes(o.phase)) throw new Error('Invalid operation status');
       return {project:o.project,phase:o.phase,...(typeof o.reason === 'string' ? {reason:scrubCredentials(o.reason.slice(0,1000))} : {})};
