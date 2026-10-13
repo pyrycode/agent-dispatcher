@@ -56,6 +56,12 @@ def credential_probe(env, salt, project):
     except Exception:
         return {'ok': False}
 
+def reporting_gap(state, reporting, seconds, now=time.time):
+    """A manager that restarted recently has not yet heard from its dispatchers."""
+    started = state.get('managerStartedAt')
+    return (reporting.get('health') == 'not-registered' and isinstance(started, (int, float))
+            and now() * 1000 - started < seconds * 1000)
+
 class NativeAdapter:
     def __init__(self, config):
         self.config = config
@@ -217,6 +223,7 @@ print(json.dumps({'startupHealthy': health.get('passed'), 'runtime': receipt, 'p
         reporting = next((p for p in state['projects'] if p['project'] == project), {})
         return {'identity': identity, 'childGroups': groups, 'stopped': False, 'childrenStopped': False,
                 'healthy': probe.get('ok') and reporting.get('health') == 'reporting' and startup_healthy,
+                'reportingGap': reporting_gap(state, reporting, self.config.get('reportingGapSeconds', 300)),
                 'generation': {'consumer': consumer, 'dispatcher': dispatcher, 'credential': probe.get('credential')}}
 
     def identity_from_receipt(self, project):

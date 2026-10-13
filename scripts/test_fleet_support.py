@@ -76,7 +76,9 @@ class SupportTests(unittest.TestCase):
     self.fail('Unexpected operation '+op)
    s.rpc=rpc
    with patch.object(s,'route_ready',return_value=False),patch.object(m,'execute') as execute,patch.object(m,'clone') as clone,patch.object(m.subprocess,'Popen') as spawn:
-    with self.assertRaisesRegex(RuntimeError,'Lost connection'):s.tick()
+    skipped=[e for e in s.tick() if e.get('phase')=='error']
+    self.assertEqual([e['id'] for e in skipped],[task_id]);self.assertIn('Lost connection',skipped[0]['reason'])
+    self.assertNotIn('artifactUnrecoverable',json.loads(receipt.read_text()))
     self.assertNotIn('artifactDigest',json.loads(receipt.read_text()))
     s.tick();s.tick();execute.assert_not_called();clone.assert_not_called();spawn.assert_not_called()
    self.assertEqual(manifests[0],manifests[1]);self.assertGreater(manifests[0]['totalBytes'],4*1024*1024)
@@ -88,6 +90,92 @@ class SupportTests(unittest.TestCase):
     data=b''.join(retained[entry['path'],i] for i in range(len(entry['chunks'])))
     self.assertEqual(data,records[entry['path'].removeprefix('mobile/')].encode())
     self.assertEqual(hashlib.sha256(data).hexdigest(),entry['sha256']);self.assertEqual(len(data),entry['bytes'])
+ def test_missing_capture_folder_marks_one_record_unrecoverable_and_the_pass_continues(self):
+  # HP c02a547f: its capture folder lived in a recreated container's temporary space.
+  with tempfile.TemporaryDirectory() as d:
+   bad_id='c02a547f02bb3c7548c17198150b7acc5e290ef937d1ef495d8a1651f454d58e';good_id='f'*64
+   class Adapter:
+    def status(self):return {'machine':'build-hp-1','draining':False}
+   s=m.SupportSupervisor(Adapter(),{'stateDirectory':d,'recoveryTasks':{'android-tool-then-text:android-emulator':{'capability':'android-emulator'}}})
+   logged=[];s.housekeeping=lambda kind,subject,reason:logged.append((kind,subject,reason))
+   bad=Path(d)/'bad';bad.mkdir()
+   (bad/'execution.log').write_text('#2939 private recovery: '+str(Path(d)/'pyry-2939-mobile-lzcyx2qe')+'\n')
+   m.atomic(bad/'task.json',{'id':bad_id,'request':{'recipe':'android-tool-then-text','revision':'a'*40}})
+   m.atomic(bad/'result.json',{'outcome':'failed','summary':'Android capture completed. Artifact bundle exceeds transport size; its original private directory remains available.','files':{}})
+   good=Path(d)/'good';good.mkdir()
+   m.atomic(good/'result.json',{'outcome':'completed','summary':'Probe.','files':{'platform.json':'{}'}})
+   bad_receipt=s.directory/(bad_id+'.receipt.json');good_receipt=s.directory/(good_id+'.receipt.json')
+   m.atomic(bad_receipt,{'id':bad_id,'session':'s1','phase':'complete','result':str(bad/'result.json'),'pid':1})
+   m.atomic(good_receipt,{'id':good_id,'session':'s2','phase':'complete','result':str(good/'result.json'),'pid':2})
+   calls=[]
+   def rpc(op,body):
+    calls.append((op,body.get('id')))
+    return artifact_reply(op,body)
+   s.rpc=rpc
+   with patch.object(s,'route_ready',return_value=False):
+    self.assertEqual(s.tick(),[])
+    s.tick()
+   saved=json.loads(bad_receipt.read_text())
+   self.assertNotIn('artifactDigest',saved)
+   self.assertIn('FileNotFoundError',saved['artifactUnrecoverable']['reason'])
+   self.assertIn('artifactDigest',json.loads(good_receipt.read_text()))
+   self.assertEqual([entry[:2] for entry in logged],[('native-task-unrecoverable',bad_id)])
+   self.assertNotIn(bad_id,[task for op,task in calls if op.startswith('artifacts')])
+   # The pass reached scheduling on both ticks.
+   self.assertEqual([op for op,_ in calls].count('schedule'),2)
+ def support_with(self,d,receipts,draining=False):
+  class Adapter:
+   def status(self):return {'machine':'build-hp-1','draining':draining}
+  s=m.SupportSupervisor(Adapter(),{'stateDirectory':d,'recoveryTasks':{'probe:macos-arm64':{'capability':'macos-arm64'}}})
+  logged=[];s.housekeeping=lambda kind,subject,reason:logged.append((kind,subject))
+  calls=[];s.rpc=lambda op,body:calls.append(op) or artifact_reply(op,body)
+  result=Path(d)/'result.json';m.atomic(result,{'outcome':'completed','summary':'Probe.','files':{'platform.json':'{}'}})
+  for task,phase in receipts:m.atomic(s.directory/(task+'.receipt.json'),{'id':task,'session':'s','phase':phase,'result':str(result),'pid':1})
+  return s,logged,calls
+ def test_a_non_artifact_record_error_skips_scheduling_for_that_pass(self):
+  with tempfile.TemporaryDirectory() as d:
+   s,logged,calls=self.support_with(d,[('a','running')])
+   with patch.object(s,'route_ready',return_value=False),patch.object(m,'process_snapshot',side_effect=RuntimeError('census unavailable')):
+    [entry]=s.tick()
+   self.assertEqual(entry['phase'],'error');self.assertIn('census unavailable',entry['reason'])
+   self.assertNotIn('schedule',calls)
+ def test_an_artifact_transfer_error_is_retried_and_scheduling_continues(self):
+  with tempfile.TemporaryDirectory() as d:
+   s,logged,calls=self.support_with(d,[('a','complete')])
+   def rpc(op,body):
+    calls.append(op)
+    if op=='artifacts-begin':raise RuntimeError('Lost connection')
+    return artifact_reply(op,body)
+   s.rpc=rpc
+   with patch.object(s,'route_ready',return_value=False):[entry]=s.tick()
+   self.assertIn('Lost connection',entry['reason']);self.assertIn('schedule',calls)
+   self.assertNotIn('artifactUnrecoverable',json.loads((s.directory/'a.receipt.json').read_text()))
+ def test_only_known_local_artifact_failures_are_unrecoverable(self):
+  for error,marked in [(PermissionError(13,'denied'),False),(OSError(5,'io'),False),(RuntimeError('other'),False),
+                       (KeyError('id'),True),(FileNotFoundError(2,'gone'),True),(RuntimeError('Capture returned no unique private recovery directory'),True)]:
+   with self.subTest(error=error),tempfile.TemporaryDirectory() as d:
+    s,logged,calls=self.support_with(d,[('a','complete')])
+    with patch.object(s,'route_ready',return_value=False),patch.object(s,'artifact_files',side_effect=error):
+     entries=s.tick()
+    saved=json.loads((s.directory/'a.receipt.json').read_text())
+    self.assertEqual('artifactUnrecoverable' in saved,marked)
+    self.assertEqual(entries,[] if marked else [entries[0]])
+    self.assertIn('schedule',calls)
+ def test_a_malformed_skip_record_is_treated_as_empty(self):
+  for content in ['[1,2]','"text"','null','{broken']:
+   with self.subTest(content=content),tempfile.TemporaryDirectory() as d:
+    (Path(d)/'native-task-skips.json').write_text(content)
+    s,logged,calls=self.support_with(d,[('a','complete')])
+    self.assertEqual(s.reported_errors,{})
+    with patch.object(s,'route_ready',return_value=False),patch.object(s,'artifact_files',side_effect=PermissionError(13,'denied')):s.tick()
+    self.assertEqual(logged,[('native-task-skipped','a')])
+ def test_a_supervisor_restart_does_not_log_the_same_skip_again(self):
+  with tempfile.TemporaryDirectory() as d:
+   s,logged,calls=self.support_with(d,[('a','complete')])
+   with patch.object(s,'route_ready',return_value=False),patch.object(s,'artifact_files',side_effect=PermissionError(13,'denied')):s.tick();s.tick()
+   restarted,relogged,_=self.support_with(d,[])
+   with patch.object(restarted,'route_ready',return_value=False),patch.object(restarted,'artifact_files',side_effect=PermissionError(13,'denied')):restarted.tick()
+   self.assertEqual(logged,[('native-task-skipped','a')]);self.assertEqual(relogged,[])
  def test_capture_inventory_keeps_more_than_64_files_and_refuses_escaping_symlinks(self):
   with tempfile.TemporaryDirectory() as d,tempfile.TemporaryDirectory() as outside:
    capture=Path(d)/'capture';capture.mkdir();log=Path(d)/'execution.log';log.write_text('#2939 private recovery: '+str(capture)+'\n')

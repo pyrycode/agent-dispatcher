@@ -5,7 +5,9 @@ import { listen, readJson, tokenMatches, type FleetClient } from "./fleet-http.j
 import { validateStart, validateLimits, type MachineLimits, type FleetRun } from "./fleet-store.js";
 import { scheduleMachine, runnableTickets, acceptsDuringProjectDrain, type WorkOffer } from "./machine-scheduler.js";
 
-export interface MachineConfig extends MachineLimits { machine: string; projects: string[]; drainingProjects?: string[]; ticketLimit?: number; controlRevision?: string }
+/** An operator drain or resume command, kept so a supervisor can tell it from an unexplained policy change. */
+export interface ProjectDrainChange { project: string; draining: boolean; at: number }
+export interface MachineConfig extends MachineLimits { machine: string; projects: string[]; drainingProjects?: string[]; projectDrainChanges?: ProjectDrainChange[]; ticketLimit?: number; controlRevision?: string }
 type ClaimService = Pick<FleetClient, "snapshot" | "start" | "finish"> & Partial<Pick<FleetClient, "authorize" | "github" | "call">>;
 interface Offers { session: string; work: WorkOffer[]; at: number }
 export function offerId(machine: string, session: string, offer: WorkOffer): string {
@@ -18,21 +20,26 @@ export class MachineManager {
   private tickPromise: Promise<void> | undefined;
   private readonly finished = new Set<string>();
   draining = false;
+  /** A fresh manager has heard from no dispatcher yet. Supervisors read this as a reporting gap, not a health failure. */
+  readonly startedAt: number;
   constructor(readonly config: MachineConfig, readonly claims: ClaimService, private readonly now = Date.now) {
+    this.startedAt = now();
     validateLimits(config);
     if (config.ticketLimit !== undefined && (!Number.isSafeInteger(config.ticketLimit) || config.ticketLimit < 1)) throw new Error("Invalid ticket limit");
     if (!config.machine || new Set(config.projects).size !== config.projects.length) throw new Error("Invalid machine configuration");
     if (config.drainingProjects !== undefined && (!Array.isArray(config.drainingProjects) || config.drainingProjects.some(p => !config.projects.includes(p)))) throw new Error("Invalid project drain configuration");
   }
-  async setProjectDraining(project: string, draining: boolean, persist: (projects: string[]) => void): Promise<void> {
+  async setProjectDraining(project: string, draining: boolean, persist: (projects: string[], changes: ProjectDrainChange[]) => void): Promise<void> {
     if (!this.config.projects.includes(project) || typeof draining !== "boolean") throw new Error("Invalid project drain request");
     const projects = new Set(this.config.drainingProjects ?? []);
     if (draining) projects.add(project); else projects.delete(project);
     const next = [...projects];
+    const changes = [...(this.config.projectDrainChanges ?? []), { project, draining, at: this.now() }].slice(-50);
     // Save before acknowledging or changing admission. A failed save leaves
     // the previous policy intact. Both operations are synchronous.
-    persist(next);
+    persist(next, changes);
     this.config.drainingProjects = next;
+    this.config.projectDrainChanges = changes;
     // A start already sent to the authority can still commit. Wait for it
     // before acknowledging the drain; subsequent jobs check the new policy.
     try { await this.tickPromise; } catch { /* a lost reply remains reserved */ }
@@ -112,7 +119,7 @@ export class MachineManager {
     const available = [...this.offers.values(),...(this.supportOffers?[this.supportOffers]:[])].filter(o => this.now() - o.at < 180_000).flatMap(o => o.work);
     const runnableOffers = available.filter(o => !this.finished.has(`${o.project}/${o.key}`));
     const eligible = new Set(scheduleMachine({ ...this.config, offers: runnableOffers, state }).map(o => `${o.project}/${o.key}`));
-    return { ...(this.config.controlRevision?{controlRevision:this.config.controlRevision}:{}), machine: this.config.machine, heavyLimit: this.config.heavyLimit, combinedLimit: this.config.combinedLimit, ticketLimit: this.config.ticketLimit ?? null, runnableTicketCount: runnableTickets(this.config.machine, runnableOffers, state).size, draining: this.draining, drainingProjects: this.config.drainingProjects ?? [], ...state,
+    return { ...(this.config.controlRevision?{controlRevision:this.config.controlRevision}:{}), managerStartedAt: this.startedAt, machine: this.config.machine, heavyLimit: this.config.heavyLimit, combinedLimit: this.config.combinedLimit, ticketLimit: this.config.ticketLimit ?? null, runnableTicketCount: runnableTickets(this.config.machine, runnableOffers, state).size, draining: this.draining, drainingProjects: this.config.drainingProjects ?? [], projectDrainChanges: this.config.projectDrainChanges ?? [], ...state,
       projects: this.config.projects.map(project => ({ project, draining: this.config.drainingProjects?.includes(project) ?? false, lastSeen: this.offers.get(project)?.at ?? null, health: !this.offers.has(project) ? "not-registered" : this.now() - this.offers.get(project)!.at >= 180_000 ? "dispatcher-unreachable" : "reporting" })),
       attention: state.runs.filter(r => r.machine === this.config.machine && this.now() - r.created >= 3 * 3600000)
         .map(r => ({ ticket: r.ticket, runId: r.id, reason: "Reservation older than three hours; verify worker progress before intervening" })),
@@ -139,7 +146,7 @@ export class MachineManager {
   }
 }
 
-export async function serveManager(manager: MachineManager, projectTokens: Record<string, string>, operatorToken: string, port: number | string, host = "127.0.0.1", persistDrains?: (projects: string[]) => void): Promise<Server> {
+export async function serveManager(manager: MachineManager, projectTokens: Record<string, string>, operatorToken: string, port: number | string, host = "127.0.0.1", persistDrains?: (projects: string[], changes: ProjectDrainChange[]) => void): Promise<Server> {
   const tokens = [...Object.values(projectTokens), operatorToken];
   if (tokens.some(t => !t) || new Set(tokens).size !== tokens.length) throw new Error("Manager credentials must be distinct");
   const server = createServer(async (req, res) => {

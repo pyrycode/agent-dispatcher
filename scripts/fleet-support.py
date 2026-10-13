@@ -15,6 +15,13 @@ from pathlib import Path
 from contextlib import contextmanager
 
 RECIPES={'platform-probe','memory-runtime-smoke','android-tool-then-text','dispatcher-repair'}
+# Deterministic local failures of retained artifacts. Anything else is retried next pass.
+UNRECOVERABLE_ARTIFACTS=('Capture returned no unique private recovery directory','Capture artifact escapes its private directory',
+    'Capture artifacts exceed total bounds','Retained task receipt mismatch','Invalid artifact path','Task artifacts exceed total bounds')
+
+def artifacts_unrecoverable(error):
+    if isinstance(error,(FileNotFoundError,KeyError)):return True
+    return type(error) is RuntimeError and str(error).startswith(UNRECOVERABLE_ARTIFACTS)
 ARTIFACT_BYTES=64*1024*1024
 ARTIFACT_FILES=1024
 CHUNK_BYTES=256*1024
@@ -304,6 +311,10 @@ def native_recipe(task,paths,directory):
     artifact_manifest(files)
     return {'outcome':'completed' if code==0 else 'failed','summary':summary,'files':files}
 
+class ArtifactPassError(Exception):
+    """A completed record's artifact recovery failed. No worker or host state is involved."""
+    def __init__(self,error):super().__init__(type(error).__name__+': '+str(error));self.error=error
+
 def route_available(route):
     capability=route['capability']
     required=['go'] if capability in {'linux-amd64','macos-arm64'} else ['go','java','adb'] if capability=='android-emulator' else ['node','pnpm','codex']
@@ -315,6 +326,13 @@ def route_available(route):
 class SupportSupervisor:
     def __init__(self,adapter,config):
         self.adapter=adapter;self.config=config;self.children={};self.directory=Path(config['stateDirectory'])/'tasks'
+        # Optional callable(kind, subject, reason) for automatic state changes.
+        self.housekeeping=None
+        # Persisted so a supervisor re-exec does not log the same skip again.
+        self.skips_file=Path(config['stateDirectory'])/'native-task-skips.json'
+        try:self.reported_errors=json.loads(self.skips_file.read_text())
+        except (OSError,ValueError):self.reported_errors={}
+        if not isinstance(self.reported_errors,dict):self.reported_errors={}
         self.directory.mkdir(parents=True,exist_ok=True,mode=0o700)
 
     def rpc(self,operation,body):
@@ -355,7 +373,8 @@ class SupportSupervisor:
             old['drainConfirmed']=True;atomic(receipt,old)
         return drained
 
-    def return_artifacts(self,machine,receipt,value):
+    def artifact_files(self,receipt,value):
+        """Local inputs only. A failure here repeats on every pass."""
         files=value.get('files',{})
         # The old helper discarded oversized capture records but retained their
         # directory in its private execution log. Recover that saved execution.
@@ -364,6 +383,11 @@ class SupportSupervisor:
             task=json.loads((directory/'task.json').read_text())
             if task['id']!=receipt['id'] or task['request']['recipe']!='android-tool-then-text':raise RuntimeError('Retained task receipt mismatch')
             files=capture_records(directory/'execution.log')
+        artifact_manifest(files)
+        return files
+
+    def return_artifacts(self,machine,receipt,value,files=None):
+        if files is None:files=self.artifact_files(receipt,value)
         manifest=artifact_manifest(files)
         identity={'machine':machine,'id':receipt['id'],'session':receipt['session']}
         transfer=self.rpc('artifacts-begin',{**identity,'manifest':manifest})
@@ -379,6 +403,81 @@ class SupportSupervisor:
         self.rpc('artifacts-commit',{**identity,'digest':digest,'result':{**value,'files':{}}})
         return digest
 
+    def receipt_pass(self,machine,receipt,running):
+        old=json.loads(receipt.read_text())
+        if old['phase']=='complete' and (old.get('artifactDigest') or old.get('artifactUnrecoverable')):return
+        result=Path(old['result'])
+        if old['phase']=='complete' and not result.is_file():return
+        if old['phase']=='complete':
+            # This trusted supervisor receipt records the prior terminal
+            # acknowledgement. Recover bytes only, without launching or
+            # signalling workers or changing the already released outcome.
+            try:
+                value=json.loads(Path(old.get('artifactResult',str(result))).read_text())
+                if 'publication.json' in value.get('files',{}):return
+                files=self.artifact_files(old,value)
+            except Exception as error:
+                if not artifacts_unrecoverable(error):raise ArtifactPassError(error) from error
+                # The retained inputs are gone or invalid, for example a capture
+                # folder in a recreated container's temporary space. The outcome
+                # was already acknowledged, so only the artifacts are lost.
+                reason='Retained artifacts unrecoverable. '+type(error).__name__+': '+str(error)[:300]
+                old['artifactUnrecoverable']={'at':time.time(),'reason':reason};atomic(receipt,old)
+                if self.housekeeping:self.housekeeping('native-task-unrecoverable',old['id'],reason)
+                return
+            try:old['artifactDigest']=self.return_artifacts(machine,old,value,files)
+            except Exception as error:raise ArtifactPassError(error) from error
+            atomic(receipt,old)
+            return
+        child=self.children.get(old.get('pid'))
+        custody=old.get('custody')
+        def observe_worker():
+            nonlocal snapshot,custody_state
+            if old.get('drainConfirmed'):
+                custody_state='drained';return
+            snapshot=process_snapshot()
+            custody_state=observe_custody(custody,snapshot) if custody else 'uncertain'
+            if custody:
+                custody['phase']=custody_state
+                atomic(receipt,old)
+        snapshot=None;custody_state='uncertain'
+        observe_worker()
+        # Preserve the leader as an ownership anchor until its descendants
+        # have been recorded; poll() can reap it immediately.
+        root_alive=not old.get('drainConfirmed') and child is not None and poll_with_custody(child,observe_worker) is None
+        root=custody.get('root') if custody else None
+        observed=snapshot.get(old.get('pid')) if snapshot is not None else None
+        worker_alive=root_alive or bool(child is None and root and observed and
+            observed['identity']==root['identity'] and not observed['state'].startswith(('Z','X')))
+        alive=root_alive or custody_state!='drained'
+        if result.is_file() and not alive and self.drained(old,receipt):
+            value=json.loads(Path(old.get('artifactResult',str(result))).read_text())
+            publication=value.get('files',{}).pop('publication.json',None)
+            if publication:
+                self.rpc('prepare-repair',{'machine':machine,'id':old['id'],'session':old['session'],'publication':json.loads(publication)})
+                old['phase']='publishing';atomic(receipt,old)
+                published=self.rpc('publish-repair',{'machine':machine,'id':old['id'],'session':old['session'],'publication':json.loads(publication)})
+                if published.get('pendingControl'):running.append(old);return
+                value['summary']='Dispatcher repair '+published['url']+'. '+('Merged; supervised rollout is pending.' if published.get('merged') else published.get('reason','Review remains pending.'))
+                value['files']={'publication-result.json':json.dumps(published)}
+                if published.get('dispatcherSHA'):value['dispatcherRevision']=published['dispatcherSHA']
+                # A later publication retry can return different consumer
+                # receipts. Freeze the exact upload before its first part,
+                # so a lost acknowledgement never changes its manifest.
+                artifact_result=result.with_name('artifact-result.json')
+                atomic(artifact_result,value)
+                old['artifactResult']=str(artifact_result);atomic(receipt,old)
+            old['artifactDigest']=self.return_artifacts(machine,old,value)
+            old['phase']='complete';atomic(receipt,old)
+        elif old['phase']=='attention':
+            running.append(old)
+        elif old['phase']=='launch-requested' or not worker_alive:
+            # Delivery could have happened before a crash. Never create another worker.
+            old['phase']='attention';old['reason']='Task worker or descendants have no confirmed drainage; inspect the retained process and reservation';atomic(receipt,old)
+            self.rpc('uncertain',{'machine':machine,'id':old['id'],'session':old['session'],'reason':old['reason']})
+            running.append(old)
+        else:running.append(old)
+
     def tick(self):
         routes=self.config.get('recoveryTasks',{})
         if not routes:return []
@@ -388,70 +487,26 @@ class SupportSupervisor:
         scheduler_session=json.loads(session_file.read_text())['session']
         capabilities=sorted(set(route['capability'] for route in routes.values() if self.route_ready(route)))
         self.rpc('capabilities',{'machine':machine,'record':{'capabilities':capabilities,'ready':not state.get('draining',False)}})
-        running=[]
-        for receipt in self.directory.glob('*.receipt.json'):
-            old=json.loads(receipt.read_text())
-            if old['phase']=='complete' and old.get('artifactDigest'):continue
-            result=Path(old['result'])
-            if old['phase']=='complete' and not result.is_file():continue
-            if old['phase']=='complete':
-                # This trusted supervisor receipt records the prior terminal
-                # acknowledgement. Recover bytes only, without launching or
-                # signalling workers or changing the already released outcome.
-                value=json.loads(Path(old.get('artifactResult',str(result))).read_text())
-                if 'publication.json' in value.get('files',{}):continue
-                old['artifactDigest']=self.return_artifacts(machine,old,value)
-                atomic(receipt,old)
-                continue
-            child=self.children.get(old.get('pid'))
-            custody=old.get('custody')
-            def observe_worker():
-                nonlocal snapshot,custody_state
-                if old.get('drainConfirmed'):
-                    custody_state='drained';return
-                snapshot=process_snapshot()
-                custody_state=observe_custody(custody,snapshot) if custody else 'uncertain'
-                if custody:
-                    custody['phase']=custody_state
-                    atomic(receipt,old)
-            snapshot=None;custody_state='uncertain'
-            observe_worker()
-            # Preserve the leader as an ownership anchor until its descendants
-            # have been recorded; poll() can reap it immediately.
-            root_alive=not old.get('drainConfirmed') and child is not None and poll_with_custody(child,observe_worker) is None
-            root=custody.get('root') if custody else None
-            observed=snapshot.get(old.get('pid')) if snapshot is not None else None
-            worker_alive=root_alive or bool(child is None and root and observed and
-                observed['identity']==root['identity'] and not observed['state'].startswith(('Z','X')))
-            alive=root_alive or custody_state!='drained'
-            if result.is_file() and not alive and self.drained(old,receipt):
-                value=json.loads(Path(old.get('artifactResult',str(result))).read_text())
-                publication=value.get('files',{}).pop('publication.json',None)
-                if publication:
-                    self.rpc('prepare-repair',{'machine':machine,'id':old['id'],'session':old['session'],'publication':json.loads(publication)})
-                    old['phase']='publishing';atomic(receipt,old)
-                    published=self.rpc('publish-repair',{'machine':machine,'id':old['id'],'session':old['session'],'publication':json.loads(publication)})
-                    if published.get('pendingControl'):running.append(old);continue
-                    value['summary']='Dispatcher repair '+published['url']+'. '+('Merged; supervised rollout is pending.' if published.get('merged') else published.get('reason','Review remains pending.'))
-                    value['files']={'publication-result.json':json.dumps(published)}
-                    if published.get('dispatcherSHA'):value['dispatcherRevision']=published['dispatcherSHA']
-                    # A later publication retry can return different consumer
-                    # receipts. Freeze the exact upload before its first part,
-                    # so a lost acknowledgement never changes its manifest.
-                    artifact_result=result.with_name('artifact-result.json')
-                    atomic(artifact_result,value)
-                    old['artifactResult']=str(artifact_result);atomic(receipt,old)
-                old['artifactDigest']=self.return_artifacts(machine,old,value)
-                old['phase']='complete';atomic(receipt,old)
-            elif old['phase']=='attention':
-                running.append(old)
-            elif old['phase']=='launch-requested' or not worker_alive:
-                # Delivery could have happened before a crash. Never create another worker.
-                old['phase']='attention';old['reason']='Task worker or descendants have no confirmed drainage; inspect the retained process and reservation';atomic(receipt,old)
-                self.rpc('uncertain',{'machine':machine,'id':old['id'],'session':old['session'],'reason':old['reason']})
-                running.append(old)
-            else:running.append(old)
-        if state.get('draining'):return running
+        running=[];host_uncertain=False;errors={}
+        for receipt in sorted(self.directory.glob('*.receipt.json')):
+            task=receipt.name[:-len('.receipt.json')]
+            # One bad record must not stop the pass, later records or the operation report.
+            try:self.receipt_pass(machine,receipt,running)
+            except Exception as error:
+                detail=str(error) if isinstance(error,ArtifactPassError) else type(error).__name__+': '+str(error)
+                reason='Native task record skipped this pass. '+detail[:300]
+                running.append({'id':task,'phase':'error','reason':reason})
+                errors[task]=reason
+                # Only a completed record's artifact transfer is known to be local
+                # to that record. Anything else may be host-wide, such as an
+                # unavailable process census, so no new worker starts this pass.
+                if not isinstance(error,ArtifactPassError):host_uncertain=True
+                # Logged once per distinct failure, not on every pass.
+                if self.reported_errors.get(task)!=reason and self.housekeeping:
+                    self.housekeeping('native-task-skipped',task,reason)
+        if errors!=self.reported_errors:
+            self.reported_errors=errors;atomic(self.skips_file,errors)
+        if state.get('draining') or host_uncertain:return running
         for grant in self.rpc('schedule',{'session':scheduler_session}):
             task=grant['task'];session=grant['run']['session']
             receipt=self.directory/(task['id']+'.receipt.json')

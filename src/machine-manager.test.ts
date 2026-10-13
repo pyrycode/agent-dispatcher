@@ -101,3 +101,12 @@ test("manager enforces the cap over repeated polls and returns space after compl
   assert.equal(store.snapshot().claims.length, 3); // Done claims remain reserved.
   store.close();
 });
+test("a restarted manager reports its start time so supervisors can tell a reporting gap from a failure", async () => {
+  let now = 5_000;
+  const client = { snapshot: async () => ({ claims: [], runs: [] }), start: async () => ({ ok: false as const, reason: "foreign-claim" as const }), finish: async () => {} };
+  const manager = new MachineManager({ machine: "mac", heavyLimit: 1, combinedLimit: 2, projects: ["org/core"] }, client, () => now);
+  now = 7_000;
+  const status = await manager.status();
+  assert.equal(status.managerStartedAt, 5_000);
+  assert.equal(status.projects[0].health, "not-registered");
+});
