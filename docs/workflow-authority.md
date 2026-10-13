@@ -30,6 +30,16 @@ GraphQL request. GitHub has no atomic update-all-tickets operation. Partial or
 failed responses remain pending. Acknowledging an older revision cannot clear a
 newer pending change. Projects retry independently.
 
+Each ticket in a batch is acknowledged on its own. A GraphQL error tied to one
+ticket's alias, or a failed position or dependency write, keeps only that ticket
+pending. It then waits 30 seconds, doubling to at most 15 minutes, unless a newer
+database revision arrives first. Waiting tickets do not take one of the ten batch
+places. The log names the ticket, its revision and GitHub's error text. An error
+GitHub does not tie to one alias still holds the whole project batch. If GitHub
+refuses a dependency as a cycle because it still shows the reverse link, the
+publisher removes that link when the blocker's own database record does not want
+it. A cycle recorded in the database itself is reported and left for an operator.
+
 Result comments are saved before publication. The publisher uses a stable marker
 to find an earlier successful POST after an uncertain response. Workflow counters
 read saved history. Issue discussion remains available through GitHub. A five
