@@ -40,12 +40,13 @@ ACTIONS = COMMENT_ACTIONS | {'label-edit', 'push', 'issue-create', 'issue-edit',
            'pr-review', 'board-add', 'board-status', 'board-after',
            'relations', 'add-child', 'remove-child', 'add-blocker', 'remove-blocker'}
 
-# Workflow state (column, order, dependencies, family) belongs to the
-# orchestrator. These actions reach it only through the managed GitHub bridge
-# an admitted worker's gh is configured with. Outside it they would write the
-# GitHub display directly, and reconciliation would silently overwrite them.
-WORKFLOW_ACTIONS = {'board-add', 'board-status', 'board-after', 'add-child', 'remove-child',
-                    'add-blocker', 'remove-blocker'}
+# Workflow state (column, order, dependencies) belongs to the orchestrator.
+# These actions reach it only through the managed GitHub bridge an admitted
+# worker's gh is configured with. Outside it they would write the GitHub
+# display directly, and reconciliation would silently overwrite them.
+# Sub-issue links are GitHub content the orchestrator reads back, so
+# add-child and remove-child work anywhere.
+WORKFLOW_ACTIONS = {'board-add', 'board-status', 'board-after', 'add-blocker', 'remove-blocker'}
 
 
 def bridged():

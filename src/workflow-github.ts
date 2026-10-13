@@ -420,6 +420,7 @@ export class WorkflowGitHub {
         }
       }
       let change: WorkflowChange | undefined;
+      let blockingIssue: Record<string, unknown> | undefined;
       if (
         !pullRequestLabel &&
         ["addLabelsToLabelable", "removeLabelsFromLabelable"].includes(field)
@@ -492,6 +493,12 @@ export class WorkflowGitHub {
         const blocker = this.store.workflow.find(input.blockingIssueId);
         if (!found || !blocker)
           throw new Error("Both dependency tickets must be imported");
+        const blockerProject = blocker.ticket.split("#")[0];
+        blockingIssue = {
+          __typename: "Issue",
+          ...this.node(blocker.item, this.catalog.get(blockerProject) ?? []),
+          repository: { nameWithOwner: blockerProject },
+        };
         change = {
           blockedBy: found.item.blockedBy.filter((b) =>
             b.url
@@ -516,13 +523,14 @@ export class WorkflowGitHub {
             ...this.node(item, this.catalog.get(project) ?? []),
             repository: { nameWithOwner: project },
           },
-          card = { __typename: "ProjectV2Item", id: item.id, content: node };
+          card = { __typename: "ProjectV2Item", id: item.id, type: "ISSUE", content: node };
         output[key] = selectResponse(
           {
             __typename: payloadType(field),
             clientMutationId: input.clientMutationId ?? null,
             issue: node,
             labelable: node,
+            blockingIssue: blockingIssue ?? null,
             projectV2Item: card,
             items: { nodes: [card] },
           },

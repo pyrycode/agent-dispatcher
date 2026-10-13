@@ -52,12 +52,20 @@ class Helper:
         with patch.object(m, 'bridged', return_value=False), patch.object(m, 'gh') as gh, \
                 patch.object(m, 'graphql') as gql:
             for args in [['board-add', '2266'], ['board-status', '2266', 'Backlog'], ['board-after', '2266', 'top'],
-                         ['add-child', '1984', '2148'], ['remove-child', '1984', '2148'],
                          ['add-blocker', '2149', '2148'], ['remove-blocker', '2149', '2148']]:
                 with self.subTest(args=args), self.assertRaisesRegex(ValueError, 'bridge'):
                     m.perform(args)
             gh.assert_not_called()
             gql.assert_not_called()
+
+    def test_sub_issue_links_do_not_need_the_bridge(self):
+        m = self.m
+        with patch.object(m, 'bridged', return_value=False), \
+                patch.object(m, 'gh', side_effect=['{"id":"I_1"}', '{"id":"I_2"}'] * 2), \
+                patch.object(m, 'graphql', return_value={}) as gql:
+            m.perform(['add-child', '1984', '2148'])
+            m.perform(['remove-child', '1984', '2148'])
+            self.assertEqual(gql.call_count, 2)
 
     def test_bridge_detection_reads_gh_socket_config(self):
         m = self.m
