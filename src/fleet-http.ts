@@ -98,7 +98,21 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
       }
       if (req.url === '/tasks/read') {
         if (!machine) return send(403,{error:'Admitted source worker required'});
-        return send(200,store.readTask(machine,body.session,body.project,body.runId,body.id));
+        return send(200,store.readTask(machine,body.session,body.project,body.runId,body.id,body.format));
+      }
+      if(req.url==='/tasks/artifact') {
+        if(!machine) return send(403,{error:'Admitted source worker required'});
+        return send(200,store.readTaskArtifact(machine,body.session,body.project,body.runId,body.id,body.digest,body.path,body.part));
+      }
+      if(['/tasks/artifacts-begin','/tasks/artifacts-put','/tasks/artifacts-commit'].includes(req.url??'')) {
+        const actor=isAdmin?body.machine:machine;
+        if(!actor) return send(403,{error:'Task worker required'});
+        if(req.url==='/tasks/artifacts-begin') return send(200,store.tasks.beginArtifacts(body.id,actor,body.session,body.manifest));
+        if(req.url==='/tasks/artifacts-put') {
+          store.tasks.putArtifact(body.id,actor,body.session,body.digest,body.path,body.part,body.data);return send(200,{ok:true});
+        }
+        const task=store.commitTaskArtifacts(actor,body.id,body.session,body.digest,body.result);
+        return send(200,{...task,result:task.result?{...task.result,files:{}}:null});
       }
       if(req.url==='/tasks/prepare-repair') {
         if(!isAdmin&&!machine) return send(403,{error:'Configured repair executor required'});

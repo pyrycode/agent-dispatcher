@@ -1,5 +1,6 @@
 """Regressions from the retained #1947 independent review."""
 import importlib.util
+import hashlib
 import json
 import subprocess
 import errno
@@ -11,6 +12,13 @@ from unittest.mock import patch
 spec = importlib.util.spec_from_file_location('support', Path(__file__).with_name('fleet-support.py'))
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
+
+def artifact_reply(operation,body):
+    if operation=='artifacts-begin':
+        manifest=body['manifest']
+        return {'digest':hashlib.sha256(json.dumps(manifest,separators=(',',':')).encode()).hexdigest(),
+                'missing':{entry['path']:list(range(len(entry['chunks']))) for entry in manifest['files']}}
+    return []
 
 
 class SetupCustodyTests(unittest.TestCase):
@@ -79,10 +87,10 @@ class SetupCustodyTests(unittest.TestCase):
                 m.atomic(receipt, {'id': 'job', 'session': 's', 'phase': 'attention', 'pid': 123,
                                   'custody': {'root': root, 'owned': {'123': 'root'}, 'phase': 'uncertain'}, 'result': str(result)})
                 operations = []
-                supervisor.rpc = lambda op, body: operations.append((op, body)) or []
+                supervisor.rpc = lambda op, body: operations.append((op, body)) or artifact_reply(op,body)
                 with patch.object(m, 'process_snapshot', return_value={}): supervisor.tick()
-                complete = [body for op, body in operations if op == 'complete']
-                self.assertEqual(complete, [{'machine': 'mac', 'id': 'job', 'session': 's', 'result': value}])
+                complete = [body for op, body in operations if op == 'artifacts-commit']
+                self.assertEqual(complete, [{'machine': 'mac', 'id': 'job', 'session': 's', 'digest':artifact_reply('artifacts-begin',{'manifest':m.artifact_manifest({})})['digest'], 'result': value}])
                 self.assertEqual(json.loads(receipt.read_text())['phase'], 'complete')
 
     def test_setup_launch_failure_records_that_no_process_was_started(self):
@@ -108,12 +116,16 @@ class SetupCustodyTests(unittest.TestCase):
             receipt = supervisor.directory / 'job.receipt.json'
             m.atomic(receipt, {'id': 'job', 'session': 's', 'phase': 'running', 'pid': 123,
                               'custody': {'root': root, 'owned': {'123': 'original'}, 'phase': 'alive'}, 'result': str(result)})
-            operations = []
+            operations = []; interrupted = [True]; manifests = []
             def rpc(op, body):
                 operations.append(op)
                 if op == 'publish-repair':
                     return {'pendingControl': True} if operations.count(op) == 1 else {'url': 'https://github.com/org/dispatcher/pull/1', 'merged': True}
-                return []
+                if op == 'artifacts-begin': manifests.append(body['manifest'])
+                if op == 'artifacts-put' and interrupted[0]:
+                    interrupted[0] = False
+                    raise RuntimeError('Interrupted artifact upload')
+                return artifact_reply(op,body)
             supervisor.rpc = rpc
             with patch.object(m, 'process_snapshot', return_value={}): supervisor.tick()
             self.assertEqual(json.loads(receipt.read_text())['phase'], 'publishing')
@@ -123,10 +135,14 @@ class SetupCustodyTests(unittest.TestCase):
             # signals or invalidate drainage already proved before publication.
             with patch.object(m, 'process_snapshot', return_value={123: {**root, 'identity': 'unrelated'}}), \
                  patch.object(m.os, 'killpg') as send:
-                restarted.tick()
+                with self.assertRaisesRegex(RuntimeError, 'Interrupted artifact upload'): restarted.tick()
+                resumed = m.SupportSupervisor(Adapter(), config); resumed.rpc = rpc
+                resumed.tick()
                 send.assert_not_called()
             self.assertNotIn('uncertain', operations)
-            self.assertEqual(operations.count('complete'), 1)
+            self.assertEqual(operations.count('publish-repair'), 2)
+            self.assertEqual(manifests[0], manifests[1])
+            self.assertEqual(operations.count('artifacts-commit'), 1)
             self.assertEqual(json.loads(receipt.read_text())['phase'], 'complete')
 
 

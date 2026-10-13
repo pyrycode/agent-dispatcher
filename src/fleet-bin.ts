@@ -54,7 +54,7 @@ async function main(): Promise<void> {
     return;
   }
   if (command === 'recovery-task') {
-    if (args.length !== 2 || !['capabilities','queue','start','complete','operator-request','publish-repair','prepare-repair','uncertain','schedule'].includes(args[0])) throw new Error('Provide task operation and saved request JSON');
+    if (args.length !== 2 || !['capabilities','queue','start','complete','operator-request','publish-repair','prepare-repair','uncertain','schedule','artifacts-begin','artifacts-put','artifacts-commit'].includes(args[0])) throw new Error('Provide task operation and saved request JSON');
     const body = JSON.parse(readFileSync(args[1],'utf8'));
     if(args[0]==='schedule') {
       const local=new JsonClient(config.managerUrl??`unix://${resolve(config.socketPath)}`,secret(config.operatorTokenEnv));
