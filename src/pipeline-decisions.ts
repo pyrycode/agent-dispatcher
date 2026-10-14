@@ -2301,6 +2301,17 @@ export const BLOCKED_RETRY_PATTERNS: readonly { signature: string; pattern: RegE
  * it would repeat an action that was refused.
  */
 export const BLOCKED_NEVER_RETRY = /\bapproval\b|unacceptable risk|permission denied|\bhuman\b|\bmaintainer\b|\bdecision\b/i;
+// Sign-in, credential and provisioning wording is deliberately NOT here
+// (decided 2026-10-14, Desktop #1809). A summary such as "gh authentication is
+// unavailable in this sandbox; GITHUB_TOKEN is not set" is what an agent
+// writes while the GitHub command bridge is down for a claims service
+// restart, which clears by itself, and the agent cannot tell that apart from
+// a sign-in nobody has provisioned. Retrying is bounded: four attempts over
+// about 75 minutes, then the same `error:<agent>` park. Parking at once would
+// turn every bridge restart into a human task to save at most four runs on
+// the rarer genuine provisioning gap. A missing Figma tool that a person must
+// install follows the same rule. Words that name a person, a decision or a
+// refusal still park immediately.
 
 /**
  * Classify a Codex run that stopped with `status: blocked`. Transient only
