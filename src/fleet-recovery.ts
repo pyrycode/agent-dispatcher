@@ -183,7 +183,7 @@ export class RecoveryLedger {
       created INTEGER NOT NULL, recheck_at INTEGER NOT NULL, reopened TEXT, reopened_at INTEGER
     ) STRICT;
     CREATE TABLE IF NOT EXISTS fleet_recovery_status (ticket TEXT PRIMARY KEY, status TEXT NOT NULL, present INTEGER NOT NULL) STRICT;
-    CREATE TABLE IF NOT EXISTS fleet_recovery_cadence (ticket TEXT PRIMARY KEY, streak INTEGER NOT NULL, updated INTEGER NOT NULL) STRICT;`);
+    CREATE TABLE IF NOT EXISTS fleet_recovery_cadence (ticket TEXT PRIMARY KEY, streak INTEGER NOT NULL, updated INTEGER NOT NULL, pause TEXT) STRICT;`);
   }
   /** Quiet repeat assessments in a row for a ticket. */
   private quietRepeats(ticket: string): number {
@@ -193,8 +193,13 @@ export class RecoveryLedger {
   quietInterval(repeats: number): number {
     return Math.min(this.reassess.ceilingMs, this.reassess.baseMs * 2 ** Math.min(Math.max(0, repeats), 30));
   }
-  /** As quietInterval, one step shorter for an awaited result, and none the first time. */
-  private quietDelay(repeats: number, awaited: boolean): number {
+  /**
+   * The wait after the last decision before a quiet repeat. An awaited
+   * result is one step shorter and immediate the first time. A person's
+   * escalation keeps the flat base, so a reply by comment is read within it.
+   */
+  private quietDelay(repeats: number, awaited: boolean, human: boolean): number {
+    if (human) return this.reassess.baseMs;
     return !awaited ? this.quietInterval(repeats) : repeats === 0 ? 0 : this.quietInterval(repeats - 1);
   }
   private hasTable(name: string): boolean {
@@ -279,7 +284,8 @@ export class RecoveryLedger {
       .map(i => {
         if (!i.current || !i.decision || i.state === "queued" || i.state === "resolved") return i;
         const quietRepeats = this.quietRepeats(i.ticket);
-        return { ...i, cadence: { quietRepeats, nextQuietReassessAt: i.updated + this.quietInterval(quietRepeats) } };
+        const delay = this.quietDelay(quietRepeats, i.state === "waiting", i.state === "escalated" && i.decision.category === "human");
+        return { ...i, cadence: { quietRepeats, nextQuietReassessAt: i.updated + delay } };
       });
   }
   report(machine: string, project: string, observations: RecoveryObservation[], fleet: FleetSnapshot, partial = false): RecoveryIncident[] {
@@ -365,7 +371,7 @@ export class RecoveryLedger {
       const assessedWorkflow = this.db.prepare("SELECT fingerprint FROM fleet_recovery_workflow WHERE ticket=?").get(o.ticket);
       const taskFinished = old?.state === 'waiting' && !this.db.prepare("SELECT 1 FROM fleet_recovery_tasks WHERE ticket=? AND state IN ('queued','running','publishing','attention')").get(o.ticket);
       const evidenceChanged = !taskFinished && trigger && old && old.fingerprint !== fingerprint && assessedWorkflow?.fingerprint === workflow
-        && this.now() - Number(old.updated) < RECOVERY_RECHECK_MS;
+        && this.now() - Number(old.updated) < this.reassess.baseMs;
       if (evidenceChanged && trigger && !trigger.manual) continue;
       if(old?.state==='waiting' && trigger?.manual) {
         this.db.prepare("UPDATE fleet_recovery SET state='escalated',reason=?,decision=?,updated=? WHERE id=?")
@@ -383,31 +389,42 @@ export class RecoveryLedger {
         && !policyRecorded;
       const recheck = (legacyLimit || waited || coordinated || operational || legacyAssessment)
         && trigger && (!trigger.manual || pauseInspection) && !wip;
-      // A repeat assessment whose stage, recovery labels and blockers are what
-      // the last one saw: only comments, logs, task results or dependencies
-      // moved. It waits a growing interval after the last decision. A new
-      // error, a stage move or a manual trigger is never held here, nor is a
-      // code deadline or the safety interval, which are timers already.
+      // A repeat assessment whose stage, recovery labels, blocked state and
+      // pause record are what the last one saw: only comments, logs, task
+      // results or dependencies moved. It waits a growing interval after the
+      // last decision. A new error, a stage move or a manual trigger is never
+      // held here, nor is a code deadline or the safety interval, which are
+      // timers already, nor anything after an applied repair.
       const manualNow = !!trigger?.manual && !pauseInspection;
+      // Why a settled incident reopened, also when its evidence moved meanwhile.
+      const cause = !settledIncident ? null : reopened ?? (old!.fingerprint !== fingerprint ? this.reopenCause(old!, oldDecision!) : null);
+      const timed = cause === "code deadline" || cause === "safety interval";
+      const pauseKey = createHash("sha256").update(JSON.stringify(o.pause ?? null)).digest("hex");
+      const cadence = this.db.prepare("SELECT pause FROM fleet_recovery_cadence WHERE ticket=?").get(o.ticket);
       const quiet = !!old && !!trigger && !manualNow && !(wip && !trigger.manual)
-        && !["queued", "assessing", "applying"].includes(String(old.state)) && !!old.decision
-        && assessedWorkflow?.fingerprint === workflow
-        && (old.fingerprint !== fingerprint || recheck)
-        && reopened !== "code deadline" && reopened !== "safety interval";
+        && !["queued", "assessing", "applying"].includes(String(old.state)) && !!oldDecision
+        && !["retry", "rework", "resume", "refine", "unblock"].includes(oldDecision.action)
+        && assessedWorkflow?.fingerprint === workflow && (!cadence?.pause || cadence.pause === pauseKey)
+        && (old.fingerprint !== fingerprint || recheck) && !timed;
       // A result the last decision waited for, its own repair task or a named
       // dependency, is read at once the first time; only repeats are spaced.
-      const awaited = coordinated || (!!reopened && /^(dependency |coordination |capability )/.test(reopened));
-      if (quiet && this.now() < Number(old!.updated) + this.quietDelay(this.quietRepeats(o.ticket), awaited)) continue;
+      const awaited = coordinated || (!!cause && /^(dependency |coordination |capability )/.test(cause));
+      const human = old?.state === "escalated" && oldDecision?.category === "human";
+      if (quiet && this.now() < Number(old!.updated) + this.quietDelay(this.quietRepeats(o.ticket), awaited, human)) continue;
       if (old && (!trigger || old.fingerprint !== fingerprint || recheck)) this.db.prepare("UPDATE fleet_recovery SET present=0, updated=CASE WHEN state='queued' THEN ? ELSE updated END, state=CASE WHEN state='queued' THEN 'resolved' ELSE state END WHERE id=?").run(this.now(), old.id);
       if (!trigger || old?.fingerprint === fingerprint && !recheck || (wip && !trigger.manual)) continue;
       if (old && settledIncident) this.markReopened(String(old.id), old.fingerprint !== fingerprint ? "ticket changed" : reopened ?? "reassessed");
       const id = randomUUID();
       this.db.prepare("INSERT INTO fleet_recovery_workflow VALUES (?,?) ON CONFLICT(ticket) DO UPDATE SET fingerprint=excluded.fingerprint").run(o.ticket, workflow);
       const manual = trigger.manual && !pauseInspection;
-      // Count quiet repeats in a row. Any other assessment starts the count again.
-      if (!manual) this.db.prepare(`INSERT INTO fleet_recovery_cadence VALUES (?,?,?)
-        ON CONFLICT(ticket) DO UPDATE SET streak=excluded.streak,updated=excluded.updated`)
-        .run(o.ticket, quiet ? Math.min(this.quietRepeats(o.ticket) + 1, REASSESS_STREAK_CAP) : 0, this.now());
+      // Count quiet repeats in a row. A timer keeps the count; any other
+      // assessment starts it again.
+      if (!manual) {
+        const repeats = this.quietRepeats(o.ticket);
+        this.db.prepare(`INSERT INTO fleet_recovery_cadence VALUES (?,?,?,?)
+          ON CONFLICT(ticket) DO UPDATE SET streak=excluded.streak,updated=excluded.updated,pause=excluded.pause`)
+          .run(o.ticket, quiet ? Math.min(repeats + 1, REASSESS_STREAK_CAP) : timed ? repeats : 0, this.now(), pauseKey);
+      }
       this.db.prepare("INSERT INTO fleet_recovery VALUES (?,?,?,?,?,?,?,NULL,NULL,1)").run(id, o.ticket, fingerprint, trigger.reason, manual ? "escalated" : "queued", this.now(), this.now());
       if (upgraded || pauseInspection) this.db.prepare("INSERT INTO fleet_recovery_assessment_policy VALUES (?,?)").run(id, RECOVERY_ASSESSMENT_POLICY);
       if (manual) newAlerts.add(id);

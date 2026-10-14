@@ -477,11 +477,11 @@ export class FleetStore {
       if (claim && claim.machine !== req.machine) return { ok: false, reason: "foreign-claim" };
       if (this.db.prepare("SELECT 1 FROM fleet_runs WHERE ticket=? AND finished IS NULL").get(req.ticket)) return { ok: false, reason: "running" };
       // A Codex rate limit pauses new Codex starts across the fleet, and
-      // Codex starts are spaced apart fleet-wide. Admitted runs and work that
-      // starts no Codex agent are untouched. A refusal reserves nothing.
+      // Codex starts are spaced apart fleet-wide (checked below, after the
+      // other admission checks). Admitted runs and work that starts no Codex
+      // agent are untouched. A refusal reserves nothing.
       const codex = startsCodex(req, this.runnerPolicy(), req.supportTaskId ? this.tasks.get(req.supportTaskId).request.recipe : undefined);
       if (codex && this.codex.paused(this.clock())) return { ok: false, reason: "codex-paused" };
-      if (codex && this.codex.spacingWaitMs(this.clock()) > 0) { this.codex.spacingHeld(); return { ok: false, reason: "codex-spaced" }; }
       if (req.resource !== "light") {
         const row = this.db.prepare(`SELECT
           count(CASE WHEN resource='heavy' THEN 1 END) AS heavy,
@@ -503,6 +503,8 @@ export class FleetStore {
       for (const lock of req.locks) {
         if (this.db.prepare("SELECT 1 FROM fleet_locks WHERE name=?").get(lock)) return { ok: false, reason: "locked" };
       }
+      // Last, so a start that would be refused anyway is not counted as spaced.
+      if (codex && this.codex.spacingWaitMs(this.clock()) > 0) { this.codex.spacingHeld(); return { ok: false, reason: "codex-spaced" }; }
       const generation = claim ? String(claim.generation) : randomUUID();
       const now = this.clock();
       const runnerPolicy = this.runnerPolicy();

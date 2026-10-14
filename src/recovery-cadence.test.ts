@@ -39,28 +39,63 @@ function assessQueued(ledger: RecoveryLedger, project: string, o: RecoveryObserv
   return queued.length;
 }
 
-test("#3268 shape: an escalation whose only change is its own comment churn is reassessed on a doubling interval", () => {
-  const { db, clock, ledger } = setup();
-  const escalate: RecoveryDecision = { action: "escalate", category: "human", reason: "A write-authority product decision is missing" };
+/** Poll every five minutes; every decision moves the evidence revision, the worst case the ledger can see. */
+function churn(ledger: RecoveryLedger, clock: { now: number }, decision: RecoveryDecision, hours: number) {
   let runs = 0;
   const times: number[] = [];
   const start = clock.now;
-  // The worst case the ledger can see: every escalation moves the evidence
-  // revision, so the ticket always differs from what was last assessed.
-  // Poll every five minutes for nine hours.
-  for (let t = 0; t < 9 * HOUR; t += POLL) {
-    const n = assessQueued(ledger, core, inbox3268(runs), escalate, `r${runs}`);
+  for (let t = 0; t < hours * HOUR; t += POLL) {
+    const n = assessQueued(ledger, core, inbox3268(runs), decision, `r${runs}`);
     if (n) { runs += n; times.push(clock.now - start); }
     clock.now += POLL;
   }
-  const gaps = times.slice(1).map((t, i) => t - times[i]);
+  return { runs, gaps: times.slice(1).map((t, i) => t - times[i]) };
+}
+
+test("a wait whose only change is evidence churn is reassessed on a doubling interval", () => {
+  const { db, clock, ledger } = setup();
+  const { runs, gaps } = churn(ledger, clock, { action: "wait", reason: "Planning inputs are still missing" }, 9);
   // 30 minutes, then 1, 2 and 4 hours: never sooner than the doubling interval.
   for (const [i, gap] of gaps.entries()) assert.ok(gap >= Math.min(RECOVERY_REASSESS_CEILING_MS, RECOVERY_REASSESS_BASE_MS * 2 ** i), `repeat ${i + 1} came after ${gap / MIN} minutes`);
   assert.ok(runs <= 5, `${runs} assessments in nine hours; the 30-minute cooldown alone allowed about 15`);
   const current = ledger.list(core).find(i => i.current)!;
-  assert.equal(current.state, "escalated");
   assert.equal(current.cadence?.quietRepeats, runs - 1);
   assert.equal(current.cadence?.nextQuietReassessAt, current.updated + ledger.quietInterval(runs - 1));
+  db.close();
+});
+
+test("#3268 shape: a person's escalation keeps the flat thirty minutes, so a reply by comment is read promptly", () => {
+  // On 2026-10-14 the churn itself came from the comment read, which
+  // evidence-revision.test.ts covers. Here the ledger must not slow a reply.
+  const { db, clock, ledger } = setup();
+  const { gaps } = churn(ledger, clock, { action: "escalate", category: "human", reason: "A write-authority product decision is missing" }, 4);
+  assert.ok(gaps.length >= 3);
+  for (const gap of gaps) assert.ok(gap >= RECOVERY_REASSESS_BASE_MS && gap <= RECOVERY_REASSESS_BASE_MS + POLL, `${gap / MIN} minutes`);
+  const current = ledger.list(core).find(i => i.current)!;
+  assert.equal(current.state, "escalated");
+  assert.equal(current.cadence?.nextQuietReassessAt, current.updated + RECOVERY_REASSESS_BASE_MS);
+  db.close();
+});
+
+test("a code deadline is kept even when evidence moved meanwhile, and does not reset the count", () => {
+  const { db, clock, ledger } = setup();
+  const wait: RecoveryDecision = { action: "wait", reason: "x" };
+  assessQueued(ledger, core, inbox3268(0), wait, "r0");
+  for (let i = 1; i <= 2; i++) { clock.now += ledger.quietInterval(i - 1); assert.equal(assessQueued(ledger, core, inbox3268(i), wait, `r${i}`), 1); }
+  // A transient transport failure: an operational escalation with the code cooldown.
+  clock.now += ledger.quietInterval(2);
+  const [incident] = ledger.report("hp", core, [inbox3268(3)], empty);
+  ledger.begin(incident.id, "r3");
+  ledger.decide(incident.id, "r3", { action: "escalate", category: "operational", reason: "GitHub transport failed", cooldown: true });
+  // Evidence moves inside the cooldown. At the 30-minute deadline it is assessed, not held for the 4-hour step.
+  clock.now += 10 * MIN;
+  assert.equal(ledger.report("hp", core, [inbox3268(4)], empty).filter(i => i.state === "queued").length, 0);
+  clock.now += 20 * MIN;
+  const reopened = ledger.report("hp", core, [inbox3268(4)], empty).filter(i => i.state === "queued");
+  assert.equal(reopened.length, 1);
+  ledger.begin(reopened[0].id, "r4");
+  ledger.decide(reopened[0].id, "r4", wait);
+  assert.equal(ledger.list(core).find(i => i.current)?.cadence?.quietRepeats, 3, "the timer kept the count of three quiet repeats");
   db.close();
 });
 

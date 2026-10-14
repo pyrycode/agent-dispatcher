@@ -336,21 +336,27 @@ incident is assessed again only when one of these changes:
 
 ### Quiet repeat assessments
 
-A repeat assessment whose ticket stage, recovery labels and blockers are what the
-last assessment saw, so that only comments, the body, logs, recovery task results,
-coordination or a dependency moved, is spaced out. The first such repeat waits 30
-minutes after the last decision, the same as the earlier evidence cooldown. Each
-further one in a row doubles that, to 1, 2 and then 4 hours, the ceiling. A result
-the last decision waited for, the recovery task it coordinated or a dependency it
-named, is read at once the first time, and its repeats follow the same doubling, so a
-loop of failing repairs slows down instead of running every hour. Any change
-to the stage, the recovery labels or the blockers, which includes every new stage
-error, starts the count again and is assessed at once. A manual trigger such as a
-`needs-human:` hold or a denied permission escalates at once as before, and a code
-deadline or the safety interval is never held. `/recovery/state` shows a current
+A repeat assessment whose ticket stage, recovery labels, blocked state and pause
+record are what the last assessment saw, so that only comments, the body, logs,
+recovery task results, coordination or a dependency moved, is spaced out. The first
+such repeat waits 30 minutes after the last decision, the same as the earlier
+evidence cooldown. Each further one in a row doubles that, to 1, 2 and then 4 hours,
+the ceiling. A result the last decision waited for, the recovery task it coordinated
+or a dependency it named, is read at once the first time, and its repeats follow the
+same doubling, so a loop of failing repairs slows down instead of running every hour.
+An escalation to a person keeps the flat 30 minutes, so a reply by comment is read
+promptly.
+
+Never held: any change to the stage, the recovery labels, whether the ticket is
+blocked or its pause record, which includes every new stage error; anything after an
+applied repair (`retry`, `rework`, `resume`, `refine`, `unblock`); a manual trigger
+such as a `needs-human:` hold or a denied permission, which escalates at once as
+before; and a code deadline or the safety interval, also when evidence moved
+meanwhile. A deadline or safety reassessment keeps the count of quiet repeats; any
+other non-quiet assessment starts it again. `/recovery/state` shows a current
 assessed incident's `cadence`: `quietRepeats` and `nextQuietReassessAt`. Set
-`recovery.reassessBaseMinutes` (5 to 1440) and `recovery.reassessCeilingHours`
-(up to 168) in the claim service configuration to change the spacing.
+`recovery.reassessBaseMinutes` (5 to 1440) and `recovery.reassessCeilingHours` (up
+to 168) in the claim service configuration to change the spacing.
 
 Measured on 2026-10-14: 154 recovery assessments in one day against 36 builder
 runs. 25 were the overnight unchanged-wait loop settled above. 28 were started by
