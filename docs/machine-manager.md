@@ -209,16 +209,34 @@ error, or a later assessment escalates. Until 2026-10-14 this label was called
 `orchestrator:fixing`; see [Recovery labels](workflow-authority.md#recovery-labels)
 for the rename.
 
-`orchestrator:repairing` shows the assigned repair run itself. Retry, rework,
-resume and refine receive it with the handback, because each assigns an
-ordinary stage run: the failed stage, the builder or developer, the recorded
-stage, or the refiner. It stays while the ticket waits for that run and while
-the run works. It is removed when that first run finishes, whatever its
-outcome, and on every condition that removes recovery priority. Unblock and
-coordinate assign no stage run, so they get priority without this label.
+`wip:repair` shows the assigned repair run itself. It was called
+`orchestrator:repairing` for its first day (2026-10-14) and is a `wip:` label so
+that every tool that reads `wip:` as "busy" shows it: takeover and halt refuse
+the ticket, and the board watch counts it. Retry, rework, resume and refine
+receive it with the handback, because each assigns an ordinary stage run: the
+failed stage, the builder or developer, the recorded stage, or the refiner. It
+stays while the ticket waits for that run and while the run works. It is removed
+when that first run finishes, whatever its outcome, and on every condition that
+removes recovery priority. Unblock and coordinate assign no stage run, so they
+get priority without this label.
+
+Two rules separate the repair marker from an agent's own `wip:<agent>` label.
+The central admission check refuses a stage run on a ticket with any `wip:`
+label except `wip:repair`, because the run it is waiting for is the assigned
+repair. And the marker is never a running agent: the stranded-label sweep
+ignores a ticket that carries only the marker (a repair waiting for a slot is
+not stranded) and strips the marker together with a stranded `wip:<agent>`
+label, never while that agent's run is in flight. Recovery treats a ticket with
+only the marker as assessable, so a repair that never starts can reopen after
+the usual 24 hours; a real running label still blocks assessment.
+
+When the assigned run starts, the dispatcher posts one comment on the ticket
+that begins `<!-- pyry-repair-start -->`. It names the stage and the computer
+running it, which is the dispatcher's own machine name and not necessarily the
+computer that holds the ticket's claim label. Evidence hashing skips the comment.
 
 Owned, idle-ticket reconciliation removes stale labels after an interrupted
-run or failed cleanup. It removes a repairing label left without recovery
+run or failed cleanup. It removes a repair marker left without recovery
 priority. For an imported project, the central store also removes a repairing
 label once the assigned run has marked the ticket running and no run remains
 active on it. That covers a crashed worker after the operator releases it.

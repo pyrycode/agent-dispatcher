@@ -2,14 +2,15 @@ import { coordinationReceipts } from "./recovery-receipts.js";
 import { writeRuntimeReceipt } from "./runtime-receipt.js";
 import { type ChildProcess, execSync, spawn, spawnSync } from "node:child_process";
 import { readFileSync, existsSync, writeFileSync, mkdirSync, mkdtempSync, rmdirSync, appendFileSync, readdirSync, createWriteStream, statSync, symlinkSync, unlinkSync, openSync, closeSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir, hostname, tmpdir } from "node:os";
 import { resolve, dirname, basename } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { config } from "dotenv";
 import { githubPauseMs, freshGitHubRead } from "./github-transport.js";
 import { decidePollFailure, newPollOutage, pollRecovered, transientPollFailure } from "./poll-failure.js";
-import { runRecoveryWork, recoveryHandoff, parseRecoveryDecision, RECOVERY_INSTRUCTIONS, RECOVERY_EFFORT, RECOVERY_MAX_TURNS, RECOVERY_TIMEOUT_MS, cleanRecoveryLabels, RECOVERY_REPAIRING } from "./recovery-work.js";
+import { runRecoveryWork, recoveryHandoff, parseRecoveryDecision, RECOVERY_INSTRUCTIONS, RECOVERY_EFFORT, RECOVERY_MAX_TURNS, RECOVERY_TIMEOUT_MS, cleanRecoveryLabels, repairStartComment } from "./recovery-work.js";
+import { RECOVERY_REPAIRING_LABELS } from "./recovery-labels.js";
 import { verifyCoordination } from "./recovery-coordination.js";
 import { recoveryInventory, relatedTickets, relatedEvidence } from "./recovery-evidence.js";
 import { recoveryLogContext } from "./recovery-context.js";
@@ -8612,11 +8613,21 @@ export async function runConcurrentDispatches(
   candidates: ReadonlyArray<{ agent: AgentConfig; item: ProjectItem }>,
   client: DispatchClient,
   deps: DispatchDeps = DEFAULT_DEPS,
+  /** The computer these runs execute on, for the repair start comment. Managed dispatch passes its machine name. */
+  machine: string = hostname(),
 ): Promise<PromiseSettledResult<void>[]> {
   return Promise.allSettled(candidates.map(({ agent, item }) =>
     (async () => {
       const wipLabel = `wip:${agent.name}`;
+      const repairLabels = item.labels.filter(l => RECOVERY_REPAIRING_LABELS.includes(l));
       try {
+        // The run the orchestrator assigned is starting: say where. The
+        // comment names the computer that runs it, which is not always the
+        // one the ticket's claim label names.
+        if (repairLabels.length) {
+          try { await client.addComment(item.issueNumber, repairStartComment(agent.name, machine)); }
+          catch (e) { warnOnceCleanup(item.issueNumber, "wip:repair", "repair start comment", e); }
+        }
         await dispatchToAgent(agent, item, client, deps);
       } catch (error: any) {
         console.error(`Error dispatching ${agent.name} on #${item.issueNumber}: ${error.message}`);
@@ -8624,9 +8635,9 @@ export async function runConcurrentDispatches(
         // This run was the repair the orchestrator assigned. Recovery priority
         // stays; only the marker for the repair run itself ends here. The
         // central store removes a marker this write leaves behind.
-        if (item.labels.includes(RECOVERY_REPAIRING)) {
-          try { await client.removeLabel(item.issueNumber, RECOVERY_REPAIRING); }
-          catch (e) { warnOnceCleanup(item.issueNumber, RECOVERY_REPAIRING, "post-dispatch removeLabel", e); }
+        for (const repairLabel of repairLabels) {
+          try { await client.removeLabel(item.issueNumber, repairLabel); }
+          catch (e) { warnOnceCleanup(item.issueNumber, repairLabel, "post-dispatch removeLabel", e); }
         }
         try {
           await client.removeLabel(item.issueNumber, wipLabel);
@@ -10307,7 +10318,7 @@ export async function pollLoop(): Promise<void> {
           const claim = await claimForDispatch(c.agent, c.item, client);
           if (drainMode) { await releaseDispatchClaim(c.agent, c.item, client, claim); return; }
           await countFamilyDispatch(c.agent, c.item, rawClient, { tallies: familyTallies, rootLabelsByIssue });
-          await runConcurrentDispatches([c], client);
+          await runConcurrentDispatches([c], client, DEFAULT_DEPS, managed.machine ?? hostname());
         }, recoveryEnabled ? {
           observe: async () => {
             const [labels, blockers, status] = await Promise.all([

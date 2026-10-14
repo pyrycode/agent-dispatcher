@@ -231,7 +231,7 @@ function toRawItem(itemId: string, status: string | null | undefined, content: a
     labels: content.labels.nodes.map((l: any) => l.name),
     url: content.url,
     evidenceRevision: createHash("sha256").update(JSON.stringify([content.body ?? "",
-      (content.comments?.nodes ?? []).filter((c: any) => !/^(<!-- (?:fleet-recovery|family-dispatch|stranded-wip|auto-retry)|## Orchestrator recovery)/.test(c.body ?? ""))
+      (content.comments?.nodes ?? []).filter((c: any) => !/^(<!-- (?:fleet-recovery|family-dispatch|stranded-wip|auto-retry|pyry-repair-start)|## Orchestrator recovery)/.test(c.body ?? ""))
         .map((c: any) => [c.id, c.updatedAt]),
       (content.blockedBy?.nodes ?? []).map((b: any) => [b.url, b.state, b.updatedAt])])).digest("hex"),
     blockedBy: (content.blockedBy?.nodes ?? []).map((b: any) => ({

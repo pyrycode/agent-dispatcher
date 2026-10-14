@@ -1,7 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import type { ProjectItem } from "./types.js";
-import { RECOVERY_PRIORITY, RECOVERY_REPAIRING, LEGACY_RECOVERY_PRIORITY, WRITE_LEGACY_RECOVERY_PRIORITY } from "./recovery-labels.js";
+import { RECOVERY_PRIORITY, RECOVERY_REPAIRING, LEGACY_RECOVERY_REPAIRING, LEGACY_RECOVERY_PRIORITY, WRITE_LEGACY_RECOVERY_PRIORITY, isRepairWip } from "./recovery-labels.js";
 
 export type WorkflowItem = ProjectItem & {
   state: "OPEN" | "CLOSED";
@@ -53,6 +53,38 @@ export class WorkflowStore {
       CREATE INDEX IF NOT EXISTS workflow_parent ON workflow_tickets(project,json_extract(item,'$.parentNumber'));
       CREATE INDEX IF NOT EXISTS workflow_order ON workflow_tickets(project,position);`);
     this.migrateRecoveryPriority();
+    this.migrateRepairing();
+  }
+  /**
+   * Renames the saved repair marker `orchestrator:repairing` to `wip:repair`.
+   * Idempotent: a converged store changes nothing. Each change is a recorded
+   * workflow command. Unlike the priority rename the old name is removed at
+   * once: a dispatcher that reads only the old name loses nothing, because the
+   * marker only ever ends a run's bookkeeping and the store settles it too.
+   */
+  migrateRepairing(): number {
+    let changed = 0;
+    const rows = this.db
+      .prepare(
+        "SELECT ticket FROM workflow_tickets WHERE EXISTS (SELECT 1 FROM json_each(item,'$.labels') WHERE value=?) ORDER BY ticket",
+      )
+      .all(LEGACY_RECOVERY_REPAIRING);
+    for (const row of rows) {
+      const ticket = String(row.ticket),
+        item = this.get(ticket);
+      this.change(
+        ticket,
+        {
+          addLabels: item.labels.includes(RECOVERY_REPAIRING) ? [] : [RECOVERY_REPAIRING],
+          removeLabels: [LEGACY_RECOVERY_REPAIRING],
+        },
+        "migration:wip-repair",
+        `migration:wip-repair:${ticket}:${item.revision}`,
+        item.revision,
+      );
+      changed++;
+    }
+    return changed;
   }
   /**
    * Renames the saved recovery priority label once. Idempotent: a converged
@@ -96,8 +128,9 @@ export class WorkflowStore {
     const settled: string[] = [];
     for (const item of this.list(project)) {
       const ticket = `${project}#${item.issueNumber}`;
+      const markers = item.labels.filter(isRepairWip);
       if (
-        !item.labels.includes(RECOVERY_REPAIRING) ||
+        !markers.length ||
         this.db
           .prepare("SELECT 1 FROM fleet_runs WHERE ticket=? AND finished IS NULL")
           .get(ticket)
@@ -113,22 +146,27 @@ export class WorkflowStore {
           return false;
         }
       };
-      const events = this.db
-        .prepare("SELECT change FROM workflow_events WHERE ticket=? ORDER BY id")
-        .all(ticket)
-        .map((e) => String(e.change));
+      const rows = this.db
+        .prepare("SELECT change, actor FROM workflow_events WHERE ticket=? ORDER BY id")
+        .all(ticket);
+      const events = rows.map((e) => String(e.change));
+      // The rename migration re-adds the marker under its new name. It is not
+      // an assignment: the handback that wrote the old name still is.
       let assigned = -1;
       events.forEach((e, i) => {
-        if (adds(e, (l) => l === RECOVERY_REPAIRING)) assigned = i;
+        if (rows[i].actor !== "migration:wip-repair" && adds(e, isRepairWip)) assigned = i;
       });
+      // The run's own label is a wip: label other than the marker.
       if (
         assigned < 0 ||
-        !events.slice(assigned + 1).some((e) => adds(e, (l) => l.startsWith("wip:")))
+        !events
+          .slice(assigned + 1)
+          .some((e) => adds(e, (l) => l.startsWith("wip:") && !isRepairWip(l)))
       )
         continue;
       this.change(
         ticket,
-        { removeLabels: [RECOVERY_REPAIRING] },
+        { removeLabels: markers },
         "authority",
         `repairing:${ticket}:${item.revision}`,
         item.revision,

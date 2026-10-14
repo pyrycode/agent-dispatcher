@@ -2,11 +2,21 @@ import { recoveryFingerprint, recoveryTrigger, hasOperatorHold, canInspectUnknow
 import type { AgentConfig, ProjectItem } from "./types.js";
 import { AUTO_RETRY_RESET_COMMENT_MARKER } from "./pipeline-decisions.js";
 import { githubPauseMs } from "./github-transport.js";
-import { RECOVERY_INVESTIGATING, RECOVERY_REPAIRING, RECOVERY_ASSIGNMENT_LABELS, RECOVERY_PRIORITY_LABELS, hasRecoveryPriority, recoveryAssignmentLabels } from "./recovery-labels.js";
+import { RECOVERY_INVESTIGATING, RECOVERY_ASSIGNMENT_LABELS, RECOVERY_PRIORITY_LABELS, hasRecoveryPriority, hasRunningWip, recoveryAssignmentLabels, isRepairWip } from "./recovery-labels.js";
 
-export { RECOVERY_INVESTIGATING, RECOVERY_PRIORITY, RECOVERY_REPAIRING, LEGACY_RECOVERY_PRIORITY } from "./recovery-labels.js";
+export { RECOVERY_INVESTIGATING, RECOVERY_PRIORITY, RECOVERY_REPAIRING, LEGACY_RECOVERY_PRIORITY, LEGACY_RECOVERY_REPAIRING } from "./recovery-labels.js";
 
 export const RECOVERY_MARKER = "<!-- fleet-recovery:";
+/**
+ * Hidden first line of the comment posted when an assigned repair run starts.
+ * Evidence hashing skips comments that begin with it, so announcing a repair
+ * never reopens a recovery assessment.
+ */
+export const REPAIR_START_MARKER = "<!-- pyry-repair-start -->";
+/** The start comment for an assigned repair run. It names the stage and the computer that runs it. */
+export function repairStartComment(stage: string, machine: string): string {
+  return `${REPAIR_START_MARKER}\n## Repair run started\n\nThe repair the orchestrator assigned is starting: \`${stage}\` on \`${machine}\`. The ticket carries \`wip:repair\` until this run finishes.`;
+}
 export const RECOVERY_EFFORT = "xhigh";
 export const RECOVERY_MAX_TURNS = 80;
 export const RECOVERY_TIMEOUT_MS = 30 * 60_000;
@@ -53,7 +63,7 @@ export function recoveryStillCurrent(project: string, item: ProjectItem | undefi
   const trigger = recoveryTrigger(observation);
   return observation.ticket === incident.ticket && !hasOperatorHold(item.labels)
     && !(item.status === "Halted" && observation.pause?.origin === "operator") && (trigger ? !trigger.manual || canInspectUnknownPause(observation) : incident.reason === "No workflow progress for 24 hours")
-    && !item.labels.some(l => l.startsWith("wip:")) && recoveryFingerprint(observation) === incident.fingerprint;
+    && !hasRunningWip(item.labels) && recoveryFingerprint(observation) === incident.fingerprint;
 }
 
 /** The model proposes; code restricts which existing stage may resume. */
@@ -62,7 +72,7 @@ export function recoveryPlan(item: ProjectItem, decision: RecoveryDecision, agen
   const o = observationFor("unused/project", item);
   const trigger = recoveryTrigger(o);
   if (trigger?.manual || hasOperatorHold(item.labels) || item.status === "Halted" && item.recoveryPause?.origin === "operator"
-    || item.labels.some(l => l.startsWith("wip:"))) throw new Error("Ticket is not safe for automatic recovery");
+    || hasRunningWip(item.labels)) throw new Error("Ticket is not safe for automatic recovery");
   if (decision.action === "coordinate") return {remove:[]};
   if (decision.action === "unblock") {
     if (!decision.blocker || !item.blockedBy.some(b => b.state === "OPEN" && (b.url === `https://github.com/${decision.blocker!.replace("#", "/issues/")}`))) throw new Error("Unblock must name an existing open blocker");
@@ -204,8 +214,8 @@ export async function cleanRecoveryLabels(items: readonly ProjectItem[], remove:
   for (const item of items) {
     const stop = ["Done", "Halted"].includes(item.status) || hasOperatorHold(item.labels) || item.labels.some(l => l.startsWith("error:"));
     for (const label of item.labels.filter(l => l === RECOVERY_INVESTIGATING
-      || (RECOVERY_PRIORITY_LABELS.includes(l) || l === RECOVERY_REPAIRING) && stop
-      || l === RECOVERY_REPAIRING && !hasRecoveryPriority(item.labels)
+      || (RECOVERY_PRIORITY_LABELS.includes(l) || isRepairWip(l)) && stop
+      || isRepairWip(l) && !hasRecoveryPriority(item.labels)
       || l === RECOVERY_RETURNED_INBOX && item.status !== "Inbox")) {
       await remove(item.issueNumber, label);
       item.labels = item.labels.filter(l => l !== label);

@@ -5292,9 +5292,9 @@ describe("runConcurrentDispatches", () => {
     // The attempted wip removal was recorded (failed, but attempted).
     assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1104 && c.label === "wip:developer"));
   });
-  test("the assigned repair run ends the repairing marker but keeps recovery priority", async () => {
+  test("the assigned repair run ends the wip:repair marker but keeps recovery priority", async () => {
     const claudeMd = claudeMdAbsPath("developer/CLAUDE.md");
-    const repair = ["orchestrator:recovery-priority", "orchestrator:fixing", "orchestrator:repairing", "wip:developer"];
+    const repair = ["orchestrator:recovery-priority", "orchestrator:fixing", "wip:repair", "wip:developer"];
     const client = new MockGitHubClient({
       status: { 1105: "In Development", 1106: "In Development" },
       labels: { 1105: [...repair], 1106: ["wip:developer"] },
@@ -5318,12 +5318,35 @@ describe("runConcurrentDispatches", () => {
     await runConcurrentDispatches([
       { agent, item: makeProjectItem({ issueNumber: 1105, labels: [...repair] }) },
       { agent, item: makeProjectItem({ issueNumber: 1106, labels: ["wip:developer"] }) },
-    ], client, deps);
+    ], client, deps, "build-hp-1");
     const removed = (n: number) => client.removeLabelCalls.filter(c => c.issueNumber === n).map(c => c.label);
-    assert.ok(removed(1105).includes("orchestrator:repairing"));
+    assert.ok(removed(1105).includes("wip:repair"));
+    assert.ok(removed(1105).includes("wip:developer"));
     assert.ok(!removed(1105).includes("orchestrator:recovery-priority"));
     assert.ok(!removed(1105).includes("orchestrator:fixing"));
-    assert.ok(!removed(1106).includes("orchestrator:repairing"), "an ordinary run writes nothing extra");
+    assert.ok(!removed(1106).includes("wip:repair"), "an ordinary run writes nothing extra");
+    const start = client.comments.filter(c => c.issueNumber === 1105 && c.body.startsWith("<!-- pyry-repair-start -->"));
+    assert.equal(start.length, 1, "one start comment for the repair run");
+    assert.match(start[0]!.body, /`developer` on `build-hp-1`/, "it names the stage and the computer that runs it");
+    assert.ok(!client.comments.some(c => c.issueNumber === 1106 && c.body.includes("Repair run started")), "an ordinary run posts no start comment");
+  });
+  test("a repair marker under the first name still ends with the run and still announces it", async () => {
+    const claudeMd = claudeMdAbsPath("developer/CLAUDE.md");
+    const labels = ["orchestrator:recovery-priority", "orchestrator:repairing", "wip:developer"];
+    const client = new MockGitHubClient({ status: { 1107: "In Development" }, labels: { 1107: [...labels] } });
+    const { deps } = makeMockDeps({
+      execImpls: {
+        "git rev-parse --verify feature/1107": () => execError({ stderr: "fatal" }),
+        "git rev-parse --verify origin/feature/1107": () => execError({ stderr: "fatal" }),
+        "git status --porcelain": () => "",
+        "git rev-list --count main..": () => "1\n",
+      },
+      fsMap: { [claudeMd]: "developer system prompt" },
+      streamResult: () => streamResult({ isError: false, output: "ok" }),
+    });
+    await runConcurrentDispatches([{ agent: makeAgentConfig({}), item: makeProjectItem({ issueNumber: 1107, labels }) }], client, deps, "pyrybox");
+    assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1107 && c.label === "orchestrator:repairing"));
+    assert.ok(client.comments.some(c => c.issueNumber === 1107 && /on `pyrybox`/.test(c.body)));
   });
 });
 
