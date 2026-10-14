@@ -159,6 +159,23 @@ export class ManagedDispatch {
     this.pending.clear();
   }
   beginCycle(): void { this.seen.clear(); }
+  /**
+   * Start draining: take no new work while admitted runs finish.
+   *
+   * Every offer that is not running is withdrawn and any grant it already
+   * holds is released as unused. The loop never runs another offer once it
+   * drains, so such a grant would otherwise sit idle until the last run
+   * ended and stop() withdrew it. An idle `@reconcile` grant holds the
+   * project lock, which stops every computer's work for the project:
+   * pyrycode/pyrycode's reconcile was held that way from 17:39:35 on
+   * 2026-10-14 while Fractal drained for an update, and Core #3354 waited
+   * fleet-wide. Running offers keep their grants.
+   */
+  async drain(): Promise<void> {
+    this.draining = true;
+    this.seen.clear();
+    await this.endCycle();
+  }
   setRecoveryTickets(items: readonly ProjectItem[]): void {
     this.recoveryTickets = new Set(items.filter(i => hasRecoveryPriority(i.labels))
       .map(i => `${this.project}#${i.issueNumber}`));
@@ -239,7 +256,11 @@ export class ManagedDispatch {
     // During the random Codex start spread, Codex work is not offered at all,
     // so it holds no admitted place while it waits.
     const holdCodex = codexStartHoldMs() > 0;
+    // A draining dispatcher starts nothing new, so it offers only its running
+    // work. An offer made during the drain, such as a failed run's recovery
+    // successor, waits for the next dispatcher, which finds the incident.
     return [...this.pending.values()].filter(p => p !== exclude && !p.retired
+      && (!this.draining || (!!p.run && this.running.has(p.run.id)))
       && !(holdCodex && !p.run && startsCodex(p.offer, this.state.runnerPolicy))
       && Date.now() >= (this.cooldown.get(this.name(p.offer.ticket, p.offer.role)) ?? 0)).map(p => p.offer);
   }
@@ -286,7 +307,8 @@ export class ManagedDispatch {
       for (const run of state.runs) {
         if (run.machine !== state.machine || run.project !== this.project || run.session !== this.session || this.running.has(run.id)) continue;
         const pending = this.pending.get(this.name(run.ticket, run.role));
-        if (pending && !pending.retired && offerId(state.machine, this.session, pending.offer) === run.id) continue;
+        // While draining, ready() refuses every grant, so one not running now never will.
+        if (pending && !pending.retired && !this.draining && offerId(state.machine, this.session, pending.offer) === run.id) continue;
         // Admission may have committed after an ungranted offer disappeared.
         // Only this live session knows this run never entered run(), whose
         // running entry lasts through child exit and finish acknowledgement.

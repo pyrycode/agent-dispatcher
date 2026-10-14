@@ -9887,6 +9887,16 @@ export async function pollLoop(): Promise<void> {
     // mid-execution (including a running dispatchToAgent) finishes first —
     // wip:<agent> labels get stripped naturally by the agent completion path.
     if (drainMode) {
+      // Release every grant this computer will no longer run before waiting
+      // on the runs in flight, which can take hours. An idle grant left
+      // reserved meanwhile holds its place, and an idle reconcile grant holds
+      // the project lock and so stops the project on every computer. A
+      // failure here is not fatal: the timer's sync releases idle grants
+      // once the manager answers, and stop() withdraws whatever remains.
+      if (managed) {
+        try { await managed.drain(); }
+        catch (e) { console.warn(`   ⚠️  Drain: could not release idle grants yet: ${(e as any)?.message ?? e}`); }
+      }
       if (pool.size > 0) {
         console.log(`🚦 Drain: waiting for ${pool.size} in-flight run(s) to finish: ${[...pool.keys()].join(", ")}`);
         await pool.drain();
