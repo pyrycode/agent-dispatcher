@@ -184,6 +184,11 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
           if(body.ticket?.split('#')[0]!==project) throw new Error('Workflow project mismatch');
           return send(200,store.workflowOperator(body.ticket,body.change,body.commandId,body.revision));
         }
+        if(req.url==='/workflow/file') {
+          if(!isAdmin) return send(403,{error:'Operator credential required'});
+          if(!workflowGitHub) return send(403,{error:'Shared GitHub not configured'});
+          return send(200,await workflowGitHub.file(project,body));
+        }
         if(!machine) return send(403,{error:'Machine credential required'});
         if(body.ticket?.split('#')[0]!==project) throw new Error('Workflow project mismatch');
         if(req.url==='/workflow/change') return send(200,store.workflowChange(machine,body.session,body.runId,body.ticket,body.change,body.commandId,body.revision));
@@ -243,7 +248,7 @@ export class JsonClient {
     } else if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("Invalid service connection");
   }
   async call<T>(path: string, body?: unknown): Promise<T> {
-    const timeoutMs = path === "/tasks/publish-repair" ? 120_000 : path === "/github" ? 60_000 : 10_000;
+    const timeoutMs = path === "/tasks/publish-repair" ? 120_000 : path === "/github" || path === "/workflow/file" ? 60_000 : 10_000;
     if (this.socketPath) return new Promise<T>((resolve, reject) => {
       const req = request({ socketPath: this.socketPath, path, method: body === undefined ? "GET" : "POST",
         headers: { Authorization: `Bearer ${this.token}`, "Content-Type": "application/json" },
