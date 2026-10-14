@@ -429,6 +429,12 @@ class DispatcherRunsAndStarvation(unittest.TestCase):
             f.now[0] += 3601
             [item] = f.watchdog.tick({})
             self.assertEqual((item['kind'], item['ticket'], item['holder']), ('starvation', 'pyrycode/pyrycode-desktop#1809', 'pyrycode/pyrycode-desktop#1700 verifier'))
+            # A support task waiting for the same project is charged to its parent ticket's project.
+            f.state['queue'] = [{'ticket': 'pyrycode/pyrycode#@task-' + 'a' * 64, 'parentTicket': 'pyrycode/pyrycode-desktop#1810', 'role': 'recovery-task', 'resource': 'heavy', 'state': 'waiting-for-capacity-or-lock'}]
+            self.assertEqual(f.watchdog.tick({}), [])
+            f.now[0] += 3601
+            [item] = f.watchdog.tick({})
+            self.assertEqual((item['kind'], item['holder']), ('starvation', 'pyrycode/pyrycode-desktop#1700 verifier'))
             # Without the project limit a free heavy place is not starvation.
             f.state['projectHeavyLimits'] = {}
             self.assertEqual(f.watchdog.tick({}), [])

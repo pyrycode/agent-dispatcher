@@ -226,7 +226,10 @@ test("per-project heavy limits are optional, validated, and shown in the manager
     manager.offer(CORE, "c", [job(3, CORE)]);
     await manager.tick();
     assert.deepEqual(store.snapshot().runs.map(r => r.ticket).sort(), [`${CORE}#3`, `${MOBILE}#1`]);
+    // Support tasks name the ticket they serve in the queue, for the watchdog.
+    await manager.offer(MOBILE, "m", [job(1, MOBILE), job(2, MOBILE)]);
     const queue = (await manager.status()).queue;
+    assert.equal(queue.some(q => "parentTicket" in q), false);
     assert.equal(queue.find(q => q.ticket === `${MOBILE}#2`)!.state, "waiting-for-capacity-or-lock");
     // The manager holds the limit even when the authority has none for this computer.
     const loose = new FleetStore(":memory:", { hp: { heavyLimit: 2, combinedLimit: 3 } });

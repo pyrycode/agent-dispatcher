@@ -517,7 +517,7 @@ class Watchdog:
             if not isinstance(offer, dict) or offer.get('resource') != 'heavy' or offer.get('state') != 'waiting-for-capacity-or-lock':
                 continue
             blocking = heavy if full else []
-            project = str(offer.get('ticket', '')).split('#')[0]
+            project = str(offer.get('parentTicket') or offer.get('ticket', '')).split('#')[0]
             if not blocking and isinstance(project_limits.get(project), int):
                 own = [r for r in heavy if heavy_project(r) == project]
                 if len(own) >= project_limits[project]:

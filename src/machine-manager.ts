@@ -124,7 +124,7 @@ export class MachineManager {
       projects: this.config.projects.map(project => ({ project, draining: this.config.drainingProjects?.includes(project) ?? false, lastSeen: this.offers.get(project)?.at ?? null, health: !this.offers.has(project) ? "not-registered" : this.now() - this.offers.get(project)!.at >= 180_000 ? "dispatcher-unreachable" : "reporting" })),
       attention: state.runs.filter(r => r.machine === this.config.machine && this.now() - r.created >= 3 * 3600000)
         .map(r => ({ ticket: r.ticket, runId: r.id, reason: "Reservation older than three hours; verify worker progress before intervening" })),
-      queue: available.map(o => ({ ticket: o.ticket, role: o.role, resource: o.resource,
+      queue: available.map(o => ({ ticket: o.ticket, role: o.role, resource: o.resource, ...(o.parentTicket ? { parentTicket: o.parentTicket } : {}),
         state: this.finished.has(`${o.project}/${o.key}`) ? "already-completed"
           : state.runs.some(r => r.ticket === o.ticket) ? "reserved-or-running"
           : this.draining ? "draining"
