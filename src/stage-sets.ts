@@ -190,8 +190,9 @@ const BUILDER_AGENTS: AgentConfig[] = [
     // The cap protects the host, not the repository, so under managed
     // dispatch it is one verifier per computer per project, and two
     // computers can verify the same project at once (2026-10-14). The
-    // PYRY_VERIFIER_SERIAL=0 and PYRY_VERIFIER_MAX variants below inherit
-    // the scope.
+    // PYRY_VERIFIER_SERIAL=0 and PYRY_VERIFIER_MAX variants below drop the
+    // scope: a PYRY_VERIFIER_MAX number stays a total across computers, as
+    // it was when Mobile chose two on 2026-10-01.
     roleLimitScope: "machine",
     // A clean exit must have ruled: see verdict-guard.ts (Mobile #782).
     requiresVerdict: true,
@@ -204,8 +205,14 @@ const BUILDER_AGENTS: AgentConfig[] = [
 // the verifier's config differs; every other agent is the same object, so
 // documentation keeps its cap and its model by reference.
 const BUILDER_AGENTS_CONCURRENT_VERIFIERS: AgentConfig[] = BUILDER_AGENTS.map((a) =>
-  a.name === "verifier" ? { ...a, serial: false } : a,
+  a.name === "verifier" ? { ...fleetScoped(a), serial: false } : a,
 );
+
+/** The verifier without its machine scope, for the variants whose cap is a fleet total. */
+function fleetScoped(agent: AgentConfig): AgentConfig {
+  const { roleLimitScope: _scope, ...rest } = agent;
+  return rest;
+}
 
 // The collapsed chain. In Architecture and In QA are simply absent —
 // never polled, never advanced into.
@@ -243,7 +250,7 @@ function cappedVerifierSet(max: number): StageSet {
   if (set === undefined) {
     set = deriveStageSet({
       name: "builder",
-      agents: BUILDER_AGENTS.map((a) => (a.name === "verifier" ? { ...a, serial: false, maxInFlight: max } : a)),
+      agents: BUILDER_AGENTS.map((a) => (a.name === "verifier" ? { ...fleetScoped(a), serial: false, maxInFlight: max } : a)),
       advanceRules: BUILDER_ADVANCE_RULES,
       agentToolNames: new Set(["builder", "verifier"]),
       webSearchToolNames: new Set(["builder"]),

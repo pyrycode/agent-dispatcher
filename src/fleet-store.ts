@@ -108,6 +108,8 @@ export function validateStart(req: StartRequest): void {
   if (req.runner !== undefined && req.runner !== 'claude' && req.runner !== 'codex') throw new Error('Invalid runner');
   if (req.requiresRecovery !== undefined && (typeof req.requiresRecovery !== 'boolean' || req.role !== 'recovery')) throw new Error('Invalid recovery requirement');
   if(req.readyRepairs!==undefined && (!Array.isArray(req.readyRepairs)||req.readyRepairs.length>10||req.readyRepairs.some(s=>! /^[a-f0-9]{40}$/.test(s)))) throw new Error("Invalid repair readiness");
+  // Only a support task is charged to another ticket's project, so only it may name one.
+  if(req.parentTicket!==undefined && req.supportTaskId===undefined) throw new Error("Invalid support task admission");
   if(req.supportTaskId!==undefined && (req.role!=="recovery-task"||! /^[a-f0-9]{64}$/.test(req.supportTaskId)||! /^[\w.-]+\/[\w.-]+#[1-9]\d*$/.test(req.parentTicket??""))) throw new Error("Invalid support task admission");
   if (!Array.isArray(req.locks) || req.locks.length > 16 || req.locks.some(k => typeof k !== "string" || !k.startsWith(`${req.project}:`) || k.length > 300)) {
     throw new Error("Invalid project locks");

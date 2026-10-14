@@ -87,19 +87,24 @@ test("documentation stays fleet-wide in the dispatcher's offer, the scheduler an
   } finally { store.close(); }
 });
 
-test("the builder set's verifier is machine-scoped in every variant and takes no fleet lock", () => {
+test("the builder set's serial verifier is machine-scoped and takes no fleet lock; a PYRY_VERIFIER_MAX cap stays a fleet total", () => {
   const managed = new ManagedDispatch(CORE, { PYRY_MANAGER_URL: "http://localhost:1", PYRY_MANAGER_TOKEN: "test" });
-  const variants = [{}, { PYRY_VERIFIER_SERIAL: "0" }, { PYRY_VERIFIER_SERIAL: "0", PYRY_VERIFIER_MAX: "2" }];
-  const expected = [1, undefined, 2];
-  variants.forEach((env, i) => {
-    const verifier = resolveStageSet("builder", env).agents.find(a => a.name === "verifier")!;
-    assert.equal(verifier.roleLimitScope, "machine");
-    const offer = managed.agentOffer(verifier, { issueNumber: 100 + i, labels: [] } as any, 0).offer;
-    assert.deepEqual(offer.locks, []);
-    assert.equal(offer.roleLimit, expected[i]);
-    // A scope only travels with a limit; the uncapped variant states neither.
-    assert.equal(offer.roleLimitScope, expected[i] === undefined ? undefined : "machine");
-  });
+  const serial = resolveStageSet("builder", {}).agents.find(a => a.name === "verifier")!;
+  assert.equal(serial.roleLimitScope, "machine");
+  const offer = managed.agentOffer(serial, { issueNumber: 100, labels: [] } as any, 0).offer;
+  assert.deepEqual([offer.locks, offer.roleLimit, offer.roleLimitScope], [[], 1, "machine"]);
+
+  const capped = resolveStageSet("builder", { PYRY_VERIFIER_SERIAL: "0", PYRY_VERIFIER_MAX: "2" }).agents.find(a => a.name === "verifier")!;
+  assert.equal("roleLimitScope" in capped, false);
+  const cappedOffer = managed.agentOffer(capped, { issueNumber: 101, labels: [] } as any, 0).offer;
+  assert.deepEqual([cappedOffer.locks, cappedOffer.roleLimit, cappedOffer.roleLimitScope], [[], 2, undefined]);
+
+  const open = resolveStageSet("builder", { PYRY_VERIFIER_SERIAL: "0" }).agents.find(a => a.name === "verifier")!;
+  assert.equal("roleLimitScope" in open, false);
+  const openOffer = managed.agentOffer(open, { issueNumber: 102, labels: [] } as any, 0).offer;
+  assert.deepEqual([openOffer.roleLimit, openOffer.roleLimitScope], [undefined, undefined]);
+  // The default set is untouched by building the variants.
+  assert.equal(resolveStageSet("builder", {}).agents.find(a => a.name === "verifier")!.roleLimitScope, "machine");
 });
 
 test("mixed versions: an older verifier offer keeps counting the whole fleet", () => {
@@ -133,6 +138,8 @@ test("the start request validates the scope and requires a role limit with it", 
   assert.doesNotThrow(() => validateStart({ ...base, roleLimitScope: "fleet" }));
   assert.throws(() => validateStart({ ...base, roleLimitScope: "host" as any }), /role limit scope/);
   assert.throws(() => validateStart({ ...base, roleLimit: undefined }), /role limit scope/);
+  // Only a support task may be charged to another ticket's project.
+  assert.throws(() => validateStart({ ...start(job(1, CORE), "hp"), parentTicket: `${MOBILE}#1` }), /support task/);
 });
 
 test("the manager's status queue and admission both apply the machine scope", async () => {

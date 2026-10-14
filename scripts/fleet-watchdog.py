@@ -506,15 +506,26 @@ class Watchdog:
         idle_after = self.settings['holderIdleSeconds']
         limit = self.settings['starvationSeconds']
         heavy = [r for r in runs if r.get('resource') == 'heavy']
-        holders = sorted(self.holder(r, progress) for r in heavy)
         full = isinstance(status.get('heavyLimit'), int) and len(heavy) >= status['heavyLimit']
-        idle = bool(holders) and all(last is not None and now - last > idle_after for _, last in holders)
+        # A project with its own heavy limit here is full when its own heavy runs reach it.
+        # A support task counts for the project of the ticket it serves.
+        project_limits = status.get('projectHeavyLimits') if isinstance(status.get('projectHeavyLimits'), dict) else {}
+        def heavy_project(run):
+            return str(run.get('parentTicket') or '').split('#')[0] or run.get('project')
         waits = {}
         for offer in status.get('queue', []):
             if not isinstance(offer, dict) or offer.get('resource') != 'heavy' or offer.get('state') != 'waiting-for-capacity-or-lock':
                 continue
-            if not full:
+            blocking = heavy if full else []
+            project = str(offer.get('ticket', '')).split('#')[0]
+            if not blocking and isinstance(project_limits.get(project), int):
+                own = [r for r in heavy if heavy_project(r) == project]
+                if len(own) >= project_limits[project]:
+                    blocking = own
+            if not blocking:
                 continue
+            holders = sorted(self.holder(r, progress) for r in blocking)
+            idle = all(last is not None and now - last > idle_after for _, last in holders)
             key = str(offer.get('ticket', '')) + ' ' + str(offer.get('role', ''))
             since = state['waits'].get(key)
             waits[key] = since if isinstance(since, (int, float)) else now

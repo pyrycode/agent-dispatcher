@@ -414,6 +414,25 @@ class DispatcherRunsAndStarvation(unittest.TestCase):
             f.now[0] += 1000
             self.assertEqual(f.watchdog.tick({}), [])
 
+    def test_a_heavy_job_held_by_its_project_limit_names_that_project_holder(self):
+        # build-hp-1: heavy limit 2, at most one Mobile heavy job. A free heavy
+        # place does not help a Mobile job waiting behind an idle Mobile run.
+        with tempfile.TemporaryDirectory() as d:
+            f = Fleet(d)
+            f.state['heavyLimit'] = 2
+            f.state['projectHeavyLimits'] = {'pyrycode/pyrycode-desktop': 1}
+            self.dispatcher_run(f, ticket='pyrycode/pyrycode-desktop#1700', role='verifier', log_at=FINISHED - 5000, project='pyrycode/pyrycode-desktop')
+            f.watchdog.settings['dispatcherSilenceSeconds'] = 10 ** 6
+            f.state['queue'] = [{'ticket': 'pyrycode/pyrycode-desktop#1809', 'role': 'verifier', 'resource': 'heavy', 'state': 'waiting-for-capacity-or-lock'},
+                                {'ticket': 'pyrycode/pyrycode#9', 'role': 'builder', 'resource': 'heavy', 'state': 'waiting-for-capacity-or-lock'}]
+            self.assertEqual(f.watchdog.tick({}), [])
+            f.now[0] += 3601
+            [item] = f.watchdog.tick({})
+            self.assertEqual((item['kind'], item['ticket'], item['holder']), ('starvation', 'pyrycode/pyrycode-desktop#1809', 'pyrycode/pyrycode-desktop#1700 verifier'))
+            # Without the project limit a free heavy place is not starvation.
+            f.state['projectHeavyLimits'] = {}
+            self.assertEqual(f.watchdog.tick({}), [])
+
     def test_an_update_waiting_for_an_idle_native_task_names_both(self):
         # pyrybox Core waited in waiting-for-native-task from 09:20 behind the #3289 task.
         with tempfile.TemporaryDirectory() as d:
