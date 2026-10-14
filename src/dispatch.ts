@@ -234,6 +234,7 @@ import {
   type LiveTestsSection,
 } from "./gate-selection.js";
 import { liveTestsSectionError, requiredLiveTestNames } from "./live-tests.js";
+import { loadTestEvidenceRules, type TestEvidenceRule } from "./gate-test-evidence.js";
 import {
   trimMemoryIndexFile,
   MEMORY_INDEX_CAP_BYTES,
@@ -374,6 +375,16 @@ const REAL_CLAUDE_GATE_FORMAT: GateOutputFormat | null = (() => {
     `   ❌ PYRY_REAL_CLAUDE_GATE_FORMAT="${raw}" is not a format this dispatcher knows. ` +
     `The real-claude gate is DISABLED for this fork; gated tickets will park for an operator instead.`,
   );
+  return null;
+})();
+
+// The fork's evidence rules for named live tests, from `live-test-evidence.json`
+// in its agents repo (gate-test-evidence.ts). Null when the file is present but
+// invalid: the gate is then off, loudly, rather than judging without the rules.
+const REAL_CLAUDE_GATE_TEST_EVIDENCE: readonly TestEvidenceRule[] | null = (() => {
+  const { rules, error } = loadTestEvidenceRules(agentsRepoRoot);
+  if (error === null) return rules;
+  console.error(`   ❌ ${error}. The real-claude gate is disabled until the file is fixed.`);
   return null;
 })();
 
@@ -1667,6 +1678,7 @@ Use native blockers for required repairs. Shared-file editing alone is coordinat
         logsDir: LOGS_DIR,
         env: process.env,
         namingText: [item.body, ...planTexts, verdictText].join("\n"),
+        testEvidence: REAL_CLAUDE_GATE_TEST_EVIDENCE ?? [],
       }));
     } catch (e) {
       console.warn(`   ⚠️  Failed to build the gate report for #${ticketNum}: ${e}`);
@@ -7227,6 +7239,8 @@ export async function runRealClaudeGateSuite(opts: {
   selection?: GateSelectionConfig | null;
   /** Named tests every run must pass, from `PYRY_REAL_CLAUDE_GATE_ALWAYS_TESTS`. */
   requiredTests?: readonly string[];
+  /** The fork's evidence rules for named tests, for the backstop's verdict. */
+  testEvidence?: readonly TestEvidenceRule[];
   /** The fork's floor, which a full run must clear to count as the backstop's pass. */
   minExecuted?: number;
   /**
@@ -7480,6 +7494,7 @@ export async function runRealClaudeGateSuite(opts: {
     if (
       report.selection?.mode === "full" && decideGateVerdict({
         ...report, minExecuted: opts.minExecuted ?? 1, requiredTests: gateRunRequiredTests(report),
+        testEvidence: opts.testEvidence,
       }).verdict === "pass"
     ) {
       try {
@@ -7912,6 +7927,7 @@ async function runBranchRerun(opts: {
 export function makeRealClaudeGateRunner(): RealClaudeGateRunner | null {
   if (REAL_CLAUDE_GATE_CMD === "") return null;
   if (REAL_CLAUDE_GATE_FORMAT === null) return null; // bad format, already reported
+  if (REAL_CLAUDE_GATE_TEST_EVIDENCE === null) return null; // bad evidence rules, already reported
   const format = REAL_CLAUDE_GATE_FORMAT;
   return async ({ issueNumber }) => {
     const report = await runRealClaudeGateSuite({
@@ -7922,6 +7938,7 @@ export function makeRealClaudeGateRunner(): RealClaudeGateRunner | null {
       timeoutMs: REAL_CLAUDE_GATE_TIMEOUT_MS,
       selection: REAL_CLAUDE_GATE_SELECTION,
       requiredTests: (process.env.PYRY_REAL_CLAUDE_GATE_ALWAYS_TESTS ?? "").split(",").map(s => s.trim()).filter(Boolean),
+      testEvidence: REAL_CLAUDE_GATE_TEST_EVIDENCE ?? [],
       minExecuted: REAL_CLAUDE_GATE_MIN_EXECUTED,
       infraBreaker: INFRA_BREAKER,
     });
@@ -9841,7 +9858,7 @@ export async function pollLoop(): Promise<void> {
                 REAL_CLAUDE_GATE_MIN_EXECUTED, notifyDiscord, 0,
                 (flaky, ctx) => recordFlakyTests(client, flaky, ctx), undefined,
                 (failures, ctx) => recordInheritedTests(client, failures, ctx),
-                { legacyFormat: REAL_CLAUDE_GATE_FORMAT ?? undefined },
+                { legacyFormat: REAL_CLAUDE_GATE_FORMAT ?? undefined, testEvidence: REAL_CLAUDE_GATE_TEST_EVIDENCE ?? [] },
               );
             }).finally(() => { if (gateRun?.done === done) gateRun = null; });
             gateRun = { issue: candidate.issueNumber, done };
@@ -9859,7 +9876,7 @@ export async function pollLoop(): Promise<void> {
         (flaky, ctx) => recordFlakyTests(client, flaky, ctx),
         undefined,
         (failures, ctx) => recordInheritedTests(client, failures, ctx),
-        { legacyFormat: REAL_CLAUDE_GATE_FORMAT ?? undefined },
+        { legacyFormat: REAL_CLAUDE_GATE_FORMAT ?? undefined, testEvidence: REAL_CLAUDE_GATE_TEST_EVIDENCE ?? [] },
       );
     } else if (gateRun === null) {
       const verifiersInFlight = REAL_CLAUDE_GATE_HOLD_VERIFIERS
@@ -9877,7 +9894,7 @@ export async function pollLoop(): Promise<void> {
           gateRun = { issue, done };
         },
         (failures, ctx) => recordInheritedTests(client, failures, ctx),
-        { legacyFormat: REAL_CLAUDE_GATE_FORMAT ?? undefined },
+        { legacyFormat: REAL_CLAUDE_GATE_FORMAT ?? undefined, testEvidence: REAL_CLAUDE_GATE_TEST_EVIDENCE ?? [] },
       );
     }
     // A waiting or running background gate keeps the main sweep off the

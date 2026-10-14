@@ -31,6 +31,7 @@ import { gateRunRequiredTests, isGateOutputFormat, parseGateOutput, parseGateTes
 import { parseVerifierGateFormats } from "./verifier-gate-baseline.js";
 import { parseVerifierGatePass, verifierGatePassFileName, type VerifierGatePass } from "./verifier-gate-reuse.js";
 import { decideGateVerdict } from "./pipeline-decisions.js";
+import { rulesFor, type TestEvidenceRule } from "./gate-test-evidence.js";
 
 /** Most named tests listed; the rest are counted. */
 export const MAX_NAMED_TESTS = 25;
@@ -98,6 +99,8 @@ export function buildGateReportSection(input: {
   namingText: string;
   /** The latest real-claude gate run, reported test by test. */
   live?: LiveGateRun | null;
+  /** The fork's evidence rules for named live tests. */
+  testEvidence?: readonly TestEvidenceRule[];
 }): string {
   if (input.pass === null && input.runs.length === 0) {
     return "\n## Gate report\nNo gate report is available for this ticket: there is no recorded verifier gate pass, " +
@@ -171,7 +174,7 @@ export function buildGateReportSection(input: {
     lines.push(`- ${named.slice(0, MAX_NAMED_TESTS).map((m) => `\`${m}\``).join(", ")}: no run has per-test counts.`);
   }
 
-  if (input.live) lines.push("", ...liveGateLines(input.live, input.namingText));
+  if (input.live) lines.push("", ...liveGateLines(input.live, input.namingText, input.testEvidence));
 
   return "\n## Gate report\n" +
     "The dispatcher built this from its own gate logs for this ticket. Use it for handoff items that ask whether a named test ran and passed. " +
@@ -200,6 +203,7 @@ export function gateReportSection(opts: {
   logsDir: string;
   env: NodeJS.ProcessEnv;
   namingText: string;
+  testEvidence?: readonly TestEvidenceRule[];
 }): string {
   const { issueNumber, logsDir, env } = opts;
   const passRaw = readOrNull(resolve(logsDir, verifierGatePassFileName(issueNumber)));
@@ -234,7 +238,7 @@ export function gateReportSection(opts: {
     liveRun = { stamp, format, raw, meta: metaRaw === null ? null : parseGateRunMeta(metaRaw) };
   }
 
-  return buildGateReportSection({ pass, runs, namingText: opts.namingText, live: liveRun });
+  return buildGateReportSection({ pass, runs, namingText: opts.namingText, live: liveRun, testEvidence: opts.testEvidence });
 }
 
 // --------- The latest live gate run, test by test ---------
@@ -382,7 +386,7 @@ function isNamedTest(name: string, format: GateOutputFormat, text: string): bool
 }
 
 /** The report lines for the latest live gate run. */
-export function liveGateLines(live: LiveGateRun, namingText: string): string[] {
+export function liveGateLines(live: LiveGateRun, namingText: string, testEvidence: readonly TestEvidenceRule[] = []): string[] {
   const lines = [`Latest real-claude gate run, every test (output ${live.stamp}${live.format ? `, ${live.format}` : ""}):`];
   const meta = live.meta;
   if (meta === null) {
@@ -409,13 +413,14 @@ export function liveGateLines(live: LiveGateRun, namingText: string): string[] {
 
   const requiredTests = meta?.requiredTests ?? [];
   // Do not present aggregate passes as acceptance when a required named
-  // result is missing: the documentation stage must not record it as proof.
-  if (requiredTests.length > 0) {
-    lines.push(`- Required live tests: ${requiredTests.map(n => `\`${n}\``).join(", ")}.`);
+  // result or its configured evidence is missing: the documentation stage
+  // must not record it as proof.
+  if (requiredTests.length > 0 || testEvidence.length > 0) {
+    if (requiredTests.length > 0) lines.push(`- Required live tests: ${requiredTests.map(n => `\`${n}\``).join(", ")}.`);
     const acceptance = decideGateVerdict({
       runError: meta?.runError ?? null, timedOut: meta?.timedOut ?? false,
       exitCode: meta?.exitCode ?? null, minExecuted: 1,
-      tally: parseGateOutput(live.raw, live.format), requiredTests, outputFormat: live.format,
+      tally: parseGateOutput(live.raw, live.format), requiredTests, testEvidence, outputFormat: live.format,
     });
     if (acceptance.verdict === "unusable" || acceptance.verdict === "zero-executed") {
       lines.push(`- Live acceptance remains missing: ${acceptance.reason}. \`needs-real-claude\` must remain; this run cannot advance to documentation.`);
@@ -471,6 +476,9 @@ export function liveGateLines(live: LiveGateRun, namingText: string): string[] {
     if (d.status !== "skipped" && d.status !== "flaky" && d.attempts !== undefined) parts.push(`${d.attempts} attempt${d.attempts === 1 ? "" : "s"}`);
     if (d.status !== "skipped" && d.durationMs !== undefined) parts.push(formatSeconds(d.durationMs));
     if (d.daemonRevisions?.length) parts.push(`daemon ${d.daemonRevisions.join(", ")}`);
+    const configured = rulesFor(d.name, testEvidence).flatMap(rule => [...(rule.attachments ?? []), ...(rule.json ?? []).map(c => c.attachment)]);
+    const attached = [...new Set(configured)].filter(name => d.passingAttempt?.attachments?.[name]);
+    if (attached.length > 0) parts.push(`${attached.join(", ")} on passing attempt ${d.passingAttempt!.attempt}`);
     lines.push(`  - \`${displayName(d.name, live.format)}\`: ${parts.join(", ")}`);
   }
   if (shown.length < details.length) {

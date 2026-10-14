@@ -1,0 +1,18 @@
+[
+  {
+    "pattern": "\\bLuna\\b",
+    "requireWhenReported": true,
+    "sameAttemptDaemonRevision": true,
+    "attachments": ["daemon-revision", "published-model-row"],
+    "json": [
+      {
+        "attachment": "published-model-row",
+        "nonEmpty": ["serverId", "conversationId", "model.value"],
+        "equals": { "model.agent": "codex", "model.display_name": "GPT-6 Luna" },
+        "notEquals": { "model.value": "default" },
+        "includes": { "model.effort_levels": "low" },
+        "listContains": { "models": "model" }
+      }
+    ]
+  }
+]

@@ -65,6 +65,7 @@ import { selectDispatches } from "./dispatch-selection.js";
 import { findRepeatedMustFix, newestFailVerdict, parseVerdictArtifacts, staleBaseFindings, type VerdictArtifact } from "./verdict-guard.js";
 import { GATE_PARSER_VERSION, formatGateEvidenceComment, gateCommandProvenance, gateRunFloor, gateRunRequiredTests, parseGateOutput, validateGateOutputProvenance, type GateOutputFormat, type GateRunReport } from "./gate-output.js";
 import { gateRunMetaMatches, gateRunMetaPath, parseGateRunMeta, type GateRunMeta } from "./gate-report.js";
+import type { TestEvidenceRule } from "./gate-test-evidence.js";
 import type { FlakyRunContext, FlakyTicketResult } from "./flaky-tickets.js";
 import type { InheritedTicketResult } from "./inherited-tickets.js";
 
@@ -704,7 +705,7 @@ export async function runRealClaudeGateExecution(
   recordInherited: (failures: readonly string[], ctx: FlakyRunContext) => Promise<InheritedTicketResult> = noInheritedTickets,
   /** The fork's configured gate format, used only for a saved report that
    *  predates recorded formats and whose command names no reporter. */
-  options: { legacyFormat?: GateOutputFormat } = {},
+  options: { legacyFormat?: GateOutputFormat; testEvidence?: readonly TestEvidenceRule[] } = {},
 ): Promise<boolean> {
   // Off switch. No command configured means this step never touches the
   // board, so the whole feature can land on a live dispatcher before any
@@ -882,6 +883,7 @@ export async function runRealClaudeGateExecution(
         minExecuted: gateRunFloor(report, minExecuted),
         command: report.command,
         requiredTests: gateRunRequiredTests(report),
+        testEvidence: options.testEvidence,
         outputFormat: format,
       });
       // A failure in the shape of a shared environment failure is not judged
@@ -925,6 +927,10 @@ export async function runRealClaudeGateExecution(
         : infra.pausedUntil === null
           ? `The live gate pause could not be recorded, so the next gated ticket may meet the same failure. `
           : `No live gate pause is configured (\`PYRY_INFRA_COOLDOWN_MS=0\`). `;
+      if (verdict === "flaky-pass" && raw.missingLiveAcceptance) {
+        verdict = "unusable";
+        reason = `${raw.missingLiveAcceptance}; a failure-only re-run cannot supply missing live acceptance`;
+      }
       if (conflictParkNote !== "") reason = `${reason} ${conflictParkNote.replace(/\.$/, "")}`;
       let inheritedTickets: InheritedTicketResult = { blockers: [], untracked: [] };
       if (preExisting.length > 0) {
