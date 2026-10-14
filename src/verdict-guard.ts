@@ -263,11 +263,12 @@ export function findRepeatedMustFix(artifacts: readonly VerdictArtifact[], build
   const previous = older.find(p => completedAt.some(t => t > Date.parse(p.at) && t < Date.parse(newest.at)));
   if (previous === undefined) return [];
   if (newest.head && newest.head === previous.head) return [];
-  const open = extractMustFixFindings(newest.body!).filter((f) => !isBranchInvariantKey(f.key));
+  const raised = extractTaggedFindings(newest.body!).filter((f) => !isBranchInvariantKey(f.key));
+  const open = raised.filter((f) => f.mustFix);
   const prior = withoutRepaired(
     extractTaggedFindings(previous.body!).filter((f) => !isBranchInvariantKey(f.key)),
     extractFixedFindings(newest.body!),
-    open,
+    raised,
   ).filter((f) => f.mustFix);
   const repeated = open.filter((f) => prior.some((p) => sameLocation(p, f) && findingSimilarity(p, f) >= REPEAT_FINDING_SIMILARITY));
   return [...new Set(repeated.map((f) => f.key))];
@@ -283,18 +284,19 @@ function findingSimilarity(a: MustFixFinding, b: MustFixFinding): number {
  * newest verdict lists as fixed. Each `Fixed:` line retires one previous
  * finding at a shared location: the one its text reads most like, and among
  * equals, which is every candidate when the line carries only its location,
- * the one least like any finding the newest verdict still raises there. So a
+ * the one least like any finding the newest verdict still raises there, at
+ * any severity. So a
  * location with two previous findings, one fixed and one raised again, keeps
  * the one raised again, and a fixed `[SHOULD FIX]` or `[NIT]` is retired in
  * place of a `[MUST FIX]` beside it. The line with the fewest candidates
  * goes first, so the order the verifier lists them in does not matter. A
  * `Fixed:` line with no previous finding at its location retires nothing.
  */
-function withoutRepaired<T extends MustFixFinding>(prior: readonly T[], fixed: readonly MustFixFinding[], open: readonly MustFixFinding[]): T[] {
+function withoutRepaired<T extends MustFixFinding>(prior: readonly T[], fixed: readonly MustFixFinding[], raised: readonly MustFixFinding[]): T[] {
   const left = [...prior];
   const pending = [...fixed];
   const stillRaised = (p: MustFixFinding) =>
-    Math.max(0, ...open.filter((o) => sameLocation(p, o)).map((o) => findingSimilarity(p, o)));
+    Math.max(0, ...raised.filter((o) => sameLocation(p, o)).map((o) => findingSimilarity(p, o)));
   const candidates = (fx: MustFixFinding) => left.filter((p) => sameLocation(p, fx));
   while (pending.length > 0) {
     let next = -1;

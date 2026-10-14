@@ -346,6 +346,25 @@ describe("a finding the newer verdict lists as fixed is never repeated (desktop 
     assert.deepStrictEqual(findRepeatedMustFix(comments, ["2026-10-05T09:30:00Z"]), ["app/src/Screen.kt → Screen"]);
   });
 
+  test("a location-only Fixed line retires the MUST FIX when the SHOULD FIX beside it is raised again", () => {
+    const verdict = (findings: string[]) => `## Verifier Review: #1\n\n**Decision: FAIL**\n\n### Findings\n${findings.map((f) => `- ${f}`).join("\n")}\n`;
+    const colour = "[SHOULD FIX] `app/src/Screen.kt` → `Screen`: the header title uses a hardcoded colour instead of the theme token";
+    const comments = artifacts(
+      { createdAt: "2026-10-05T09:00:00Z", body: verdict([
+        "[MUST FIX] `app/src/Screen.kt` → `Screen`: the retry button stays enabled while a request is in flight, so a double tap sends two requests",
+        colour,
+      ]) },
+      { createdAt: "2026-10-05T10:00:00Z", body: verdict([
+        "Fixed: `app/src/Screen.kt` → `Screen`",
+        colour,
+        // A different defect that reads close to the retry one (0.3 or more),
+        // the #1951 shape: only the Fixed line keeps it from counting.
+        "[MUST FIX] `app/src/Screen.kt` → `Screen`: the cancel button stays enabled while a request is in flight, so a tap after cancel sends a stale request",
+      ]) },
+    );
+    assert.deepStrictEqual(findRepeatedMustFix(comments, ["2026-10-05T09:30:00Z"]), []);
+  });
+
   test("Fixed lines retire the same findings whatever order the verifier lists them in", () => {
     const verdict = (findings: string[]) => `## Verifier Review: #1\n\n**Decision: FAIL**\n\n### Findings\n${findings.map((f) => `- ${f}`).join("\n")}\n`;
     const p1 = "[MUST FIX] `a.ts` → `A`; `b.ts` → `B`: the cache is never invalidated after a host switch";
