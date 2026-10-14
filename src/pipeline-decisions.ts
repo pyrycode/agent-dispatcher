@@ -738,6 +738,9 @@ export interface GateVerdictInput {
   /** Retained raw evidence takes precedence over a legacy/incomplete tally. */
   rawOutput?: string | null;
   outputFormat?: GateOutputFormat;
+  /** Named live acceptance. Survives a full-suite selection: each name must
+   *  execute and pass, whatever the suite totals say. */
+  requiredTests?: readonly string[];
   /** Non-null when the run could not be started or completed at all. */
   runError: string | null;
   /** True when the outer wall clock fired. */
@@ -783,6 +786,17 @@ export interface GateVerdictDecision {
   verdict: GateVerdict;
   /** One line, suitable for a log and for the evidence comment. */
   reason: string;
+}
+
+/** Go filters may name a parent while its report counts only leaf tests.
+ * Bare Go function names also omit the package qualifier the parser adds. */
+function matchesRequiredTest(actual: string, required: string): boolean {
+  if (/^(Test|Benchmark|Example|Fuzz)/.test(required)) {
+    const boundary = actual.search(/\.(Test|Benchmark|Example|Fuzz)/);
+    if (boundary >= 0) actual = actual.slice(boundary + 1);
+  }
+  return actual === required ||
+    (!required.includes(" › ") && /(?:^|\.)(Test|Benchmark|Example|Fuzz)/.test(required) && actual.startsWith(`${required}/`));
 }
 
 /** Reject incomplete evidence before attributing named failures. A subset
@@ -861,6 +875,24 @@ export function decideGateVerdict(input: GateVerdictInput): GateVerdictDecision 
   const skipCount = Math.max(tally.skipped ?? 0, tally.skipReasons?.length ?? 0);
   if (skippedNames.length !== skipCount) {
     return { verdict: "unusable", reason: "skipped test identities are incomplete; reparse retained raw evidence before judging live acceptance" };
+  }
+
+  // Suite totals cannot replace a required named result. Judge acceptance
+  // before failure attribution, which could otherwise turn an unrelated
+  // failure into a flaky pass that never ran the named test.
+  for (const name of new Set(input.requiredTests ?? [])) {
+    const matches = (actual: string) => matchesRequiredTest(actual, name);
+    const details = (tally.testDetails ?? []).filter(d => matches(d.name));
+    const skipped = details.some(d => d.status === "skipped") || skippedNames.some(matches);
+    const failed = tally.failedNames?.some(matches) === true;
+    // A genuine named failure routes to repair through the failure path below.
+    if (failed && !skipped) continue;
+    const passed = tally.passedNames?.some(matches) === true && !skipped;
+    if (!passed) return { verdict: "unusable", reason: `required live test ${name} ${skipped ? "skipped" : "has no passing execution"}; live acceptance remains missing` };
+    if ((tally.testDetails || format === "playwright-json" || name.includes(" › ")) &&
+      (details.length === 0 || details.some(d => !d.passingAttempt))) {
+      return { verdict: "unusable", reason: `required live test ${name} has no actual passing attempt; live acceptance remains missing` };
+    }
   }
 
   if (tally.failed > 0 || tally.packageFailed) {

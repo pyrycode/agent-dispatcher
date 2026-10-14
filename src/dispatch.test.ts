@@ -107,11 +107,12 @@ import {
   baseCurrencyNote,
   recordGateRunMeta,
   refreshStaleBaseBranch,
+  LIVE_TESTS_SECTION_GATE,
 } from "./dispatch.js";
 import { DEFAULT_INFRA_BREAKER_CONFIG, type InfraBreakerConfig } from "./infra-failure.js";
-import { parseGateRunMeta } from "./gate-report.js";
+import { parseGateRunMeta, serializeGateRunMeta } from "./gate-report.js";
 import { serializeLastVerdict } from "./verdict-handoff.js";
-import { formatGateEvidenceComment, gateRunFloor } from "./gate-output.js";
+import { formatGateEvidenceComment, gateRunFloor, gateRunRequiredTests } from "./gate-output.js";
 import { decideGateVerdict } from "./pipeline-decisions.js";
 import { flakyMarker } from "./flaky-tickets.js";
 import { FINAL_MERGE_HANDOFF_MARKER, MERGE_RESOLUTION_NOTE_MARKER, mergeResolutionComment } from "./merge-handoff.js";
@@ -7018,6 +7019,54 @@ describe("runRealClaudeGateSuite — evidence gathering", () => {
 });
 
 describe("runRealClaudeGateSuite — per-ticket selection", () => {
+  test("comma and colon titles survive execution and persistence for passing, skipped and absent results", async () => {
+    const captured = JSON.parse(readFileSync(new URL("./fixtures/desktop-1809-live-report.json", import.meta.url), "utf8"));
+    const retained = captured.suites.find((s: any) => s.title === "real-claude-effort-default.spec.ts");
+    for (const title of [retained.specs[0].title, "applied effort: Low, confirmed preference: yes"]) {
+      const name = `${retained.title} › ${title}`;
+      for (const mode of ["off", "selected", "all", "shared"] as const) {
+        for (const status of ["passed", "skipped", "absent"] as const) {
+          // Parser fixtures retain the real effort result; other scenarios are synthetic.
+          const suite = JSON.parse(JSON.stringify(retained));
+          suite.specs[0].title = title;
+          if (status === "skipped") suite.specs[0].tests = [{ status: "skipped", results: [], annotations: [{ type: "skip", description: "fixture: unavailable" }] }];
+          const output = JSON.stringify({ suites: [
+            ...(status === "absent" ? [] : [suite]),
+            { title: "other.spec.ts", specs: [{ title: "unrelated pass", tests: [{ status: "expected", results: [{ status: "passed" }] }] }] },
+          ] });
+          const body = `## Live tests\n${mode === "all" ? "- all\n" : ""}- \`${name}\``;
+          const writes: string[] = [];
+          const harness = makeGateDeps({
+            gitOut: cmd => cmd.startsWith("gh pr list") ? body : cmd.startsWith("git diff --name-only") ? (mode === "shared" ? "net/Relay.ts" : "ui/Settings.ts") : cmd.includes("--count --merges") ? "2" : GATE_SHAS[cmd] ?? "",
+            fileContents: output,
+            readGateFullState: () => JSON.stringify({ lastFullPassSha: "f".repeat(40) }),
+            writeGateFullState: json => { writes.push(json); },
+          });
+          const report = await runRealClaudeGateSuite({
+            issueNumber: 1382, command: "playwright test --reporter=json", baselineCommand: "playwright test --reporter=json -g {{TESTS}}",
+            format: "playwright-json", timeoutMs: 60_000, minExecuted: 1,
+            selection: mode === "off" ? null : { alwaysTests: [], fullPaths: ["net/"], fullEvery: 10 },
+            repoRoot: "/tmp/fake-repo", logsDir: "/tmp/fake-logs", defaultBranch: "main", deps: harness.deps,
+          });
+          assert.equal(report.runError, null);
+          // `all` asks for the whole suite and names no required test.
+          const required = mode === "all" ? [] : [name];
+          assert.deepEqual(report.requiredTests, required);
+          assert.equal(report.selection?.mode, mode === "off" ? undefined : mode === "selected" ? "selected" : "full");
+          if (mode === "selected") {
+            assert.deepEqual(report.selection?.mode === "selected" && report.selection.tests, [name]);
+            assert.ok(harness.spawnRequests[0].command.includes(title));
+          }
+          const saved = JSON.parse(JSON.stringify(report));
+          const passes = status === "passed" || mode === "all";
+          assert.equal(decideGateVerdict({ ...saved, minExecuted: gateRunFloor(saved, 1), requiredTests: gateRunRequiredTests(saved) }).verdict, passes ? "pass" : "unusable");
+          assert.deepEqual(parseGateRunMeta(serializeGateRunMeta(saved, {}, new Date()))?.requiredTests, required);
+          assert.equal(writes.length, passes && (mode === "all" || mode === "shared") ? 1 : 0);
+        }
+      }
+    }
+  });
+
   const LAST_FULL = "f".repeat(40);
   const body = "## Summary\nx\n\n## Live tests\n- p.TestRename\n";
 
@@ -7028,6 +7077,8 @@ describe("runRealClaudeGateSuite — per-ticket selection", () => {
     merges?: string;
     fileContents?: string;
     selection?: Parameters<typeof runRealClaudeGateSuite>[0]["selection"];
+    requiredTests?: string[];
+    prFail?: boolean;
   } = {}) {
     const writes: string[] = [];
     const out: Record<string, string> = {
@@ -7037,6 +7088,7 @@ describe("runRealClaudeGateSuite — per-ticket selection", () => {
     };
     const harness = makeGateDeps({
       gitOut: (cmd: string) => cmd.startsWith("gh pr list") ? (over.prBody ?? body) : (out[cmd] ?? ""),
+      gitFail: (cmd: string) => over.prFail === true && cmd.startsWith("gh pr list"),
       fileContents: over.fileContents,
       readGateFullState: () => over.lastFull === null ? null : JSON.stringify({ lastFullPassSha: over.lastFull ?? LAST_FULL }),
       writeGateFullState: (json: string) => { writes.push(json); },
@@ -7053,6 +7105,7 @@ describe("runRealClaudeGateSuite — per-ticket selection", () => {
         selection: over.selection === undefined
           ? { alwaysTests: ["p.TestPing"], fullPaths: ["net/"], fullEvery: 10 }
           : over.selection,
+        requiredTests: over.requiredTests,
         minExecuted: 1,
         repoRoot: "/tmp/fake-repo",
         defaultBranch: "main",
@@ -7067,6 +7120,7 @@ describe("runRealClaudeGateSuite — per-ticket selection", () => {
     const report = await run();
 
     assert.equal(report.selection?.mode, "selected");
+    assert.deepEqual(report.requiredTests, ["p.TestPing", "p.TestRename"]);
     assert.match(spawnRequests[0].command, /-run '\^\(TestPing\|TestRename\)\$'/);
     assert.equal(report.command, spawnRequests[0].command, "the evidence shows the command that actually ran");
     assert.deepEqual(writes, [], "a selected run never resets the backstop");
@@ -7080,7 +7134,8 @@ describe("runRealClaudeGateSuite — per-ticket selection", () => {
   });
 
   test("with no full pass on record, runs the full command and records it when it is clean", async () => {
-    const { run, spawnRequests, writes } = selectionRun({ lastFull: null });
+    const { run, spawnRequests, writes } = selectionRun({ lastFull: null,
+      fileContents: ["TestPing", "TestRename"].map(Test => JSON.stringify({ Action: "pass", Package: "p", Test })).join("\n") });
     await run();
     assert.equal(spawnRequests[0].command, "go test -json ./...");
     assert.deepEqual(writes, [JSON.stringify({ lastFullPassSha: GATE_BASE_SHA })]);
@@ -7103,12 +7158,88 @@ describe("runRealClaudeGateSuite — per-ticket selection", () => {
     assert.equal(spawnRequests[0].command, "go test -json ./...");
   });
 
-  test("selection off reads no pull request and records nothing", async () => {
+  test("selection off still reads named requirements and records no backstop", async () => {
     const { run, calls, writes } = selectionRun({ selection: null, lastFull: null });
     const report = await run();
     assert.equal(report.selection, undefined);
-    assert.ok(!calls.some(c => c.startsWith("gh pr list")));
+    assert.ok(calls.some(c => c.startsWith("gh pr list")));
+    assert.deepEqual(report.requiredTests, ["p.TestRename"]);
     assert.deepEqual(writes, []);
+  });
+
+  test("a full run missing required names cannot record a passing backstop", async () => {
+    const { run, writes } = selectionRun({ lastFull: null });
+    const report = await run();
+    assert.deepEqual(report.requiredTests, ["p.TestPing", "p.TestRename"]);
+    assert.deepEqual(writes, []);
+  });
+
+  test("the fork's always-required names stay when selection is off", async () => {
+    const { run } = selectionRun({ selection: null, requiredTests: ["p.TestPing"] });
+    assert.deepEqual((await run()).requiredTests, ["p.TestPing", "p.TestRename"]);
+  });
+
+  test("an unreadable pull request runs the full suite with the fork's names only, without parking", async () => {
+    const { run, spawnRequests } = gateRun({ gitFail: cmd => cmd.startsWith("gh pr list") });
+    const report = await run();
+    assert.equal(report.runError, null);
+    assert.equal(spawnRequests.length, 1);
+    assert.deepEqual(report.requiredTests, []);
+    const selected = selectionRun({ requiredTests: ["p.TestPing"], prFail: true });
+    const fallback = await selected.run();
+    assert.equal(fallback.runError, null);
+    assert.equal(fallback.selection?.mode, "full");
+    assert.equal(selected.spawnRequests[0].command, "go test -json ./...");
+    assert.deepEqual(fallback.requiredTests, ["p.TestPing"]);
+  });
+
+  test("a JUnit name cut at '#' is not required, so the mobile gate still judges its run", async () => {
+    // An env-file loader that treats `#` as a comment turns
+    // `de.pyryco.mobile.e2e.InteractiveStreamE2ETest#interactiveTurn` into the
+    // bare class name. Required as is, it never matches a test and every run
+    // is unusable.
+    const cls = "de.pyryco.mobile.e2e.InteractiveStreamE2ETest";
+    const junit = '<testsuite name="live" tests="2">' +
+      `<testcase classname="${cls}" name="interactiveTurn"/><testcase classname="${cls}" name="reconnects"/></testsuite>`;
+    for (const [always, body, required] of [
+      [[cls], "## Summary\nno list", []],
+      [[cls, `${cls}#interactiveTurn`], "## Summary\nno list", [`${cls}#interactiveTurn`]],
+      [[], `## Live tests\n- ${cls}\n- ${cls}#reconnects`, [`${cls}#reconnects`]],
+    ] as const) {
+      const harness = makeGateDeps({
+        gitOut: cmd => cmd.startsWith("gh pr list") ? body : cmd.includes("--count --merges") ? "0" : GATE_SHAS[cmd] ?? "",
+        fileContents: junit,
+        readGateFullState: () => JSON.stringify({ lastFullPassSha: "f".repeat(40) }),
+        writeGateFullState: () => {},
+      });
+      const report = await runRealClaudeGateSuite({
+        issueNumber: 2153, command: "./gradlew connectedDebugAndroidTest", format: "junit-xml", timeoutMs: 60_000, minExecuted: 2,
+        baselineCommand: "./gradlew connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class={{TESTS}}",
+        selection: { alwaysTests: [...always], fullPaths: [], fullEvery: 10 }, requiredTests: [...always],
+        repoRoot: "/tmp/fake-repo", logsDir: "/tmp/fake-logs", defaultBranch: "main", deps: harness.deps,
+      });
+      assert.equal(report.runError, null);
+      assert.deepEqual(report.requiredTests, required);
+      assert.equal(decideGateVerdict({ ...report, minExecuted: gateRunFloor(report, 2), requiredTests: gateRunRequiredTests(report) }).verdict, "pass", JSON.stringify(always));
+    }
+  });
+
+  test("an invalid ## Live tests section names nothing and runs the full suite (mobile #2132, #1847)", async () => {
+    for (const body of [
+      "## Live tests\n\nde.pyryco.mobile.e2e.InteractiveStreamE2ETest#interactiveTurn_backgroundAgent_followsBottomUntilFinished\n\nReview: self-reviewed reply identity, fragment completeness, cancellation, private diagnostics and navigation assertions.",
+      "## Live tests\n- p.TestRename\nThis also covers the reconnect path",
+    ]) {
+      const { run, spawnRequests } = selectionRun({ prBody: body });
+      const report = await run();
+      assert.equal(report.runError, null);
+      assert.equal(report.selection?.mode, "full");
+      assert.equal(spawnRequests[0].command, "go test -json ./...");
+      assert.deepEqual(report.requiredTests, ["p.TestPing"], "only the fork's always-run name remains");
+    }
+    const { run } = selectionRun({ prBody: "## Live tests\n\nall\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n" });
+    const report = await run();
+    assert.equal(report.selection?.mode, "full");
+    assert.deepEqual(report.requiredTests, ["p.TestPing"], "the generated footer is not a test");
   });
 });
 
@@ -9009,6 +9140,36 @@ describe("pre-verifier gates — dispatchToAgent wiring", () => {
 
       assert.equal(calls.gates.length, 0, "only the verifier is gate-gated");
       assert.equal(calls.claudeStreams, 1);
+    }));
+  });
+
+  test("maybeRunPreSpawnGates: an invalid ## Live tests section is a red check with the offending lines (mobile #2132)", async () => {
+    const invalid = "## Live tests\n\nde.pyryco.mobile.e2e.InteractiveStreamE2ETest#interactiveTurn_backgroundAgent_followsBottomUntilFinished\n\n" +
+      "Review: self-reviewed reply identity, fragment completeness, cancellation, private diagnostics and navigation assertions.";
+    await withStageSet("builder", () => withVerifierGates("make check", async () => {
+      for (const [body, red] of [
+        [invalid, true],
+        ["## Live tests\n\nall\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)", false],
+        ["## Live tests\n- `real.spec.ts › effort, Low: confirmed`\n- p.TestRename\n\n## Testing\nprose is fine here", false],
+        ["## Summary\nno live tests section", false],
+        [new Error("HTTP 502"), false],
+      ] as const) {
+        const { ctx, calls } = makeTestContext({
+          agent: builderAgent("verifier"), item: { issueNumber: 916 },
+          mockOptions: { execImpls: { "gh pr view": () => body } },
+        });
+        const result = await maybeRunPreSpawnGates(ctx);
+        assert.equal(ctx.failedPreSpawnGate, red ? LIVE_TESTS_SECTION_GATE : undefined, String(body));
+        assert.match(result.promptNote, /make check/, "the configured gates still ran");
+        if (red) {
+          assert.match(result.promptNote, /Live tests` section: TRIAGE MODE/);
+          assert.match(result.promptNote, /Review: self-reviewed reply identity/);
+          assert.match(result.promptNote, /cannot advance or publish PASS/);
+          assert.match(loggedText(calls), /## Live tests section: invalid/);
+        } else {
+          assert.doesNotMatch(result.promptNote, /Live tests` section/);
+        }
+      }
     }));
   });
 

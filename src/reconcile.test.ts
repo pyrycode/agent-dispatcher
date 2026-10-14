@@ -29,6 +29,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GATE_PARSER_VERSION, parseGateOutput, type GateRunReport, type GateTally } from "./gate-output.js";
 import { gateRunMetaPath, serializeGateRunMeta } from "./gate-report.js";
+import { requiredLiveTestNames } from "./live-tests.js";
 import type { ProjectItem } from "./types.js";
 import { resetActiveStageSetForTests } from "./stage-sets.js";
 import { REAL_CLAUDE_GATE_RUNNING_LABEL } from "./pipeline-decisions.js";
@@ -1471,6 +1472,39 @@ describe("runRealClaudeGateExecution — outcomes", () => {
       assert.equal(item.labels.includes("needs-real-claude"), !passes);
       assert.ok(item.labels.includes("claim:mac"));
       if (!passes) assert.match(client.addCommentCalls[0].body, /metadata is invalid or does not match/);
+    }
+  });
+
+  test("saved comma and colon requirements recover passing, skipped and absent results", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "named-gate-recovery-"));
+    const captured = JSON.parse(readFileSync(new URL("./fixtures/desktop-1809-live-report.json", import.meta.url), "utf8"));
+    const retained = captured.suites.find((s: any) => s.title === "real-claude-effort-default.spec.ts");
+    for (const title of [retained.specs[0].title, "applied effort: Low, confirmed preference: yes"]) {
+      const name = `${retained.title} › ${title}`;
+      for (const mode of ["full", "selected"] as const) {
+        for (const status of ["passed", "skipped", "absent"] as const) {
+          const suite = JSON.parse(JSON.stringify(retained));
+          suite.specs[0].title = title;
+          if (status === "skipped") suite.specs[0].tests = [{ status: "skipped", results: [], annotations: [{ type: "skip", description: "fixture: unavailable" }] }];
+          const output = JSON.stringify({ suites: [...(status === "absent" ? [] : [suite]), { title: "other.spec.ts", specs: [{ title: "unrelated", tests: [{ status: "expected", results: [{ status: "passed" }] }] }] }] });
+          const outputPath = join(dir, `gate-${mode}-${status}-${title.length}.log`);
+          writeFileSync(outputPath, output);
+          const saved = JSON.parse(JSON.stringify(report({ outputPath, outputFormat: "playwright-json",
+            requiredTests: requiredLiveTestNames(`## Live tests\n- \`${name}\``),
+            selection: mode === "full" ? { mode, reason: "all" } : { mode, tests: [name], filter: "fixture", reason: "named" }, tally: parseGateOutput(output, "playwright-json") }))) as GateRunReport;
+          // Force raw-artifact recovery of a saved report.
+          delete saved.tally!.testDetails; delete saved.tally!.skippedTests;
+          const item = parkedItem({ labels: ["done:code-review", "needs-real-claude", "claim:mac", "rework-count:3", "error-retry-count:2"] });
+          const client = new MockClient([item]);
+          await runRealClaudeGateExecution(client, async () => saved, 1, async () => {});
+          assert.equal(item.status, status === "passed" ? "In Documentation" : "Inbox");
+          for (const label of ["claim:mac", "rework-count:3", "error-retry-count:2"]) assert.ok(item.labels.includes(label));
+          if (status !== "passed") {
+            assert.ok(item.labels.includes("needs-real-claude"));
+            assert.match(client.addCommentCalls[0].body, status === "skipped" ? /skipped/ : /has no passing execution/);
+          }
+        }
+      }
     }
   });
 

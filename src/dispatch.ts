@@ -217,6 +217,8 @@ import {
   BASELINE_TESTS_PLACEHOLDER,
   buildBaselineCommand,
   buildBaselineFilter,
+  gateRunRequiredTests,
+  judgeableRequiredTests,
   isGateOutputFormat,
   parseGateOutput,
   validateGateOutputProvenance,
@@ -231,6 +233,7 @@ import {
   type GateSelectionConfig,
   type LiveTestsSection,
 } from "./gate-selection.js";
+import { liveTestsSectionError, requiredLiveTestNames } from "./live-tests.js";
 import {
   trimMemoryIndexFile,
   MEMORY_INDEX_CAP_BYTES,
@@ -441,7 +444,8 @@ const REAL_CLAUDE_GATE_SELECTION: GateSelectionConfig | null = (() => {
   if (cut.length > 0) {
     console.warn(
       `   ⚠️  PYRY_REAL_CLAUDE_GATE_ALWAYS_TESTS holds a name with no #method (${cut.join(", ")}). ` +
-      `An env-file loader may have cut the value at a #; quote it. Until then every gate run uses the full suite.`,
+      `An env-file loader may have cut the value at a #; quote it. Until then every gate run uses the full suite, ` +
+      `and a JUnit gate does not require that name.`,
     );
   }
   return config;
@@ -6144,7 +6148,51 @@ export function gitNoShell(spawn: typeof spawnSync, cwd: string, args: string[],
   return String(result.stdout ?? "");
 }
 
+/** The red gate a broken `## Live tests` section reports as. */
+export const LIVE_TESTS_SECTION_GATE = "pull request ## Live tests section";
+
+/**
+ * Pre-spawn step for the verifier: the fork's deterministic gates, then a
+ * check of the pull request's `## Live tests` section. A section with lines
+ * that are not test names names no required test (live-tests.ts), so the
+ * builder must fix the pull request body before review can pass. It is
+ * reported as a red gate with the offending lines. A pull request that
+ * cannot be read is not an error here; the live gate then runs in full.
+ */
 export async function maybeRunPreSpawnGates(
+  ctx: DispatchContext,
+): Promise<{ promptNote: string }> {
+  const result = await runConfiguredPreSpawnGates(ctx);
+  const preSpawnGate = activeStageSet().preSpawnGate;
+  if (preSpawnGate === null || !preSpawnGate.agentNames.has(ctx.agent.name) || ctx.infraGateFailure) return result;
+  let error: string | null = null;
+  try {
+    error = liveTestsSectionError(ctx.deps.execSync(
+      `gh pr view "${ctx.branchName}" --json body --jq '.body // ""'`,
+      { cwd: ctx.agentCwd, encoding: "utf-8", timeout: 60_000, stdio: "pipe" },
+    ).toString());
+  } catch (e: any) {
+    console.warn(`   ⚠️  Could not read #${ctx.item.issueNumber}'s pull request to check its ## Live tests section: ${e?.message ?? e}`);
+  }
+  if (error === null) return result;
+  ctx.failedPreSpawnGate ??= LIVE_TESTS_SECTION_GATE;
+  console.log(`   ❌ Pre-${ctx.agent.name} check red: the pull request's ## Live tests section is invalid`);
+  ctx.deps.writeLog(ctx.logFile, "GATES", `${LIVE_TESTS_SECTION_GATE}: invalid\n${error}`);
+  return {
+    promptNote: [
+      result.promptNote,
+      "",
+      "",
+      "## Pull request `## Live tests` section: TRIAGE MODE",
+      "",
+      error,
+      "",
+      "This review cannot advance or publish PASS until the section is fixed. Route it to rework so the builder corrects the pull request body; the code itself may be fine.",
+    ].join("\n"),
+  };
+}
+
+async function runConfiguredPreSpawnGates(
   ctx: DispatchContext,
 ): Promise<{ promptNote: string }> {
   delete ctx.failedPreSpawnGate;
@@ -7177,6 +7225,8 @@ export async function runRealClaudeGateSuite(opts: {
   timeoutMs: number;
   /** Per-ticket selection. Absent or null runs the full command every time. */
   selection?: GateSelectionConfig | null;
+  /** Named tests every run must pass, from `PYRY_REAL_CLAUDE_GATE_ALWAYS_TESTS`. */
+  requiredTests?: readonly string[];
   /** The fork's floor, which a full run must clear to count as the backstop's pass. */
   minExecuted?: number;
   /**
@@ -7211,6 +7261,7 @@ export async function runRealClaudeGateSuite(opts: {
   const started = deps.now();
   const report: GateRunReport = {
     outputFormat: opts.format,
+    requiredTests: [...new Set([...(opts.requiredTests ?? []), ...(opts.selection?.alwaysTests ?? [])])],
     runError: null,
     timedOut: false,
     exitCode: null,
@@ -7273,7 +7324,27 @@ export async function runRealClaudeGateSuite(opts: {
 
   // 2b. The whole suite, or the tests the pull request names. Decided before
   // any worktree exists; every input that cannot be read resolves to full.
+  // The pull request's named tests are also required for a full run. When
+  // GitHub cannot be read, the full suite runs with the fork's own required
+  // names only: a hiccup must not park the ticket.
   let command = opts.command;
+  let section: LiveTestsSection = { kind: "missing" };
+  try {
+    const body = deps.execSync(
+      `gh pr list --head ${branchName} --state open --json body --jq '.[0].body // ""'`,
+      { cwd: targetRepo, encoding: "utf-8", timeout: 60_000, stdio: "pipe" },
+    ).toString();
+    section = parseLiveTestsSection(body);
+    report.requiredTests = [...new Set([...(report.requiredTests ?? []), ...requiredLiveTestNames(body)])];
+  } catch (e: any) {
+    console.warn(`   ⚠️  Real-claude gate: could not read the pull request's live tests (${e?.message ?? e}); running the full suite with the fork's required tests only`);
+  }
+  const required = judgeableRequiredTests(report.requiredTests ?? [], opts.format);
+  report.requiredTests = required.kept;
+  if (required.dropped.length > 0) {
+    console.warn(`   ⚠️  Real-claude gate: not requiring ${required.dropped.join(", ")}, a JUnit name with no #method, which cannot name one test. ` +
+      `If it came from PYRY_REAL_CLAUDE_GATE_ALWAYS_TESTS, an env-file loader may have cut the value at a #; quote it.`);
+  }
   if (opts.selection) {
     let changedPaths: string[] | null = null;
     try {
@@ -7287,13 +7358,6 @@ export async function runRealClaudeGateSuite(opts: {
         mergesSinceFull = Number.isFinite(n) ? n : null;
       } catch {}
     }
-    let section: LiveTestsSection = { kind: "missing" };
-    try {
-      section = parseLiveTestsSection(deps.execSync(
-        `gh pr list --head ${branchName} --state open --json body --jq '.[0].body // ""'`,
-        { cwd: targetRepo, encoding: "utf-8", timeout: 60_000, stdio: "pipe" },
-      ).toString());
-    } catch {}
     let selection = decideGateSelection({
       config: opts.selection, section, changedPaths, mergesSinceFull, format: opts.format,
     });
@@ -7415,7 +7479,7 @@ export async function runRealClaudeGateSuite(opts: {
     // gated ticket runs the full suite again until main is green.
     if (
       report.selection?.mode === "full" && decideGateVerdict({
-        ...report, minExecuted: opts.minExecuted ?? 1,
+        ...report, minExecuted: opts.minExecuted ?? 1, requiredTests: gateRunRequiredTests(report),
       }).verdict === "pass"
     ) {
       try {
@@ -7857,6 +7921,7 @@ export function makeRealClaudeGateRunner(): RealClaudeGateRunner | null {
       format,
       timeoutMs: REAL_CLAUDE_GATE_TIMEOUT_MS,
       selection: REAL_CLAUDE_GATE_SELECTION,
+      requiredTests: (process.env.PYRY_REAL_CLAUDE_GATE_ALWAYS_TESTS ?? "").split(",").map(s => s.trim()).filter(Boolean),
       minExecuted: REAL_CLAUDE_GATE_MIN_EXECUTED,
       infraBreaker: INFRA_BREAKER,
     });

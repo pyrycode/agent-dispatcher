@@ -60,12 +60,14 @@ export type LiveTestsSection =
 /**
  * Read the `## Live tests` section of a pull request body. Entries are one per
  * line, as list items or bare. Commas outside backticks also separate names.
- * An empty section reads as missing, so a forgotten list runs the full suite.
+ * An empty or invalid section reads as missing, so it runs the full suite.
+ * See live-tests.ts for what counts as a name.
  */
 export function parseLiveTestsSection(body: string): LiveTestsSection {
-  const { all, names } = parseLiveTestEntries(body);
+  const { all, names, invalid } = parseLiveTestEntries(body);
   if (all) return { kind: "all" };
-  return names.length === 0 ? { kind: "missing" } : { kind: "list", names };
+  // An invalid section names nothing trustworthy, so it runs the full suite.
+  return names.length === 0 || invalid.length > 0 ? { kind: "missing" } : { kind: "list", names };
 }
 
 export type GateSelection =

@@ -923,6 +923,23 @@ export interface GateTestDetail {
   daemonRevisions?: string[];
   /** Why it skipped, for a skipped test. */
   skipReason?: string;
+  /** The final attempt, when it actually passed. Earlier failed retries and
+   *  test-level annotations cannot supply this evidence. */
+  passingAttempt?: {
+    attempt: number;
+    /** The `daemon-revision` annotation on that attempt, when its
+     *  `daemon-revision` attachment carries the same value. */
+    daemonRevision: string | null;
+  };
+}
+
+/** The text of a named attachment on one Playwright attempt, decoded. */
+export function attachmentText(result: any, name: string): string | null {
+  const attachment = (Array.isArray(result?.attachments) ? result.attachments : [])
+    .find((a: any) => a?.name === name && typeof a.body === "string" && a.body.trim() !== "");
+  if (!attachment) return null;
+  const text = Buffer.from(attachment.body, "base64").toString("utf8").trim();
+  return text || null;
 }
 
 /**
@@ -996,6 +1013,9 @@ function playwrightTestDetails(raw: string): GateTestDetail[] | null {
         const revisions = new Set<string>();
         revisionsOf(test.annotations, revisions);
         for (const r of results) revisionsOf(r?.annotations, revisions);
+        const passingRevisions = new Set<string>();
+        revisionsOf(last?.annotations, passingRevisions);
+        const attachedRevision = attachmentText(last, "daemon-revision");
         out.push({
           name,
           status,
@@ -1003,6 +1023,12 @@ function playwrightTestDetails(raw: string): GateTestDetail[] | null {
           ...(status !== "skipped" && typeof last?.duration === "number" ? { durationMs: Math.round(last.duration) } : {}),
           ...(revisions.size > 0 ? { daemonRevisions: [...revisions] } : {}),
           ...(status === "skipped" ? { skipReason: extractPlaywrightSkipReason(test) } : {}),
+          ...((status === "passed" || status === "flaky") && last?.status === "passed" ? {
+            passingAttempt: {
+              attempt: results.length,
+              daemonRevision: attachedRevision !== null && passingRevisions.has(attachedRevision) ? attachedRevision : null,
+            },
+          } : {}),
         });
       }
     }
@@ -1190,6 +1216,9 @@ export function buildBaselineCommand(template: string, filter: string): string |
 export interface GateRunReport {
   /** Format needed to recover structured evidence from retained raw output. */
   outputFormat?: GateOutputFormat;
+  /** Named live acceptance from the pull request and the fork, kept for full
+   *  runs too. Each must execute and pass for the run to pass. */
+  requiredTests?: string[];
   /** Non-null when the run could not be started or completed at all. */
   runError: string | null;
   timedOut: boolean;
@@ -1292,6 +1321,27 @@ export interface GateRunReport {
  */
 export function gateRunFloor(report: GateRunReport, forkFloor: number): number {
   return report.selection?.mode === "selected" ? report.selection.tests.length : forkFloor;
+}
+
+/**
+ * Split required names into those a run can judge and those it cannot. A
+ * JUnit test is `Class#method`; a bare class name cannot name one test. It
+ * is what an env-file loader leaves of `PYRY_REAL_CLAUDE_GATE_ALWAYS_TESTS`
+ * when it cuts the value at a `#`, and as a requirement it would never
+ * match, so every gate run would be unusable. It is left out instead; the
+ * dispatcher's startup warning already names it.
+ */
+export function judgeableRequiredTests(names: readonly string[], format: GateOutputFormat): { kept: string[]; dropped: string[] } {
+  const kept: string[] = [], dropped: string[] = [];
+  for (const name of new Set(names)) (format === "junit-xml" && !name.includes("#") ? dropped : kept).push(name);
+  return { kept, dropped };
+}
+
+/** Every name the run must pass: its recorded requirements, plus a selected
+ *  run's names, which older saved reports carried only as their selection. */
+export function gateRunRequiredTests(report: Pick<GateRunReport, "requiredTests" | "selection">): string[] {
+  return [...new Set([...(report.requiredTests ?? []),
+    ...(report.selection?.mode === "selected" ? report.selection.tests : [])])];
 }
 
 /**
