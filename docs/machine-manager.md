@@ -66,7 +66,7 @@ Every physical computer has two shared limits: `heavyLimit` bounds heavy jobs, a
 
 With heavy at 1 and combined at 2, the computer can run one verifier and one builder, or two builders. It cannot run two heavy jobs or three medium jobs. Jobs retain their resource class for their whole run; there is no mid-run upgrade or second reservation. Existing role restrictions such as serial documentation still apply across computers to protect shared files.
 
-Each reservation covers setup, the agent, its pre-verifier tests, retries, cleanup and indexing. Heavy runs consume both counters. Medium runs consume only the combined counter. Merge work, standalone live gates and main checks are always heavy. Background children in the recorded process groups keep the reservation until they exit. Programs that deliberately detach into a different process group are outside that check. Do not use daemonised test runners for managed jobs.
+Each reservation covers setup, the agent, its pre-verifier tests, retries, cleanup and indexing. Heavy runs consume both counters. Medium runs consume only the combined counter. Standalone live gates and main checks are always heavy. Merge work is light, so a ticket that reaches Done merges without waiting for a heavy or combined place. The merge itself is a few GitHub calls and a pull of main. The codegraph refresh a merge needs is CPU work, so it is not part of the merge: the dispatcher runs it afterwards as its own medium job, `@codegraph-<computer>`, charged against that computer's combined limit, one at a time per computer and project. It stays single by ownership, not capacity: only the ticket's claiming computer is granted the merge, the claim service admits one unfinished run per ticket, and the project's merge lock admits one merge per board across all computers. Before 2026-10-14 merges were heavy, and pyrycode-mobile #1977 waited 13 minutes in Done behind an unrelated repair task. Background children in the recorded process groups keep the reservation until they exit. Programs that deliberately detach into a different process group are outside that check. Do not use daemonised test runners for managed jobs.
 
 Only admitted runs create claims. Writing follow-up tickets, comments or labels does not claim those tickets. This also prevents a drained computer from turning newly filed follow-ups into owned work.
 
@@ -450,6 +450,59 @@ of the launch gone, no result written, and either the container absent or fully
 stopped with no process, or the worker's own files written before the running
 container instance started. A stopping container, an unknown container state
 or a worker that never wrote proves nothing, and the record stays in attention.
+
+### No-progress watchdog
+
+Each supervisor pass also runs `scripts/fleet-watchdog.py` over the places held
+on its own computer. It never signals, starts or reaps a process. It measures
+each holder against a limit for its phase, set under `watchdog` in the
+supervisor configuration:
+
+- A native task running: its recipe's own time limits plus 15 minutes.
+- A native task that wrote its result, while its completion or publication
+  preparation is refused: 10 minutes after its last worker write.
+- A native task publishing: 10 minutes after the phase was first seen.
+- A native task in attention: 30 minutes. A deferred grant: 60 minutes.
+- A dispatcher run: two hours with none of its ticket's logs written.
+
+Progress is a phase change or a write by the worker itself: its logs, check
+results, result or publication. Files the supervisor writes, such as the custody
+journal, do not count, and neither does a file dated more than a minute ahead of
+the clock. A result dated in the future counts from when it was first seen.
+
+Its one automatic action is to finish a native task as failed when every one of
+these holds: the record is `running` or in `attention`, never `publishing`; its
+result is written; the supervisor's own custody proof has confirmed its worker
+drained; the control service answered `prepare-repair` or an artifact transfer
+with the same 4xx refusal on at least five consecutive passes over more than ten
+minutes; and ten minutes have passed since the worker's last write. A timeout, a
+lost connection, a local crash or a refusal that changes restarts the count. The
+release is conditional: the service accepts it only while it holds the task as
+running or in attention, and refuses any failed completion while a publication
+for that task is still being written. A service that already holds another
+outcome stops the retries and leaves one item for an operator. The summary names
+the refusal and the task whose private folder keeps the result, logs and any
+prepared publication. Nothing is published. Anything else past its limit,
+including a live worker, a worker whose absence is not proven and every
+dispatcher run, becomes an attention item and nothing is released.
+
+Limits come from `watchdog` in the supervisor configuration. A value of the wrong
+type falls back to its default and is reported. A watchdog that fails to load or
+to run is reported as an `error` item; the supervisor and its report carry on.
+
+A heavy job waiting for capacity for 60 minutes while every heavy place is held
+by work with no progress for 30 minutes produces a starvation item naming both.
+So does a supervised update waiting that long for native work with no progress.
+
+The findings are published as the operation report's `watchdog` list, which
+`operator.sh attention` returns under each computer in `operationReports`.
+Each item has `kind` (`stalled`, `starvation`, `finalize-refused`, `finalized`,
+`released` or `error`), `action`, `reason`, and where known `subject`, `ticket`,
+`phase`, `worker`, `holder`, `since`, `lastProgress` and `limitSeconds`. Times are
+Unix seconds. Releases by the dead-worker path and by the watchdog stay listed as
+notices for a day. Each new finding and each release is also written to
+`housekeeping.jsonl` once. Findings stay out of the report's `housekeeping` list,
+which keeps its room for clears, retirements and releases.
 
 The fixed recipes are `platform-probe`, `memory-runtime-smoke`,
 `android-tool-then-text` and `dispatcher-repair`. Executed recipes require an exact

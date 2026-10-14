@@ -86,3 +86,29 @@ test('native helpers wait for active owned work through ordinary machine capacit
  assert.equal(jobs[0].run.supportTaskId,task.id);
  assert.equal(store.snapshot().claims.find(c=>c.ticket==='org/core#3154')?.machine,'box');
 });
+
+test('a failed completion waits for a publication still being written, and a conditional one needs the expected state', async t => {
+ const SHA='9950e6fbd28aac7ec3f6772e2deeebbcf83b52a2';
+ const store=new FleetStore(':memory:',limits);
+ // A publication whose GitHub writes never answer, as one still landing.
+ const github={request:()=>new Promise(()=>{})} as any;
+ const server=await serveFleet(store,{box:'b',mac:'m'},'a',0,'127.0.0.1',github,undefined,'org/dispatcher');
+ t.after(async()=>{server.closeAllConnections();await new Promise<void>(r=>server.close(()=>r()));store.close();});
+ const address=server.address();assert.ok(address&&typeof address!=='string');
+ const mac=new JsonClient('http://127.0.0.1:'+address.port,'m');
+ store.start({id:'builder',machine:'box',session:'s',project:'org/core',ticket:'org/core#3289',role:'builder',resource:'medium',locks:[]});
+ store.tasks.report('mac',{capabilities:['dispatcher-repair'],ready:true});
+ const job=store.requestTask('box','s','org/core','builder',{recipe:'dispatcher-repair',capability:'dispatcher-repair',revision:SHA,reason:'repair'});
+ store.taskStart('mac',job.id,'repair');
+ const failed={outcome:'failed',summary:'Watchdog: refused on every pass',files:{}};
+ // Conditional release: a publishing task is not released.
+ await assert.rejects(mac.call('/tasks/complete',{id:job.id,session:'repair',result:failed,expectStates:'running'}),/Invalid expected task states/);
+ const publication={files:{'src/fix.ts':'export const repaired=true;\n'},message:'Fix',review:'PASS',checksPassed:true};
+ store.prepareRepair('mac',job.id,'repair',publication);
+ await assert.rejects(mac.call('/tasks/complete',{id:job.id,session:'repair',result:failed,expectStates:['running','attention']}),/Task state is publishing/);
+ assert.equal(store.tasks.get(job.id).state,'publishing');
+ void mac.call('/tasks/publish-repair',{id:job.id,session:'repair',publication}).catch(()=>{});
+ await new Promise(r=>setTimeout(r,200));
+ await assert.rejects(mac.call('/tasks/complete',{id:job.id,session:'repair',result:failed}),/Repair publication in progress/);
+ assert.equal(store.tasks.get(job.id).state,'publishing');
+});

@@ -321,23 +321,6 @@ class ReleasePassError(ArtifactPassError):
 class PublicationPassError(ArtifactPassError):
     """A finished repair's publication did not go through this pass. Local to that record."""
 
-class RpcError(Exception):
-    """A recovery-task operation failed. `status` is the service's HTTP status when it answered."""
-    def __init__(self,operation,detail):
-        self.operation=operation
-        lines=detail.strip().splitlines() or ['']
-        # The service's own line, even when the operator writes after it.
-        line=next((l for l in reversed(lines) if re.match(r'Service \d{3}: ',l)),lines[-1])
-        match=re.match(r'Service (\d{3}): (.*)$',line)
-        self.status=int(match.group(1)) if match else None
-        body=None
-        if match:
-            try:body=json.loads(match.group(2))
-            except ValueError:body=None
-        self.refused=self.status==422 and isinstance(body,dict) and body.get('refused') is True
-        self.detail=(body.get('error') if isinstance(body,dict) and isinstance(body.get('error'),str) else line)[:300] or 'no detail'
-        super().__init__('recovery-task '+operation+' failed'+(' with HTTP '+str(self.status) if self.status else '')+': '+self.detail)
-
 # A transient publication failure waits this long after its first failure,
 # doubling each time up to the cap. A definitive refusal never retries.
 PUBLICATION_RETRY_SECONDS=60
@@ -413,6 +396,40 @@ def operation_open(record):
     if record.get('latch')=='health' or str(record.get('reason','')).startswith('Health failed again after a verified restart'):return False
     return record.get('attentionFrom') not in {'start-requested','verifying'}
 
+class ServiceRefusal(RuntimeError):
+    """The control service answered and refused the operation. Not a lost reply."""
+    def __init__(self,operation,status,detail):
+        super().__init__('Control service refused '+operation+': Service '+str(status)+': '+detail)
+        self.operation=operation;self.status=status;self.detail=detail
+        try:body=json.loads(detail)
+        except ValueError:body=None
+        # The service's own message, and whether it refused the submitted bytes
+        # themselves (422 with refused), which no retry can change.
+        self.message=(body.get('error') if isinstance(body,dict) and isinstance(body.get('error'),str) else detail)[:300] or 'no detail'
+        self.refused=status==422 and isinstance(body,dict) and body.get('refused') is True
+
+SERVICE_REPLY=re.compile(r'^Service (\d{3}): (.*)$')
+
+def rpc_failure(operation,code,stderr):
+    """A typed error from the operator command's output.
+
+    The command prints only the error message, but an uncaught crash adds a
+    stack and a runtime version line, so the service's reply is searched for.
+    Timeouts, connection failures and local crashes are never refusals."""
+    lines=[line.strip() for line in (stderr or '').splitlines() if line.strip()]
+    for line in reversed(lines):
+        match=SERVICE_REPLY.match(line)
+        if match:return ServiceRefusal(operation,int(match.group(1)),match.group(2)[:300])
+    detail=next((line for line in reversed(lines) if not line.startswith('Node.js v') and not line.startswith('at ')),'exit '+str(code))
+    return RuntimeError('Control service call '+operation+' failed without a service reply: '+detail[:300])
+
+def service_refusal(error):
+    """The service refusal behind a record's failure, or None."""
+    while error is not None:
+        if isinstance(error,ServiceRefusal):return error
+        error=error.__cause__
+    return None
+
 class SupportSupervisor:
     def __init__(self,adapter,config):
         self.adapter=adapter;self.config=config;self.children={};self.directory=Path(config['stateDirectory'])/'tasks'
@@ -424,16 +441,14 @@ class SupportSupervisor:
         except (OSError,ValueError):self.reported_errors={}
         if not isinstance(self.reported_errors,dict):self.reported_errors={}
         self.directory.mkdir(parents=True,exist_ok=True,mode=0o700)
+        self.refusals={}
 
     def rpc(self,operation,body):
         path=self.directory/(operation+'.request.json');atomic(path,body)
-        done=subprocess.run(self.adapter.operator_command('recovery-task',operation,str(path)),stdin=subprocess.DEVNULL,
-                            stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=150)
-        # The operator prints the service's own error line, for example
-        # `Service 422: {"error":...,"refused":true}`, which says whether a retry can help.
+        done=subprocess.run(self.adapter.operator_command('recovery-task',operation,str(path)),stdin=subprocess.DEVNULL,capture_output=True,text=True,timeout=150)
         # Diagnostics still reach the journal as before.
         if done.stderr:sys.stderr.write(done.stderr);sys.stderr.flush()
-        if done.returncode!=0:raise RpcError(operation,done.stderr or '')
+        if done.returncode:raise rpc_failure(operation,done.returncode,done.stderr)
         return json.loads(done.stdout)
 
     def capability_record(self,state,withheld=()):
@@ -518,7 +533,8 @@ class SupportSupervisor:
 
     def receipt_pass(self,machine,receipt,running):
         old=json.loads(receipt.read_text())
-        if old['phase']=='complete' and (old.get('artifactDigest') or old.get('artifactUnrecoverable') or old.get('interrupted') or old.get('publicationRefused')):return
+        if old['phase']=='complete' and (old.get('artifactDigest') or old.get('artifactUnrecoverable') or old.get('interrupted')
+                                         or old.get('publicationRefused') or (old.get('finalized') or {}).get('released')):return
         result=Path(old['result'])
         if old['phase']=='complete' and not result.is_file():return
         if old['phase']=='complete':
@@ -576,14 +592,18 @@ class SupportSupervisor:
                     self.rpc('prepare-repair',{'machine':machine,'id':old['id'],'session':old['session'],'publication':json.loads(publication)})
                     old['phase']='publishing';atomic(receipt,old)
                     published=self.rpc('publish-repair',{'machine':machine,'id':old['id'],'session':old['session'],'publication':json.loads(publication)})
-                except RpcError as error:
+                except ServiceRefusal as error:
                     # The authority refused these exact bytes. A retry is refused
                     # again, so the task ends here and its reservation is released.
                     if error.operation=='prepare-repair' and error.refused:
-                        old['publicationRefused']={'at':time.time(),'reason':error.detail}
+                        old['publicationRefused']={'at':time.time(),'reason':error.message}
                         return self.refuse_publication(machine,receipt,old)
+                    # Any other 4xx is asked again every pass, so the watchdog can
+                    # count the same definite refusal on consecutive passes.
+                    if 400<=error.status<500:raise PublicationPassError(error) from error
                     self.publication_retry(receipt,old,error)
-                except (OSError,subprocess.SubprocessError,ValueError) as error:
+                except (RuntimeError,OSError,subprocess.SubprocessError,ValueError) as error:
+                    # 5xx, no reply, a timeout or a local failure may clear.
                     self.publication_retry(receipt,old,error)
                 old.pop('publicationRetry',None)
                 if published.get('pendingControl'):running.append(old);return
@@ -616,7 +636,7 @@ class SupportSupervisor:
         its reservation and stays in the report with the next attempt time."""
         failures=old.get('publicationRetry',{}).get('failures',0)+1
         delay=min(PUBLICATION_RETRY_SECONDS*2**(failures-1),PUBLICATION_RETRY_CAP_SECONDS)
-        detail=str(error) if isinstance(error,RpcError) else type(error).__name__+': '+str(error)
+        detail=str(error) if isinstance(error,ServiceRefusal) else type(error).__name__+': '+str(error)
         raised=old.get('publicationRetry',{}).get('attention',False)
         old['publicationRetry']={'failures':failures,'next':time.time()+delay,'reason':detail[:300],'attention':raised or failures>=PUBLICATION_ATTENTION_FAILURES}
         atomic(receipt,old)
@@ -678,6 +698,8 @@ class SupportSupervisor:
         scheduler_session=json.loads(session_file.read_text())['session']
         self.rpc('capabilities',{'machine':machine,'record':self.capability_record(state)})
         running=[];host_uncertain=False;errors={}
+        # This pass's definite service refusals per record, for the watchdog.
+        self.refusals={}
         for receipt in sorted(self.directory.glob('*.receipt.json')):
             task=receipt.name[:-len('.receipt.json')]
             # One bad record must not stop the pass, later records or the operation report.
@@ -692,6 +714,8 @@ class SupportSupervisor:
                 reason='Native task record skipped this pass. '+detail[:300]
                 running.append({'id':task,'phase':'error','reason':reason})
                 errors[task]=reason
+                refusal=service_refusal(error)
+                if refusal:self.refusals[task]={'operation':refusal.operation,'status':refusal.status,'detail':refusal.detail}
                 # Only a completed record's artifact transfer, or the release of a
                 # worker already proven gone, is known to be local to that record.
                 # Anything else may be host-wide, such as an

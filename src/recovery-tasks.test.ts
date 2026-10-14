@@ -294,3 +294,17 @@ test('a drained repair can resume preparation from attention without losing sour
   assert.throws(()=>s.prepareRepair('mac',job.id,'repair',{...publication,message:'changed'}),/changed/);
  }finally{s.close();}
 });
+
+test('a conditional release frees a running task once and answers a retry with the same outcome',()=>{
+ const s=new FleetStore(':memory:',limits);try {
+  s.start(req);s.tasks.report('mac',{capabilities:['dispatcher-repair'],ready:true});
+  const job=s.requestTask('box','s','org/core','builder',{recipe:'dispatcher-repair',capability:'dispatcher-repair',revision:SHA,reason:'repair'});
+  s.taskStart('mac',job.id,'repair');
+  const failed={outcome:'failed' as const,summary:'Watchdog: refused on every pass',files:{}};
+  assert.throws(()=>s.taskComplete('mac',job.id,'repair',failed,['publishing']),/Task state is running, not publishing/);
+  assert.equal(s.tasks.get(job.id).state,'running');
+  for(let i=0;i<2;i++) assert.equal(s.taskComplete('mac',job.id,'repair',failed,['running','attention']).state,'failed');
+  assert.equal(s.snapshot().runs.some(r=>r.supportTaskId===job.id),false);
+  assert.throws(()=>s.taskComplete('mac',job.id,'repair',{...failed,summary:'other'},['running']),/Completed task result changed/);
+ }finally{s.close();}
+});

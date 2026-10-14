@@ -918,7 +918,7 @@ class PublicationRefusalTests(unittest.TestCase):
 
  def test_refused_publication_ends_the_task_as_failed_once_and_keeps_the_patch(self):
   with tempfile.TemporaryDirectory() as d:
-   s,calls,logged,receipt,work=self.support(d,{'prepare-repair':m.RpcError('prepare-repair',REFUSED)})
+   s,calls,logged,receipt,work=self.support(d,{'prepare-repair':m.rpc_failure('prepare-repair',1,REFUSED)})
    first=s.tick();second=s.tick()
    ops=[op for op,_ in calls]
    self.assertEqual(ops.count('prepare-repair'),1,'a definitive refusal is never asked again')
@@ -943,11 +943,11 @@ class PublicationRefusalTests(unittest.TestCase):
 
  def test_a_lost_release_retries_the_saved_result_without_asking_again(self):
   with tempfile.TemporaryDirectory() as d:
-   s,calls,logged,receipt,work=self.support(d,{'prepare-repair':m.RpcError('prepare-repair',REFUSED),
-                                              'complete':[m.RpcError('complete','fetch failed'),{}]})
+   s,calls,logged,receipt,work=self.support(d,{'prepare-repair':m.rpc_failure('prepare-repair',1,REFUSED),
+                                              'complete':[m.rpc_failure('complete',1,'fetch failed'),{}]})
    entries=s.tick()
    self.assertEqual([e['phase'] for e in entries],['error'])
-   self.assertIn('recovery-task complete failed',entries[0]['reason'])
+   self.assertIn('call complete failed without a service reply',entries[0]['reason'])
    self.assertEqual(json.loads(receipt.read_text())['phase'],'running')
    self.assertIn('schedule',[op for op,_ in calls],'a release failure is local to the record')
    s.tick()
@@ -961,8 +961,8 @@ class PublicationRefusalTests(unittest.TestCase):
   with tempfile.TemporaryDirectory() as d:
    published={'url':'https://github.com/org/agent-dispatcher/pull/9','merged':True,'dispatcherSHA':'b'*40}
    s,calls,logged,receipt,work=self.support(d,{
-    'prepare-repair':[m.RpcError('prepare-repair','Service 503: {"error":"Repair base sources unavailable: HTTP 502"}'),
-                      m.RpcError('prepare-repair','Service 409: {"error":"Task run changed"}'),{},{}],
+    'prepare-repair':[m.rpc_failure('prepare-repair',1,'Service 503: {"error":"Repair base sources unavailable: HTTP 502"}'),
+                      m.rpc_failure('prepare-repair',1,'Error: fetch failed'),{},{}],
     'publish-repair':published,
     'artifacts-begin':artifact_reply,'artifacts-put':{},'artifacts-commit':{}})
    now=1_000_000.0
@@ -977,7 +977,7 @@ class PublicationRefusalTests(unittest.TestCase):
    self.assertEqual([op for op,_ in calls].count('prepare-repair'),1)
    self.assertEqual([(e['phase'],e['next']) for e in entries],[('publication-retry',now+60)])
    self.assertEqual(len(logged),1);self.assertIn(REPAIR,s.reported_errors)
-   # A 409 that is not a refusal is retried too, after twice the wait.
+   # A failure with no service reply is retried too, after twice the wait.
    with patch.object(m.time,'time',return_value=now+61):s.tick()
    saved=json.loads(receipt.read_text())
    self.assertEqual(saved['publicationRetry']['failures'],2);self.assertEqual(saved['publicationRetry']['next'],now+61+120)
@@ -987,39 +987,41 @@ class PublicationRefusalTests(unittest.TestCase):
    self.assertEqual(saved['phase'],'complete');self.assertNotIn('publicationRetry',saved)
    self.assertEqual([op for op,_ in calls].count('publish-repair'),1)
    # Each distinct failure is logged once, not again after each wait. Nothing was refused.
-   self.assertEqual([(k,r.split('HTTP ')[1][:3]) for k,_,r in logged],[('native-task-skipped','503'),('native-task-skipped','409')])
+   self.assertEqual([k for k,_,_ in logged],['native-task-skipped','native-task-skipped'])
+   self.assertIn('Service 503',logged[0][2]);self.assertIn('without a service reply',logged[1][2])
 
  def test_retry_wait_is_capped(self):
   with tempfile.TemporaryDirectory() as d:
    s,calls,logged,receipt,work=self.support(d,{})
    old=json.loads(receipt.read_text());old['publicationRetry']={'failures':12,'next':0}
    with patch.object(m.time,'time',return_value=5000.0),self.assertRaises(m.PublicationPassError):
-    s.publication_retry(receipt,old,m.RpcError('publish-repair','Service 409: {"error":"Repair publication unavailable: HTTP 502"}'))
+    s.publication_retry(receipt,old,m.rpc_failure('publish-repair',1,'Service 503: {"error":"unavailable"}'))
    self.assertEqual(json.loads(receipt.read_text())['publicationRetry']['next'],5000.0+1800)
 
  def test_operator_errors_are_classified_from_the_service_line(self):
-  refused=m.RpcError('prepare-repair','(node:1) warning\n'+REFUSED)
+  refused=m.rpc_failure('prepare-repair',1,'(node:1) warning\n'+REFUSED)
+  self.assertIsInstance(refused,m.ServiceRefusal)
   self.assertEqual((refused.status,refused.refused),(422,True))
-  self.assertEqual(refused.detail,'Repair contains credential-shaped text; retain it privately')
+  self.assertEqual(refused.message,'Repair contains credential-shaped text; retain it privately')
   for detail,status in [('Service 409: {"error":"Prepared repair changed"}',409),('Service 422: {"error":"x"}',422),
-                        ('Service 503: {"error":"Repair base sources unavailable"}',503),('fetch failed',None),('',None)]:
-   error=m.RpcError('prepare-repair',detail)
+                        ('Service 503: {"error":"Repair base sources unavailable"}',503)]:
+   error=m.rpc_failure('prepare-repair',1,detail)
    self.assertEqual(error.status,status);self.assertFalse(error.refused,detail)
+  for detail in ['fetch failed','']:self.assertNotIsInstance(m.rpc_failure('prepare-repair',1,detail),m.ServiceRefusal)
+
+ def test_a_definite_refusal_other_than_422_is_asked_again_each_pass(self):
+  # Left to the watchdog, which counts the same refusal on consecutive passes.
   with tempfile.TemporaryDirectory() as d:
-   s,calls,logged,receipt,work=self.support(d,{})
-   del s.rpc
-   class Done:
-    def __init__(self,code,out,err):self.returncode=code;self.stdout=out;self.stderr=err
-   with patch.object(m.subprocess,'run',return_value=Done(1,'',REFUSED)) as run:
-    with self.assertRaises(m.RpcError) as caught:s.rpc('prepare-repair',{'id':REPAIR})
-   self.assertTrue(caught.exception.refused)
-   self.assertEqual(run.call_args[0][0],['operator','recovery-task','prepare-repair',str(s.directory/'prepare-repair.request.json')])
-   with patch.object(m.subprocess,'run',return_value=Done(0,'{"ok":true}','')):
-    self.assertEqual(s.rpc('complete',{}),{'ok':True})
+   s,calls,logged,receipt,work=self.support(d,{'prepare-repair':m.rpc_failure('prepare-repair',1,'Service 409: {"error":"Repair actor mismatch"}')})
+   s.tick();s.tick()
+   self.assertEqual([op for op,_ in calls].count('prepare-repair'),2)
+   self.assertNotIn('publicationRetry',json.loads(receipt.read_text()))
+   self.assertEqual(s.refusals[REPAIR]['status'],409)
+   self.assertNotIn('complete',[op for op,_ in calls])
 
  def test_repeated_temporary_failures_are_raised_for_attention_once(self):
   with tempfile.TemporaryDirectory() as d:
-   s,calls,logged,receipt,work=self.support(d,{'prepare-repair':m.RpcError('prepare-repair','Service 409: {"error":"Repair actor mismatch"}')})
+   s,calls,logged,receipt,work=self.support(d,{'prepare-repair':m.rpc_failure('prepare-repair',1,'Service 503: {"error":"Repair base sources unavailable: HTTP 502"}')})
    now=1_000_000.0
    for i in range(8):
     old=json.loads(receipt.read_text());retry=old.get('publicationRetry')
@@ -1032,11 +1034,11 @@ class PublicationRefusalTests(unittest.TestCase):
    self.assertEqual(entries[0]['phase'],'attention')
 
  def test_service_line_is_found_when_the_operator_writes_after_it(self):
-  error=m.RpcError('prepare-repair',REFUSED+'    at main (fleet-bin.ts:1)\n')
+  error=m.rpc_failure('prepare-repair',1,REFUSED+'    at main (fleet-bin.ts:1)\nNode.js v24.13.0\n')
   self.assertTrue(error.refused)
   with tempfile.TemporaryDirectory() as d:
    s,calls,logged,receipt,work=self.support(d,{});del s.rpc
    class Done:returncode=1;stdout='';stderr=REFUSED
    with patch.object(m.subprocess,'run',return_value=Done()),patch.object(m.sys,'stderr') as stream:
-    with self.assertRaises(m.RpcError):s.rpc('prepare-repair',{})
+    with self.assertRaises(m.ServiceRefusal):s.rpc('prepare-repair',{})
    stream.write.assert_called_with(REFUSED)

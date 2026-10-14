@@ -181,3 +181,47 @@ test("remote native recovery keeps its parent claim priority without moving owne
   const busy={...state,runs:[{...ordinary,id:"active",machine:"mac",session:"s",generation:"local",created:3}]};
   assert.deepEqual(select([helper],busy),[]);
 });
+
+// pyrycode-mobile #1977 on 2026-10-14: Done at 12:05:56, but the merge was
+// heavy and build-hp-1's one heavy place belonged to a core repair task
+// until 12:19:04. A merge is light now; its ownership guards are unchanged.
+test("a Done ticket's merge starts beside a running heavy job, still singly owned", async () => {
+  const { mergeOfferShape } = await import("./managed-dispatch.js");
+  const mobile = "org/mobile";
+  const shape = mergeOfferShape(mobile);
+  const mergeOf = (n: number, key = `m${n}`): WorkOffer => ({ project: mobile, ticket: `${mobile}#${n}`, ...shape, key });
+  const claim = (n: number, machine = "hp") => ({ ticket: `${mobile}#${n}`, machine, generation: "g", created: 1 });
+  const repair = { project: "org/core", ticket: "org/core#@task-1", role: "recovery-task", resource: "heavy" as const, locks: [],
+    key: "t", order: 0, id: "task", machine: "hp", session: "s", generation: "g", created: 1 };
+  const schedule = (offers: WorkOffer[], state: FleetSnapshot) => scheduleMachine({
+    machine: "hp", heavyLimit: 1, combinedLimit: 2, ticketLimit: 2, projects: ["org/core", mobile], offers, state,
+  });
+
+  assert.equal(shape.resource, "light");
+  // Heavy and combined places both taken: the merge is still granted.
+  const busy: FleetSnapshot = { claims: [claim(1977)], runs: [repair, { ...repair, id: "b", ticket: "org/core#9", resource: "medium" }] };
+  assert.deepEqual(schedule([mergeOf(1977)], busy).map(o => o.ticket), [`${mobile}#1977`]);
+  // Only the claiming computer is granted it.
+  assert.deepEqual(schedule([mergeOf(1977)], { claims: [claim(1977, "fractal")], runs: [] }), []);
+  // One merge per board across computers: the project lock holds.
+  const merging: FleetSnapshot = { claims: [claim(1977), claim(1978, "fractal")],
+    runs: [{ ...mergeOf(1978), id: "m", machine: "fractal", session: "s", generation: "g", created: 1 }] };
+  assert.deepEqual(schedule([mergeOf(1977)], merging), []);
+  // Two Done tickets in one selection: one grant.
+  assert.equal(schedule([mergeOf(1977), mergeOf(1979)], { claims: [claim(1977), claim(1979)], runs: [] }).length, 1);
+  // Never beside another run on the same ticket.
+  const sameTicket: FleetSnapshot = { claims: [claim(1977)], runs: [{ ...repair, id: "r", project: mobile, ticket: `${mobile}#1977`, role: "recovery" }] };
+  assert.deepEqual(schedule([mergeOf(1977)], sameTicket), []);
+});
+
+test("the post-merge codegraph refresh is charged as medium work, one per computer", async () => {
+  const { codegraphOfferShape } = await import("./managed-dispatch.js");
+  const shape = codegraphOfferShape("build-hp-1")!;
+  assert.equal(shape.resource, "medium");
+  assert.equal(shape.ticket, "@codegraph-build-hp-1");
+  const refresh: WorkOffer = { project: "org/mobile", ...shape, ticket: `org/mobile#${shape.ticket}`, key: "c" };
+  const full: FleetSnapshot = { claims: [], runs: [1, 2].map(n => ({ ...offer("org/core", n), resource: "medium" as const, id: `r${n}`, machine: "mac", session: "s", generation: "g", created: 1 })) };
+  assert.deepEqual(scheduleMachine({ machine: "mac", heavyLimit: 1, combinedLimit: 2, projects: ["org/core", "org/mobile"], offers: [refresh], state: full }), [], "waits for a combined place");
+  assert.equal(scheduleMachine({ machine: "mac", heavyLimit: 1, combinedLimit: 2, projects: ["org/core", "org/mobile"], offers: [refresh], state: { claims: [], runs: [] } }).length, 1);
+  assert.equal(codegraphOfferShape("bad name"), null, "a name a ticket cannot carry skips the refresh instead of failing the cycle");
+});

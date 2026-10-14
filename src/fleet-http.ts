@@ -90,8 +90,11 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
       if (req.url === '/tasks/start' || req.url === '/tasks/complete') {
         const actor = isAdmin ? body.machine : machine;
         if (!actor) return send(403,{error:'Task worker required'});
+        // A publication write still running here may merge. Failing its task
+        // now would release the place and discard a repair that is landing.
+        if(req.url === '/tasks/complete' && body.result?.outcome === 'failed' && repairWrites.has(body.id)) return send(409,{error:'Repair publication in progress'});
         return send(200,req.url === '/tasks/start' ? store.taskStart(actor,body.id,body.session)
-          : store.taskComplete(actor,body.id,body.session,body.result));
+          : store.taskComplete(actor,body.id,body.session,body.result,body.expectStates));
       }
       if (req.url === '/tasks/request') {
         if (!machine) return send(403,{error:'Admitted source worker required'});
