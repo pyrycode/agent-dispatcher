@@ -37,6 +37,7 @@ const projectPattern = /^[\w.-]+\/[\w.-]+$/;
 
 /** Workflow authority. GitHub observations never overwrite an adopted ticket's controls. */
 export class WorkflowStore {
+  private readonly labelTickets = new Map<string, { version: number; tickets: string[] }>();
   constructor(private readonly db: DatabaseSync) {
     db.exec(`CREATE TABLE IF NOT EXISTS workflow_projects (project TEXT PRIMARY KEY, config TEXT NOT NULL) STRICT;
       CREATE TABLE IF NOT EXISTS workflow_migrations (project TEXT PRIMARY KEY) STRICT;
@@ -181,6 +182,32 @@ export class WorkflowStore {
       .all()
       .map((r) => JSON.parse(String(r.config)));
   }
+  /**
+   * Open tickets of adopted projects that carry this label, in ticket order.
+   * Every scheduler snapshot asks, and the scan parses every saved ticket, so
+   * the answer is kept until the data can have changed. Every ticket write runs
+   * in transaction(), which drops it; a commit by another connection moves
+   * data_version. Inside a transaction, which may still roll back, it is
+   * neither read nor kept.
+   */
+  openTicketsWithLabel(label: string): string[] {
+    const inTransaction = (this.db as { isTransaction?: boolean }).isTransaction !== false;
+    const version = Number(this.db.prepare("PRAGMA data_version").get()?.data_version);
+    const kept = inTransaction ? undefined : this.labelTickets.get(label);
+    if (kept && kept.version === version) return [...kept.tickets];
+    const tickets = this.db
+      .prepare(
+        `SELECT ticket FROM workflow_tickets
+         WHERE project IN (SELECT project FROM workflow_projects)
+           AND json_extract(item,'$.state') IS NOT 'CLOSED'
+           AND EXISTS (SELECT 1 FROM json_each(item,'$.labels') WHERE value=?)
+         ORDER BY ticket`,
+      )
+      .all(label)
+      .map((r) => String(r.ticket));
+    if (!inTransaction) this.labelTickets.set(label, { version, tickets });
+    return [...tickets];
+  }
   config(project: string): WorkflowProject | undefined {
     return this.projects().find((p) => p.project === project);
   }
@@ -214,6 +241,7 @@ export class WorkflowStore {
       .run(project);
   }
   transaction<T>(work: () => T): T {
+    this.labelTickets.clear();
     this.db.exec("SAVEPOINT workflow");
     try {
       const value = work();

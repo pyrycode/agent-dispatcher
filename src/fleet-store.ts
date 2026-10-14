@@ -1,4 +1,5 @@
 import { isRepairWip } from "./recovery-labels.js";
+import { PRIORITY_HIGH } from "./ticket-priority.js";
 import { WorkflowStore, type WorkflowChange } from "./workflow-store.js";
 // The one authority for fleet ownership. No heartbeat expires a claim or run.
 // Keep this file on the claim server's local disk, never on a shared filesystem.
@@ -41,7 +42,7 @@ export interface StartRequest {
 }
 export interface Claim { ticket: string; machine: string; generation: string; created: number }
 export interface FleetRun extends StartRequest { generation: string; created: number; runnerPolicy?: RunnerPolicy }
-export interface FleetSnapshot { workflowProjects?: string[]; claims: Claim[]; runs: FleetRun[]; runnerPolicy?: RunnerPolicy; idleRecoveryTickets?: string[]; releasedAssessmentClaims?: Claim[]; features?: {recoveryTasks:boolean}; requiredRepairs?: Record<string,string[]> }
+export interface FleetSnapshot { workflowProjects?: string[]; claims: Claim[]; runs: FleetRun[]; runnerPolicy?: RunnerPolicy; idleRecoveryTickets?: string[]; priorityHighTickets?: string[]; releasedAssessmentClaims?: Claim[]; features?: {recoveryTasks:boolean}; requiredRepairs?: Record<string,string[]> }
 export type StartResult = { ok: true; generation: string } | {
   ok: false; reason: "foreign-claim" | "running" | "capacity" | "locked" | "finished";
 };
@@ -518,10 +519,13 @@ export class FleetStore {
     const idleRecoveryTickets = this.db.prepare(`SELECT ticket FROM fleet_recovery WHERE present=1 AND state='queued' AND reason IN (${IDLE_RECOVERY_REASONS.map(() => '?').join(',')})`)
       .all(...IDLE_RECOVERY_REASONS).map(r => String(r.ticket));
     const releasedAssessmentClaims = this.db.prepare("SELECT * FROM fleet_assessment_releases").all() as unknown as Claim[];
+    // Read from the workflow authority, so offers from older workers are ranked too.
+    const priorityHighTickets = this.workflow.openTicketsWithLabel(PRIORITY_HIGH);
     return {
       ...(this.workflow.projects().length ? {workflowProjects:this.workflow.projects().map(p=>p.project)} : {}),
       ...(runnerPolicy ? { runnerPolicy } : {}),
       ...(idleRecoveryTickets.length ? { idleRecoveryTickets } : {}),
+      ...(priorityHighTickets.length ? { priorityHighTickets } : {}),
       ...(releasedAssessmentClaims.length ? { releasedAssessmentClaims } : {}),
       claims: this.db.prepare("SELECT * FROM fleet_claims ORDER BY created,ticket").all() as unknown as Claim[],
       runs: this.db.prepare("SELECT request,generation,created FROM fleet_runs WHERE finished IS NULL ORDER BY created,id").all()
