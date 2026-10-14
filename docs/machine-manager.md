@@ -635,9 +635,26 @@ The fixed recipes are `platform-probe`, `memory-runtime-smoke`,
 `android-tool-then-text` and `dispatcher-repair`. Executed recipes require an exact
 candidate revision. There is no model-supplied shell command. Requests are stable
 within the admitted source run or recovery incident. A lost acknowledgement does
-not launch another worker. Private text artifacts are limited to 4 MiB, reject
+not launch another worker. Private text artifacts are limited to 64 MiB in total, reject
 path traversal and credential-shaped content, and return through the source's
 admitted writer. A failed check returns diagnostic evidence, never a passing gate.
+
+For `linux-amd64` and `macos-arm64`, `memory-runtime-smoke` runs the installer
+package's race tests and tagged `TestSmoke`, then the tagged `cmd/pyry TestSmoke`
+on the same exact product candidate. It sets separate private
+`PYRY_MEMORY_SMOKE_EVIDENCE` and `PYRY_MEMORY_OWNER_EVIDENCE` paths and returns
+`smoke.json` and `memory-owner.json` unchanged, including on failure. Each must be
+a JSON object with positive integer `executed` and equal integer `passed` counts.
+Non-JSON constants (`NaN`, `Infinity`, `-Infinity`) anywhere in either record,
+missing or malformed records, and command failures fail the task. The ordinary
+builder requests each capability through `fleet-task.py request`, then retrieves
+both records with `fleet-task.py await <task-id> --out <private-directory>`. A
+platform probe establishes route availability only; it supplies no candidate test
+evidence. Inspect the actual results before committing product evidence and
+continuing the normal review and required gates.
+The watchdog allows all three one-hour commands and the checkout setup, plus its
+usual 15-minute margin. It continues to report an overdue live worker without
+releasing its reservation.
 
 A coordinating incident waits while its helper is queued, running or publishing.
 The terminal result queues a new assessment without the usual evidence cooldown.

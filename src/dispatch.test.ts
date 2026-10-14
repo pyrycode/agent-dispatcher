@@ -386,6 +386,7 @@ export function makeMockDeps(opts: MockDepsOptions = {}): { deps: DispatchDeps; 
   }) as DispatchDeps["spawnGate"];
 
   const deps: DispatchDeps = {
+    salvageGates: ["go vet ./...", "go build ./..."],
     execSync: mockExecSync,
     spawnSync: mockSpawnSync,
     existsSync: mockExistsSync,
@@ -2573,6 +2574,7 @@ describe("handleAgentResultErrors", () => {
     await assert.rejects(handleAgentResultErrors(
       streamResult({ isError: true, terminalReason: "", timedOut: true }), ctx,
     ), /Agent error/);
+    assert.ok(calls.exec.some(c => c.cmd === "go build ./..."));
     assert.ok(!calls.spawn.some(c => c.args[0] === "push" || c.cmd === "gh"));
   });
 
