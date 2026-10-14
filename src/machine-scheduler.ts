@@ -77,17 +77,27 @@ export function isNewTicket(ticket: string, state: FleetSnapshot): boolean {
   return /#[1-9]\d*$/.test(ticket) && !state.claims.some(c => c.ticket === ticket);
 }
 
+/** Roles that review a ticket: the builder set's verifier and the classic qa and code-review. */
+export const REVIEW_ROLES: ReadonlySet<string> = new Set(["verifier", "qa", "code-review"]);
+
 /**
  * This computer's review queue: tickets it owns, across all its projects,
- * that the authority reports waiting for review and that no run holds,
- * including a support task serving the ticket. Undefined when the claim
- * service predates the report, so an older authority holds nothing.
+ * that the authority reports waiting for review, that no run holds
+ * (including a support task serving the ticket), and whose review its own
+ * dispatcher currently offers with every required repair ready. The offer
+ * test fails open: a review the dispatcher holds back (a failed health
+ * check, a verdict waiting to publish, backoff, a stopped dispatcher or a
+ * project this manager no longer serves) cannot hold new work here.
+ * Undefined when the claim service predates the report, so an older
+ * authority holds nothing.
  */
-export function reviewQueue(machine: string, state: FleetSnapshot): string[] | undefined {
+export function reviewQueue(machine: string, state: FleetSnapshot, offers: readonly WorkOffer[]): string[] | undefined {
   if (!state.reviewReadyTickets) return undefined;
   const owned = new Set(state.claims.filter(c => c.machine === machine).map(c => c.ticket));
   const running = new Set(state.runs.flatMap(r => r.parentTicket ? [r.ticket, r.parentTicket] : [r.ticket]));
-  return state.reviewReadyTickets.filter(t => owned.has(t) && !running.has(t));
+  const offered = new Set(offers.filter(o => REVIEW_ROLES.has(o.role)
+    && (state.requiredRepairs?.[o.ticket] ?? []).every(sha => o.readyRepairs?.includes(sha))).map(o => o.ticket));
+  return state.reviewReadyTickets.filter(t => owned.has(t) && !running.has(t) && offered.has(t));
 }
 
 /**
@@ -108,6 +118,12 @@ export function scheduleMachine(opts: {
    * heavyLimit; 0 turns the hold off. See reviewQueue.
    */
   reviewQueueLimit?: number;
+  /**
+   * Every current offer, for the review queue's offer test. The manager's
+   * admission loop passes `offers` without the ones it already tried this
+   * tick, and a review refused for capacity still waits. Defaults to offers.
+   */
+  reviewOffers?: readonly WorkOffer[];
   offers: readonly WorkOffer[]; state: FleetSnapshot;
 } & MachineLimits): WorkOffer[] {
   const claims = new Map(opts.state.claims.map(c => [c.ticket, c]));
@@ -123,7 +139,7 @@ export function scheduleMachine(opts: {
   let ticketPlaces = Math.max(0, (opts.ticketLimit ?? Infinity) - runnable.size);
   const reviewLimit = effectiveReviewQueueLimit(opts);
   // A ticket leaves the queue once a run selected here takes it.
-  const waitingReview = new Set(reviewQueue(opts.machine, opts.state) ?? []);
+  const waitingReview = new Set(reviewQueue(opts.machine, opts.state, opts.reviewOffers ?? opts.offers) ?? []);
   const reviewQueueFull = () => reviewLimit > 0 && opts.state.reviewReadyTickets !== undefined && waitingReview.size >= reviewLimit;
   const rank = new Map(opts.projects.map((p, i) => [p, i]));
   const priorityHigh = new Set(opts.state.priorityHighTickets ?? []);

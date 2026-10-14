@@ -49,9 +49,11 @@ const REVIEW_COLUMNS: Record<string, readonly string[]> = {
 /**
  * True when an open ticket waits for its review stage and nothing holds it:
  * no open blocker, no `error:` label, no rework on its way back
- * (`needs-rework:`), no operator hold (`needs-human:` except sizing, or
- * `health-hold:`), no running agent label and no passed review. The review
- * queue limit counts these per owning computer. Added 2026-10-14:
+ * (`needs-rework:`), no operator hold (`needs-human:` except sizing), no
+ * dispatcher hold (`held:`, such as the failed health check's
+ * `held:health-check`), no running agent label, no passed review and no
+ * review verdict waiting to be published (`pending-verdict:`,
+ * `pending-done:`). The review queue limit counts these per owning computer. Added 2026-10-14:
  * build-fractal-2 owned six runnable tickets, three of them waiting for its
  * one heavy place, while build-hp-1 sat half idle.
  */
@@ -59,7 +61,8 @@ export function awaitsReview(item: Pick<WorkflowItem, "state" | "status" | "labe
   const passed = REVIEW_COLUMNS[item.status];
   return item.state === "OPEN" && passed !== undefined
     && !item.labels.some(l => passed.includes(l) || l.startsWith("error:") || l.startsWith("needs-rework:")
-      || (l.startsWith("needs-human:") && l !== "needs-human:sizing") || l.startsWith("health-hold:"))
+      || (l.startsWith("needs-human:") && l !== "needs-human:sizing") || l.startsWith("held:")
+      || l.startsWith("pending-verdict:") || l.startsWith("pending-done:"))
     && !hasRunningWip(item.labels)
     && !item.blockedBy.some(b => b.state === "OPEN");
 }
@@ -83,7 +86,8 @@ export class WorkflowStore {
     db.exec(`CREATE INDEX IF NOT EXISTS workflow_item_id ON workflow_tickets(json_extract(item,'$.id'));
       CREATE INDEX IF NOT EXISTS workflow_issue_id ON workflow_tickets(json_extract(item,'$.issueId'));
       CREATE INDEX IF NOT EXISTS workflow_parent ON workflow_tickets(project,json_extract(item,'$.parentNumber'));
-      CREATE INDEX IF NOT EXISTS workflow_order ON workflow_tickets(project,position);`);
+      CREATE INDEX IF NOT EXISTS workflow_order ON workflow_tickets(project,position);
+      CREATE INDEX IF NOT EXISTS workflow_status ON workflow_tickets(json_extract(item,'$.status'));`);
     this.migrateRecoveryPriority();
     this.migrateRepairing();
   }

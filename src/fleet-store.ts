@@ -646,6 +646,17 @@ export class FleetStore {
     });
   }
 
+  /**
+   * The workflow's review-ready tickets less those this authority would refuse
+   * a review for while a support task is open on them (see start()).
+   */
+  private reviewReadyTickets(): string[] {
+    const ready = this.workflow.reviewReadyTickets();
+    if (!ready.length) return ready;
+    const tasked = new Set(this.db.prepare("SELECT DISTINCT ticket FROM fleet_recovery_tasks WHERE state IN ('queued','running','publishing','attention')").all().map(r => String(r.ticket)));
+    return ready.filter(t => !tasked.has(t));
+  }
+
   snapshot(): FleetSnapshot {
     const runnerPolicy = this.runnerPolicy();
     const idleRecoveryTickets = this.db.prepare(`SELECT ticket FROM fleet_recovery WHERE present=1 AND state='queued' AND reason IN (${IDLE_RECOVERY_REASONS.map(() => '?').join(',')})`)
@@ -655,14 +666,15 @@ export class FleetStore {
     const codexSpacing = this.codex.spacingWaitMs() > 0 ? this.codex.spacingState() : undefined;
     // Read from the workflow authority, so offers from older workers are ranked too.
     const priorityHighTickets = this.workflow.openTicketsWithLabel(PRIORITY_HIGH);
+    const workflowProjects = this.workflow.projects().map(p => p.project);
     return {
       ...(codexPause ? { codexPause } : {}),
       ...(codexSpacing ? { codexSpacing } : {}),
-      ...(this.workflow.projects().length ? {workflowProjects:this.workflow.projects().map(p=>p.project)} : {}),
+      ...(workflowProjects.length ? { workflowProjects } : {}),
       ...(runnerPolicy ? { runnerPolicy } : {}),
       ...(idleRecoveryTickets.length ? { idleRecoveryTickets } : {}),
       ...(priorityHighTickets.length ? { priorityHighTickets } : {}),
-      ...(this.workflow.projects().length ? { reviewReadyTickets: this.workflow.reviewReadyTickets() } : {}),
+      ...(workflowProjects.length ? { reviewReadyTickets: this.reviewReadyTickets() } : {}),
       ...(releasedAssessmentClaims.length ? { releasedAssessmentClaims } : {}),
       claims: this.db.prepare("SELECT * FROM fleet_claims ORDER BY created,ticket").all() as unknown as Claim[],
       runs: this.db.prepare("SELECT request,generation,created FROM fleet_runs WHERE finished IS NULL ORDER BY created,id").all()

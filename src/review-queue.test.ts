@@ -16,8 +16,10 @@ const claim = (ticket: string, machine = "fractal") => ({ ticket, machine, gener
 const offer = (ticket: string, role = "builder", resource: "heavy" | "medium" | "light" = "medium"): WorkOffer => ({
   project: ticket.split("#")[0], ticket, role, resource, locks: [], key: `${role}-${ticket}`, order: Number(ticket.split("#")[1]),
 });
-const schedule = (state: FleetSnapshot, offers: WorkOffer[], limits: { heavyLimit: number; combinedLimit: number; reviewQueueLimit?: number } = { heavyLimit: 1, combinedLimit: 3 }, machine = "fractal") =>
-  scheduleMachine({ machine, projects: [CORE, MOBILE], offers, state, ticketLimit: 10, ...limits }).map(o => `${o.role} ${o.ticket}`);
+/** The verifier offers a dispatcher makes for every review-ready ticket, by default. */
+const reviews = (state: FleetSnapshot) => (state.reviewReadyTickets ?? []).map(t => offer(t, "verifier", "heavy"));
+const schedule = (state: FleetSnapshot, offers: WorkOffer[], limits: { heavyLimit: number; combinedLimit: number; reviewQueueLimit?: number } = { heavyLimit: 1, combinedLimit: 3 }, machine = "fractal", reviewOffers: WorkOffer[] = [...offers, ...reviews(state)]) =>
+  scheduleMachine({ machine, projects: [CORE, MOBILE], offers, reviewOffers, state, ticketLimit: 10, ...limits }).map(o => `${o.role} ${o.ticket}`);
 
 // ---------- Which tickets wait for review ----------
 
@@ -26,7 +28,7 @@ const item = (status: string, labels: string[] = [], blockedBy: WorkflowItem["bl
 test("a ticket waits for review in its review column with nothing holding it", () => {
   assert.equal(awaitsReview(item("In Code Review")), true);
   assert.equal(awaitsReview(item("In QA")), true, "classic qa");
-  assert.equal(awaitsReview(item("In Code Review", ["priority:high", "size:S", "error-retry-count:1", "rework-count:2", "wip:repair", "needs-human:sizing"])), true);
+  assert.equal(awaitsReview(item("In Code Review", ["priority:high", "size:S", "error-retry-count:1", "rework-count:2", "wip:repair", "needs-human:sizing", "done:builder", "claim:fractal"])), true);
   assert.equal(awaitsReview(item("In Code Review", [], [{ number: 5, state: "CLOSED" }])), true, "a closed blocker holds nothing");
   for (const status of ["Backlog", "In Development", "In Architecture", "In Documentation", "Done", "Halted", "Inbox"]) assert.equal(awaitsReview(item(status)), false, status);
 });
@@ -37,7 +39,9 @@ test("blocked, errored, held, running, reworked and passed tickets do not wait f
     ["error", item("In Code Review", ["error:verifier"])],
     ["family breaker", item("In Code Review", ["error:family-breaker"])],
     ["operator hold", item("In Code Review", ["needs-human:approval"])],
-    ["health hold", item("In Code Review", ["health-hold:emulator"])],
+    ["failed health check", item("In Code Review", ["held:health-check"])],
+    ["verdict waiting to publish", item("In Code Review", ["pending-verdict:verifier"])],
+    ["done label waiting to publish", item("In Code Review", ["pending-done:verifier"])],
     ["running verifier", item("In Code Review", ["wip:verifier"])],
     ["rework on its way", item("In Code Review", ["needs-rework:builder"])],
     ["passed verifier", item("In Code Review", ["done:verifier"])],
@@ -86,6 +90,27 @@ test("only this computer's idle owned tickets count", () => {
   assert.deepEqual(schedule({ claims: [claim(`${CORE}#4`), claim(`${CORE}#5`)], runs: [], reviewReadyTickets: ready }, offers), [`builder ${CORE}#9`]);
 });
 
+test("a review its dispatcher does not offer, or cannot start for a missing repair, does not count", () => {
+  const state: FleetSnapshot = { claims: [claim(`${CORE}#1`), claim(`${MOBILE}#2`)], runs: [], reviewReadyTickets: [`${CORE}#1`, `${MOBILE}#2`] };
+  const offers = [offer(`${CORE}#9`)];
+  const hp = { heavyLimit: 2, combinedLimit: 3 };
+  // No verifier offer at all: a stopped dispatcher, a failed health check, an unserved project.
+  assert.deepEqual(schedule(state, offers, hp, "fractal", offers), [`builder ${CORE}#9`]);
+  // Only one of the two offered: still under HP's limit of two.
+  assert.deepEqual(schedule(state, offers, hp, "fractal", [...offers, offer(`${CORE}#1`, "verifier", "heavy")]), [`builder ${CORE}#9`]);
+  assert.deepEqual(schedule(state, offers, hp), [], "both offered");
+  // A required repair not yet ready means the authority would refuse the verifier.
+  const sha = "a".repeat(40);
+  const repairs = { ...state, requiredRepairs: { [`${CORE}#1`]: [sha] } };
+  assert.deepEqual(schedule(repairs, offers, hp), [`builder ${CORE}#9`]);
+  const ready = [...offers, { ...offer(`${CORE}#1`, "verifier", "heavy"), readyRepairs: [sha] }, offer(`${MOBILE}#2`, "verifier", "heavy")];
+  assert.deepEqual(schedule(repairs, offers, hp, "fractal", ready), []);
+  // Classic review roles count the same way.
+  assert.deepEqual(schedule(state, offers, hp, "fractal", [offer(`${CORE}#1`, "qa", "heavy"), offer(`${MOBILE}#2`, "code-review", "heavy")]), []);
+  // A builder offer for a review-ready ticket is not a review.
+  assert.deepEqual(schedule(state, offers, hp, "fractal", [offer(`${CORE}#1`), offer(`${MOBILE}#2`)]), [`builder ${CORE}#9`]);
+});
+
 test("owned work is never held: verifiers, rework builders, documentation and recovery continue", () => {
   const claims = [1, 2, 3, 4, 5].map(n => claim(`${CORE}#${n}`));
   const state: FleetSnapshot = { claims, runs: [], reviewReadyTickets: [`${CORE}#1`, `${CORE}#2`] };
@@ -111,7 +136,7 @@ test("reviewQueueLimit overrides the heavy limit, and 0 turns the hold off", () 
 
 test("an older claim service that sends no review list holds nothing", () => {
   const state: FleetSnapshot = { claims: [claim(`${CORE}#1`), claim(`${CORE}#2`)], runs: [] };
-  assert.equal(reviewQueue("fractal", state), undefined);
+  assert.equal(reviewQueue("fractal", state, reviews(state)), undefined);
   assert.deepEqual(schedule(state, [offer(`${MOBILE}#9`)]), [`builder ${MOBILE}#9`]);
 });
 
@@ -168,6 +193,19 @@ test("the authority reports review-ready tickets across projects, resolving bloc
   } finally { store.close(); }
 });
 
+test("a ticket with an open support task is not review-ready, since the authority would refuse its review", () => {
+  const { store, build } = fleet();
+  try {
+    build("fractal", `${CORE}#1`);
+    build("fractal", `${CORE}#2`);
+    const db = (store as unknown as { db: import("node:sqlite").DatabaseSync }).db;
+    const insert = (id: string, ticket: string, state: string) => db.prepare("INSERT INTO fleet_recovery_tasks (id,ticket,request,state,created,updated) VALUES (?,?,?,?,1,1)").run(id, ticket, "{}", state);
+    insert("t1", `${CORE}#1`, "attention");
+    insert("t2", `${CORE}#2`, "completed");
+    assert.deepEqual(store.snapshot().reviewReadyTickets, [`${CORE}#2`]);
+  } finally { store.close(); }
+});
+
 test("a claim service with no adopted project sends no review list", () => {
   const store = new FleetStore(":memory:", { fractal: { heavyLimit: 1, combinedLimit: 3 } });
   try { assert.equal(store.snapshot().reviewReadyTickets, undefined); } finally { store.close(); }
@@ -178,7 +216,10 @@ test("the manager holds new tickets, shows review-queue-full and keeps owned wor
   try {
     build("fractal", `${CORE}#1`);
     build("hp", `${CORE}#2`);
-    // Fractal also owns #3, still in development (a rework builder).
+    // Fractal's heavy place is busy verifying Mobile #1.
+    build("fractal", `${MOBILE}#1`);
+    assert.equal(store.start(request("vm1", "fractal", `${MOBILE}#1`, "verifier", "heavy")).ok, true);
+    // Fractal also owns #3, back in development (a rework builder).
     assert.equal(store.start(request("b3", "fractal", `${CORE}#3`)).ok, true);
     store.finish("fractal", "s-fractal", "b3");
     const client = { snapshot: async () => store.snapshot(), start: async (r: StartRequest) => store.start(r), finish: async () => {} };
@@ -186,37 +227,71 @@ test("the manager holds new tickets, shows review-queue-full and keeps owned wor
     const newBuilder = { ...offer(`${MOBILE}#9`), workflowVersion: 1 as const };
     const newRefiner = { ...offer(`${CORE}#4`, "refiner", "light"), workflowVersion: 1 as const };
     const rework = { ...offer(`${CORE}#3`), workflowVersion: 1 as const };
+    const verifier = { ...offer(`${CORE}#1`, "verifier", "heavy"), workflowVersion: 1 as const };
     manager.offer(MOBILE, "m", [newBuilder]);
-    manager.offer(CORE, "c", [newRefiner, rework]);
+    manager.offer(CORE, "c", [newRefiner, rework, verifier]);
     const status = await manager.status();
     assert.deepEqual(status.reviewQueue, { limit: 1, tickets: [`${CORE}#1`], full: true });
     assert.deepEqual(Object.fromEntries(status.queue.map(q => [q.ticket, q.state])),
-      { [`${MOBILE}#9`]: "review-queue-full", [`${CORE}#4`]: "review-queue-full", [`${CORE}#3`]: "eligible" });
+      { [`${MOBILE}#9`]: "review-queue-full", [`${CORE}#4`]: "review-queue-full", [`${CORE}#3`]: "eligible", [`${CORE}#1`]: "waiting-for-capacity-or-lock" });
     await manager.tick();
-    assert.deepEqual(store.snapshot().runs.map(r => r.ticket), [`${CORE}#3`], "only the owned rework started");
+    assert.deepEqual(store.snapshot().runs.map(r => r.ticket).sort(), [`${CORE}#3`, `${MOBILE}#1`].sort(), "only the owned rework started");
 
-    // Its verifier starts: #1 is under review, so the queue empties and new work flows.
+    // Mobile #1's verifier and the rework finish: #1's verifier takes the heavy place, the queue empties and new work flows.
+    store.finish("fractal", "s-fractal", "vm1");
     store.finish("fractal", "c", (await manager.grants(CORE, "c"))[0].id);
-    manager.offer(CORE, "c", [newRefiner, { ...offer(`${CORE}#1`, "verifier", "heavy"), workflowVersion: 1 }]);
+    manager.offer(CORE, "c", [newRefiner, verifier]);
     await manager.tick();
     assert.deepEqual(store.snapshot().runs.map(r => r.ticket).sort(), [`${CORE}#1`, `${CORE}#4`, `${MOBILE}#9`].sort());
     assert.deepEqual((await manager.status()).reviewQueue, { limit: 1, tickets: [], full: false });
   } finally { store.close(); }
 });
 
+test("a review refused for capacity in one tick still holds new tickets in that tick", async () => {
+  const { store, build } = fleet();
+  try {
+    build("fractal", `${CORE}#1`);
+    // Fractal's one heavy place is taken by a verifier of another project's ticket.
+    assert.equal(store.start(request("b2", "fractal", `${MOBILE}#2`)).ok, true);
+    store.finish("fractal", "s-fractal", "b2");
+    store.workflow.change(`${MOBILE}#2`, { status: "In Code Review" }, "test", "review-m2");
+    assert.equal(store.start(request("v2", "fractal", `${MOBILE}#2`, "verifier", "heavy")).ok, true);
+    const client = { snapshot: async () => store.snapshot(), start: async (r: StartRequest) => store.start(r), finish: async () => {} };
+    const manager = new MachineManager({ machine: "fractal", heavyLimit: 1, combinedLimit: 3, ticketLimit: 10, projects: [CORE, MOBILE] }, client);
+    manager.offer(CORE, "c", [{ ...offer(`${CORE}#1`, "verifier", "heavy"), workflowVersion: 1 }, { ...offer(`${CORE}#4`, "refiner", "light"), workflowVersion: 1 }]);
+    const status = await manager.status();
+    assert.deepEqual(status.reviewQueue, { limit: 1, tickets: [`${CORE}#1`], full: true });
+    assert.deepEqual(Object.fromEntries(status.queue.map(q => [q.ticket, q.state])),
+      { [`${CORE}#1`]: "waiting-for-capacity-or-lock", [`${CORE}#4`]: "review-queue-full" });
+    await manager.tick();
+    assert.deepEqual(store.snapshot().runs.map(r => r.ticket), [`${MOBILE}#2`], "neither the verifier nor the new refiner started");
+  } finally { store.close(); }
+});
+
 test("build-hp-1 at heavy limit 2 takes new work with one ticket waiting and holds at two", async () => {
   const { store, build } = fleet();
   try {
+    // HP's two heavy places verify Core #2 and Mobile #2, so its other reviews wait for a place.
+    for (const t of [`${CORE}#2`, `${MOBILE}#2`]) {
+      build("hp", t);
+      assert.equal(store.start(request(`v-${t}`, "hp", t, "verifier", "heavy")).ok, true);
+    }
     build("hp", `${CORE}#1`);
     const client = { snapshot: async () => store.snapshot(), start: async (r: StartRequest) => store.start(r), finish: async () => {} };
     const manager = new MachineManager({ machine: "hp", heavyLimit: 2, combinedLimit: 3, ticketLimit: 10, projects: [CORE, MOBILE] }, client);
+    const verifier = (t: string) => ({ ...offer(t, "verifier", "heavy"), workflowVersion: 1 as const });
+    manager.offer(CORE, "c", [verifier(`${CORE}#1`)]);
+    manager.offer(MOBILE, "m", [{ ...offer(`${MOBILE}#9`), workflowVersion: 1 }]);
     assert.deepEqual((await manager.status()).reviewQueue, { limit: 2, tickets: [`${CORE}#1`], full: false });
+    assert.equal((await manager.status()).queue.find(q => q.ticket === `${MOBILE}#9`)!.state, "eligible");
+
     build("hp", `${MOBILE}#1`);
+    manager.offer(MOBILE, "m", [verifier(`${MOBILE}#1`), { ...offer(`${MOBILE}#9`), workflowVersion: 1 }]);
     const status = await manager.status();
     assert.deepEqual(status.reviewQueue, { limit: 2, tickets: [`${CORE}#1`, `${MOBILE}#1`], full: true });
-    manager.offer(MOBILE, "m", [{ ...offer(`${MOBILE}#9`), workflowVersion: 1 }]);
+    assert.equal(status.queue.find(q => q.ticket === `${MOBILE}#9`)!.state, "review-queue-full");
     await manager.tick();
-    assert.deepEqual(store.snapshot().runs, []);
+    assert.deepEqual(store.snapshot().runs.map(r => r.ticket).sort(), [`${CORE}#2`, `${MOBILE}#2`].sort());
   } finally { store.close(); }
 });
 
