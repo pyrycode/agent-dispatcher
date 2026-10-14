@@ -13,15 +13,47 @@ export interface RecoveryObservation {
   assessmentPolicy?: number;
 }
 export type RecoveryAction = "wait" | "retry" | "rework" | "resume" | "refine" | "unblock" | "propose-close" | "coordinate" | "escalate";
-export interface RecoveryDecision { action: RecoveryAction; reason: string; blocker?: string; retryReset?: string; recheckAt?: number; task?: RecoveryTaskRequest; category?: "operational" | "human" }
+/** What should reopen a settled wait or operational escalation. Recovery task ids and full ticket references only. */
+export interface RecoveryWaitFor { tasks?: string[]; tickets?: string[] }
+export interface RecoveryDecision { action: RecoveryAction; reason: string; blocker?: string; retryReset?: string; recheckAt?: number; task?: RecoveryTaskRequest; category?: "operational" | "human";
+  waitFor?: RecoveryWaitFor;
+  /** Code-only: a transient transport failure keeps its short cooldown. Never accepted from an assessment. */
+  cooldown?: boolean }
+/**
+ * The state a wait or operational escalation was settled against. A settled
+ * incident is reassessed only when this basis changes, at an explicit code
+ * deadline, or after the long safety interval.
+ */
+export interface RecoverySettlement {
+  incident: string; ticket: string; created: number; recheckAt: number;
+  basis: { fingerprint: string; tasks: Record<string, string>; tickets: Record<string, string>; coordination: string | null; capabilities?: string[] };
+  digest: string; reopened: string | null; reopenedAt: number | null;
+}
 export interface RecoveryIncident {
   id: string; ticket: string; fingerprint: string; reason: string;
   state: "queued" | "assessing" | "applying" | "waiting" | "complete" | "escalated" | "resolved";
   created: number; updated: number; runId: string | null; decision: RecoveryDecision | null;
   current?: boolean;
+  /** Present for a settled wait or operational escalation: what it waits on and why it reopened. */
+  settlement?: RecoverySettlement;
 }
 
+/** Short code-set cooldown, used only for transient transport failures. */
 export const RECOVERY_RECHECK_MS = 30 * 60_000;
+/** Default safety reassessment of an unchanged settled wait or operational escalation. */
+export const RECOVERY_SAFETY_RECHECK_MS = 24 * 3600_000;
+export interface RecoveryLedgerOptions { safetyRecheckMs?: number }
+export function validateSafetyRecheck(ms: number): number {
+  if (!Number.isSafeInteger(ms) || ms < 60 * 60_000 || ms > 30 * 86400_000) throw new Error("Recovery safety recheck must be between one hour and thirty days");
+  return ms;
+}
+const TASK_ID = /^[a-f0-9]{64}$/;
+const FULL_TICKET = /^[\w.-]+\/[\w.-]+#[1-9]\d*$/;
+/** Pending task states collapse, so a dependency starting to run is not a change. */
+const taskPhase = (state: string | undefined) => state === undefined ? "missing" : ["queued", "running", "publishing"].includes(state) ? "pending" : state;
+function settles(state: string, decision: RecoveryDecision | null): boolean {
+  return !!decision && (state === "complete" && decision.action === "wait" || state === "escalated" && decision.action === "escalate" && decision.category === "operational");
+}
 export const RECOVERY_DEPENDENCY_REASON = "Dependency evidence and coordination reassessment";
 export const RECOVERY_INBOX_REASON = "Inbox readiness reassessment";
 export const RECOVERY_UNKNOWN_PAUSE_REASON = "Pause origin unknown; record who paused this ticket and the reopening condition";
@@ -89,13 +121,21 @@ export function validateRecoveryDecision(value: unknown): RecoveryDecision {
     || typeof d.retryReset !== "string" || !d.retryReset.trim() || d.retryReset.length > 6000)) throw new Error("Invalid retry reset finding");
   if (d.category !== undefined && !["operational","human"].includes(d.category)) throw new Error("Invalid escalation category");
   const task = d.action === "coordinate" ? validateTaskRequest(d.task) : undefined;
+  // A malformed reopening hint is dropped rather than failing the assessment.
+  const hint = (values: unknown, pattern: RegExp) => Array.isArray(values) ? [...new Set(values.filter((v): v is string => typeof v === "string" && pattern.test(v)))].slice(0, 10) : [];
+  const waitFor = (d.action === "wait" || d.action === "escalate") && d.waitFor && typeof d.waitFor === "object"
+    ? { tasks: hint(d.waitFor.tasks, TASK_ID), tickets: hint(d.waitFor.tickets, FULL_TICKET) } : undefined;
   return { action: d.action, reason: d.reason, ...(task ? {task} : {}), ...(d.action === "escalate" && d.category ? {category:d.category} : {}), ...(d.action === "unblock" ? { blocker: d.blocker } : {}),
-    ...(d.retryReset !== undefined ? { retryReset: d.retryReset } : {}) };
+    ...(d.retryReset !== undefined ? { retryReset: d.retryReset } : {}),
+    ...(waitFor && (waitFor.tasks.length || waitFor.tickets.length) ? { waitFor } : {}),
+    ...(d.cooldown === true && d.action === "escalate" && d.category === "operational" ? { cooldown: true } : {}) };
 }
 
 /** Uses the claim authority's database. No independent watcher can race this ledger. */
 export class RecoveryLedger {
-  constructor(private db: DatabaseSync, private now = Date.now) {
+  private readonly safetyRecheckMs: number;
+  constructor(private db: DatabaseSync, private now = Date.now, options: RecoveryLedgerOptions = {}) {
+    this.safetyRecheckMs = validateSafetyRecheck(options.safetyRecheckMs ?? RECOVERY_SAFETY_RECHECK_MS);
     db.exec(`CREATE TABLE IF NOT EXISTS fleet_recovery (
       id TEXT PRIMARY KEY, ticket TEXT NOT NULL, fingerprint TEXT NOT NULL, reason TEXT NOT NULL,
       state TEXT NOT NULL, created INTEGER NOT NULL, updated INTEGER NOT NULL,
@@ -106,7 +146,79 @@ export class RecoveryLedger {
       ticket TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, since INTEGER NOT NULL
     ) STRICT;
     CREATE TABLE IF NOT EXISTS fleet_recovery_workflow (ticket TEXT PRIMARY KEY, fingerprint TEXT NOT NULL) STRICT;
-    CREATE TABLE IF NOT EXISTS fleet_recovery_assessment_policy (incident_id TEXT PRIMARY KEY, version INTEGER NOT NULL) STRICT;`);
+    CREATE TABLE IF NOT EXISTS fleet_recovery_assessment_policy (incident_id TEXT PRIMARY KEY, version INTEGER NOT NULL) STRICT;
+    CREATE TABLE IF NOT EXISTS fleet_recovery_settlement (
+      incident_id TEXT PRIMARY KEY, ticket TEXT NOT NULL, basis TEXT NOT NULL, digest TEXT NOT NULL,
+      created INTEGER NOT NULL, recheck_at INTEGER NOT NULL, reopened TEXT, reopened_at INTEGER
+    ) STRICT;
+    CREATE TABLE IF NOT EXISTS fleet_recovery_status (ticket TEXT PRIMARY KEY, status TEXT NOT NULL, present INTEGER NOT NULL) STRICT;`);
+  }
+  private hasTable(name: string): boolean {
+    return !!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name);
+  }
+  /** Current state of everything a settled incident is waiting on. */
+  private basis(ticket: string, fingerprint: string, tasks: string[], tickets: string[], operational: boolean): RecoverySettlement["basis"] {
+    const taskStates = Object.fromEntries(tasks.sort().map(id => [id, taskPhase(this.hasTable("fleet_recovery_tasks")
+      ? this.db.prepare("SELECT state FROM fleet_recovery_tasks WHERE id=?").get(id)?.state as string | undefined : undefined)]));
+    const ticketStates = Object.fromEntries(tickets.sort().map(t => {
+      const row = this.db.prepare("SELECT status,present FROM fleet_recovery_status WHERE ticket=?").get(t);
+      return [t, !row ? "unobserved" : Number(row.present) ? String(row.status) : "absent"];
+    }));
+    const coordination = this.hasTable("fleet_coordination")
+      ? this.db.prepare("SELECT blocker,record FROM fleet_coordination WHERE ticket=? ORDER BY blocker").all(ticket).map(r => [String(r.blocker), String(r.record)]) : [];
+    const capabilities = operational && this.hasTable("fleet_capabilities")
+      ? [...new Set(this.db.prepare("SELECT record FROM fleet_capabilities").all().flatMap(r => {
+          const record = JSON.parse(String(r.record)) as { ready?: boolean; capabilities?: string[] };
+          return record.ready ? record.capabilities ?? [] : [];
+        }))].sort() : undefined;
+    return { fingerprint, tasks: taskStates, tickets: ticketStates,
+      coordination: coordination.length ? createHash("sha256").update(JSON.stringify(coordination)).digest("hex") : null,
+      ...(capabilities ? { capabilities } : {}) };
+  }
+  private dependencies(ticket: string, decision: RecoveryDecision): { tasks: string[]; tickets: string[] } {
+    // Assessments often name the repair they wait on only in prose. Accept a
+    // 64-hex identifier from the reason only when it is a real recovery task.
+    const named = this.hasTable("fleet_recovery_tasks") ? [...decision.reason.matchAll(/\b[a-f0-9]{64}\b/g)].map(m => m[0])
+      .filter(id => this.db.prepare("SELECT 1 FROM fleet_recovery_tasks WHERE id=?").get(id)) : [];
+    return { tasks: [...new Set([...decision.waitFor?.tasks ?? [], ...named])].slice(0, 10),
+      tickets: [...new Set(decision.waitFor?.tickets ?? [])].filter(t => t !== ticket).slice(0, 10) };
+  }
+  private settle(incident: string, ticket: string, fingerprint: string, decision: RecoveryDecision, since?: number): RecoverySettlement {
+    const created = this.now();
+    const deps = this.dependencies(ticket, decision);
+    const basis = this.basis(ticket, fingerprint, deps.tasks, deps.tickets, decision.action === "escalate");
+    const digest = createHash("sha256").update(JSON.stringify(basis)).digest("hex");
+    this.db.prepare("INSERT INTO fleet_recovery_settlement VALUES (?,?,?,?,?,?,NULL,NULL) ON CONFLICT(incident_id) DO NOTHING")
+      .run(incident, ticket, JSON.stringify(basis), digest, created, (since ?? created) + this.safetyRecheckMs);
+    return this.settlement(incident)!;
+  }
+  settlement(incident: string): RecoverySettlement | undefined {
+    const r = this.db.prepare("SELECT * FROM fleet_recovery_settlement WHERE incident_id=?").get(incident);
+    return r ? { incident: String(r.incident_id), ticket: String(r.ticket), created: Number(r.created), recheckAt: Number(r.recheck_at),
+      basis: JSON.parse(String(r.basis)), digest: String(r.digest), reopened: r.reopened as string | null, reopenedAt: r.reopened_at as number | null } : undefined;
+  }
+  /**
+   * Why a settled incident should be assessed again, or null while nothing it
+   * depends on has changed. Ticket fingerprint changes are handled by the caller.
+   */
+  private reopenCause(old: Record<string, unknown>, decision: RecoveryDecision): string | null {
+    const id = String(old.id);
+    // Incidents settled before this policy are recorded against today's state.
+    const settled = this.settlement(id) ?? this.settle(id, String(old.ticket), String(old.fingerprint), decision, Number(old.updated));
+    if (decision.recheckAt !== undefined && this.now() >= decision.recheckAt) return "code deadline";
+    if (this.now() >= settled.recheckAt) return "safety interval";
+    const current = this.basis(settled.ticket, settled.basis.fingerprint, Object.keys(settled.basis.tasks), Object.keys(settled.basis.tickets), !!settled.basis.capabilities);
+    const task = Object.keys(settled.basis.tasks).find(t => current.tasks[t] !== settled.basis.tasks[t]);
+    if (task) return `dependency task ${task} ${current.tasks[task]}`;
+    const ticket = Object.keys(settled.basis.tickets).find(t => current.tickets[t] !== settled.basis.tickets[t]);
+    if (ticket) return `dependency ticket ${ticket} ${current.tickets[ticket]}`;
+    if (current.coordination !== settled.basis.coordination) return "coordination record changed";
+    const gained = current.capabilities?.find(c => !settled.basis.capabilities!.includes(c));
+    if (gained) return `capability ${gained} ready`;
+    return null;
+  }
+  private markReopened(incident: string, cause: string): void {
+    this.db.prepare("UPDATE fleet_recovery_settlement SET reopened=?,reopened_at=? WHERE incident_id=? AND reopened IS NULL").run(cause.slice(0, 500), this.now(), incident);
   }
   escalatedTickets():string[] {
     return this.db.prepare("SELECT ticket FROM fleet_recovery WHERE present=1 AND state='escalated' ORDER BY ticket").all().map(r=>String(r.ticket));
@@ -116,13 +228,21 @@ export class RecoveryLedger {
       : this.db.prepare("SELECT * FROM fleet_recovery ORDER BY created DESC LIMIT 500").all();
     return rows.map(r => ({ id: String(r.id), ticket: String(r.ticket), fingerprint: String(r.fingerprint), reason: String(r.reason),
       state: r.state as RecoveryIncident["state"], created: Number(r.created), updated: Number(r.updated), runId: r.run_id as string | null,
-      decision: r.decision ? JSON.parse(String(r.decision)) : null, current: r.present === 1 }));
+      decision: r.decision ? JSON.parse(String(r.decision)) : null, current: r.present === 1 }))
+      .map(i => { const settlement = this.settlement(i.id); return settlement ? { ...i, settlement } : i; });
   }
   report(machine: string, project: string, observations: RecoveryObservation[], fleet: FleetSnapshot, partial = false): RecoveryIncident[] {
     validateObservations(project, observations);
     const active = new Set(fleet.runs.map(r => r.ticket));
     const seen = new Set<string>();
     const newAlerts = new Set<string>();
+    // Dependency tickets are compared by stage and presence, never by comment churn.
+    for (const o of observations) this.db.prepare("INSERT INTO fleet_recovery_status VALUES (?,?,1) ON CONFLICT(ticket) DO UPDATE SET status=excluded.status,present=1").run(o.ticket, o.status);
+    if (!partial) {
+      const observed = new Set(observations.map(o => o.ticket));
+      for (const row of this.db.prepare("SELECT ticket FROM fleet_recovery_status WHERE ticket LIKE ? AND present=1").all(`${project}#%`))
+        if (!observed.has(String(row.ticket))) this.db.prepare("UPDATE fleet_recovery_status SET present=0 WHERE ticket=?").run(row.ticket);
+    }
     for (const o of observations) {
       const owner = fleet.claims.find(c => c.ticket === o.ticket);
       if (owner && owner.machine !== machine) continue;
@@ -180,9 +300,14 @@ export class RecoveryLedger {
       }
       const legacyLimit = old?.state === "escalated" && ["Explicit operator hold", "Fleet recovery assessment daily limit reached",
         "Automatic repair budget exhausted: two fleet repairs and one per ticket per day"].includes(String(old.reason));
+      // A settled wait or operational escalation is assessed again only when
+      // something it depends on changed, at a code deadline, or after the long
+      // safety interval. A changed ticket fingerprint is handled below.
+      const oldDecision = old?.decision ? JSON.parse(String(old.decision)) as RecoveryDecision : null;
+      const settledIncident = !!old && settles(String(old.state), oldDecision);
+      const reopened = settledIncident && old!.fingerprint === fingerprint ? this.reopenCause(old!, oldDecision!) : null;
       const waited = !o.blocked && trigger && !IDLE_RECOVERY_REASONS.includes(trigger.reason)
-        && old?.state === "complete" && old.decision && JSON.parse(String(old.decision)).action === "wait"
-        && this.now() >= (JSON.parse(String(old.decision)).recheckAt ?? Number(old.updated)+RECOVERY_RECHECK_MS);
+        && old?.state === "complete" && oldDecision?.action === "wait" && !!reopened;
       const workflow = recoveryFingerprint({ ...o, evidenceRevision: undefined, artifactRevision: undefined, pause: undefined });
       const assessedWorkflow = this.db.prepare("SELECT fingerprint FROM fleet_recovery_workflow WHERE ticket=?").get(o.ticket);
       const taskFinished = old?.state === 'waiting' && !this.db.prepare("SELECT 1 FROM fleet_recovery_tasks WHERE ticket=? AND state IN ('queued','running','publishing','attention')").get(o.ticket);
@@ -196,8 +321,7 @@ export class RecoveryLedger {
       }
       if (old?.state === 'waiting' && this.db.prepare("SELECT 1 FROM fleet_recovery_tasks WHERE ticket=? AND state IN ('queued','running','publishing','attention')").get(o.ticket)) continue;
       const coordinated = old?.state === 'waiting' && !this.db.prepare("SELECT 1 FROM fleet_recovery_tasks WHERE ticket=? AND state IN ('queued','running','publishing','attention')").get(o.ticket);
-      const operational = old?.state === 'escalated' && old.decision && JSON.parse(String(old.decision)).category === 'operational'
-        && this.now() >= (JSON.parse(String(old.decision)).recheckAt ?? Number(old.updated)+RECOVERY_RECHECK_MS);
+      const operational = old?.state === 'escalated' && oldDecision?.category === 'operational' && !!reopened;
       const previousDecision = old?.decision ? JSON.parse(String(old.decision)) as RecoveryDecision : null;
       // Wait for the reporting worker to load the policy. Revisit only legacy
       // assessments, never a possibly applied repair or a classified human hold.
@@ -208,6 +332,7 @@ export class RecoveryLedger {
         && trigger && (!trigger.manual || pauseInspection) && !wip;
       if (old && (!trigger || old.fingerprint !== fingerprint || recheck)) this.db.prepare("UPDATE fleet_recovery SET present=0, updated=CASE WHEN state='queued' THEN ? ELSE updated END, state=CASE WHEN state='queued' THEN 'resolved' ELSE state END WHERE id=?").run(this.now(), old.id);
       if (!trigger || old?.fingerprint === fingerprint && !recheck || (wip && !trigger.manual)) continue;
+      if (old && settledIncident) this.markReopened(String(old.id), old.fingerprint !== fingerprint ? "ticket changed" : reopened ?? "reassessed");
       const id = randomUUID();
       this.db.prepare("INSERT INTO fleet_recovery_workflow VALUES (?,?) ON CONFLICT(ticket) DO UPDATE SET fingerprint=excluded.fingerprint").run(o.ticket, workflow);
       const manual = trigger.manual && !pauseInspection;
@@ -254,8 +379,13 @@ export class RecoveryLedger {
         decision={action:'escalate',category:'operational',reason:'Automatic repair budget exhausted: three repairs per ticket per rolling day',recheckAt:Number(first.at)+86400001};
       }
     }
-    this.db.prepare("UPDATE fleet_recovery SET state=?, decision=?, updated=? WHERE id=?").run(
-      ["retry", "rework", "resume", "refine", "unblock"].includes(decision.action) ? "applying" : decision.action === "coordinate" ? "waiting" : decision.action === "wait" ? "complete" : "escalated", JSON.stringify(decision), this.now(), id);
+    if (decision.cooldown) {
+      const { cooldown: _, ...rest } = decision;
+      decision = { ...rest, recheckAt: this.now() + RECOVERY_RECHECK_MS };
+    }
+    const state = ["retry", "rework", "resume", "refine", "unblock"].includes(decision.action) ? "applying" : decision.action === "coordinate" ? "waiting" : decision.action === "wait" ? "complete" : "escalated";
+    this.db.prepare("UPDATE fleet_recovery SET state=?, decision=?, updated=? WHERE id=?").run(state, JSON.stringify(decision), this.now(), id);
+    if (settles(state, decision)) this.settle(id, incident.ticket, incident.fingerprint, decision);
     return decision;
   }
   complete(id: string, runId: string): void {

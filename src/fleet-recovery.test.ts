@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { RecoveryLedger, recoveryFingerprint, recoveryTrigger, RECOVERY_RECHECK_MS, RECOVERY_STALLED_RUN_MS, type RecoveryObservation, type RecoveryIncident } from "./fleet-recovery.js";
+import { RecoveryLedger, recoveryFingerprint, recoveryTrigger, RECOVERY_RECHECK_MS, RECOVERY_SAFETY_RECHECK_MS, RECOVERY_STALLED_RUN_MS, type RecoveryObservation, type RecoveryIncident } from "./fleet-recovery.js";
 import { FleetStore, type StartRequest } from "./fleet-store.js";
 import { FleetClient, JsonClient, serveFleet } from "./fleet-http.js";
 import { MachineManager, serveManager } from "./machine-manager.js";
@@ -464,7 +464,7 @@ test("sizing review remains informational while real operator holds stay manual"
   assert.deepEqual(removed, [], "informational sizing must not remove repair priority");
 });
 
-test("waits recheck after a persisted cooldown and never duplicate an active worker", () => {
+test("unchanged waits recheck only after the persisted safety interval and never duplicate an active worker", () => {
   const db = new DatabaseSync(":memory:"); let now = 100000000;
   let ledger = new RecoveryLedger(db, () => now);
   const empty = { claims: [], runs: [] };
@@ -472,7 +472,9 @@ test("waits recheck after a persisted cooldown and never duplicate an active wor
   ledger.begin(first.id, "first");
   ledger.decide(first.id, "first", { action: "wait", reason: "Temporary service outage is resolving" });
   ledger = new RecoveryLedger(db, () => now);
-  now += RECOVERY_RECHECK_MS - 1;
+  now += RECOVERY_RECHECK_MS;
+  assert.equal(ledger.report("mac", project, [observation()], empty).length, 0, "the old thirty-minute timer no longer reopens an unchanged wait");
+  now += RECOVERY_SAFETY_RECHECK_MS - RECOVERY_RECHECK_MS - 1;
   assert.equal(ledger.report("mac", project, [observation()], empty).length, 0);
   now++;
   assert.equal(ledger.report("mac", project, [observation()], { claims: [], runs: [{ ...request(), generation: "generation", created: now }] }).length, 0);

@@ -4,7 +4,7 @@ import { WorkflowStore, type WorkflowChange } from "./workflow-store.js";
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { RecoveryFacts, type PauseRecord, type EvidenceRecord, type CoordinationRecord } from "./recovery-facts.js";
-import { RecoveryLedger, validateObservations, IDLE_RECOVERY_REASONS, RECOVERY_UNKNOWN_PAUSE_REASON, type RecoveryObservation, type RecoveryDecision, type RecoveryIncident } from "./fleet-recovery.js";
+import { RecoveryLedger, validateObservations, IDLE_RECOVERY_REASONS, RECOVERY_UNKNOWN_PAUSE_REASON, type RecoveryObservation, type RecoveryDecision, type RecoveryIncident, type RecoveryLedgerOptions } from "./fleet-recovery.js";
 import { OperationReports } from './operation-reports.js';
 import {RecoveryTasks, assessmentTasks, type RecoveryTaskRequest, type RecoveryTaskResult} from './recovery-tasks.js';
 import {createHash} from 'node:crypto';
@@ -71,7 +71,7 @@ export class FleetStore {
   readonly facts: RecoveryFacts;
   readonly operations: OperationReports;
   readonly tasks: RecoveryTasks;
-  constructor(path: string, private readonly limits: Readonly<Record<string, MachineLimits>>) {
+  constructor(path: string, private readonly limits: Readonly<Record<string, MachineLimits>>, options: RecoveryLedgerOptions = {}) {
     for (const value of Object.values(limits)) validateLimits(value);
     this.db = new DatabaseSync(path);
     this.db.exec(`
@@ -98,7 +98,7 @@ export class FleetStore {
       ) STRICT;
     `);
     this.workflow = new WorkflowStore(this.db);
-    this.recovery = new RecoveryLedger(this.db);
+    this.recovery = new RecoveryLedger(this.db, Date.now, options);
     this.facts = new RecoveryFacts(this.db);
     this.tasks = new RecoveryTasks(this.db);
     this.db.exec("CREATE TABLE IF NOT EXISTS fleet_assessment_releases (ticket TEXT NOT NULL, machine TEXT NOT NULL, generation TEXT NOT NULL, created INTEGER NOT NULL, PRIMARY KEY(ticket,generation)) STRICT");

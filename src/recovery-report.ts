@@ -8,7 +8,7 @@ export function recoveryReport(incidents: RecoveryIncident[], machine: { project
     id: i.id, ticket: i.ticket, url: `https://github.com/${i.ticket.replace("#", "/issues/")}`,
     kind: i.decision?.action === "propose-close" ? "closure-proposal" : i.decision?.category==='operational' ? 'automatic-wait' : "decision-needed",
     reason: scrubCredentials(i.decision?.reason ?? i.reason), updated: i.updated,
-    nextAction: i.decision?.category==='operational' ? 'The existing recovery cycle will recheck this condition automatically.' : i.decision?.action === "propose-close" ? "Approve or retain this investigation. No repair is being claimed."
+    nextAction: i.decision?.category==='operational' ? 'Rechecked automatically when a capability, named dependency or the ticket changes, or after the safety interval.' : i.decision?.action === "propose-close" ? "Approve or retain this investigation. No repair is being claimed."
       : i.reason.startsWith("Pause origin unknown") ? "Confirm why this ticket is paused and what allows it to resume."
       : "Resolve the specific missing permission, evidence or policy described above.",
   }));
