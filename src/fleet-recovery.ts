@@ -70,7 +70,7 @@ export function hasOperatorHold(labels: readonly string[]): boolean {
 /** Inspection can establish pause provenance, but cannot authorise reopening. */
 export function canInspectUnknownPause(o: RecoveryObservation): boolean {
   return o.status === "Halted" && !o.pause && !hasOperatorHold(o.labels)
-    && !o.labels.some(l => /permission_denied/.test(l) || l.startsWith("wip:"));
+    && !o.labels.some(l => /permission_denied/.test(l)) && !hasRunningWip(o.labels);
 }
 
 export function validateObservations(project: string, observations: RecoveryObservation[]): void {

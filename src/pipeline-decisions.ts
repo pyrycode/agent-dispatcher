@@ -387,8 +387,11 @@ export function decideReworkRoutes(
       // routing runs while agents are still working (dispatch-pool.ts), so
       // a ticket carrying wip:<agent> waits for the next pass: the rework
       // label is still there then, and a dead run's stale wip is cleared
-      // by the stranded-wip sweep after its age gate.
-      if (item.labels.some((l) => l.startsWith("wip:"))) continue;
+      // by the stranded-wip sweep after its age gate. The repair marker
+      // (wip:repair) is no agent: a leftover one must not stop a rework
+      // label from routing, and this route strips it with the other wip:
+      // labels, so a failed marker removal cannot deadlock the ticket.
+      if (hasRunningWip(item.labels)) continue;
 
       // First valid rework label wins. Iterate in array order for
       // determinism — same order GitHub returns from the labels query.

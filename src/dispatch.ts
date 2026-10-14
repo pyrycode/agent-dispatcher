@@ -10,7 +10,7 @@ import { config } from "dotenv";
 import { githubPauseMs, freshGitHubRead } from "./github-transport.js";
 import { decidePollFailure, newPollOutage, pollRecovered, transientPollFailure } from "./poll-failure.js";
 import { runRecoveryWork, recoveryHandoff, parseRecoveryDecision, RECOVERY_INSTRUCTIONS, RECOVERY_EFFORT, RECOVERY_MAX_TURNS, RECOVERY_TIMEOUT_MS, cleanRecoveryLabels, repairStartComment } from "./recovery-work.js";
-import { RECOVERY_REPAIRING_LABELS } from "./recovery-labels.js";
+import { RECOVERY_REPAIRING_LABELS, hasRunningWip } from "./recovery-labels.js";
 import { verifyCoordination } from "./recovery-coordination.js";
 import { recoveryInventory, relatedTickets, relatedEvidence } from "./recovery-evidence.js";
 import { recoveryLogContext } from "./recovery-context.js";
@@ -10178,7 +10178,7 @@ export async function pollLoop(): Promise<void> {
       if (Date.now() - recoveryCheckedAt >= 300_000) {
         // Reuses the board snapshot. No extra board poll and no model on a quiet cycle.
         const recoveryItems = await client.getOpenProjectItems();
-        const evidenceIssues = new Set(recoveryItems.filter(i => !i.labels.some(l => l.startsWith("wip:"))).map(i => i.issueNumber));
+        const evidenceIssues = new Set(recoveryItems.filter(i => !hasRunningWip(i.labels)).map(i => i.issueNumber));
         for (const i of recoveryItems) for (const ref of relatedTickets(managed.project, [i.body], [], [managed.project]))
           evidenceIssues.add(Number(ref.split("#")[1]));
         await managed.recordEvidence(recoveryInventory(LOGS_DIR, managed.project, "local", [...evidenceIssues]));

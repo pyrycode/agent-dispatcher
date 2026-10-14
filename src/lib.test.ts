@@ -1546,12 +1546,18 @@ describe("decideReworkRoutes", () => {
     assert.equal(r.length, 0);
   });
 
-  test("a ticket carrying wip:repair is busy: rework routing waits, but it is not a running agent (2026-10-14)", () => {
-    const r = decideReworkRoutes(
+  test("a leftover wip:repair never blocks rework routing, and the route strips it; a running agent label still does (2026-10-14)", () => {
+    const routed = decideReworkRoutes(
       AGENT_COLUMN_MAP,
       items(["In Architecture", [{ id: "i1", issueNumber: 27, labels: ["needs-rework:po", "wip:repair"] }]]),
     );
-    assert.equal(r.length, 0, "busy for routing");
+    assert.equal(routed.length, 1, "a marker whose removal failed cannot deadlock the ticket");
+    assert.ok(routed[0].labelsToStrip.includes("wip:repair"));
+    const busy = decideReworkRoutes(
+      AGENT_COLUMN_MAP,
+      items(["In Architecture", [{ id: "i1", issueNumber: 27, labels: ["needs-rework:po", "wip:repair", "wip:architect"] }]]),
+    );
+    assert.equal(busy.length, 0, "a live agent still owns the ticket");
     assert.equal(hasRunningWip(["wip:repair"]), false);
     assert.equal(hasRunningWip(["wip:repair", "wip:builder"]), true);
     assert.equal(isRetryWaiting(["error-retry-count:1", "wip:repair"]), true, "a repair marker does not hold a retry seat");

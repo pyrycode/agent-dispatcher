@@ -220,6 +220,10 @@ back with the old one. When the central service starts, it replaces
 workflow command by `migration:wip-repair` each. A converged store changes
 nothing, so restarts are safe. The migration is not a new assignment: the
 settling rule still dates the repair from the handback that wrote the old name.
+Roll the central service out before any dispatcher: an old central refuses a stage run
+on a ticket that carries any `wip:` label, `wip:repair` included, and would never settle
+it. Rework routing waits only for a running agent label, so a leftover marker cannot
+block a `needs-rework:` route, and the route strips it.
 Once the boards show no `orchestrator:repairing`, delete the GitHub label in each
 repository, for example
 `gh label delete orchestrator:repairing -R pyrycode/pyrycode --yes`.

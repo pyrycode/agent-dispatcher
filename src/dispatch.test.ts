@@ -4827,6 +4827,31 @@ describe("runStrandedWipSweep", () => {
     assert.equal(client.clearItemsCacheCalls, 0);
   });
 
+  test("a ticket carrying only wip:repair is a repair waiting for its run: no clock, no comment, no strip (2026-10-14)", async () => {
+    const client = new MockGitHubClient({
+      items: [{ issueNumber: 3290, status: "In Development", labels: ["orchestrator:recovery-priority", "wip:repair"] }],
+    });
+    client.strandedWipMarkersByIssue.set(3290, { observedAt: hoursAgo(5), sweptAt: null });
+    await runStrandedWipSweep(client, silentDiscord, MIN_AGE);
+    assert.deepEqual(client.getStrandedWipMarkersCalls, []);
+    assert.deepEqual(client.removeLabelCalls, []);
+    assert.equal(client.comments.length, 0);
+  });
+
+  test("a crashed repair run strips its stranded agent label and wip:repair together; a live one keeps both (2026-10-14)", async () => {
+    const mk = () => new MockGitHubClient({
+      items: [{ issueNumber: 3290, status: "In Development", labels: ["orchestrator:recovery-priority", "wip:repair", "wip:builder"] }],
+    });
+    const live = mk();
+    live.strandedWipMarkersByIssue.set(3290, { observedAt: hoursAgo(5), sweptAt: null });
+    await runStrandedWipSweep(live, silentDiscord, MIN_AGE, Date.now(), new Set(["builder#3290"]));
+    assert.deepEqual(live.removeLabelCalls, [], "the run is in flight");
+    const crashed = mk();
+    crashed.strandedWipMarkersByIssue.set(3290, { observedAt: hoursAgo(5), sweptAt: null });
+    await runStrandedWipSweep(crashed, silentDiscord, MIN_AGE);
+    assert.deepEqual(crashed.removeLabelCalls.map(c => c.label).sort(), ["wip:builder", "wip:repair"]);
+  });
+
   test("observation still inside the gate → holds, no second marker", async () => {
     const client = new MockGitHubClient({
       items: [{ issueNumber: 2191, status: "In Review", labels: ["wip:verifier"] }],
@@ -6357,6 +6382,11 @@ describe("countActiveWork", () => {
 
   test("counts a running ticket (wip:<agent>)", () => {
     const m = cols([makeProjectItem({ issueNumber: 1, labels: ["wip:developer"] })]);
+    assert.equal(countActiveWork(m), 1);
+  });
+
+  test("counts a repair waiting for its run (wip:repair) as active work", () => {
+    const m = cols([makeProjectItem({ issueNumber: 1, labels: ["orchestrator:recovery-priority", "wip:repair"] })]);
     assert.equal(countActiveWork(m), 1);
   });
 
