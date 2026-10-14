@@ -107,15 +107,28 @@ test('a receipt list too long to keep is treated as unknown rather than truncate
  cancelReservation();
  const many=Array.from({length:LOCAL_TASK_LIMIT+1},(_,i)=>i.toString(16).padStart(64,'0'));
  store.operations.record('mac',{operations:[],localTasks:many});
- assert.equal(store.operations.list().find(r=>r.machine==='mac')!.localTasks,undefined);
+ assert.equal(store.operations.list(true).find(r=>r.machine==='mac')!.localTasks,undefined);
  advance(5*60*MIN);store.operations.record('mac',{operations:[],localTasks:many});
+ assert.deepEqual(store.orphans.list(),[]);
+});
+
+test('the operator report leaves the receipt lists out',()=>{
+ const {store}=setup();
+ store.operations.record('mac',{operations:[],localTasks:['a'.repeat(64)]});
+ assert.equal('localTasks' in store.operations.list().find(r=>r.machine==='mac')!,false);
+});
+
+test('a clock that steps backward cannot make an old report look fresh',()=>{
+ const {store,advance,report,cancelReservation}=setup();
+ cancelReservation();report([]);advance(-3*60*MIN);
+ store.orphans.observe();advance(3*60*MIN+61*MIN);
  assert.deepEqual(store.orphans.list(),[]);
 });
 
 test('malformed receipt ids are dropped from the report',()=>{
  const {store}=setup();
  store.operations.record('mac',{operations:[],localTasks:['x',5,null,'a'.repeat(64),'a'.repeat(64)]});
- assert.deepEqual(store.operations.list().find(r=>r.machine==='mac')!.localTasks,['a'.repeat(64)]);
+ assert.deepEqual(store.operations.list(true).find(r=>r.machine==='mac')!.localTasks,['a'.repeat(64)]);
 });
 
 test('the limit is configurable and queued or finished tasks are never reported',()=>{

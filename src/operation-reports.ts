@@ -65,5 +65,11 @@ export class OperationReports {
     const report = {operations,...(localTasks ? {localTasks} : {}),...(housekeeping.length ? {housekeeping} : {}),...(watchdog.length ? {watchdog} : {}),...(value.service === 'attention' ? {service:'attention',reason:scrubCredentials(String(value.reason ?? 'Control service unavailable').slice(0,1000))} : {})};
     this.db.prepare('INSERT INTO fleet_operation_reports VALUES (?,?,?) ON CONFLICT(machine) DO UPDATE SET received=excluded.received,report=excluded.report').run(machine,this.now(),JSON.stringify(report));
   }
-  list() { return this.db.prepare('SELECT * FROM fleet_operation_reports ORDER BY machine').all().map(r => ({machine:String(r.machine),received:Number(r.received),...JSON.parse(String(r.report))})); }
+  /** The receipt lists are for the orphaned task watch only, so the operator report leaves them out. */
+  list(receipts = false) {
+    return this.db.prepare('SELECT * FROM fleet_operation_reports ORDER BY machine').all().map(r => {
+      const { localTasks, ...rest } = JSON.parse(String(r.report));
+      return { machine: String(r.machine), received: Number(r.received), ...rest, ...(receipts && localTasks ? { localTasks } : {}) };
+    });
+  }
 }

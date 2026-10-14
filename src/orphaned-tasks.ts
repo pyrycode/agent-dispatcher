@@ -43,8 +43,8 @@ export class OrphanedTaskWatch {
   /** Record which tasks are unheld right now. Cheap enough to call on every report. */
   observe(): void {
     const now = this.now();
-    const reports = this.reports.list();
-    const fresh = new Map(reports.filter(r => now - r.received <= REPORT_FRESH_MS && Array.isArray(r.localTasks)).map(r => [r.machine, new Set<string>(r.localTasks)]));
+    const reports = this.reports.list(true) as Array<{ machine: string; received: number; localTasks?: string[] }>;
+    const fresh = new Map(reports.filter(r => now >= r.received && now - r.received <= REPORT_FRESH_MS && Array.isArray(r.localTasks)).map(r => [r.machine, new Set<string>(r.localTasks!)]));
     const unheld: string[] = [];
     for (const row of this.db.prepare("SELECT id FROM fleet_recovery_tasks WHERE state IN ('running','attention')").all()) {
       const id = String(row.id), task = this.tasks.get(id);

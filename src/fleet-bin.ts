@@ -178,10 +178,12 @@ async function main(): Promise<void> {
   }
   if (command === "attention") {
     const claims = new JsonClient(config.claimsUrl, secret(config.claimsOperatorTokenEnv ?? config.claimsTokenEnv));
-    // A claims service that predates the route answers an error. That must not hide the rest of the report.
+    // A claims service that predates the route, or a failed read, must not hide the rest of the report,
+    // and must not read as "no orphaned tasks": the list is null with the reason beside it.
+    let orphanedError: string | undefined;
     const [incidents, state, operations, orphaned] = await Promise.all([claims.call<import("./fleet-recovery.js").RecoveryIncident[]>("/recovery/state"), client.call<any>("/state"),claims.call<any[]>('/operations/reports'),
-      claims.call<any[]>('/tasks/orphaned').catch(() => [])]);
-    console.log(JSON.stringify({...recoveryReport(incidents, state),operationReports:operations,orphanedTasks:orphaned}, null, 2)); return;
+      claims.call<any[]>('/tasks/orphaned').catch((error: Error) => { orphanedError = String(error.message).slice(0, 200); return null; })]);
+    console.log(JSON.stringify({...recoveryReport(incidents, state),operationReports:operations,orphanedTasks:orphaned,...(orphanedError ? {orphanedTasksError:orphanedError} : {})}, null, 2)); return;
   }
   if (command === "drain") { await client.call("/drain", {}); console.log("Draining: no new grants. Existing grants remain reserved."); }
   else if (command === "drain-project" || command === "resume-project") {
