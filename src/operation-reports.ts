@@ -26,6 +26,17 @@ function watchdogItems(value: unknown) {
 }
 
 /**
+ * Native task ids this computer still holds a receipt for. Absent when the supervisor
+ * did not say, which is different from an empty list. Bad entries are dropped. A list
+ * too long to keep whole is not kept at all: a truncated list would read as absence.
+ */
+export const LOCAL_TASK_LIMIT = 2000;
+function localTaskIds(value: unknown) {
+  if (!Array.isArray(value) || value.length > LOCAL_TASK_LIMIT) return undefined;
+  return [...new Set(value.filter((id: unknown): id is string => typeof id === 'string' && /^[a-f0-9]{64}$/.test(id)))];
+}
+
+/**
  * The supervisor's recent automatic clears and retirements. Malformed entries are
  * dropped rather than rejected, so this audit trail can never cost the operation report.
  */
@@ -50,7 +61,8 @@ export class OperationReports {
     });
     const housekeeping = automaticChanges(value.housekeeping);
     const watchdog = watchdogItems(value.watchdog);
-    const report = {operations,...(housekeeping.length ? {housekeeping} : {}),...(watchdog.length ? {watchdog} : {}),...(value.service === 'attention' ? {service:'attention',reason:scrubCredentials(String(value.reason ?? 'Control service unavailable').slice(0,1000))} : {})};
+    const localTasks = localTaskIds(value.localTasks);
+    const report = {operations,...(localTasks ? {localTasks} : {}),...(housekeeping.length ? {housekeeping} : {}),...(watchdog.length ? {watchdog} : {}),...(value.service === 'attention' ? {service:'attention',reason:scrubCredentials(String(value.reason ?? 'Control service unavailable').slice(0,1000))} : {})};
     this.db.prepare('INSERT INTO fleet_operation_reports VALUES (?,?,?) ON CONFLICT(machine) DO UPDATE SET received=excluded.received,report=excluded.report').run(machine,this.now(),JSON.stringify(report));
   }
   list() { return this.db.prepare('SELECT * FROM fleet_operation_reports ORDER BY machine').all().map(r => ({machine:String(r.machine),received:Number(r.received),...JSON.parse(String(r.report))})); }

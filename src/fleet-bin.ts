@@ -91,7 +91,11 @@ async function main(): Promise<void> {
     // Unchanged settled waits are reassessed after this interval. Default 24 hours.
     const safetyHours = config.recovery?.safetyRecheckHours;
     if (safetyHours !== undefined && (typeof safetyHours !== "number" || !Number.isFinite(safetyHours))) throw new Error("recovery.safetyRecheckHours must be a number");
-    const store = new FleetStore(database, limits, safetyHours === undefined ? {} : { safetyRecheckMs: Math.round(safetyHours * 3600_000) });
+    // A running or attention task nothing holds is reported after this many minutes. Default 60.
+    const orphanMinutes = config.recovery?.orphanedTaskMinutes;
+    if (orphanMinutes !== undefined && (typeof orphanMinutes !== "number" || !Number.isFinite(orphanMinutes) || orphanMinutes < 1)) throw new Error("recovery.orphanedTaskMinutes must be a number of at least 1");
+    const store = new FleetStore(database, limits, { ...(safetyHours === undefined ? {} : { safetyRecheckMs: Math.round(safetyHours * 3600_000) }),
+      ...(orphanMinutes === undefined ? {} : { orphanedTaskMs: Math.round(orphanMinutes * 60_000) }) });
     const github = config.github ? new GitHubBroker({ ...config.github,
       projects: [...new Set([...config.github.projects, ...Object.values(config.updates?.consumers ?? {}), ...(config.updates?.dispatcherRepository ? [config.updates.dispatcherRepository] : [])])], token: secret(config.github.tokenEnv) }) : undefined;
     const updates = config.updates && github ? new FleetUpdates(github, config.updates.consumers, config.updates.dispatcherRepository) : undefined;
@@ -174,8 +178,10 @@ async function main(): Promise<void> {
   }
   if (command === "attention") {
     const claims = new JsonClient(config.claimsUrl, secret(config.claimsOperatorTokenEnv ?? config.claimsTokenEnv));
-    const [incidents, state, operations] = await Promise.all([claims.call<import("./fleet-recovery.js").RecoveryIncident[]>("/recovery/state"), client.call<any>("/state"),claims.call<any[]>('/operations/reports')]);
-    console.log(JSON.stringify({...recoveryReport(incidents, state),operationReports:operations}, null, 2)); return;
+    // A claims service that predates the route answers an error. That must not hide the rest of the report.
+    const [incidents, state, operations, orphaned] = await Promise.all([claims.call<import("./fleet-recovery.js").RecoveryIncident[]>("/recovery/state"), client.call<any>("/state"),claims.call<any[]>('/operations/reports'),
+      claims.call<any[]>('/tasks/orphaned').catch(() => [])]);
+    console.log(JSON.stringify({...recoveryReport(incidents, state),operationReports:operations,orphanedTasks:orphaned}, null, 2)); return;
   }
   if (command === "drain") { await client.call("/drain", {}); console.log("Draining: no new grants. Existing grants remain reserved."); }
   else if (command === "drain-project" || command === "resume-project") {

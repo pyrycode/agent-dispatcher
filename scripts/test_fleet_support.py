@@ -124,6 +124,17 @@ class SupportTests(unittest.TestCase):
    self.assertNotIn(bad_id,[task for op,task in calls if op.startswith('artifacts')])
    # The pass reached scheduling on both ticks.
    self.assertEqual([op for op,_ in calls].count('schedule'),2)
+ def test_local_task_ids_lists_receipts_and_deferred_markers_only(self):
+  with tempfile.TemporaryDirectory() as d:
+   s,_,_=self.support_with(d,[('a'*64,'running'),('b'*64,'complete')])
+   m.atomic(s.directory/(('c'*64)+'.deferred.json'),{'id':'c'*64})
+   (s.directory/'scheduler-session.json').write_text('{}')
+   (s.directory/'notatask.receipt.json').write_text('{}')
+   (s.directory/(('d'*64)+'.new')).write_text('{}')
+   self.assertEqual(s.local_task_ids(),['a'*64,'b'*64,'c'*64])
+   for path in s.directory.iterdir():path.unlink()
+   s.directory.rmdir()
+   self.assertEqual(s.local_task_ids(),[])
  def support_with(self,d,receipts,draining=False):
   class Adapter:
    def status(self):return {'machine':'build-hp-1','draining':draining}

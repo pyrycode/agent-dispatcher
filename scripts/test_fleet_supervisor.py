@@ -599,4 +599,39 @@ class SupervisorReportTests(unittest.TestCase):
             self.assertIn('Native task pass failed. FileNotFoundError',published['reason'])
             self.assertEqual(published['housekeeping'],[{k:v for k,v in json.loads((state/'housekeeping.jsonl').read_text()).items() if k!='archive'}])
 
+    def run_once(self,support_source):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder)
+            (root/'fleet-supervisor.py').write_bytes(Path(__file__).with_name('fleet-supervisor.py').read_bytes())
+            (root/'fleet-native.py').write_text('''class NativeAdapter:
+    def __init__(self, config): pass
+    def desired(self): return {}
+    def attention(self): return {}
+    def publish_attention(self): pass
+''')
+            (root/'fleet-support.py').write_text(support_source)
+            state=root/'state';state.mkdir()
+            report=root/'report.json';config=root/'config.json'
+            config.write_text(json.dumps({'stateDirectory':str(state),'reportFile':str(report),'projects':{},'recoveryTasks':{'probe':{}}}))
+            config.chmod(0o600)
+            result=subprocess.run([sys.executable,str(root/'fleet-supervisor.py'),str(config),'--once'],capture_output=True,text=True,timeout=5)
+            self.assertEqual(result.returncode,0,result.stderr)
+            return json.loads(report.read_text())
+    def test_report_lists_the_native_tasks_this_computer_holds(self):
+        published=self.run_once('''class SupportSupervisor:
+    def __init__(self, adapter, config): pass
+    def tick(self): return []
+    def local_task_ids(self): return ['a'*64]
+''')
+        self.assertEqual(published['localTasks'],['a'*64])
+        self.assertNotIn('service',published)
+    def test_unreadable_task_folder_or_failing_listing_reports_nothing_about_receipts(self):
+        for body in ('return None','raise OSError("denied")'):
+            published=self.run_once('''class SupportSupervisor:
+    def __init__(self, adapter, config): pass
+    def tick(self): return []
+    def local_task_ids(self): '''+body+'\n')
+            self.assertNotIn('localTasks',published)
+            self.assertNotIn('service',published)
+
 if __name__=='__main__':unittest.main()

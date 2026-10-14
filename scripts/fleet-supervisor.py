@@ -556,6 +556,16 @@ def main():
                 if watch is not None:
                     attention['watchdog'] = [{k: redact_paths(v) if isinstance(v, str) else v for k, v in item.items()} for item in watch]
                 attention['operations'] = results
+                if support and hasattr(support, 'local_task_ids'):
+                    # What this computer still holds, so the control service can tell a
+                    # task nobody holds from one whose machine is only quiet. It must
+                    # never cost the rest of the report.
+                    try:
+                        local = support.local_task_ids()
+                    except Exception:
+                        local = None
+                    if local is not None:
+                        attention['localTasks'] = local
                 attention['housekeeping'] = housekeeping.recent()
                 if support_failure:
                     attention['service'] = 'attention'
