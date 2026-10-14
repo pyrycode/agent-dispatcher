@@ -43,7 +43,10 @@ function hasMarker(issue: { body: string }, name: string): boolean {
 }
 /** The ticket names this exact test, not just a method of the same name. */
 function namesExactly(issue: { title?: string; body: string }, name: string): boolean {
-  return hasMarker(issue, name) || issue.body.includes(`\`${name}\``) || (issue.title ?? "").includes(name);
+  if (hasMarker(issue, name) || issue.body.includes(`\`${name}\``)) return true;
+  // The whole name, not the start of a longer one: `C#bar` is not `C#barBaz`.
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?<![\\w$#./])${escaped}(?![\\w$#./])`).test(issue.title ?? "");
 }
 function matchesTrackingTicket(issue: { title?: string; body: string }, name: string): boolean {
   if (issue.body.includes(`\`${name}\``)) return true;
@@ -157,9 +160,11 @@ export async function recordInheritedTests(
   }
   if (options.advance) {
     const placedNames = new Map(placed.flatMap(g => g.names.map(name => [name, g.issue.number] as const)));
+    const selfNamed = ctx.gatedBody === undefined ? [] : names.filter(n => namesExactly({ body: ctx.gatedBody! }, n));
     const gap = (result.owned!.length > 0 && `this ticket owns the fix for ${result.owned!.join(", ")}`)
+      || (selfNamed.length > 0 && `this ticket names ${selfNamed.join(", ")} itself, so it may be the fix`)
       || names.filter(n => !result.owned!.includes(n) && !placedNames.has(n)).map(n => `${n} has no confirmed tracking ticket`)[0]
-      || [...looselyTracked].map(n => `${n} is tracked on #${placedNames.get(n)} only by its method name; add ${inheritedMarker(n)} to that ticket's body`)[0];
+      || [...looselyTracked].map(n => `${n} is tracked on #${placedNames.get(n)} only by its method name; if it is the same test, add ${inheritedMarker(n)} to that ticket's body`)[0];
     if (!gap) {
       return { blockers: [], untracked: [], owned: [], tracked: names.map(name => ({ name, issue: placedNames.get(name)! })) };
     }

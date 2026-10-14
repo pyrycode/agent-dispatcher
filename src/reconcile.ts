@@ -956,6 +956,7 @@ export async function runRealClaudeGateExecution(
         try {
           inheritedTickets = await recordInherited(preExisting, {
             gatedIssue: candidate.issueNumber, report, at: new Date().toISOString(),
+            gatedBody: parked.find(i => i.issueNumber === candidate.issueNumber)?.body,
           }, advance?.eligible ? { advance: true } : undefined);
         } catch (error) {
           console.warn(`   ⚠️ Shared live failure filing failed: ${error}`);

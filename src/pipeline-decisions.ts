@@ -792,6 +792,8 @@ export interface GateTallyLike {
   timedOutBudget?: string;
   /** How long each killed test had been running when the deadline fired. */
   timedOutRunningFor?: Readonly<Record<string, string>>;
+  /** Go: a non-deadline panic or a data race was printed (gate-output.ts). */
+  abnormalExit?: boolean;
 }
 
 export interface GateVerdictDecision {
@@ -1095,7 +1097,11 @@ export type InheritedAdvanceDecision =
  *   on the base, by exact name;
  * - no suite-level failure the named failures do not explain: a Go package
  *   counts as explained only when one of its own tests failed, and any
- *   suite-level failure in other formats parks;
+ *   suite-level failure in other formats parks; a Go panic or data race
+ *   parks, since tests after a panic never ran on either tree;
+ * - matching is by name only: a branch that breaks an already-red test in
+ *   a new way advances too. The tracker owns that test, and its own gate
+ *   run will meet the new break;
  * - no required live test, from the fork, the pull request or an evidence
  *   rule, matches any failing name, flaky or inherited. Required tests that
  *   are skipped, missing or lack evidence never reach here: the raw verdict
@@ -1119,6 +1125,10 @@ export function decideInheritedAdvance(opts: {
   if (opts.raw.missingLiveAcceptance) return no(opts.raw.missingLiveAcceptance);
   if (tally === null || (tally.failedNames?.length ?? 0) === 0) return no("no named failing test to account for");
   if ((tally.timedOutTests?.length ?? 0) > 0) return no("a test was killed by the test binary's own deadline");
+  // A panic stops the package's binary, so every later test in it never ran
+  // on either tree, and a regression there would be invisible. A data race
+  // is reported against the package, not the test that caused it.
+  if (tally.abnormalExit) return no("the run printed a panic or a data race, which can hide failures in tests that never ran");
   if (adjusted.introduced.length > 0) return no("a failure passes on the base commit");
   if (opts.rerunFailures === null) return no("no same-tree re-run was made, so a flake cannot be told from an inherited failure");
   if (opts.baselineFailures === null) return no("no base comparison was made");
@@ -1145,7 +1155,10 @@ export function decideInheritedAdvance(opts: {
     if (opts.format !== "go-json" || packages.length === 0) {
       return no("the run has a suite-level failure the named failures do not explain");
     }
-    const unexplained = packages.filter(pkg => !failed.some(name => name.startsWith(`${pkg}.`)));
+    // Exactly this package: `example.com/foo` is not explained by a test in
+    // `example.com/foo.v2`.
+    const unexplained = packages.filter(pkg => !failed.some(name =>
+      name.startsWith(`${pkg}.`) && /^(Test|Benchmark|Example|Fuzz)/.test(name.slice(pkg.length + 1))));
     if (unexplained.length > 0) return no(`package ${unexplained.join(", ")} failed with no failing test of its own`);
   }
   const skippedNames = tally.skippedTests?.map(t => t.name) ?? [];

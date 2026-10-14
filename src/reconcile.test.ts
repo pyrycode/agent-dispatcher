@@ -2671,7 +2671,7 @@ describe("runRealClaudeGateExecution: advancing past tracked inherited failures"
       assert.equal(item.status, "Inbox");
       assert.equal(tracker.created.length, 0);
       assert.deepEqual(tracker.blockers, [{ parent: 1397, blocker: 1480 }]);
-      assert.match(client.addCommentCalls[0].body, /only by its method name; add <!-- inherited-live-test: pkg.TestThing -->/);
+      assert.match(client.addCommentCalls[0].body, /only by its method name; if it is the same test, add <!-- inherited-live-test: pkg.TestThing -->/);
     });
   });
 

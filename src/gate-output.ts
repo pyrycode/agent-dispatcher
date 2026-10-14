@@ -382,6 +382,12 @@ export interface GateTally {
   /** Packages/suites that reported failure, in encounter order. */
   packageFailures: string[];
   /**
+   * Go only: the run printed a panic other than the test binary's own
+   * deadline, or a data race. Either stops or taints a whole package, so the
+   * named failures alone cannot say what else broke.
+   */
+  abnormalExit?: boolean;
+  /**
    * How many lines/documents parsed into recognisable events. Zero means
    * the artifact is unusable — there is nothing to judge, which is a very
    * different thing from "nothing failed".
@@ -642,6 +648,9 @@ function parseGoJson(raw: string): GateTally {
     if (event.Action === "output") {
       const text = event.Output ?? "";
       const panic = text.match(GO_TIMEOUT_PANIC);
+      if (!panic && (/^\s*panic: /.test(text) || /WARNING: DATA RACE|race detected during execution of test/.test(text))) {
+        tally.abnormalExit = true;
+      }
       if (panic) {
         inTimeoutList = true;
         tally.timedOutBudget = panic[1];

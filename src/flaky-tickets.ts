@@ -44,6 +44,9 @@ export interface FlakyRunContext {
   report: GateRunReport;
   /** ISO timestamp of the run, for the ticket text. */
   at: string;
+  /** The gated ticket's own body, when known, so a fix ticket without the
+   *  `bug` label or its marker is still seen naming its own test. */
+  gatedBody?: string;
 }
 
 /** A pre-verifier gate run that saw a flake. */
@@ -64,6 +67,9 @@ export interface VerifierGateFlakyContext {
   verifierGate: VerifierGateRun;
   /** ISO timestamp of the run, for the ticket text. */
   at: string;
+  /** The gated ticket's own body, when known, so a fix ticket without the
+   *  `bug` label or its marker is still seen naming its own test. */
+  gatedBody?: string;
 }
 
 /** Either gate's run: the real-claude gate's report, or a verifier gate's own lines. */
