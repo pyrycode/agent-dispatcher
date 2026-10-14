@@ -416,8 +416,12 @@ class Watchdog:
         try:
             # Conditional on the service still holding the task as running or in
             # attention. A task it holds as publishing is never failed here.
-            self.support.rpc('complete', {'machine': machine, 'id': old['id'], 'session': old['session'],
-                                          'result': old['finalized']['result'], 'expectStates': ['running', 'attention']})
+            answer = self.support.rpc('complete', {'machine': machine, 'id': old['id'], 'session': old['session'],
+                                                   'result': old['finalized']['result'], 'expectStates': ['running', 'attention']})
+            # Only a service that understood the conditional release answers with
+            # the failed task. Anything else is not taken as a release.
+            if not isinstance(answer, dict) or answer.get('state') != 'failed':
+                raise RuntimeError('The service did not confirm the task as failed.')
         except Exception as error:
             text = str(error)
             if RESULT_CHANGED in text:

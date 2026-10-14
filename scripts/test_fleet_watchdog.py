@@ -56,7 +56,7 @@ class Fleet:
             if op in self.refuse:
                 value = self.refuse[op]
                 raise m.rpc_failure(op, 1, value) if isinstance(value, str) else value
-            return [] if op == 'schedule' else {}
+            return [] if op == 'schedule' else {'state': 'failed'} if op == 'complete' else {}
         self.support.rpc = rpc
         self.logged = []
         self.support.housekeeping = self.record
@@ -239,6 +239,16 @@ class FinishedButRefused(unittest.TestCase):
             self.assertEqual([b['result'] for b in f.ops('complete')], [first, first])
             self.assertEqual(json.loads(receipt.read_text())['finalized']['released'], True)
             self.assertEqual([e['kind'] for e in f.logged][-2:], ['watchdog-finalize-refused', 'native-task-finalized'])
+
+    def test_a_release_the_service_does_not_confirm_is_not_taken_as_one(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Fleet(d)
+            folder, receipt = f.task(drainConfirmed=True)
+            rpc = f.support.rpc
+            f.support.rpc = lambda op, body: {'ok': True} if op == 'complete' else rpc(op, body)
+            [item] = self.refused_passes(f, {TASK: REFUSAL})
+            self.assertEqual(item['kind'], 'finalize-refused'); self.assertIn('did not confirm', item['reason'])
+            self.assertEqual(json.loads(receipt.read_text())['phase'], 'running')
 
     def test_a_different_outcome_already_held_stops_the_retries(self):
         with tempfile.TemporaryDirectory() as d:
