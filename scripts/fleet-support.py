@@ -689,6 +689,22 @@ class SupportSupervisor:
         old['phase']='complete';atomic(receipt,old)
         if self.housekeeping:self.housekeeping('native-task-interrupted',old['id'],old['interrupted']['reason']+' Reservation released as interrupted work.')
 
+    def local_task_ids(self):
+        """Ids of the native tasks this computer still holds a launch receipt or a
+        deferred marker for. None when the folder cannot be read, which the control
+        service treats as unknown rather than as no tasks."""
+        try:
+            names=[p.name for p in self.directory.iterdir()]
+        except FileNotFoundError:
+            names=[]
+        except OSError:
+            return None
+        ids=set()
+        for name in names:
+            for suffix in ('.receipt.json','.deferred.json'):
+                if name.endswith(suffix) and re.fullmatch(r'[a-f0-9]{64}',name[:-len(suffix)]):ids.add(name[:-len(suffix)])
+        return sorted(ids)
+
     def tick(self):
         routes=self.config.get('recoveryTasks',{})
         if not routes:return []

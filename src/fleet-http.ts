@@ -48,6 +48,7 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
       if (req.method === "GET" && req.url === "/operations/desired") return send(200, desired?.() ?? {});
       if (req.method === "GET" && req.url === "/operations/control") return send(200,{desired:store.controlTarget(),centralLoaded:controlRevision});
       if (req.method === "GET" && req.url === "/operations/reports") return send(200, store.operations.list());
+      if (req.method === "GET" && req.url === "/tasks/orphaned") return send(200, store.orphans.list());
       if (req.method === "GET" && req.url === "/state") return send(200, {...store.snapshot(), features:{recoveryTasks:true},requiredRepairs:store.requiredRepairs()});
       if (req.method === "GET" && req.url === "/runner") return send(200, store.runnerPolicy() ?? null);
       if (req.method === "GET" && req.url === "/recovery/state") return send(200, store.recovery.list());
@@ -66,6 +67,8 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
       if (req.url === '/operations/report') {
         if (!isAdmin && body.machine !== machine) return send(403, {error:'Machine identity mismatch'});
         store.operations.record(isAdmin ? body.machine : machine!, body.report);
+        // Starts the orphan clock between operator reads. A failure here must never refuse the report.
+        try { store.orphans.observe(); } catch { /* observed again on the next report */ }
         return send(200, {ok:true});
       }
       if (req.url === '/tasks/capabilities') {

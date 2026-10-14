@@ -504,6 +504,28 @@ notices for a day. Each new finding and each release is also written to
 `housekeeping.jsonl` once. Findings stay out of the report's `housekeeping` list,
 which keeps its room for clears, retirements and releases.
 
+#### Central tasks nobody holds
+
+The watchdog reads only the local receipts, so a central task record left
+`running` or `attention` after its receipt was moved away or lost, and its
+reservation cancelled, had no detector. The claims service now lists those.
+Each supervisor report carries `localTasks`, the ids of the receipts and deferred
+markers in its `tasks` folder. A task is held when a reservation for it is open
+or any computer lists it. A task that is running or in attention and held by
+nothing for 60 minutes is returned by `GET /tasks/orphaned`, and
+`operator.sh attention` carries the list as `orphanedTasks`.
+
+Each item has `kind` `orphaned-task`, `task`, `ticket`, `machine`, `state`,
+`since` (Unix seconds, when it was first seen unheld) and `reason`. It is
+attention only: nothing is closed or released. The record has to be closed by
+hand, for example with `recovery-task complete`, after checking the computer.
+
+The evidence has to be positive. The task's own computer must have reported in the
+last 15 minutes with a `localTasks` list, so a computer that is briefly offline,
+or still on a supervisor that does not send the list, reports nothing. The clock
+restarts whenever the condition stops holding. If the claims service cannot answer, `orphanedTasks` is `null` with `orphanedTasksError` beside it, which a reader must treat as unknown rather than as none. The receipt lists themselves stay out of the operator report. The limit is
+`recovery.orphanedTaskMinutes` in the claims configuration, default 60.
+
 The fixed recipes are `platform-probe`, `memory-runtime-smoke`,
 `android-tool-then-text` and `dispatcher-repair`. Executed recipes require an exact
 candidate revision. There is no model-supplied shell command. Requests are stable

@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import { RecoveryFacts, type PauseRecord, type EvidenceRecord, type CoordinationRecord } from "./recovery-facts.js";
 import { RecoveryLedger, validateObservations, IDLE_RECOVERY_REASONS, RECOVERY_UNKNOWN_PAUSE_REASON, type RecoveryObservation, type RecoveryDecision, type RecoveryIncident, type RecoveryLedgerOptions } from "./fleet-recovery.js";
 import { OperationReports } from './operation-reports.js';
+import { OrphanedTaskWatch } from './orphaned-tasks.js';
 import {RecoveryTasks, assessmentTasks, type RecoveryTaskRequest, type RecoveryTaskResult} from './recovery-tasks.js';
 import {createHash} from 'node:crypto';
 import {manifestHash} from './recovery-artifacts.js';
@@ -64,6 +65,12 @@ export function validateStart(req: StartRequest): void {
   }
 }
 
+export interface FleetStoreOptions extends RecoveryLedgerOptions {
+  /** How long a running or attention task may have no holder before it is reported. Default one hour. */
+  orphanedTaskMs?: number;
+  now?: () => number;
+}
+
 export class FleetStore {
   private readonly db: DatabaseSync;
   readonly recovery: RecoveryLedger;
@@ -71,7 +78,8 @@ export class FleetStore {
   readonly facts: RecoveryFacts;
   readonly operations: OperationReports;
   readonly tasks: RecoveryTasks;
-  constructor(path: string, private readonly limits: Readonly<Record<string, MachineLimits>>, options: RecoveryLedgerOptions = {}) {
+  readonly orphans: OrphanedTaskWatch;
+  constructor(path: string, private readonly limits: Readonly<Record<string, MachineLimits>>, options: FleetStoreOptions = {}) {
     for (const value of Object.values(limits)) validateLimits(value);
     this.db = new DatabaseSync(path);
     this.db.exec(`
@@ -103,7 +111,9 @@ export class FleetStore {
     this.tasks = new RecoveryTasks(this.db);
     this.db.exec("CREATE TABLE IF NOT EXISTS fleet_assessment_releases (ticket TEXT NOT NULL, machine TEXT NOT NULL, generation TEXT NOT NULL, created INTEGER NOT NULL, PRIMARY KEY(ticket,generation)) STRICT");
     this.db.exec("CREATE TABLE IF NOT EXISTS fleet_control_target (singleton INTEGER PRIMARY KEY,revision TEXT NOT NULL) STRICT; CREATE TABLE IF NOT EXISTS fleet_control_ready (machine TEXT PRIMARY KEY,revision TEXT NOT NULL) STRICT;");
-    this.operations = new OperationReports(this.db, Object.keys(limits));
+    const clock = options.now ?? Date.now;
+    this.operations = new OperationReports(this.db, Object.keys(limits), clock);
+    this.orphans = new OrphanedTaskWatch(this.db, this.tasks, this.operations, clock, options.orphanedTaskMs);
   }
   close(): void { this.db.close(); }
 
