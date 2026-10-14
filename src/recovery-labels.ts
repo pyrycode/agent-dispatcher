@@ -1,11 +1,13 @@
 /**
- * Recovery labels. Kept free of imports so the scheduler, the effort policy,
+ * Recovery labels. Kept free of imports (bar the dependency-free colour table) so the scheduler, the effort policy,
  * the central store and the publisher can all read them.
  *
  * `orchestrator:fixing` had two jobs until 2026-10-14. It gave every later
  * stage of an assigned repair recovery priority, and people read it as "being
  * repaired now". The two jobs now have their own labels.
  */
+import { labelColor } from "./label-colors.js";
+
 export const RECOVERY_INVESTIGATING = "orchestrator:investigating";
 /** An assigned repair. Scheduler priority and builder effort, until Done, a hold, a new error or an escalation. */
 export const RECOVERY_PRIORITY = "orchestrator:recovery-priority";
@@ -46,8 +48,8 @@ export function recoveryAssignmentLabels(action: string): string[] {
     ...(RECOVERY_REPAIR_RUN_ACTIONS.includes(action) ? [RECOVERY_REPAIRING] : [])];
 }
 
-/** GitHub label definitions used when the publisher first creates a label. One bright shared colour. */
+/** GitHub label definitions used when the publisher first creates a label. Colours come from the shared label scheme. */
 export const RECOVERY_LABEL_DEFINITIONS: Readonly<Record<string, { color: string; description: string }>> = {
-  [RECOVERY_PRIORITY]: { color: "FF1493", description: "Orchestrator repair assigned. Its stages get recovery priority until Done, a hold or a new error." },
-  [RECOVERY_REPAIRING]: { color: "FF1493", description: "The repair run the orchestrator assigned is waiting to start or running now." },
+  [RECOVERY_PRIORITY]: { color: labelColor(RECOVERY_PRIORITY), description: "Orchestrator repair assigned. Its stages get recovery priority until Done, a hold or a new error." },
+  [RECOVERY_REPAIRING]: { color: labelColor(RECOVERY_REPAIRING), description: "The repair run the orchestrator assigned is waiting to start or running now." },
 };
