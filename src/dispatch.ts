@@ -5485,13 +5485,11 @@ export async function cleanupAfterDispatch(ctx: DispatchContext): Promise<void> 
 
 // --------- Pre-verifier deterministic gates (builder stage set) ---------
 
-/** Wall-clock cap per pre-verifier gate command. 10 min default; a fork
- *  whose slowest gate runs longer raises it with
- *  `PYRY_VERIFIER_GATE_TIMEOUT_MS`. Desktop's serial Playwright tier
- *  measured 14.8 min on 2026-09-24 (pyrycode-desktop #1634), so every
- *  pass timed out at the default. */
+/** Wall-clock cap per pre-verifier gate command. 15 min default covers
+ *  pyrycode's full `make check` (615.1s on #3341). A fork whose slowest
+ *  gate runs longer raises it with `PYRY_VERIFIER_GATE_TIMEOUT_MS`. */
 export const VERIFIER_GATE_TIMEOUT_MS =
-  Number(process.env.PYRY_VERIFIER_GATE_TIMEOUT_MS) || 600_000;
+  Number(process.env.PYRY_VERIFIER_GATE_TIMEOUT_MS) || 900_000;
 
 /** Cap on the failing gate's output tail injected into the verifier's
  *  triage-mode prompt note. */
@@ -5530,7 +5528,7 @@ export interface VerifierGatesOutcome {
  * stopping at the first red. Same execution fabric as the real-claude
  * gate: each command goes through the `GateSpawner` seam (async spawn in
  * its own process group, stdout/stderr streamed to files, SIGTERM →
- * SIGKILL teardown on timeout), never `execSync` — a 10-minute gate on
+ * SIGKILL teardown on timeout), never `execSync` — a long-running gate on
  * the event loop would starve sibling dispatches' stream watchdogs.
  *
  * Output files land in the logs dir with deterministic names
