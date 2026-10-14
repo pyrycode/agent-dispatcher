@@ -10,6 +10,12 @@ const pins=JSON.parse(fs.readFileSync(new URL('scripts/gitleaks-runtime-pin.json
 const platform=process.platform+'-'+process.arch;
 const FAILURE='Source package scan refused; retain it privately';
 const TIMEOUT_MS=10_000;
+// Gitleaks exits 1 on its own fatal errors, so findings use a distinct code.
+// Only this code is a finding. Every other failure is the scanner being unavailable.
+const FINDINGS_EXIT=17;
+
+/** The pinned scanner ran and found something. The same bytes are refused again on every retry. */
+export class SourceScanFindings extends Error {}
 // All filename predicates from config/gitleaks.toml at pins.sourceCommit.
 // Each alias matches its rule without retaining an excluded submitted name.
 const privateNames:Array<[RegExp,string]>=[
@@ -22,7 +28,7 @@ const privateNames:Array<[RegExp,string]>=[
 
 /** Offline, fail-closed scan of every submitted byte, without filename exclusions. */
 export function scanSourcePackage(files:Record<string,string|null>):void {
- let directory:string|undefined;
+ let directory:string|undefined,findings=false;
  try {
   const pin=pins.platforms[platform];
   if(!pin) throw new Error();
@@ -65,7 +71,7 @@ export function scanSourcePackage(files:Record<string,string|null>):void {
   const flags=[
    '--config',config,'--gitleaks-ignore-path',ignore,
    '--ignore-gitleaks-allow','--redact=100','--no-banner','--no-color',
-   '--log-level','error','--exit-code','1','--timeout','9',
+   '--log-level','error','--exit-code',String(FINDINGS_EXIT),'--timeout','9',
   ];
   // Both scans use the same trusted config and empty ignore, with no ambient
   // settings. Directory mode retains filenames required by embedded rules.
@@ -78,11 +84,12 @@ export function scanSourcePackage(files:Record<string,string|null>):void {
     input:mode==='stdin'?'\n'.repeat(1024)+Object.values(files).filter((value):value is string=>value!==null).join('\n'):undefined,
     stdio:['pipe','ignore','ignore'],timeout:TIMEOUT_MS,killSignal:'SIGKILL',
    });
+   if(!result.error&&!result.signal&&result.status===FINDINGS_EXIT) findings=true;
    if(result.error||result.signal||result.status!==0) throw new Error();
   }
  }catch {
   // Never propagate scanner output, matches, source, or system error paths.
-  throw new Error(FAILURE);
+  throw findings?new SourceScanFindings(FAILURE):new Error(FAILURE);
  }finally {
   if(directory) {
    try {fs.rmSync(directory,{recursive:true,force:true});}

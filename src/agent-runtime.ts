@@ -1537,6 +1537,20 @@ export function scrubCredentials(text: string): string {
 }
 
 /**
+ * Where `scrubCredentials` would blank something: the start and end offset
+ * of every match of every credential shape, each pattern run on the
+ * original text. Repair publication uses the offsets to judge only the
+ * lines a patch adds or changes.
+ */
+export function credentialMatches(text: string): Array<[number, number]> {
+  const matches: Array<[number, number]> = [];
+  for (const [pattern] of CREDENTIAL_PATTERNS) {
+    for (const match of text.matchAll(pattern)) matches.push([match.index, match.index + match[0].length]);
+  }
+  return matches;
+}
+
+/**
  * The scrubbed last `max` characters of a stderr tail, ready to sit inside
  * the error comment's code block: a run of three or more backticks would
  * close that block early, so those become quotes. "" when there is none.

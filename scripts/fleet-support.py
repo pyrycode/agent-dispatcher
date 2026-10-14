@@ -318,6 +318,29 @@ class ArtifactPassError(Exception):
 class ReleasePassError(ArtifactPassError):
     """The authority refused or lost one proven-gone worker's release. Local to that record."""
 
+class PublicationPassError(ArtifactPassError):
+    """A finished repair's publication did not go through this pass. Local to that record."""
+
+class RpcError(Exception):
+    """A recovery-task operation failed. `status` is the service's HTTP status when it answered."""
+    def __init__(self,operation,detail):
+        self.operation=operation
+        line=(detail.strip().splitlines() or [''])[-1]
+        match=re.match(r'Service (\d{3}): (.*)$',line)
+        self.status=int(match.group(1)) if match else None
+        body=None
+        if match:
+            try:body=json.loads(match.group(2))
+            except ValueError:body=None
+        self.refused=self.status==422 and isinstance(body,dict) and body.get('refused') is True
+        self.detail=(body.get('error') if isinstance(body,dict) and isinstance(body.get('error'),str) else line)[:300] or 'no detail'
+        super().__init__('recovery-task '+operation+' failed'+(' with HTTP '+str(self.status) if self.status else '')+': '+self.detail)
+
+# A transient publication failure waits this long after its first failure,
+# doubling each time up to the cap. A definitive refusal never retries.
+PUBLICATION_RETRY_SECONDS=60
+PUBLICATION_RETRY_CAP_SECONDS=1800
+
 def route_available(route):
     capability=route['capability']
     required=['go'] if capability in {'linux-amd64','macos-arm64'} else ['go','java','adb'] if capability=='android-emulator' else ['node','pnpm','codex']
@@ -399,8 +422,12 @@ class SupportSupervisor:
 
     def rpc(self,operation,body):
         path=self.directory/(operation+'.request.json');atomic(path,body)
-        output=subprocess.check_output(self.adapter.operator_command('recovery-task',operation,str(path)),text=True,timeout=150)
-        return json.loads(output)
+        done=subprocess.run(self.adapter.operator_command('recovery-task',operation,str(path)),stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=150)
+        # The operator prints the service's own error line, for example
+        # `Service 422: {"error":...,"refused":true}`, which says whether a retry can help.
+        if done.returncode!=0:raise RpcError(operation,done.stderr or '')
+        return json.loads(done.stdout)
 
     def capability_record(self,state,withheld=()):
         routes=self.config.get('recoveryTasks',{})
@@ -484,7 +511,7 @@ class SupportSupervisor:
 
     def receipt_pass(self,machine,receipt,running):
         old=json.loads(receipt.read_text())
-        if old['phase']=='complete' and (old.get('artifactDigest') or old.get('artifactUnrecoverable') or old.get('interrupted')):return
+        if old['phase']=='complete' and (old.get('artifactDigest') or old.get('artifactUnrecoverable') or old.get('interrupted') or old.get('publicationRefused')):return
         result=Path(old['result'])
         if old['phase']=='complete' and not result.is_file():return
         if old['phase']=='complete':
@@ -533,9 +560,24 @@ class SupportSupervisor:
             value=json.loads(Path(old.get('artifactResult',str(result))).read_text())
             publication=value.get('files',{}).pop('publication.json',None)
             if publication:
-                self.rpc('prepare-repair',{'machine':machine,'id':old['id'],'session':old['session'],'publication':json.loads(publication)})
-                old['phase']='publishing';atomic(receipt,old)
-                published=self.rpc('publish-repair',{'machine':machine,'id':old['id'],'session':old['session'],'publication':json.loads(publication)})
+                if old.get('publicationRefused'):return self.refuse_publication(machine,receipt,old)
+                retry=old.get('publicationRetry')
+                if retry and retry.get('next',0)>time.time():
+                    running.append({'id':old['id'],'phase':'publication-retry','reason':retry.get('reason'),'next':retry['next']});return
+                try:
+                    self.rpc('prepare-repair',{'machine':machine,'id':old['id'],'session':old['session'],'publication':json.loads(publication)})
+                    old['phase']='publishing';atomic(receipt,old)
+                    published=self.rpc('publish-repair',{'machine':machine,'id':old['id'],'session':old['session'],'publication':json.loads(publication)})
+                except RpcError as error:
+                    # The authority refused these exact bytes. A retry is refused
+                    # again, so the task ends here and its reservation is released.
+                    if error.operation=='prepare-repair' and error.refused:
+                        old['publicationRefused']={'at':time.time(),'reason':error.detail}
+                        return self.refuse_publication(machine,receipt,old)
+                    self.publication_retry(receipt,old,error)
+                except (OSError,subprocess.SubprocessError,ValueError) as error:
+                    self.publication_retry(receipt,old,error)
+                old.pop('publicationRetry',None)
                 if published.get('pendingControl'):running.append(old);return
                 value['summary']='Dispatcher repair '+published['url']+'. '+('Merged; supervised rollout is pending.' if published.get('merged') else published.get('reason','Review remains pending.'))
                 value['files']={'publication-result.json':json.dumps(published)}
@@ -558,6 +600,42 @@ class SupportSupervisor:
             self.rpc('uncertain',{'machine':machine,'id':old['id'],'session':old['session'],'reason':old['reason']})
             running.append(old)
         else:running.append(old)
+
+    def publication_retry(self,receipt,old,error):
+        """Wait before the next attempt at a temporary publication failure.
+
+        Service errors, timeouts and network failures can clear. The record keeps
+        its reservation and stays in the report with the next attempt time."""
+        failures=old.get('publicationRetry',{}).get('failures',0)+1
+        delay=min(PUBLICATION_RETRY_SECONDS*2**(failures-1),PUBLICATION_RETRY_CAP_SECONDS)
+        detail=str(error) if isinstance(error,RpcError) else type(error).__name__+': '+str(error)
+        old['publicationRetry']={'failures':failures,'next':time.time()+delay,'reason':detail[:300]}
+        atomic(receipt,old)
+        raise PublicationPassError(error) from error
+
+    def refuse_publication(self,machine,receipt,old):
+        """End a finished repair the authority will not publish, as failed work.
+
+        The reviewed patch stays on this host only. Releasing the task frees its
+        reservation, so a refused publication never holds a place indefinitely."""
+        refused=old['publicationRefused']
+        if 'result' not in refused:
+            retained=str(Path(old.get('directory') or Path(old['result']).parent))
+            summary=('Repair publication refused: '+refused['reason']+' The repair finished, but it was not published. '
+                     'Its reviewed patch is retained privately on this host in '+retained+' (publication.json). '
+                     'Fix the cause of the refusal, then republish it or request the repair again.')
+            # Saved before the release, so a retry sends the identical result.
+            refused['retained']=retained
+            refused['result']={'outcome':'failed','summary':summary,'files':{}}
+            atomic(receipt,old)
+        try:self.rpc('complete',{'machine':machine,'id':old['id'],'session':old['session'],'result':refused['result']})
+        except Exception as error:
+            # Retried each pass with the saved result. The refusal itself never retries.
+            raise PublicationPassError(error) from error
+        old['phase']='complete';old.pop('publicationRetry',None);atomic(receipt,old)
+        if self.housekeeping:
+            self.housekeeping('native-task-publication-refused',old['id'],
+                              'Repair publication refused: '+refused['reason']+' Task ended as failed and its reservation released. Reviewed patch retained privately in '+refused['retained']+'.')
 
     def interrupt(self,machine,receipt,old,proof=None):
         """Release the reservation of a worker proven gone, as failed interrupted work."""
@@ -590,7 +668,12 @@ class SupportSupervisor:
         for receipt in sorted(self.directory.glob('*.receipt.json')):
             task=receipt.name[:-len('.receipt.json')]
             # One bad record must not stop the pass, later records or the operation report.
-            try:self.receipt_pass(machine,receipt,running)
+            try:
+                self.receipt_pass(machine,receipt,running)
+                # Waiting out a publication retry keeps the failure it waits on,
+                # so the same failure is not logged again after each wait.
+                if running and running[-1].get('id')==task and running[-1].get('phase')=='publication-retry' and task in self.reported_errors:
+                    errors[task]=self.reported_errors[task]
             except Exception as error:
                 detail=str(error) if isinstance(error,ArtifactPassError) else type(error).__name__+': '+str(error)
                 reason='Native task record skipped this pass. '+detail[:300]

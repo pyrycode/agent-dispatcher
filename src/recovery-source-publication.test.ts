@@ -10,6 +10,8 @@ import {FleetStore} from './fleet-store.js';
 import {serveFleet} from './fleet-http.js';
 import {validateTaskResult} from './recovery-tasks.js';
 import {scrubCredentials} from './agent-runtime.js';
+import {GitHubBroker} from './github-broker.js';
+import {RepairRefusal,validateRepairPublication} from './recovery-source-publication.js';
 
 const revision='6bf6a1971332440c5fe344ff3018414ecbccc7df';
 const limits={box:{heavyLimit:1,combinedLimit:2},mac:{heavyLimit:1,combinedLimit:2}};
@@ -334,7 +336,9 @@ test('refused source literals and invalid publications retain the exact reservat
   assert.deepEqual(store.snapshot(),before);
   assert.equal(store.tasks.get(id).state,'running');
   const response:Response=await fetch('http://127.0.0.1:'+address.port+'/tasks/prepare-repair',{method:'POST',headers:{authorization:'Bearer m-test','content-type':'application/json'},body:JSON.stringify({id,session:'repair',publication:value})});
-  assert.equal(response.status,409);
+  // A refusal of the submitted bytes is final, so the supervisor can end the task.
+  assert.equal(response.status,422);
+  assert.equal((await response.json()).refused,true);
   assert.deepEqual(store.snapshot(),before);
  }
 });
@@ -354,4 +358,132 @@ test('configuration-shaped basenames cannot hide filename-specific credentials',
    assert.equal(store.tasks.get(id).state,'running');
   }finally {store.close();}
  }
+});
+
+// ---------------------------------------------------------------------
+// pyrycode/pyrycode#3289, 2026-10-14. A reviewed repair to src/dispatch.ts
+// and src/dispatch.test.ts was refused at every supervisor pass. The flagged
+// lines were two synthetic provider-key fixtures already on main and two
+// ordinary `token: process.env.GITHUB_TOKEN!` lines, none of them changed.
+// All values are assembled at runtime so this file itself stays publishable.
+const anthropic='sk'+'-ant-';
+const fixtureLines=[
+ '  const env = buildGateSpawnEnv({ ANTHROPIC_API_KEY: "'+anthropic+'metered", CLAUDE_CODE_OAUTH_TOKEN: "t" });',
+ '  const key = "'+anthropic+'api03-" + "k".repeat(48);',
+];
+const clientLines=['const client = new GitHubClient({','  token: process.env.GITHUB_TOKEN!,','  owner: "org",','});'];
+const baseTest=['import { test } from "node:test";',...fixtureLines,'test("old", () => {});',''].join('\n');
+const baseSource=['export const VERIFIER_GATE_TIMEOUT_MS = 600_000;',...clientLines,''].join('\n');
+const repairedTest=baseTest.replace('test("old", () => {});','test("old", () => {});\ntest("a simulated 686-second gate completes (#3289)", () => {});');
+const repairedSource=baseSource.replace('600_000','1_200_000');
+const base3289={'src/dispatch.test.ts':baseTest,'src/dispatch.ts':baseSource};
+
+test('#3289: unchanged fixtures and environment reads in changed files no longer refuse a reviewed repair',()=>{
+ for(const line of [...fixtureLines,clientLines[1]]) assert.notEqual(scrubCredentials(line),line,'each line is credential-shaped to the diagnostic patterns');
+ const value=publication({'src/dispatch.test.ts':repairedTest,'src/dispatch.ts':repairedSource});
+ assert.equal(validateRepairPublication(value,base3289),value);
+ // Without the base every line is new, and the synthetic literals stay refused.
+ assert.throws(()=>validateRepairPublication(value),RepairRefusal);
+ // The environment read alone is source syntax, not a credential, base or not.
+ assert.doesNotThrow(()=>validateRepairPublication(publication({'src/dispatch.ts':repairedSource})));
+ const {store,id}=admitted();try {
+  const prepared=store.prepareRepair('mac',id,'repair',value,base3289);
+  assert.equal(prepared.state,'publishing');
+  assert.equal(prepared.result?.files['publication.json'],JSON.stringify(value));
+  // A repeat compares the prepared bytes and does not need the base again.
+  assert.deepEqual(store.prepareRepair('mac',id,'repair',value),prepared);
+ }finally{store.close();}
+});
+
+test('#3289: added or changed lines stay strict for literal secrets',async t=>{
+ const secret='aB3dE6gH9jK2mN5pQ8sT1vW4';
+ const cases:Array<[string,Record<string,string>]>=[
+  ['a new provider key literal',{'src/dispatch.test.ts':repairedTest+'const added = "'+anthropic+'api03-'+secret+'";\n'}],
+  ['an edited fixture line',{'src/dispatch.test.ts':repairedTest.replace('metered','metered2')}],
+  ['a second copy of an unchanged fixture',{'src/dispatch.test.ts':repairedTest+fixtureLines[0]+'\n'}],
+  ['a token literal on a changed line',{'src/dispatch.ts':repairedSource.replace('owner: "org"','owner: "org", token: "'+secret+'"')}],
+  ['an undeclared bare identifier',{'src/dispatch.ts':repairedSource+'export const config = { token: '+secret+' };\n'}],
+  ['a provider key inside a changed environment read',{'src/dispatch.ts':repairedSource+'const auth = { token: process.env.'+'gh'+'p_'+'A'.repeat(36)+' };\n'}],
+  ['a secret in a changed comment',{'src/dispatch.ts':repairedSource+'// token='+secret+'\n'}],
+  ['a new file',{'src/new.ts':fixtureLines[0]+'\n'}],
+ ];
+ for(const [name,files] of cases) await t.test(name,()=>{
+  assert.throws(()=>validateRepairPublication(publication(files),base3289),RepairRefusal);
+ });
+});
+
+test('identifier and environment references are not credentials, in code and in comments',async t=>{
+ const accepted:Array<[string,string]>=[
+  ['a non-null environment read','export const c = { token: process.env.GITHUB_TOKEN! };'],
+  ['a parenthesised cast environment read','export const c = { token: (process.env.GITHUB_TOKEN as string)! };'],
+  ['a declared variable','const installationAccessToken = read();\nexport const c = { token: installationAccessToken! };'],
+  ['a parameter','export function f(sharedGitHubToken: string) { return { token: sharedGitHubToken }; }'],
+  ['a read on this','class C { t = ""; m() { return { token: this.t }; } }'],
+  // PR #222 (2026-10-14): a test comment quoting source was refused.
+  ['a comment quoting an environment read','// The client reads token: process.env.GITHUB_TOKEN! once at startup.\nexport {};'],
+  ['a comment naming a declared variable','const installationAccessToken = read();\n// token: installationAccessToken!\nexport {};'],
+ ];
+ for(const [name,source] of accepted) await t.test(name,()=>{
+  assert.doesNotThrow(()=>validateRepairPublication(publication({'src/client.ts':source})));
+ });
+ const refused:Array<[string,Record<string,string>]>=[
+  ['an undeclared root in a comment',{'src/client.ts':'// token: parentEnv.PYRY_DEV_AGENTS_TOKEN\nexport {};'}],
+  ['an undeclared identifier in a comment',{'src/client.ts':'// token: aB3dE6gH9jK2mN5pQ8sT1vW4\nexport {};'}],
+  ['an environment read outside source',{'notes.txt':'token: process.env.GITHUB_TOKEN\n'}],
+ ];
+ for(const [name,files] of refused) await t.test(name,()=>{
+  assert.throws(()=>validateRepairPublication(publication(files)),RepairRefusal);
+ });
+});
+
+test('pinned scanner findings are final refusals; an unavailable scanner is not',t=>{
+ try {validateRepairPublication(publication({'notes.txt':'// '+providerSecrets[0][1]+'\n'}));assert.fail('refused');}
+ catch(error) {assert.ok(error instanceof RepairRefusal);assert.equal((error as Error).message,'Source package scan refused; retain it privately');}
+ const spawn=childProcess.spawnSync;
+ t.mock.method(childProcess,'spawnSync',(binary:string,args:string[],options:any)=>{
+  // Gitleaks exits 1 on its own fatal errors. That is never a finding.
+  if(args[0]==='dir') return {status:1,signal:null,error:undefined,stdout:'',stderr:''};
+  return spawn(binary,args,options);
+ });
+ try {validateRepairPublication(publication({'src/safe.ts':'export const safe=true;'}));assert.fail('refused');}
+ catch(error) {assert.ok(!(error instanceof RepairRefusal));assert.equal((error as Error).message,'Source package scan refused; retain it privately');}
+});
+
+test('#3289 over HTTP: the base is read from GitHub at the repair revision, and refusals are final',async t=>{
+ const reads:string[]=[];let failing=false;
+ const github=new GitHubBroker({token:'central',projects:['org/dispatcher'],fetcher:async(input,init)=>{
+  const url=new URL(String(input));reads.push(url.pathname+url.search);
+  assert.equal(new Headers(init?.headers).get('accept'),'application/vnd.github.raw+json');
+  if(failing) return new Response('unavailable',{status:502});
+  const path=url.pathname.replace('/repos/org/dispatcher/contents/','');
+  assert.equal(url.searchParams.get('ref'),revision);
+  return Object.hasOwn(base3289,path)?new Response(base3289[path as keyof typeof base3289]):new Response('{"message":"Not Found"}',{status:404});
+ }});
+ const {store,id}=admitted(),server=await serveFleet(store,{box:'b-test',mac:'m-test'},'a-test',0,'127.0.0.1',github,undefined,'org/dispatcher');
+ const other=admitted(),otherServer=await serveFleet(other.store,{box:'b-test',mac:'m-test'},'a-test',0,'127.0.0.1',github,undefined,'org/dispatcher');
+ t.after(async()=>{
+  for(const s of [server,otherServer]) await new Promise<void>(resolve=>s.close(()=>resolve()));
+  store.close();other.store.close();
+ });
+ const post=(target:typeof server,taskId:string,p:unknown)=>{
+  const address=target.address();assert.ok(address&&typeof address!=='string');
+  return fetch('http://127.0.0.1:'+address.port+'/tasks/prepare-repair',{method:'POST',headers:{authorization:'Bearer m-test','content-type':'application/json'},body:JSON.stringify({id:taskId,session:'repair',publication:p})});
+ };
+ const value=publication({'src/dispatch.test.ts':repairedTest,'src/dispatch.ts':repairedSource});
+ // A temporary GitHub failure is retryable and keeps the reservation.
+ failing=true;
+ let before=store.snapshot();
+ assert.equal((await post(server,id,value)).status,503);
+ assert.deepEqual(store.snapshot(),before);assert.equal(store.tasks.get(id).state,'running');
+ failing=false;
+ assert.equal((await post(server,id,value)).status,200);
+ assert.ok(reads.includes('/repos/org/dispatcher/contents/src/dispatch.ts?ref='+revision));
+ assert.equal(store.tasks.get(id).state,'publishing');
+ assert.equal(store.snapshot().runs.some(r=>r.id==='task-'+id),false);
+ // A new file has no base, so every line is judged. That refusal is final.
+ before=other.store.snapshot();
+ const response=await post(otherServer,other.id,publication({'src/new.ts':fixtureLines[0]+'\n'}));
+ assert.equal(response.status,422);
+ assert.deepEqual(await response.json(),{error:'Repair contains credential-shaped text; retain it privately',refused:true});
+ assert.deepEqual(other.store.snapshot(),before);assert.equal(other.store.tasks.get(other.id).state,'running');
 });

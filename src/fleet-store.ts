@@ -218,9 +218,9 @@ export class FleetStore {
     }
     return required;
   }
-  prepareRepair(machine:string,id:string,session:string,publication:unknown) {
+  prepareRepair(machine:string,id:string,session:string,publication:unknown,base?:Record<string,string|null>) {
     return this.transaction(()=>{
-      const task=this.tasks.prepareRepair(id,machine,session,publication);
+      const task=this.tasks.prepareRepair(id,machine,session,publication,base);
       this.releaseTaskRun(task.runId!,machine,session,true);
       return task;
     });

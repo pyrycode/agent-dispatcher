@@ -155,14 +155,16 @@ export class RecoveryTasks {
   this.db.prepare('UPDATE fleet_recovery_tasks SET state=?,result=?,updated=? WHERE id=?').run(result.outcome==='completed'?'complete':'failed',JSON.stringify(result),this.now(),id);
   return this.get(id);
  }
- prepareRepair(id:string,machine:string,session:string,publication:unknown):RecoveryTask {
+ prepareRepair(id:string,machine:string,session:string,publication:unknown,base?:Record<string,string|null>):RecoveryTask {
   const task=this.get(id);
   if(task.machine!==machine||task.session!==session||task.request.recipe!=='dispatcher-repair'||!task.runId) throw new Error('Repair actor mismatch');
-  const serialized=JSON.stringify(validateRepairPublication(publication));
+  // The prepared bytes were validated against their base when first accepted.
+  // A repeat compares the exact bytes, so it never depends on reading the base again.
   if(task.state==='publishing') {
-   if(task.result?.files['publication.json']!==serialized) throw new Error('Prepared repair changed');
+   if(task.result?.files['publication.json']!==JSON.stringify(publication)) throw new Error('Prepared repair changed');
    return task;
   }
+  const serialized=JSON.stringify(validateRepairPublication(publication,base));
   if(!['running','attention'].includes(task.state)) throw new Error('Repair is not running');
   const result:RecoveryTaskResult={outcome:'completed',summary:'Verified repair prepared; publication and deployment remain pending.',files:{'publication.json':serialized}};
   this.db.prepare("UPDATE fleet_recovery_tasks SET state='publishing',result=?,updated=? WHERE id=?").run(JSON.stringify(result),this.now(),id);
