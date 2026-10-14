@@ -3,7 +3,7 @@ import { scrubCredentials } from './agent-runtime.js';
 
 export const OPERATION_PHASES: readonly string[] = ['current','stopped','drain-requested','draining','start-requested','verifying','complete','attention','preflight-failed','changed-before-drain','waiting-for-native-task'];
 
-const AUTOMATIC_CHANGES = ['health-latch-cleared','operation-retired','native-task-unrecoverable','native-task-skipped'];
+const AUTOMATIC_CHANGES = ['health-latch-cleared','operation-retired','native-task-unrecoverable','native-task-skipped','native-task-interrupted','native-task-deferred'];
 
 /**
  * The supervisor's recent automatic clears and retirements. Malformed entries are

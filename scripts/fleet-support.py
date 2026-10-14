@@ -315,6 +315,9 @@ class ArtifactPassError(Exception):
     """A completed record's artifact recovery failed. No worker or host state is involved."""
     def __init__(self,error):super().__init__(type(error).__name__+': '+str(error));self.error=error
 
+class ReleasePassError(ArtifactPassError):
+    """The authority refused or lost one proven-gone worker's release. Local to that record."""
+
 def route_available(route):
     capability=route['capability']
     required=['go'] if capability in {'linux-amd64','macos-arm64'} else ['go','java','adb'] if capability=='android-emulator' else ['node','pnpm','codex']
@@ -322,6 +325,65 @@ def route_available(route):
     args=['podman','exec',route['container'],'python3','-c',probe] if route.get('container') else [sys.executable,'-c',probe]
     try:return subprocess.run(args,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=15).returncode==0
     except (OSError,subprocess.TimeoutExpired):return False
+
+# File timestamps can trail the real write by one clock tick. A worker write
+# counts as older than a container start only with this margin.
+INSTANCE_MARGIN_NS=2_000_000_000
+
+def container_instance(container):
+    """The container's current instance. {'running': False} only when it is absent,
+    or stopped with no process. Its start time and id when running. None for any
+    other state, such as stopping, or when podman cannot say."""
+    try:
+        exists=subprocess.run(['podman','container','exists',container],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=15).returncode
+        if exists==1:return {'running':False}
+        if exists!=0:return None
+        fields=subprocess.check_output(['podman','inspect',container,'--format','{{.State.Status}} {{.State.Pid}} {{.State.StartedAt.UnixNano}} {{.Id}}'],
+                                       stdin=subprocess.DEVNULL,stderr=subprocess.DEVNULL,text=True,timeout=15).split()
+    except (OSError,subprocess.SubprocessError):return None
+    if len(fields)!=4 or not fields[1].isdigit() or not fields[2].isdigit():return None
+    status,pid=fields[0],int(fields[1])
+    # A stopping container can still hold processes, so it proves nothing.
+    if status in {'exited','stopped','created','configured'} and pid==0:return {'running':False}
+    if status=='running' and pid>0:return {'running':True,'startedAt':int(fields[2]),'id':fields[3]}
+    return None
+
+def worker_gone_with_container(old):
+    """Proof that a container task's worker no longer exists, or None.
+
+    Every process started in a container ends when that container instance
+    stops. The worker is gone when its container is not running, or when the
+    worker wrote its own files before the running instance started, which
+    places it in an earlier instance. Files the host also writes never count."""
+    container=old.get('container')
+    if not container or not old.get('directory'):return None
+    instance=container_instance(container)
+    if instance is None:return None
+    if not instance['running']:
+        return 'Its container '+container+' is not running, and no process started in it survives a stop.'
+    directory=Path(old['directory'])
+    written=[]
+    for name in ('started.json','execution.log'):
+        try:written.append((directory/name).stat().st_mtime_ns)
+        except FileNotFoundError:continue
+        except OSError:return None
+    if written and min(written)<instance['startedAt']-INSTANCE_MARGIN_NS:
+        return 'Its container '+container+' restarted after the worker last wrote, so the worker ran in an instance that has stopped.'
+    return None
+
+OPEN_PHASES={'drain-requested','draining','start-requested','verifying','waiting-for-native-task'}
+
+def operation_open(record):
+    """Whether a supervisor record means the container may be draining or updating.
+
+    A health latch, or attention after a start was issued, leaves the dispatcher
+    running with nothing draining. Any other attention record may hold an
+    undelivered or stuck drain, so it stays open."""
+    phase=record.get('phase')
+    if phase in OPEN_PHASES:return True
+    if phase!='attention':return False
+    if record.get('latch')=='health' or str(record.get('reason','')).startswith('Health failed again after a verified restart'):return False
+    return record.get('attentionFrom') not in {'start-requested','verifying'}
 
 class SupportSupervisor:
     def __init__(self,adapter,config):
@@ -340,12 +402,29 @@ class SupportSupervisor:
         output=subprocess.check_output(self.adapter.operator_command('recovery-task',operation,str(path)),text=True,timeout=150)
         return json.loads(output)
 
+    def capability_record(self,state,withheld=()):
+        routes=self.config.get('recoveryTasks',{})
+        capabilities=sorted(set(route['capability'] for route in routes.values()
+                                if not (route.get('container') and route['container'] in withheld) and self.route_ready(route)))
+        return {'capabilities':capabilities,'ready':not state.get('draining',False)}
+
+    def withhold(self,project):
+        """Report capabilities without this project's container before its drain signal.
+
+        The authority admits a task only against a fresh capability record, so
+        once this report is accepted no new task can be admitted into the
+        container. Its later records come from the open operation receipt."""
+        container=self.config.get('projects',{}).get(project,{}).get('container')
+        if not container or not any(r.get('container')==container for r in self.config.get('recoveryTasks',{}).values()):return
+        state=self.adapter.status()
+        self.rpc('capabilities',{'machine':state['machine'],'record':self.capability_record(state,{container})})
+
     def route_ready(self,route):
         if route.get('container'):
             for project,cfg in self.config.get('projects',{}).items():
                 if cfg.get('container')!=route['container']:continue
                 receipt=Path(self.config['stateDirectory'])/(project.replace('/','_')+'.json')
-                if receipt.exists() and json.loads(receipt.read_text()).get('phase')!='complete':return False
+                if receipt.exists() and operation_open(json.loads(receipt.read_text())):return False
         return route_available(route)
 
     def drained(self,old,receipt):
@@ -405,7 +484,7 @@ class SupportSupervisor:
 
     def receipt_pass(self,machine,receipt,running):
         old=json.loads(receipt.read_text())
-        if old['phase']=='complete' and (old.get('artifactDigest') or old.get('artifactUnrecoverable')):return
+        if old['phase']=='complete' and (old.get('artifactDigest') or old.get('artifactUnrecoverable') or old.get('interrupted')):return
         result=Path(old['result'])
         if old['phase']=='complete' and not result.is_file():return
         if old['phase']=='complete':
@@ -440,7 +519,7 @@ class SupportSupervisor:
             if custody:
                 custody['phase']=custody_state
                 atomic(receipt,old)
-        snapshot=None;custody_state='uncertain'
+        snapshot=None;custody_state='uncertain';proof=None
         observe_worker()
         # Preserve the leader as an ownership anchor until its descendants
         # have been recorded; poll() can reap it immediately.
@@ -469,6 +548,8 @@ class SupportSupervisor:
                 old['artifactResult']=str(artifact_result);atomic(receipt,old)
             old['artifactDigest']=self.return_artifacts(machine,old,value)
             old['phase']='complete';atomic(receipt,old)
+        elif old['phase'] in {'running','attention'} and not alive and not result.is_file() and (old.get('interrupted') or (proof:=worker_gone_with_container(old))):
+            self.interrupt(machine,receipt,old,proof)
         elif old['phase']=='attention':
             running.append(old)
         elif old['phase']=='launch-requested' or not worker_alive:
@@ -478,6 +559,25 @@ class SupportSupervisor:
             running.append(old)
         else:running.append(old)
 
+    def interrupt(self,machine,receipt,old,proof=None):
+        """Release the reservation of a worker proven gone, as failed interrupted work."""
+        if not old.get('interrupted'):
+            summary=('Native task worker was interrupted before it wrote a result. '+proof
+                     +' The reservation was released as interrupted work, not completed and not unused. Request the task again if it is still needed.')
+            # Saved before the release, so a retry sends the identical result.
+            old['interrupted']={'at':time.time(),'reason':proof,'result':{'outcome':'failed','summary':summary,'files':{}}}
+            atomic(receipt,old)
+        try:self.rpc('complete',{'machine':machine,'id':old['id'],'session':old['session'],'result':old['interrupted']['result']})
+        except Exception as error:
+            # A refusal or a lost reply concerns this record only. The saved
+            # result is retried each pass, and the record stays in attention.
+            if old['phase']!='attention':
+                old['phase']='attention';old['reason']='Release of a worker proven gone was not accepted; inspect the task and reservation'
+                atomic(receipt,old)
+            raise ReleasePassError(error) from error
+        old['phase']='complete';atomic(receipt,old)
+        if self.housekeeping:self.housekeeping('native-task-interrupted',old['id'],old['interrupted']['reason']+' Reservation released as interrupted work.')
+
     def tick(self):
         routes=self.config.get('recoveryTasks',{})
         if not routes:return []
@@ -485,8 +585,7 @@ class SupportSupervisor:
         session_file=self.directory/'scheduler-session.json'
         if not session_file.exists():atomic(session_file,{'session':uuid.uuid4().hex})
         scheduler_session=json.loads(session_file.read_text())['session']
-        capabilities=sorted(set(route['capability'] for route in routes.values() if self.route_ready(route)))
-        self.rpc('capabilities',{'machine':machine,'record':{'capabilities':capabilities,'ready':not state.get('draining',False)}})
+        self.rpc('capabilities',{'machine':machine,'record':self.capability_record(state)})
         running=[];host_uncertain=False;errors={}
         for receipt in sorted(self.directory.glob('*.receipt.json')):
             task=receipt.name[:-len('.receipt.json')]
@@ -497,8 +596,9 @@ class SupportSupervisor:
                 reason='Native task record skipped this pass. '+detail[:300]
                 running.append({'id':task,'phase':'error','reason':reason})
                 errors[task]=reason
-                # Only a completed record's artifact transfer is known to be local
-                # to that record. Anything else may be host-wide, such as an
+                # Only a completed record's artifact transfer, or the release of a
+                # worker already proven gone, is known to be local to that record.
+                # Anything else may be host-wide, such as an
                 # unavailable process census, so no new worker starts this pass.
                 if not isinstance(error,ArtifactPassError):host_uncertain=True
                 # Logged once per distinct failure, not on every pass.
@@ -513,6 +613,20 @@ class SupportSupervisor:
             if receipt.exists():continue
             route=routes.get(task['request']['recipe']+':'+task['request']['capability'])
             if not route:raise RuntimeError('The admitted task has no configured recipe route')
+            deferred=self.directory/(task['id']+'.deferred.json')
+            if not self.route_ready(route):
+                # Admitted just before its container's operation opened. Never
+                # start it into a container that is draining or updating. The
+                # reservation stays held and the task starts once the update
+                # completes. The drain does not wait for a task never started.
+                marker={'id':task['id'],'session':session,'runId':grant['run'].get('id'),'container':route.get('container')}
+                try:saved=json.loads(deferred.read_text()) if deferred.is_file() else None
+                except ValueError:saved=None
+                if saved!=marker:
+                    atomic(deferred,marker)
+                    if self.housekeeping:self.housekeeping('native-task-deferred',task['id'],'Admitted while its container was draining or updating. It starts after the update completes.')
+                running.append({'id':task['id'],'phase':'deferred','reason':'Waiting for its container operation to complete before starting.'})
+                continue
             admitted={'ok':True,'runnerPolicy':grant['run'].get('runnerPolicy'),'run':grant['run']}
             folder=Path(route['directory'])/task['id'];folder.mkdir(parents=True,exist_ok=True,mode=0o700)
             result=folder/'result.json';task['admission']=admitted
@@ -525,6 +639,8 @@ class SupportSupervisor:
             saved={'id':task['id'],'session':session,'phase':'launch-requested','result':str(result),'created':time.time(),'container':route.get('container'),'directory':str(folder)}
             if route.get('container'):saved['containerDirectory']=root
             receipt=self.directory/(task['id']+'.receipt.json');atomic(receipt,saved)
+            # The launch receipt exists first, so a drain sees this task as active.
+            deferred.unlink(missing_ok=True)
             with (folder/'worker.log').open('ab') as output:
                 child=subprocess.Popen(command,stdin=subprocess.DEVNULL,stdout=output,stderr=output,start_new_session=True,env=clean_env())
             self.children[child.pid]=child
@@ -538,6 +654,9 @@ def main():
     directory=Path(sys.argv[2])
     if sys.argv[1]=='--custody':
         print(json.dumps({'phase':directory_custody(directory)}));return
+    # Written only by the worker, inside its container. Its time places the
+    # worker in one container instance for the supervisor's interruption proof.
+    atomic(directory/'started.json',{'pid':os.getpid()})
     try:result=native_recipe(json.loads((directory/'task.json').read_text()),json.loads((directory/'paths.json').read_text()),directory)
     except Exception as error:result={'outcome':'failed','summary':'Native execution failed: '+type(error).__name__+'. Private logs retained.','files':{}}
     atomic(directory/'result.json',result)

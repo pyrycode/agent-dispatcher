@@ -236,10 +236,18 @@ print(json.dumps({'startupHealthy': health.get('passed'), 'runtime': receipt, 'p
         state=self.status()
         for run in state['runs']:
             if run['machine']!=state['machine'] or not run.get('supportTaskId'): continue
-            receipt=Path(self.config['stateDirectory'])/'tasks'/(run['supportTaskId']+'.receipt.json')
-            # Admission can precede its saved launch receipt. Unknown placement
-            # cannot authorise stopping a container that might own the worker.
-            if not receipt.is_file(): return True
+            tasks=Path(self.config['stateDirectory'])/'tasks'
+            receipt=tasks/(run['supportTaskId']+'.receipt.json')
+            if not receipt.is_file():
+                # A grant the native task pass deferred was never launched, and
+                # is not launched while its container's operation is open.
+                deferred=tasks/(run['supportTaskId']+'.deferred.json')
+                try:saved=json.loads(deferred.read_text()) if deferred.is_file() else None
+                except ValueError:saved=None
+                if isinstance(saved,dict) and saved.get('session')==run.get('session') and saved.get('runId')==run.get('id'):continue
+                # Admission can precede its saved launch receipt. Unknown placement
+                # cannot authorise stopping a container that might own the worker.
+                return True
             saved=json.loads(receipt.read_text())
             if 'container' not in saved or saved['container']==container: return True
         return False
@@ -264,9 +272,13 @@ print(json.dumps({'startupHealthy': health.get('passed'), 'runtime': receipt, 'p
     def update(self, project, desired):
         cfg = self.config['projects'][project]
         if not self.preflight(project, desired): raise RuntimeError('Update preflight no longer passes')
-        execute(['git', '-C', cfg['agents'], 'pull', '--ff-only'])
+        # Fast-forward to exactly the queued consumer revision. Pulling main
+        # could land on a newer revision than the target when main moves
+        # before the desired versions are refreshed.
+        execute(['git', '-C', cfg['agents'], 'fetch', '--quiet'])
+        execute(['git', '-C', cfg['agents'], 'merge', '--ff-only', '--quiet', desired['consumer']])
         if execute(['git', '-C', cfg['agents'], 'rev-parse', 'HEAD']) != desired['consumer']:
-            raise RuntimeError('Consumer main changed while the operation was draining')
+            raise RuntimeError('Consumer checkout does not match the queued update')
         execute(['git', '-C', cfg['agents'], 'submodule', 'update', '--init', 'dispatcher'])
         if execute(['git', '-C', Path(cfg['agents']) / 'dispatcher', 'rev-parse', 'HEAD']) != desired['dispatcher']:
             raise RuntimeError('Dispatcher pin does not match the queued update')

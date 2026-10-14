@@ -279,6 +279,44 @@ class StaleStateTests(unittest.TestCase):
         self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'attention')
         self.assertEqual(self.adapter.calls,['drain','update','start'])
 
+    def test_latch_on_superseded_versions_clears_on_any_healthy_version_and_updates_once(self):
+        # Mac Core and Mobile, 2026-10-13: latched at 17:14 on versions superseded twice since.
+        self.latch()
+        self.adapter.start=lambda p:(self.adapter.calls.append('start'),self.adapter.current.update(identity={'pid':21},generation='newest',stopped=False,childrenStopped=False))
+        # Neither the latched record's versions nor the current desired ones.
+        self.adapter.current.update(generation='superseded',healthy=True)
+        for _ in range(3):
+            self.assertEqual(self.worker.tick(PROJECT,'newest')['phase'],'attention');self.now[0]+=CLEAR//3
+        result=self.worker.tick(PROJECT,'newest')
+        self.assertEqual(result['phase'],'draining')
+        self.assertIn('neither the verified nor the desired',result['reason'])
+        self.assertIn('can now be updated',result['reason'])
+        self.assertEqual(self.adapter.calls,['drain','update','start','drain'])
+        [folder]=self.archives('latch-cleared')
+        self.assertEqual(json.loads((folder/'org_core.json').read_text())['desired'],'new')
+        self.adapter.current.update(stopped=True,childrenStopped=True)
+        self.assertEqual(self.worker.tick(PROJECT,'newest')['phase'],'complete')
+        self.assertEqual(self.adapter.calls,['drain','update','start','drain','update','start'])
+        # Failing again on the updated versions latches without another restart.
+        self.adapter.current={'identity':{'pid':22},'generation':'newest','healthy':False,'stopped':False,'childrenStopped':False}
+        self.worker.tick(PROJECT,'newest');self.now[0]+=CONFIRM
+        self.assertEqual(self.worker.tick(PROJECT,'newest')['phase'],'attention')
+        for _ in range(4):
+            self.now[0]+=CLEAR;self.assertEqual(self.worker.tick(PROJECT,'newest')['phase'],'attention')
+        self.assertEqual(self.adapter.calls,['drain','update','start','drain','update','start'])
+
+    def test_a_dispatcher_that_keeps_failing_on_other_versions_is_never_restarted(self):
+        self.latch()
+        self.adapter.current.update(generation='superseded')
+        for healthy in [True,False,True,False,True,False]:
+            self.adapter.current.update(healthy=healthy);self.now[0]+=CLEAR//2
+            self.assertEqual(self.worker.tick(PROJECT,'newest')['phase'],'attention')
+        self.adapter.current.update(stopped=True,healthy=None)
+        for _ in range(3):
+            self.now[0]+=CLEAR;self.assertEqual(self.worker.tick(PROJECT,'newest')['phase'],'attention')
+        self.assertEqual(self.adapter.calls,['drain','update','start'])
+        self.assertEqual(self.archives('latch-cleared'),[])
+
     def open_record(self,phase,target='old-target',created=1000):
         module.atomic(self.receipt(),{'phase':phase,'project':PROJECT,'desired':target,'identity':{'pid':20,'start':'birth'},
             'childGroups':[],'created':created,'claims':{},'policy':['mac',False,['other/repo']]})
@@ -454,6 +492,82 @@ class ReviewFollowUpTests(StaleStateTests):
         self.assertLessEqual(log.path.stat().st_size,module.HOUSEKEEPING_BYTES+2000)
         self.assertTrue(log.path.with_name('housekeeping.jsonl.1').exists())
         self.assertEqual(len(log.recent()),20)
+
+class DrainRetargetTests(unittest.TestCase):
+    """Modelled on 2026-10-13 22:59 EEST: desired versions moved while HP Relay and
+    Fractal Mobile were draining for the 22:48 rollout, and both stopped for inspection."""
+    def setUp(self):
+        self.directory=Path(tempfile.mkdtemp());self.adapter=Adapter();self.now=[1000]
+        self.updates=[]
+        update=self.adapter.update
+        self.adapter.update=lambda p,d:(self.updates.append(d),update(p,d))
+        clock=lambda:self.now[0]
+        self.worker=module.Supervisor(self.directory,self.adapter,clock,housekeeping=quiet(self.directory,clock),monotonic=clock)
+    def receipt(self):return self.directory/'org_core.json'
+
+    def test_target_change_while_draining_updates_once_to_the_newest_target(self):
+        first={'consumer':'c-2248','dispatcher':'0f76fa2','credential':'tag'}
+        second={'consumer':'c-2259','dispatcher':'18e65d4','credential':'tag'}
+        self.adapter.start=lambda p:(self.adapter.calls.append('start'),self.adapter.current.update(identity={'pid':21},generation=second,stopped=False,childrenStopped=False))
+        self.assertEqual(self.worker.tick(PROJECT,first)['phase'],'draining')
+        self.now[0]+=600
+        result=self.worker.tick(PROJECT,second)
+        self.assertEqual(result['phase'],'draining')
+        self.assertIn('same drain now updates to the newest',result['reason'])
+        saved=json.loads(self.receipt().read_text())
+        self.assertEqual(saved['desired'],second)
+        self.assertEqual(saved['retargeted'],[{'from':first,'at':1600}])
+        self.assertEqual(saved['created'],1000)
+        self.adapter.current.update(stopped=True,childrenStopped=True)
+        self.assertEqual(self.worker.tick(PROJECT,second)['phase'],'complete')
+        self.assertEqual(self.adapter.calls,['drain','update','start'])
+        self.assertEqual(self.updates,[second])
+
+    def test_retargeted_drain_still_compares_ownership_and_drain_policy(self):
+        self.worker.tick(PROJECT,'first');self.worker.tick(PROJECT,'second')
+        self.adapter.current.update(stopped=True,childrenStopped=True)
+        self.adapter.state['drainingProjects']=[]
+        result=self.worker.tick(PROJECT,'second')
+        self.assertEqual(result['phase'],'attention');self.assertIn('drain policy changed',result['reason'])
+        self.assertEqual(self.adapter.calls,['drain'])
+
+    def test_target_change_after_the_start_finishes_the_pinned_operation(self):
+        self.worker.tick(PROJECT,'new');self.adapter.current.update(stopped=True,childrenStopped=True)
+        verify=self.adapter.verify
+        self.adapter.verify=lambda p,d:(_ for _ in ()).throw(RuntimeError('Startup lock not written yet'))
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'verifying')
+        self.adapter.verify=verify
+        result=self.worker.tick(PROJECT,'newer')
+        self.assertEqual(result['phase'],'complete');self.assertEqual(result['desired'],'new')
+        self.assertEqual(self.worker.tick(PROJECT,'newer')['phase'],'draining')
+        self.assertEqual(self.adapter.calls,['drain','update','start','drain'])
+        self.assertEqual(self.updates,['new'])
+
+class NativeAdmissionBeforeDrainTests(unittest.TestCase):
+    """Modelled on 2026-10-13 22:48:43 EEST: a Desktop #1809 repair task was admitted
+    into pyrybox's Core container two seconds before its drain receipt was written."""
+    def setUp(self):
+        self.directory=Path(tempfile.mkdtemp());self.adapter=Adapter()
+        self.worker=module.Supervisor(self.directory,self.adapter,lambda:1000)
+        self.active=False
+        self.adapter.helpers_active=lambda project:self.active
+        self.withheld=[]
+    def test_admission_is_withdrawn_and_rechecked_before_the_drain_signal(self):
+        def withhold(project):
+            self.withheld.append(project)
+            self.active=True  # The task the manager admitted just before the withdrawal.
+        self.worker.withhold=withhold
+        result=self.worker.tick(PROJECT,'new')
+        self.assertEqual(result['phase'],'waiting-for-native-task')
+        self.assertEqual(self.withheld,[PROJECT]);self.assertEqual(self.adapter.calls,[])
+        self.active=False;self.worker.withhold=self.withheld.append
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'draining')
+        self.assertEqual(self.withheld,[PROJECT,PROJECT]);self.assertEqual(self.adapter.calls,['drain'])
+    def test_failed_withdrawal_sends_no_drain_signal(self):
+        def withhold(project):raise RuntimeError('control service unavailable')
+        self.worker.withhold=withhold
+        with self.assertRaises(RuntimeError):self.worker.tick(PROJECT,'new')
+        self.assertEqual(self.adapter.calls,[]);self.assertFalse((self.directory/'org_core.json').exists())
 
 class SupervisorReportTests(unittest.TestCase):
     def test_failed_native_task_pass_still_publishes_operations(self):

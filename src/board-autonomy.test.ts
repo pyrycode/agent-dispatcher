@@ -63,12 +63,16 @@ test('supervisor reports keep automatic clears and retirements visible without r
   const client=new JsonClient(`http://127.0.0.1:${address.port}`,'mac-fixture');
   const retired={at:1791915253,kind:'operation-retired',subject:project,reason:'Retired verifying record automatically',archive:'/private/path'};
   const housekeeping=[retired,{at:'soon',kind:'operation-retired',subject:project,reason:'bad time'},{at:1,kind:'run-command',subject:project,reason:'unknown kind'},
-    {at:1791915300,kind:'native-task-unrecoverable',subject:'c02a547f',reason:'Retained artifacts unrecoverable. FileNotFoundError'}];
+    {at:1791915300,kind:'native-task-unrecoverable',subject:'c02a547f',reason:'Retained artifacts unrecoverable. FileNotFoundError'},
+    {at:1791920992,kind:'native-task-interrupted',subject:'29219c8b',reason:'Its container pyrycode-dispatcher is not running. Reservation released as interrupted work.'},
+    {at:1791920936,kind:'native-task-deferred',subject:'29219c8b',reason:'Admitted while its container was draining or updating.'}];
   await client.call('/operations/report',{machine:'mac',report:{operations:[{project,phase:'current'}],housekeeping}});
   const [record]=await client.call<any[]>('/operations/reports');
   assert.deepEqual(record.operations,[{project,phase:'current'}]);
   assert.deepEqual(record.housekeeping,[{at:1791915253,kind:'operation-retired',subject:project,reason:'Retired verifying record automatically'},
-    {at:1791915300,kind:'native-task-unrecoverable',subject:'c02a547f',reason:'Retained artifacts unrecoverable. FileNotFoundError'}]);
+    {at:1791915300,kind:'native-task-unrecoverable',subject:'c02a547f',reason:'Retained artifacts unrecoverable. FileNotFoundError'},
+    {at:1791920992,kind:'native-task-interrupted',subject:'29219c8b',reason:'Its container pyrycode-dispatcher is not running. Reservation released as interrupted work.'},
+    {at:1791920936,kind:'native-task-deferred',subject:'29219c8b',reason:'Admitted while its container was draining or updating.'}]);
 });
 
 test('unavailable optional related evidence preserves the other ticket evidence', async () => {

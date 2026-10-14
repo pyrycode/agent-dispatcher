@@ -127,6 +127,9 @@ class Supervisor:
         self.unhealthy_since = {}
         self.monotonic = monotonic
         self.notices = {}
+        # Optional callable(project). Withdraws native task admission for the
+        # project's container before a drain signal. Set by the service.
+        self.withhold = None
 
     def tick(self, project, desired):
         self.notices[project] = []
@@ -160,9 +163,11 @@ class Supervisor:
         except Exception:
             observed = {}
         now = self.clock()
-        # Healthy on the versions the latched restart verified, or on the current desired ones.
-        good = (not observed.get('stopped') and observed.get('healthy') is True
-                and observed.get('generation') in (state.get('desired'), desired))
+        # Healthy on any version. A latch set on versions that have since been
+        # superseded must still be able to clear, or the dispatcher can never be
+        # updated: an outdated latched dispatcher is never drained. A dispatcher
+        # that keeps failing never holds the window, so it is never restarted.
+        good = not observed.get('stopped') and observed.get('healthy') is True
         seen = state.get('healthySeen')
         if not good or (seen is not None and now - seen > self.settings['healthSampleGapSeconds']):
             if 'healthySince' in state or 'healthySeen' in state:
@@ -176,8 +181,13 @@ class Supervisor:
         if held < self.settings['healthLatchClearSeconds']:
             atomic(receipt, state)
             return state
+        generation = observed.get('generation')
+        on = ('the desired versions' if generation == desired else 'the verified versions' if generation == state.get('desired')
+              else 'versions that are neither the verified nor the desired ones')
         reason = ('Health latch cleared automatically after ' + str(int(held)) + ' s of continuous healthy reporting on '
-                  + ('the desired' if observed.get('generation') == desired else 'the verified') + ' versions. No restart was issued.')
+                  + on + '. No restart was issued.')
+        if generation not in (desired, state.get('desired')):
+            reason += ' The dispatcher can now be updated to the desired versions.'
         folder = self.housekeeping.archive('latch-cleared', project.replace('/', '_'),
                                            {'reason': reason, 'project': project, 'phase': 'attention'},
                                            copy={receipt.name: state})
@@ -186,6 +196,13 @@ class Supervisor:
         cleared = {k: v for k, v in state.items() if k not in {'reason', 'latch', 'healthySince', 'healthySeen', 'attentionFrom'}}
         cleared['phase'] = 'complete'
         cleared['latchCleared'] = now
+        if generation not in (desired, state.get('desired')):
+            # The record now describes what was seen healthy. It no longer
+            # matches the desired target, so the next step is an ordinary
+            # supervised update: one drain, one start, verified. A failure
+            # after that latches again and is never restarted.
+            cleared['latchedDesired'] = state.get('desired')
+            cleared['desired'] = generation
         atomic(receipt, cleared)
         self.housekeeping.record('health-latch-cleared', project, reason, folder)
         self.unhealthy_since.pop(project, None)
@@ -348,6 +365,15 @@ class Supervisor:
             current = self.adapter.observe(project)
             if current.get('identity') != observed.get('identity'):
                 return {'phase': 'changed-before-drain', 'project': project}
+            # Stop new native task admissions into this container first, then
+            # look again. A task admitted before the withdrawal is visible now,
+            # and the drain waits for it instead of stopping its container.
+            if self.withhold:
+                self.withhold(project)
+                if helpers_active(project):
+                    state = {'phase': 'waiting-for-native-task', 'project': project, 'desired': desired, 'created': self.clock()}
+                    atomic(receipt, state)
+                    return state
             state = {'phase': 'drain-requested', 'project': project, 'desired': desired,
                      'identity': observed['identity'], 'childGroups': observed.get('childGroups', []), 'created': self.clock(),
                      'claims': real_claims(before), 'policy': policy(before)}
@@ -369,8 +395,20 @@ class Supervisor:
             if self.clock() - state['created'] > 6 * 3600:
                 raise RuntimeError(SIX_HOUR_REASON)
             if state['desired'] != desired:
-                # Finish exactly the pinned operation. New revisions wait for its verified completion.
-                desired = state['desired']
+                if state['phase'] == 'draining':
+                    # Nothing has been updated or started yet. Continue the same
+                    # operation toward the newest target: one drain, one update,
+                    # one start. Ownership and drain policy are still compared
+                    # against the saved record before the update and after the start.
+                    state.setdefault('retargeted', []).append({'from': state['desired'], 'at': self.clock()})
+                    state['retargeted'] = state['retargeted'][-20:]
+                    state['desired'] = desired
+                    atomic(receipt, state)
+                    self.notices[project].append('Desired versions changed while draining. The same drain now updates to the newest desired versions.')
+                else:
+                    # A start was already issued. Finish exactly the pinned
+                    # operation; new revisions wait for its verified completion.
+                    desired = state['desired']
             if state['phase'] == 'draining':
                 if helpers_active(project): return state
                 if not observed.get('stopped'):
@@ -449,6 +487,7 @@ def main():
             support_module = importlib.util.module_from_spec(support_spec); support_spec.loader.exec_module(support_module)
             support = support_module.SupportSupervisor(adapter, config)
             support.housekeeping = housekeeping.record
+            supervisor.withhold = getattr(support, 'withhold', None)
         if config.get('control'):
             control_spec = importlib.util.spec_from_file_location('fleet_control', Path(__file__).with_name('fleet-control.py'))
             control_module = importlib.util.module_from_spec(control_spec); control_spec.loader.exec_module(control_module)
