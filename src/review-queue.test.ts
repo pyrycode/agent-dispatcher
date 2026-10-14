@@ -268,6 +268,35 @@ test("a review refused for capacity in one tick still holds new tickets in that 
   } finally { store.close(); }
 });
 
+test("a review the authority refuses in a tick still holds new tickets later in that tick", async () => {
+  const { store, build } = fleet();
+  try {
+    build("fractal", `${CORE}#1`);
+    // The scheduler sees a free heavy place, so it tries the verifier first; the authority refuses it.
+    const client = { snapshot: async () => store.snapshot(), finish: async () => {},
+      start: async (r: StartRequest) => r.role === "verifier" ? { ok: false as const, reason: "locked" as const } : store.start(r) };
+    const manager = new MachineManager({ machine: "fractal", heavyLimit: 1, combinedLimit: 3, ticketLimit: 10, projects: [CORE, MOBILE] }, client);
+    manager.offer(CORE, "c", [{ ...offer(`${CORE}#1`, "verifier", "heavy"), workflowVersion: 1 }, { ...offer(`${CORE}#4`, "refiner", "light"), workflowVersion: 1 }]);
+    manager.offer(MOBILE, "m", [{ ...offer(`${MOBILE}#9`), workflowVersion: 1 }]);
+    await manager.tick();
+    assert.deepEqual(store.snapshot().runs, [], "neither new ticket started after the refusal");
+    assert.deepEqual((await manager.status()).reviewQueue, { limit: 1, tickets: [`${CORE}#1`], full: true });
+  } finally { store.close(); }
+});
+
+test("a project still preparing its workflow import is left out of the review list", () => {
+  const { store, build } = fleet();
+  try {
+    build("fractal", `${CORE}#1`);
+    build("fractal", `${MOBILE}#1`);
+    assert.deepEqual(store.snapshot().reviewReadyTickets, [`${CORE}#1`, `${MOBILE}#1`]);
+    store.workflow.prepare(MOBILE);
+    assert.deepEqual(store.snapshot().reviewReadyTickets, [`${CORE}#1`]);
+    store.workflow.activate(MOBILE);
+    assert.deepEqual(store.snapshot().reviewReadyTickets, [`${CORE}#1`, `${MOBILE}#1`]);
+  } finally { store.close(); }
+});
+
 test("build-hp-1 at heavy limit 2 takes new work with one ticket waiting and holds at two", async () => {
   const { store, build } = fleet();
   try {

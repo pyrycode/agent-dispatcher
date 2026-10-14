@@ -650,8 +650,12 @@ export class FleetStore {
    * The workflow's review-ready tickets less those this authority would refuse
    * a review for while a support task is open on them (see start()).
    */
-  private reviewReadyTickets(): string[] {
-    const ready = this.workflow.reviewReadyTickets();
+  private reviewReadyTickets(): string[] | undefined {
+    let ready: string[];
+    // A row that cannot be read must not stop every manager's scheduling:
+    // leaving the list out means no review queue hold anywhere.
+    try { ready = this.workflow.reviewReadyTickets(); }
+    catch (e) { console.warn("Review queue list unavailable:", (e as Error).message); return undefined; }
     if (!ready.length) return ready;
     const tasked = new Set(this.db.prepare("SELECT DISTINCT ticket FROM fleet_recovery_tasks WHERE state IN ('queued','running','publishing','attention')").all().map(r => String(r.ticket)));
     return ready.filter(t => !tasked.has(t));
@@ -667,6 +671,7 @@ export class FleetStore {
     // Read from the workflow authority, so offers from older workers are ranked too.
     const priorityHighTickets = this.workflow.openTicketsWithLabel(PRIORITY_HIGH);
     const workflowProjects = this.workflow.projects().map(p => p.project);
+    const reviewReadyTickets = workflowProjects.length ? this.reviewReadyTickets() : undefined;
     return {
       ...(codexPause ? { codexPause } : {}),
       ...(codexSpacing ? { codexSpacing } : {}),
@@ -674,7 +679,7 @@ export class FleetStore {
       ...(runnerPolicy ? { runnerPolicy } : {}),
       ...(idleRecoveryTickets.length ? { idleRecoveryTickets } : {}),
       ...(priorityHighTickets.length ? { priorityHighTickets } : {}),
-      ...(workflowProjects.length ? { reviewReadyTickets: this.reviewReadyTickets() } : {}),
+      ...(reviewReadyTickets ? { reviewReadyTickets } : {}),
       ...(releasedAssessmentClaims.length ? { releasedAssessmentClaims } : {}),
       claims: this.db.prepare("SELECT * FROM fleet_claims ORDER BY created,ticket").all() as unknown as Claim[],
       runs: this.db.prepare("SELECT request,generation,created FROM fleet_runs WHERE finished IS NULL ORDER BY created,id").all()

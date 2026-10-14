@@ -245,7 +245,8 @@ export class WorkflowStore {
   }
   /**
    * Open tickets of adopted projects that wait for review, see awaitsReview,
-   * in ticket order, whoever owns them. Kept like openTicketsWithLabel, since
+   * in ticket order, whoever owns them. A project still preparing is left
+   * out, since the authority starts nothing there. Kept like openTicketsWithLabel, since
    * every scheduler snapshot asks; a blocker's state is a ticket row too, so
    * data_version covers it.
    */
@@ -259,6 +260,7 @@ export class WorkflowStore {
       .prepare(
         `SELECT * FROM workflow_tickets
          WHERE project IN (SELECT project FROM workflow_projects)
+           AND project NOT IN (SELECT project FROM workflow_migrations)
            AND json_extract(item,'$.state') IS NOT 'CLOSED'
            AND json_extract(item,'$.status') IN (${columns.map(() => "?").join(",")})
          ORDER BY ticket`,
@@ -281,6 +283,7 @@ export class WorkflowStore {
       .get(project);
   }
   prepare(project: string): void {
+    this.reviewTickets = undefined;
     if (!projectPattern.test(project))
       throw new Error("Invalid workflow project");
     this.db
@@ -288,6 +291,7 @@ export class WorkflowStore {
       .run(project);
   }
   activate(project: string): void {
+    this.reviewTickets = undefined;
     if (!this.enabled(project))
       throw new Error("Import the workflow before activation");
     this.db
@@ -295,6 +299,7 @@ export class WorkflowStore {
       .run(project);
   }
   cancelPreparation(project: string): void {
+    this.reviewTickets = undefined;
     if (this.enabled(project))
       throw new Error("Imported workflow cannot revert to GitHub authority");
     this.db
