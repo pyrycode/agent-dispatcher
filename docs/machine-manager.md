@@ -181,9 +181,10 @@ A failed reader or invalid response escalates, without a less restricted fallbac
 The four possible decisions are:
 
 - `wait`: review is making progress or no intervention is needed. Record the
-  assessment and allow the ordinary workflow to continue. If the same eligible
-  incident remains unresolved, reassess after thirty minutes. This delay persists
-  across restarts. Running workers and deliberate holds still prevent reassessment.
+  assessment and allow the ordinary workflow to continue. The wait is settled
+  against what it depends on and is not reassessed on a timer. See
+  [Settled waits](#settled-waits). Running workers and deliberate holds still
+  prevent reassessment.
 - `retry`: remove the error on the current failed stage. Code restricts this to
   a recognised stage with no completion label. Existing automatic backoff keeps
   its own budget and is not assessed by this path.
@@ -223,10 +224,39 @@ and one assessment at a time bound investigation concurrency. Each ticket can
 receive three automatic repair or retry handbacks per rolling twenty-four hours.
 Budget exhaustion escalates that ticket without preventing unrelated recoveries.
 Real escalations and completed handbacks are not replayed on a timer. Wait decisions
-recheck after thirty minutes. Normal review can still advance, and a changed rework
-count creates a new assessment. Previously exhausted fleet quotas and incorrectly
+and operational escalations are settled, as described below. Normal review can still
+advance, and a changed rework count creates a new assessment. Previously exhausted fleet quotas and incorrectly
 held sizing markers become eligible again. Genuine escalations and interrupted
 handbacks remain held for inspection.
+
+### Settled waits
+
+A `wait` decision, or an `escalate` decision with category `operational`, records a
+settlement in `fleet_recovery_settlement`. It stores the incident's ticket
+fingerprint and the state of everything the decision waits on, with a digest. The
+incident is assessed again only when one of these changes:
+
+- the ticket fingerprint: stage, recovery labels, body, non-recovery comments,
+  blockers and their state, retained logs, the ticket's own recovery task results,
+  or its pause record. A human comment or an operator pause lands here.
+- a named recovery task leaves the queued, running or publishing phase. Tasks come
+  from the decision's optional `waitFor.tasks`, and from 64-hex identifiers in the
+  reason that match a real recovery task.
+- a ticket named in `waitFor.tickets` changes stage or leaves the open board.
+- the ticket's coordination records, including an operator `coordination` receipt.
+- for operational escalations, a capability becomes ready on some computer.
+- an explicit code deadline: the repair budget expiry, or the thirty-minute cooldown
+  that code sets after a transient GitHub transport failure. An assessment cannot
+  request that cooldown.
+- the safety interval, 24 hours by default, so nothing is forgotten. Set
+  `recovery.safetyRecheckHours` in the claim service configuration to change it,
+  between one hour and thirty days.
+
+The cause that reopened a settlement is stored in its `reopened` column and shown in
+`/recovery/state`. Incidents settled before this policy are recorded against the
+state at the first report after deployment, so the deployment itself does not
+trigger assessments. Waits for idle dependency and Inbox checks keep their earlier
+rule: only a ticket change reopens them.
 
 The decision and repair budget are stored before GitHub writes. A process that
 stops during assessment or handback keeps its reservation. Once that exact run

@@ -75,7 +75,10 @@ async function main(): Promise<void> {
     mkdirSync(dirname(database), { recursive: true, mode: 0o700 });
     const machines = Object.fromEntries(Object.entries(config.machines).map(([id, value]) => [id, secret((value as any).tokenEnv)]));
     const limits = Object.fromEntries(Object.entries(config.machines).map(([id, value]) => [id, { heavyLimit: (value as any).heavyLimit, combinedLimit: (value as any).combinedLimit }]));
-    const store = new FleetStore(database, limits);
+    // Unchanged settled waits are reassessed after this interval. Default 24 hours.
+    const safetyHours = config.recovery?.safetyRecheckHours;
+    if (safetyHours !== undefined && (typeof safetyHours !== "number" || !Number.isFinite(safetyHours))) throw new Error("recovery.safetyRecheckHours must be a number");
+    const store = new FleetStore(database, limits, safetyHours === undefined ? {} : { safetyRecheckMs: Math.round(safetyHours * 3600_000) });
     const github = config.github ? new GitHubBroker({ ...config.github,
       projects: [...new Set([...config.github.projects, ...Object.values(config.updates?.consumers ?? {}), ...(config.updates?.dispatcherRepository ? [config.updates.dispatcherRepository] : [])])], token: secret(config.github.tokenEnv) }) : undefined;
     const updates = config.updates && github ? new FleetUpdates(github, config.updates.consumers, config.updates.dispatcherRepository) : undefined;

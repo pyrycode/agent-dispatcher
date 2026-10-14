@@ -6,6 +6,8 @@ import {ARTIFACT_LIMITS,artifactManifest,manifestHash,sha256,validateArtifactPat
 
 export const CAPABILITIES = ['linux-amd64','macos-arm64','android-emulator','dispatcher-repair'] as const;
 export type Capability = typeof CAPABILITIES[number];
+/** A capability report older than this is stale: its machine may be offline. */
+export const CAPABILITY_FRESH_MS = 180_000;
 export interface RecoveryTaskRequest {
  recipe: 'platform-probe'|'memory-runtime-smoke'|'android-tool-then-text'|'dispatcher-repair';
  capability: Capability; revision?: string; reason: string;
@@ -135,7 +137,7 @@ export class RecoveryTasks {
   // A read-only provenance assessment never authorises a previously queued task.
   if(incident && (/Explicit operator hold|Denied permission|Pause origin unknown/.test(String(incident.reason))
     || incident.state==='escalated' && incident.decision && JSON.parse(String(incident.decision)).category==='human')) return false;
-  return task.state==='queued' && !!host?.ready && this.now()-host.updated<180000 && host.capabilities.includes(task.request.capability);
+  return task.state==='queued' && !!host?.ready && this.now()-host.updated<CAPABILITY_FRESH_MS && host.capabilities.includes(task.request.capability);
  }
  begin(id:string,machine:string,session:string,runId:string):void {
   if (!this.available(machine,id)) throw new Error('Task or capability unavailable');
