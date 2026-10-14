@@ -1,6 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import type { ProjectItem } from "./types.js";
+import { RECOVERY_PRIORITY, RECOVERY_REPAIRING, LEGACY_RECOVERY_PRIORITY, WRITE_LEGACY_RECOVERY_PRIORITY } from "./recovery-labels.js";
 
 export type WorkflowItem = ProjectItem & {
   state: "OPEN" | "CLOSED";
@@ -51,6 +52,90 @@ export class WorkflowStore {
       CREATE INDEX IF NOT EXISTS workflow_issue_id ON workflow_tickets(json_extract(item,'$.issueId'));
       CREATE INDEX IF NOT EXISTS workflow_parent ON workflow_tickets(project,json_extract(item,'$.parentNumber'));
       CREATE INDEX IF NOT EXISTS workflow_order ON workflow_tickets(project,position);`);
+    this.migrateRecoveryPriority();
+  }
+  /**
+   * Renames the saved recovery priority label once. Idempotent: a converged
+   * store changes nothing. Each change is a recorded workflow command.
+   * While old dispatchers may run, the old name stays beside the new one.
+   */
+  migrateRecoveryPriority(retireLegacy = !WRITE_LEGACY_RECOVERY_PRIORITY): number {
+    let changed = 0;
+    const rows = this.db
+      .prepare(
+        "SELECT ticket FROM workflow_tickets WHERE EXISTS (SELECT 1 FROM json_each(item,'$.labels') WHERE value=?) ORDER BY ticket",
+      )
+      .all(LEGACY_RECOVERY_PRIORITY);
+    for (const row of rows) {
+      const ticket = String(row.ticket),
+        item = this.get(ticket);
+      const addLabels = item.labels.includes(RECOVERY_PRIORITY)
+        ? []
+        : [RECOVERY_PRIORITY];
+      const removeLabels = retireLegacy ? [LEGACY_RECOVERY_PRIORITY] : [];
+      if (!addLabels.length && !removeLabels.length) continue;
+      this.change(
+        ticket,
+        { addLabels, removeLabels },
+        "migration:recovery-priority",
+        `migration:recovery-priority:${ticket}:${item.revision}`,
+        item.revision,
+      );
+      changed++;
+    }
+    return changed;
+  }
+  /**
+   * The repair run marker ends when the run the handback assigned has
+   * finished, whatever its outcome. That run is the first stage run to mark
+   * the ticket running after the marker was added. Removing it here, with no
+   * active run on the ticket, covers an interrupted run, a crashed worker
+   * released by an operator and a dispatcher that does not remove it itself.
+   */
+  settleRepairing(project: string): string[] {
+    const settled: string[] = [];
+    for (const item of this.list(project)) {
+      const ticket = `${project}#${item.issueNumber}`;
+      if (
+        !item.labels.includes(RECOVERY_REPAIRING) ||
+        this.db
+          .prepare("SELECT 1 FROM fleet_runs WHERE ticket=? AND finished IS NULL")
+          .get(ticket)
+      )
+        continue;
+      const adds = (change: string, label: (l: string) => boolean) => {
+        try {
+          const c = JSON.parse(change);
+          return [...(c?.addLabels ?? []), ...(c?.labels ?? [])].some(
+            (l: unknown) => typeof l === "string" && label(l),
+          );
+        } catch {
+          return false;
+        }
+      };
+      const events = this.db
+        .prepare("SELECT change FROM workflow_events WHERE ticket=? ORDER BY id")
+        .all(ticket)
+        .map((e) => String(e.change));
+      let assigned = -1;
+      events.forEach((e, i) => {
+        if (adds(e, (l) => l === RECOVERY_REPAIRING)) assigned = i;
+      });
+      if (
+        assigned < 0 ||
+        !events.slice(assigned + 1).some((e) => adds(e, (l) => l.startsWith("wip:")))
+      )
+        continue;
+      this.change(
+        ticket,
+        { removeLabels: [RECOVERY_REPAIRING] },
+        "authority",
+        `repairing:${ticket}:${item.revision}`,
+        item.revision,
+      );
+      settled.push(ticket);
+    }
+    return settled;
   }
   projects(): WorkflowProject[] {
     return this.db

@@ -48,7 +48,7 @@ monitoring or reporting process is added.
 
 ## Scheduling
 
-Each manager configuration lists projects in priority order. It first considers runnable locally claimed recovery and repair work, then locally claimed ordinary work, then unclaimed recovery and repair work, then unclaimed ordinary work. Recovery includes assessments and tickets labelled `orchestrator:fixing`. Routine dependency assessments and quiet Inbox readiness checks form a final idle-only group, after all actionable ticket offers regardless of ownership. They run only when the local computer has no active ticket reservation and selects no ready ticket stage. Actual stage errors and assigned repairs retain the existing recovery order. Within the claimed groups, oldest claim comes next. Within the unclaimed groups, project order comes next. The dispatcher's ticket priority labels and stage order break ties. The manager rereads offers and reservations before every admission. An owned offer that cannot fit the remaining capacity does not prevent fitting unclaimed work from starting. Running work is never pre-empted. A blocked or errored ticket stays owned but is absent from ordinary eligible offers, so other work can proceed. Strict project priority can starve a lower project if higher projects always have eligible work.
+Each manager configuration lists projects in priority order. It first considers runnable locally claimed recovery and repair work, then locally claimed ordinary work, then unclaimed recovery and repair work, then unclaimed ordinary work. Recovery includes assessments and tickets labelled `orchestrator:recovery-priority`, or its old name `orchestrator:fixing`. Routine dependency assessments and quiet Inbox readiness checks form a final idle-only group, after all actionable ticket offers regardless of ownership. They run only when the local computer has no active ticket reservation and selects no ready ticket stage. Actual stage errors and assigned repairs retain the existing recovery order. Within the claimed groups, oldest claim comes next. Within the unclaimed groups, project order comes next. The dispatcher's ticket priority labels and stage order break ties. The manager rereads offers and reservations before every admission. An owned offer that cannot fit the remaining capacity does not prevent fitting unclaimed work from starting. Running work is never pre-empted. A blocked or errored ticket stays owned but is absent from ordinary eligible offers, so other work can proceed. Strict project priority can starve a lower project if higher projects always have eligible work.
 
 A dispatcher can explicitly cancel a reservation it never started, for example after a board stage changes. That cancellation releases a new ticket claim only if no actual or uncertain run has used that ownership generation. Completed, failed and blocked implementation keeps its claim. A confirmed assessment-only wait releases its claim with an authority receipt for the exact owner and generation. Offline reservations still require manual release. A cancelled offer therefore cannot gain priority over work that is ready to run.
 
@@ -198,14 +198,33 @@ The four possible decisions are:
   changed.
 
 The issue receives `orchestrator:investigating` while its admitted assessment runs.
-A retry or code-repair handback receives `orchestrator:fixing`. That label remains
-through the repair pipeline and gives each subsequent stage recovery priority.
-It means an orchestrator repair is in progress, including waits between stages.
-It is removed when the ticket reaches Done, is held, encounters another error,
-or its assessment escalates. Investigation labels are removed when assessment
-ends. Owned, idle-ticket reconciliation removes stale labels after an interrupted
-run or failed cleanup. Existing ticket ownership is checked before each write.
-The two labels are created by GitHub on first use, like other workflow labels.
+It is removed when the assessment ends.
+
+A handback that assigns a repair receives `orchestrator:recovery-priority`. These
+are retry, rework, resume, refine, unblock and coordinate. The label stays through
+the repair pipeline, including waits between stages. It gives each later stage
+recovery priority and gives the builder or developer extra-high effort. It is
+removed when the ticket reaches Done, is Halted, gets an operator hold or another
+error, or a later assessment escalates. Until 2026-10-14 this label was called
+`orchestrator:fixing`; see [Recovery labels](workflow-authority.md#recovery-labels)
+for the rename.
+
+`orchestrator:repairing` shows the assigned repair run itself. Retry, rework,
+resume and refine receive it with the handback, because each assigns an
+ordinary stage run: the failed stage, the builder or developer, the recorded
+stage, or the refiner. It stays while the ticket waits for that run and while
+the run works. It is removed when that first run finishes, whatever its
+outcome, and on every condition that removes recovery priority. Unblock and
+coordinate assign no stage run, so they get priority without this label.
+
+Owned, idle-ticket reconciliation removes stale labels after an interrupted
+run or failed cleanup. It removes a repairing label left without recovery
+priority. For an imported project, the central store also removes a repairing
+label once the assigned run has marked the ticket running and no run remains
+active on it. That covers a crashed worker after the operator releases it.
+Existing ticket ownership is checked before each write. The publisher creates
+the two new labels on GitHub on first use, in one bright shared colour with a
+description.
 
 The model only proposes a decision. The wrapper checks current open issue state
 before and after assessment, and validates the proposed handback. It cannot

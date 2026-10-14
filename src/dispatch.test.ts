@@ -5281,6 +5281,39 @@ describe("runConcurrentDispatches", () => {
     // The attempted wip removal was recorded (failed, but attempted).
     assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1104 && c.label === "wip:developer"));
   });
+  test("the assigned repair run ends the repairing marker but keeps recovery priority", async () => {
+    const claudeMd = claudeMdAbsPath("developer/CLAUDE.md");
+    const repair = ["orchestrator:recovery-priority", "orchestrator:fixing", "orchestrator:repairing", "wip:developer"];
+    const client = new MockGitHubClient({
+      status: { 1105: "In Development", 1106: "In Development" },
+      labels: { 1105: [...repair], 1106: ["wip:developer"] },
+    });
+    const { deps } = makeMockDeps({
+      execImpls: {
+        "git rev-parse --verify feature/1105": () => execError({ stderr: "fatal" }),
+        "git rev-parse --verify origin/feature/1105": () => execError({ stderr: "fatal" }),
+        "git rev-parse --verify feature/1106": () => execError({ stderr: "fatal" }),
+        "git rev-parse --verify origin/feature/1106": () => execError({ stderr: "fatal" }),
+        "git status --porcelain": () => "",
+        "git rev-list --count main..": () => "1\n",
+      },
+      fsMap: { [claudeMd]: "developer system prompt" },
+      // The repair run fails. Its outcome does not matter to the marker.
+      streamResult: (opts) => opts?.cwd?.includes("developer-1105")
+        ? streamResult({ isError: true, terminalReason: "api_error", output: "anthropic API failure" })
+        : streamResult({ isError: false, output: "ok" }),
+    });
+    const agent = makeAgentConfig({});
+    await runConcurrentDispatches([
+      { agent, item: makeProjectItem({ issueNumber: 1105, labels: [...repair] }) },
+      { agent, item: makeProjectItem({ issueNumber: 1106, labels: ["wip:developer"] }) },
+    ], client, deps);
+    const removed = (n: number) => client.removeLabelCalls.filter(c => c.issueNumber === n).map(c => c.label);
+    assert.ok(removed(1105).includes("orchestrator:repairing"));
+    assert.ok(!removed(1105).includes("orchestrator:recovery-priority"));
+    assert.ok(!removed(1105).includes("orchestrator:fixing"));
+    assert.ok(!removed(1106).includes("orchestrator:repairing"), "an ordinary run writes nothing extra");
+  });
 });
 
 // =====================================================================

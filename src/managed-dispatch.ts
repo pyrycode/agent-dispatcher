@@ -11,6 +11,7 @@ import type { Claim, FleetRun, FleetSnapshot, ResourceClass } from "./fleet-stor
 import type { WorkOffer } from "./machine-scheduler.js";
 import type { AgentConfig, ProjectItem } from "./types.js";
 import { observationFor } from "./recovery-work.js";
+import { hasRecoveryPriority } from "./recovery-labels.js";
 import type { PauseRecord, EvidenceRecord, CoordinationRecord } from "./recovery-facts.js";
 import type { RecoveryObservation, RecoveryIncident, RecoveryDecision } from "./fleet-recovery.js";
 import type { AgentRunner } from './agent-runner.js';
@@ -110,7 +111,7 @@ export class ManagedDispatch {
   }
   beginCycle(): void { this.seen.clear(); }
   setRecoveryTickets(items: readonly ProjectItem[]): void {
-    this.recoveryTickets = new Set(items.filter(i => i.labels.includes("orchestrator:fixing"))
+    this.recoveryTickets = new Set(items.filter(i => hasRecoveryPriority(i.labels))
       .map(i => `${this.project}#${i.issueNumber}`));
     for (const p of this.pending.values()) if (!p.run && p.offer.role !== 'recovery') {
       p.offer.recovery = this.recoveryTickets.has(p.offer.ticket);
@@ -149,7 +150,7 @@ export class ManagedDispatch {
       agent.serial ? [`${this.project}:role:${agent.name}`] : [], order);
     pending.offer.roleLimit = agent.serial ? 1 : agent.maxInFlight;
     if (!pending.run) {
-      pending.offer.recovery = item.labels.includes("orchestrator:fixing");
+      pending.offer.recovery = hasRecoveryPriority(item.labels);
       pending.offer.recoveryError = pending.offer.recovery;
     }
     return pending;

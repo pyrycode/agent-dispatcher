@@ -3,6 +3,7 @@ import type { DatabaseSync } from "node:sqlite";
 import type { FleetSnapshot } from "./fleet-store.js";
 import {validateTaskRequest, CAPABILITY_FRESH_MS, type RecoveryTaskRequest} from "./recovery-tasks.js";
 import type { PauseRecord } from "./recovery-facts.js";
+import { hasRecoveryPriority } from "./recovery-labels.js";
 
 export interface RecoveryObservation {
   ticket: string; status: string; labels: string[]; blocked: boolean;
@@ -107,7 +108,7 @@ export function recoveryTrigger(o: RecoveryObservation): { reason: string; manua
   if (o.labels.some(l => l.startsWith("error-retry-count:"))) return null;
   // The assigned repair already addresses these retained historical counts.
   // A new stage error still triggers diagnosis above.
-  if (o.labels.includes("orchestrator:fixing")) return null;
+  if (hasRecoveryPriority(o.labels)) return null;
   if (o.labels.some(l => /^rework-count:\d+$/.test(l) && Number(l.split(":")[1]) >= 2)) return { reason: "Repeated review rework", manual: false };
   if (o.status === "Inbox" && o.labels.some(l => l === RECOVERY_RETURNED_INBOX || l === "needs-real-claude" || l === "done:refiner")) return { reason: "Pipeline evidence or refinement is needed in Inbox", manual: false };
   if (o.status === "Inbox") return { reason: RECOVERY_INBOX_REASON, manual: false };

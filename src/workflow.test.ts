@@ -10,6 +10,7 @@ import { GitHubBroker } from "./github-broker.js";
 import { workflowClient } from "./workflow-client.js";
 import { JsonClient, serveFleet } from "./fleet-http.js";
 import { decideReworkRoutes, decideAutoAdvance } from "./pipeline-decisions.js";
+import { DatabaseSync } from "node:sqlite";
 import type { WorkflowItem, WorkflowProject } from "./workflow-store.js";
 
 const config: WorkflowProject = {
@@ -974,4 +975,131 @@ test("bridge mutation responses carry only the fields the caller selected", asyn
   assert.deepEqual(saved.labels, ["done:refiner"]);
   assert.deepEqual(saved.blockedBy.map((b) => b.number), [2]);
   assert.equal(store.workflow.pendingComments().length, 1);
+});
+
+const PRIORITY = "orchestrator:recovery-priority",
+  LEGACY = "orchestrator:fixing",
+  REPAIRING = "orchestrator:repairing";
+const events = (path: string, ticket: string) => {
+  const db = new DatabaseSync(path);
+  try {
+    return db
+      .prepare("SELECT actor,change FROM workflow_events WHERE ticket=? ORDER BY id")
+      .all(ticket)
+      .map((e) => ({ actor: String(e.actor), change: String(e.change) }));
+  } finally {
+    db.close();
+  }
+};
+test("the saved fixing label migrates once at central start, keeps the old name for old dispatchers and records history", (t) => {
+  const { store, path } = fixture(t);
+  store.workflow.import(config, [
+    { ...item(1947), labels: [LEGACY, "rework-count:2"] },
+    { ...item(1948), labels: [LEGACY, PRIORITY] },
+    { ...item(1949), labels: ["priority:high"] },
+  ]);
+  const open = () => {
+    const s = new FleetStore(path, { mac: { heavyLimit: 2, combinedLimit: 2 } });
+    t.after(() => s.close());
+    return s;
+  };
+  const started = open();
+  assert.deepEqual(started.workflow.get("org/mobile#1947").labels, [LEGACY, "rework-count:2", PRIORITY]);
+  assert.equal(started.workflow.get("org/mobile#1947").revision, 2);
+  assert.equal(started.workflow.get("org/mobile#1948").revision, 1, "an already migrated ticket is not touched");
+  assert.equal(started.workflow.get("org/mobile#1949").revision, 1);
+  assert.deepEqual(events(path, "org/mobile#1947"), [
+    { actor: "migration:recovery-priority", change: JSON.stringify({ addLabels: [PRIORITY], removeLabels: [] }) },
+  ]);
+  // A second start and an explicit run change nothing.
+  const restarted = open();
+  assert.equal(restarted.workflow.migrateRecoveryPriority(), 0);
+  assert.equal(restarted.workflow.get("org/mobile#1947").revision, 2);
+  assert.equal(events(path, "org/mobile#1947").length, 1);
+  // The later retirement removes the old name, also exactly once.
+  assert.equal(restarted.workflow.migrateRecoveryPriority(true), 2);
+  assert.equal(restarted.workflow.migrateRecoveryPriority(true), 0);
+  assert.deepEqual(restarted.workflow.get("org/mobile#1947").labels, ["rework-count:2", PRIORITY]);
+  assert.deepEqual(restarted.workflow.get("org/mobile#1948").labels, [PRIORITY]);
+});
+test("the repairing marker lasts from the handback until the assigned run ends, including an interrupted run", (t) => {
+  const { store } = fixture(t);
+  store.workflow.import(config, [item(1947), item(1950)]);
+  const handback = (ticket: string) =>
+    store.workflow.change(ticket, { addLabels: [PRIORITY, LEGACY, REPAIRING] }, "mac:s", `handback:${ticket}`);
+  const labels = (ticket: string) => store.workflow.get(ticket).labels;
+
+  // Normal run: waits for admission, runs, finishes.
+  handback("org/mobile#1950");
+  assert.deepEqual(store.workflow.settleRepairing(config.project), [], "waiting for its run keeps the marker");
+  store.start({ ...run("normal"), role: "builder", ticket: "org/mobile#1950" });
+  store.workflowChange("mac", "s", "normal", "org/mobile#1950", { addLabels: ["wip:builder"] }, "claim-1950");
+  assert.deepEqual(store.workflow.settleRepairing(config.project), [], "a running repair keeps the marker");
+  store.finish("mac", "s", "normal");
+  assert.deepEqual(store.workflow.settleRepairing(config.project), ["org/mobile#1950"]);
+  assert.deepEqual(labels("org/mobile#1950"), [PRIORITY, LEGACY], "recovery priority continues through later stages");
+
+  // Interrupted run: the worker dies holding its reservation and its running label.
+  handback("org/mobile#1947");
+  store.start({ ...run("crashed"), role: "builder" });
+  store.workflowChange("mac", "s", "crashed", "org/mobile#1947", { addLabels: ["wip:builder"] }, "claim-1947");
+  assert.deepEqual(store.workflow.settleRepairing(config.project), [], "an uncertain worker still holds its run");
+  store.free("org/mobile#1947", store.snapshot().claims.find((c) => c.ticket === "org/mobile#1947")!.generation, true);
+  assert.deepEqual(store.workflow.settleRepairing(config.project), ["org/mobile#1947"]);
+  assert.deepEqual(labels("org/mobile#1947"), [PRIORITY, LEGACY, "wip:builder"]);
+  assert.deepEqual(store.workflow.settleRepairing(config.project), [], "settling is idempotent");
+
+  // A later handback starts a new repair, and earlier runs do not end it.
+  store.workflow.change("org/mobile#1947", { removeLabels: ["wip:builder"] }, "mac:s", "sweep");
+  store.workflow.change("org/mobile#1947", { addLabels: [REPAIRING] }, "mac:s", "second-handback");
+  assert.deepEqual(store.workflow.settleRepairing(config.project), []);
+  assert.ok(labels("org/mobile#1947").includes(REPAIRING));
+});
+test("the publisher settles repair markers and creates the recovery labels with their colour and description", async (t) => {
+  const { store } = fixture(t);
+  store.workflow.import(config, [{ ...item(), labels: [PRIORITY, LEGACY, REPAIRING] }]);
+  store.workflow.change("org/mobile#1947", { addLabels: [REPAIRING] }, "mac:s", "handback");
+  store.workflow.change("org/mobile#1947", { addLabels: ["wip:builder"] }, "mac:s", "claim");
+  store.workflow.change("org/mobile#1947", { removeLabels: ["wip:builder"] }, "mac:s", "release");
+  const catalog: Array<{ id: number; node_id: string; name: string }> = [],
+    created: Array<Record<string, string>> = [];
+  const github = new GitHubBroker({
+    token: "test",
+    projects: ["org/mobile"],
+    fetcher: async (input, init) => {
+      const path = String(input),
+        body = init?.body ? JSON.parse(String(init.body)) : {};
+      if (path.includes("/labels") && init?.method === "POST") {
+        created.push(body);
+        catalog.push({ id: catalog.length + 1, node_id: `L${catalog.length + 1}`, name: body.name });
+        return new Response(JSON.stringify(catalog.at(-1)), { status: 201 });
+      }
+      if (path.includes("/labels")) return new Response(JSON.stringify(catalog));
+      if (body.query?.startsWith("mutation {"))
+        return new Response(
+          JSON.stringify({ data: { i0: { issue: { id: "I1947" } }, s0: { projectV2Item: { id: "P1947" } } } }),
+        );
+      if (body.query?.startsWith("query($ids:"))
+        return new Response(JSON.stringify({ data: { nodes: [remoteMetadata(store.workflow.get("org/mobile#1947"))] } }));
+      if (body.query?.startsWith("query($id:ID!)"))
+        return new Response(
+          JSON.stringify({ data: { node: { blockedBy: { nodes: [], pageInfo: { hasNextPage: false } } } } }),
+        );
+      if (body.query?.includes("repository"))
+        return new Response(
+          JSON.stringify({ data: { repository: { issues: { nodes: [], pageInfo: { hasNextPage: false } } } } }),
+        );
+      throw new Error("Unexpected GitHub request");
+    },
+  });
+  await new WorkflowPublisher(store, github).tick();
+  assert.deepEqual(store.workflow.get("org/mobile#1947").labels, [PRIORITY, LEGACY]);
+  assert.deepEqual(created, [
+    {
+      name: PRIORITY,
+      color: "FF1493",
+      description: "Orchestrator repair assigned. Its stages get recovery priority until Done, a hold or a new error.",
+    },
+    { name: LEGACY, color: "ededed" },
+  ]);
 });

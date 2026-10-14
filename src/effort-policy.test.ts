@@ -114,12 +114,15 @@ describe("builder effort", () => {
 });
 
 test("orchestrator code repairs use xhigh with either runner despite lower defaults", () => {
-  for (const runner of ["claude", "codex"] as const) {
-    for (const name of ["builder", "developer"]) {
-      const result = resolveEffort({ agent: agent(name, "low"), item: { body: routine, labels: ["orchestrator:fixing"] },
-        runner, env: { PYRY_CODEX_EFFORT: "medium" }, stageSet: name === "builder" ? "builder" : "default" });
-      assert.equal(result.effort, "xhigh");
-      assert.equal(result.reason, "orchestrator recovery repair");
+  // The old name stays equivalent while dispatchers of both versions run.
+  for (const label of ["orchestrator:recovery-priority", "orchestrator:fixing"]) {
+    for (const runner of ["claude", "codex"] as const) {
+      for (const name of ["builder", "developer"]) {
+        const result = resolveEffort({ agent: agent(name, "low"), item: { body: routine, labels: [label] },
+          runner, env: { PYRY_CODEX_EFFORT: "medium" }, stageSet: name === "builder" ? "builder" : "default" });
+        assert.equal(result.effort, "xhigh");
+        assert.equal(result.reason, "orchestrator recovery repair");
+      }
     }
   }
 });
