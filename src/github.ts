@@ -1015,25 +1015,68 @@ export class GitHubProjectClient {
     return result.addProjectV2ItemById.item.id;
   }
 
-  /** Labels this client has already made sure exist with their scheme colour. */
-  private readonly ensuredLabels = new Set<string>();
+  /** Lower-cased names of the repo's labels, loaded once per process (GitHub label names are case-insensitive). */
+  private labelNames: Promise<Set<string> | undefined> | undefined;
+  private labelNamesRetryAt = 0;
+  private readonly labelCreateRetryAt = new Map<string, number>();
+
+  private loadLabelNames(): Promise<Set<string> | undefined> {
+    if (this.labelNames) return this.labelNames;
+    if (Date.now() < this.labelNamesRetryAt) return Promise.resolve(undefined);
+    const load = (async () => {
+      const names = new Set<string>();
+      for (let page = 1; page <= 20; page++) {
+        const response = await githubFetch(
+          `https://api.github.com/repos/${this.config.owner}/${this.config.repo}/labels?per_page=100&page=${page}`,
+          { headers: { Authorization: `token ${this.config.token}` } },
+        );
+        if (!response.ok) throw new Error(`label list ${response.status}`);
+        const rows: any = await response.json();
+        if (!Array.isArray(rows)) throw new Error("label list is not an array");
+        for (const row of rows) names.add(String(row?.name).toLowerCase());
+        if (rows.length < 100) break;
+      }
+      return names;
+    })().catch(() => {
+      // Best effort: adding the label still creates it, just in grey. Try the list again in a minute.
+      this.labelNames = undefined;
+      this.labelNamesRetryAt = Date.now() + 60_000;
+      return undefined;
+    });
+    this.labelNames = load;
+    return load;
+  }
 
   /**
-   * GitHub's add-label endpoint creates an unknown label with a default grey.
-   * Create it first with the shared scheme colour. A label that already exists
-   * answers 422 and is left alone, so existing colours are never overwritten.
+   * GitHub's add-label endpoint creates an unknown label with a default grey and
+   * never answers "not found", so there is no failure to react to. Instead the
+   * repo's label names are read once per process (one GET, through the shared
+   * GitHub transport), and a label is created with its scheme colour only when
+   * it is missing from that list. Adding an existing label costs no extra call,
+   * and an existing label is never touched, so its colour is never overwritten.
+   * Two writers creating the same label race to a 422, which is harmless.
    */
   private async ensureLabel(label: string): Promise<void> {
-    if (this.ensuredLabels.has(label)) return;
+    const known = await this.loadLabelNames();
+    const key = label.toLowerCase();
+    if (!known || known.has(key)) return;
+    if (Date.now() < (this.labelCreateRetryAt.get(key) ?? 0)) return;
+    // Claim the name before the request so concurrent adds of the same new label send one create.
+    known.add(key);
     try {
-      await fetch(`https://api.github.com/repos/${this.config.owner}/${this.config.repo}/labels`, {
-        method: "POST",
-        headers: { Authorization: `token ${this.config.token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ name: label, color: labelColor(label) }),
-      });
-      this.ensuredLabels.add(label);
+      const response = await githubFetch(
+        `https://api.github.com/repos/${this.config.owner}/${this.config.repo}/labels`,
+        {
+          method: "POST",
+          headers: { Authorization: `token ${this.config.token}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ name: label, color: labelColor(label) }),
+        },
+      );
+      if (!response.ok && response.status !== 422) throw new Error(`label create ${response.status}`);
     } catch {
-      // Best effort: adding the label below still creates it, just in grey.
+      // Best effort: adding the label below still creates it, just in grey. Do not retry for a minute.
+      known.delete(key);
+      this.labelCreateRetryAt.set(key, Date.now() + 60_000);
     }
   }
 

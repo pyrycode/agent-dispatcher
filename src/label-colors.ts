@@ -11,7 +11,6 @@ const EXACT: Readonly<Record<string, string>> = {
   merged: "0F5323",
   "merge-handoff": "BFD9F8",
   "flaky-test": "F2CC60",
-  "trial:invariant-probes": "DDF4FF",
   "orchestrator:escalated": "073F3A",
 };
 
@@ -40,19 +39,26 @@ const DONE_STAGE: Readonly<Record<string, string>> = {
 
 const COUNTER_PREFIXES = ["error-retry-count:", "rework-count:", "rework-other:", "family-dispatches:", "merge-attempt:"];
 
+/** Own-property lookup, so a label named "constructor" or "toString" cannot resolve to an Object.prototype member. */
+function own(table: Readonly<Record<string, string>>, key: string): string | undefined {
+  return Object.hasOwn(table, key) ? table[key] : undefined;
+}
+
 export function labelColor(name: string): string {
-  if (EXACT[name]) return EXACT[name];
+  const exact = own(EXACT, name);
+  if (exact) return exact;
   if (COUNTER_PREFIXES.some((p) => name.startsWith(p))) return "E4E8EC";
   if (name.startsWith("error:")) return "B60205";
   if (name.startsWith("needs-rework:")) return "F5B17A";
   if (name.startsWith("needs-")) return "C2410C";
   if (name.startsWith("wip:")) return "0B5CAD";
   if (name.startsWith("pending-") || name.startsWith("ready:")) return "BFD9F8";
+  if (name.startsWith("trial:")) return "DDF4FF";
   if (name.startsWith("held:")) return "F2CC60";
   if (name.startsWith("orchestrator:")) return "0B6E65";
-  if (name.startsWith("claim:")) return CLAIM[name.slice(6)] ?? "C4CBD3";
-  if (name.startsWith("priority:")) return PRIORITY[name.slice(9)] ?? DEFAULT_LABEL_COLOR;
-  if (name.startsWith("size:")) return SIZE[name.slice(5)] ?? DEFAULT_LABEL_COLOR;
-  if (name.startsWith("done:")) return DONE_STAGE[name.slice(5)] ?? "A5DDB5";
+  if (name.startsWith("claim:")) return own(CLAIM, name.slice(6)) ?? "C4CBD3";
+  if (name.startsWith("priority:")) return own(PRIORITY, name.slice(9)) ?? DEFAULT_LABEL_COLOR;
+  if (name.startsWith("size:")) return own(SIZE, name.slice(5)) ?? DEFAULT_LABEL_COLOR;
+  if (name.startsWith("done:")) return own(DONE_STAGE, name.slice(5)) ?? "A5DDB5";
   return DEFAULT_LABEL_COLOR;
 }
