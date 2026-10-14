@@ -304,6 +304,23 @@ test("a priority:high verifier never preempts and still obeys locks, ownership, 
   // A role limit still holds.
   const limited = { ...v, roleLimit: 1 };
   assert.deepEqual(select([limited, check], { ...base, runs: [running(verifier(30), "linux")] }).map(o => o.ticket), [check.ticket]);
-  // An unknown snapshot field from an older authority changes nothing.
+  // An older authority sends no priorityHighTickets: today's order.
   assert.deepEqual(select([v, check], { ...empty, claims: [claimOf(check, 1)] }).map(o => o.ticket), [check.ticket]);
+});
+
+// 2026-10-14 17:05: #3354 was freed from pyrybox and sat unclaimed. HP's heavy
+// place opened and HP admitted a recovery check on its own claimed #3247.
+test("an unclaimed priority:high verifier goes ahead of another computer's owned recovery check", () => {
+  const ownCheck = { ...offer("org/core", 3247), role: "recovery", order: -100 };
+  const v = verifier(3354);
+  const hp = (offers: WorkOffer[], state: FleetSnapshot) => scheduleMachine({ machine: "hp", heavyLimit: 1, combinedLimit: 2, ticketLimit: 2,
+    projects: ["org/core", "org/mobile"], offers, state }).map(o => o.ticket);
+  const state: FleetSnapshot = { ...empty, claims: [claimOf(ownCheck, 1, "hp")] };
+  assert.deepEqual(hp([ownCheck, v], urgent(state, v)), [v.ticket]);
+  // Without the label, owned-first keeps HP on its own check.
+  assert.deepEqual(hp([ownCheck, v], state), [ownCheck.ticket]);
+  // Owned-first still wins over ordinary unclaimed work, including an unlabelled verifier.
+  const ownBuilder = offer("org/core", 3248);
+  const owned: FleetSnapshot = { ...empty, claims: [claimOf(ownBuilder, 1, "hp")] };
+  assert.deepEqual(hp([verifier(3354), offer("org/core", 1), ownBuilder], urgent(owned, offer("org/core", 1))), [ownBuilder.ticket]);
 });
