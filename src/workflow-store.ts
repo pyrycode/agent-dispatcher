@@ -181,6 +181,19 @@ export class WorkflowStore {
       .all()
       .map((r) => JSON.parse(String(r.config)));
   }
+  /** Open tickets of adopted projects that carry this label, in ticket order. */
+  openTicketsWithLabel(label: string): string[] {
+    return this.db
+      .prepare(
+        `SELECT ticket FROM workflow_tickets
+         WHERE project IN (SELECT project FROM workflow_projects)
+           AND json_extract(item,'$.state') IS NOT 'CLOSED'
+           AND EXISTS (SELECT 1 FROM json_each(item,'$.labels') WHERE value=?)
+         ORDER BY ticket`,
+      )
+      .all(label)
+      .map((r) => String(r.ticket));
+  }
   config(project: string): WorkflowProject | undefined {
     return this.projects().find((p) => p.project === project);
   }

@@ -225,3 +225,85 @@ test("the post-merge codegraph refresh is charged as medium work, one per comput
   assert.equal(scheduleMachine({ machine: "mac", heavyLimit: 1, combinedLimit: 2, projects: ["org/core", "org/mobile"], offers: [refresh], state: { claims: [], runs: [] } }).length, 1);
   assert.equal(codegraphOfferShape("bad name"), null, "a name a ticket cannot carry skips the refresh instead of failing the cycle");
 });
+
+// pyrycode #3324 and #3354 on 2026-10-14: priority:high verifiers sat behind
+// 23 recovery checks waiting for pyrybox's one heavy place.
+const verifier = (n: number, project = "org/core"): WorkOffer => ({ ...offer(project, n), role: "verifier" });
+const claimOf = (o: WorkOffer, created: number, machine = "mac") => ({ ticket: o.ticket, machine, generation: `g${created}`, created });
+const urgent = (state: FleetSnapshot, ...offers: WorkOffer[]): FleetSnapshot => ({ ...state, priorityHighTickets: offers.map(o => o.ticket) });
+
+test("a priority:high verifier is admitted ahead of every kind of recovery waiting for the heavy place", () => {
+  const ownedCheck = { ...offer("org/core", 1), role: "recovery", order: -100 };
+  const failedCheck = { ...offer("org/core", 2), role: "recovery", recoveryError: true, order: -100 };
+  const repair = { ...offer("org/core", 3), recovery: true, recoveryError: true, order: -100 };
+  const unclaimedCheck = { ...offer("org/mobile", 4), role: "recovery", order: -100 };
+  const task: WorkOffer = { ...offer("org/core", 5), ticket: "org/core#@task-a", role: "recovery-task", supportTaskId: "a", parentTicket: "org/core#5", recovery: true, recoveryError: true, order: -5 };
+  const v = { ...verifier(3354, "org/mobile"), order: 100 };
+  const claims = [ownedCheck, failedCheck, repair].map((o, i) => claimOf(o, i + 1)).concat(claimOf({ ...offer("org/core", 5) }, 4));
+  const state = urgent({ ...empty, claims }, v);
+  for (const rival of [ownedCheck, failedCheck, repair, unclaimedCheck, task]) {
+    assert.deepEqual(select([rival, v], state).map(o => o.ticket), [v.ticket], `${rival.ticket} ${rival.role}`);
+  }
+  // The whole queue at once: the verifier takes the one heavy place, recovery keeps its own order behind it.
+  const all = [ownedCheck, failedCheck, repair, unclaimedCheck, task, v];
+  assert.deepEqual(select(all, state).map(o => o.ticket), [v.ticket]);
+  assert.deepEqual(select(all, state, 3).map(o => o.ticket), [v.ticket, failedCheck.ticket, repair.ticket]);
+});
+
+test("a verifier without priority:high keeps today's place behind recovery", () => {
+  const check = { ...offer("org/core", 1), role: "recovery" };
+  const repair = { ...offer("org/core", 2), recovery: true };
+  const plain = verifier(3354, "org/mobile");
+  const ownedPlain = verifier(3355);
+  const state = { ...empty, claims: [claimOf(check, 1), claimOf(repair, 2), claimOf(ownedPlain, 3)] };
+  for (const s of [state, urgent(state, offer("org/core", 99))]) {
+    assert.deepEqual(select([plain, check], s).map(o => o.ticket), [check.ticket]);
+    assert.deepEqual(select([ownedPlain, repair], s).map(o => o.ticket), [repair.ticket]);
+  }
+});
+
+test("priority:high on another stage does not move it ahead of recovery", () => {
+  const check = { ...offer("org/core", 1), role: "recovery" };
+  const builder = offer("org/core", 2);
+  const state = urgent({ ...empty, claims: [claimOf(check, 1), claimOf(builder, 2)] }, builder);
+  assert.deepEqual(select([builder, check], state).map(o => o.ticket), [check.ticket]);
+});
+
+test("several priority:high verifiers keep the existing order among themselves", () => {
+  const ownedOld = { ...verifier(10), order: 50 }, ownedNew = { ...verifier(11), order: 1 };
+  const unclaimedCore = verifier(12), unclaimedMobile = verifier(1, "org/mobile");
+  const repairing = { ...verifier(13), recovery: true };
+  const check = { ...offer("org/core", 14), role: "recovery" };
+  const state = urgent({ ...empty, claims: [claimOf(ownedNew, 2), claimOf(ownedOld, 1), claimOf(repairing, 3), claimOf(check, 0)] },
+    ownedOld, ownedNew, unclaimedCore, unclaimedMobile, repairing);
+  const order = scheduleMachine({ machine: "mac", heavyLimit: 9, combinedLimit: 9, projects: ["org/core", "org/mobile"], state,
+    offers: [unclaimedMobile, check, unclaimedCore, ownedNew, ownedOld, repairing] }).map(o => o.ticket);
+  // Owned before unclaimed, recovery before ordinary, older claim first, then project rank: as without the label.
+  assert.deepEqual(order, [repairing.ticket, ownedOld.ticket, ownedNew.ticket, unclaimedCore.ticket, unclaimedMobile.ticket, check.ticket]);
+});
+
+test("a priority:high verifier never preempts and still obeys locks, ownership, drains and limits", () => {
+  const v = verifier(3354), check = { ...offer("org/core", 1), role: "recovery" };
+  const base = urgent({ ...empty, claims: [claimOf(check, 1)] }, v);
+  const running = (o: WorkOffer, machine = "mac") => ({ ...o, id: `run-${o.ticket}`, machine, session: "s", generation: "g", created: 1 });
+  // A running heavy job keeps its place; nothing new starts in a full heavy place.
+  assert.deepEqual(select([v, check], { ...base, runs: [running(offer("org/mobile", 7))] }), []);
+  // Same-ticket run, project lock, reconcile lock.
+  assert.deepEqual(select([v, check], { ...base, runs: [running({ ...v, role: "builder", resource: "light" }, "linux")] }, 2).map(o => o.ticket), [check.ticket]);
+  const locked = { ...v, locks: ["org/core:release"] };
+  assert.deepEqual(select([locked, check], { ...base, runs: [running({ ...offer("org/mobile", 8, "light"), project: "org/core", ticket: "org/core#8", locks: ["org/core:release"] }, "linux")] }).map(o => o.ticket), [check.ticket]);
+  assert.deepEqual(select([v], { ...base, runs: [running({ ...offer("org/core", 9, "light"), ticket: "org/core#@reconcile", locks: ["org/core:reconcile"] }, "linux")] }), []);
+  // Owned by another computer: never admitted here.
+  assert.deepEqual(select([v, check], { ...base, claims: [...base.claims, claimOf(v, 2, "linux")] }).map(o => o.ticket), [check.ticket]);
+  // Project drain stops an unclaimed verifier.
+  assert.deepEqual(scheduleMachine({ machine: "mac", projects: ["org/core", "org/mobile"], drainingProjects: ["org/core"], heavyLimit: 1, combinedLimit: 1,
+    offers: [v], state: base }), []);
+  // A full new-ticket budget leaves the unclaimed verifier waiting and the fitting owned check runs.
+  const busy = { ...base, runs: [running(offer("org/mobile", 20, "light")), running(offer("org/mobile", 21, "light"))] };
+  assert.deepEqual(capped([v, check], busy).map(o => o.ticket), [check.ticket]);
+  // A role limit still holds.
+  const limited = { ...v, roleLimit: 1 };
+  assert.deepEqual(select([limited, check], { ...base, runs: [running(verifier(30), "linux")] }).map(o => o.ticket), [check.ticket]);
+  // An unknown snapshot field from an older authority changes nothing.
+  assert.deepEqual(select([v, check], { ...empty, claims: [claimOf(check, 1)] }).map(o => o.ticket), [check.ticket]);
+});
