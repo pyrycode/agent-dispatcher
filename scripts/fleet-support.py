@@ -315,6 +315,9 @@ class ArtifactPassError(Exception):
     """A completed record's artifact recovery failed. No worker or host state is involved."""
     def __init__(self,error):super().__init__(type(error).__name__+': '+str(error));self.error=error
 
+class ReleasePassError(ArtifactPassError):
+    """The authority refused or lost one proven-gone worker's release. Local to that record."""
+
 def route_available(route):
     capability=route['capability']
     required=['go'] if capability in {'linux-amd64','macos-arm64'} else ['go','java','adb'] if capability=='android-emulator' else ['node','pnpm','codex']
@@ -368,6 +371,20 @@ def worker_gone_with_container(old):
         return 'Its container '+container+' restarted after the worker last wrote, so the worker ran in an instance that has stopped.'
     return None
 
+OPEN_PHASES={'drain-requested','draining','start-requested','verifying','waiting-for-native-task'}
+
+def operation_open(record):
+    """Whether a supervisor record means the container may be draining or updating.
+
+    A health latch, or attention after a start was issued, leaves the dispatcher
+    running with nothing draining. Any other attention record may hold an
+    undelivered or stuck drain, so it stays open."""
+    phase=record.get('phase')
+    if phase in OPEN_PHASES:return True
+    if phase!='attention':return False
+    if record.get('latch')=='health' or str(record.get('reason','')).startswith('Health failed again after a verified restart'):return False
+    return record.get('attentionFrom') not in {'start-requested','verifying'}
+
 class SupportSupervisor:
     def __init__(self,adapter,config):
         self.adapter=adapter;self.config=config;self.children={};self.directory=Path(config['stateDirectory'])/'tasks'
@@ -407,7 +424,7 @@ class SupportSupervisor:
             for project,cfg in self.config.get('projects',{}).items():
                 if cfg.get('container')!=route['container']:continue
                 receipt=Path(self.config['stateDirectory'])/(project.replace('/','_')+'.json')
-                if receipt.exists() and json.loads(receipt.read_text()).get('phase')!='complete':return False
+                if receipt.exists() and operation_open(json.loads(receipt.read_text())):return False
         return route_available(route)
 
     def drained(self,old,receipt):
@@ -550,7 +567,14 @@ class SupportSupervisor:
             # Saved before the release, so a retry sends the identical result.
             old['interrupted']={'at':time.time(),'reason':proof,'result':{'outcome':'failed','summary':summary,'files':{}}}
             atomic(receipt,old)
-        self.rpc('complete',{'machine':machine,'id':old['id'],'session':old['session'],'result':old['interrupted']['result']})
+        try:self.rpc('complete',{'machine':machine,'id':old['id'],'session':old['session'],'result':old['interrupted']['result']})
+        except Exception as error:
+            # A refusal or a lost reply concerns this record only. The saved
+            # result is retried each pass, and the record stays in attention.
+            if old['phase']!='attention':
+                old['phase']='attention';old['reason']='Release of a worker proven gone was not accepted; inspect the task and reservation'
+                atomic(receipt,old)
+            raise ReleasePassError(error) from error
         old['phase']='complete';atomic(receipt,old)
         if self.housekeeping:self.housekeeping('native-task-interrupted',old['id'],old['interrupted']['reason']+' Reservation released as interrupted work.')
 
@@ -572,8 +596,9 @@ class SupportSupervisor:
                 reason='Native task record skipped this pass. '+detail[:300]
                 running.append({'id':task,'phase':'error','reason':reason})
                 errors[task]=reason
-                # Only a completed record's artifact transfer is known to be local
-                # to that record. Anything else may be host-wide, such as an
+                # Only a completed record's artifact transfer, or the release of a
+                # worker already proven gone, is known to be local to that record.
+                # Anything else may be host-wide, such as an
                 # unavailable process census, so no new worker starts this pass.
                 if not isinstance(error,ArtifactPassError):host_uncertain=True
                 # Logged once per distinct failure, not on every pass.

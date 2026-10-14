@@ -831,6 +831,44 @@ class NativeTaskDuringDrainTests(unittest.TestCase):
         patch.object(m.subprocess,'check_output',return_value=inspect or ''):
     self.assertEqual(m.container_instance('core'),expected)
 
+ def test_a_refused_release_stays_local_to_its_record_and_scheduling_continues(self):
+  for refusal in ['Completed task result changed','Task is not running','Task actor mismatch']:
+   with self.subTest(refusal),tempfile.TemporaryDirectory() as d:
+    s,calls,logged,receipt=self.orphan(d)
+    rpc=s.rpc
+    def refusing(op,body):
+     if op=='complete':calls.append(('refused',body));raise RuntimeError(refusal)
+     return rpc(op,body)
+    s.rpc=refusing
+    for _ in range(3):
+     with patch.object(m,'process_snapshot',return_value={}),patch.object(m,'observe_custody',return_value='drained'),\
+          patch.object(m,'container_instance',return_value={'running':False}),patch.object(m,'route_available',return_value=True),\
+          patch.object(m.subprocess,'Popen',return_value=Child()):
+      entries=s.tick()
+     self.assertEqual(entries[0]['phase'],'error');self.assertIn(refusal,entries[0]['reason'])
+    self.assertEqual([c[0] for c in calls].count('refused'),3)
+    self.assertEqual([c[0] for c in calls].count('schedule'),3)
+    saved=json.loads(receipt.read_text())
+    self.assertEqual(saved['phase'],'attention');self.assertIn('interrupted',saved)
+    self.assertEqual([k for k,_,_ in logged],['native-task-skipped'])
+
+ def test_only_an_open_operation_defers_a_grant(self):
+  latch={'phase':'attention','latch':'health','reason':'Health failed again after a verified restart. No repeat restart within twenty-four hours.'}
+  legacy_latch={'phase':'attention','reason':latch['reason']}
+  started={'phase':'attention','attentionFrom':'verifying','reason':'Existing ticket ownership changed. Inspect the retained comparison.'}
+  stuck={'phase':'attention','attentionFrom':'draining','reason':'Operation exceeded six hours. No forced stop or second signal sent.'}
+  uncertain={'phase':'attention','reason':'Drain acknowledgement uncertain. No second signal sent.'}
+  cases=[({'phase':'complete'},True),(latch,True),(legacy_latch,True),(started,True),
+         (stuck,False),(uncertain,False)]+[({'phase':phase},False) for phase in sorted(m.OPEN_PHASES)]
+  for record,ready in cases:
+   with self.subTest(record=record),tempfile.TemporaryDirectory() as d:
+    s,state,calls,logged,grant=self.support(d)
+    m.atomic(Path(d)/'org_core.json',record)
+    with patch.object(m,'route_available',return_value=True),patch.object(m.subprocess,'Popen',return_value=Child()) as spawn:
+     entries=s.tick()
+    self.assertEqual(spawn.call_count,1 if ready else 0)
+    self.assertEqual(entries[-1]['phase'],'running' if ready else 'deferred')
+
  def test_worker_marks_its_start_before_running_the_recipe(self):
   with tempfile.TemporaryDirectory() as d:
    folder=Path(d);m.atomic(folder/'task.json',{'request':{'recipe':'platform-probe'}});m.atomic(folder/'paths.json',{})
