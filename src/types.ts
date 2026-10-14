@@ -116,6 +116,18 @@ export interface AgentConfig {
    */
   maxInFlight?: number;
   /**
+   * Where the `serial` or `maxInFlight` limit counts runs under managed
+   * dispatch. Omitted means "fleet": every computer together, as before.
+   * "machine" counts only the computer the run would start on, for a limit
+   * that protects host resources rather than shared repository files. Set
+   * on the builder set's verifier on 2026-10-14: its gates contend for the
+   * host's emulator and start a relay and a daemon on the host, so two
+   * verifiers on different computers do not conflict. Documentation stays
+   * fleet-wide, since its conflict is the shared docs/knowledge/INDEX.md.
+   * Independent mode runs on one computer, so it ignores this.
+   */
+  roleLimitScope?: "machine" | "fleet";
+  /**
    * True if a clean run of this agent must leave a verdict on the ticket's
    * pull request: a review or a comment posted after the run started, or
    * a `needs-rework:*` label. A clean exit with neither is treated as

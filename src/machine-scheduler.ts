@@ -1,4 +1,4 @@
-import type { FleetSnapshot, MachineLimits, ResourceClass } from "./fleet-store.js";
+import { countsForRoleLimit, heavyProject, type FleetSnapshot, type MachineLimits, type ResourceClass, type RoleLimitScope } from "./fleet-store.js";
 import type { AgentRunner } from "./agent-runner.js";
 import { startsCodex } from "./codex-throttle.js";
 
@@ -12,6 +12,8 @@ export interface WorkOffer {
   key: string;
   order: number;
   roleLimit?: number;
+  /** Absent means "fleet": the limit counts this project's role on every computer. */
+  roleLimitScope?: RoleLimitScope;
   recovery?: boolean;
   recoveryError?: boolean;
   requiresRecovery?: boolean;
@@ -73,6 +75,9 @@ export function scheduleMachine(opts: {
   const localRuns = opts.state.runs.filter(r => r.machine === opts.machine);
   let heavyPlaces = Math.max(0, opts.heavyLimit - localRuns.filter(r => r.resource === "heavy").length);
   let combinedPlaces = Math.max(0, opts.combinedLimit - localRuns.filter(r => r.resource !== "light").length);
+  // Heavy places a project may still take here, for projects with their own limit.
+  const projectHeavy = new Map(Object.entries(opts.projectHeavyLimits ?? {}).map(([project, limit]) =>
+    [project, Math.max(0, limit - localRuns.filter(r => r.resource === "heavy" && heavyProject(r) === project).length)]));
   const runnable = runnableTickets(opts.machine, opts.offers, opts.state);
   let ticketPlaces = Math.max(0, (opts.ticketLimit ?? Infinity) - runnable.size);
   const rank = new Map(opts.projects.map((p, i) => [p, i]));
@@ -95,12 +100,17 @@ export function scheduleMachine(opts: {
     if (idleAssessment(job, opts.state) && [...localRuns, ...selected].some(r => /#[1-9]\d*$/.test(r.ticket))) continue;
     if (active.has(job.ticket) || locks.has(`${job.project}:reconcile`) || job.locks.some(l => locks.has(l))) continue;
     if (codexPaused(job, opts.state)) continue;
-    if (job.roleLimit !== undefined && [...opts.state.runs, ...selected].filter(r => r.project === job.project && r.role === job.role).length >= job.roleLimit) continue;
+    if (job.roleLimit !== undefined && [...opts.state.runs, ...selected].filter(r => countsForRoleLimit(r, job, opts.machine)).length >= job.roleLimit) continue;
     const newTicket = /#[1-9]\d*$/.test(job.ticket) && !claims.has(job.ticket);
     if (newTicket && ticketPlaces === 0) continue;
     if (job.resource !== "light" && combinedPlaces === 0) continue;
     if (job.resource === "heavy" && heavyPlaces === 0) continue;
-    if (job.resource === "heavy") heavyPlaces--;
+    if (job.resource === "heavy" && projectHeavy.get(heavyProject(job)) === 0) continue;
+    if (job.resource === "heavy") {
+      heavyPlaces--;
+      const project = heavyProject(job);
+      if (projectHeavy.has(project)) projectHeavy.set(project, projectHeavy.get(project)! - 1);
+    }
     if (job.resource !== "light") combinedPlaces--;
     if (newTicket) ticketPlaces--;
     active.add(job.ticket);

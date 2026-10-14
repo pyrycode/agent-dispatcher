@@ -94,7 +94,7 @@ async function main(): Promise<void> {
     const database = resolve(config.database);
     mkdirSync(dirname(database), { recursive: true, mode: 0o700 });
     const machines = Object.fromEntries(Object.entries(config.machines).map(([id, value]) => [id, secret((value as any).tokenEnv)]));
-    const limits = Object.fromEntries(Object.entries(config.machines).map(([id, value]) => [id, { heavyLimit: (value as any).heavyLimit, combinedLimit: (value as any).combinedLimit }]));
+    const limits = Object.fromEntries(Object.entries(config.machines).map(([id, value]) => [id, { heavyLimit: (value as any).heavyLimit, combinedLimit: (value as any).combinedLimit, ...((value as any).projectHeavyLimits !== undefined ? { projectHeavyLimits: (value as any).projectHeavyLimits } : {}) }]));
     // Unchanged settled waits are reassessed after this interval. Default 24 hours.
     const safetyHours = config.recovery?.safetyRecheckHours;
     if (safetyHours !== undefined && (typeof safetyHours !== "number" || !Number.isFinite(safetyHours))) throw new Error("recovery.safetyRecheckHours must be a number");
@@ -147,7 +147,7 @@ async function main(): Promise<void> {
   }
   if (command === "manager") {
     const claims = new FleetClient(config.claimsUrl, secret(config.claimsTokenEnv));
-    const manager = new MachineManager({ machine: config.machine, heavyLimit: config.heavyLimit, combinedLimit: config.combinedLimit, ticketLimit: config.ticketLimit ?? 2, controlRevision: execFileSync("git",["rev-parse","HEAD"],{cwd:resolve(fileURLToPath(new URL("..",import.meta.url))),encoding:"utf8"}).trim(), projects: config.projects.map((p: any) => p.repo), drainingProjects: config.drainingProjects, projectDrainChanges: config.projectDrainChanges }, claims);
+    const manager = new MachineManager({ machine: config.machine, heavyLimit: config.heavyLimit, combinedLimit: config.combinedLimit, ...(config.projectHeavyLimits !== undefined ? { projectHeavyLimits: config.projectHeavyLimits } : {}), ticketLimit: config.ticketLimit ?? 2, controlRevision: execFileSync("git",["rev-parse","HEAD"],{cwd:resolve(fileURLToPath(new URL("..",import.meta.url))),encoding:"utf8"}).trim(), projects: config.projects.map((p: any) => p.repo), drainingProjects: config.drainingProjects, projectDrainChanges: config.projectDrainChanges }, claims);
     const tokens = Object.fromEntries(config.projects.map((p: any) => [p.repo, secret(p.tokenEnv)]));
     const endpoint = config.socketPath ? resolve(config.socketPath) : config.port ?? 7431;
     const server = await serveManager(manager, tokens, secret(config.operatorTokenEnv), endpoint, config.host ?? "127.0.0.1", (projects, changes) => persistProjectDrains(configPath, projects, changes));
