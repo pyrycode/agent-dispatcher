@@ -1614,7 +1614,8 @@ export function formatGateEvidenceComment(opts: {
   if (report.evidenceDir) {
     lines.push(`Raw evidence: \`${report.evidenceDir}\` on the dispatcher host, one folder per part of the run ` +
       `(\`main\`, \`rerun\`, \`base\`, \`infra-check\`). It holds whatever the gate command wrote to ` +
-      `\`PYRY_GATE_EVIDENCE_DIR\`, kept outside the removed worktree and pruned by age, count and size.`);
+      `\`PYRY_GATE_EVIDENCE_DIR\`, kept outside the removed worktree. It is empty when the command does not use the ` +
+      `variable, and it is pruned later by age, count and size.`);
   }
 
   return lines.join("\n");

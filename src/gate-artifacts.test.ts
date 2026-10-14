@@ -94,6 +94,23 @@ describe("pruneGateEvidence", () => {
     assert.ok(existsSync(middle) && existsSync(newest));
   });
 
+  test("the size limit never takes a ticket's newest run", () => {
+    const logs = logsDir();
+    const a = makeRun(logs, 1, NOW - 2 * 3600_000, 900);
+    const b = makeRun(logs, 2, NOW - 1 * 3600_000, 900);
+    assert.deepEqual(pruneGateEvidence(logs, { ...roomy, maxTotalBytes: 100 }, NOW), []);
+    assert.ok(existsSync(a) && existsSync(b));
+  });
+
+  test("an evidence root that is a link is not followed", () => {
+    const logs = logsDir();
+    const outside = mkdtempSync(resolve(tmpdir(), "gate-artifacts-root-"));
+    const lured = makeRun(outside, 3, NOW - 90 * DAY);
+    symlinkSync(resolve(outside, "evidence"), resolve(logs, "evidence"));
+    assert.deepEqual(pruneGateEvidence(logs, roomy, NOW), []);
+    assert.ok(existsSync(lured));
+  });
+
   test("never removes the protected run, the one about to start", () => {
     const logs = logsDir();
     const current = makeRun(logs, 1, NOW - 40 * DAY);
@@ -111,8 +128,16 @@ describe("pruneGateEvidence", () => {
     const target = mkdtempSync(resolve(tmpdir(), "gate-artifacts-target-"));
     writeFileSync(resolve(target, "keep.txt"), "outside");
     symlinkSync(target, resolve(ev, "2153", "gate-runs", stampAt(NOW - 91 * DAY)));
+    // A ticket folder that is a link out of the logs (review of #237).
+    const outside = mkdtempSync(resolve(tmpdir(), "gate-artifacts-outside-"));
+    const lured = resolve(outside, "gate-runs", stampAt(NOW - 90 * DAY));
+    mkdirSync(lured, { recursive: true });
+    writeFileSync(resolve(lured, "keep.txt"), "outside");
+    utimesSync(lured, new Date(NOW - 90 * DAY), new Date(NOW - 90 * DAY));
+    symlinkSync(outside, resolve(ev, "999"));
     const old = makeRun(logs, 2153, NOW - 90 * DAY);
     assert.deepEqual(pruneGateEvidence(logs, roomy, NOW), [old]);
+    assert.ok(existsSync(resolve(lured, "keep.txt")), "a linked ticket folder is never followed");
     assert.ok(existsSync(resolve(ev, "2153", "suite-green")));
     assert.ok(existsSync(resolve(ev, "harness")));
     assert.ok(existsSync(resolve(ev, "2153", "gate-runs", "notes")));

@@ -405,7 +405,8 @@ export function liveGateLines(live: LiveGateRun, namingText: string, testEvidenc
     lines.push(`- Tested: \`${meta.branchName}\` at \`${shortSha(meta.headSha)}\` merged with \`${meta.baseRef}\` at \`${shortSha(meta.baseSha)}\`; ${scope}; ${end}.`);
     lines.push(meta.evidenceDir
       ? `- Raw evidence: \`${meta.evidenceDir}\`, kept outside the removed gate worktree. The \`main\` folder holds the first pass's ` +
-        "captures; `rerun`, `base` and `infra-check` exist only when those parts ran. Cite files from there by path."
+        "captures; `rerun`, `base` and `infra-check` exist only when those parts ran. It is empty when the gate command does not " +
+        "use the folder, and old runs are pruned, so check a file exists before citing it by path."
       : "- Raw evidence: no evidence folder was recorded for this run. It predates the folder or one could not be made, so only the test report and diagnostic log are kept.");
   }
 

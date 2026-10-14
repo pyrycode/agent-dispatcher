@@ -7476,7 +7476,7 @@ export async function runRealClaudeGateSuite(opts: {
     const outcome = await deps.spawnGate({
       command,
       cwd: worktreeDir,
-      env: {...buildGateSpawnEnv(process.env),...managedTaskEnv(),...gateEvidenceEnv(report.evidenceDir, "main", deps.mkdirSync as any)},
+      env: {...buildGateSpawnEnv(process.env),...managedTaskEnv(),...gateEvidenceEnv(report.evidenceDir, "main", deps.mkdirSync)},
       timeoutMs: opts.timeoutMs,
       stdoutPath,
       stderrPath,
@@ -7797,7 +7797,7 @@ async function runFailuresOnBase(opts: {
       command,
       cwd: worktreeDir,
       env: {...buildGateSpawnEnv(process.env),...managedTaskEnv(),
-        ...gateEvidenceEnv(opts.evidence?.runDir, opts.evidence?.part ?? "base", (deps.mkdirSync ?? mkdirSync) as any)},
+        ...gateEvidenceEnv(opts.evidence?.runDir, opts.evidence?.part ?? "base", deps.mkdirSync ?? mkdirSync)},
       timeoutMs: opts.timeoutMs,
       stdoutPath,
       stderrPath,
@@ -7889,7 +7889,7 @@ async function runBranchRerun(opts: {
     const outcome = await deps.spawnGate({
       command,
       cwd: opts.worktreeDir,
-      env: {...buildGateSpawnEnv(process.env),...managedTaskEnv(),...gateEvidenceEnv(report.evidenceDir, "rerun", deps.mkdirSync as any)},
+      env: {...buildGateSpawnEnv(process.env),...managedTaskEnv(),...gateEvidenceEnv(report.evidenceDir, "rerun", deps.mkdirSync)},
       timeoutMs: opts.timeoutMs,
       stdoutPath,
       stderrPath,

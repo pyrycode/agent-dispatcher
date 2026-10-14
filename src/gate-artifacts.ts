@@ -107,9 +107,16 @@ function listRunFolders(logsDir: string): RunFolder[] {
   const root = resolve(logsDir, "evidence");
   const out: RunFolder[] = [];
   let tickets: string[] = [];
+  // Every level is checked with lstat, so a link anywhere on the way is
+  // skipped rather than followed out of the logs folder.
+  const isRealDir = (path: string): boolean => {
+    try { return lstatSync(path).isDirectory(); } catch { return false; }
+  };
+  if (!isRealDir(root)) return out;
   try { tickets = readdirSync(root); } catch { return out; }
   for (const ticket of tickets) {
     if (!/^\d+$/.test(ticket)) continue;
+    if (!isRealDir(resolve(root, ticket))) continue;
     const runsDir = resolve(root, ticket, GATE_RUNS_DIR);
     try { if (!lstatSync(runsDir).isDirectory()) continue; } catch { continue; }
     let stamps: string[] = [];
@@ -148,10 +155,14 @@ export function pruneGateEvidence(
     for (const list of byTicket.values()) {
       for (const f of list.slice(0, Math.max(0, list.length - retention.keepPerTicket))) doomed.add(f);
     }
+    // The size pass never takes a ticket's newest run: that is the evidence
+    // a ticket in flight still needs. So the total can exceed the cap by at
+    // most one run per ticket, and the age and count limits bound those.
+    const newest = new Set([...byTicket.values()].map(list => list[list.length - 1]));
     let total = folders.filter(f => !doomed.has(f)).reduce((sum, f) => sum + f.bytes, 0);
     for (const f of folders) {
       if (total <= retention.maxTotalBytes) break;
-      if (doomed.has(f)) continue;
+      if (doomed.has(f) || newest.has(f)) continue;
       doomed.add(f);
       total -= f.bytes;
     }
@@ -205,7 +216,7 @@ export function prepareGateRunEvidence(logsDir: string, issueNumber: number, sta
 export function gateEvidenceEnv(
   runDir: string | null | undefined,
   part: string,
-  mkdir: (path: string, options: { recursive: true; mode: number }) => unknown = mkdirSync,
+  mkdir: (path: string, options: { recursive: true; mode: number }) => unknown = (path, options) => mkdirSync(path, options),
 ): NodeJS.ProcessEnv {
   if (!runDir) return {};
   const dir = resolve(runDir, part);
