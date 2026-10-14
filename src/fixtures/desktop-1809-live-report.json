@@ -1,0 +1,784 @@
+{
+  "suites": [
+    {
+      "title": "real-claude-attachment.spec.ts",
+      "specs": [
+        {
+          "title": "an attached image reaches claude, which describes it back (#1055 AC4)",
+          "tests": [
+            {
+              "status": "expected",
+              "expectedStatus": "passed",
+              "annotations": [],
+              "results": [
+                {
+                  "status": "passed",
+                  "duration": 8641,
+                  "attachments": [],
+                  "annotations": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "real-claude-codex-channel.spec.ts",
+      "specs": [
+        {
+          "title": "real GPT-6 Luna channel replies with Low effort from creation",
+          "tests": [
+            {
+              "status": "skipped",
+              "expectedStatus": "skipped",
+              "annotations": [
+                {
+                  "type": "skip",
+                  "description": "real-codex: PYRY_CODEX_CAPTURE_HOME is unset"
+                }
+              ],
+              "results": [
+                {
+                  "status": "skipped",
+                  "duration": 2,
+                  "attachments": [],
+                  "annotations": [
+                    {
+                      "type": "skip",
+                      "description": "real-codex: PYRY_CODEX_CAPTURE_HOME is unset"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "real-claude-effort-default.spec.ts",
+      "specs": [
+        {
+          "title": "applied effort, confirmed preference, restart, chat recall and channel creation choice",
+          "tests": [
+            {
+              "status": "expected",
+              "expectedStatus": "passed",
+              "annotations": [
+                {
+                  "type": "daemon-revision",
+                  "description": "0.37.0"
+                }
+              ],
+              "results": [
+                {
+                  "status": "passed",
+                  "duration": 19766,
+                  "attachments": [
+                    {
+                      "name": "daemon-revision",
+                      "contentType": "text/plain",
+                      "body": "MC4zNy4w"
+                    }
+                  ],
+                  "annotations": [
+                    {
+                      "type": "daemon-revision",
+                      "description": "0.37.0"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "real-claude-interrupt.spec.ts",
+      "specs": [
+        {
+          "title": "real claude quiesces a genuinely running turn when interrupted",
+          "tests": [
+            {
+              "status": "expected",
+              "expectedStatus": "passed",
+              "annotations": [],
+              "results": [
+                {
+                  "status": "passed",
+                  "duration": 8227,
+                  "attachments": [],
+                  "annotations": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "real-claude-mcp.spec.ts",
+      "specs": [
+        {
+          "title": "real claude: the Channel info sheet shows the daemon\u2019s own MCP servers",
+          "tests": [
+            {
+              "status": "expected",
+              "expectedStatus": "passed",
+              "annotations": [
+                {
+                  "type": "mcp-reconnect-outcome",
+                  "description": "refused"
+                },
+                {
+                  "type": "mcp-toggle-outcome",
+                  "description": "refused"
+                }
+              ],
+              "results": [
+                {
+                  "status": "passed",
+                  "duration": 6323,
+                  "attachments": [],
+                  "annotations": [
+                    {
+                      "type": "mcp-reconnect-outcome",
+                      "description": "refused"
+                    },
+                    {
+                      "type": "mcp-toggle-outcome",
+                      "description": "refused"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "real-claude-model-recall.spec.ts",
+      "specs": [
+        {
+          "title": "confirmed model survives profile restart and governs the new chat first announcement",
+          "tests": [
+            {
+              "status": "expected",
+              "expectedStatus": "passed",
+              "annotations": [],
+              "results": [
+                {
+                  "status": "passed",
+                  "duration": 9555,
+                  "attachments": [
+                    {
+                      "name": "daemon-revision",
+                      "contentType": "text/plain",
+                      "body": "MC4zNy4w"
+                    }
+                  ],
+                  "annotations": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "real-claude-new-session.spec.ts",
+      "specs": [
+        {
+          "title": "real claude restarts on Reset session and the turn stream survives it",
+          "tests": [
+            {
+              "status": "expected",
+              "expectedStatus": "passed",
+              "annotations": [],
+              "results": [
+                {
+                  "status": "passed",
+                  "duration": 11213,
+                  "attachments": [],
+                  "annotations": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "real-claude-permission-modal.spec.ts",
+      "specs": [
+        {
+          "title": "real claude session checkbox grants repeated Bash use only in the current session",
+          "tests": [
+            {
+              "status": "expected",
+              "expectedStatus": "passed",
+              "annotations": [],
+              "results": [
+                {
+                  "status": "passed",
+                  "duration": 13824,
+                  "attachments": [],
+                  "annotations": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "real-claude-permission-mode.spec.ts",
+      "specs": [
+        {
+          "title": "operator bypass stays confirmed through a no-op write, then the menu returns to bypass and Manual approval enforces Read",
+          "tests": [
+            {
+              "status": "expected",
+              "expectedStatus": "passed",
+              "annotations": [
+                {
+                  "type": "daemon-revision",
+                  "description": "0.37.0"
+                }
+              ],
+              "results": [
+                {
+                  "status": "passed",
+                  "duration": 12616,
+                  "attachments": [
+                    {
+                      "name": "daemon-revision",
+                      "contentType": "text/plain",
+                      "body": "MC4zNy4w"
+                    }
+                  ],
+                  "annotations": [
+                    {
+                      "type": "daemon-revision",
+                      "description": "0.37.0"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "real-claude-phase-reconnect.spec.ts",
+      "specs": [
+        {
+          "title": "real claude restores the status after reconnect during the same running turn",
+          "tests": [
+            {
+              "status": "expected",
+              "expectedStatus": "passed",
+              "annotations": [
+                {
+                  "type": "daemon-revision",
+                  "description": "0.37.0"
+                },
+                {
+                  "type": "baseline-before-drop",
+                  "description": "running phase: responding"
+                },
+                {
+                  "type": "baseline",
+                  "description": "unchanged desktop restored the phase during the original running turn"
+                }
+              ],
+              "results": [
+                {
+                  "status": "passed",
+                  "duration": 11049,
+                  "attachments": [],
+                  "annotations": [
+                    {
+                      "type": "daemon-revision",
+                      "description": "0.37.0"
+                    },
+                    {
+                      "type": "baseline-before-drop",
+                      "description": "running phase: responding"
+                    },
+                    {
+                      "type": "baseline",
+                      "description": "unchanged desktop restored the phase during the original running turn"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "real-claude-question-answer.spec.ts",
+      "specs": [
+        {
+          "title": "real claude changes model during a question and resumes with the original answer",
+          "tests": [
+            {
+              "status": "expected",
+              "expectedStatus": "passed",
+              "annotations": [],
+              "results": [
+                {
+                  "status": "passed",
+                  "duration": 10654,
+                  "attachments": [],
+                  "annotations": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "real-claude-question-cancel.spec.ts",
+      "specs": [
+        {
+          "title": "real claude raises a clarifying question that refusing through Cancel stops the gated work",
+          "tests": [
+            {
+              "status": "expected",
+              "expectedStatus": "passed",
+              "annotations": [],
+              "results": [
+                {
+                  "status": "passed",
+                  "duration": 11725,
+                  "attachments": [],
+                  "annotations": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "real-claude-queue-delivery.spec.ts",
+      "specs": [
+        {
+          "title": "real claude delivers one queued follow-up exactly once",
+          "tests": [
+            {
+              "status": "expected",
+              "expectedStatus": "passed",
+              "annotations": [
+                {
+                  "type": "daemon-revision",
+                  "description": "0.37.0"
+                }
+              ],
+              "results": [
+                {
+                  "status": "passed",
+                  "duration": 14633,
+                  "attachments": [],
+                  "annotations": [
+                    {
+                      "type": "daemon-revision",
+                      "description": "0.37.0"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "title": "real claude delivers two queued follow-ups in submission order",
+          "tests": [
+            {
+              "status": "expected",
+              "expectedStatus": "passed",
+              "annotations": [
+                {
+                  "type": "daemon-revision",
+                  "description": "0.37.0"
+                }
+              ],
+              "results": [
+                {
+                  "status": "passed",
+                  "duration": 22471,
+                  "attachments": [],
+                  "annotations": [
+                    {
+                      "type": "daemon-revision",
+                      "description": "0.37.0"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "title": "real claude drops the queued head and completes the remaining follow-up",
+          "tests": [
+            {
+              "status": "expected",
+              "expectedStatus": "passed",
+              "annotations": [
+                {
+                  "type": "daemon-revision",
+                  "description": "0.37.0"
+                }
+              ],
+              "results": [
+                {
+                  "status": "passed",
+                  "duration": 20402,
+                  "attachments": [],
+                  "annotations": [
+                    {
+                      "type": "daemon-revision",
+                      "description": "0.37.0"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "real-claude-queue-drop.spec.ts",
+      "specs": [
+        {
+          "title": "real claude enqueues a mid-turn send, drops it before drain, and runs no turn for it",
+          "tests": [
+            {
+              "status": "expected",
+              "expectedStatus": "passed",
+              "annotations": [],
+              "results": [
+                {
+                  "status": "passed",
+                  "duration": 12466,
+                  "attachments": [],
+                  "annotations": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "real-claude-queue-send-now.spec.ts",
+      "specs": [
+        {
+          "title": "real claude reads a Send now message inside the running turn",
+          "tests": [
+            {
+              "status": "expected",
+              "expectedStatus": "passed",
+              "annotations": [
+                {
+                  "type": "daemon-revision",
+                  "description": "0.37.0"
+                }
+              ],
+              "results": [
+                {
+                  "status": "passed",
+                  "duration": 13363,
+                  "attachments": [],
+                  "annotations": [
+                    {
+                      "type": "daemon-revision",
+                      "description": "0.37.0"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "real-claude-system-prompt.spec.ts",
+      "specs": [
+        {
+          "title": "real claude applies a stored system prompt at a spawn, and a save never reaches a running session",
+          "tests": [
+            {
+              "status": "expected",
+              "expectedStatus": "passed",
+              "annotations": [],
+              "results": [
+                {
+                  "status": "passed",
+                  "duration": 13059,
+                  "attachments": [],
+                  "annotations": []
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "title": "real claude picks up a saved channel system prompt at Reset session",
+          "tests": [
+            {
+              "status": "skipped",
+              "expectedStatus": "skipped",
+              "annotations": [
+                {
+                  "type": "fixme"
+                }
+              ],
+              "results": [
+                {
+                  "status": "skipped",
+                  "duration": 0,
+                  "attachments": [],
+                  "annotations": [
+                    {
+                      "type": "fixme"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "real-claude.spec.ts",
+      "specs": [
+        {
+          "title": "real claude streams a reply into a UI-created conversation for two consecutive sends",
+          "tests": [
+            {
+              "status": "expected",
+              "expectedStatus": "passed",
+              "annotations": [],
+              "results": [
+                {
+                  "status": "passed",
+                  "duration": 7570,
+                  "attachments": [],
+                  "annotations": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "real-daemon-archive-order.spec.ts",
+      "specs": [
+        {
+          "title": "real daemon shows the second archived channel first, against last-used ascending order",
+          "tests": [
+            {
+              "status": "expected",
+              "expectedStatus": "passed",
+              "annotations": [
+                {
+                  "type": "daemon-revision",
+                  "description": "0.37.0"
+                }
+              ],
+              "results": [
+                {
+                  "status": "passed",
+                  "duration": 2317,
+                  "attachments": [],
+                  "annotations": [
+                    {
+                      "type": "daemon-revision",
+                      "description": "0.37.0"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "real-daemon-conversation-lifecycle.spec.ts",
+      "specs": [
+        {
+          "title": "real daemon archive \u2192 restore \u2192 delete lifecycle reflects through the client",
+          "tests": [
+            {
+              "status": "expected",
+              "expectedStatus": "passed",
+              "annotations": [],
+              "results": [
+                {
+                  "status": "passed",
+                  "duration": 2326,
+                  "attachments": [],
+                  "annotations": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "real-daemon-create-channel.spec.ts",
+      "specs": [
+        {
+          "title": "real daemon creates a promoted, named channel in its default workspace over the real wire",
+          "tests": [
+            {
+              "status": "expected",
+              "expectedStatus": "passed",
+              "annotations": [],
+              "results": [
+                {
+                  "status": "passed",
+                  "duration": 1325,
+                  "attachments": [],
+                  "annotations": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "real-daemon-history-on-open.spec.ts",
+      "specs": [
+        {
+          "title": "a real daemon lazily fills a served gap after more than 200 entries written while Electron is closed",
+          "tests": [
+            {
+              "status": "expected",
+              "expectedStatus": "passed",
+              "annotations": [],
+              "results": [
+                {
+                  "status": "passed",
+                  "duration": 6881,
+                  "attachments": [],
+                  "annotations": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "real-daemon-multi-agent.spec.ts",
+      "specs": [
+        {
+          "title": "a real daemon echoes interactive and multi_agent in the app hello_ack",
+          "tests": [
+            {
+              "status": "expected",
+              "expectedStatus": "passed",
+              "annotations": [],
+              "results": [
+                {
+                  "status": "passed",
+                  "duration": 1219,
+                  "attachments": [],
+                  "annotations": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "real-daemon-promote.spec.ts",
+      "specs": [
+        {
+          "title": "real daemon promotes a Recent discussion into a Channel over the real wire",
+          "tests": [
+            {
+              "status": "expected",
+              "expectedStatus": "passed",
+              "annotations": [],
+              "results": [
+                {
+                  "status": "passed",
+                  "duration": 1191,
+                  "attachments": [],
+                  "annotations": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "real-daemon-rename.spec.ts",
+      "specs": [
+        {
+          "title": "real daemon persists a rename round-trip, visible in the channel list",
+          "tests": [
+            {
+              "status": "expected",
+              "expectedStatus": "passed",
+              "annotations": [],
+              "results": [
+                {
+                  "status": "passed",
+                  "duration": 1206,
+                  "attachments": [],
+                  "annotations": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "real-daemon-session-settings.spec.ts",
+      "specs": [
+        {
+          "title": "real daemon persists a session-settings write and returns it on a fresh read",
+          "tests": [
+            {
+              "status": "expected",
+              "expectedStatus": "passed",
+              "annotations": [],
+              "results": [
+                {
+                  "status": "passed",
+                  "duration": 1485,
+                  "attachments": [],
+                  "annotations": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "errors": []
+}

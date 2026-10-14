@@ -147,6 +147,7 @@ import {
   REAL_CLAUDE_GATE_RUN_FROM_COLUMN,
   INFRA_FAILURE_LABEL,
   decideRealClaudeGateRun,
+  decideGateVerdict,
   decideDoneCleanup,
   decideMergeRetry,
   decidePostRunLabels,
@@ -218,6 +219,7 @@ import {
   buildBaselineFilter,
   isGateOutputFormat,
   parseGateOutput,
+  validateGateOutputProvenance,
   type GateOutputFormat,
   type GateRunReport,
 } from "./gate-output.js";
@@ -5677,6 +5679,7 @@ async function rerunVerifierGateFailures(
     }
     const tally = parseGateOutput(raw, format);
     if (tally.recognizedLines === 0) return skip("the re-run produced no readable test events");
+    if (tally.completeParse !== true) return skip("the re-run produced incomplete test evidence");
     // A re-run that SKIPPED the tests proves nothing; accepting it would excuse every failure.
     if (tally.executed === 0) return skip(`the re-run executed nothing (${tally.skipped} skipped)`);
     return { passed: tally.passedNames, skipReason: null, outputPath };
@@ -7207,6 +7210,7 @@ export async function runRealClaudeGateSuite(opts: {
 
   const started = deps.now();
   const report: GateRunReport = {
+    outputFormat: opts.format,
     runError: null,
     timedOut: false,
     exitCode: null,
@@ -7402,16 +7406,17 @@ export async function runRealClaudeGateSuite(opts: {
       // as unusable — never as "nothing failed".
       console.warn(`   ⚠️  Real-claude gate: could not read ${stdoutPath} back: ${e?.message ?? e}`);
     }
-    if (raw !== null) report.tally = parseGateOutput(raw, opts.format);
+    const provenance = validateGateOutputProvenance(report.command, [report.outputFormat]);
+    if (provenance.error !== null) report.runError ||= provenance.error;
+    else if (raw !== null) report.tally = parseGateOutput(raw, provenance.format);
 
     // A clean full run resets the selection backstop's merge count. Only a
     // clean one: a red full run leaves the count where it was, so the next
     // gated ticket runs the full suite again until main is green.
-    const tally = report.tally;
     if (
-      report.selection?.mode === "full" && report.runError === null && !report.timedOut &&
-      report.exitCode === 0 && tally !== null && tally.failed === 0 &&
-      tally.executed >= Math.max(1, opts.minExecuted ?? 1)
+      report.selection?.mode === "full" && decideGateVerdict({
+        ...report, minExecuted: opts.minExecuted ?? 1,
+      }).verdict === "pass"
     ) {
       try {
         deps.writeGateFullState(JSON.stringify({ lastFullPassSha: report.baseSha }));
@@ -7717,6 +7722,9 @@ async function runFailuresOnBase(opts: {
     if (baseTally.recognizedLines === 0) {
       return skip("the base re-run produced no readable test events", stdoutPath);
     }
+    if (baseTally.completeParse !== true) {
+      return skip("the base re-run produced incomplete test evidence", stdoutPath);
+    }
     // A base run where the tests SKIPPED tells us nothing. It is the same
     // false green the whole gate exists to reject, and accepting it here
     // would exonerate every branch by default.
@@ -7808,6 +7816,10 @@ async function runBranchRerun(opts: {
     const tally = parseGateOutput(raw, opts.format);
     if (tally.recognizedLines === 0) {
       report.rerunSkipReason = "the re-run produced no readable test events";
+      return;
+    }
+    if (tally.completeParse !== true) {
+      report.rerunSkipReason = "the re-run produced incomplete test evidence";
       return;
     }
     // A re-run that SKIPPED the tests proves nothing, the same false green
@@ -9764,6 +9776,7 @@ export async function pollLoop(): Promise<void> {
                 REAL_CLAUDE_GATE_MIN_EXECUTED, notifyDiscord, 0,
                 (flaky, ctx) => recordFlakyTests(client, flaky, ctx), undefined,
                 (failures, ctx) => recordInheritedTests(client, failures, ctx),
+                { legacyFormat: REAL_CLAUDE_GATE_FORMAT ?? undefined },
               );
             }).finally(() => { if (gateRun?.done === done) gateRun = null; });
             gateRun = { issue: candidate.issueNumber, done };
@@ -9781,6 +9794,7 @@ export async function pollLoop(): Promise<void> {
         (flaky, ctx) => recordFlakyTests(client, flaky, ctx),
         undefined,
         (failures, ctx) => recordInheritedTests(client, failures, ctx),
+        { legacyFormat: REAL_CLAUDE_GATE_FORMAT ?? undefined },
       );
     } else if (gateRun === null) {
       const verifiersInFlight = REAL_CLAUDE_GATE_HOLD_VERIFIERS
@@ -9798,6 +9812,7 @@ export async function pollLoop(): Promise<void> {
           gateRun = { issue, done };
         },
         (failures, ctx) => recordInheritedTests(client, failures, ctx),
+        { legacyFormat: REAL_CLAUDE_GATE_FORMAT ?? undefined },
       );
     }
     // A waiting or running background gate keeps the main sweep off the

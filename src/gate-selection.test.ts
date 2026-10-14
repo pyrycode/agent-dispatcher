@@ -52,6 +52,18 @@ describe("readGateSelectionConfig", () => {
 });
 
 describe("parseLiveTestsSection", () => {
+  test("keeps backticked comma and colon titles intact beside plain names", () => {
+    const name = "real-claude-effort-default.spec.ts › applied effort, confirmed preference, restart, chat recall and channel creation choice";
+    const colon = "required.spec.ts › preference: Low, confirmed: yes";
+    const entries = `- \`${name}\`, a.B#one, \`\`${colon}\`\`, a.B#two\n- \`${name}\``;
+    const body = `## Live tests\n${entries}\n## Testing\n- ignored`;
+    const names = [name, "a.B#one", colon, "a.B#two"];
+    assert.deepEqual(parseLiveTestsSection(body), { kind: "list", names });
+    for (const body of [`## Live tests\n- all\n${entries}`, `## Live tests\n${entries}\n- ALL`]) {
+      assert.deepEqual(parseLiveTestsSection(body), { kind: "all" });
+    }
+  });
+
   test("reads list items, backticks and commas, up to the next heading", () => {
     const body = [
       "## Summary",

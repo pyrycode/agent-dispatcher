@@ -29,6 +29,7 @@ import { homedir, tmpdir } from "node:os";
 import { FleetStore } from './fleet-store.js';
 import { MachineManager, serveManager } from './machine-manager.js';
 import { ManagedDispatch } from './managed-dispatch.js';
+import { completeGo, completePlaywright, loggedArtifacts, loggedFailures, mixedGoCommands, singleWrappedGoCommands, repeatedGo } from "./fixtures/gate-completeness.js";
 
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -110,7 +111,8 @@ import {
 import { DEFAULT_INFRA_BREAKER_CONFIG, type InfraBreakerConfig } from "./infra-failure.js";
 import { parseGateRunMeta } from "./gate-report.js";
 import { serializeLastVerdict } from "./verdict-handoff.js";
-import { formatGateEvidenceComment } from "./gate-output.js";
+import { formatGateEvidenceComment, gateRunFloor } from "./gate-output.js";
+import { decideGateVerdict } from "./pipeline-decisions.js";
 import { flakyMarker } from "./flaky-tickets.js";
 import { FINAL_MERGE_HANDOFF_MARKER, MERGE_RESOLUTION_NOTE_MARKER, mergeResolutionComment } from "./merge-handoff.js";
 import { runReworkRouting } from "./reconcile.js";
@@ -6897,6 +6899,79 @@ describe("runRealClaudeGateSuite — worktree safety", () => {
 });
 
 describe("runRealClaudeGateSuite — evidence gathering", () => {
+  for (const mode of ["full", "selected"] as const) test(`fresh invocation provenance guards ${mode} judgments and backstop writes`, async () => {
+    const ordinary = "ok  fixture/ordinary 0.001s\n";
+    const failed = completeGo.replace('"Action":"pass","Package":"fixture","Test":"TestOther0"',
+      '"Action":"fail","Package":"fixture","Test":"TestOther0"');
+    for (const [command, format, output, verdict] of [
+      ...mixedGoCommands.map(command => [command, "go-json", command.startsWith("go test -json") ? completeGo + "\n" + ordinary : ordinary + completeGo, "unusable"] as const),
+      ...singleWrappedGoCommands.map(command => [`echo "$BUILD_STEP"; ${command}`, "go-json", completeGo, "pass"] as const),
+      ...singleWrappedGoCommands.map(command => [command, "go-json", failed, "fail"] as const),
+      ...[["pass", "fail"], ["fail", "pass"]].map(statuses => ["command env go -C /tmp/fixture test -json -count=2", "go-json", repeatedGo(statuses as ("pass" | "fail")[]), "fail"] as const),
+      ["go test -json ./...; go test ./ordinary", "go-json", completeGo + "\n" + ordinary, "unusable"],
+      ["go test ./ordinary; go test -json ./...", "go-json", completeGo + "\n" + ordinary, "unusable"],
+      ["playwright test --reporter=json; playwright test", "playwright-json", completePlaywright, "unusable"],
+      ["playwright test; playwright test --reporter=json", "playwright-json", completePlaywright, "unusable"],
+      ['echo "$BUILD_STEP"; go test -json ./...', "go-json", completeGo, "pass"],
+      ['echo "$BUILD_STEP"; go test -json ./...', "go-json", failed, "fail"],
+      ['echo "$BUILD_STEP"; "$TEST_RUNNER" test -json ./...', "go-json", completeGo, "unusable"],
+      ['go test -json ./...; exec "$TEST_RUNNER" test ./ordinary', "go-json", completeGo + "\n" + ordinary, "unusable"],
+      ['go test "$JSON_FLAG" ./...', "go-json", completeGo, "unusable"],
+      ['playwright test --reporter="$REPORTER"', "playwright-json", completePlaywright, "unusable"],
+      ['echo "$BUILD_STEP"; go test -json ./... > "$LOG" 2>&1', "go-json", completeGo, "pass"],
+      ["go test -json ./...", "playwright-json", completePlaywright, "unusable"],
+    ] as const) {
+      const selected = format === "go-json" ? "fixture.TestOther0" : "fixture.spec.ts › other 0";
+      const writes: string[] = [];
+      const harness = makeGateDeps({ fileContents: output,
+        gitOut: cmd => cmd.startsWith("gh pr list") ? `## Live tests\n- \`${selected}\``
+          : cmd.startsWith("git rev-list --count --merges") ? "0" : GATE_SHAS[cmd] ?? "",
+        readGateFullState: () => mode === "full" ? null : JSON.stringify({ lastFullPassSha: GATE_BASE_SHA }),
+        writeGateFullState: text => { writes.push(text); },
+      });
+      const report = await runRealClaudeGateSuite({ issueNumber: 1382, command, format,
+        baselineCommand: command + (format === "go-json" ? " -run {{TESTS}}" : " -g {{TESTS}}"),
+        timeoutMs: 60_000, minExecuted: 10,
+        selection: { alwaysTests: [], fullPaths: [], fullEvery: 10 },
+        repoRoot: "/tmp/fake-repo", logsDir: "/tmp/fake-logs", deps: harness.deps, defaultBranch: "main",
+      });
+      assert.equal(report.selection?.mode, mode);
+      assert.equal(decideGateVerdict({ ...report, minExecuted: gateRunFloor(report, 10) }).verdict, verdict, `${mode}: ${command}`);
+      assert.equal(writes.length, mode === "full" && verdict === "pass" ? 1 : 0, `${mode}: ${command}`);
+      if (verdict === "fail") assert.deepEqual(report.tally?.failedNames, [command.includes("-count=2") ? "fixture.TestRepeated/case:Low,confirmed" : "fixture.TestOther0"]);
+    }
+  });
+
+  test("tagged logs preserve full and selected execution judgments and backstop writes", async () => {
+    for (const artifact of [...loggedArtifacts, ...loggedFailures]) {
+      for (const mode of ["full", "selected"] as const) {
+        const selected = artifact.format === "go-json" ? "fixture.TestOther0" : "fixture.spec.ts › other 0";
+        const writes: string[] = [];
+        const harness = makeGateDeps({
+          fileContents: artifact.raw,
+          gitOut: cmd => cmd.startsWith("gh pr list") ? `## Live tests\n- \`${selected}\``
+            : cmd.startsWith("git rev-list --count --merges") ? "0" : GATE_SHAS[cmd] ?? "",
+          readGateFullState: () => mode === "full" ? null : JSON.stringify({ lastFullPassSha: GATE_BASE_SHA }),
+          writeGateFullState: text => { writes.push(text); },
+        });
+        const report = await runRealClaudeGateSuite({
+          issueNumber: 1382, command: artifact.format === "go-json" ? "go test -json" : "playwright test --reporter=json",
+          format: artifact.format, timeoutMs: 60_000, minExecuted: 10,
+          selection: { alwaysTests: [], fullPaths: [], fullEvery: 10 },
+          baselineCommand: artifact.format === "go-json" ? "go test -json -run {{TESTS}}" : "playwright test --reporter=json -g {{TESTS}}",
+          repoRoot: "/tmp/fake-repo", logsDir: "/tmp/fake-logs", deps: harness.deps,
+          defaultBranch: "main",
+        });
+        assert.equal(report.tally?.completeParse, true, `${artifact.name}, ${mode}`);
+        assert.equal(report.selection?.mode, mode);
+        const expected = "failedName" in artifact ? "fail" : "pass";
+        assert.equal(decideGateVerdict({ ...report, minExecuted: gateRunFloor(report, 10) }).verdict, expected);
+        if ("failedName" in artifact) assert.deepEqual(report.tally?.failedNames, [artifact.failedName]);
+        assert.equal(writes.length, expected === "pass" && report.selection?.mode === "full" ? 1 : 0);
+      }
+    }
+  });
+
   test("records how many commits behind the base the branch was", async () => {
     const report = await gateRun().run();
     assert.equal(report.commitsBehind, 29);
@@ -7107,6 +7182,22 @@ describe("runRealClaudeGateSuite — same-tree re-run before the base comparison
     assert.equal(report.rerunFailures, null);
     assert.match(report.rerunSkipReason ?? "", /executed nothing/);
     assert.deepEqual(report.baselineFailures, ["p.TestFlaky"], "the base comparison still runs over the full set");
+  });
+
+  test("an unfinished re-run cannot excuse a named failure using its passing fragment", async () => {
+    const incomplete = `${rerunGreen}\n${JSON.stringify({ Action: "run", Package: "p", Test: "TestLuna" })}`;
+    const report = await rerunHarness(contents(incomplete, rerunRed)).run();
+    assert.equal(report.rerunFailures, null);
+    assert.match(report.rerunSkipReason ?? "", /incomplete/);
+    assert.deepEqual(report.baselineFailures, ["p.TestFlaky"]);
+  });
+
+  test("an unfinished base comparison cannot establish an inherited failure", async () => {
+    const incomplete = `${rerunRed}\n${JSON.stringify({ Action: "run", Package: "p", Test: "TestLuna" })}`;
+    const report = await rerunHarness(contents(rerunRed, incomplete)).run();
+    assert.deepEqual(report.rerunFailures, ["p.TestFlaky"]);
+    assert.equal(report.baselineFailures, null);
+    assert.match(report.baselineSkipReason ?? "", /incomplete/);
   });
 
   test("a hang killed by the test binary's own timeout is neither re-tried nor compared", async () => {
@@ -11153,6 +11244,7 @@ describe("pre-verifier gates — failures already on main (#123)", () => {
             : { exitCode: 0, timedOut: false, spawnError: null },
       }],
       ["cannot be read", { rerunOutput: "BUILD FAILED" }],
+      ["contains incomplete evidence", { rerunOutput: junit([], [Z]).replace("</testsuite>", "<testcase/></testsuite>") }],
       ["has no template", { formats: JSON.stringify({ [UI]: "junit-xml" }), rerunOutput: junit([], [Z]) }],
     ];
     for (const [label, over] of unknown) {
