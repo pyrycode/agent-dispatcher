@@ -2143,6 +2143,15 @@ export interface DispatchClient {
   addLabel(issueNumber: number, label: string): Promise<void>;
   removeLabel(issueNumber: number, label: string): Promise<void>;
   addComment(issueNumber: number, body: string): Promise<void>;
+  /**
+   * Comment on a pull request that belongs to ticket `issueNumber`. A PR is
+   * not a workflow ticket: the orchestrator's store owns ticket comments,
+   * but PR discussion stays on GitHub (docs/workflow-authority.md), so this
+   * goes straight to GitHub and is never queued as a workflow comment. The
+   * ticket number is what ownership is checked against. Callers that need
+   * idempotency read the PR back and look for their own marker.
+   */
+  addPullRequestComment(issueNumber: number, pr: number, body: string): Promise<void>;
   getIssueLabels(issueNumber: number): Promise<string[]>;
   /** Fresh GitHub read, including blockers added during this agent run. */
   getOpenBlockers(issueNumber: number): Promise<number[]>;
@@ -4790,7 +4799,9 @@ async function publishSavedVerdict(
   const marker = handoffMarker({ agent: state.agent, issueNumber: state.issueNumber, startedAtMs: state.startedAtMs });
   if (!alreadyPosted) {
     try {
-      await client.addComment(pr, `${state.handoff.body}\n\n${marker}`);
+      // On the PR itself, not the ticket: the workflow store knows only
+      // tickets and refused this as "Unknown workflow ticket" (#2148/PR #2150).
+      await client.addPullRequestComment(state.issueNumber, pr, `${state.handoff.body}\n\n${marker}`);
     } catch (e) {
       return { ok: false, why: `posting the verdict on PR #${pr} failed: ${e}` };
     }

@@ -167,6 +167,9 @@ export function workflowClient<T extends object>(
         ...actor(),
       });
     },
+    // addPullRequestComment is deliberately absent. A PR is not a workflow
+    // ticket, so the store would refuse it ("Unknown workflow ticket"), and
+    // PR discussion stays on GitHub. It falls through to the base client.
     getIssueCommentBodies: async (n: number) =>
       (base as any).getIssueCommentBodies(n),
     getFamilyDispatchState: async (n: number) =>

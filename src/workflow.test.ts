@@ -463,6 +463,58 @@ test("dispatcher reads and changes workflow through the central API with no GitH
     "done:builder",
   ]);
 });
+test("a PR comment bypasses the workflow store; the store still refuses a PR as a ticket (#2148 / PR #2150)", async (t) => {
+  const { store } = fixture(t);
+  store.workflow.import(config, [item(), item(2148)]);
+  assert.equal(store.start(run()).ok, true);
+  const server = await serveFleet(store, { mac: "machine" }, "operator", 0);
+  t.after(() => server.close());
+  const connection = new JsonClient(`http://127.0.0.1:${(server.address() as any).port}`, "machine");
+  const posted: Array<[number, number, string]> = [];
+  const client = workflowClient(
+    {
+      addComment: async (_n: number, _body: string): Promise<void> => {
+        throw new Error("GitHub must not be written for a ticket comment");
+      },
+      addPullRequestComment: async (n: number, pr: number, body: string): Promise<void> => {
+        posted.push([n, pr, body]);
+      },
+    },
+    connection,
+    config.project,
+    () => true,
+    () => ({ session: "s", runId: "builder" }),
+  );
+  await assert.rejects(client.addComment(2150, "verdict"), /Unknown workflow ticket/);
+  await client.addPullRequestComment(2148, 2150, "verdict");
+  assert.deepEqual(posted, [[2148, 2150, "verdict"]]);
+  assert.equal(store.workflow.comments("org/mobile#2148").length, 0, "nothing queued on the ticket");
+  assert.equal(store.workflow.pendingComments().length, 0);
+});
+test("PR comment ownership refuses a finished run but lets the claim holder's sweep through (#2148 / PR #2150)", async (t) => {
+  const { store } = fixture(t);
+  store.workflow.import(config, [item()]);
+  assert.equal(store.start(run()).ok, true);
+  const server = await serveFleet(store, { mac: "machine" }, "operator", 0);
+  t.after(() => server.close());
+  const connection = new JsonClient(`http://127.0.0.1:${(server.address() as any).port}`, "machine");
+  const check = (runId?: string) =>
+    connection.call("/workflow/authorize", { project: config.project, session: "s", ticket: "org/mobile#1947", runId });
+  // While the run is admitted, its own error path may post.
+  assert.deepEqual(await check("builder"), { ok: true });
+  store.finish("mac", "s", "builder");
+  // Plain /authorize still answers with the machine's claim for the
+  // finished run's id; the workflow check does not.
+  await connection.call("/authorize", { session: "s", ticket: "org/mobile#1947", runId: "builder" });
+  await assert.rejects(check("builder"), /finished or lost ownership/);
+  // The pending-verdict sweep has no admitted run: the claim decides.
+  assert.deepEqual(await check(), { ok: true });
+  // Another session on the same machine cannot borrow the finished run's id.
+  await assert.rejects(
+    connection.call("/workflow/authorize", { project: config.project, session: "other", ticket: "org/mobile#1947", runId: "builder" }),
+    /finished or lost ownership/,
+  );
+});
 test("a finished worker cannot enqueue a late result comment", (t) => {
   const { store } = fixture(t);
   store.workflow.import(config, [item()]);

@@ -50,6 +50,9 @@ class FakeClient implements DispatchClient {
     if (this.failAddComment) throw this.failAddComment;
     this.comments.push({ issueNumber, body });
   }
+  async addPullRequestComment(_issueNumber: number, pr: number, body: string) {
+    this.comments.push({ issueNumber: pr, body });
+  }
   async getIssueLabels() { return []; }
   async getOpenBlockers() { return []; }
   async getItemStatus() { return null; }

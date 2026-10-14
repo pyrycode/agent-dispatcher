@@ -787,6 +787,17 @@ export class GitHubProjectClient {
     }
   }
 
+  /**
+   * Comment on pull request `pr`, which belongs to ticket `issueNumber`.
+   * GitHub serves PR conversation comments from the issues endpoint, so the
+   * request is the same as `addComment`. The difference is who handles it:
+   * the workflow client leaves this method alone, so it reaches GitHub
+   * through the shared transport, whose bridge passes PR requests upstream.
+   */
+  async addPullRequestComment(_issueNumber: number, pr: number, body: string): Promise<void> {
+    await this.addComment(pr, body);
+  }
+
   /** Close an issue as completed. Used by `runParentClose`. */
   async closeIssue(issueNumber: number): Promise<void> {
     const response = await fetchWithRetry(

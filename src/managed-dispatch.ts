@@ -297,6 +297,16 @@ export class ManagedDispatch {
   async authorize(issue: number): Promise<void> {
     await this.connection.call<Claim>("/authorize", { session: this.session, ticket: `${this.project}#${issue}`, runId: currentRun.getStore()?.run.id });
   }
+  /**
+   * Ownership for a PR comment, checked against the PR's ticket. The body
+   * goes to GitHub, not the store, so this repeats the store's own check for
+   * a ticket comment: a finished run or lost ownership is refused. With no
+   * admitted run, as in the pending-verdict sweep, the machine's claim on
+   * the ticket decides, exactly as for its labels.
+   */
+  async authorizeWorkflow(issue: number): Promise<void> {
+    await this.connection.call("/workflow/authorize", { project: this.project, session: this.session, ticket: `${this.project}#${issue}`, runId: currentRun.getStore()?.run.id });
+  }
   async recoveryFacts(tickets: string[]) {
     const run=currentRun.getStore()?.run;
     return this.connection.call<Array<{ ticket: string; pause?: PauseRecord; artifactRevision?: string; evidence: EvidenceRecord[]; coordination: CoordinationRecord[] }>>("/recovery/facts", {
@@ -341,9 +351,10 @@ export class ManagedDispatch {
         const value = Reflect.get(target, key);
         if (typeof value !== "function") return value;
         if (typeof key !== "string") return value.bind(target);
-        if (!numbers.has(key) && !items.has(key) && !lists.has(key) && key !== "createIssue" && key !== "addItemToProject") return value.bind(target);
+        if (!numbers.has(key) && !items.has(key) && !lists.has(key) && key !== "createIssue" && key !== "addItemToProject" && key !== "addPullRequestComment") return value.bind(target);
         return async (...args: any[]) => {
           if (numbers.has(key)) await this.authorize(args[0]);
+          if (key === "addPullRequestComment") await this.authorizeWorkflow(args[0]);
           if (items.has(key)) {
             const number = itemNumbers.get(args[0]);
             if (number === undefined) throw new Error("Cannot mutate an item outside the managed snapshot");

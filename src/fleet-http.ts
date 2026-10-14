@@ -188,6 +188,12 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
         if(body.ticket?.split('#')[0]!==project) throw new Error('Workflow project mismatch');
         if(req.url==='/workflow/change') return send(200,store.workflowChange(machine,body.session,body.runId,body.ticket,body.change,body.commandId,body.revision));
         if(req.url==='/workflow/comments') return send(200,store.workflow.comments(body.ticket));
+        // Ownership for a write that does not go to the store, a PR comment:
+        // the same refusal of a finished run or lost ownership that a ticket
+        // comment gets from workflowComment.
+        if(req.url==='/workflow/authorize') {
+          store.authorizeWorkflow(machine,body.session,body.ticket,body.runId);return send(200,{ok:true});
+        }
         if(req.url==='/workflow/comment') {
           store.workflowComment(machine,body.session,body.runId,body.ticket,body.body,body.commandId);return send(200,{ok:true});
         }
