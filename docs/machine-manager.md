@@ -523,7 +523,7 @@ hand, for example with `recovery-task complete`, after checking the computer.
 The evidence has to be positive. The task's own computer must have reported in the
 last 15 minutes with a `localTasks` list, so a computer that is briefly offline,
 or still on a supervisor that does not send the list, reports nothing. The clock
-restarts whenever the condition stops holding. The limit is
+restarts whenever the condition stops holding. If the claims service cannot answer, `orphanedTasks` is `null` with `orphanedTasksError` beside it, which a reader must treat as unknown rather than as none. The receipt lists themselves stay out of the operator report. The limit is
 `recovery.orphanedTaskMinutes` in the claims configuration, default 60.
 
 The fixed recipes are `platform-probe`, `memory-runtime-smoke`,
