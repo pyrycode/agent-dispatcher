@@ -101,8 +101,15 @@ async function main(): Promise<void> {
     // A running or attention task nothing holds is reported after this many minutes. Default 60.
     const orphanMinutes = config.recovery?.orphanedTaskMinutes;
     if (orphanMinutes !== undefined && (typeof orphanMinutes !== "number" || !Number.isFinite(orphanMinutes) || orphanMinutes < 1)) throw new Error("recovery.orphanedTaskMinutes must be a number of at least 1");
+    // Quiet repeat assessments of one ticket: first after this many minutes,
+    // doubling up to the ceiling in hours. Defaults 30 minutes and 4 hours.
+    const reassessMinutes = config.recovery?.reassessBaseMinutes, reassessHours = config.recovery?.reassessCeilingHours;
+    if (reassessMinutes !== undefined && (typeof reassessMinutes !== "number" || !Number.isFinite(reassessMinutes))) throw new Error("recovery.reassessBaseMinutes must be a number");
+    if (reassessHours !== undefined && (typeof reassessHours !== "number" || !Number.isFinite(reassessHours))) throw new Error("recovery.reassessCeilingHours must be a number");
     const store = new FleetStore(database, limits, { ...(safetyHours === undefined ? {} : { safetyRecheckMs: Math.round(safetyHours * 3600_000) }),
       ...(orphanMinutes === undefined ? {} : { orphanedTaskMs: Math.round(orphanMinutes * 60_000) }),
+      ...(reassessMinutes === undefined ? {} : { reassessBaseMs: Math.round(reassessMinutes * 60_000) }),
+      ...(reassessHours === undefined ? {} : { reassessCeilingMs: Math.round(reassessHours * 3600_000) }),
       codexThrottle: readCodexThrottleConfig(config.codexThrottle) });
     // Logs a Codex pause's end once, when it runs out, rather than at the next report.
     const codexTimer = setInterval(() => { try { store.codexTick(); } catch (e) { console.warn("Codex throttle tick failed:", (e as Error).message); } }, 5_000);

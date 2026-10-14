@@ -31,6 +31,14 @@ export interface WorkOffer {
 export function codexPaused(offer: WorkOffer, state: FleetSnapshot): boolean {
   return state.codexPause?.active === true && offer.role !== "recovery-task" && startsCodex(offer, state.runnerPolicy);
 }
+/**
+ * The authority also spaces Codex starts fleet-wide. While the snapshot says
+ * the next start must wait, the scheduler passes over Codex offers the same
+ * way, so fitting non-Codex work starts instead.
+ */
+export function codexSpaced(offer: WorkOffer, state: FleetSnapshot): boolean {
+  return state.codexSpacing?.held === true && offer.role !== "recovery-task" && startsCodex(offer, state.runnerPolicy);
+}
 
 /** The authority classifies queued checks, including offers from older workers. */
 function idleAssessment(offer: WorkOffer, state: FleetSnapshot): boolean {
@@ -99,7 +107,7 @@ export function scheduleMachine(opts: {
   for (const job of ready) {
     if (idleAssessment(job, opts.state) && [...localRuns, ...selected].some(r => /#[1-9]\d*$/.test(r.ticket))) continue;
     if (active.has(job.ticket) || locks.has(`${job.project}:reconcile`) || job.locks.some(l => locks.has(l))) continue;
-    if (codexPaused(job, opts.state)) continue;
+    if (codexPaused(job, opts.state) || codexSpaced(job, opts.state)) continue;
     if (job.roleLimit !== undefined && [...opts.state.runs, ...selected].filter(r => countsForRoleLimit(r, job, opts.machine)).length >= job.roleLimit) continue;
     const newTicket = /#[1-9]\d*$/.test(job.ticket) && !claims.has(job.ticket);
     if (newTicket && ticketPlaces === 0) continue;

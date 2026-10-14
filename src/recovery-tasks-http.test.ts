@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {FleetStore} from './fleet-store.js';
 import {serveFleet,JsonClient} from './fleet-http.js';
 import {recoveryFingerprint} from './fleet-recovery.js';
+import {DEFAULT_CODEX_THROTTLE} from './codex-throttle.js';
 
 const limits={box:{heavyLimit:1,combinedLimit:2},mac:{heavyLimit:1,combinedLimit:2}};
 const revision='9950e6fbd28aac7ec3f6772e2deeebbcf83b52a2';
@@ -27,7 +28,7 @@ test('failed-task excerpts require the owning recovery run over HTTP',async t=>{
 });
 
 test('real HTTP source admission, native result, ownership and reassessment work together',async t=>{
- const store=new FleetStore(':memory:',limits),server=await serveFleet(store,{box:'b',mac:'m'},'a',0);
+ const store=new FleetStore(':memory:',limits,{codexThrottle:{...DEFAULT_CODEX_THROTTLE,startSpacingMs:0}}),server=await serveFleet(store,{box:'b',mac:'m'},'a',0);
  t.after(async()=>{await new Promise<void>(r=>server.close(()=>r()));store.close();});
  const address=server.address();assert.ok(address&&typeof address!=='string');
  const url='http://127.0.0.1:'+address.port,box=new JsonClient(url,'b'),mac=new JsonClient(url,'m'),admin=new JsonClient(url,'a');

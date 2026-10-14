@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { setTimeout as sleep } from "node:timers/promises";
 import { FleetStore } from "./fleet-store.js";
+import { DEFAULT_CODEX_THROTTLE } from './codex-throttle.js';
 import { FleetClient, serveFleet } from "./fleet-http.js";
 import { MachineManager, offerId, serveManager } from "./machine-manager.js";
 import { ManagedDispatch, managedRunRunner, trackManagedChild } from "./managed-dispatch.js";
@@ -19,7 +20,8 @@ const url = (server: Server) => {
 const close = (server: Server) => new Promise<void>(resolve => server.close(() => resolve()));
 
 test('one central runner reaches every role and computer without replacing an active run', async t => {
-  const store = new FleetStore(':memory:', { mac: { heavyLimit: 2, combinedLimit: 2 }, linux: { heavyLimit: 2, combinedLimit: 2 } });
+  // Start spacing is covered in codex-spacing.test.ts; here every role starts at once.
+  const store = new FleetStore(':memory:', { mac: { heavyLimit: 2, combinedLimit: 2 }, linux: { heavyLimit: 2, combinedLimit: 2 } }, { codexThrottle: { ...DEFAULT_CODEX_THROTTLE, startSpacingMs: 0 } });
   const claimsServer = await serveFleet(store, { mac: 'mac-test', linux: 'linux-test' }, 'admin-test', 0);
   const instances: Array<{ manager: MachineManager; server: Server; managed: ManagedDispatch; env: NodeJS.ProcessEnv }> = [];
   t.after(async () => {

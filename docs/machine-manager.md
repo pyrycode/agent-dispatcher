@@ -62,6 +62,18 @@ A run counts as Codex when the central runner choice is `codex`. Without a centr
 
 The dispatcher reports through its existing manager connection. Its Codex runner reads Codex's own failed-turn message (`last status: 429`, `429 Too Many Requests`, or `hit your usage limit`), never the agent's prose. A failed run is reported once it ends; a clean start is reported once per admitted run at its first completed item that is not an error. A ticket whose run hit the limit is not given an error label or an `error-retry-count`; it is offered again and admitted when the pause ends. That happens only when the claim service confirms a pause is in force, and for at most four 429s on one ticket while other Codex runs get through. A ticket that keeps meeting a 429 while others start cleanly has a limit of its own, such as an oversized request, so from the fifth it counts. A 429 counts towards that limit only if some Codex run started cleanly since the ticket's previous one, so an account-wide limit that stops every run never counts against a ticket; the ticket's own clean start resets it. If the report cannot be delivered, or the throttle is off, the failure also takes the ordinary capped transient retry. A recovery assessment whose Codex run hits the limit waits out the existing thirty-minute transport cooldown as an operational escalation instead of escalating to a person. The live gate's infrastructure breaker does not count a model provider's own 429 lines as relay admission rejections, so a Codex limit seen inside a live test cannot halt a ticket with `error:infra`.
 
+### Codex start spacing
+
+The 429s kept coming with only three Codex runs in flight while the plan still showed two thirds left, which points at a tokens-per-minute limit rather than the plan's allowance. A Codex run's opening turns are its largest requests, so several starting in the same minute is the burst that meets that limit. The claim service therefore admits at most one new Codex start every 20 seconds across the whole fleet:
+
+- A Codex start inside the spacing is refused with the reason `codex-spaced`. Nothing is reserved for it, so it occupies no place, claim or lock, and the manager passes over Codex offers while the snapshot says the spacing holds, so fitting non-Codex work starts instead. The next Codex start goes to whichever manager asks first once the spacing has passed.
+- Only an admitted Codex start begins the next spacing. A start refused for capacity, a lock or a pause does not. A lost-reply retry of an admitted start recovers its grant as usual.
+- What counts as a Codex start is the same as for the pause above. Claude runs and work that starts no agent are never spaced.
+- A start recorded in the future, as after the clock steps back, holds nothing.
+- The spacing is enforced only by the claim service. An independent dispatcher with no claim service is not spaced.
+
+Set `"codexThrottle": {"startSpacingSeconds": 20}` in the claim service configuration, between 0 and 300; 0 turns spacing off. It is independent of `enabled`. `operator.sh codex` shows `spacing`: `spacingSeconds`, `held`, `remainingSeconds`, `lastStartAt`, `nextStartAt`, `lastStart`, `heldSinceLastStart` and `startsLastHour`, plus `recentStarts`, the last twenty admitted Codex starts. `operator.sh status` carries `codexSpacing` only while a start would be held, and a queued offer held by it shows the state `codex-spaced`.
+
 After a restart, and again when it sees a pause end, each dispatcher holds its Codex offers back for a random time of up to a minute (`PYRY_CODEX_START_JITTER_MS`), so a fleet-wide restart or the end of a pause does not send every Codex start to OpenAI in the same second. Holding the offer rather than the run means the wait occupies no place; an independent dispatcher waits just before the spawn instead. A run already admitted never waits.
 
 Visibility:
@@ -322,6 +334,44 @@ incident is assessed again only when one of these changes:
   `recovery.safetyRecheckHours` in the claim service configuration to change it,
   between one hour and thirty days.
 
+### Quiet repeat assessments
+
+A repeat assessment whose ticket stage, recovery labels, blocked state and pause
+record are what the last assessment saw, so that only comments, the body, logs,
+recovery task results, coordination or a dependency moved, is spaced out. The first
+such repeat waits 30 minutes after the last decision, the same as the earlier
+evidence cooldown. Each further one in a row doubles that, to 1, 2 and then 4 hours,
+the ceiling. A result the last decision waited for, the recovery task it coordinated
+or a dependency it named, is read at once the first time, and its repeats follow the
+same doubling, so a loop of failing repairs slows down instead of running every hour.
+An escalation to a person keeps the flat 30 minutes, so a reply by comment is read
+promptly.
+
+Never held: any change to the stage, the recovery labels, whether the ticket is
+blocked or its pause record, which includes every new stage error; anything after an
+applied repair (`retry`, `rework`, `resume`, `refine`, `unblock`); a manual trigger
+such as a `needs-human:` hold or a denied permission, which escalates at once as
+before; and a code deadline or the safety interval, also when evidence moved
+meanwhile. A deadline or safety reassessment keeps the count of quiet repeats; any
+other non-quiet assessment starts it again. `/recovery/state` shows a current
+assessed incident's `cadence`: `quietRepeats` and `nextQuietReassessAt`. Set
+`recovery.reassessBaseMinutes` (5 to 1440) and `recovery.reassessCeilingHours` (up
+to 168) in the claim service configuration to change the spacing.
+
+Measured on 2026-10-14: 154 recovery assessments in one day against 36 builder
+runs. 25 were the overnight unchanged-wait loop settled above. 28 were started by
+nothing but the comment read: the publisher reads an issue's latest eight
+comments, so each recovery report pushed an older comment out of view and moved the
+evidence revision, and pyrycode#3268 was escalated to a person five times that way.
+The evidence revision is now recomputed only when the body changes or a counted
+comment appears or is edited; a comment leaving the read is not new evidence, and
+nor is an automatic-retry status note, whose labels already carry the change. The
+comments it was computed from are kept beside the ticket, in
+`workflow_evidence_seen`, so recording them never changes the ticket's revision. A
+deleted comment alone does not move the revision. With nothing recorded, as on the
+first read after an upgrade, the revision is computed exactly as before, so the
+upgrade itself starts no assessments.
+
 The cause that reopened a settlement is stored in its `reopened` column and shown in
 `/recovery/state`. Incidents settled before this policy are recorded against the
 state at the first report after deployment, so the deployment itself does not
@@ -419,7 +469,7 @@ All supervisors and launch commands must use the shared path. This does not limi
 
 ## Recovery without board supervision
 
-Recovery now watches changed issue evidence and dependency revisions as well as errors and repeated rework. Blocked issues receive an assessment. An unchanged dependency wait does not repeat that assessment on a timer. Changed evidence can reopen an escalation after a thirty minute cooldown. Workflow changes remain eligible immediately. Inbox items with no progress for a day also enter assessment. A pipeline Inbox item needing live evidence can enter immediately. Evidence refinement returns to the normal planning stage with its portable proof brief.
+Recovery now watches changed issue evidence and dependency revisions as well as errors and repeated rework. Blocked issues receive an assessment. An unchanged dependency wait does not repeat that assessment on a timer. Changed evidence can reopen an escalation after a thirty minute cooldown, doubling to four hours while only evidence keeps changing (see Quiet repeat assessments). Workflow changes remain eligible immediately. Inbox items with no progress for a day also enter assessment. A pipeline Inbox item needing live evidence can enter immediately. Evidence refinement returns to the normal planning stage with its portable proof brief.
 
 A parked stage error enters assessment even when ordinary transient retries have already run out. A retry count without a stage error still belongs to the ordinary retry wait. Health holds retain their existing recovery. Active workers, human holds and capacity limits remain respected.
 

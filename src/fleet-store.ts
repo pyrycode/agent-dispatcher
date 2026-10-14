@@ -13,7 +13,7 @@ import {RecoveryTasks, assessmentTasks, type RecoveryTaskRequest, type RecoveryT
 import {createHash} from 'node:crypto';
 import {manifestHash} from './recovery-artifacts.js';
 import type { AgentRunner } from './agent-runner.js';
-import { CodexThrottle, startsCodex, DEFAULT_CODEX_THROTTLE, type CodexThrottleConfig, type CodexPauseState } from './codex-throttle.js';
+import { CodexThrottle, startsCodex, DEFAULT_CODEX_THROTTLE, type CodexThrottleConfig, type CodexPauseState, type CodexSpacingState } from './codex-throttle.js';
 
 /** An operator choice, frozen into each new grant. Null restores local settings. */
 export interface RunnerPolicy { runner: AgentRunner | null; revision: number }
@@ -87,9 +87,11 @@ export interface StartRequest {
 }
 export interface Claim { ticket: string; machine: string; generation: string; created: number }
 export interface FleetRun extends StartRequest { generation: string; created: number; runnerPolicy?: RunnerPolicy }
-export interface FleetSnapshot { workflowProjects?: string[]; claims: Claim[]; runs: FleetRun[]; runnerPolicy?: RunnerPolicy; idleRecoveryTickets?: string[]; priorityHighTickets?: string[]; releasedAssessmentClaims?: Claim[]; features?: {recoveryTasks:boolean}; requiredRepairs?: Record<string,string[]>; codexPause?: CodexPauseState }
+export interface FleetSnapshot { workflowProjects?: string[]; claims: Claim[]; runs: FleetRun[]; runnerPolicy?: RunnerPolicy; idleRecoveryTickets?: string[]; priorityHighTickets?: string[]; releasedAssessmentClaims?: Claim[]; features?: {recoveryTasks:boolean}; requiredRepairs?: Record<string,string[]>; codexPause?: CodexPauseState;
+  /** Present only while a new Codex start would be refused for spacing. */
+  codexSpacing?: CodexSpacingState }
 export type StartResult = { ok: true; generation: string } | {
-  ok: false; reason: "foreign-claim" | "running" | "capacity" | "locked" | "finished" | "codex-paused";
+  ok: false; reason: "foreign-claim" | "running" | "capacity" | "locked" | "finished" | "codex-paused" | "codex-spaced";
 };
 
 export function validateStart(req: StartRequest): void {
@@ -474,10 +476,12 @@ export class FleetStore {
       const claim = this.db.prepare("SELECT * FROM fleet_claims WHERE ticket=?").get(req.ticket);
       if (claim && claim.machine !== req.machine) return { ok: false, reason: "foreign-claim" };
       if (this.db.prepare("SELECT 1 FROM fleet_runs WHERE ticket=? AND finished IS NULL").get(req.ticket)) return { ok: false, reason: "running" };
-      // A Codex rate limit pauses new Codex starts across the fleet. Admitted
-      // runs and work that starts no Codex agent are untouched.
-      if (startsCodex(req, this.runnerPolicy(), req.supportTaskId ? this.tasks.get(req.supportTaskId).request.recipe : undefined)
-        && this.codex.paused(this.clock())) return { ok: false, reason: "codex-paused" };
+      // A Codex rate limit pauses new Codex starts across the fleet, and
+      // Codex starts are spaced apart fleet-wide (checked below, after the
+      // other admission checks). Admitted runs and work that starts no Codex
+      // agent are untouched. A refusal reserves nothing.
+      const codex = startsCodex(req, this.runnerPolicy(), req.supportTaskId ? this.tasks.get(req.supportTaskId).request.recipe : undefined);
+      if (codex && this.codex.paused(this.clock())) return { ok: false, reason: "codex-paused" };
       if (req.resource !== "light") {
         const row = this.db.prepare(`SELECT
           count(CASE WHEN resource='heavy' THEN 1 END) AS heavy,
@@ -499,6 +503,8 @@ export class FleetStore {
       for (const lock of req.locks) {
         if (this.db.prepare("SELECT 1 FROM fleet_locks WHERE name=?").get(lock)) return { ok: false, reason: "locked" };
       }
+      // Last, so a start that would be refused anyway is not counted as spaced.
+      if (codex && this.codex.spacingWaitMs(this.clock()) > 0) { this.codex.spacingHeld(); return { ok: false, reason: "codex-spaced" }; }
       const generation = claim ? String(claim.generation) : randomUUID();
       const now = this.clock();
       const runnerPolicy = this.runnerPolicy();
@@ -506,6 +512,7 @@ export class FleetStore {
       this.db.prepare("INSERT OR IGNORE INTO fleet_claims VALUES (?,?,?,?)").run(req.ticket, req.machine, generation, now);
       this.db.prepare("INSERT INTO fleet_runs VALUES (?,?,?,?,?,?,?,?,NULL,NULL)").run(req.id, req.machine, req.session, req.ticket, generation, req.resource, admitted, now);
       for (const lock of new Set(req.locks)) this.db.prepare("INSERT INTO fleet_locks VALUES (?,?)").run(lock, req.id);
+      if (codex) this.codex.started({ machine: req.machine, ticket: req.ticket, role: req.role }, now);
       return { ok: true, generation };
   }
 
@@ -609,10 +616,12 @@ export class FleetStore {
       .all(...IDLE_RECOVERY_REASONS).map(r => String(r.ticket));
     const releasedAssessmentClaims = this.db.prepare("SELECT * FROM fleet_assessment_releases").all() as unknown as Claim[];
     const codexPause = this.codex.snapshot();
+    const codexSpacing = this.codex.spacingWaitMs() > 0 ? this.codex.spacingState() : undefined;
     // Read from the workflow authority, so offers from older workers are ranked too.
     const priorityHighTickets = this.workflow.openTicketsWithLabel(PRIORITY_HIGH);
     return {
       ...(codexPause ? { codexPause } : {}),
+      ...(codexSpacing ? { codexSpacing } : {}),
       ...(this.workflow.projects().length ? {workflowProjects:this.workflow.projects().map(p=>p.project)} : {}),
       ...(runnerPolicy ? { runnerPolicy } : {}),
       ...(idleRecoveryTickets.length ? { idleRecoveryTickets } : {}),
