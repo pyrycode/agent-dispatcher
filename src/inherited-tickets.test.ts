@@ -2,6 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { recordInheritedTests, inheritedMarker, type InheritedTicketClient } from "./inherited-tickets.js";
 import type { FlakyRunContext } from "./flaky-tickets.js";
+import { decideInheritedAdvance } from "./pipeline-decisions.js";
+import { inheritedAdvanceEnabled } from "./dispatch.js";
 
 const name = "p.C#permissionAnswer";
 const ctx = { gatedIssue: 1397, at: "2026-10-01T18:00:00Z", report: {
@@ -183,4 +185,121 @@ test("a failed grouped filing leaves every new test untracked and links nothing"
   const result = await recordInheritedTests(client, [a, b], ctx);
   assert.deepEqual(result, { blockers: [], untracked: [a, b], owned: [] });
   assert.deepEqual(client.linked, []);
+});
+
+// --------- Advance mode (2026-10-14) ---------
+
+test("advance mode reuses an exactly-naming tracker, comments, and adds no blocker", async () => {
+  const client = new Client();
+  client.open.push({ number: 1480, nodeId: "node-1480", title: "repair it", body: `fails: \`${name}\`` });
+  const result = await recordInheritedTests(client, [name], ctx, { advance: true });
+  assert.deepEqual(result, { blockers: [], untracked: [], owned: [], tracked: [{ name, issue: 1480 }] });
+  assert.deepEqual(client.linked, []);
+  assert.equal(client.comments.length, 1);
+  assert.equal(client.created.length, 0);
+});
+test("advance mode prefers a ticket naming the full test over an older loose title match", async () => {
+  const client = new Client();
+  client.open.push({ number: 1400, nodeId: "node-1400", title: "flaky permissionAnswer elsewhere", body: "other package" });
+  client.open.push({ number: 1480, nodeId: "node-1480", body: `\`${name}\`` });
+  const result = await recordInheritedTests(client, [name], ctx, { advance: true });
+  assert.deepEqual(result.tracked, [{ name, issue: 1480 }]);
+});
+test("advance mode files a tracker with the marker when none exists, without a blocker", async () => {
+  const client = new Client();
+  const result = await recordInheritedTests(client, [name], ctx, { advance: true });
+  assert.deepEqual(result.tracked, [{ name, issue: 1500 }]);
+  assert.ok(client.created[0].body.includes(inheritedMarker(name)));
+  assert.equal(client.statuses.get(1500), "Backlog");
+  assert.deepEqual(client.linked, []);
+});
+test("advance mode falls back to blockers when filing fails, and never reports a tracker", async () => {
+  const client = new Client();
+  client.fail = "create";
+  const result = await recordInheritedTests(client, [name], ctx, { advance: true });
+  assert.equal(result.tracked, undefined);
+  assert.deepEqual(result.untracked, [name]);
+  assert.match(result.fallbackReason!, /no confirmed tracking ticket/);
+});
+test("advance mode falls back to a blocker when the board write for the tracker fails", async () => {
+  const client = new Client();
+  client.open.push({ number: 1480, nodeId: "node-1480", body: inheritedMarker(name) });
+  client.fail = "board";
+  const result = await recordInheritedTests(client, [name], ctx, { advance: true });
+  assert.equal(result.tracked, undefined);
+  assert.deepEqual(result.untracked, [name]);
+  assert.deepEqual(client.linked, []);
+});
+test("advance mode falls back to blockers for a loose title match, and files no duplicate", async () => {
+  const client = new Client();
+  client.open.push({ number: 1400, nodeId: "node-1400", title: "flaky permissionAnswer", body: "seen in CI" });
+  const result = await recordInheritedTests(client, [name], ctx, { advance: true });
+  assert.equal(result.tracked, undefined);
+  assert.deepEqual(result.blockers, [{ name, issue: 1400 }]);
+  assert.equal(client.created.length, 0);
+  assert.match(result.fallbackReason!, /only by its method name/);
+});
+test("advance mode on a ticket that owns one of the fixes falls back, so the owner repairs it", async () => {
+  const client = new Client();
+  const other = "p.C#other";
+  client.open.push({ number: 1397, nodeId: "node-1397", body: inheritedMarker(name) });
+  client.open.push({ number: 1480, nodeId: "node-1480", body: inheritedMarker(other) });
+  const result = await recordInheritedTests(client, [name, other], ctx, { advance: true });
+  assert.equal(result.tracked, undefined);
+  assert.deepEqual(result.owned, [name]);
+  assert.match(result.fallbackReason!, /owns the fix/);
+});
+
+// The pure half of the decision: what must hold before any tracker is looked at.
+const pass = (n: string) => n;
+function goTally(overrides: Record<string, unknown> = {}) {
+  return { completeParse: true, executed: 10, failed: 1, skipped: 0, packageFailed: true, packageFailures: ["pkg"],
+    recognizedLines: 1, failedNames: ["pkg.TestShared"], passedNames: Array.from({ length: 9 }, (_, i) => pass(`pkg.TestOk${i}`)),
+    skippedTests: [], timedOutTests: [], ...overrides };
+}
+const inheritedRun = {
+  enabled: true,
+  adjusted: { verdict: "inherited-failure" as const, introduced: [], preExisting: ["pkg.TestShared"], flaky: [] },
+  raw: { verdict: "fail" as const },
+  format: "go-json" as const,
+  rerunFailures: ["pkg.TestShared"],
+  baselineFailures: ["pkg.TestShared"],
+  requiredTests: [],
+};
+test("an inherited Go failure whose package failure it explains is eligible", () => {
+  assert.deepEqual(decideInheritedAdvance({ ...inheritedRun, tally: goTally() }), { eligible: true, inherited: ["pkg.TestShared"] });
+});
+test("a package failing with no failing test of its own is not explained by another package's failure", () => {
+  const d = decideInheritedAdvance({ ...inheritedRun, tally: goTally({ packageFailures: ["pkg", "other"] }) });
+  assert.equal(d.eligible, false);
+  assert.match((d as any).reason, /package other failed/);
+});
+test("a suite-level failure outside Go is never explained", () => {
+  const d = decideInheritedAdvance({ ...inheritedRun, format: "playwright-json", tally: goTally({ packageFailures: ["playwright (global errors)"] }) });
+  assert.equal(d.eligible, false);
+});
+test("a required Go parent whose subtest is the inherited failure is not eligible", () => {
+  const d = decideInheritedAdvance({ ...inheritedRun, requiredTests: ["TestShared"],
+    tally: goTally({ failedNames: ["pkg.TestShared/case"] }),
+    adjusted: { ...inheritedRun.adjusted, preExisting: ["pkg.TestShared/case"] },
+    rerunFailures: ["pkg.TestShared/case"], baselineFailures: ["pkg.TestShared/case"] });
+  assert.equal(d.eligible, false);
+  assert.match((d as any).reason, /required live test TestShared/);
+});
+test("eligibility needs the switch on, the re-run, the base run and no hang", () => {
+  for (const change of [
+    { enabled: false }, { rerunFailures: null }, { baselineFailures: null },
+    { tally: goTally({ timedOutTests: ["pkg.TestShared"] }) },
+    { raw: { verdict: "fail" as const, missingLiveAcceptance: "required live test X has no passing attempt" } },
+    { adjusted: { ...inheritedRun.adjusted, verdict: "fail" as const } },
+  ]) {
+    assert.equal(decideInheritedAdvance({ ...inheritedRun, tally: goTally(), ...change } as any).eligible, false, JSON.stringify(change));
+  }
+});
+test("the advance switch is on unless the fork turns it off", () => {
+  assert.equal(inheritedAdvanceEnabled({}), true);
+  assert.equal(inheritedAdvanceEnabled({ PYRY_REAL_CLAUDE_GATE_INHERITED_ADVANCE: "1" }), true);
+  for (const off of ["0", "false", "OFF", " no "]) {
+    assert.equal(inheritedAdvanceEnabled({ PYRY_REAL_CLAUDE_GATE_INHERITED_ADVANCE: off }), false, off);
+  }
 });

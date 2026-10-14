@@ -726,6 +726,13 @@ export type GateVerdict =
    */
   | "inherited-failure"
   /**
+   * An inherited failure the gate accepted: every failing test failed again
+   * on the same-tree re-run and fails on the base, each has an open tracking
+   * ticket naming it, and the ticket's own required live tests passed with
+   * their evidence. Advances like a pass, without a blocker on the fix.
+   */
+  | "inherited-pass"
+  /**
    * The first pass failed in an infrastructure shape, so nothing was judged
    * and no re-run or base comparison ran. Halts with `error:infra`; never a
    * rework, never a pass.
@@ -772,6 +779,8 @@ export interface GateTallyLike {
   executed: number;
   failed: number;
   packageFailed: boolean;
+  /** Packages or suites with a suite-level failure, when the parser names them. */
+  packageFailures?: readonly string[];
   recognizedLines: number;
   /**
    * Tests still running when the test binary's OWN deadline fired, as
@@ -1061,6 +1070,94 @@ export function decideBaselineAdjustedVerdict(opts: {
   };
 }
 
+/** Whether an inherited failure may advance, and if not, why. */
+export type InheritedAdvanceDecision =
+  | { eligible: true; inherited: string[] }
+  | { eligible: false; reason: string };
+
+/**
+ * Decide whether an inherited failure may advance the ticket instead of
+ * parking it behind its fix tickets. Pure; the tracking-ticket check that
+ * completes the decision needs GitHub and happens in the caller.
+ *
+ * **Why this exists.** On 2026-10-14 pyrycode-desktop #1809 ran 27 live
+ * tests: 26 passed and 1 failed that also fails on main, already tracked on
+ * #1947. The gate parked the ticket in Inbox behind #1947 and a person moved
+ * it on by hand. Every gated ticket whose run touches a test that is red on
+ * main parked the same way, each one a person.
+ *
+ * **What must hold, all of it.** Anything else parks exactly as before:
+ * - the run is an inherited failure: judged a failure, not infrastructure,
+ *   no hang killed by the binary's own deadline, base comparison made, and
+ *   no failure that passes on the base;
+ * - a same-tree re-run happened, and every failing test either passed there
+ *   (a flake, excused as on a flaky pass) or failed there again AND fails
+ *   on the base, by exact name;
+ * - no suite-level failure the named failures do not explain: a Go package
+ *   counts as explained only when one of its own tests failed, and any
+ *   suite-level failure in other formats parks;
+ * - no required live test, from the fork, the pull request or an evidence
+ *   rule, matches any failing name, flaky or inherited. Required tests that
+ *   are skipped, missing or lack evidence never reach here: the raw verdict
+ *   is already unusable for them.
+ */
+export function decideInheritedAdvance(opts: {
+  enabled: boolean;
+  adjusted: Pick<BaselineAdjustedVerdict, "verdict" | "introduced" | "preExisting" | "flaky">;
+  raw: Pick<GateVerdictDecision, "verdict" | "missingLiveAcceptance">;
+  tally: GateTallyLike | null;
+  format?: GateOutputFormat;
+  rerunFailures: readonly string[] | null;
+  baselineFailures: readonly string[] | null;
+  requiredTests: readonly string[];
+  testEvidence?: readonly TestEvidenceRule[];
+}): InheritedAdvanceDecision {
+  const no = (reason: string): InheritedAdvanceDecision => ({ eligible: false, reason });
+  if (!opts.enabled) return no("advancing past inherited failures is turned off for this fork");
+  const { adjusted, tally } = opts;
+  if (opts.raw.verdict !== "fail" || adjusted.verdict !== "inherited-failure") return no("the run is not an inherited failure");
+  if (opts.raw.missingLiveAcceptance) return no(opts.raw.missingLiveAcceptance);
+  if (tally === null || (tally.failedNames?.length ?? 0) === 0) return no("no named failing test to account for");
+  if ((tally.timedOutTests?.length ?? 0) > 0) return no("a test was killed by the test binary's own deadline");
+  if (adjusted.introduced.length > 0) return no("a failure passes on the base commit");
+  if (opts.rerunFailures === null) return no("no same-tree re-run was made, so a flake cannot be told from an inherited failure");
+  if (opts.baselineFailures === null) return no("no base comparison was made");
+  const failed = [...new Set(tally.failedNames!)];
+  const rerun = new Set(opts.rerunFailures);
+  const base = new Set(opts.baselineFailures);
+  const inherited = [...new Set(adjusted.preExisting)];
+  if (inherited.length === 0) return no("no failure is inherited");
+  const flaky = new Set(adjusted.flaky);
+  const inheritedSet = new Set(inherited);
+  for (const name of failed) {
+    if (inheritedSet.has(name)) {
+      if (!rerun.has(name)) return no(`${name} did not fail again on the same-tree re-run`);
+      if (!base.has(name)) return no(`${name} does not fail on the base commit`);
+    } else if (!flaky.has(name) || rerun.has(name)) {
+      return no(`${name} failed and is neither a flake nor inherited`);
+    }
+  }
+  for (const name of inherited) {
+    if (!failed.includes(name)) return no(`${name} is not a failure of this run`);
+  }
+  if (tally.packageFailed) {
+    const packages = tally.packageFailures ?? [];
+    if (opts.format !== "go-json" || packages.length === 0) {
+      return no("the run has a suite-level failure the named failures do not explain");
+    }
+    const unexplained = packages.filter(pkg => !failed.some(name => name.startsWith(`${pkg}.`)));
+    if (unexplained.length > 0) return no(`package ${unexplained.join(", ")} failed with no failing test of its own`);
+  }
+  const skippedNames = tally.skippedTests?.map(t => t.name) ?? [];
+  const observed = [...(tally.passedNames ?? []), ...failed, ...(tally.testDetails ?? []).map(d => d.name), ...skippedNames];
+  const required = new Set([...opts.requiredTests, ...reportedRequiredTests(observed, opts.testEvidence ?? [])]);
+  for (const req of required) {
+    const hit = failed.find(name => matchesRequiredTest(name, req));
+    if (hit !== undefined) return no(`required live test ${req} failed (${hit})`);
+  }
+  return { eligible: true, inherited };
+}
+
 /** Board actions for one gate verdict. */
 export interface GateOutcome {
   /** Target column, or null to leave the ticket where it is. */
@@ -1078,6 +1175,8 @@ export interface GateOutcome {
  *   flaky-pass    → the same, plus a Discord ping naming the flaky tests
  *   fail          → In Development, add the set's fail rework label (classic: `needs-rework:developer`)
  *   inherited-failure → stays at the live gate behind separate fix-ticket blockers
+ *   inherited-pass → the same as flaky-pass: an accepted inherited failure,
+ *                    each tracked on an open ticket, with no blocker added
  *   zero-executed → stays in Inbox, add `error:real-claude-gate`, notify
  *   unusable      → stays in Inbox, add `error:real-claude-gate`, notify
  *   infra-failure → stays in Inbox, add `error:infra`, notify
@@ -1126,6 +1225,15 @@ export function decideGateOutcome(
         addLabels: [failReworkLabel],
         removeLabels: [],
         notify: false,
+      };
+    case "inherited-pass":
+      // Same board actions as a pass. The suite is still red on main, so a
+      // human is pinged, as for a flaky pass.
+      return {
+        toColumn: REAL_CLAUDE_GATE_PASS_COLUMN,
+        addLabels: [],
+        removeLabels: [REAL_CLAUDE_GATE_LABEL],
+        notify: true,
       };
     case "inherited-failure":
       // Reconciliation creates and confirms the fix-ticket blockers first.

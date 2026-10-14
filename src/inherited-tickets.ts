@@ -16,11 +16,34 @@ export interface InheritedTicketResult {
   untracked: string[];
   /** The gated ticket itself is already the fix owner for these tests. */
   owned?: string[];
+  /**
+   * Advance mode only, and only when the advance holds: every name has an
+   * open tracking ticket that names it exactly, and no blocker was added.
+   * Absent whenever the result fell back to blockers.
+   */
+  tracked?: { name: string; issue: number }[];
+  /** Advance mode: why the result fell back to blockers. */
+  fallbackReason?: string;
+}
+export interface InheritedTicketOptions {
+  /**
+   * Try to let the gated ticket advance: find or file a tracker for every
+   * name, and add no blocker when each one names its test exactly. Any gap
+   * falls back to the blockers of the default mode.
+   */
+  advance?: boolean;
 }
 type OpenIssue = { number: number; nodeId: string; title?: string; body: string };
 
 export function inheritedMarker(name: string): string {
   return `<!-- inherited-live-test: ${name} -->`;
+}
+function hasMarker(issue: { body: string }, name: string): boolean {
+  return issue.body.split("\n").some(line => line.trim() === inheritedMarker(name));
+}
+/** The ticket names this exact test, not just a method of the same name. */
+function namesExactly(issue: { title?: string; body: string }, name: string): boolean {
+  return hasMarker(issue, name) || issue.body.includes(`\`${name}\``) || (issue.title ?? "").includes(name);
 }
 function matchesTrackingTicket(issue: { title?: string; body: string }, name: string): boolean {
   if (issue.body.includes(`\`${name}\``)) return true;
@@ -71,6 +94,7 @@ function fixTicket(names: readonly string[], ctx: FlakyRunContext): { title: str
  * the same open issue on the next attempt. Never report an unconfirmed blocker. */
 export async function recordInheritedTests(
   client: InheritedTicketClient, failures: readonly string[], ctx: FlakyRunContext,
+  options: InheritedTicketOptions = {},
 ): Promise<InheritedTicketResult> {
   const result: InheritedTicketResult = { blockers: [], untracked: [], owned: [] };
   const names = [...new Set(failures)];
@@ -86,11 +110,16 @@ export async function recordInheritedTests(
   const candidates = open.filter(i => i.number !== ctx.gatedIssue).sort((a, b) => a.number - b.number);
   const groups = new Map<number, { issue: OpenIssue; names: string[]; created: boolean }>();
   const untrackedNow: string[] = [];
+  // Names whose tracker matched only by the method name in its title.
+  const looselyTracked = new Set<string>();
   for (const name of names) {
-    // Exact markers win; quoted full names also find verifier/hand-filed bugs.
-    const ownerMarked = owner?.body.split("\n").some(line => line.trim() === inheritedMarker(name));
-    const issue = candidates.find(i => i.body.split("\n").some(line => line.trim() === inheritedMarker(name)))
+    // Exact markers win, then tickets naming the full test, so a loose title
+    // match on a same-named method elsewhere is the last resort.
+    const ownerMarked = owner !== undefined && hasMarker(owner, name);
+    const issue = candidates.find(i => hasMarker(i, name))
+      ?? candidates.find(i => namesExactly(i, name))
       ?? candidates.find(i => matchesTrackingTicket(i, name));
+    if (issue && !namesExactly(issue, name)) looselyTracked.add(name);
     if (ownerMarked || (!issue && owner && matchesTrackingTicket(owner, name))) {
       result.owned!.push(name);
     } else if (issue) {
@@ -110,7 +139,9 @@ export async function recordInheritedTests(
       console.warn(`   ⚠️ Could not file a fix ticket for ${untrackedNow.join(", ")}: ${error}`);
     }
   }
-  const confirmed = new Map<string, number>();
+  // Record the sighting and keep each tracker on the board first. A ticket
+  // whose tracker could not be confirmed here never advances.
+  const placed: { issue: OpenIssue; names: string[] }[] = [];
   for (const { issue, names: groupNames, created } of groups.values()) {
     try {
       if (!created) await client.addComment(issue.number, `## Shared failure seen again\n\n${evidence(groupNames, ctx)}`);
@@ -119,6 +150,24 @@ export async function recordInheritedTests(
       const entersBacklog = status === null || status === "Inbox" || status === "Done";
       if (entersBacklog) await client.updateItemStatus(itemId, "Backlog");
       if (entersBacklog || status === "Backlog") await client.moveItemToTop(itemId);
+      placed.push({ issue, names: groupNames });
+    } catch (error) {
+      console.warn(`   ⚠️ Could not confirm a fix ticket for ${groupNames.join(", ")}: ${error}`);
+    }
+  }
+  if (options.advance) {
+    const placedNames = new Map(placed.flatMap(g => g.names.map(name => [name, g.issue.number] as const)));
+    const gap = (result.owned!.length > 0 && `this ticket owns the fix for ${result.owned!.join(", ")}`)
+      || names.filter(n => !result.owned!.includes(n) && !placedNames.has(n)).map(n => `${n} has no confirmed tracking ticket`)[0]
+      || [...looselyTracked].map(n => `${n} is tracked on #${placedNames.get(n)} only by its method name; add ${inheritedMarker(n)} to that ticket's body`)[0];
+    if (!gap) {
+      return { blockers: [], untracked: [], owned: [], tracked: names.map(name => ({ name, issue: placedNames.get(name)! })) };
+    }
+    result.fallbackReason = gap;
+  }
+  const confirmed = new Map<string, number>();
+  for (const { issue, names: groupNames } of placed) {
+    try {
       await client.addBlocker(ctx.gatedIssue, issue.number);
       for (const name of groupNames) confirmed.set(name, issue.number);
     } catch (error) {

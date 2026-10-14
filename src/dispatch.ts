@@ -405,6 +405,20 @@ const REAL_CLAUDE_GATE_TIMEOUT_MS =
 const REAL_CLAUDE_GATE_MIN_EXECUTED =
   Number(process.env.PYRY_REAL_CLAUDE_GATE_MIN_EXECUTED) || 1;
 
+// Advance past an inherited failure instead of parking behind its fix. On
+// 2026-10-14 desktop #1809 ran 26 of 27 live tests green; the one red test
+// also failed on main and was tracked on #1947, and a person moved the
+// ticket on by hand. With this on, such a run advances to documentation when
+// every failing test failed again on the same-tree re-run and fails on the
+// base, each has an open tracking ticket naming it, and the ticket's own
+// required live tests passed (decideInheritedAdvance). Any new failure still
+// parks or routes exactly as before. On by default; `0`, `false`, `off` or
+// `no` turns it off for the fork.
+export function inheritedAdvanceEnabled(env: NodeJS.ProcessEnv): boolean {
+  return !/^(0|false|off|no)$/i.test((env.PYRY_REAL_CLAUDE_GATE_INHERITED_ADVANCE ?? "").trim());
+}
+const REAL_CLAUDE_GATE_INHERITED_ADVANCE = inheritedAdvanceEnabled(process.env);
+
 // Command for the base-commit re-run, used ONLY when the branch run has
 // named failures. `{{TESTS}}` is replaced with an anchored, shell-quoted
 // filter matching exactly those tests, so this costs seconds rather than a
@@ -9739,6 +9753,9 @@ export async function pollLoop(): Promise<void> {
           ? ", full suite every run"
           : `, per-ticket selection with ${REAL_CLAUDE_GATE_SELECTION.alwaysTests.length} always-run test(s), ` +
             `full suite every ${REAL_CLAUDE_GATE_SELECTION.fullEvery} merges`) +
+        (REAL_CLAUDE_GATE_INHERITED_ADVANCE
+          ? ", advances past tracked inherited failures"
+          : ", parks on inherited failures (PYRY_REAL_CLAUDE_GATE_INHERITED_ADVANCE off)") +
         (!REAL_CLAUDE_GATE_BACKGROUND
           ? ", runs alone"
           : REAL_CLAUDE_GATE_HOLD_VERIFIERS
@@ -10004,8 +10021,8 @@ export async function pollLoop(): Promise<void> {
                 managed.client(rawClient, false, candidate.issueNumber), gateRunner,
                 REAL_CLAUDE_GATE_MIN_EXECUTED, notifyDiscord, 0,
                 (flaky, ctx) => recordFlakyTests(client, flaky, ctx), undefined,
-                (failures, ctx) => recordInheritedTests(client, failures, ctx),
-                { legacyFormat: REAL_CLAUDE_GATE_FORMAT ?? undefined, testEvidence: REAL_CLAUDE_GATE_TEST_EVIDENCE ?? [] },
+                (failures, ctx, opts) => recordInheritedTests(client, failures, ctx, opts),
+                { legacyFormat: REAL_CLAUDE_GATE_FORMAT ?? undefined, testEvidence: REAL_CLAUDE_GATE_TEST_EVIDENCE ?? [], inheritedAdvance: REAL_CLAUDE_GATE_INHERITED_ADVANCE },
               );
             }).finally(() => { if (gateRun?.done === done) gateRun = null; });
             gateRun = { issue: candidate.issueNumber, done };
@@ -10022,8 +10039,8 @@ export async function pollLoop(): Promise<void> {
         pool.size + (sweepRun !== null ? 1 : 0),
         (flaky, ctx) => recordFlakyTests(client, flaky, ctx),
         undefined,
-        (failures, ctx) => recordInheritedTests(client, failures, ctx),
-        { legacyFormat: REAL_CLAUDE_GATE_FORMAT ?? undefined, testEvidence: REAL_CLAUDE_GATE_TEST_EVIDENCE ?? [] },
+        (failures, ctx, opts) => recordInheritedTests(client, failures, ctx, opts),
+        { legacyFormat: REAL_CLAUDE_GATE_FORMAT ?? undefined, testEvidence: REAL_CLAUDE_GATE_TEST_EVIDENCE ?? [], inheritedAdvance: REAL_CLAUDE_GATE_INHERITED_ADVANCE },
       );
     } else if (gateRun === null) {
       const verifiersInFlight = REAL_CLAUDE_GATE_HOLD_VERIFIERS
@@ -10040,8 +10057,8 @@ export async function pollLoop(): Promise<void> {
           const done: Promise<void> = work().finally(() => { if (gateRun?.done === done) gateRun = null; });
           gateRun = { issue, done };
         },
-        (failures, ctx) => recordInheritedTests(client, failures, ctx),
-        { legacyFormat: REAL_CLAUDE_GATE_FORMAT ?? undefined, testEvidence: REAL_CLAUDE_GATE_TEST_EVIDENCE ?? [] },
+        (failures, ctx, opts) => recordInheritedTests(client, failures, ctx, opts),
+        { legacyFormat: REAL_CLAUDE_GATE_FORMAT ?? undefined, testEvidence: REAL_CLAUDE_GATE_TEST_EVIDENCE ?? [], inheritedAdvance: REAL_CLAUDE_GATE_INHERITED_ADVANCE },
       );
     }
     // A waiting or running background gate keeps the main sweep off the

@@ -28,7 +28,8 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GATE_PARSER_VERSION, parseGateOutput, type GateRunReport, type GateTally } from "./gate-output.js";
-import { gateRunMetaPath, serializeGateRunMeta } from "./gate-report.js";
+import { gateRunMetaPath, liveGateLines, parseGateRunMeta, serializeGateRunMeta } from "./gate-report.js";
+import { recordInheritedTests, type InheritedTicketClient } from "./inherited-tickets.js";
 import { requiredLiveTestNames } from "./live-tests.js";
 import { parseTestEvidenceRules } from "./gate-test-evidence.js";
 
@@ -2408,6 +2409,282 @@ describe("runReworkRouting: a stale base FAIL costs no builder round (merge race
       assert.equal(refreshed, 0);
       assert.equal(item.status, "In Development");
       assert.ok(item.labels.includes("rework-count:3"));
+    });
+  });
+});
+
+// --------- Advancing past tracked inherited failures (2026-10-14) ---------
+
+/** GitHub as the shared-failure tracker sees it: open bug tickets, the
+ *  board, comments and blocker links. Records every write. */
+class TrackerClient implements InheritedTicketClient {
+  open: { number: number; nodeId: string; title?: string; body: string }[] = [];
+  created: { number: number; title: string; body: string }[] = [];
+  blockers: { parent: number; blocker: number }[] = [];
+  comments: { issue: number; body: string }[] = [];
+  statuses = new Map<number, string>();
+  async listOpenIssuesWithLabel(label: string) { assert.equal(label, "bug"); return this.open; }
+  async createIssue(title: string, body: string) {
+    const issue = { number: 2000 + this.created.length, nodeId: `node-${2000 + this.created.length}`, title, body };
+    this.created.push(issue); this.open.push(issue);
+    return { ...issue, url: "https://example.com" };
+  }
+  async addItemToProject(nodeId: string) { return nodeId; }
+  async getItemStatus(number: number) { return this.statuses.get(number) ?? null; }
+  async updateItemStatus(item: string, status: string) { this.statuses.set(Number(item.slice(5)), status); }
+  async addComment(issue: number, body: string) { this.comments.push({ issue, body }); }
+  async moveItemToTop() {}
+  async addBlocker(parent: number, blocker: number) { this.blockers.push({ parent, blocker }); }
+}
+
+const HISTORY_GAP = "real-daemon-history-on-open.spec.ts › a real daemon lazily fills a served gap after more than 200 entries written while Electron is closed";
+const SYSTEM_PROMPT = "real-claude-system-prompt.spec.ts › real claude picks up a saved channel system prompt at Reset session";
+
+/** Desktop #1809's gate run on 2026-10-14: 27 executed, 26 passed, the
+ *  history gap test failed, one test skipped. */
+function desktopRun(extra: { title: string; status: "passed" | "failed" }[] = []): string {
+  return JSON.stringify({ suites: [
+    { title: "real-claude-basic.spec.ts", specs: Array.from({ length: 26 - extra.filter(e => e.status === "passed").length }, (_, i) => ({
+      title: `live case ${i}`, tests: [{ status: "expected", results: [{ status: "passed" }] }] })) },
+    { title: "real-daemon-history-on-open.spec.ts", specs: [{ title: HISTORY_GAP.split(" › ")[1],
+      tests: [{ status: "unexpected", results: [{ status: "failed" }] }] }] },
+    { title: "real-claude-system-prompt.spec.ts", specs: [{ title: SYSTEM_PROMPT.split(" › ")[1],
+      tests: [{ status: "skipped", results: [{ status: "skipped" }] }] }] },
+    ...(extra.length > 0 ? [{ title: "extra.spec.ts", specs: extra.map(e => ({ title: e.title,
+      tests: [{ status: e.status === "passed" ? "expected" : "unexpected", results: [{ status: e.status }] }] })) }] : []),
+  ] });
+}
+
+/** A gate report on disk with its run record, as the runner leaves it. */
+function desktopReport(raw: string, overrides: Partial<GateRunReport> = {}): GateRunReport {
+  const dir = mkdtempSync(join(tmpdir(), "inherited-advance-"));
+  const outputPath = join(dir, "2026-10-14T09-16-23-519Z_real-claude-gate_#1809.log");
+  writeFileSync(outputPath, raw);
+  const r = report({
+    outputFormat: "playwright-json", exitCode: 1, branchName: "feature/1809", commitsBehind: 22,
+    tally: parseGateOutput(raw, "playwright-json"), outputPath,
+    rerunFailures: [HISTORY_GAP], rerunSkipReason: null, rerunOutputPath: join(dir, "rerun.log"),
+    baselineFailures: [HISTORY_GAP], baselineSkipReason: null, baselineOutputPath: join(dir, "base.log"),
+    ...overrides,
+  });
+  writeFileSync(gateRunMetaPath(outputPath), serializeGateRunMeta(r, {}, new Date()));
+  return r;
+}
+
+function desktopTicket(): ProjectItem {
+  return parkedItem({ id: "item-1809", issueNumber: 1809, labels: ["done:verifier", "needs-real-claude", "size:m"] });
+}
+
+/** Desktop #1947 as refined: the full test name quoted, no marker. */
+function historyGapTracker(): { number: number; nodeId: string; title: string; body: string } {
+  return { number: 1947, nodeId: "node-1947", title: "fix shared live failure: history gap fill",
+    body: `As a maintainer, I want \`${HISTORY_GAP}\` to pass on main so unrelated tickets can complete their live checks.` };
+}
+
+async function gate(client: MockClient, tracker: TrackerClient, r: GateRunReport, options: { inheritedAdvance?: boolean; testEvidence?: any[] } = {}) {
+  const notes: string[] = [];
+  await runRealClaudeGateExecution(client, async () => r, 10, async (m) => { notes.push(m); }, 0, undefined, undefined,
+    (failures, ctx, opts) => recordInheritedTests(tracker, failures, ctx, opts),
+    { inheritedAdvance: true, ...options });
+  return notes;
+}
+
+describe("runRealClaudeGateExecution: advancing past tracked inherited failures", () => {
+  test("desktop #1809: one test red on main, tracked on #1947, advances to documentation without a blocker", async () => {
+    await withStageSet("builder", async () => {
+      const item = desktopTicket();
+      const client = new MockClient([item]);
+      const tracker = new TrackerClient();
+      tracker.open.push(historyGapTracker());
+      tracker.statuses.set(1947, "In Development");
+      const r = desktopReport(desktopRun());
+      const notes = await gate(client, tracker, r);
+
+      assert.equal(item.status, "In Documentation");
+      assert.ok(!item.labels.includes("needs-real-claude"));
+      assert.ok(!item.labels.some(l => l.startsWith("error:") || l.startsWith("needs-rework:")));
+      assert.deepEqual(tracker.blockers, [], "the advancing ticket is not blocked by the fix");
+      assert.equal(tracker.created.length, 0, "the existing tracker is reused, not duplicated");
+      assert.equal(tracker.comments.length, 1);
+      assert.equal(tracker.comments[0].issue, 1947);
+      assert.equal(tracker.statuses.get(1947), "In Development", "the fix keeps its progress");
+      const comment = client.addCommentCalls.find(c => c.issueNumber === 1809)!.body;
+      assert.match(comment, /PASS WITH ACCEPTED INHERITED FAILURES/);
+      assert.ok(comment.includes(`- \`${HISTORY_GAP}\`, tracked on #1947`));
+      assert.ok(comment.includes(`<!-- real-claude-gate-accepted-inherited: #1947 ${HISTORY_GAP} -->`));
+      assert.match(comment, /accepted inherited-failure pass/);
+      assert.equal(notes.length, 1);
+
+      // The documentation stage's gate report shows the accepted failure.
+      const meta = parseGateRunMeta(readFileSync(gateRunMetaPath(r.outputPath), "utf8"))!;
+      assert.deepEqual(meta.acceptedInherited, [{ name: HISTORY_GAP, issue: 1947 }]);
+      const lines = liveGateLines({ stamp: "2026-10-14T09-16-23-519Z", format: "playwright-json", raw: readFileSync(r.outputPath, "utf8"), meta }, "").join("\n");
+      assert.match(lines, /Accepted inherited failures: .* on #1947/);
+      assert.ok(lines.includes(`\`${HISTORY_GAP}\`: failed, inherited from the base and accepted by the gate, tracked on #1947`));
+    });
+  });
+
+  test("a new failure beside the inherited one still goes to rework, with no advance", async () => {
+    await withStageSet("builder", async () => {
+      const item = desktopTicket();
+      const client = new MockClient([item]);
+      const tracker = new TrackerClient();
+      tracker.open.push(historyGapTracker());
+      const raw = desktopRun([{ title: "the branch broke this", status: "failed" }]);
+      const r = desktopReport(raw, {
+        rerunFailures: [HISTORY_GAP, "extra.spec.ts › the branch broke this"], baselineFailures: [HISTORY_GAP] });
+      await gate(client, tracker, r);
+      assert.equal(item.status, "In Development");
+      assert.ok(item.labels.includes("needs-rework:builder"));
+      assert.ok(item.labels.includes("needs-real-claude"));
+      assert.doesNotMatch(client.addCommentCalls[0].body, /ACCEPTED INHERITED/);
+    });
+  });
+
+  test("a new failure that also fails on the base but is not the tracked one still needs its own tracker", async () => {
+    // The base fails both, so both are inherited; the second gets a tracker
+    // filed for it and the ticket advances past both.
+    await withStageSet("builder", async () => {
+      const item = desktopTicket();
+      const client = new MockClient([item]);
+      const tracker = new TrackerClient();
+      tracker.open.push(historyGapTracker());
+      const other = "extra.spec.ts › also red on main";
+      const r = desktopReport(desktopRun([{ title: "also red on main", status: "failed" }]), {
+        rerunFailures: [HISTORY_GAP, other], baselineFailures: [HISTORY_GAP, other] });
+      await gate(client, tracker, r);
+      assert.equal(item.status, "In Documentation");
+      assert.equal(tracker.created.length, 1);
+      assert.ok(tracker.created[0].body.includes(`<!-- inherited-live-test: ${other} -->`));
+      assert.deepEqual(tracker.blockers, []);
+    });
+  });
+
+  test("a flake that passes on the re-run is excused beside the inherited failure", async () => {
+    await withStageSet("builder", async () => {
+      const item = desktopTicket();
+      const client = new MockClient([item]);
+      const tracker = new TrackerClient();
+      tracker.open.push(historyGapTracker());
+      const flake = "extra.spec.ts › sometimes slow";
+      const r = desktopReport(desktopRun([{ title: "sometimes slow", status: "failed" }]), {
+        rerunFailures: [HISTORY_GAP], baselineFailures: [HISTORY_GAP] });
+      await gate(client, tracker, r);
+      assert.equal(item.status, "In Documentation");
+      const comment = client.addCommentCalls[0].body;
+      assert.match(comment, /PASS WITH ACCEPTED INHERITED FAILURES/);
+      assert.ok(comment.includes(`- \`${flake}\``), "the flake is named in the evidence");
+      assert.match(comment, /1 other\(s\) passed on re-run/);
+    });
+  });
+
+  test("an inherited failure with no tracker gets one filed on the board, and the ticket advances", async () => {
+    await withStageSet("builder", async () => {
+      const item = desktopTicket();
+      const client = new MockClient([item]);
+      const tracker = new TrackerClient();
+      await gate(client, tracker, desktopReport(desktopRun()));
+      assert.equal(tracker.created.length, 1);
+      assert.ok(tracker.created[0].body.includes(`<!-- inherited-live-test: ${HISTORY_GAP} -->`));
+      assert.match(tracker.created[0].body, /Found while testing #1809/);
+      assert.equal(tracker.statuses.get(2000), "Backlog");
+      assert.deepEqual(tracker.blockers, []);
+      assert.equal(item.status, "In Documentation");
+      assert.ok(client.addCommentCalls[0].body.includes("tracked on #2000"));
+      // A second ticket meeting the same failure reuses it.
+      const next = parkedItem({ id: "item-1810", issueNumber: 1810, labels: ["done:verifier", "needs-real-claude"] });
+      client.items.push(next);
+      await gate(client, tracker, desktopReport(desktopRun(), { branchName: "feature/1810" }));
+      assert.equal(tracker.created.length, 1);
+      assert.equal(next.status, "In Documentation");
+    });
+  });
+
+  test("a required test that is the inherited failure parks behind the fix, as before", async () => {
+    await withStageSet("builder", async () => {
+      const item = desktopTicket();
+      const client = new MockClient([item]);
+      const tracker = new TrackerClient();
+      tracker.open.push(historyGapTracker());
+      await gate(client, tracker, desktopReport(desktopRun(), { requiredTests: [HISTORY_GAP] }));
+      assert.equal(item.status, "Inbox");
+      assert.ok(item.labels.includes("needs-real-claude"));
+      assert.deepEqual(tracker.blockers, [{ parent: 1809, blocker: 1947 }]);
+      assert.match(client.addCommentCalls[0].body, /did not advance past the inherited failure: required live test/);
+    });
+  });
+
+  test("a required test that was skipped parks, and never advances", async () => {
+    await withStageSet("builder", async () => {
+      const item = desktopTicket();
+      const client = new MockClient([item]);
+      const tracker = new TrackerClient();
+      tracker.open.push(historyGapTracker());
+      await gate(client, tracker, desktopReport(desktopRun(), { requiredTests: [SYSTEM_PROMPT] }));
+      assert.equal(item.status, "Inbox");
+      assert.ok(item.labels.includes("error:real-claude-gate"));
+      assert.ok(item.labels.includes("needs-real-claude"));
+      assert.match(client.addCommentCalls[0].body, /skipped; live acceptance remains missing/);
+      assert.equal(tracker.comments.length + tracker.created.length + tracker.blockers.length, 0);
+    });
+  });
+
+  test("a required test with configured evidence must carry it: a passing Luna run with no evidence parks", async () => {
+    await withStageSet("builder", async () => {
+      const item = desktopTicket();
+      const client = new MockClient([item]);
+      const tracker = new TrackerClient();
+      tracker.open.push(historyGapTracker());
+      const raw = desktopRun([{ title: "real GPT-6 Luna channel replies", status: "passed" }]);
+      await gate(client, tracker, desktopReport(raw), { testEvidence: desktopEvidence });
+      assert.equal(item.status, "Inbox");
+      assert.ok(item.labels.includes("error:real-claude-gate"));
+      assert.match(client.addCommentCalls[0].body, /required live test .*Luna.* live acceptance remains missing/);
+      assert.deepEqual(tracker.blockers, []);
+    });
+  });
+
+  test("no same-tree re-run: the inherited failure parks behind its fix", async () => {
+    await withStageSet("builder", async () => {
+      const item = desktopTicket();
+      const client = new MockClient([item]);
+      const tracker = new TrackerClient();
+      tracker.open.push(historyGapTracker());
+      await gate(client, tracker, desktopReport(desktopRun(), { rerunFailures: null, rerunSkipReason: "the re-run hit the outer timeout" }));
+      assert.equal(item.status, "Inbox");
+      assert.deepEqual(tracker.blockers, [{ parent: 1809, blocker: 1947 }]);
+      assert.match(client.addCommentCalls[0].body, /no same-tree re-run was made/);
+    });
+  });
+
+  test("a tracker matched only by its method name parks behind it and asks for the marker, filing nothing", async () => {
+    await withStageSet("builder", async () => {
+      const item = parkedItem({ issueNumber: 1397, labels: ["done:verifier", "needs-real-claude"] });
+      const client = new MockClient([item]);
+      const tracker = new TrackerClient();
+      tracker.open.push({ number: 1480, nodeId: "node-1480", title: "flaky TestThing on main", body: "seen in CI" });
+      const r = report({ exitCode: 1,
+        tally: tally({ executed: 176, passed: 175, failed: 1, failedNames: ["pkg.TestThing"], packageFailed: true, packageFailures: ["pkg"] }),
+        rerunFailures: ["pkg.TestThing"], rerunSkipReason: null, baselineFailures: ["pkg.TestThing"] });
+      await runRealClaudeGateExecution(client, async () => r, 150, async () => {}, 0, undefined, undefined,
+        (failures, ctx, opts) => recordInheritedTests(tracker, failures, ctx, opts), { inheritedAdvance: true });
+      assert.equal(item.status, "Inbox");
+      assert.equal(tracker.created.length, 0);
+      assert.deepEqual(tracker.blockers, [{ parent: 1397, blocker: 1480 }]);
+      assert.match(client.addCommentCalls[0].body, /only by its method name; add <!-- inherited-live-test: pkg.TestThing -->/);
+    });
+  });
+
+  test("turned off for the fork, a tracked inherited failure parks exactly as before", async () => {
+    await withStageSet("builder", async () => {
+      const item = desktopTicket();
+      const client = new MockClient([item]);
+      const tracker = new TrackerClient();
+      tracker.open.push(historyGapTracker());
+      await gate(client, tracker, desktopReport(desktopRun()), { inheritedAdvance: false });
+      assert.equal(item.status, "Inbox");
+      assert.deepEqual(tracker.blockers, [{ parent: 1809, blocker: 1947 }]);
+      assert.doesNotMatch(client.addCommentCalls[0].body, /did not advance/);
     });
   });
 });

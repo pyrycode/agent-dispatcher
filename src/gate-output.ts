@@ -1394,6 +1394,8 @@ export function formatGateEvidenceComment(opts: {
   preExisting?: readonly string[];
   /** Failures that passed when re-run on the same merged tree. */
   flaky?: readonly string[];
+  /** Inherited failures the gate accepted, each with its tracking ticket. */
+  acceptedInherited?: readonly { name: string; issue: number }[];
 }): string {
   const { report } = opts;
   const heading: Record<string, string> = {
@@ -1403,6 +1405,7 @@ export function formatGateEvidenceComment(opts: {
     "zero-executed": "🚨 Real-claude gate — NOTHING EXECUTED",
     unusable: "🚨 Real-claude gate — NO USABLE RESULT",
     "inherited-failure": "⚠️ Real-claude gate — FAILURES THIS BRANCH DID NOT CAUSE",
+    "inherited-pass": "⚠️ Real-claude gate: PASS WITH ACCEPTED INHERITED FAILURES",
     "infra-failure": "🚨 Real-claude gate: INFRASTRUCTURE FAILURE, NOT JUDGED",
   };
 
@@ -1535,9 +1538,15 @@ export function formatGateEvidenceComment(opts: {
       const compared = report.baselineFailures !== null;
 
       if (compared && preExisting.length > 0) {
-        lines.push(`**Already failing on \`${report.baseRef}\` (${preExisting.length})** — not caused by this branch:`);
+        const trackers = new Map((opts.acceptedInherited ?? []).map(t => [t.name, t.issue] as const));
+        lines.push(trackers.size > 0
+          ? `**Already failing on \`${report.baseRef}\` (${preExisting.length})**, not caused by this branch, failed again on the same-tree re-run, and accepted because each is tracked on an open ticket:`
+          : `**Already failing on \`${report.baseRef}\` (${preExisting.length})** — not caused by this branch:`);
         lines.push("");
-        for (const name of preExisting.slice(0, 25)) lines.push(`- \`${name}\``);
+        for (const name of preExisting.slice(0, 25)) {
+          const issue = trackers.get(name);
+          lines.push(issue === undefined ? `- \`${name}\`` : `- \`${name}\`, tracked on #${issue}`);
+        }
         lines.push("");
       }
 
@@ -1616,6 +1625,10 @@ export function formatGateEvidenceComment(opts: {
       `(\`main\`, \`rerun\`, \`base\`, \`infra-check\`). It holds whatever the gate command wrote to ` +
       `\`PYRY_GATE_EVIDENCE_DIR\`, kept outside the removed worktree. It is empty when the command does not use the ` +
       `variable, and it is pruned later by age, count and size.`);
+  }
+  // Machine-readable record of the accepted inherited failures, one per test.
+  for (const t of opts.acceptedInherited ?? []) {
+    lines.push(`<!-- real-claude-gate-accepted-inherited: #${t.issue} ${t.name.replace(/--/g, "- -")} -->`);
   }
 
   return lines.join("\n");
