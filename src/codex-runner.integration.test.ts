@@ -3,8 +3,14 @@ import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runClaudeStreaming } from "./dispatch.js";
+import { runClaudeStreaming, armCodexStartJitter } from "./dispatch.js";
 import { agentSpawnEnv } from "./agent-runtime.js";
+import type { AddressInfo } from "node:net";
+import type { Server } from "node:http";
+import { FleetStore } from "./fleet-store.js";
+import { FleetClient, serveFleet } from "./fleet-http.js";
+import { MachineManager, serveManager } from "./machine-manager.js";
+import { ManagedDispatch } from "./managed-dispatch.js";
 
 // Exercise the real detached child, stdin, JSONL buffering and close handlers.
 // This executable never contacts a model, repository or board.
@@ -63,6 +69,11 @@ process.stdin.on('end', async () => {
     return;
   }
   if (process.env.TEST_MODE === 'reconnect') events.splice(2, 0, {type:'error',message:'Reconnecting 1/5: connection reset'});
+  // The exact sequence pyrybox logged at 10:07:56 EEST on 2026-10-14.
+  if (process.env.TEST_MODE === 'rate-limited') events.splice(2, 2,
+    {type:'error',message:'Reconnecting... 2/5 (unexpected status 503 Service Unavailable: An error occurred while processing your request.)'},
+    {type:'error',message:'exceeded retry limit, last status: 429 Too Many Requests'},
+    {type:'turn.failed',error:{message:'exceeded retry limit, last status: 429 Too Many Requests'}});
   if (process.env.TEST_MODE === 'failed-command') events.splice(2, 0, {type:'item.completed',item:{id:'red-test',type:'command_execution',status:'failed',exit_code:1,aggregated_output:'Expected red test'}});
   if (process.env.TEST_MODE === 'refinement') events[2].item.text = JSON.stringify({status:'needs_refinement', summary:'Scope conflict requires refinement'});
   if (process.env.TEST_MODE === 'blocked') events[2].item.text = JSON.stringify({status:'blocked', summary:'Required action rejected by review'});
@@ -85,7 +96,7 @@ process.stdin.on('end', async () => {
       await new Promise(resolve => setTimeout(resolve, 2));
     }
   } else process.stdout.write(output);
-  process.exitCode = process.env.TEST_MODE === 'nonzero' ? 7 : 0;
+  process.exitCode = process.env.TEST_MODE === 'nonzero' ? 7 : process.env.TEST_MODE === 'rate-limited' ? 1 : 0;
 });
 `;
 
@@ -351,4 +362,65 @@ test("builder account travels in environment only, no other role gets it", async
     assert.equal(log.includes("restricted-fixture"), false);
     assert.equal(log.includes("automation-fixture"), false);
   }
+});
+
+test("a Codex 429 outside a managed run is flagged but claims no fleet pause", async t => {
+  const result = await runClaudeStreaming(fixture(t, "rate-limited").options);
+  assert.equal(result.isError, true);
+  assert.equal(result.terminalReason, "codex_error");
+  assert.equal(result.codexRateLimited, true);
+  assert.equal(result.codexRateLimitPaused, undefined);
+  assert.match(result.output, /last status: 429/);
+});
+
+test("in a managed run a Codex 429 pauses the fleet, and a later clean start resets the backoff", async t => {
+  const url = (server: Server) => `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  let clock = Date.now();
+  const store = new FleetStore(":memory:", { mac: { heavyLimit: 1, combinedLimit: 2 } }, { log: () => {}, now: () => clock });
+  store.setRunner("codex");
+  const central = await serveFleet(store, { mac: "mac-token" }, "central-admin", 0);
+  const manager = new MachineManager({ machine: "mac", heavyLimit: 1, combinedLimit: 2, projects: ["org/core"] }, new FleetClient(url(central), "mac-token"));
+  const server = await serveManager(manager, { "org/core": "project-token" }, "manager-admin", 0);
+  t.after(async () => { await new Promise<void>(r => server.close(() => r())); await new Promise<void>(r => central.close(() => r())); store.close(); });
+  const managed = new ManagedDispatch("org/core", { PYRY_MANAGER_URL: url(server), PYRY_MANAGER_TOKEN: "project-token" });
+  const admitted = async (issue: number) => {
+    const offer = managed.offer(issue, "builder", "medium");
+    await managed.sync(); await manager.tick(); await managed.sync();
+    return offer;
+  };
+
+  const first = await admitted(1);
+  assert.equal(managed.ready(first), true);
+  const limited = await managed.run(first, () => runClaudeStreaming(fixture(t, "rate-limited").options));
+  assert.equal(limited.codexRateLimited, true);
+  assert.equal(limited.codexRateLimitPaused, true);
+  assert.equal(store.codex.state().active, true);
+  assert.equal(store.codex.state().level, 1);
+
+  const second = await admitted(2);
+  assert.equal(managed.ready(second), false, "no new Codex start during the pause");
+  clock += 2 * 60_000;
+  await managed.sync(); await manager.tick(); await managed.sync();
+  assert.equal(managed.ready(second), true, "admitted once the pause ends");
+  const ok = await managed.run(second, () => runClaudeStreaming(fixture(t, "normal").options));
+  assert.equal(ok.isError, false);
+  // The clean report is fire-and-forget from the stream; give it a moment.
+  for (let i = 0; i < 100 && !store.codex.events().some(e => e.kind === "reset"); i++) await new Promise(r => setTimeout(r, 20));
+  assert.equal(store.codex.state().level, 0);
+  assert.equal(store.codex.state().nextDurationMs, 2 * 60_000);
+});
+
+test("after a dispatcher restart the first Codex start waits its random spread, and only Codex waits", async t => {
+  assert.equal(armCodexStartJitter({}, 1000, () => 0.5), 30_000, "default spread is up to a minute");
+  assert.equal(armCodexStartJitter({ PYRY_CODEX_START_JITTER_MS: "0" }, Date.now(), () => 0.99), 0, "0 turns it off");
+  const f = fixture(t, "normal");
+  armCodexStartJitter({ PYRY_CODEX_START_JITTER_MS: "400" }, Date.now(), () => 1);
+  const started = Date.now();
+  const result = await runClaudeStreaming(f.options);
+  assert.equal(result.isError, false);
+  assert.ok(Date.now() - started >= 350, "the first start waited");
+  assert.match(readFileSync(f.options.logFile, "utf8"), /First Codex start after a dispatcher restart: waiting 1s/);
+  const g = fixture(t, "normal");
+  await runClaudeStreaming(g.options);
+  assert.doesNotMatch(readFileSync(g.options.logFile, "utf8"), /First Codex start/, "later starts do not wait");
 });

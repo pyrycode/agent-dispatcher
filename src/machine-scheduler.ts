@@ -1,4 +1,6 @@
 import type { FleetSnapshot, MachineLimits, ResourceClass } from "./fleet-store.js";
+import type { AgentRunner } from "./agent-runner.js";
+import { startsCodex } from "./codex-throttle.js";
 
 export interface WorkOffer {
   workflowVersion?: 1;
@@ -15,6 +17,17 @@ export interface WorkOffer {
   requiresRecovery?: boolean;
   readyRepairs?: string[];
   supportTaskId?:string; parentTicket?:string;
+  runner?: AgentRunner;
+}
+
+/**
+ * The authority refuses this offer while a fleet Codex pause lasts, so the
+ * scheduler passes over it for work that can start. The authority still
+ * decides: a pause can begin after this snapshot. A support task's recipe is
+ * not in its offer, so only the authority can hold one.
+ */
+export function codexPaused(offer: WorkOffer, state: FleetSnapshot): boolean {
+  return state.codexPause?.active === true && offer.role !== "recovery-task" && startsCodex(offer, state.runnerPolicy);
 }
 
 /** The authority classifies queued checks, including offers from older workers. */
@@ -69,6 +82,7 @@ export function scheduleMachine(opts: {
   for (const job of ready) {
     if (idleAssessment(job, opts.state) && [...localRuns, ...selected].some(r => /#[1-9]\d*$/.test(r.ticket))) continue;
     if (active.has(job.ticket) || locks.has(`${job.project}:reconcile`) || job.locks.some(l => locks.has(l))) continue;
+    if (codexPaused(job, opts.state)) continue;
     if (job.roleLimit !== undefined && [...opts.state.runs, ...selected].filter(r => r.project === job.project && r.role === job.role).length >= job.roleLimit) continue;
     const newTicket = /#[1-9]\d*$/.test(job.ticket) && !claims.has(job.ticket);
     if (newTicket && ticketPlaces === 0) continue;

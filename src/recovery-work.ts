@@ -6,6 +6,20 @@ import { RECOVERY_INVESTIGATING, RECOVERY_ASSIGNMENT_LABELS, RECOVERY_PRIORITY_L
 
 export { RECOVERY_INVESTIGATING, RECOVERY_PRIORITY, RECOVERY_REPAIRING, LEGACY_RECOVERY_PRIORITY, LEGACY_RECOVERY_REPAIRING } from "./recovery-labels.js";
 
+/**
+ * The assessment's Codex run was refused with a rate limit before it could
+ * assess anything. Like a GitHub transport failure, it says nothing about the
+ * ticket: the incident waits out the code-set cooldown and is assessed again,
+ * instead of escalating to a person as a failed assessment.
+ */
+export class CodexRateLimitError extends Error {
+  constructor(message: string) { super(message); this.name = "CodexRateLimitError"; }
+}
+/** A failure that clears by itself and must not become a human escalation. */
+function transientRecoveryFailure(error: unknown): boolean {
+  return githubPauseMs(error) !== null || error instanceof CodexRateLimitError;
+}
+
 export const RECOVERY_MARKER = "<!-- fleet-recovery:";
 /**
  * Hidden first line of the comment posted when an assigned repair run starts.
@@ -151,7 +165,7 @@ export async function runRecoveryWork(incident: RecoveryIncident, deps: Recovery
       if (decision.action === "escalate" && !decision.category) decision.category = "human";
     }
     catch (error) {
-      if (githubPauseMs(error) !== null) throw error;
+      if (transientRecoveryFailure(error)) throw error;
       decision = { action: "escalate", category: "human", reason: "Recovery assessment failed or returned an invalid result; inspect the recovery log" };
     }
     item = await deps.readCurrent();
@@ -186,13 +200,13 @@ export async function runRecoveryWork(incident: RecoveryIncident, deps: Recovery
     await deps.complete();
     if (decision.action !== "wait") await deps.notify(`${incident.ticket}: recovery ${decision.action}. ${decision.reason}`);
   } catch (error) {
-    if (deciding || githubPauseMs(error) === null) throw error;
+    if (deciding || !transientRecoveryFailure(error)) throw error;
     // Only assessment work and its temporary investigating label preceded this
     // failure. Reassess after the durable operational cooldown, never replay an
     // unconfirmed handback or replace a diagnosed permission/operator hold.
     await deps.decide(decision?.action === "escalate" && decision.category !== "operational" ? decision : {
       action: "escalate", category: "operational", cooldown: true,
-      reason: `Temporary GitHub transport failure before recovery handback; reassess after cooldown. ${error instanceof Error ? error.message : String(error)}`.slice(0, 6000),
+      reason: `${error instanceof CodexRateLimitError ? "Temporary Codex rate limit" : "Temporary GitHub transport failure"} before recovery handback; reassess after cooldown. ${error instanceof Error ? error.message : String(error)}`.slice(0, 6000),
     });
   } finally {
     // A failed cleanup is retried by owned, idle-ticket reconciliation next cycle.

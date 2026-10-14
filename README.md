@@ -190,6 +190,7 @@ Optional:
 | `PYRY_INFRA_BASE_CHECK_TESTS` | `3` | How many connection-shaped failing tests the shape rule re-runs on the base commit before blaming the environment. |
 | `PYRY_INFRA_BASE_CHECK_TIMEOUT_MS` | `900000` | Wall clock for that base check, never more than `PYRY_REAL_CLAUDE_GATE_TIMEOUT_MS`. |
 | `PYRY_INFRA_PAUSE_FILE` | `logs/live-gate-infra-pause.json` | Where the pause is kept. Point every dispatcher on one computer at the same writable path to pause their live gates together. |
+| `PYRY_CODEX_START_JITTER_MS` | `60000` | After a dispatcher starts, its first Codex run waits a random time up to this long, so a fleet-wide restart does not start every Codex run in the same second. `0` turns it off; held at five minutes. See [Codex rate-limit pause](docs/machine-manager.md#codex-rate-limit-pause). |
 | `PYRY_MAIN_SWEEP_CMD` | — | Main sweep: an in-depth command, too slow for every verifier pass, run against main when the board is idle or every `PYRY_MAIN_SWEEP_EVERY` merges. Runs inline, never beside a verifier. A failure files one Backlog ticket labelled `bug` and `priority:low`. While that ticket is open, a later failure comments the new failing set on it whenever the set differs from the last one recorded, and posts nothing when it is the same. **Empty disables it.** State in `logs/main-sweep-state.json`, including the main commit of the last sweep and the tests it failed. |
 | `PYRY_MAIN_SWEEP_EVERY` | `5` | Merges since the last sweep that force one while the board is busy. |
 | `PYRY_MAIN_SWEEP_TIMEOUT_MS` | `1800000` | Outer wall clock for one sweep. Extended by waiting for the Android device or a build place, like the verifier gates. |
@@ -1013,6 +1014,8 @@ The consumer launcher exposes it as `bin/pyry-test --slow`.
 ## Multiple computers
 
 Optional [managed dispatch](docs/machine-manager.md) shares heavy capacity across projects on each computer and reserves tickets across computers. The guide covers configuration, Linux and macOS services, draining and manual ticket release.
+
+A Codex run that OpenAI refuses with a rate limit (429) pauses new Codex starts across the whole fleet, doubling while the limit lasts. The ticket is not errored and its retry count does not move. See [Codex rate-limit pause](docs/machine-manager.md#codex-rate-limit-pause).
 
 ### Incomplete verification
 

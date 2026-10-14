@@ -148,6 +148,25 @@ const ADMISSION_SIGNATURES: readonly RegExp[] = [
 ];
 
 /**
+ * A model provider's own rate or usage limit, as Codex and the OpenAI API
+ * print it: `exceeded retry limit, last status: 429 Too Many Requests`. That
+ * is the account's limit, not a relay or service refusing admission, and it
+ * says nothing about this host. The fleet's Codex throttle owns it, so a line
+ * like this never counts as an admission rejection here.
+ */
+const PROVIDER_RATE_LIMIT: readonly RegExp[] = [
+  /\blast status: 429\b/i,
+  /\bexceeded retry limit\b/i,
+  /\bhit your usage limit\b/i,
+  /\b(?:rate_limit_exceeded|usage_limit_reached)\b/,
+];
+
+/** One line naming a refused admission, and not a model provider's own limit. */
+function isAdmissionLine(line: string): boolean {
+  return ADMISSION_SIGNATURES.some(re => re.test(line)) && !PROVIDER_RATE_LIMIT.some(re => re.test(line));
+}
+
+/**
  * The host's toolchain does not match what the repository requires. No
  * change to the code under review can fix that on this host, and no re-run
  * will either. Seen on HP for pyrycode-relay #167's verifier on 2026-10-13:
@@ -163,7 +182,7 @@ const TOOLCHAIN_SIGNATURES: readonly RegExp[] = [
 
 /** Toolchain-mismatch lines anywhere in a run's output, deduplicated, at most `limit`. */
 export function findToolchainMismatch(text: string, limit = 3): { count: number; samples: string[] } {
-  return findLines(text, TOOLCHAIN_SIGNATURES, limit);
+  return findLines(text, line => TOOLCHAIN_SIGNATURES.some(re => re.test(line)), limit);
 }
 
 /**
@@ -183,7 +202,7 @@ export type FailureShape = "connection" | "wait" | "other";
 
 /** Classify one failing test by its failure text. */
 export function classifyFailureMessage(message: string): FailureShape {
-  if (ADMISSION_SIGNATURES.some(re => re.test(message))) return "connection";
+  if (message.split("\n").some(isAdmissionLine)) return "connection";
   if (CONNECTION_SIGNATURES.some(re => re.test(message))) return "connection";
   if (WAIT_SIGNATURES.some(re => re.test(message))) return "wait";
   return "other";
@@ -193,15 +212,15 @@ const ANSI_ESCAPE = /\x1b\[[0-9;]*[A-Za-z]/g;
 
 /** Admission-rejection lines anywhere in the run's output, deduplicated, at most `limit`. */
 export function findAdmissionRejections(text: string, limit = 5): { count: number; samples: string[] } {
-  return findLines(text, ADMISSION_SIGNATURES, limit);
+  return findLines(text, isAdmissionLine, limit);
 }
 
-function findLines(text: string, signatures: readonly RegExp[], limit: number): { count: number; samples: string[] } {
+function findLines(text: string, matches: (line: string) => boolean, limit: number): { count: number; samples: string[] } {
   let count = 0;
   const samples: string[] = [];
   for (const raw of text.split("\n")) {
     const line = raw.replace(ANSI_ESCAPE, "").trim();
-    if (line === "" || !signatures.some(re => re.test(line))) continue;
+    if (line === "" || !matches(line)) continue;
     count++;
     const short = line.length > 200 ? line.slice(0, 200) + "…" : line;
     if (samples.length < limit && !samples.includes(short)) samples.push(short);
@@ -424,7 +443,7 @@ export function classifyGateFailure(opts: {
     base[shape]++;
     if (shape === "connection") connectionTests.push(name);
     if (shape === "connection" && samples.length < 5) {
-      const first = text!.split("\n").find(l => CONNECTION_SIGNATURES.some(re => re.test(l)) || ADMISSION_SIGNATURES.some(re => re.test(l))) ?? text!;
+      const first = text!.split("\n").find(l => CONNECTION_SIGNATURES.some(re => re.test(l)) || isAdmissionLine(l)) ?? text!;
       const line = first.trim();
       const short = line.length > 200 ? line.slice(0, 200) + "…" : line;
       if (!samples.includes(short)) samples.push(short);

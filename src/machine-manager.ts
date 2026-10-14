@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { listen, readJson, tokenMatches, type FleetClient } from "./fleet-http.js";
 import { validateStart, validateLimits, type MachineLimits, type FleetRun } from "./fleet-store.js";
-import { scheduleMachine, runnableTickets, acceptsDuringProjectDrain, type WorkOffer } from "./machine-scheduler.js";
+import { scheduleMachine, runnableTickets, acceptsDuringProjectDrain, codexPaused, type WorkOffer } from "./machine-scheduler.js";
 
 /** An operator drain or resume command, kept so a supervisor can tell it from an unexplained policy change. */
 export interface ProjectDrainChange { project: string; draining: boolean; at: number }
@@ -129,6 +129,7 @@ export class MachineManager {
           : this.draining ? "draining"
           : state.claims.some(c => c.ticket === o.ticket && c.machine !== this.config.machine) ? "owned-elsewhere"
           : !acceptsDuringProjectDrain(o, this.config.machine, this.config.drainingProjects ?? [], state) ? "project-draining"
+          : codexPaused(o, state) ? "codex-paused"
           : eligible.has(`${o.project}/${o.key}`) ? "eligible" : "waiting-for-capacity-or-lock" })),
     };
   }
@@ -179,7 +180,7 @@ export async function serveManager(manager: MachineManager, projectTokens: Recor
         return send(200, { ok: true, drainingProjects: manager.config.drainingProjects });
       }
       if (!project) return send(403, { error: "Project credential required" });
-      if (["/tasks/request", "/tasks/read", "/tasks/artifact", "/recovery/facts", "/recovery/evidence", "/recovery/pause", "/recovery/coordination", "/recovery/report", "/recovery/begin", "/recovery/decide", "/recovery/complete"].includes(req.url ?? "")) {
+      if (["/codex/report", "/tasks/request", "/tasks/read", "/tasks/artifact", "/recovery/facts", "/recovery/evidence", "/recovery/pause", "/recovery/coordination", "/recovery/report", "/recovery/begin", "/recovery/decide", "/recovery/complete"].includes(req.url ?? "")) {
         if (!manager.claims.call) throw new Error("Recovery service unavailable");
         return send(200, await manager.claims.call(req.url!, { ...body, project,
           ...(req.url === "/recovery/evidence" ? { records: body.records?.map((r: any) => ({ ...r, machine: manager.config.machine })) } : {}) }));

@@ -17,11 +17,22 @@ import type { RecoveryObservation, RecoveryIncident, RecoveryDecision } from "./
 import type { AgentRunner } from './agent-runner.js';
 import {taskBridge} from "./recovery-task-bridge.js";
 import { offerId } from "./machine-manager.js";
+import { NON_AGENT_ROLES, type CodexPauseState } from "./codex-throttle.js";
 
 const DEFAULT_RESOURCE_CLASSES: Readonly<Record<string, ResourceClass>> = {
   builder: "medium", developer: "medium", refiner: "light", po: "light", documentation: "light",
 };
-const currentRun = new AsyncLocalStorage<{ run: FleetRun; groups: Set<number>; taskSocket?: string; githubEnv?:NodeJS.ProcessEnv }>();
+export type CodexReportEvent = "rate-limited" | "clean";
+type CodexReporter = (event: CodexReportEvent) => Promise<CodexPauseState | null>;
+const currentRun = new AsyncLocalStorage<{ run: FleetRun; groups: Set<number>; taskSocket?: string; githubEnv?:NodeJS.ProcessEnv; reportCodex?: CodexReporter }>();
+/**
+ * Reports the current admitted run's Codex events to the fleet's Codex
+ * throttle, or null outside a managed dispatcher run. The reporter resolves
+ * to the pause state after the report, or null when it could not be
+ * delivered. Capture it where the run starts: stream callbacks may not carry
+ * the run's context.
+ */
+export function managedCodexReporter(): CodexReporter | null { return currentRun.getStore()?.reportCodex ?? null; }
 /** A granted run uses its saved choice even after the global setting changes. */
 export function managedRunRunner(): AgentRunner | undefined { return currentRun.getStore()?.run.runnerPolicy?.runner ?? undefined; }
 export function managedTaskEnv(): NodeJS.ProcessEnv {
@@ -105,6 +116,8 @@ export class ManagedDispatch {
   private readonly repairProofs=new Map<string,boolean>();
   private recoveryTickets = new Set<string>();
   draining = false;
+  /** This dispatcher's runner for a role, without the central choice. Stated on agent offers. */
+  localRunner: ((role: string) => AgentRunner) | undefined;
   tasksEnabled: boolean;
   private readonly tasksDisabled: boolean;
 
@@ -162,6 +175,9 @@ export class ManagedDispatch {
     let pending = this.pending.get(name);
     if (!pending) {
       pending = { offer: { project: this.project, ticket, role, resource, locks, key: randomUUID(), order } };
+      // Fixed for the offer's life: the request must not change under a retried admission.
+      const runner = NON_AGENT_ROLES.has(role) ? undefined : this.localRunner?.(role);
+      if (runner === "codex" || runner === "claude") pending.offer.runner = runner;
       this.pending.set(name, pending);
     }
     const required=pending.run ? [] : this.state.requiredRepairs?.[ticket]??[];
@@ -269,7 +285,7 @@ export class ManagedDispatch {
     if (!this.ready(pending)) throw new Error("No managed run grant");
     const run = pending.run!;
     this.running.add(run.id);
-    return withGitHubActor({session:this.session,runId:run.id},()=>currentRun.run({ run, groups: new Set() }, async () => {
+    return withGitHubActor({session:this.session,runId:run.id},()=>currentRun.run({ run, groups: new Set(), reportCodex: this.codexReporter(run) }, async () => {
       let completed = false;
       let ghBridge:Awaited<ReturnType<typeof startGitHubBridge>>;
       let bridge:Awaited<ReturnType<typeof taskBridge>>|undefined;
@@ -343,6 +359,27 @@ export class ManagedDispatch {
         this.wake?.(); this.wake = undefined;
       }
     }));
+  }
+  /**
+   * One reporter per admitted run. A clean start is reported once per run,
+   * however many Codex processes the run spawns. A delivery failure is
+   * logged and returns null: the caller then treats a 429 as an ordinary
+   * counted retry, because no pause is protecting the next start.
+   */
+  codexReporter(run: FleetRun): CodexReporter {
+    let clean: Promise<CodexPauseState | null> | undefined;
+    return event => {
+      if (event === "clean") return clean ??= this.reportCodex(run, event);
+      return this.reportCodex(run, event);
+    };
+  }
+  private async reportCodex(run: FleetRun, event: CodexReportEvent): Promise<CodexPauseState | null> {
+    try {
+      return await this.connection.call<CodexPauseState>("/codex/report", { session: this.session, runId: run.id, event });
+    } catch (error) {
+      console.warn(`   ⚠️  Codex ${event} report for ${run.ticket} not delivered: ${error instanceof Error ? error.message : error}`);
+      return null;
+    }
   }
   private async finish(run: FleetRun, completed = true, unused = false): Promise<void> {
     await this.connection.call("/finish", { session: this.session, id: run.id, completed, unused });

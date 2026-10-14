@@ -9,7 +9,7 @@ import { FleetStore, type StartRequest } from "./fleet-store.js";
 import { FleetClient, JsonClient, serveFleet } from "./fleet-http.js";
 import { MachineManager, serveManager } from "./machine-manager.js";
 import { ManagedDispatch } from "./managed-dispatch.js";
-import { runRecoveryWork, recoveryPlan, parseRecoveryDecision, recoveryHandoff, observationFor, cleanRecoveryLabels } from "./recovery-work.js";
+import { runRecoveryWork, CodexRateLimitError, recoveryPlan, parseRecoveryDecision, recoveryHandoff, observationFor, cleanRecoveryLabels } from "./recovery-work.js";
 import type { AgentConfig, ProjectItem } from "./types.js";
 import { recoveryLogContext } from "./recovery-context.js";
 import { RECOVERY_ASSIGNMENT_LABELS, recoveryAssignmentLabels, RECOVERY_LABEL_DEFINITIONS } from "./recovery-labels.js";
@@ -813,4 +813,31 @@ test("scheduler readers accept the new and the old priority name", () => {
   const managed = new ManagedDispatch(project, {PYRY_MANAGER_URL: "http://localhost:1", PYRY_MANAGER_TOKEN: "test"});
   assert.equal(managed.agentOffer({name: "builder"} as any, {issueNumber: 2, labels: ["wip:repair"]} as any, 0).offer.recovery, false,
     "priority comes from the priority label, not the run marker");
+});
+
+test("a Codex rate limit during assessment waits out the transport cooldown instead of escalating to a person", async t => {
+  const db = new DatabaseSync(":memory:"); t.after(() => db.close());
+  let now = 100000000;
+  const ledger = new RecoveryLedger(db, () => now);
+  const current = item();
+  const observed = observationFor(project, current), empty = { claims: [], runs: [] };
+  const [incident] = ledger.report("mac", project, [observed], empty);
+  const removed: string[] = [];
+  await runRecoveryWork(incident, {
+    project, agents, begin: async () => ledger.begin(incident.id, "run-1"),
+    readCurrent: async () => current,
+    assess: async () => { throw new CodexRateLimitError("Codex rate limit (429) before the assessment could run"); },
+    decide: async d => ledger.decide(incident.id, "run-1", d),
+    complete: async () => { assert.fail("No handback completed"); },
+    addLabel: async () => {}, removeLabel: async (_n, label) => { removed.push(label); },
+    comment: async () => { assert.fail("No ticket mutation"); }, move: async () => { assert.fail("No ticket mutation"); }, notify: async () => {},
+  });
+  const decision = ledger.incident(incident.id).decision!;
+  assert.equal(decision.action, "escalate");
+  assert.equal(decision.category, "operational");
+  assert.match(decision.reason, /^Temporary Codex rate limit before recovery handback; reassess after cooldown\. Codex rate limit \(429\)/);
+  assert.equal(decision.recheckAt, now + RECOVERY_RECHECK_MS);
+  assert.deepEqual(removed, ["orchestrator:investigating"]);
+  now += RECOVERY_RECHECK_MS;
+  assert.equal(ledger.report("mac", project, [observed], empty)[0]?.state, "queued", "assessed again after the cooldown");
 });

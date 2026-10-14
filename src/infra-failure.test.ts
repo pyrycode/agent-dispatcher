@@ -313,3 +313,18 @@ describe("branchToolchainChanges (review finding 3)", () => {
     assert.deepEqual(branchToolchainChanges(["gradle/libs.versions.toml"], () => '+agp = "8.9.0"'), ["gradle/libs.versions.toml"]);
   });
 });
+
+describe("a model provider's own rate limit is not an admission rejection", () => {
+  const codex = "Error: codex turn failed: exceeded retry limit, last status: 429 Too Many Requests";
+  test("Codex's 429 wording names no refused connection", () => {
+    assert.equal(classifyFailureMessage(codex), "other");
+    assert.equal(classifyFailureMessage("You've hit your usage limit. Try again in 3 hours."), "other");
+    assert.equal(findAdmissionRejections([codex, codex, codex, "{\"error\":{\"code\":\"rate_limit_exceeded\"},\"status\":\"429 Too Many Requests\"}"].join("\n")).count, 0);
+  });
+  test("the relay's own rejection still counts, even beside a provider line", () => {
+    const relay = "java.net.ProtocolException: Expected HTTP 101 response but was '429 Too Many Requests'";
+    assert.equal(classifyFailureMessage(relay), "connection");
+    assert.equal(classifyFailureMessage(`${codex}\n${relay}`), "connection");
+    assert.equal(findAdmissionRejections(`${codex}\n${relay}\nHTTP/1.1 429 Too Many Requests`).count, 2);
+  });
+});
