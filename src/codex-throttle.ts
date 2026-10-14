@@ -23,6 +23,15 @@
 //
 // The state is one SQLite row, so a claim service restart keeps a pause. Each
 // pause start and end is logged once and kept in a short event list.
+//
+// Start spacing, added the same evening. 429s kept coming with only three
+// Codex runs in flight while the plan still showed two thirds left, which
+// points at a tokens-per-minute limit rather than the plan's allowance. A
+// Codex run's first turns are its largest requests, so several starting in
+// the same minute is the burst that meets that limit. The claim service
+// therefore admits at most one new Codex start per `startSpacingMs` across the
+// fleet, default 20 seconds. A held offer is refused, not reserved, so it
+// occupies no place, and non-Codex work is admitted as usual.
 import type { DatabaseSync } from "node:sqlite";
 import type { RunnerPolicy, StartRequest } from "./fleet-store.js";
 
@@ -33,15 +42,21 @@ export interface CodexThrottleConfig {
   ceilingMs: number;
   /** False turns the throttle off: reports are recorded, nothing pauses. */
   enabled: boolean;
+  /**
+   * Least time between two Codex admissions anywhere in the fleet. Default 20
+   * seconds; 0 turns spacing off. Independent of `enabled`.
+   */
+  startSpacingMs: number;
 }
-export const DEFAULT_CODEX_THROTTLE: CodexThrottleConfig = { baseMs: 2 * 60_000, ceilingMs: 30 * 60_000, enabled: true };
+export const DEFAULT_CODEX_START_SPACING_MS = 20_000;
+export const DEFAULT_CODEX_THROTTLE: CodexThrottleConfig = { baseMs: 2 * 60_000, ceilingMs: 30 * 60_000, enabled: true, startSpacingMs: DEFAULT_CODEX_START_SPACING_MS };
 
 /** Read `codexThrottle` from the claim service configuration. */
 export function readCodexThrottleConfig(raw: unknown): CodexThrottleConfig {
   if (raw === undefined) return DEFAULT_CODEX_THROTTLE;
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("codexThrottle must be an object");
   const value = raw as Record<string, unknown>;
-  const unknown = Object.keys(value).filter(k => !["baseSeconds", "ceilingSeconds", "enabled"].includes(k));
+  const unknown = Object.keys(value).filter(k => !["baseSeconds", "ceilingSeconds", "enabled", "startSpacingSeconds"].includes(k));
   if (unknown.length) throw new Error(`codexThrottle has unknown settings: ${unknown.join(", ")}`);
   const seconds = (key: string, fallback: number): number => {
     const v = value[key];
@@ -53,7 +68,12 @@ export function readCodexThrottleConfig(raw: unknown): CodexThrottleConfig {
   const baseMs = seconds("baseSeconds", DEFAULT_CODEX_THROTTLE.baseMs);
   const ceilingMs = seconds("ceilingSeconds", DEFAULT_CODEX_THROTTLE.ceilingMs);
   if (ceilingMs < baseMs) throw new Error("codexThrottle.ceilingSeconds must be at least baseSeconds");
-  return { baseMs, ceilingMs, enabled: value.enabled !== false };
+  const spacing = value.startSpacingSeconds;
+  if (spacing !== undefined && (typeof spacing !== "number" || !Number.isFinite(spacing) || spacing < 0 || spacing > 300)) {
+    throw new Error("codexThrottle.startSpacingSeconds must be a number of seconds between 0 and 300");
+  }
+  return { baseMs, ceilingMs, enabled: value.enabled !== false,
+    startSpacingMs: spacing === undefined ? DEFAULT_CODEX_START_SPACING_MS : Math.round(spacing * 1000) };
 }
 
 /**
@@ -116,6 +136,22 @@ export const CODEX_UNCOUNTED_PER_TICKET = 4;
 export function rateLimitWaitsUncounted(state: CodexPauseState | null | undefined): boolean {
   return state?.active === true && (state.ticketReports ?? 1) <= CODEX_UNCOUNTED_PER_TICKET;
 }
+/** The fleet's Codex start spacing, as `operator.sh codex` and the snapshot show it. */
+export interface CodexSpacingState {
+  spacingSeconds: number;
+  /** True while a new Codex start would be refused for spacing. */
+  held: boolean;
+  /** Time until the next Codex start may be admitted, rounded up. */
+  remainingSeconds: number;
+  lastStartAt: number | null;
+  nextStartAt: number | null;
+  /** The last admitted Codex start. */
+  lastStart: { machine: string; ticket: string; role: string } | null;
+  /** Codex starts refused for spacing since the last admitted one. */
+  heldSinceLastStart: number;
+  /** Codex starts admitted in the last hour, from the kept start history. */
+  startsLastHour: number;
+}
 export interface CodexThrottleEvent { at: number; kind: "pause-started" | "pause-ended" | "rate-limited" | "reset" | "cleared"; detail: string }
 
 const EVENTS_KEPT = 200;
@@ -135,7 +171,56 @@ export class CodexThrottle {
       CREATE TABLE IF NOT EXISTS fleet_codex_throttle_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL
       ) STRICT;
+      CREATE TABLE IF NOT EXISTS fleet_codex_starts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, machine TEXT NOT NULL, ticket TEXT NOT NULL, role TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS fleet_codex_spacing (
+        singleton INTEGER PRIMARY KEY CHECK(singleton=1), held INTEGER NOT NULL
+      ) STRICT;
     `);
+  }
+
+  private lastStart(): { at: number; machine: string; ticket: string; role: string } | undefined {
+    const r = this.db.prepare("SELECT at,machine,ticket,role FROM fleet_codex_starts ORDER BY id DESC LIMIT 1").get();
+    return r ? { at: Number(r.at), machine: String(r.machine), ticket: String(r.ticket), role: String(r.role) } : undefined;
+  }
+  /**
+   * Milliseconds until the next Codex start may be admitted, or 0. A start
+   * recorded in the future, as after the clock steps back, holds nothing, so
+   * spacing can never stall Codex until the clock catches up.
+   */
+  spacingWaitMs(t = this.now()): number {
+    const spacing = this.config.startSpacingMs;
+    const last = this.lastStart();
+    if (!spacing || !last || last.at > t) return 0;
+    return Math.max(0, last.at + spacing - t);
+  }
+  /** A Codex start refused for spacing. Counted for status only, never logged one by one. */
+  spacingHeld(): void {
+    this.db.prepare("INSERT INTO fleet_codex_spacing VALUES (1,1) ON CONFLICT(singleton) DO UPDATE SET held=held+1").run();
+  }
+  /** A Codex start was admitted. Called inside the admitting transaction. */
+  started(source: { machine: string; ticket: string; role: string }, t = this.now()): void {
+    this.db.prepare("INSERT INTO fleet_codex_starts (at,machine,ticket,role) VALUES (?,?,?,?)").run(t, source.machine, source.ticket, source.role);
+    this.db.prepare("DELETE FROM fleet_codex_starts WHERE id <= (SELECT max(id) FROM fleet_codex_starts) - ?").run(EVENTS_KEPT);
+    this.db.prepare("INSERT INTO fleet_codex_spacing VALUES (1,0) ON CONFLICT(singleton) DO UPDATE SET held=0").run();
+  }
+  spacingState(t = this.now()): CodexSpacingState {
+    const last = this.lastStart();
+    const wait = this.spacingWaitMs(t);
+    const held = this.db.prepare("SELECT held FROM fleet_codex_spacing WHERE singleton=1").get();
+    return {
+      spacingSeconds: this.config.startSpacingMs / 1000, held: wait > 0, remainingSeconds: Math.ceil(wait / 1000),
+      lastStartAt: last?.at ?? null, nextStartAt: last && this.config.startSpacingMs ? t + wait : null,
+      lastStart: last ? { machine: last.machine, ticket: last.ticket, role: last.role } : null,
+      heldSinceLastStart: held ? Number(held.held) : 0,
+      startsLastHour: Number(this.db.prepare("SELECT count(*) AS n FROM fleet_codex_starts WHERE at > ?").get(t - 3600_000)!.n),
+    };
+  }
+  /** Recent admitted Codex starts, newest first. */
+  starts(limit = 20): Array<{ at: number; machine: string; ticket: string; role: string }> {
+    return this.db.prepare("SELECT at,machine,ticket,role FROM fleet_codex_starts ORDER BY id DESC LIMIT ?").all(limit)
+      .map(r => ({ at: Number(r.at), machine: String(r.machine), ticket: String(r.ticket), role: String(r.role) }));
   }
 
   private row(): { level: number; since: number | null; until: number | null; duration: number; ended: boolean; reports: number; cause: CodexPauseState["cause"]; lastClean: number | null } | undefined {

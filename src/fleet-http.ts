@@ -51,7 +51,7 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
       if (req.method === "GET" && req.url === "/tasks/orphaned") return send(200, store.orphans.list());
       if (req.method === "GET" && req.url === "/state") return send(200, {...store.snapshot(), features:{recoveryTasks:true},requiredRepairs:store.requiredRepairs()});
       if (req.method === "GET" && req.url === "/runner") return send(200, store.runnerPolicy() ?? null);
-      if (req.method === "GET" && req.url === "/codex") return send(200, { pause: store.codex.state(), config: store.codex.config, events: store.codex.events() });
+      if (req.method === "GET" && req.url === "/codex") return send(200, { pause: store.codex.state(), spacing: store.codex.spacingState(), config: store.codex.config, events: store.codex.events(), recentStarts: store.codex.starts() });
       if (req.method === "GET" && req.url === "/recovery/state") return send(200, store.recovery.list());
       if (req.method === "GET" && req.url === "/github/status" && isAdmin) return send(200, github?.status() ?? { enabled: false });
       if (req.method !== "POST") return send(404, { error: "Unknown operation" });

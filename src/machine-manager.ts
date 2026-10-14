@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { listen, readJson, tokenMatches, type FleetClient } from "./fleet-http.js";
 import { validateStart, validateLimits, type MachineLimits, type FleetRun } from "./fleet-store.js";
-import { scheduleMachine, runnableTickets, acceptsDuringProjectDrain, codexPaused, type WorkOffer } from "./machine-scheduler.js";
+import { scheduleMachine, runnableTickets, acceptsDuringProjectDrain, codexPaused, codexSpaced, type WorkOffer } from "./machine-scheduler.js";
 
 /** An operator drain or resume command, kept so a supervisor can tell it from an unexplained policy change. */
 export interface ProjectDrainChange { project: string; draining: boolean; at: number }
@@ -131,6 +131,7 @@ export class MachineManager {
           : state.claims.some(c => c.ticket === o.ticket && c.machine !== this.config.machine) ? "owned-elsewhere"
           : !acceptsDuringProjectDrain(o, this.config.machine, this.config.drainingProjects ?? [], state) ? "project-draining"
           : codexPaused(o, state) ? "codex-paused"
+          : codexSpaced(o, state) ? "codex-spaced"
           : eligible.has(`${o.project}/${o.key}`) ? "eligible" : "waiting-for-capacity-or-lock" })),
     };
   }

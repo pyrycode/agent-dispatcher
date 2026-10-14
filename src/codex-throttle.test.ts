@@ -11,12 +11,13 @@ import { MachineManager, serveManager } from "./machine-manager.js";
 import { scheduleMachine, type WorkOffer } from "./machine-scheduler.js";
 import { ManagedDispatch, managedCodexReporter } from "./managed-dispatch.js";
 import {
-  codexPauseAttention, codexStartJitterMaxMs, DEFAULT_CODEX_START_JITTER_MS, readCodexThrottleConfig, startsCodex,
+  codexPauseAttention, codexStartJitterMaxMs, DEFAULT_CODEX_THROTTLE, DEFAULT_CODEX_START_JITTER_MS, readCodexThrottleConfig, startsCodex,
   rateLimitWaitsUncounted, armCodexStartJitter, codexStartHoldMs, CODEX_UNCOUNTED_PER_TICKET,
   type CodexPauseState,
 } from "./codex-throttle.js";
 
 const MIN = 60_000;
+const NO_SPACING = { ...DEFAULT_CODEX_THROTTLE, startSpacingMs: 0 };
 const limits = { box: { heavyLimit: 2, combinedLimit: 4 }, hp: { heavyLimit: 2, combinedLimit: 4 } };
 
 function fixture(t: TestContext, options: ConstructorParameters<typeof FleetStore>[2] = {}, path?: string) {
@@ -24,7 +25,8 @@ function fixture(t: TestContext, options: ConstructorParameters<typeof FleetStor
   const logs: string[] = [];
   const dir = path ? undefined : mkdtempSync(join(tmpdir(), "codex-throttle-"));
   const file = path ?? join(dir!, "claims.sqlite");
-  const store = new FleetStore(file, limits, { now: () => clock, log: line => logs.push(line), ...options });
+  // Start spacing has its own tests in codex-spacing.test.ts; these admit Codex starts back to back.
+  const store = new FleetStore(file, limits, { now: () => clock, log: line => logs.push(line), codexThrottle: NO_SPACING, ...options });
   t.after(() => { try { store.close(); } catch { /* a test closed it to restart */ } if (dir) rmSync(dir, { recursive: true, force: true }); });
   return { store, logs, file, advance: (ms: number) => { clock += ms; }, now: () => clock };
 }
@@ -186,7 +188,7 @@ describe("Codex pause backoff", () => {
     store.close();
     // A restart keeps the pause and still logs its end once.
     let clock = now();
-    const restarted = new FleetStore(file, limits, { now: () => clock, log: line => logs.push(line) });
+    const restarted = new FleetStore(file, limits, { now: () => clock, log: line => logs.push(line), codexThrottle: NO_SPACING });
     t.after(() => restarted.close());
     assert.deepEqual(restarted.start(req("builder")), { ok: false, reason: "codex-paused" });
     clock += MIN;
@@ -209,7 +211,7 @@ describe("Codex pause backoff", () => {
   });
 
   test("a disabled throttle records a 429 and pauses nothing", t => {
-    const { store } = fixture(t, { codexThrottle: { baseMs: 2 * MIN, ceilingMs: 30 * MIN, enabled: false } });
+    const { store } = fixture(t, { codexThrottle: { baseMs: 2 * MIN, ceilingMs: 30 * MIN, enabled: false, startSpacingMs: 0 } });
     store.setRunner("codex");
     const state = limited(store, admit(store, "builder"));
     assert.equal(state.active, false);
@@ -240,8 +242,8 @@ describe("Codex pause backoff", () => {
 
 describe("configuration", () => {
   test("claim service settings are validated and default to two and thirty minutes", () => {
-    assert.deepEqual(readCodexThrottleConfig(undefined), { baseMs: 2 * MIN, ceilingMs: 30 * MIN, enabled: true });
-    assert.deepEqual(readCodexThrottleConfig({ baseSeconds: 60, ceilingSeconds: 600 }), { baseMs: MIN, ceilingMs: 10 * MIN, enabled: true });
+    assert.deepEqual(readCodexThrottleConfig(undefined), { baseMs: 2 * MIN, ceilingMs: 30 * MIN, enabled: true, startSpacingMs: 20_000 });
+    assert.deepEqual(readCodexThrottleConfig({ baseSeconds: 60, ceilingSeconds: 600 }), { baseMs: MIN, ceilingMs: 10 * MIN, enabled: true, startSpacingMs: 20_000 });
     assert.equal(readCodexThrottleConfig({ enabled: false }).enabled, false);
     assert.throws(() => readCodexThrottleConfig({ baseSeconds: 600, ceilingSeconds: 60 }), /at least baseSeconds/);
     assert.throws(() => readCodexThrottleConfig({ baseSeconds: 1 }), /between 10 and 86400/);
@@ -279,7 +281,7 @@ const url = (server: Server) => `http://127.0.0.1:${(server.address() as Address
 
 describe("end to end over the claim service and machine manager", () => {
   test("a dispatcher's 429 report pauses the fleet; status shows it; the operator reads and clears it", async t => {
-    const store = new FleetStore(":memory:", { mac: { heavyLimit: 1, combinedLimit: 2 } }, { log: () => {} });
+    const store = new FleetStore(":memory:", { mac: { heavyLimit: 1, combinedLimit: 2 } }, { log: () => {}, codexThrottle: NO_SPACING });
     store.setRunner("codex");
     const central = await serveFleet(store, { mac: "mac-token" }, "central-admin", 0);
     const manager = new MachineManager({ machine: "mac", heavyLimit: 1, combinedLimit: 2, projects: ["org/core"] }, new FleetClient(url(central), "mac-token"));

@@ -1,10 +1,10 @@
-import { createHash } from "node:crypto";
 import type { FleetStore } from "./fleet-store.js";
 import type { GitHubBroker, GitHubRequest } from "./github-broker.js";
 import type { WorkflowProject, WorkflowItem } from "./workflow-store.js";
 import { WorkflowGitHub } from "./workflow-github.js";
 import { RECOVERY_LABEL_DEFINITIONS } from "./recovery-labels.js";
 import { labelColor } from "./label-colors.js";
+import { issueEvidence, type EvidenceSeen } from "./evidence-revision.js";
 
 type GraphQLError = { message?: string; path?: Array<string | number> };
 
@@ -437,7 +437,7 @@ export class WorkflowPublisher {
     config: WorkflowProject,
     issues: any[],
   ): Promise<void> {
-    const observations: WorkflowItem[] = [];
+    const observations: Array<WorkflowItem & { evidenceSeen?: EvidenceSeen }> = [];
     for (const issue of issues) {
       if (
         issue.labels.pageInfo.hasNextPage ||
@@ -458,24 +458,24 @@ export class WorkflowPublisher {
         );
         board = { id: added.data.addProjectV2ItemById.item.id };
       }
-      const evidenceRevision = createHash("sha256")
-        .update(
-          JSON.stringify([
-            issue.body,
-            (issue.comments?.nodes ?? [])
-              .filter(
-                (c: any) =>
-                  !/^(<!-- (?:fleet-recovery|family-dispatch|stranded-wip|auto-retry|pyry-repair-start)|## Orchestrator recovery)/.test(
-                    c.body ?? "",
-                  ),
-              )
-              .map((c: any) => [c.id, c.updatedAt]),
-          ]),
-        )
-        .digest("hex");
+      // Recomputed only on new evidence, never because a recovery report
+      // pushed an older comment out of the latest-comments read.
+      const evidence = issueEvidence(
+        issue.body,
+        issue.comments?.nodes,
+        known
+          ? {
+              revision: known.item.evidenceRevision,
+              body: known.item.body,
+              seen: this.store.workflow.evidenceSeen(known.ticket),
+            }
+          : undefined,
+      );
       observations.push({
         ...known?.item,
-        evidenceRevision,
+        evidenceRevision: evidence.revision,
+        // Written only when recomputed, so an unchanged ticket writes nothing.
+        ...(evidence.recomputed ? { evidenceSeen: evidence.seen } : {}),
         id: board.id,
         archived: board.isArchived === true ? true : undefined,
         issueId: issue.id,

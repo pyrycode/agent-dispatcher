@@ -1,3 +1,4 @@
+import type { EvidenceSeen } from "./evidence-revision.js";
 import type { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import type { ProjectItem } from "./types.js";
@@ -48,7 +49,8 @@ export class WorkflowStore {
       CREATE TABLE IF NOT EXISTS workflow_commands (id TEXT PRIMARY KEY, ticket TEXT NOT NULL, request TEXT NOT NULL, result TEXT NOT NULL) STRICT;
       CREATE TABLE IF NOT EXISTS workflow_events (id INTEGER PRIMARY KEY, ticket TEXT NOT NULL, actor TEXT NOT NULL, at INTEGER NOT NULL, change TEXT NOT NULL) STRICT;
       CREATE TABLE IF NOT EXISTS workflow_comments (id TEXT PRIMARY KEY, ticket TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL, published INTEGER NOT NULL DEFAULT 0) STRICT;
-      CREATE TABLE IF NOT EXISTS workflow_filings (id TEXT PRIMARY KEY, project TEXT NOT NULL, request TEXT NOT NULL, started_at INTEGER NOT NULL, issue_id TEXT, result TEXT) STRICT;`);
+      CREATE TABLE IF NOT EXISTS workflow_filings (id TEXT PRIMARY KEY, project TEXT NOT NULL, request TEXT NOT NULL, started_at INTEGER NOT NULL, issue_id TEXT, result TEXT) STRICT;
+      CREATE TABLE IF NOT EXISTS workflow_evidence_seen (ticket TEXT PRIMARY KEY, seen TEXT NOT NULL) STRICT;`);
     db.exec(`CREATE INDEX IF NOT EXISTS workflow_item_id ON workflow_tickets(json_extract(item,'$.id'));
       CREATE INDEX IF NOT EXISTS workflow_issue_id ON workflow_tickets(json_extract(item,'$.issueId'));
       CREATE INDEX IF NOT EXISTS workflow_parent ON workflow_tickets(project,json_extract(item,'$.parentNumber'));
@@ -379,12 +381,23 @@ export class WorkflowStore {
       ? { ticket: String(row.ticket), item: this.decode(row) }
       : undefined;
   }
+  /**
+   * The counted comments the ticket's evidence revision was last computed
+   * from, kept beside the item so recording them never changes the item's
+   * revision. See issueEvidence.
+   */
+  evidenceSeen(ticket: string): EvidenceSeen | undefined {
+    const row = this.db.prepare("SELECT seen FROM workflow_evidence_seen WHERE ticket=?").get(ticket);
+    return row ? JSON.parse(String(row.seen)) : undefined;
+  }
   /** Content refresh may discover new issues. Their initial workflow is always Inbox. */
-  observe(project: string, items: WorkflowItem[]): void {
+  observe(project: string, items: Array<WorkflowItem & { evidenceSeen?: EvidenceSeen }>): void {
     const config = this.config(project);
     if (!config) throw new Error("Workflow not enabled");
     this.transaction(() => {
-      for (const observed of items) {
+      for (const { evidenceSeen, ...observed } of items) {
+        if (evidenceSeen) this.db.prepare("INSERT INTO workflow_evidence_seen VALUES (?,?) ON CONFLICT(ticket) DO UPDATE SET seen=excluded.seen")
+          .run(`${project}#${observed.issueNumber}`, JSON.stringify(evidenceSeen));
         this.validate(
           { ...observed, status: observed.status || "Inbox" },
           config,

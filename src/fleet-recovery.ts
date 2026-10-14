@@ -37,17 +37,45 @@ export interface RecoveryIncident {
   current?: boolean;
   /** Present for a settled wait or operational escalation: what it waits on and why it reopened. */
   settlement?: RecoverySettlement;
+  /**
+   * Present on a current assessed incident. `quietRepeats` counts assessments
+   * in a row with no stage, recovery label or blocker change; a change of only
+   * comments, logs or task results is assessed again no earlier than
+   * `nextQuietReassessAt`.
+   */
+  cadence?: { quietRepeats: number; nextQuietReassessAt: number };
 }
 
 /** Short code-set cooldown, used only for transient transport failures. */
 export const RECOVERY_RECHECK_MS = 30 * 60_000;
 /** Default safety reassessment of an unchanged settled wait or operational escalation. */
 export const RECOVERY_SAFETY_RECHECK_MS = 24 * 3600_000;
-export interface RecoveryLedgerOptions { safetyRecheckMs?: number }
+/**
+ * Spacing of repeat assessments of one ticket whose stage, recovery labels
+ * and blockers have not changed since its last assessment: only its comments,
+ * body, logs, recovery task results, coordination or dependencies moved. The
+ * first such repeat waits `base` after the last decision, the same thirty
+ * minutes as the earlier evidence cooldown, and each further one in a row
+ * doubles it up to `ceiling`. Any change to stage, recovery labels or
+ * blockers, a new error among them, resets the run and is assessed at once.
+ *
+ * Measured 2026-10-14: 154 recovery assessments in one day, each a large
+ * Codex request, against 36 builder runs. See docs/machine-manager.md.
+ */
+export const RECOVERY_REASSESS_BASE_MS = RECOVERY_RECHECK_MS;
+export const RECOVERY_REASSESS_CEILING_MS = 4 * 3600_000;
+export interface RecoveryLedgerOptions { safetyRecheckMs?: number; reassessBaseMs?: number; reassessCeilingMs?: number }
 export function validateSafetyRecheck(ms: number): number {
   if (!Number.isSafeInteger(ms) || ms < 60 * 60_000 || ms > 30 * 86400_000) throw new Error("Recovery safety recheck must be between one hour and thirty days");
   return ms;
 }
+export function validateReassessSpacing(baseMs: number, ceilingMs: number): { baseMs: number; ceilingMs: number } {
+  if (!Number.isSafeInteger(baseMs) || baseMs < 5 * 60_000 || baseMs > 24 * 3600_000) throw new Error("Recovery reassessment base must be between five minutes and one day");
+  if (!Number.isSafeInteger(ceilingMs) || ceilingMs < baseMs || ceilingMs > 7 * 86400_000) throw new Error("Recovery reassessment ceiling must be between the base and seven days");
+  return { baseMs, ceilingMs };
+}
+/** Consecutive quiet repeats are counted up to this, far past any ceiling. */
+const REASSESS_STREAK_CAP = 20;
 const TASK_ID = /^[a-f0-9]{64}$/;
 const FULL_TICKET = /^[\w.-]+\/[\w.-]+#[1-9]\d*$/;
 /** Pending task states collapse, so a dependency starting to run is not a change. */
@@ -135,8 +163,10 @@ export function validateRecoveryDecision(value: unknown): RecoveryDecision {
 /** Uses the claim authority's database. No independent watcher can race this ledger. */
 export class RecoveryLedger {
   private readonly safetyRecheckMs: number;
+  private readonly reassess: { baseMs: number; ceilingMs: number };
   constructor(private db: DatabaseSync, private now = Date.now, options: RecoveryLedgerOptions = {}) {
     this.safetyRecheckMs = validateSafetyRecheck(options.safetyRecheckMs ?? RECOVERY_SAFETY_RECHECK_MS);
+    this.reassess = validateReassessSpacing(options.reassessBaseMs ?? RECOVERY_REASSESS_BASE_MS, options.reassessCeilingMs ?? RECOVERY_REASSESS_CEILING_MS);
     db.exec(`CREATE TABLE IF NOT EXISTS fleet_recovery (
       id TEXT PRIMARY KEY, ticket TEXT NOT NULL, fingerprint TEXT NOT NULL, reason TEXT NOT NULL,
       state TEXT NOT NULL, created INTEGER NOT NULL, updated INTEGER NOT NULL,
@@ -152,7 +182,20 @@ export class RecoveryLedger {
       incident_id TEXT PRIMARY KEY, ticket TEXT NOT NULL, basis TEXT NOT NULL, digest TEXT NOT NULL,
       created INTEGER NOT NULL, recheck_at INTEGER NOT NULL, reopened TEXT, reopened_at INTEGER
     ) STRICT;
-    CREATE TABLE IF NOT EXISTS fleet_recovery_status (ticket TEXT PRIMARY KEY, status TEXT NOT NULL, present INTEGER NOT NULL) STRICT;`);
+    CREATE TABLE IF NOT EXISTS fleet_recovery_status (ticket TEXT PRIMARY KEY, status TEXT NOT NULL, present INTEGER NOT NULL) STRICT;
+    CREATE TABLE IF NOT EXISTS fleet_recovery_cadence (ticket TEXT PRIMARY KEY, streak INTEGER NOT NULL, updated INTEGER NOT NULL) STRICT;`);
+  }
+  /** Quiet repeat assessments in a row for a ticket. */
+  private quietRepeats(ticket: string): number {
+    return Number(this.db.prepare("SELECT streak FROM fleet_recovery_cadence WHERE ticket=?").get(ticket)?.streak ?? 0);
+  }
+  /** How long after its last decision a ticket with only quiet changes waits. */
+  quietInterval(repeats: number): number {
+    return Math.min(this.reassess.ceilingMs, this.reassess.baseMs * 2 ** Math.min(Math.max(0, repeats), 30));
+  }
+  /** As quietInterval, one step shorter for an awaited result, and none the first time. */
+  private quietDelay(repeats: number, awaited: boolean): number {
+    return !awaited ? this.quietInterval(repeats) : repeats === 0 ? 0 : this.quietInterval(repeats - 1);
   }
   private hasTable(name: string): boolean {
     return !!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name);
@@ -232,7 +275,12 @@ export class RecoveryLedger {
     return rows.map(r => ({ id: String(r.id), ticket: String(r.ticket), fingerprint: String(r.fingerprint), reason: String(r.reason),
       state: r.state as RecoveryIncident["state"], created: Number(r.created), updated: Number(r.updated), runId: r.run_id as string | null,
       decision: r.decision ? JSON.parse(String(r.decision)) : null, current: r.present === 1 }))
-      .map(i => { const settlement = this.settlement(i.id); return settlement ? { ...i, settlement } : i; });
+      .map(i => { const settlement = this.settlement(i.id); return settlement ? { ...i, settlement } : i; })
+      .map(i => {
+        if (!i.current || !i.decision || i.state === "queued" || i.state === "resolved") return i;
+        const quietRepeats = this.quietRepeats(i.ticket);
+        return { ...i, cadence: { quietRepeats, nextQuietReassessAt: i.updated + this.quietInterval(quietRepeats) } };
+      });
   }
   report(machine: string, project: string, observations: RecoveryObservation[], fleet: FleetSnapshot, partial = false): RecoveryIncident[] {
     validateObservations(project, observations);
@@ -335,12 +383,31 @@ export class RecoveryLedger {
         && !policyRecorded;
       const recheck = (legacyLimit || waited || coordinated || operational || legacyAssessment)
         && trigger && (!trigger.manual || pauseInspection) && !wip;
+      // A repeat assessment whose stage, recovery labels and blockers are what
+      // the last one saw: only comments, logs, task results or dependencies
+      // moved. It waits a growing interval after the last decision. A new
+      // error, a stage move or a manual trigger is never held here, nor is a
+      // code deadline or the safety interval, which are timers already.
+      const manualNow = !!trigger?.manual && !pauseInspection;
+      const quiet = !!old && !!trigger && !manualNow && !(wip && !trigger.manual)
+        && !["queued", "assessing", "applying"].includes(String(old.state)) && !!old.decision
+        && assessedWorkflow?.fingerprint === workflow
+        && (old.fingerprint !== fingerprint || recheck)
+        && reopened !== "code deadline" && reopened !== "safety interval";
+      // A result the last decision waited for, its own repair task or a named
+      // dependency, is read at once the first time; only repeats are spaced.
+      const awaited = coordinated || (!!reopened && /^(dependency |coordination |capability )/.test(reopened));
+      if (quiet && this.now() < Number(old!.updated) + this.quietDelay(this.quietRepeats(o.ticket), awaited)) continue;
       if (old && (!trigger || old.fingerprint !== fingerprint || recheck)) this.db.prepare("UPDATE fleet_recovery SET present=0, updated=CASE WHEN state='queued' THEN ? ELSE updated END, state=CASE WHEN state='queued' THEN 'resolved' ELSE state END WHERE id=?").run(this.now(), old.id);
       if (!trigger || old?.fingerprint === fingerprint && !recheck || (wip && !trigger.manual)) continue;
       if (old && settledIncident) this.markReopened(String(old.id), old.fingerprint !== fingerprint ? "ticket changed" : reopened ?? "reassessed");
       const id = randomUUID();
       this.db.prepare("INSERT INTO fleet_recovery_workflow VALUES (?,?) ON CONFLICT(ticket) DO UPDATE SET fingerprint=excluded.fingerprint").run(o.ticket, workflow);
       const manual = trigger.manual && !pauseInspection;
+      // Count quiet repeats in a row. Any other assessment starts the count again.
+      if (!manual) this.db.prepare(`INSERT INTO fleet_recovery_cadence VALUES (?,?,?)
+        ON CONFLICT(ticket) DO UPDATE SET streak=excluded.streak,updated=excluded.updated`)
+        .run(o.ticket, quiet ? Math.min(this.quietRepeats(o.ticket) + 1, REASSESS_STREAK_CAP) : 0, this.now());
       this.db.prepare("INSERT INTO fleet_recovery VALUES (?,?,?,?,?,?,?,NULL,NULL,1)").run(id, o.ticket, fingerprint, trigger.reason, manual ? "escalated" : "queued", this.now(), this.now());
       if (upgraded || pauseInspection) this.db.prepare("INSERT INTO fleet_recovery_assessment_policy VALUES (?,?)").run(id, RECOVERY_ASSESSMENT_POLICY);
       if (manual) newAlerts.add(id);
