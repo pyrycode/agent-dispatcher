@@ -320,7 +320,7 @@ export class CodexStreamAdapter {
   responded = false;
 
   accept(event: Record<string, any>): void {
-    if (event.type === "item.completed" || event.type === "turn.completed") this.responded = true;
+    if ((event.type === "item.completed" && event.item?.type !== "error") || event.type === "turn.completed") this.responded = true;
     switch (event.type) {
       case "thread.started":
         if (typeof event.thread_id === "string") this.sessionId = event.thread_id;

@@ -155,14 +155,17 @@ const ADMISSION_SIGNATURES: readonly RegExp[] = [
  * like this never counts as an admission rejection here.
  */
 const PROVIDER_RATE_LIMIT: readonly RegExp[] = [
-  /\blast status: 429\b/i,
-  /\bexceeded retry limit\b/i,
+  /\bexceeded retry limit, last status: 429\b/i,
   /\bhit your usage limit\b/i,
   /\b(?:rate_limit_exceeded|usage_limit_reached)\b/,
 ];
 
+/** A refused WebSocket upgrade. Always an admission rejection, whatever else the line says. */
+const HANDSHAKE_REJECTION: readonly RegExp[] = ADMISSION_SIGNATURES.slice(0, 2);
+
 /** One line naming a refused admission, and not a model provider's own limit. */
 function isAdmissionLine(line: string): boolean {
+  if (HANDSHAKE_REJECTION.some(re => re.test(line))) return true;
   return ADMISSION_SIGNATURES.some(re => re.test(line)) && !PROVIDER_RATE_LIMIT.some(re => re.test(line));
 }
 

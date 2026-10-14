@@ -12,6 +12,7 @@ import { scheduleMachine, type WorkOffer } from "./machine-scheduler.js";
 import { ManagedDispatch, managedCodexReporter } from "./managed-dispatch.js";
 import {
   codexPauseAttention, codexStartJitterMaxMs, DEFAULT_CODEX_START_JITTER_MS, readCodexThrottleConfig, startsCodex,
+  rateLimitWaitsUncounted, armCodexStartJitter, codexStartHoldMs, CODEX_UNCOUNTED_PER_TICKET,
   type CodexPauseState,
 } from "./codex-throttle.js";
 
@@ -246,6 +247,7 @@ describe("configuration", () => {
     assert.throws(() => readCodexThrottleConfig({ baseSeconds: 1 }), /between 10 and 86400/);
     assert.throws(() => readCodexThrottleConfig({ enabled: "no" }), /true or false/);
     assert.throws(() => readCodexThrottleConfig([]), /object/);
+    assert.throws(() => readCodexThrottleConfig({ baseSecond: 60 }), /unknown settings: baseSecond/);
   });
 
   test("the dispatcher start spread defaults to a minute, can be off, and is held at five minutes", () => {
@@ -333,5 +335,98 @@ describe("end to end over the claim service and machine manager", () => {
     // A failed delivery is null, never a thrown error inside the stream handler.
     (managed as any).connection = { call: async () => { throw new Error("Service 404"); } };
     assert.equal(await managed.codexReporter({ id: "r2", ticket: "org/core#2" } as any)("rate-limited"), null);
+  });
+});
+
+describe("per-ticket limit on uncounted waits", () => {
+  test("a ticket that keeps meeting 429s while others start cleanly counts after four in a row", t => {
+    const { store, advance } = fixture(t);
+    store.setRunner("codex");
+    const ticket = "org/core#900";
+    const answers: boolean[] = [];
+    for (let i = 0; i < 6; i++) {
+      // Another ticket starts cleanly between the attempts and keeps the pause short.
+      const run = admit(store, "builder", { ticket, id: `t900-${i}` });
+      const state = limited(store, run);
+      answers.push(rateLimitWaitsUncounted(state));
+      assert.equal(state.ticketReports, i + 1);
+      store.finish("box", "s1", run.id, false);
+      advance(state.durationMs);
+      clean(store, admit(store, "builder"));
+      assert.equal(store.codex.state().level, 0);
+    }
+    assert.deepEqual(answers, [true, true, true, true, false, false]);
+    assert.equal(CODEX_UNCOUNTED_PER_TICKET, 4);
+    // Its own clean start ends the run of 429s.
+    clean(store, admit(store, "builder", { ticket, id: "t900-ok" }));
+    store.finish("box", "s1", "t900-ok");
+    assert.equal(limited(store, admit(store, "builder", { ticket, id: "t900-again" })).ticketReports, 1);
+  });
+
+  test("no pause, or a failed delivery, never waits uncounted", () => {
+    assert.equal(rateLimitWaitsUncounted(null), false);
+    assert.equal(rateLimitWaitsUncounted({ active: false } as CodexPauseState), false);
+    assert.equal(rateLimitWaitsUncounted({ active: true } as CodexPauseState), true, "an older controller that does not count per ticket");
+  });
+
+  test("an operator clear logs the end of a pause that had already run out", t => {
+    const { store, advance, logs } = fixture(t);
+    store.setRunner("codex");
+    limited(store, admit(store, "builder"));
+    advance(2 * MIN + 1);
+    store.clearCodexPause();
+    assert.equal(logs.filter(l => l.includes("pause-ended")).length, 1);
+    assert.ok(logs.some(l => l.includes("cleared: Operator reset the backoff")));
+  });
+});
+
+describe("dispatcher side offers", () => {
+  const managed = () => new ManagedDispatch("org/core", { PYRY_MANAGER_URL: "http://127.0.0.1:1", PYRY_MANAGER_TOKEN: "t" });
+
+  test("a local runner switch replaces an ungranted offer, never a granted one", () => {
+    const m = managed();
+    let runner: "codex" | "claude" = "codex";
+    m.localRunner = () => runner;
+    const first = m.offer(1, "builder", "medium");
+    assert.equal(first.offer.runner, "codex");
+    assert.equal(m.offer(1, "builder", "medium"), first, "unchanged runner keeps the offer");
+    runner = "claude";
+    const second = m.offer(1, "builder", "medium");
+    assert.notEqual(second, first);
+    assert.notEqual(second.offer.key, first.offer.key);
+    assert.equal(second.offer.runner, "claude");
+    second.run = { id: "granted" } as any;
+    runner = "codex";
+    assert.equal(m.offer(1, "builder", "medium"), second, "a granted offer keeps its admission");
+  });
+
+  test("during the start spread Codex offers are held back and other work is still offered", () => {
+    const m = managed();
+    m.localRunner = role => role === "refiner" ? "claude" : "codex";
+    m.offer(1, "builder", "medium"); m.offer(2, "refiner", "light"); m.offer(3, "merge", "light");
+    try {
+      armCodexStartJitter({ PYRY_CODEX_START_JITTER_MS: "60000" }, Date.now(), () => 1);
+      assert.ok(codexStartHoldMs() > 0);
+      assert.deepEqual((m as any).offers().map((o: WorkOffer) => o.role).sort(), ["merge", "refiner"]);
+    } finally { armCodexStartJitter({ PYRY_CODEX_START_JITTER_MS: "0" }); }
+    assert.deepEqual((m as any).offers().map((o: WorkOffer) => o.role).sort(), ["builder", "merge", "refiner"]);
+  });
+
+  test("a pause ending re-arms the spread so dispatchers do not all start Codex at once", async () => {
+    const m = managed();
+    const active = { active: true } as CodexPauseState;
+    let state: any = { claims: [], runs: [], machine: "box", draining: false, codexPause: active };
+    (m as any).connection = { call: async (path: string) => path === "/state" ? state : [] };
+    armCodexStartJitter({ PYRY_CODEX_START_JITTER_MS: "0" });
+    await m.sync();
+    assert.equal(codexStartHoldMs(), 0);
+    state = { ...state, codexPause: { active: false } };
+    const prior = process.env.PYRY_CODEX_START_JITTER_MS;
+    (m as any).env.PYRY_CODEX_START_JITTER_MS = "60000";
+    try {
+      let armed = false;
+      for (let i = 0; i < 20 && !armed; i++) { (m as any).state = { ...state, codexPause: active }; await m.sync(); armed = codexStartHoldMs() > 0; }
+      assert.ok(armed, "a random spread was drawn when the pause ended");
+    } finally { armCodexStartJitter({ PYRY_CODEX_START_JITTER_MS: "0" }); if (prior !== undefined) process.env.PYRY_CODEX_START_JITTER_MS = prior; }
   });
 });

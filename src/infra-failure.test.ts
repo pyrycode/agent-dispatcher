@@ -326,5 +326,8 @@ describe("a model provider's own rate limit is not an admission rejection", () =
     assert.equal(classifyFailureMessage(relay), "connection");
     assert.equal(classifyFailureMessage(`${codex}\n${relay}`), "connection");
     assert.equal(findAdmissionRejections(`${codex}\n${relay}\nHTTP/1.1 429 Too Many Requests`).count, 2);
+    // A test client that wraps the relay's refusal in its own retry wording is still the relay.
+    assert.equal(classifyFailureMessage("exceeded retry limit: expected handshake response status code 101 but got 429"), "connection");
+    assert.equal(classifyFailureMessage("retry gave up, last status: 429 Too Many Requests from relay"), "connection");
   });
 });

@@ -17,7 +17,7 @@ import type { RecoveryObservation, RecoveryIncident, RecoveryDecision } from "./
 import type { AgentRunner } from './agent-runner.js';
 import {taskBridge} from "./recovery-task-bridge.js";
 import { offerId } from "./machine-manager.js";
-import { NON_AGENT_ROLES, type CodexPauseState } from "./codex-throttle.js";
+import { NON_AGENT_ROLES, startsCodex, codexStartHoldMs, rearmCodexStartJitter, type CodexPauseState } from "./codex-throttle.js";
 
 const DEFAULT_RESOURCE_CLASSES: Readonly<Record<string, ResourceClass>> = {
   builder: "medium", developer: "medium", refiner: "light", po: "light", documentation: "light",
@@ -173,11 +173,16 @@ export class ManagedDispatch {
     const name = this.name(ticket, role);
     this.seen.add(name);
     let pending = this.pending.get(name);
+    const stated = NON_AGENT_ROLES.has(role) ? undefined : this.localRunner?.(role);
+    const runner = stated === "codex" || stated === "claude" ? stated : undefined;
+    // The runner is part of the admission request, which must not change
+    // under a retried admission. A local switch replaces an ungranted offer
+    // with a new one; the old key disappears from the queue and any admission
+    // that still commits for it is cancelled as unused by sync().
+    if (pending && !pending.run && pending.offer.runner !== runner) pending = undefined;
     if (!pending) {
       pending = { offer: { project: this.project, ticket, role, resource, locks, key: randomUUID(), order } };
-      // Fixed for the offer's life: the request must not change under a retried admission.
-      const runner = NON_AGENT_ROLES.has(role) ? undefined : this.localRunner?.(role);
-      if (runner === "codex" || runner === "claude") pending.offer.runner = runner;
+      if (runner) pending.offer.runner = runner;
       this.pending.set(name, pending);
     }
     const required=pending.run ? [] : this.state.requiredRepairs?.[ticket]??[];
@@ -225,7 +230,11 @@ export class ManagedDispatch {
   }
   ready(pending: Pending): boolean { return !this.draining && !pending.retired && !!pending.run && !this.running.has(pending.run.id); }
   private offers(exclude?: Pending): WorkOffer[] {
+    // During the random Codex start spread, Codex work is not offered at all,
+    // so it holds no admitted place while it waits.
+    const holdCodex = codexStartHoldMs() > 0;
     return [...this.pending.values()].filter(p => p !== exclude && !p.retired
+      && !(holdCodex && !p.run && startsCodex(p.offer, this.state.runnerPolicy))
       && Date.now() >= (this.cooldown.get(this.name(p.offer.ticket, p.offer.role)) ?? 0)).map(p => p.offer);
   }
   async endCycle(): Promise<void> {
@@ -253,6 +262,9 @@ export class ManagedDispatch {
     this.syncing = true;
     try {
       const state = await this.connection.call<FleetSnapshot & { machine: string; draining: boolean }>("/state");
+      // A pause ending is the other moment every dispatcher would start Codex
+      // at once, so each draws a fresh random spread before its next start.
+      if (this.state.codexPause?.active && state.codexPause && !state.codexPause.active) rearmCodexStartJitter(this.env);
       const runs = await this.connection.call<FleetRun[]>("/offers", { session: this.session, offers: this.offers() });
       this.state = state;
       this.tasksEnabled = !this.tasksDisabled && state.features?.recoveryTasks === true;

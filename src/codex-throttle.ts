@@ -41,6 +41,8 @@ export function readCodexThrottleConfig(raw: unknown): CodexThrottleConfig {
   if (raw === undefined) return DEFAULT_CODEX_THROTTLE;
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("codexThrottle must be an object");
   const value = raw as Record<string, unknown>;
+  const unknown = Object.keys(value).filter(k => !["baseSeconds", "ceilingSeconds", "enabled"].includes(k));
+  if (unknown.length) throw new Error(`codexThrottle has unknown settings: ${unknown.join(", ")}`);
   const seconds = (key: string, fallback: number): number => {
     const v = value[key];
     if (v === undefined) return fallback;
@@ -97,6 +99,22 @@ export interface CodexPauseState {
   lastCleanAt: number | null;
   remainingSeconds: number;
   enabled: boolean;
+  /** In a report's answer only: 429s on the reported run's ticket since that ticket last started Codex cleanly. */
+  ticketReports?: number;
+}
+
+/**
+ * How many 429s in a row one ticket may wait out without counting against
+ * it. A ticket that keeps meeting a 429 while other tickets start cleanly
+ * has a limit of its own, such as an oversized request, and must not retry
+ * uncounted forever, pausing the whole fleet each time. Past this it takes
+ * the ordinary capped transient retry.
+ */
+export const CODEX_UNCOUNTED_PER_TICKET = 4;
+
+/** True when a reported 429 may wait for the pause without counting against its ticket. */
+export function rateLimitWaitsUncounted(state: CodexPauseState | null | undefined): boolean {
+  return state?.active === true && (state.ticketReports ?? 1) <= CODEX_UNCOUNTED_PER_TICKET;
 }
 export interface CodexThrottleEvent { at: number; kind: "pause-started" | "pause-ended" | "rate-limited" | "reset" | "cleared"; detail: string }
 
@@ -110,6 +128,9 @@ export class CodexThrottle {
         singleton INTEGER PRIMARY KEY CHECK(singleton=1),
         level INTEGER NOT NULL, since INTEGER, until INTEGER, duration INTEGER NOT NULL,
         ended INTEGER NOT NULL, reports INTEGER NOT NULL, cause TEXT, last_clean INTEGER
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS fleet_codex_ticket_reports (
+        ticket TEXT PRIMARY KEY, reports INTEGER NOT NULL, updated INTEGER NOT NULL
       ) STRICT;
       CREATE TABLE IF NOT EXISTS fleet_codex_throttle_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL
@@ -165,24 +186,29 @@ export class CodexThrottle {
   rateLimited(source: CodexReportSource): CodexPauseState {
     const t = this.now();
     this.tick(t);
+    this.db.prepare("DELETE FROM fleet_codex_ticket_reports WHERE updated < ?").run(t - 7 * 86400_000);
+    this.db.prepare(`INSERT INTO fleet_codex_ticket_reports VALUES (?,1,?)
+      ON CONFLICT(ticket) DO UPDATE SET reports=reports+1, updated=excluded.updated`).run(source.ticket, t);
+    const ticketReports = Number(this.db.prepare("SELECT reports FROM fleet_codex_ticket_reports WHERE ticket=?").get(source.ticket)!.reports);
     const r = this.row();
     const where = `${source.role} on ${source.ticket} (${source.machine})`;
+    const counted = ticketReports > CODEX_UNCOUNTED_PER_TICKET ? ` That is ${ticketReports} 429s in a row on this ticket, so this one counts against it.` : "";
     if (r && r.until !== null && t < r.until) {
       r.reports++;
       this.save(r);
-      this.event("rate-limited", `429 from ${where} during the current pause; the next pause is ${minutes(this.durationFor(r.level))}.`, t);
-      return this.state(t);
+      this.event("rate-limited", `429 from ${where} during the current pause; the next pause is ${minutes(this.durationFor(r.level))}.${counted}`, t);
+      return { ...this.state(t), ticketReports };
     }
     if (!this.config.enabled) {
       this.event("rate-limited", `429 from ${where}; the throttle is off, so nothing paused.`, t);
-      return this.state(t);
+      return { ...this.state(t), ticketReports };
     }
     const level = this.levelAt(r, t);
     const duration = this.durationFor(level);
     const { admittedAt: _admitted, ...cause } = source;
     this.save({ level: Math.min(level + 1, 30), since: t, until: t + duration, duration, ended: false, reports: 1, cause, lastClean: r?.lastClean ?? null });
-    this.event("pause-started", `429 from ${where}. New Codex runs are paused fleet-wide for ${minutes(duration)}, until ${new Date(t + duration).toISOString()}${duration >= this.config.ceilingMs ? "; this is the ceiling" : ""}.`, t);
-    return this.state(t);
+    this.event("pause-started", `429 from ${where}. New Codex runs are paused fleet-wide for ${minutes(duration)}, until ${new Date(t + duration).toISOString()}${duration >= this.config.ceilingMs ? "; this is the ceiling" : ""}.${counted}`, t);
+    return { ...this.state(t), ticketReports };
   }
 
   /**
@@ -193,6 +219,8 @@ export class CodexThrottle {
   clean(source: CodexReportSource): CodexPauseState {
     const t = this.now();
     this.tick(t);
+    // The ticket itself got through, so its own run of 429s is over.
+    this.db.prepare("DELETE FROM fleet_codex_ticket_reports WHERE ticket=?").run(source.ticket);
     const r = this.row();
     // A run admitted in the pause's first millisecond was admitted before it:
     // from then on Codex admissions are refused until the pause ends.
@@ -207,6 +235,7 @@ export class CodexThrottle {
   /** Operator: end the current pause and reset the backoff. */
   clear(): CodexPauseState {
     const t = this.now();
+    this.tick(t);
     const r = this.row();
     if (r) {
       const wasActive = r.until !== null && t < r.until;
@@ -264,4 +293,30 @@ export function codexStartJitterMaxMs(raw: string | undefined): number {
   const n = Number(raw);
   if (!Number.isFinite(n) || n < 0) return DEFAULT_CODEX_START_JITTER_MS;
   return Math.min(Math.round(n), 5 * 60_000);
+}
+
+/** No Codex run starts before this time, epoch ms. Process-wide: one dispatcher per process. */
+let codexStartNotBefore = 0;
+/** Set by the first arming, at dispatcher startup. Library use and tests never spread. */
+let codexSpreadArmed = false;
+
+/**
+ * Pick a random time, up to `PYRY_CODEX_START_JITTER_MS` from now, before
+ * which this dispatcher starts no Codex run. Armed at dispatcher startup and
+ * again when a fleet pause ends, the two moments every dispatcher would
+ * otherwise start Codex together. Each dispatcher draws its own.
+ */
+export function armCodexStartJitter(env: NodeJS.ProcessEnv = process.env, now = Date.now(), rng: () => number = Math.random): number {
+  const delay = Math.floor(Math.min(1, Math.max(0, rng())) * codexStartJitterMaxMs(env.PYRY_CODEX_START_JITTER_MS));
+  codexStartNotBefore = now + delay;
+  codexSpreadArmed = true;
+  return delay;
+}
+/** Re-arm after a fleet pause ends, only in a dispatcher that armed at startup. */
+export function rearmCodexStartJitter(env: NodeJS.ProcessEnv = process.env): void {
+  if (codexSpreadArmed) armCodexStartJitter(env);
+}
+/** Milliseconds this dispatcher still holds Codex starts for, or 0. */
+export function codexStartHoldMs(now = Date.now()): number {
+  return Math.max(0, codexStartNotBefore - now);
 }

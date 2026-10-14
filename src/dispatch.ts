@@ -16,7 +16,8 @@ import { recoveryInventory, relatedTickets, relatedEvidence } from "./recovery-e
 import { recoveryLogContext } from "./recovery-context.js";
 import { RECOVERY_RETURNED_INBOX, type RecoveryIncident, type RecoveryDecision } from "./fleet-recovery.js";
 import { ManagedDispatch, managedTaskEnv, managedRunRunner, trackManagedChild, managedCodexReporter } from "./managed-dispatch.js";
-import { codexStartJitterMaxMs } from "./codex-throttle.js";
+import { codexStartJitterMaxMs, armCodexStartJitter, codexStartHoldMs, rateLimitWaitsUncounted } from "./codex-throttle.js";
+export { armCodexStartJitter } from "./codex-throttle.js";
 import { DispatchPool, excludeInFlight, freeSeats, launchCandidates, liveGateRunnerFor, mayStartMainSweep, resolvePollIntervalMs } from "./dispatch-pool.js";
 import { countVerdictsSince, isStaleBaseFinding, parseBuilderCompletions, parseVerdictArtifacts, pickVerdictPr, shouldFlagMissingVerdict } from "./verdict-guard.js";
 import { countOpenPrs, shouldFlagMissingPr } from "./pr-guard.js";
@@ -1407,24 +1408,14 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
  * `TOOL_UNAVAILABLE` stop line, is retried a few times too, see
  * `retryRequiredMcpStartup`.
  */
-/** No Codex run starts before this time, epoch ms. Set once at dispatcher startup. */
-let codexStartNotBefore = 0;
-
 /**
- * Pick this dispatcher's random first-Codex-start time: up to
- * `PYRY_CODEX_START_JITTER_MS` (default one minute) after startup. Each
- * dispatcher draws its own, so a fleet-wide restart spreads its first Codex
- * starts instead of sending them to OpenAI in the same second. Called from
- * `pollLoop` only, so tests and one-off tools never wait.
+ * Wait out this dispatcher's random Codex start spread (`armCodexStartJitter`,
+ * armed from `pollLoop` only, so tests and one-off tools never wait). A
+ * managed dispatcher holds its Codex offers back until then instead, so it
+ * never sits on an admitted place; this wait covers independent dispatchers.
  */
-export function armCodexStartJitter(env: NodeJS.ProcessEnv = process.env, now = Date.now(), rng: () => number = Math.random): number {
-  const delay = Math.floor(Math.min(1, Math.max(0, rng())) * codexStartJitterMaxMs(env.PYRY_CODEX_START_JITTER_MS));
-  codexStartNotBefore = now + delay;
-  return delay;
-}
-
 async function waitForCodexStartJitter(log: (msg: string) => void): Promise<void> {
-  const wait = codexStartNotBefore - Date.now();
+  const wait = codexStartHoldMs();
   if (wait <= 0) return;
   log(`First Codex start after a dispatcher restart: waiting ${Math.ceil(wait / 1000)}s so restarted dispatchers do not start Codex together`);
   await new Promise(resolve => setTimeout(resolve, wait));
@@ -1452,10 +1443,10 @@ export async function runClaudeStreaming(opts: RunClaudeOpts): Promise<StreamRes
     // service confirms a pause is in force before this failure is allowed to
     // skip the ticket's retry count.
     const pause = await reportCodex("rate-limited");
-    logger(pause?.active
-      ? `Codex rate limit (429): fleet Codex starts paused for ${pause.remainingSeconds}s (pause of ${Math.round(pause.durationMs / 1000)}s); this attempt is not counted against the ticket`
-      : `Codex rate limit (429): no fleet pause confirmed${pause ? " (throttle off)" : " (report not delivered)"}; ordinary transient retry`);
-    return { ...result, codexRateLimitPaused: pause?.active === true };
+    logger(rateLimitWaitsUncounted(pause)
+      ? `Codex rate limit (429): fleet Codex starts paused for ${pause!.remainingSeconds}s (pause of ${Math.round(pause!.durationMs / 1000)}s); this attempt is not counted against the ticket`
+      : `Codex rate limit (429): ${!pause ? "report not delivered" : !pause.active ? "throttle off" : `${pause.ticketReports} in a row on this ticket`}; ordinary transient retry`);
+    return { ...result, codexRateLimitPaused: rateLimitWaitsUncounted(pause) };
   } finally {
     // Empty by design. Never recursively delete anything an agent wrote.
     if (sourceCwd) { try { rmdirSync(sourceCwd); } catch {} }

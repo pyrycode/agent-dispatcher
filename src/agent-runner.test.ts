@@ -659,6 +659,8 @@ describe("Codex rate limit detection", () => {
     const s = new CodexStreamAdapter();
     s.accept({ type: "turn.started" });
     assert.equal(s.responded, false);
+    s.accept({ type: "item.completed", item: { type: "error", message: "a notice, not a model answer" } });
+    assert.equal(s.responded, false);
     s.accept({ type: "item.completed", item: { type: "reasoning", text: "thinking" } });
     assert.equal(s.responded, true);
   });
