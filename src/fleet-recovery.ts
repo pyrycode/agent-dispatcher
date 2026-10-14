@@ -120,6 +120,28 @@ export function recoveryFingerprint(o: RecoveryObservation): string {
     o.labels.filter(l => l !== "error:family-breaker" && (l === RECOVERY_RETURNED_INBOX || /^(error:|error-retry-count:|needs-human:|rework-count:|done:|needs-rework:|needs-real-claude$)/.test(l))).sort(),
     o.evidenceRevision ?? null, o.artifactRevision ?? null, o.pause ?? null])).digest("hex");
 }
+/**
+ * True when the code owner's work has passed review since its last rework:
+ * the reviewer's `done:` label is on the ticket, or the ticket has moved on
+ * to documentation. A rework routed back to the code owner strips every
+ * `done:` label and moves the ticket out of review, so neither holds during
+ * a real loop. A pending rework for the code owner (`needs-rework:builder`
+ * or `needs-rework:developer`, the only routes `rework-count` counts) means
+ * another round is already on its way, so it never counts as passed.
+ *
+ * `rework-count:N` is history and stays on the ticket after the pass. Read
+ * alone, it held a passed ticket (pyrycode #3324, 2026-10-14, verifier PASS
+ * at 18:27 EEST) in a recovery assessment instead of its documentation stage.
+ */
+export function passedReview(o: Pick<RecoveryObservation, "status" | "labels">): boolean {
+  if (o.labels.some(l => l === "needs-rework:builder" || l === "needs-rework:developer")) return false;
+  if (o.status === "In Documentation") return true;
+  // A route back strips done labels only after it moves the ticket, and a
+  // failed strip is not retried. A reviewer's done label left behind in a
+  // column before review is that half-applied route, not a pass.
+  return !PRE_REVIEW_COLUMNS.includes(o.status) && o.labels.some(l => l === "done:verifier" || l === "done:code-review");
+}
+const PRE_REVIEW_COLUMNS = ["Backlog", "In Architecture", "In Development", "In QA"];
 export function recoveryTrigger(o: RecoveryObservation): { reason: string; manual: boolean } | null {
   if (o.status === "Done") return null;
   if (hasOperatorHold(o.labels) || o.status === "Halted" && o.pause?.origin === "operator") return { reason: "Explicit operator hold", manual: true };
@@ -137,7 +159,7 @@ export function recoveryTrigger(o: RecoveryObservation): { reason: string; manua
   // The assigned repair already addresses these retained historical counts.
   // A new stage error still triggers diagnosis above.
   if (hasRecoveryPriority(o.labels)) return null;
-  if (o.labels.some(l => /^rework-count:\d+$/.test(l) && Number(l.split(":")[1]) >= 2)) return { reason: "Repeated review rework", manual: false };
+  if (o.labels.some(l => /^rework-count:\d+$/.test(l) && Number(l.split(":")[1]) >= 2) && !passedReview(o)) return { reason: "Repeated review rework", manual: false };
   if (o.status === "Inbox" && o.labels.some(l => l === RECOVERY_RETURNED_INBOX || l === "needs-real-claude" || l === "done:refiner")) return { reason: "Pipeline evidence or refinement is needed in Inbox", manual: false };
   if (o.status === "Inbox") return { reason: RECOVERY_INBOX_REASON, manual: false };
   return null;
