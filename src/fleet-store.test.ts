@@ -59,7 +59,9 @@ test("heavy capacity is shared across projects and light work remains eligible",
   assert.equal(store.start(request("b", "mac", "org/desktop#1")).ok, true);
   assert.deepEqual(store.start(request("c", "mac", "org/core#1")), { ok: false, reason: "capacity" });
   assert.equal(store.start({ ...request("d", "mac", "org/core#1"), role: "refiner", resource: "light" }).ok, true);
-  assert.equal(store.snapshot().claims.length, 3);
+  // The refiner holds its reservation but starts no ownership.
+  assert.equal(store.snapshot().claims.length, 2);
+  assert.equal(store.snapshot().runs.length, 3);
 });
 
 test("retries cannot replay a completed start or free a later run", t => {

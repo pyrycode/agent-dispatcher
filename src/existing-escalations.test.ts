@@ -1,6 +1,9 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {DatabaseSync} from 'node:sqlite';
+import {mkdtempSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
 import {RecoveryLedger,recoveryFingerprint,type RecoveryObservation,type RecoveryDecision} from './fleet-recovery.js';
 import {FleetStore} from './fleet-store.js';
 import {runRecoveryWork,observationFor} from './recovery-work.js';
@@ -13,6 +16,12 @@ function seed(db:DatabaseSync,o:RecoveryObservation,decision:RecoveryDecision|nu
  db.prepare('INSERT INTO fleet_recovery VALUES (?,?,?,?,?,?,?,?,?,1)').run('old',o.ticket,recoveryFingerprint(o),reason,'escalated',100,100,'finished',decision?JSON.stringify(decision):null);
 }
 const item=(o:RecoveryObservation):ProjectItem=>({id:'item',issueId:'issue',issueNumber:Number(o.ticket.split('#')[1]),title:'Repair',body:'',status:o.status,labels:o.labels,url:'https://example.test/issue',blockedBy:[],parentNumber:null,grandparentNumber:null,...(o.pause?{recoveryPause:o.pause}:{})});
+/** A claim an assessment created before 2026-10-14, when every admitted run started ownership. */
+function legacyClaimStore(t:{after(fn:()=>void):void}):FleetStore {
+ const path=join(mkdtempSync(join(tmpdir(),'legacy-claim-')),'fleet.sqlite');new FleetStore(path,limits).close();
+ const db=new DatabaseSync(path);db.prepare('INSERT INTO fleet_claims VALUES (?,?,?,?)').run(error.ticket,'mac','legacy',1);db.close();
+ const store=new FleetStore(path,limits);t.after(()=>store.close());return store;
+}
 const agents:AgentConfig[]=[{name:'builder',column:'In Development',description:'builder',claudeMdPath:'unused',usesWorktree:true,producesCommits:true}];
 
 test('existing technical escalations get one fresh assessment only after their worker loads the policy',t=>{
@@ -68,7 +77,14 @@ test('a confirmed pause-provenance assessment retains no delivery claim without 
  const store=new FleetStore(':memory:',limits);t.after(()=>store.close());const paused=upgraded({...error,status:'Halted',labels:[]});const [incident]=store.recoveryReport('mac',project,[paused]);
  store.start({id:'review',session:'s',machine:'mac',project,ticket:paused.ticket,role:'recovery',resource:'heavy',locks:[]});
  store.recoveryStep('mac','s',project,incident.id,'review','begin');store.recoveryStep('mac','s',project,incident.id,'review','decide',{action:'escalate',category:'human',reason:'Need one explicit decision on the halted documentation batches'});store.finish('mac','s','review',true);
- assert.equal(store.snapshot().claims.length,0);assert.equal(store.recovery.incident(incident.id).state,'escalated');assert.equal(store.snapshot().releasedAssessmentClaims?.length,1);
+ assert.equal(store.snapshot().claims.length,0);assert.equal(store.recovery.incident(incident.id).state,'escalated');assert.equal(store.snapshot().releasedAssessmentClaims,undefined,'the review never owned the ticket');
+});
+
+test('a confirmed pause-provenance assessment still releases a claim an earlier assessment created',t=>{
+ const store=legacyClaimStore(t);const paused=upgraded({...error,status:'Halted',labels:[]});const [incident]=store.recoveryReport('mac',project,[paused]);
+ store.start({id:'review',session:'s',machine:'mac',project,ticket:paused.ticket,role:'recovery',resource:'heavy',locks:[]});
+ store.recoveryStep('mac','s',project,incident.id,'review','begin');store.recoveryStep('mac','s',project,incident.id,'review','decide',{action:'escalate',category:'human',reason:'Need one explicit decision on the halted documentation batches'});store.finish('mac','s','review',true);
+ assert.equal(store.snapshot().claims.length,0);assert.equal(store.snapshot().releasedAssessmentClaims?.[0]?.generation,'legacy');
 });
 
 test('new dispatcher observations advertise the reassessment policy without changing the workflow fingerprint',()=>{
@@ -98,7 +114,7 @@ test('a pipeline pause cannot hide permission denial or authorise coordination',
 });
 
 test('a confirmed provenance assessment retains ownership after an earlier recovery assigned repair',t=>{
- const store=new FleetStore(':memory:',limits);t.after(()=>store.close());const [repair]=store.recoveryReport('mac',project,[upgraded(error)]);
+ const store=legacyClaimStore(t);const [repair]=store.recoveryReport('mac',project,[upgraded(error)]);
  store.start({id:'repair',session:'s',machine:'mac',project,ticket:error.ticket,role:'recovery',resource:'heavy',locks:[]});store.recoveryStep('mac','s',project,repair.id,'repair','begin');store.recoveryStep('mac','s',project,repair.id,'repair','decide',{action:'rework',reason:'Concrete implementation needed'});store.recoveryStep('mac','s',project,repair.id,'repair','complete');store.finish('mac','s','repair',true);
  const [pause]=store.recoveryReport('mac',project,[upgraded({...error,status:'Halted',labels:[]})]);store.start({id:'review',session:'s',machine:'mac',project,ticket:error.ticket,role:'recovery',resource:'heavy',locks:[]});store.recoveryStep('mac','s',project,pause.id,'review','begin');store.recoveryStep('mac','s',project,pause.id,'review','decide',{action:'escalate',category:'human',reason:'Need the pause decision'});store.finish('mac','s','review',true);assert.equal(store.snapshot().claims.length,1);
 });
@@ -111,7 +127,7 @@ function coordinatedThenHalted(store:FleetStore,finishedTask=false) {
 }
 
 test('pause-provenance review preserves a previously coordinated repair even when its incident decision was replaced',t=>{
- const store=new FleetStore(':memory:',limits);t.after(()=>store.close());const incident=coordinatedThenHalted(store,true);
+ const store=legacyClaimStore(t);const incident=coordinatedThenHalted(store,true);
  store.start({id:'review',session:'s',machine:'mac',project,ticket:error.ticket,role:'recovery',resource:'heavy',locks:[]});store.recoveryStep('mac','s',project,incident.id,'review','begin');store.recoveryStep('mac','s',project,incident.id,'review','decide',{action:'escalate',category:'human',reason:'Pause needs an explicit decision'});store.finish('mac','s','review',true);assert.equal(store.snapshot().claims.length,1);
 });
 

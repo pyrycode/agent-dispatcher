@@ -87,7 +87,7 @@ test("manager enforces the cap over repeated polls and returns space after compl
   const manager = new MachineManager({ machine: "mac", heavyLimit: 1, combinedLimit: 2, ticketLimit: 2, projects: ["org/core", "org/mobile"] }, {
     snapshot: async () => store.snapshot(), start: async r => store.start(r), finish: async (s, id) => store.finish("mac", s, id),
   });
-  const work = (project: string, n: number): WorkOffer => ({ project, ticket: `${project}#${n}`, role: "refiner", resource: "light", key: `${n}`, order: n, locks: [] });
+  const work = (project: string, n: number): WorkOffer => ({ project, ticket: `${project}#${n}`, role: "documentation", resource: "light", key: `${n}`, order: n, locks: [] });
   manager.offer("org/core", "s", [work("org/core", 1)]);
   manager.offer("org/mobile", "m", [work("org/mobile", 2), work("org/mobile", 3)]);
   await manager.tick(); await manager.tick();

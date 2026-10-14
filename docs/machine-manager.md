@@ -115,6 +115,8 @@ Each reservation covers setup, the agent, its pre-verifier tests, retries, clean
 
 Only admitted runs create claims. Writing follow-up tickets, comments or labels does not claim those tickets. This also prevents a drained computer from turning newly filed follow-ups into owned work.
 
+Recovery assessments and refinement (`recovery`, `refiner`, and `po` in the classic stage set) start no ownership either, since 2026-10-14. A refiner writes the issue body, comments and labels on GitHub and leaves no branch, worktree or local evidence that a later stage needs. Ownership therefore starts with the first stage that makes local work: the builder, or the architect and developer in the classic set. These runs still hold their reservation, locks and run generation while they run, so the ticket cannot run twice, and a ticket the computer already owns keeps its claim unchanged. Such a run counts against the new-ticket limit while it runs. Once it finishes, the ticket is free for any computer.
+
 Housekeeping is a short light job with a project lock. It can advance unclaimed work without retaining ownership of the backlog. New runs wait for that pass. Already running jobs retain their grants. Housekeeping cannot modify another computer's tickets or a ticket with an active run. Shared family marker comments and convenience counters remain cross-owner metadata. Those helpers cannot launch agents or advance ticket stages.
 
 ## Configure
@@ -202,18 +204,44 @@ workflow progress and a new reservation restart the grace period. The diagnostic
 resolves when the owning session confirms that run ended. Ordinary unclaimed
 Backlog waits remain quiet. A running label stranded in Backlog can also alert.
 
-The owning computer offers an assessment as the `recovery` role. It uses normal
+The owning computer, or for an unclaimed ticket any computer that observes it, offers an assessment as the `recovery` role. It uses normal
 admission and a heavy reservation. Only one assessment runs across the fleet at
 a time. Existing ownership, both capacity limits, project drains and full drains
 apply. A `priority:high` ticket whose next stage is the verifier (role `verifier`, which only the builder stage set has) goes first: it precedes recovery checks, assigned repair stages (`orchestrator:recovery-priority`), recovery errors and support tasks, owned or not, and therefore all other waiting work. Several such verifiers keep the order below among themselves. A verifier without `priority:high` keeps its usual place. The central snapshot lists the open `priority:high` tickets of adopted workflow projects as `priorityHighTickets`, read from the workflow store, so this also ranks offers from older workers. It changes ranking only. Running work is not interrupted, and locks, ownership, project drains and the heavy, combined, new-ticket and role limits still apply, so a verifier that does not fit leaves the place to the next job that does. Runnable owned recovery and repair work precedes owned ordinary work. Both owned groups precede unclaimed recovery and ordinary work. Routine dependency assessments and quiet Inbox readiness checks are an exception: they run only when the local computer has no active ticket reservation and no ready ticket work was selected. These waiting checks do not count against the new-ticket limit. The central snapshot identifies them from their recorded incident reason, including offers from older workers. Actual errors, returned Inbox investigations and assigned repairs retain their existing recovery priority. A job that cannot fit the available capacity does not block a fitting job. Already reserved or running jobs are not interrupted. An unreachable owner or uncertain reservation is never released by recovery.
-An unclaimed ticket can be assessed only after normal admission claims it.
-A confirmed completed assessment that says `wait` releases that claim if its
-ownership generation contains only completed read-only assessments or explicitly
-unused reservations. Any implementation run, uncertain run or assigned repair
-preserves ownership. Recorded decisions and run history remain available.
-The authority records the exact released owner and ownership generation.
-Restart verification accepts that receipt while preserving its check against
-unexplained ownership changes.
+Since 2026-10-14 an assessment starts no ticket ownership. On an unclaimed
+ticket it is admitted with its own run generation and heavy reservation, which
+keep the ticket exclusive while it runs: no other run starts, and only the
+assessment's own run can write the ticket. Completion leaves the ticket
+unclaimed, whatever the decision. Before this, every admitted assessment
+claimed the ticket, so a computer that assessed a blocked ticket became its
+permanent owner, and when the blockers closed it held more runnable tickets
+than the claim budget allows. A decision that orders work, such as rework,
+refinement or a retry, leaves that work to normal admission, which claims the
+ticket for whichever computer starts it. A coordinated repair task is queued
+centrally and runs on any computer with its capability, as before. An
+assessment of a ticket its computer already owns runs under that claim and
+leaves it unchanged; an assessment cannot run on a ticket another computer owns.
+The assessment's evidence inventory is shared through the authority, but its
+log excerpts are read from the assessing computer. The run that hit an error
+publishes its follow-up assessment offer before freeing its place. On an
+unclaimed ticket, such as one whose refiner failed, another computer can still
+win that assessment; it then sees the GitHub comments and the evidence
+inventory, but not the failed run's log excerpts. A coordinated repair task
+whose ticket is unclaimed ranks with unclaimed work, not owned work. Only the
+computer running a job raises the three-hour retained-reservation alert for it.
+A Backlog ticket counts as started for the 24-hour no-progress check when it
+is owned, has a running label or the repair marker, carries recovery priority,
+or has finished refinement (`done:refiner` or `done:po`). An ordinary Backlog
+wait stays quiet.
+An earlier claim whose ownership generation contains only completed read-only
+assessments or explicitly unused reservations is still released when a
+confirmed completed assessment says `wait`. Any implementation run, uncertain
+run or assigned repair preserves ownership. Recorded decisions and run history
+remain available. The authority records the exact released owner and ownership
+generation. Restart verification accepts that receipt while preserving its
+check against unexplained ownership changes. The operator can end a stuck
+assessment on an unclaimed ticket with `free TICKET GENERATION
+--confirmed-stopped`, using the run generation from status.
 An unchanged quiet Inbox wait does not repeat on the ordinary thirty-minute
 retry timer. New workflow or evidence can make it eligible again. A ready Inbox
 ticket returns to ordinary refinement and retains normal review and test gates.

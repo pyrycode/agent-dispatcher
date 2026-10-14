@@ -38,7 +38,8 @@ const req = (role: string, extra: Partial<StartRequest> = {}): StartRequest => {
 /** Admit a run and return it. */
 function admit(store: FleetStore, role = "builder", extra: Partial<StartRequest> = {}): StartRequest {
   const r = req(role, extra);
-  assert.deepEqual(store.start(r), { ok: true, generation: store.snapshot().claims.find(c => c.ticket === r.ticket)?.generation ?? assert.fail("no claim") });
+  // A refiner starts no ownership, so read the generation from the run itself.
+  assert.deepEqual(store.start(r), { ok: true, generation: store.snapshot().runs.find(run => run.id === r.id)?.generation ?? assert.fail("no run") });
   return r;
 }
 const limited = (store: FleetStore, run: StartRequest) => store.codexReport(run.machine, run.session, run.project, run.id, "rate-limited");

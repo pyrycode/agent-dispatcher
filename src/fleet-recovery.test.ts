@@ -45,32 +45,46 @@ test("an unchanged idle Inbox wait does not repeat on the ordinary retry timer",
   db.close();
 });
 
-test("completed assessment-only waits release ownership and retain their evidence", () => {
-  for (const hasImplementation of [false, true]) {
-    const store = new FleetStore(":memory:", limits);
-    if (hasImplementation) {
+/** A claim an assessment created before 2026-10-14, when every admitted run started ownership. */
+function legacyAssessmentClaim(ticket = `${project}#1`, machine = "mac") {
+  const path = join(mkdtempSync(join(tmpdir(), "legacy-claim-")), "fleet.sqlite");
+  new FleetStore(path, limits).close();
+  const db = new DatabaseSync(path);
+  db.prepare("INSERT INTO fleet_claims VALUES (?,?,?,?)").run(ticket, machine, "legacy-generation", 1);
+  db.close();
+  return new FleetStore(path, limits);
+}
+
+test("a completed assessment-only wait owns nothing; an implemented ticket keeps its claim; a legacy assessment claim is released", () => {
+  for (const history of ["none", "implementation", "legacy"] as const) {
+    const store = history === "legacy" ? legacyAssessmentClaim() : new FleetStore(":memory:", limits);
+    if (history === "implementation") {
       store.start(request(1, { id: "builder", role: "builder" }));
       store.finish("mac", "session", "builder");
     }
+    const owner = store.snapshot().claims[0];
     const [incident] = store.recoveryReport("mac", project, [{ ...observation(1, []), blocked: true }]);
-    store.start(request());
+    assert.equal(store.start(request()).ok, true);
+    assert.equal(store.snapshot().runs[0].generation === owner?.generation, !!owner, "an owned ticket's assessment runs under its claim");
+    assert.deepEqual(store.snapshot().claims, owner ? [owner] : [], "admission starts no ownership");
     store.recoveryStep("mac", "session", project, incident.id, "run-1", "begin");
     store.recoveryStep("mac", "session", project, incident.id, "run-1", "decide", { action: "wait", reason: "The prerequisite is still being built" });
     store.recoveryStep("mac", "session", project, incident.id, "run-1", "complete");
     store.finish("mac", "session", "run-1");
-    assert.equal(store.snapshot().claims.length, hasImplementation ? 1 : 0);
-    assert.equal(store.snapshot().releasedAssessmentClaims?.length ?? 0, hasImplementation ? 0 : 1);
+    assert.deepEqual(store.snapshot().claims, history === "implementation" ? [owner] : []);
+    assert.deepEqual((store.snapshot().releasedAssessmentClaims ?? []).map(c => [c.ticket, c.machine, c.generation]),
+      history === "legacy" ? [[owner.ticket, owner.machine, owner.generation]] : []);
     assert.equal(store.recovery.incident(incident.id).state, "complete");
     assert.equal(store.recovery.incident(incident.id).decision?.action, "wait");
     store.finish("mac", "session", "run-1");
-    assert.equal(store.snapshot().claims.length, hasImplementation ? 1 : 0, "completion replay preserves the result");
+    assert.deepEqual(store.snapshot().claims, history === "implementation" ? [owner] : [], "completion replay preserves the result");
     store.close();
   }
 });
 
-test("an unfinished or repair-assigned assessment keeps its claim", () => {
-  for (const outcome of ["unconfirmed", "repair"] as const) {
-    const store = new FleetStore(":memory:", limits);
+test("an unfinished or repair-assigned assessment starts no ownership and keeps a legacy claim", () => {
+  for (const legacy of [false, true]) for (const outcome of ["unconfirmed", "repair"] as const) {
+    const store = legacy ? legacyAssessmentClaim() : new FleetStore(":memory:", limits);
     const [incident] = store.recoveryReport("mac", project, [observation()]);
     store.start(request());
     store.recoveryStep("mac", "session", project, incident.id, "run-1", "begin");
@@ -78,10 +92,11 @@ test("an unfinished or repair-assigned assessment keeps its claim", () => {
       { action: outcome === "repair" ? "rework" : "wait", reason: "Recorded assessment" });
     if (outcome === "repair") store.recoveryStep("mac", "session", project, incident.id, "run-1", "complete");
     store.finish("mac", "session", "run-1", outcome === "repair");
-    assert.equal(store.snapshot().claims.length, 1);
+    assert.deepEqual(store.snapshot().claims.map(c => [c.machine, c.generation]), legacy ? [["mac", "legacy-generation"]] : []);
     store.close();
   }
 });
+
 const agents: AgentConfig[] = ["refiner", "builder", "verifier", "documentation"].map((name, n) => ({ name, column: ["Backlog", "In Development", "In Code Review", "In Documentation"][n], description: name, claudeMdPath: "unused", usesWorktree: true, producesCommits: name === "builder" }));
 const item = (labels = ["error:builder"]): ProjectItem => ({ id: "item", issueId: "issue", issueNumber: 1, title: "Repair", body: "", status: "In Development", labels, url: "https://example.test/1", blockedBy: [], parentNumber: null, grandparentNumber: null });
 const url = (server: { address(): unknown }) => `http://127.0.0.1:${(server.address() as { port: number }).port}`;
@@ -432,7 +447,8 @@ test("real HTTP admission, durable decision and code-owner handback work togethe
   assert.deepEqual(current.labels, ["rework-count:6", "needs-real-claude"]);
   assert.match(recoveryHandoff([comment]), /repair all entry points/);
   assert.equal(store.snapshot().runs.length, 0);
-  assert.equal(store.snapshot().claims[0].machine, "mac");
+  // The assessment owned nothing; the ordered rework claims when it is admitted.
+  assert.deepEqual(store.snapshot().claims, []);
   assert.equal(store.recovery.incident(incident.id).state, "complete");
   const operator = new JsonClient(url(server), "manager-admin");
   assert.equal((await operator.call<RecoveryIncident[]>("/recovery/state"))[0].id, incident.id);
@@ -699,7 +715,7 @@ for (const failure of ["move", "label removal", "decision reply"] as const) {
     const [alert] = store.recoveryReport("mac", project, [observationFor(project, current)]);
     assert.equal(alert.state, "escalated");
     assert.notEqual(alert.decision?.category, "operational");
-    assert.equal(store.snapshot().claims[0].machine, "mac");
+    assert.deepEqual(store.snapshot().claims, [], "an uncertain assessment still starts no ownership");
     const next = store.recoveryReport("mac", project, [observationFor(project, current)]);
     if (failure === "label removal") {
       assert.notEqual(next[0].id, incident.id, "changed evidence can only request a fresh assessment");

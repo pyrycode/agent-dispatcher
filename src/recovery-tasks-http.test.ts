@@ -33,6 +33,8 @@ test('real HTTP source admission, native result, ownership and reassessment work
  const address=server.address();assert.ok(address&&typeof address!=='string');
  const url='http://127.0.0.1:'+address.port,box=new JsonClient(url,'b'),mac=new JsonClient(url,'m'),admin=new JsonClient(url,'a');
  const observation={ticket:'org/core#3154',status:'In Development',labels:['error:builder'],blocked:false};
+ // The failed builder made box the owner; its assessment and the native task leave that unchanged.
+ store.start({id:'builder',machine:'box',session:'s',project:'org/core',ticket:observation.ticket,role:'builder',resource:'medium',locks:[]});store.finish('box','s','builder');
  const [incident]=store.recoveryReport('box','org/core',[observation]);
  store.start({id:'recovery',machine:'box',session:'s',project:'org/core',ticket:observation.ticket,role:'recovery',resource:'heavy',locks:[]});
  store.recoveryStep('box','s','org/core',incident.id,'recovery','begin');
