@@ -93,6 +93,29 @@ export function extractMustFixFindings(body: string): MustFixFinding[] {
   return out;
 }
 
+/** `[TAG] `path` → `Symbol``, any severity tag: `[MUST FIX]`, `[SHOULD FIX]`, `[NIT]`. */
+const TAGGED_KEY = /\[([A-Za-z][A-Za-z -]*)\]\s*`([^`]+)`\s*(?:→|->)\s*(?:`([^`]+)`|([^\s:`]+))/;
+
+/** A verdict finding of any severity, with its key, text and whether it blocks. */
+interface TaggedFinding extends MustFixFinding {
+  mustFix: boolean;
+}
+
+/** Every severity-tagged finding of a verdict, in order, as `extractMustFixFindings` reads them. */
+function extractTaggedFindings(body: string): TaggedFinding[] {
+  const out: TaggedFinding[] = [];
+  for (const line of body.split("\n")) {
+    const m = TAGGED_KEY.exec(line);
+    if (!m || /^fixed$/i.test(m[1].trim())) continue;
+    out.push({
+      key: `${m[2].trim()} → ${(m[3] ?? m[4]).trim()}`,
+      text: line.slice(m.index + m[0].length),
+      mustFix: /^must fix$/i.test(m[1].trim()),
+    });
+  }
+  return out;
+}
+
 /** `- Fixed: `path` → `Symbol`…`, the verifier's re-review form for a previous
  *  finding it found repaired: a list item, no severity tag, `Fixed` plain,
  *  bold or bracketed, then the finding's location. */
@@ -115,7 +138,7 @@ export function extractFixedFindings(body: string): MustFixFinding[] {
 
 /** A file path, as the verifier quotes one: a `/` in it, or a source or
  *  config file extension. A backticked symbol like `turnState` is not one. */
-const PATH = /[^`\s]*\/[^`\s]*|[^`\s]+\.(?:tsx?|jsx?|mjs|cjs|kts?|java|go|py|rs|swift|md|json|ya?ml|toml|gradle|css|scss|html|sh)/.source;
+const PATH = /[^`\s]*\/[^`\s]*|[^`\s]+\.(?:tsx?|jsx?|mjs|cjs|kts?|java|go|py|rs|swift|md|json|ya?ml|toml|gradle|css|scss|html|sh|xml|c|h|cc|cpp|hpp|rb|sql|vue|svelte|proto)/.source;
 
 /** A backticked file path. */
 const FILE_PATH = new RegExp(`\`(?:${PATH})\``, "g");
@@ -125,14 +148,25 @@ const ANCHOR = new RegExp(`\`(${PATH})\`\\s*(?:→|->)\\s*(?:\`([^\`]+)\`|([^\\s
 
 /**
  * Every `path → Symbol` location a finding names: its key, and any further
- * locations its text lists. A verifier finding often spans several, as
- * `` `a.ts` → `dispatch`; `b.ts` → `inputs`: … ``, and the key holds only the
- * first.
+ * locations listed before the colon that starts its description. A verifier
+ * finding often spans several, as `` `a.ts` → `dispatch`; `b.ts` → `inputs`: … ``,
+ * and the key holds only the first. A location named in the description,
+ * such as where the correct behaviour lives, is not where the finding is.
  */
 function findingAnchors(f: MustFixFinding): Set<string> {
   const out = new Set([f.key]);
-  for (const m of f.text.matchAll(ANCHOR)) out.add(`${m[1].trim()} → ${(m[2] ?? m[3]).trim()}`);
+  for (const m of locationList(f.text).matchAll(ANCHOR)) out.add(`${m[1].trim()} → ${(m[2] ?? m[3]).trim()}`);
   return out;
+}
+
+/** The text after a finding's key up to the first colon outside backticks. */
+function locationList(text: string): string {
+  let quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === "`") quoted = !quoted;
+    else if (text[i] === ":" && !quoted) return text.slice(0, i);
+  }
+  return text;
 }
 
 /** Whether two findings name a location in common. */
@@ -231,10 +265,10 @@ export function findRepeatedMustFix(artifacts: readonly VerdictArtifact[], build
   if (newest.head && newest.head === previous.head) return [];
   const open = extractMustFixFindings(newest.body!).filter((f) => !isBranchInvariantKey(f.key));
   const prior = withoutRepaired(
-    extractMustFixFindings(previous.body!).filter((f) => !isBranchInvariantKey(f.key)),
+    extractTaggedFindings(previous.body!).filter((f) => !isBranchInvariantKey(f.key)),
     extractFixedFindings(newest.body!),
     open,
-  );
+  ).filter((f) => f.mustFix);
   const repeated = open.filter((f) => prior.some((p) => sameLocation(p, f) && findingSimilarity(p, f) >= REPEAT_FINDING_SIMILARITY));
   return [...new Set(repeated.map((f) => f.key))];
 }
@@ -245,28 +279,39 @@ function findingSimilarity(a: MustFixFinding, b: MustFixFinding): number {
 }
 
 /**
- * The previous verdict's findings less the ones the newest verdict lists as
- * fixed. Each `Fixed:` line retires one previous finding at a shared
- * location: the one its text reads most like, and among equals, which is
- * every candidate when the line carries only its location, the one least
- * like any finding the newest verdict still raises there. So a location with
- * two previous findings, one fixed and one raised again, keeps the one
- * raised again. A `Fixed:` line with no previous finding at its location
- * retires nothing.
+ * The previous verdict's findings, of every severity, less the ones the
+ * newest verdict lists as fixed. Each `Fixed:` line retires one previous
+ * finding at a shared location: the one its text reads most like, and among
+ * equals, which is every candidate when the line carries only its location,
+ * the one least like any finding the newest verdict still raises there. So a
+ * location with two previous findings, one fixed and one raised again, keeps
+ * the one raised again, and a fixed `[SHOULD FIX]` or `[NIT]` is retired in
+ * place of a `[MUST FIX]` beside it. The line with the fewest candidates
+ * goes first, so the order the verifier lists them in does not matter. A
+ * `Fixed:` line with no previous finding at its location retires nothing.
  */
-function withoutRepaired(prior: readonly MustFixFinding[], fixed: readonly MustFixFinding[], open: readonly MustFixFinding[]): MustFixFinding[] {
+function withoutRepaired<T extends MustFixFinding>(prior: readonly T[], fixed: readonly MustFixFinding[], open: readonly MustFixFinding[]): T[] {
   const left = [...prior];
+  const pending = [...fixed];
   const stillRaised = (p: MustFixFinding) =>
     Math.max(0, ...open.filter((o) => sameLocation(p, o)).map((o) => findingSimilarity(p, o)));
-  for (const fx of fixed) {
-    let best = -1;
-    for (let i = 0; i < left.length; i++) {
-      if (!sameLocation(left[i], fx)) continue;
-      if (best < 0) { best = i; continue; }
-      const d = findingSimilarity(left[i], fx) - findingSimilarity(left[best], fx);
-      if (d > 0 || (d === 0 && stillRaised(left[i]) < stillRaised(left[best]))) best = i;
+  const candidates = (fx: MustFixFinding) => left.filter((p) => sameLocation(p, fx));
+  while (pending.length > 0) {
+    let next = -1;
+    let fewest = Infinity;
+    pending.forEach((fx, i) => {
+      const n = candidates(fx).length;
+      if (n > 0 && n < fewest) { fewest = n; next = i; }
+    });
+    if (next < 0) break;
+    const [fx] = pending.splice(next, 1);
+    let best: T | undefined;
+    for (const p of candidates(fx)) {
+      if (best === undefined) { best = p; continue; }
+      const d = findingSimilarity(p, fx) - findingSimilarity(best, fx);
+      if (d > 0 || (d === 0 && stillRaised(p) < stillRaised(best))) best = p;
     }
-    if (best >= 0) left.splice(best, 1);
+    left.splice(left.indexOf(best!), 1);
   }
   return left;
 }
