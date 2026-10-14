@@ -53,7 +53,9 @@ export function resourceClasses(raw: string | undefined): Record<string, Resourc
  * The managed offer for one Done ticket's merge.
  *
  * Light, so it never waits for heavy or combined capacity. A merge is a few
- * GitHub calls, a pull of main and a background index refresh. While it was
+ * GitHub calls and a pull of main. The codegraph refresh that follows a
+ * merge is CPU work, so it is not part of the merge: it runs as its own
+ * medium job (`codegraphOfferShape`). While the merge was
  * heavy, a ticket that reached Done waited for the claiming computer's one
  * heavy place: pyrycode-mobile #1977 reached Done at 12:05:56 on 2026-10-14
  * and its merge was granted at 12:19:04, the second a core repair task
@@ -64,6 +66,18 @@ export function resourceClasses(raw: string | undefined): Record<string, Resourc
  * admits one unfinished run per ticket, and the project lock admits one
  * merge per board across all computers.
  */
+/**
+ * The managed offer for the post-merge codegraph refresh on one computer.
+ * Medium, so it is charged against the computer's combined capacity like a
+ * build. Named per computer: each computer refreshes its own checkout, and
+ * the authority admits one unfinished run per name, so refreshes on one
+ * computer never overlap.
+ */
+export function codegraphOfferShape(machine: string): { ticket: string; role: "codegraph"; resource: ResourceClass; locks: string[]; order: number } {
+  if (!/^[\w.-]+$/.test(machine)) throw new Error("Invalid machine name for a codegraph refresh");
+  return { ticket: `@codegraph-${machine}`, role: "codegraph", resource: "medium", locks: [], order: -1 };
+}
+
 export function mergeOfferShape(project: string): { role: "merge"; resource: ResourceClass; locks: string[]; order: number } {
   return { role: "merge", resource: "light", locks: [`${project}:merge`], order: -2 };
 }
@@ -163,6 +177,13 @@ export class ManagedDispatch {
       pending.offer.recovery = this.recoveryTickets.has(ticket);
     }
     return pending;
+  }
+  /** Null until the first sync has named this computer. */
+  codegraphOffer(): Pending | null {
+    const machine = (this.state as FleetSnapshot & { machine?: string }).machine;
+    if (!machine) return null;
+    const shape = codegraphOfferShape(machine);
+    return this.offer(shape.ticket, shape.role, shape.resource, shape.locks, shape.order);
   }
   mergeOffer(issue: number): Pending {
     const shape = mergeOfferShape(this.project);

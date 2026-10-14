@@ -8873,32 +8873,39 @@ async function handleMergeConflict(
 /** Polls of an UNKNOWN mergeability, and the wait between them. */
 const MERGEABLE_POLLS = 6;
 const MERGEABLE_POLL_MS = 5_000;
+/** Cycles a PR may stay UNKNOWN after a refused merge before it counts as a conflict. */
+export const MERGE_UNKNOWN_SKIP_MAX = 3;
+/** Consecutive uncounted UNKNOWN skips per PR, for this process. A restart
+ *  starts again from zero, which only delays the count by a few cycles. */
+export const mergeUnknownSkips = new Map<number, number>();
 
 /**
- * GitHub's mergeability for a PR once it has settled: MERGEABLE,
- * CONFLICTING, or UNKNOWN when it is still computing after about 30
- * seconds. Null when it could not be read. The read goes to GitHub fresh,
- * also through the shared connection, which never caches pull request reads.
+ * GitHub's mergeability for a PR once it has settled, with the head it
+ * describes: MERGEABLE, CONFLICTING, or UNKNOWN when it is still computing
+ * after about 30 seconds. Null when it could not be read; the head is null
+ * when it was not a full commit id. The read goes to GitHub fresh, also
+ * through the shared connection, which never caches pull request reads.
  */
-async function settleMergeable(prNumber: number, deps: DispatchDeps): Promise<string | null> {
+async function settleMergeable(prNumber: number, deps: DispatchDeps): Promise<{ state: string; head: string | null } | null> {
   const sleep = deps.sleepMs ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-  const read = (): string | null => {
+  const read = (): { state: string; head: string | null } | null => {
     try {
-      const out = deps.execSync(
-        `gh pr view ${prNumber} --json mergeable --jq .mergeable`,
+      const [state = "", head = ""] = deps.execSync(
+        `gh pr view ${prNumber} --json mergeable,headRefOid --jq '.mergeable + " " + .headRefOid'`,
         { cwd: repoRoot, encoding: "utf-8", timeout: 15_000 },
-      ).toString().trim();
-      return out === "MERGEABLE" || out === "CONFLICTING" || out === "UNKNOWN" ? out : null;
+      ).toString().trim().split(/\s+/);
+      if (state !== "MERGEABLE" && state !== "CONFLICTING" && state !== "UNKNOWN") return null;
+      return { state, head: /^[0-9a-f]{40}$/.test(head) ? head : null };
     } catch {
       return null;
     }
   };
-  let state = read();
-  for (let i = 0; state === "UNKNOWN" && i < MERGEABLE_POLLS; i++) {
+  let view = read();
+  for (let i = 0; view?.state === "UNKNOWN" && i < MERGEABLE_POLLS; i++) {
     await sleep(MERGEABLE_POLL_MS);
-    state = read();
+    view = read();
   }
-  return state;
+  return view;
 }
 
 /**
@@ -8913,12 +8920,14 @@ async function settleMergeable(prNumber: number, deps: DispatchDeps): Promise<st
  *     onto current main. Conflict here → fall through to the plain
  *     merge, which may still be clean (2026-09-23, #823). Transient
  *     failure → logged skip, retry next cycle (same posture as PR-list
- *     transient). After a successful rebase, wait up to about 30s for
- *     GitHub to settle the PR's mergeability (`settleMergeable`).
- *   - `gh pr merge <n> --merge --delete-branch`. A conflict-shaped refusal
- *     is checked against GitHub's settled mergeability first: still
- *     UNKNOWN → retry next cycle, uncounted; MERGEABLE → one immediate
- *     retry (2026-10-14, mobile #1977). On success: pull
+ *     transient).
+ *   - Wait up to about 30s for GitHub to settle the PR's mergeability and
+ *     read its head (`settleMergeable`).
+ *   - `gh pr merge <n> --merge --delete-branch --match-head-commit <head>`.
+ *     A conflict-shaped refusal is checked against GitHub's settled
+ *     mergeability first: still UNKNOWN → retry next cycle, uncounted, up
+ *     to MERGE_UNKNOWN_SKIP_MAX times; MERGEABLE → one immediate retry
+ *     (2026-10-14, mobile #1977). On success: pull
  *     merged changes to local main (non-fatal failure), strip pipeline
  *     labels from the issue, Discord notify. On conflict (detected
  *     via `isMergeConflictError` on stderr): `handleConflictWithRetry`,
@@ -9003,10 +9012,6 @@ export async function runAutoMerge(
           `gh pr update-branch ${prNumber} --rebase`,
           { cwd: repoRoot, encoding: "utf-8", timeout: 30_000 }
         );
-        // A rebase that moved the head leaves GitHub's mergeability
-        // UNKNOWN for a few seconds, and a merge in that window is refused
-        // as "not mergeable". Wait for the answer before merging.
-        await settleMergeable(prNumber, deps);
       } catch (e: any) {
         const errOut = `${e.stderr ?? ""}\n${e.message ?? ""}`;
         if (isMergeConflictError(errOut)) {
@@ -9018,38 +9023,57 @@ export async function runAutoMerge(
       }
 
       // Step 2: Try the actual merge. Conflict path is the special case.
-      const merge = (): void => {
+      //
+      // A rebase that moved the head leaves GitHub's mergeability UNKNOWN
+      // for a few seconds, and a merge in that window is refused as "not
+      // mergeable". So read the settled mergeability and the head first,
+      // and merge only that head (`--match-head-commit`): a push landing
+      // after the read is refused by GitHub instead of merged unseen.
+      const before = await settleMergeable(prNumber, deps);
+      const merge = (head: string | null): void => {
         execSync(
-          `gh pr merge ${prNumber} --merge --delete-branch`,
+          `gh pr merge ${prNumber} --merge --delete-branch${head ? ` --match-head-commit ${head}` : ""}`,
           { cwd: repoRoot, encoding: "utf-8", timeout: 30_000 }
         );
       };
       try {
         console.log(`   🔀 Auto-merging PR #${prNumber} for #${item.issueNumber} (moved to Done)`);
         try {
-          merge();
+          merge(before?.head ?? null);
         } catch (first: any) {
           // "Not mergeable" is also what GitHub answers while it is still
-          // computing mergeability, typically right after a push or the
-          // rebase above. Counting that as a conflict spent a retry on
-          // pyrycode-mobile #1977 (PR #1980) on 2026-10-14: the rebase
-          // force-pushed at 12:19:11 and the merge was refused one second
-          // later, on a PR GitHub then reported clean. So ask GitHub
-          // before counting. CONFLICTING, or no readable answer, takes the
-          // conflict path exactly as before. UNKNOWN after the wait is a
-          // transient failure, retried next cycle without a count.
-          // MERGEABLE gets one immediate retry, and a second refusal is
-          // counted.
+          // computing mergeability. Counting that as a conflict spent a
+          // retry on pyrycode-mobile #1977 (PR #1980) on 2026-10-14: the
+          // rebase force-pushed at 12:19:11 and the merge was refused one
+          // second later, on a PR GitHub then reported clean. So ask
+          // GitHub before counting:
+          //   - CONFLICTING, or no readable answer: the counted conflict
+          //     path, exactly as before.
+          //   - UNKNOWN after the wait: retried next cycle without a
+          //     count, at most MERGE_UNKNOWN_SKIP_MAX times in a row for
+          //     the PR, then counted like a conflict, so a PR GitHub never
+          //     settles still reaches the handoff instead of looping.
+          //   - MERGEABLE: one immediate retry of that head. A second
+          //     refusal goes to the counted path.
           if (!isMergeConflictError(`${first?.stderr ?? ""}\n${first?.message ?? ""}`)) throw first;
-          const state = await settleMergeable(prNumber, deps);
-          if (state === "UNKNOWN") {
-            console.warn(`   ⏳ PR #${prNumber} for #${item.issueNumber}: GitHub has not settled whether it is mergeable; retrying next cycle without counting a conflict`);
-            continue;
+          const after = before?.state === "UNKNOWN" ? before : await settleMergeable(prNumber, deps);
+          if (after?.state === "UNKNOWN") {
+            const skips = (mergeUnknownSkips.get(prNumber) ?? 0) + 1;
+            if (skips <= MERGE_UNKNOWN_SKIP_MAX) {
+              mergeUnknownSkips.set(prNumber, skips);
+              console.warn(`   ⏳ PR #${prNumber} for #${item.issueNumber}: GitHub has not settled whether it is mergeable; retrying next cycle without counting a conflict (${skips}/${MERGE_UNKNOWN_SKIP_MAX})`);
+              continue;
+            }
+            mergeUnknownSkips.delete(prNumber);
+            console.warn(`   ⏳ PR #${prNumber} for #${item.issueNumber}: mergeability still unsettled after ${MERGE_UNKNOWN_SKIP_MAX} cycles; counting it as a conflict`);
+            throw first;
           }
-          if (state !== "MERGEABLE") throw first;
+          mergeUnknownSkips.delete(prNumber);
+          if (after?.state !== "MERGEABLE") throw first;
           console.log(`   🔁 PR #${prNumber} for #${item.issueNumber}: refused while GitHub was settling mergeability, now mergeable; merging again`);
-          merge();
+          merge(after.head);
         }
+        mergeUnknownSkips.delete(prNumber);
         await client.recordMergedIssue?.(item.issueNumber);
         // Pull merged changes to local main. Failure is non-fatal — the
         // PR already merged on origin, so the next cycle's dispatch will
@@ -9547,13 +9571,34 @@ export async function pollLoop(): Promise<void> {
   if (managed) {await managed.start();rawClient=managed.authorityClient(rawClient);}
   const client = managed ? managed.client(rawClient) : rawClient;
   const maintenanceClient = managed ? managed.client(rawClient, true) : rawClient;
+  // Managed merges are light (see `mergeOfferShape`), so the CPU-heavy
+  // codegraph refresh a merge asks for is not run inside the merge. It is
+  // noted here and run as its own medium job, beside the loop, so it is
+  // charged to this computer's capacity and never holds a merge back.
+  let codegraphWanted = false;
+  let codegraphRun: Promise<void> | null = null;
+  const mergeDeps: DispatchDeps = managed
+    ? { ...DEFAULT_DEPS, reindexCodegraph: () => { codegraphWanted = true; } }
+    : DEFAULT_DEPS;
   const mergeReady = async (): Promise<void> => {
     if (!managed) return runAutoMerge(client);
     for (const item of await client.getItemsByStatus("Done")) {
       if (item.issueNumber <= 0 || item.labels.includes("merged") || item.labels.some(l => l.startsWith("error:"))) continue;
       const offer = managed.mergeOffer(item.issueNumber);
-      if (managed.ready(offer)) await managed.run(offer, () => runAutoMerge(managed.client(rawClient, false, item.issueNumber)));
+      if (managed.ready(offer)) await managed.run(offer, () => runAutoMerge(managed.client(rawClient, false, item.issueNumber), mergeDeps));
     }
+    if (!codegraphWanted || codegraphRun !== null) return;
+    const offer = managed.codegraphOffer();
+    if (offer === null || !managed.ready(offer)) return;
+    codegraphWanted = false;
+    const run: Promise<void> = managed.run(offer, async () => {
+      defaultCodegraphReindexer.request(repoRoot);
+      await defaultCodegraphReindexer.whenIdle();
+    }).catch((e: any) => {
+      codegraphWanted = true;
+      console.warn(`   ⚠️  Post-merge codegraph refresh failed to run (retried after the next merge or cycle): ${e?.message ?? e}`);
+    }).finally(() => { if (codegraphRun === run) codegraphRun = null; });
+    codegraphRun = run;
   };
   // GitHub's board listing can lag its issues (2026-09-23 incident); the
   // client then reads columns from the issues and says so here, once.
@@ -9760,6 +9805,10 @@ export async function pollLoop(): Promise<void> {
       if (gateRun !== null) {
         console.log(`🚦 Drain: waiting for the real-claude gate on #${gateRun.issue} to finish`);
         await gateRun.done;
+      }
+      if (codegraphRun !== null) {
+        console.log(`🚦 Drain: waiting for the codegraph refresh to finish`);
+        await codegraphRun;
       }
       if (managed) await managed.stop();
       console.log("✅ Drain complete. Exiting cleanly.");
