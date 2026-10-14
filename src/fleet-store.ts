@@ -264,7 +264,14 @@ export class FleetStore {
       return this.workflow.change(ticket, change, 'operator', commandId, revision);
     });
   }
-  recoveryFacts(tickets: string[], assessment?: {machine:string;session:string;project:string;runId:string}) {
+  /** The final step of an operator filing. A retry hours later must not overwrite a running ticket. */
+  workflowFile(id: string, ticket: string, change: WorkflowChange) {
+    return this.transaction(() => {
+      if (this.snapshot().runs.some(r=>r.ticket===ticket)) throw new Error('Ticket has an active reservation; drain it before changing workflow');
+      return this.workflow.completeFiling(id, ticket, change);
+    });
+  }
+  recoveryFacts(tickets: string[], assessment?:{machine:string;session:string;project:string;runId:string}) {
     let diagnosticTicket: string | undefined;
     if(assessment) {
       const run=this.snapshot().runs.find(r=>r.id===assessment.runId && r.machine===assessment.machine && r.session===assessment.session && r.project===assessment.project && r.role==='recovery');

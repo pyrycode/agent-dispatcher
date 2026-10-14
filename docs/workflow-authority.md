@@ -134,6 +134,51 @@ resolve the actual state. Reuse the same command identity only for the exact sam
 request. The controls also support `state`, `labels`, `blockedBy`, `top` and `afterItemId`.
 Changing a status does not bypass dependency, review, ownership or admission checks.
 
+### Filing a ticket
+
+An interactive session files a new ticket in one step:
+
+```sh
+node --import tsx src/fleet-bin.ts workflow OPERATOR_CONFIG file owner/repo request.json
+```
+
+```json
+{
+  "commandId": "a-unique-id-retained-for-retries",
+  "title": "Show the relay state on the phone",
+  "body": "Issue description in Markdown.",
+  "labels": ["enhancement"],
+  "workflow": {
+    "stage": "Backlog",
+    "labels": ["priority:high", "done:refiner"],
+    "blockedBy": [2101, 2102]
+  }
+}
+```
+
+`commandId`, `title` and `body` are required. `labels` are GitHub content labels
+and must not use the workflow prefixes `wip:`, `done:`, `error:`,
+`needs-rework:`, `claim:` or `orchestrator:`. Those go in `workflow.labels`. The
+`workflow` block is optional. Its stage defaults to Inbox. Each blocker is a
+ticket number that the database already holds in the same project. The whole
+request is checked before anything is written to GitHub.
+
+The central service creates the issue with its own GitHub credential, adds it to
+the board and registers it as the bridge does when a worker creates an issue.
+It then applies the stage, workflow labels and blockers in one transaction and
+saves the answer with it. The command prints the ticket, issue number, URL,
+revision and the item as the database now holds it. GitHub's labels and column
+follow through the publisher.
+
+A failed filing is retried with the same request file. The same `commandId` with
+the same request never creates a second issue. A finished filing answers with
+its first result. If the issue was created but registration failed, the retry
+reuses that issue. If GitHub's answer to the creation was lost, the retry finds
+the issue by a hidden `<!-- orchestrator-filing:ID -->` line at the end of its
+body. Reusing a `commandId` with a different request is refused. A retry also
+converges when the content scan registered the issue in Inbox in between. It
+refuses only when the ticket meanwhile has an active reservation.
+
 ## Recovery and rollback
 
 The database is now required for scheduling. If it is unavailable, workers fail
