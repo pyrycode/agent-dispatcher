@@ -4,12 +4,12 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { RecoveryLedger, recoveryFingerprint, recoveryTrigger, RECOVERY_RECHECK_MS, RECOVERY_SAFETY_RECHECK_MS, RECOVERY_STALLED_RUN_MS, type RecoveryObservation, type RecoveryIncident } from "./fleet-recovery.js";
+import { RecoveryLedger, recoveryFingerprint, recoveryTrigger, passedReview, RECOVERY_RECHECK_MS, RECOVERY_SAFETY_RECHECK_MS, RECOVERY_STALLED_RUN_MS, type RecoveryObservation, type RecoveryIncident } from "./fleet-recovery.js";
 import { FleetStore, type StartRequest } from "./fleet-store.js";
 import { FleetClient, JsonClient, serveFleet } from "./fleet-http.js";
 import { MachineManager, serveManager } from "./machine-manager.js";
 import { ManagedDispatch } from "./managed-dispatch.js";
-import { runRecoveryWork, CodexRateLimitError, recoveryPlan, parseRecoveryDecision, recoveryHandoff, observationFor, cleanRecoveryLabels } from "./recovery-work.js";
+import { runRecoveryWork, CodexRateLimitError, recoveryPlan, parseRecoveryDecision, recoveryHandoff, observationFor, cleanRecoveryLabels, recoveryStillCurrent } from "./recovery-work.js";
 import type { AgentConfig, ProjectItem } from "./types.js";
 import { recoveryLogContext } from "./recovery-context.js";
 import { RECOVERY_ASSIGNMENT_LABELS, recoveryAssignmentLabels, RECOVERY_LABEL_DEFINITIONS } from "./recovery-labels.js";
@@ -840,4 +840,106 @@ test("a Codex rate limit during assessment waits out the transport cooldown inst
   assert.deepEqual(removed, ["orchestrator:investigating"]);
   now += RECOVERY_RECHECK_MS;
   assert.equal(ledger.report("mac", project, [observed], empty)[0]?.state, "queued", "assessed again after the cooldown");
+});
+
+test("a ticket that passed review since its reworks is not a repeated rework incident", () => {
+  const reworked = (status: string, labels: string[]): RecoveryObservation => ({ ...observation(3324, labels), status });
+  const repeated = (o: RecoveryObservation) => recoveryTrigger(o)?.reason === "Repeated review rework";
+  // Still in the loop: back with the code owner, or waiting on review.
+  assert.ok(repeated(reworked("In Development", ["rework-count:3"])));
+  assert.ok(repeated(reworked("In Code Review", ["rework-count:3", "done:builder"])));
+  assert.ok(repeated(reworked("In Code Review", ["rework-count:2", "done:developer", "done:qa"])), "classic: QA passed, code review not yet");
+  // Passed review: the reviewer's done label, or the stage moved on to documentation.
+  for (const [status, labels] of [
+    ["In Code Review", ["rework-count:3", "done:builder", "done:verifier"]],
+    ["In Documentation", ["rework-count:3", "done:verifier", "priority:high"]],
+    ["In Code Review", ["rework-count:2", "done:code-review"]],
+    ["In Documentation", ["rework-count:4"]],
+    ["In Documentation", ["rework-count:3", "done:verifier", "needs-rework:documentation"]],
+  ] as const) {
+    const o = reworked(status, [...labels]);
+    assert.ok(passedReview(o), `${status} ${labels.join(",")}`);
+    assert.equal(recoveryTrigger(o), null, `${status} ${labels.join(",")}`);
+  }
+  // A later stage sending the work back to the code owner is a new round.
+  for (const label of ["needs-rework:builder", "needs-rework:developer"]) {
+    const o = reworked("In Documentation", ["rework-count:3", "done:verifier", label]);
+    assert.equal(passedReview(o), false, label);
+    assert.ok(repeated(o), label);
+  }
+  // A route back whose done-label strip failed leaves done:verifier in a pre-review column: still a loop.
+  assert.ok(repeated(reworked("In Development", ["rework-count:3", "done:verifier"])));
+  assert.ok(repeated(reworked("In QA", ["rework-count:2", "done:code-review"])));
+  // A passed ticket parked for real-claude evidence still gets its Inbox assessment.
+  assert.equal(recoveryTrigger(reworked("Inbox", ["rework-count:3", "done:verifier", "needs-real-claude"]))?.reason,
+    "Pipeline evidence or refinement is needed in Inbox");
+  // A passed ticket with a stage error is still diagnosed.
+  assert.equal(recoveryTrigger(reworked("In Documentation", ["rework-count:3", "done:verifier", "error:documentation"]))?.reason, "error:documentation");
+});
+
+test("the rework incident resolves when review passes and reopens only on a new round", () => {
+  const db = new DatabaseSync(":memory:");
+  let now = 1_000_000;
+  const ledger = new RecoveryLedger(db, () => now);
+  const empty = { claims: [], runs: [] };
+  const at = (status: string, labels: string[]): RecoveryObservation => ({ ...observation(3324, labels), status });
+  const current = () => ledger.list(project).filter(i => i.current);
+
+  const looping = at("In Code Review", ["priority:high", "rework-count:3", "done:builder"]);
+  const [open] = ledger.report("mac", project, [looping], empty);
+  assert.equal(open?.reason, "Repeated review rework");
+  assert.equal(open.state, "queued");
+
+  now += 60_000;
+  const passed = at("In Code Review", ["priority:high", "rework-count:3", "done:builder", "done:verifier"]);
+  assert.deepEqual(ledger.report("mac", project, [passed], empty), [], "no incident after the verifier passes");
+  assert.equal(ledger.list(project).find(i => i.id === open.id)?.state, "resolved");
+  assert.deepEqual(current(), []);
+
+  now += 60_000;
+  const documenting = at("In Documentation", ["priority:high", "rework-count:3", "done:verifier"]);
+  assert.deepEqual(ledger.report("mac", project, [documenting], empty), [], "documentation proceeds without a recovery assessment");
+  assert.deepEqual(current(), []);
+
+  // An incident the old rule queued after the pass (pyrycode #3324, 18:33 EEST) resolves at the next report.
+  db.prepare("INSERT INTO fleet_recovery VALUES (?,?,?,?,?,?,?,?,NULL,1)")
+    .run("stale", documenting.ticket, recoveryFingerprint(documenting), "Repeated review rework", "queued", now, now, null);
+  const stale = ledger.list(project).find(i => i.id === "stale")!;
+  const ticket: ProjectItem = { ...item(documenting.labels), issueNumber: 3324, status: "In Documentation" };
+  assert.equal(recoveryStillCurrent(project, ticket, stale), false, "a held assessment offer is no longer current");
+  now += 60_000;
+  ledger.report("mac", project, [documenting], empty);
+  assert.equal(ledger.list(project).find(i => i.id === "stale")?.state, "resolved");
+  assert.deepEqual(current(), []);
+
+  // Documentation sends it back to the builder: a real further round is detected again.
+  now += 60_000;
+  const [again] = ledger.report("mac", project, [at("In Development", ["priority:high", "rework-count:4"])], empty);
+  assert.equal(again?.reason, "Repeated review rework");
+  assert.equal(again.state, "queued");
+  db.close();
+});
+
+test("an assessed rework incident stops being current once review passes", () => {
+  const db = new DatabaseSync(":memory:");
+  let now = 1_000_000;
+  const ledger = new RecoveryLedger(db, () => now);
+  const empty = { claims: [], runs: [] };
+  const at = (status: string, labels: string[]): RecoveryObservation => ({ ...observation(3324, labels), status });
+  for (const [state, decision] of [
+    ["complete", { action: "wait", reason: "Let the builder finish this round" }],
+    ["escalated", { action: "escalate", reason: "Assessment failed", category: "human" }],
+  ] as const) {
+    const looping = at("In Code Review", ["rework-count:3", "done:builder"]);
+    const id = `assessed-${state}`;
+    db.prepare("INSERT INTO fleet_recovery VALUES (?,?,?,?,?,?,?,?,?,1)")
+      .run(id, looping.ticket, recoveryFingerprint(looping), "Repeated review rework", state, now, now, "run", JSON.stringify(decision));
+    now += 60_000;
+    assert.deepEqual(ledger.report("mac", project, [at("In Documentation", ["rework-count:3", "done:verifier"])], empty), [], state);
+    const after = ledger.list(project).find(i => i.id === id)!;
+    assert.equal(after.current, false, state);
+    assert.equal(after.state, state, "a settled decision keeps its record");
+    assert.deepEqual(ledger.list(project).filter(i => i.current), [], state);
+  }
+  db.close();
 });

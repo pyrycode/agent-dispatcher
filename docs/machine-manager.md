@@ -189,7 +189,11 @@ Each enabled dispatcher reports its open board snapshot every five minutes. It
 reuses the ordinary board query and sends only ticket numbers, columns, labels
 and blocker state. The central service records incidents in its existing SQLite
 database. Repeated polls do not call a model. A resolved error that returns creates
-a new incident. Rework counts of two or more request an assessment, not a repair.
+a new incident. Rework counts of two or more request an assessment, not a repair,
+while the ticket is still in its rework loop. Once review passes, shown by
+`done:verifier` or `done:code-review` or a move to In Documentation, the count is
+history: no incident opens and a queued one resolves. A later stage sending the
+work back to the builder or developer starts a new round and is assessed again.
 
 A retained reservation with no workflow progress for three hours produces one
 durable operator incident for that exact run. This includes cards returned to
