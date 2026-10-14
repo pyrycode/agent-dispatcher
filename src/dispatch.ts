@@ -8,6 +8,7 @@ import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { config } from "dotenv";
 import { githubPauseMs, freshGitHubRead } from "./github-transport.js";
+import { decidePollFailure, newPollOutage, pollRecovered, transientPollFailure } from "./poll-failure.js";
 import { runRecoveryWork, recoveryHandoff, parseRecoveryDecision, RECOVERY_INSTRUCTIONS, RECOVERY_EFFORT, RECOVERY_MAX_TURNS, RECOVERY_TIMEOUT_MS, cleanRecoveryLabels } from "./recovery-work.js";
 import { verifyCoordination } from "./recovery-coordination.js";
 import { recoveryInventory, relatedTickets, relatedEvidence } from "./recovery-evidence.js";
@@ -9550,6 +9551,10 @@ export async function pollLoop(): Promise<void> {
   // plain `= null` would narrow every later read to null.
   let gateRun = null as { issue: number; done: Promise<void> } | null;
 
+  // Consecutive failed polls, for the backoff and the operator notice. See
+  // poll-failure.ts for what is retried and what still stops the process.
+  const pollOutage = newPollOutage();
+
   while (true) {
     if (managed?.draining) drainMode = true;
     managed?.beginCycle();
@@ -9654,10 +9659,11 @@ export async function pollLoop(): Promise<void> {
         await new Promise((r) => setTimeout(r, waitSec * 1000));
         continue;  // restart cycle after sleep
       }
-      // Non-rate-limit fetch error: log + continue to sub-steps. The
-      // sub-steps will independently retry and most will fail too, but
-      // they'll continue normally on the next cycle.
-      if (githubPauseMs(e) !== null) throw e;
+      // A pause or an outage skips the rest of the cycle: the failed read
+      // stays cached for this cycle, so the upkeep steps would only fail on
+      // it again. The catch at the bottom of the loop waits and retries.
+      // Anything else: log and continue to the sub-steps, as before.
+      if (githubPauseMs(e) !== null || transientPollFailure(e) !== null) throw e;
       console.warn(`   ⚠️  Pre-fetch failed (non-rate-limit): ${(e as any)?.message || e}`);
     }
 
@@ -10158,6 +10164,13 @@ export async function pollLoop(): Promise<void> {
 
     if (managed) await managed.endCycle();
 
+    // A full cycle went through, so any outage is over.
+    const recovered = pollRecovered(pollOutage, Date.now());
+    if (recovered) {
+      console.log(recovered.log);
+      if (recovered.notify) await notifyDiscord(recovered.notify);
+    }
+
     // Wait for a seat to free or for the poll interval, whichever comes
     // first. A run settling wakes the loop at once, so the finished ticket's
     // next stage and a replacement candidate are picked in the same pass
@@ -10184,10 +10197,21 @@ export async function pollLoop(): Promise<void> {
     }
     if (tick !== undefined) clearTimeout(tick);
     } catch (error) {
-      const pause = githubPauseMs(error);
-      if (pause === null) throw error;
-      console.warn("Shared GitHub paused; existing agent runs continue and the cycle will retry.");
-      await new Promise(resolve => setTimeout(resolve, pause));
+      // A failed poll waits and tries again; it never touches running agent
+      // runs, which live in the pool or under a manager grant. Only errors
+      // that make carrying on unsafe stop the process (poll-failure.ts).
+      // The cycle's endCycle is skipped on purpose: it would retire every
+      // offer the failed cycle did not get to make again, and cancel granted
+      // runs that have not started yet.
+      const failure = decidePollFailure(error, pollOutage, Date.now());
+      if (failure.kind === "fatal") throw error;
+      if (failure.kind === "pause") {
+        console.warn("Shared GitHub paused; existing agent runs continue and the cycle will retry.");
+      } else {
+        console.warn(failure.log);
+        if (failure.notify) await notifyDiscord(failure.notify);
+      }
+      await new Promise(resolve => setTimeout(resolve, failure.waitMs));
     }
   }
 }

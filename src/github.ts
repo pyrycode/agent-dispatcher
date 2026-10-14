@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { graphql } from "@octokit/graphql";
 import { githubFetch, freshGitHubRead } from "./github-transport.js";
+import { GitHubNoDataError } from "./poll-failure.js";
 import type { ProjectConfig, ProjectItem } from "./types.js";
 import {
   AUTO_RETRY_COMMENT_MARKER,
@@ -509,6 +510,13 @@ export class GitHubProjectClient {
         }
       `, { projectId: this.projectId, cursor });
       pages++;
+
+      // GitHub has answered 200 with no data (Core, 2026-10-12), which used
+      // to surface as a TypeError and stop the dispatcher. A typed error lets
+      // the poll loop retry it as the GitHub fault it is.
+      if (!Array.isArray(result?.node?.items?.nodes)) {
+        throw new GitHubNoDataError("the board items", result == null ? "empty reply" : result.node == null ? "no project" : "no items");
+      }
 
       if (result.rateLimit) {
         totalCost += result.rateLimit.cost ?? 0;
