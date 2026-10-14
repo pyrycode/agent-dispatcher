@@ -19,8 +19,9 @@
 //
 // The same artifacts feed the rework breaker's repeat rule (agent-dispatcher
 // #122): the `[MUST FIX]` findings of the newest FAIL verdict and the one
-// before it, compared by their `path → Symbol` keys and then by their text
-// (#130). See `findRepeatedMustFix`.
+// before it, compared by their `path → Symbol` locations and then by their
+// text (#130), leaving out every finding the newer verdict lists as `Fixed:`
+// (desktop #1935). See `findRepeatedMustFix`.
 //
 // Pure helpers here; the I/O (the `gh` calls) stays in dispatch.ts.
 
@@ -92,6 +93,65 @@ export function extractMustFixFindings(body: string): MustFixFinding[] {
   return out;
 }
 
+/** `- Fixed: `path` → `Symbol`…`, the verifier's re-review form for a previous
+ *  finding it found repaired: a list item, no severity tag, `Fixed` plain,
+ *  bold or bracketed, then the finding's location. */
+const FIXED_KEY = /^\s*[-*]\s*(?:\*\*|\[)?Fixed(?:\*\*|\])?:?(?:\*\*)?\s*`([^`]+)`\s*(?:→|->)\s*(?:`([^`]+)`|([^\s:`]+))/i;
+
+/**
+ * The previous findings a re-review verdict lists as repaired, each written
+ * `- Fixed: <its path → Symbol>` under `### Findings` (verifier prompt,
+ * "Re-review after a FAIL"), with the same key and text shape as
+ * `extractMustFixFindings`.
+ */
+export function extractFixedFindings(body: string): MustFixFinding[] {
+  const out: MustFixFinding[] = [];
+  for (const line of body.split("\n")) {
+    const m = FIXED_KEY.exec(line);
+    if (m) out.push({ key: `${m[1].trim()} → ${(m[2] ?? m[3]).trim()}`, text: line.slice(m.index + m[0].length) });
+  }
+  return out;
+}
+
+/** A file path, as the verifier quotes one: a `/` in it, or a source or
+ *  config file extension. A backticked symbol like `turnState` is not one. */
+const PATH = /[^`\s]*\/[^`\s]*|[^`\s]+\.(?:tsx?|jsx?|mjs|cjs|kts?|java|go|py|rs|swift|md|json|ya?ml|toml|gradle|css|scss|html|sh)/.source;
+
+/** A backticked file path. */
+const FILE_PATH = new RegExp(`\`(?:${PATH})\``, "g");
+
+/** A backticked file path followed by an arrow and a symbol, anywhere in a line. */
+const ANCHOR = new RegExp(`\`(${PATH})\`\\s*(?:→|->)\\s*(?:\`([^\`]+)\`|([^\\s:\`,;]+))`, "g");
+
+/**
+ * Every `path → Symbol` location a finding names: its key, and any further
+ * locations its text lists. A verifier finding often spans several, as
+ * `` `a.ts` → `dispatch`; `b.ts` → `inputs`: … ``, and the key holds only the
+ * first.
+ */
+function findingAnchors(f: MustFixFinding): Set<string> {
+  const out = new Set([f.key]);
+  for (const m of f.text.matchAll(ANCHOR)) out.add(`${m[1].trim()} → ${(m[2] ?? m[3]).trim()}`);
+  return out;
+}
+
+/** Whether two findings name a location in common. */
+function sameLocation(a: MustFixFinding, b: MustFixFinding): boolean {
+  const theirs = findingAnchors(b);
+  for (const k of findingAnchors(a)) if (theirs.has(k)) return true;
+  return false;
+}
+
+/**
+ * A finding's text with its locations taken out, so similarity measures the
+ * defect described, not where it sits. Two different defects in the same
+ * pair of files share every word of their file paths: on desktop #1951 that
+ * alone lifted an unrelated finding over the threshold.
+ */
+function findingDescription(text: string): string {
+  return text.replace(ANCHOR, " ").replace(FILE_PATH, " ");
+}
+
 /** The distinct `path → Symbol` keys of a verdict's `[MUST FIX]` findings, in order. */
 export function extractMustFixKeys(body: string): string[] {
   return [...new Set(extractMustFixFindings(body).map((f) => f.key))];
@@ -108,7 +168,8 @@ export function extractMustFixKeys(body: string): string[] {
  * `ThreadScreen`: the ordering defect raised at 10:18 and again at 12:42
  * ("the previously reported … defect remains") scores 0.56. The different
  * paste-callback defect at 14:05 scores 0.11 against 12:42 and 0.13 against
- * 10:18. Pinned by verdict-guard.test.ts.
+ * 10:18. Pinned by verdict-guard.test.ts. Scores are taken on
+ * `findingDescription`, the text without its file locations.
  */
 export const REPEAT_FINDING_SIMILARITY = 0.3;
 
@@ -149,14 +210,17 @@ export function findingTextSimilarity(a: string, b: string): number {
 
 /**
  * The `[MUST FIX]` keys the newest FAIL shares with the last FAIL before a
- * recorded builder completion, where the findings under that key read alike
- * (`REPEAT_FINDING_SIMILARITY`): the verifier raising the same finding after
- * the builder said it was fixed, not a new finding in the same function.
- * Reviews and comments both count, ordered by time; PASS verdicts and other
- * comments are skipped. A verdict posted twice word for word, as a review and
- * a comment, is one round. A completion must lie strictly between the two
- * verdicts, and known identical heads are never a repair round. Missing
- * evidence leaves the independent hard cap in charge.
+ * recorded builder completion, where the findings name a location in common
+ * and read alike (`REPEAT_FINDING_SIMILARITY`, on the text without its
+ * locations): the verifier raising the same finding after the builder said
+ * it was fixed, not a new finding in the same function. A previous finding
+ * the newest verdict lists as `Fixed:` is repaired, so it is never the
+ * finding a new one repeats (`withoutRepaired`). Reviews and comments both
+ * count, ordered by time; PASS verdicts and other comments are skipped. A
+ * verdict posted twice word for word, as a review and a comment, is one
+ * round. A completion must lie strictly between the two verdicts, and known
+ * identical heads are never a repair round. Missing evidence leaves the
+ * independent hard cap in charge.
  */
 export function findRepeatedMustFix(artifacts: readonly VerdictArtifact[], builderCompletions: readonly string[] = []): string[] {
   const [newest, ...older] = failVerdictsNewestFirst(artifacts);
@@ -165,11 +229,46 @@ export function findRepeatedMustFix(artifacts: readonly VerdictArtifact[], build
   const previous = older.find(p => completedAt.some(t => t > Date.parse(p.at) && t < Date.parse(newest.at)));
   if (previous === undefined) return [];
   if (newest.head && newest.head === previous.head) return [];
-  const prior = extractMustFixFindings(previous.body!).filter((f) => !isBranchInvariantKey(f.key));
-  const repeated = extractMustFixFindings(newest.body!).filter((f) =>
-    !isBranchInvariantKey(f.key) &&
-    prior.some((p) => p.key === f.key && findingTextSimilarity(p.text, f.text) >= REPEAT_FINDING_SIMILARITY));
+  const open = extractMustFixFindings(newest.body!).filter((f) => !isBranchInvariantKey(f.key));
+  const prior = withoutRepaired(
+    extractMustFixFindings(previous.body!).filter((f) => !isBranchInvariantKey(f.key)),
+    extractFixedFindings(newest.body!),
+    open,
+  );
+  const repeated = open.filter((f) => prior.some((p) => sameLocation(p, f) && findingSimilarity(p, f) >= REPEAT_FINDING_SIMILARITY));
   return [...new Set(repeated.map((f) => f.key))];
+}
+
+/** `findingTextSimilarity` on two findings' descriptions, their locations left out. */
+function findingSimilarity(a: MustFixFinding, b: MustFixFinding): number {
+  return findingTextSimilarity(findingDescription(a.text), findingDescription(b.text));
+}
+
+/**
+ * The previous verdict's findings less the ones the newest verdict lists as
+ * fixed. Each `Fixed:` line retires one previous finding at a shared
+ * location: the one its text reads most like, and among equals, which is
+ * every candidate when the line carries only its location, the one least
+ * like any finding the newest verdict still raises there. So a location with
+ * two previous findings, one fixed and one raised again, keeps the one
+ * raised again. A `Fixed:` line with no previous finding at its location
+ * retires nothing.
+ */
+function withoutRepaired(prior: readonly MustFixFinding[], fixed: readonly MustFixFinding[], open: readonly MustFixFinding[]): MustFixFinding[] {
+  const left = [...prior];
+  const stillRaised = (p: MustFixFinding) =>
+    Math.max(0, ...open.filter((o) => sameLocation(p, o)).map((o) => findingSimilarity(p, o)));
+  for (const fx of fixed) {
+    let best = -1;
+    for (let i = 0; i < left.length; i++) {
+      if (!sameLocation(left[i], fx)) continue;
+      if (best < 0) { best = i; continue; }
+      const d = findingSimilarity(left[i], fx) - findingSimilarity(left[best], fx);
+      if (d > 0 || (d === 0 && stillRaised(left[i]) < stillRaised(left[best]))) best = i;
+    }
+    if (best >= 0) left.splice(best, 1);
+  }
+  return left;
 }
 
 /** FAIL artifacts with their review identity, newest first. */
