@@ -385,6 +385,34 @@ def operation_open(record):
     if record.get('latch')=='health' or str(record.get('reason','')).startswith('Health failed again after a verified restart'):return False
     return record.get('attentionFrom') not in {'start-requested','verifying'}
 
+class ServiceRefusal(RuntimeError):
+    """The control service answered and refused the operation. Not a lost reply."""
+    def __init__(self,operation,status,detail):
+        super().__init__('Control service refused '+operation+': Service '+str(status)+': '+detail)
+        self.operation=operation;self.status=status;self.detail=detail
+
+SERVICE_REPLY=re.compile(r'^Service (\d{3}): (.*)$')
+
+def rpc_failure(operation,code,stderr):
+    """A typed error from the operator command's output.
+
+    The command prints only the error message, but an uncaught crash adds a
+    stack and a runtime version line, so the service's reply is searched for.
+    Timeouts, connection failures and local crashes are never refusals."""
+    lines=[line.strip() for line in (stderr or '').splitlines() if line.strip()]
+    for line in reversed(lines):
+        match=SERVICE_REPLY.match(line)
+        if match:return ServiceRefusal(operation,int(match.group(1)),match.group(2)[:300])
+    detail=next((line for line in reversed(lines) if not line.startswith('Node.js v') and not line.startswith('at ')),'exit '+str(code))
+    return RuntimeError('Control service call '+operation+' failed without a service reply: '+detail[:300])
+
+def service_refusal(error):
+    """The service refusal behind a record's failure, or None."""
+    while error is not None:
+        if isinstance(error,ServiceRefusal):return error
+        error=error.__cause__
+    return None
+
 class SupportSupervisor:
     def __init__(self,adapter,config):
         self.adapter=adapter;self.config=config;self.children={};self.directory=Path(config['stateDirectory'])/'tasks'
@@ -396,15 +424,12 @@ class SupportSupervisor:
         except (OSError,ValueError):self.reported_errors={}
         if not isinstance(self.reported_errors,dict):self.reported_errors={}
         self.directory.mkdir(parents=True,exist_ok=True,mode=0o700)
+        self.refusals={}
 
     def rpc(self,operation,body):
         path=self.directory/(operation+'.request.json');atomic(path,body)
         done=subprocess.run(self.adapter.operator_command('recovery-task',operation,str(path)),stdin=subprocess.DEVNULL,capture_output=True,text=True,timeout=150)
-        if done.returncode:
-            # The service's own refusal, such as a 409 reason, names the problem.
-            # Its last line only: the command prints nothing else on failure.
-            lines=[line for line in done.stderr.splitlines() if line.strip()]
-            raise RuntimeError('Control service refused '+operation+': '+(lines[-1][:300] if lines else 'exit '+str(done.returncode)))
+        if done.returncode:raise rpc_failure(operation,done.returncode,done.stderr)
         return json.loads(done.stdout)
 
     def capability_record(self,state,withheld=()):
@@ -489,7 +514,7 @@ class SupportSupervisor:
 
     def receipt_pass(self,machine,receipt,running):
         old=json.loads(receipt.read_text())
-        if old['phase']=='complete' and (old.get('artifactDigest') or old.get('artifactUnrecoverable') or old.get('interrupted') or old.get('finalized')):return
+        if old['phase']=='complete' and (old.get('artifactDigest') or old.get('artifactUnrecoverable') or old.get('interrupted') or (old.get('finalized') or {}).get('released')):return
         result=Path(old['result'])
         if old['phase']=='complete' and not result.is_file():return
         if old['phase']=='complete':
@@ -592,6 +617,8 @@ class SupportSupervisor:
         scheduler_session=json.loads(session_file.read_text())['session']
         self.rpc('capabilities',{'machine':machine,'record':self.capability_record(state)})
         running=[];host_uncertain=False;errors={}
+        # This pass's definite service refusals per record, for the watchdog.
+        self.refusals={}
         for receipt in sorted(self.directory.glob('*.receipt.json')):
             task=receipt.name[:-len('.receipt.json')]
             # One bad record must not stop the pass, later records or the operation report.
@@ -601,6 +628,8 @@ class SupportSupervisor:
                 reason='Native task record skipped this pass. '+detail[:300]
                 running.append({'id':task,'phase':'error','reason':reason})
                 errors[task]=reason
+                refusal=service_refusal(error)
+                if refusal:self.refusals[task]={'operation':refusal.operation,'status':refusal.status,'detail':refusal.detail}
                 # Only a completed record's artifact transfer, or the release of a
                 # worker already proven gone, is known to be local to that record.
                 # Anything else may be host-wide, such as an

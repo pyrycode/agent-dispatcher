@@ -87,6 +87,9 @@ class Housekeeping:
                 entry = json.loads(line)
             except ValueError:
                 continue
+            # Watchdog findings have their own list in the report and would crowd this one.
+            if isinstance(entry, dict) and str(entry.get('kind', '')).startswith('watchdog-'):
+                continue
             if isinstance(entry, dict) and isinstance(entry.get('at'), (int, float)) and entry['at'] >= cutoff:
                 entries.append({k: redact_paths(entry[k]) if isinstance(entry[k], str) else entry[k]
                                 for k in ('at', 'kind', 'subject', 'reason') if k in entry})
@@ -490,11 +493,16 @@ def main():
             support.housekeeping = housekeeping.record
             supervisor.withhold = getattr(support, 'withhold', None)
         watchdog = None
+        watchdog_failure = None
         watchdog_source = Path(__file__).with_name('fleet-watchdog.py')
         if watchdog_source.is_file():
-            watchdog_spec = importlib.util.spec_from_file_location('fleet_watchdog', watchdog_source)
-            watchdog_module = importlib.util.module_from_spec(watchdog_spec); watchdog_spec.loader.exec_module(watchdog_module)
-            watchdog = watchdog_module.Watchdog(adapter, config, support, housekeeping.record, support_module=support_module)
+            # A watchdog that cannot load is reported every pass. It never stops the supervisor.
+            try:
+                watchdog_spec = importlib.util.spec_from_file_location('fleet_watchdog', watchdog_source)
+                watchdog_module = importlib.util.module_from_spec(watchdog_spec); watchdog_spec.loader.exec_module(watchdog_module)
+                watchdog = watchdog_module.Watchdog(adapter, config, support, housekeeping.record, support_module=support_module)
+            except Exception as error:
+                watchdog_failure = 'Watchdog could not start. ' + type(error).__name__ + ': ' + redact_paths(str(error))[:300]
         if config.get('control'):
             control_spec = importlib.util.spec_from_file_location('fleet_control', Path(__file__).with_name('fleet-control.py'))
             control_module = importlib.util.module_from_spec(control_spec); control_spec.loader.exec_module(control_module)
@@ -532,14 +540,16 @@ def main():
                     support_results = []
                     support_failure = 'Native task pass failed. ' + type(error).__name__ + ': ' + redact_paths(str(error))[:300]
                 watch = None
-                if watchdog:
-                    # Per-record refusals from this pass. A failed pass gives
-                    # none, and without them nothing is finished automatically.
-                    errors = dict(support.reported_errors) if support and support_failure is None else None
+                if watchdog_failure:
+                    watch = [{'kind': 'error', 'subject': 'watchdog', 'action': 'attention', 'reason': watchdog_failure}]
+                elif watchdog:
+                    # This pass's definite service refusals per record. A failed
+                    # pass gives none, and then nothing is finished automatically.
+                    refusals = dict(getattr(support, 'refusals', {})) if support and support_failure is None else None
                     try:
-                        watch = watchdog.tick(errors, results)
+                        watch = watchdog.tick(refusals, results)
                     except Exception as error:
-                        watch = [{'kind': 'error', 'subject': 'watchdog', 'since': time.time(), 'action': 'attention',
+                        watch = [{'kind': 'error', 'subject': 'watchdog', 'action': 'attention',
                                   'reason': 'Watchdog pass failed. ' + type(error).__name__ + ': ' + redact_paths(str(error))[:300]}]
                 attention = adapter.attention()
                 attention["recoveryTasks"] = support_results

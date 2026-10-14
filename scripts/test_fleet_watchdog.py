@@ -22,7 +22,9 @@ TASK = '58915c353ee70b722a335cd603c0d2c22439bc70bbdd083a50bc1da8b686d84e'
 # The Desktop #1809 repair task left behind on 2026-10-13.
 ORPHAN = '29219c8b8ff620429a99de07365c889b44ecc0c3bc1d75c99525f7feea9ab1d4'
 FINISHED = 1791959507.0  # 09:31:47 EEST, when its result was written
-REFUSAL = 'Control service refused prepare-repair: Service 409 "Repair contains credential-shaped text; retain it privately"'
+# The real reply, as the operator command prints it on stderr.
+DETAIL = '{"error":"Repair contains credential-shaped text; retain it privately"}'
+REFUSAL = {'operation': 'prepare-repair', 'status': 409, 'detail': DETAIL}
 
 
 def stamp(path, at):
@@ -52,7 +54,8 @@ class Fleet:
         def rpc(op, body):
             self.calls.append((op, body))
             if op in self.refuse:
-                raise RuntimeError(self.refuse[op])
+                value = self.refuse[op]
+                raise m.rpc_failure(op, 1, value) if isinstance(value, str) else value
             return [] if op == 'schedule' else {}
         self.support.rpc = rpc
         self.logged = []
@@ -97,7 +100,7 @@ class Fleet:
              patch.object(m, 'container_instance', return_value=container or {'running': True, 'startedAt': 0, 'id': 'i'}), \
              patch.object(self.support, 'route_ready', return_value=False):
             self.support.tick()
-            return self.watchdog.tick(dict(self.support.reported_errors))
+            return self.watchdog.tick(dict(self.support.refusals))
 
     def ops(self, name):
         return [body for op, body in self.calls if op == name]
@@ -109,22 +112,32 @@ class FinishedButRefused(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             f = Fleet(d)
             folder, receipt = f.task(drainConfirmed=True)
-            f.refuse['prepare-repair'] = REFUSAL
-            f.now[0] = FINISHED + 300
-            self.assertEqual(f.supervisor_pass(), [])
+            f.refuse['prepare-repair'] = 'Service 409: ' + DETAIL
+            # One pass a minute, as the supervisor runs. The first refusal at +60 s.
+            for minute in range(1, 11):
+                f.now[0] = FINISHED + 60 * minute
+                self.assertEqual(f.supervisor_pass(), [], minute)
+            # Past the limit from the result, but not yet from the first refusal: reported only.
+            f.now[0] = FINISHED + 60 * 11
+            [stalled] = f.supervisor_pass()
+            self.assertEqual((stalled['kind'], stalled['worker']), ('stalled', 'finished'))
+            self.assertIn('The service refused prepare-repair with 409', stalled['reason'])
             self.assertEqual(f.ops('complete'), [])
-            f.now[0] = FINISHED + 601
+            f.now[0] = FINISHED + 60 * 11 + 1
             [item] = f.supervisor_pass()
             [body] = f.ops('complete')
+            self.assertEqual(body['expectStates'], ['running', 'attention'])
             self.assertEqual((body['machine'], body['id'], body['session']), ('pyrybox', TASK, 'scheduler'))
             self.assertEqual(body['result']['outcome'], 'failed'); self.assertEqual(body['result']['files'], {})
-            for text in ('pyrycode/pyrycode#3289', '2026-10-14 06:31:47Z', 'credential-shaped text', str(folder), 'Nothing was published'):
+            for text in ('pyrycode/pyrycode#3289', '2026-10-14 06:31:47Z', 'credential-shaped text', 'prepare-repair with 409',
+                         'task 58915c353ee7', 'Nothing was published', '12 consecutive passes'):
                 self.assertIn(text, body['result']['summary'])
+            self.assertNotIn(d, body['result']['summary'])
             saved = json.loads(receipt.read_text())
             self.assertEqual(saved['phase'], 'complete'); self.assertEqual(saved['finalized']['result'], body['result'])
             self.assertEqual((item['kind'], item['action'], item['ticket'], item['phase'], item['worker']),
                              ('finalized', 'released', 'pyrycode/pyrycode#3289', 'finalizing', 'finished'))
-            self.assertEqual([e['kind'] for e in f.logged], ['native-task-skipped', 'native-task-finalized'])
+            self.assertEqual([e['kind'] for e in f.logged], ['native-task-skipped', 'watchdog-stalled', 'native-task-finalized'])
             for name in ('result.json', 'publication.json', 'execution.log', 'task.json'):
                 self.assertTrue((folder / name).is_file(), name)
             # The ordinary pass leaves a finalized record alone: no publication, no artifact return.
@@ -135,60 +148,132 @@ class FinishedButRefused(unittest.TestCase):
             self.assertEqual([op for op, _ in f.calls], ['capabilities', 'schedule'])
             self.assertEqual((notice['kind'], notice['ticket']), ('finalized', 'pyrycode/pyrycode#3289'))
 
+    def refused_passes(self, f, refusals, passes=12, start=FINISHED + 60):
+        """One watchdog pass a minute with the given refusals. Returns the last items."""
+        items = []
+        for minute in range(passes):
+            f.now[0] = start + 60 * minute
+            items = f.watchdog.tick(refusals(minute) if callable(refusals) else refusals)
+        return items
+
     def test_never_finished_automatically_unless_every_condition_holds(self):
+        timeout = m.rpc_failure('prepare-repair', 1, 'Error: The operation was aborted due to timeout\nNode.js v24.13.0')
+        lost = m.rpc_failure('prepare-repair', 1, 'TypeError: fetch failed')
         cases = [
             ('a publication may be in progress', {'phase': 'publishing', 'drainConfirmed': True}, {TASK: REFUSAL}, {}),
             ('drainage not proven by the supervisor', {}, {TASK: REFUSAL}, {}),
             ('the native task pass itself failed', {'drainConfirmed': True}, None, {}),
-            ('no refusal in this pass', {'drainConfirmed': True}, {}, {}),
+            ('no refusal', {'drainConfirmed': True}, {}, {}),
+            ('a refusal of publication itself', {'drainConfirmed': True}, {TASK: {**REFUSAL, 'operation': 'publish-repair'}}, {}),
+            ('a server error, not a refusal', {'drainConfirmed': True}, {TASK: {**REFUSAL, 'status': 500}}, {}),
             ('automatic finishing turned off', {'drainConfirmed': True}, {TASK: REFUSAL}, {'finalize': False}),
+            ('a single refusal among lost replies', {'drainConfirmed': True}, lambda minute: {TASK: REFUSAL} if minute == 11 else {}, {}),
+            ('refusals that keep changing', {'drainConfirmed': True}, lambda minute: {TASK: {**REFUSAL, 'detail': str(minute % 2)}}, {}),
         ]
-        for name, receipt_fields, errors, settings in cases:
+        for name, receipt_fields, refusals, settings in cases:
             with self.subTest(name), tempfile.TemporaryDirectory() as d:
                 f = Fleet(d, **settings)
                 fields = dict(receipt_fields)
                 folder, receipt = f.task(phase=fields.pop('phase', 'running'), **fields)
                 with patch.object(m, 'process_snapshot', return_value={}), patch.object(m, 'observe_custody', return_value='alive'):
-                    f.now[0] = FINISHED + 60
-                    self.assertEqual(f.watchdog.tick(errors), [])
-                    f.now[0] = FINISHED + 3600
-                    items = f.watchdog.tick(errors)
+                    items = self.refused_passes(f, refusals, passes=60)
                 self.assertEqual(f.ops('complete'), [])
                 self.assertNotEqual(json.loads(receipt.read_text())['phase'], 'complete')
                 [item] = items
                 self.assertEqual((item['kind'], item['action']), ('stalled', 'attention'))
                 self.assertIn('pyrycode/pyrycode#3289', item['ticket'])
+        # Timeouts, lost connections and local crashes are never refusals.
+        for error in (timeout, lost):
+            self.assertIsNone(m.service_refusal(error))
+            self.assertIn('without a service reply', str(error)); self.assertNotIn('Node.js', str(error))
+
+    def test_a_first_refusal_after_a_long_gap_still_waits_the_full_limit(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Fleet(d)
+            f.task(drainConfirmed=True)
+            # Hours of lost replies, then refusals start: the result is old, the refusals are not.
+            items = self.refused_passes(f, {TASK: REFUSAL}, passes=10, start=FINISHED + 3 * 3600)
+            self.assertEqual(f.ops('complete'), [])
+            self.assertEqual(items[0]['kind'], 'stalled')
+            self.refused_passes(f, {TASK: REFUSAL}, passes=2, start=f.now[0] + 60)
+            self.assertEqual(len(f.ops('complete')), 1)
 
     def test_finishing_waits_for_the_limit_from_the_result_and_later_worker_writes(self):
         with tempfile.TemporaryDirectory() as d:
             f = Fleet(d)
             folder, receipt = f.task(drainConfirmed=True)
-            (folder / 'reviewer.log').write_text('late write'); stamp(folder / 'reviewer.log', FINISHED + 200)
+            (folder / 'reviewer.log').write_text('late write'); stamp(folder / 'reviewer.log', FINISHED + 900)
             # Supervisor-written files are not worker progress.
             for name in ('artifact-result.json', 'execution.custody.json'):
-                (folder / name).write_text('{}'); stamp(folder / name, FINISHED + 590)
-            f.now[0] = FINISHED + 700
-            self.assertEqual(f.watchdog.tick({TASK: REFUSAL}), [])
-            f.now[0] = FINISHED + 801
-            self.assertEqual(f.watchdog.tick({TASK: REFUSAL})[0]['kind'], 'finalized')
+                (folder / name).write_text('{}'); stamp(folder / name, FINISHED + 1490)
+            # Files are written as time passes here, so none counts as dated in the future.
+            with patch.object(w, 'FUTURE_MARGIN', 10 ** 6):
+                self.refused_passes(f, {TASK: REFUSAL}, passes=25)
+            self.assertEqual(f.ops('complete'), [])
+            self.refused_passes(f, {TASK: REFUSAL}, passes=1, start=FINISHED + 1501)
+            self.assertEqual(len(f.ops('complete')), 1)
+
+    def test_a_result_dated_in_the_future_counts_as_now(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Fleet(d)
+            folder, receipt = f.task(drainConfirmed=True)
+            stamp(folder / 'result.json', FINISHED + 10 ** 7)
+            # Counted from the first pass that saw it, at +60 s, not deferred by the future date.
+            self.assertEqual(self.refused_passes(f, {TASK: REFUSAL}, passes=11), [])
+            [item] = self.refused_passes(f, {TASK: REFUSAL}, passes=1, start=f.now[0] + 60)
+            self.assertEqual((item['kind'], item['since']), ('finalized', FINISHED + 60))
+            self.assertIn('finished at 2026-10-14 06:43:47Z', item['reason'])
 
     def test_a_refused_release_is_reported_and_retried_with_the_identical_result(self):
         with tempfile.TemporaryDirectory() as d:
             f = Fleet(d)
             folder, receipt = f.task(drainConfirmed=True)
-            f.refuse['complete'] = 'Control service refused complete: Task actor mismatch'
-            f.now[0] = FINISHED + 700
-            [item] = f.watchdog.tick({TASK: REFUSAL})
+            f.refuse['complete'] = 'Service 409: {"error":"Task state is publishing, not running or attention"}'
+            [item] = self.refused_passes(f, {TASK: REFUSAL})
             self.assertEqual((item['kind'], item['action']), ('finalize-refused', 'attention'))
-            self.assertIn('Task actor mismatch', item['reason'])
+            self.assertIn('Task state is publishing', item['reason'])
             self.assertEqual(json.loads(receipt.read_text())['phase'], 'running')
             first = json.loads(receipt.read_text())['finalized']['result']
             del f.refuse['complete']
-            f.now[0] += 60
-            self.assertEqual(f.watchdog.tick({TASK: REFUSAL})[0]['kind'], 'finalized')
+            self.refused_passes(f, {TASK: REFUSAL}, passes=1, start=f.now[0] + 60)
             self.assertEqual([b['result'] for b in f.ops('complete')], [first, first])
-            self.assertEqual([e['kind'] for e in f.logged], ['watchdog-finalize-refused', 'native-task-finalized'])
+            self.assertEqual(json.loads(receipt.read_text())['finalized']['released'], True)
+            self.assertEqual([e['kind'] for e in f.logged][-2:], ['watchdog-finalize-refused', 'native-task-finalized'])
 
+    def test_a_different_outcome_already_held_stops_the_retries(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Fleet(d)
+            folder, receipt = f.task(drainConfirmed=True)
+            f.refuse['complete'] = 'Service 409: {"error":"Completed task result changed"}'
+            [item] = self.refused_passes(f, {TASK: REFUSAL}, passes=20)
+            self.assertEqual(len(f.ops('complete')), 1)
+            self.assertEqual(item['kind'], 'finalize-refused'); self.assertIn('Reconcile the task', item['reason'])
+            self.assertEqual(json.loads(receipt.read_text())['phase'], 'running')
+
+    def test_an_exited_worker_without_the_supervisors_drain_proof_is_never_finished(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Fleet(d)
+            folder, receipt = f.task()
+            with patch.object(m, 'process_snapshot', return_value={}), patch.object(m, 'observe_custody', return_value='drained'):
+                [item] = self.refused_passes(f, {TASK: REFUSAL}, passes=60)
+            self.assertEqual((item['kind'], item['worker']), ('stalled', 'exited'))
+            self.assertIn('full drainage is not yet confirmed', item['reason'])
+            self.assertEqual(f.ops('complete'), [])
+
+    def test_the_ordinary_pass_refusal_is_typed_from_the_real_operator_output(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Fleet(d)
+            folder, receipt = f.task(drainConfirmed=True)
+            operator = Path(d) / 'operator'
+            operator.write_text('#!/bin/sh\necho \'Service 409: {"error":"Repair contains credential-shaped text; retain it privately"}\' >&2\nexit 1\n')
+            operator.chmod(0o700)
+            f.adapter.operator_command = lambda *args: [str(operator), *args]
+            del f.support.rpc
+            running = []
+            with patch.object(m, 'process_snapshot', return_value={}), self.assertRaises(m.ServiceRefusal) as caught:
+                f.support.receipt_pass('pyrybox', receipt, running)
+            self.assertEqual((caught.exception.operation, caught.exception.status), ('prepare-repair', 409))
+            self.assertEqual(caught.exception.detail, DETAIL)
 
 class DeadOrSilentWorkers(unittest.TestCase):
     """#3247 and #1809: repair workers that died, and live workers that went quiet."""
@@ -258,7 +343,7 @@ class DeadOrSilentWorkers(unittest.TestCase):
 
 
 class DispatcherRunsAndStarvation(unittest.TestCase):
-    def dispatcher_run(self, f, ticket='pyrycode/pyrycode#3324', role='builder', created=FINISHED - 7200, log_at=None, project='pyrycode/pyrycode'):
+    def dispatcher_run(self, f, ticket='pyrycode/pyrycode#3324', role='builder', created=FINISHED - 9000, log_at=None, project='pyrycode/pyrycode'):
         logs = Path(f.config['projects'][project]['agents']) / 'logs'; logs.mkdir(parents=True, exist_ok=True)
         number = ticket.rsplit('#', 1)[1]
         log = logs / ('2026-10-14T07-18-49-658Z_' + role + '_#' + number + '.log'); log.write_text('working')
@@ -277,7 +362,7 @@ class DispatcherRunsAndStarvation(unittest.TestCase):
             stamp(logs / 'old_builder_#3324.log', FINISHED - 9000)
             [item] = f.watchdog.tick({})
             self.assertEqual((item['kind'], item['worker'], item['phase'], item['ticket']), ('stalled', 'dispatcher', 'builder', 'pyrycode/pyrycode#3324'))
-            self.assertEqual(item['lastProgress'], FINISHED - 7200 + 60)
+            self.assertEqual(item['lastProgress'], FINISHED - 9000 + 60)
             self.assertIn('nothing is released', item['reason'])
             stamp(log, FINISHED - 100)
             self.assertEqual(f.watchdog.tick({}), [])
@@ -383,6 +468,48 @@ class SupervisorWiring(unittest.TestCase):
         self.assertEqual((item['kind'], item['action']), ('error', 'attention'))
         self.assertIn('manager unavailable at <path>', item['reason'])
         self.assertEqual(published['operations'], [])
+
+
+class SupervisorFailures(unittest.TestCase):
+    def run_once(self, settings, watchdog_source=None):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / 'fleet-supervisor.py').write_bytes(Path(__file__).with_name('fleet-supervisor.py').read_bytes())
+            (root / 'fleet-watchdog.py').write_text(watchdog_source or Path(__file__).with_name('fleet-watchdog.py').read_text())
+            (root / 'fleet-native.py').write_text('''class NativeAdapter:
+    def __init__(self, config): pass
+    def desired(self): return {}
+    def status(self): return {'machine': 'pyrybox', 'runs': [], 'queue': [], 'heavyLimit': 1}
+    def attention(self): return {}
+    def publish_attention(self): pass
+''')
+            state = root / 'state'; state.mkdir()
+            (state / 'housekeeping.jsonl').write_text(''.join(json.dumps({'at': time.time(), 'kind': k, 'subject': 's', 'reason': 'r'}) + '\n'
+                                                            for k in ['watchdog-stalled'] * 30 + ['operation-retired']))
+            report = root / 'report.json'; config = root / 'config.json'
+            config.write_text(json.dumps({'stateDirectory': str(state), 'reportFile': str(report), 'projects': {}, **settings}))
+            config.chmod(0o600)
+            result = subprocess.run([sys.executable, str(root / 'fleet-supervisor.py'), str(config), '--once'], capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(report.read_text())
+
+    def test_bad_settings_fall_back_to_defaults_and_say_so(self):
+        published = self.run_once({'watchdog': {'finalize': 'yes', 'starvationSeconds': -5, 'recipeBudgetSeconds': {'x': 'y'}, 'launchSeconds': 30}})
+        [item] = published['watchdog']
+        self.assertEqual(item['kind'], 'error')
+        self.assertIn('finalize, recipeBudgetSeconds, starvationSeconds', item['reason'])
+        value, rejected = w.settings({'watchdog': {'launchSeconds': 30, 'finalize': 1}})
+        self.assertEqual((value['launchSeconds'], value['finalize'], rejected), (30, True, ['finalize']))
+
+    def test_a_watchdog_that_cannot_load_never_stops_the_supervisor(self):
+        published = self.run_once({}, watchdog_source='raise ImportError("broken at /private/x")\n')
+        [item] = published['watchdog']
+        self.assertEqual(item['kind'], 'error')
+        self.assertIn('Watchdog could not start. ImportError: broken at <path>', item['reason'])
+
+    def test_watchdog_findings_do_not_crowd_the_housekeeping_list(self):
+        published = self.run_once({})
+        self.assertEqual([h['kind'] for h in published['housekeeping']], ['operation-retired'])
 
 
 if __name__ == '__main__':

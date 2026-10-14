@@ -234,10 +234,16 @@ export class FleetStore {
     this.db.prepare('DELETE FROM fleet_claims WHERE ticket=? AND NOT EXISTS (SELECT 1 FROM fleet_runs WHERE ticket=? AND finished IS NULL)')
       .run(row.ticket,row.ticket);
   }
-  taskComplete(machine: string, id: string, session: string, result: RecoveryTaskResult) {
+  /** expectStates makes the release conditional on the task's current state, read in the same transaction. */
+  taskComplete(machine: string, id: string, session: string, result: RecoveryTaskResult, expectStates?: unknown) {
     return this.transaction(() => {
       const task=this.tasks.get(id);
       if (task.machine!==machine || task.session!==session || !task.runId) throw new Error('Task actor mismatch');
+      if (expectStates!==undefined) {
+        if (!Array.isArray(expectStates) || !expectStates.length || expectStates.some(s=>typeof s!=='string')) throw new Error('Invalid expected task states');
+        // A terminal task answers through complete's own identical-result check, so a lost reply can be retried.
+        if (!['complete','failed'].includes(task.state) && !expectStates.includes(task.state)) throw new Error(`Task state is ${task.state}, not ${expectStates.join(' or ')}`);
+      }
       const completed=this.tasks.complete(id,machine,session,result);
       this.releaseTaskRun(task.runId,machine,session,result.outcome==='completed');
       return completed;
