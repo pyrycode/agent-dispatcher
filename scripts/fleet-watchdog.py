@@ -34,8 +34,8 @@ DEFAULTS = {
     'runningMarginSeconds': 900,
     'recipeBudgetSeconds': {
         'platform-probe': 300,
-        # Two go test commands of up to an hour each, plus the checkout.
-        'memory-runtime-smoke': 8400,
+        # Three go test commands of up to an hour each, plus the checkout.
+        'memory-runtime-smoke': 12000,
         # One capture command of up to an hour, plus two checkouts.
         'android-tool-then-text': 6000,
         # The repair program's own limit.

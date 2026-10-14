@@ -24,6 +24,127 @@ def artifact_reply(operation,body):
  return []
 
 class SupportTests(unittest.TestCase):
+ def run_memory_recipe(self,directory,records,exits=(0,0,0),capability='linux-amd64'):
+  commands=[]
+  def execute(argv,cwd,log,env):
+   commands.append((argv,cwd,dict(env)))
+   # Counted installer evidence alone reproduced #3290 with zero exits.
+   if len(commands)==2 and 'smoke.json' in records:
+    with (directory/'smoke.json').open('w',newline='') as record:record.write(records['smoke.json'])
+   if len(commands)==3 and 'memory-owner.json' in records:
+    with (directory/'memory-owner.json').open('w',newline='') as record:record.write(records['memory-owner.json'])
+   if exits[len(commands)-1]!=0:
+    for name,data in records.items():
+     with (directory/name).open('w',newline='') as record:record.write(data)
+   return exits[len(commands)-1]
+  def clone(source,destination,revision):destination.mkdir()
+  task={'request':{'recipe':'memory-runtime-smoke','capability':capability,'revision':'a'*40,'reason':'Full product candidate native checks'}}
+  with patch.object(m,'clone',side_effect=clone) as cloned,patch.object(m,'execute',side_effect=execute):
+   result=m.native_recipe(task,{'core':'configured-core'},directory)
+  cloned.assert_called_once_with('configured-core',directory/'core',task['request']['revision'])
+  return result,commands
+ def test_memory_smoke_runs_installer_and_owner_on_full_candidate_for_both_capabilities(self):
+  records={'smoke.json':'{ "executed": 2, "passed": 2, "suite": "installer" }\r\n',
+           'memory-owner.json':'{ "executed": 3, "passed": 3, "suite": "owner" }\r\n'}
+  for capability in ['linux-amd64','macos-arm64']:
+   with self.subTest(capability=capability),tempfile.TemporaryDirectory() as d:
+    directory=Path(d)
+    with patch.dict(m.os.environ,{'PATH':'test-path','FLEET_ADMIN':'private','GITHUB_TOKEN':'private','GH_TOKEN':'private',
+       'OP_SERVICE_ACCOUNT_TOKEN':'private','PYRY_MANAGER_TOKEN':'private','PYRY_MANAGER_URL':'private','PYRY_DEV_AGENTS_TOKEN':'private',
+       'PYRY_LIVE_CLAUDE_TOKEN':'private','ANTHROPIC_API_KEY':'private','CLAUDE_CODE_OAUTH_TOKEN':'private',
+       'PYRY_MEMORY_SMOKE_EVIDENCE':'inherited-smoke','PYRY_MEMORY_OWNER_EVIDENCE':'inherited-owner'},clear=True):
+     result,commands=self.run_memory_recipe(directory,records,capability=capability)
+    self.assertEqual(result['outcome'],'completed')
+    self.assertEqual(result['files'],records)
+    self.assertEqual([command[0] for command in commands],[
+       ['go','test','-race','-count=1','./internal/memoryruntime'],
+       ['go','test','-tags','memory_runtime_smoke','-run','^TestSmoke$','-count=1','-v','./internal/memoryruntime'],
+       ['go','test','-tags','memory_runtime_smoke','-run','^TestSmoke$','-count=1','-v','./cmd/pyry']])
+    for _,cwd,env in commands:
+     self.assertEqual(cwd,directory/'core')
+     self.assertEqual(env,{'PATH':'test-path','PYRY_MEMORY_SMOKE_EVIDENCE':str(directory/'smoke.json'),
+                          'PYRY_MEMORY_OWNER_EVIDENCE':str(directory/'memory-owner.json')})
+ def test_memory_smoke_requires_owner_evidence_even_when_installer_and_commands_pass(self):
+  records={'smoke.json':'{"executed":2,"passed":2}\n'}
+  with tempfile.TemporaryDirectory() as d:
+   result,_=self.run_memory_recipe(Path(d),records)
+  self.assertEqual(result['outcome'],'failed')
+  self.assertEqual(result['files'],records)
+ def test_memory_smoke_rejects_invalid_counts_and_retains_both_produced_records(self):
+  invalid=['','{','{"executed":1,"passed":1} trailing','[]','null','true','1','"record"','{}',
+           '{"executed":1}','{"passed":1}','{"executed":2,"passed":1}',
+           '{"executed":'+('1'*5000)+',"passed":1}', '['*2000+'0'+']'*2000]
+  for value in [True,False,'1',1.0,0,-1,None]:
+   invalid.extend([json.dumps({'executed':value,'passed':value}),
+                   json.dumps({'executed':value,'passed':1}),json.dumps({'executed':1,'passed':value})])
+  for constant in ['NaN','Infinity','-Infinity']:
+   invalid.extend([constant,
+                   '{"executed":'+constant+',"passed":1}',
+                   '{"executed":1,"passed":'+constant+'}',
+                   '{"executed":1,"passed":1,"nested":{"values":[{"constant":'+constant+'}]}}'])
+  valid='{"executed":1,"passed":1}\r\n'
+  for name in ['smoke.json','memory-owner.json']:
+   for evidence in [None,*invalid]:
+    with self.subTest(record=name,evidence=evidence),tempfile.TemporaryDirectory() as d:
+     directory=Path(d);records={'smoke.json':valid,'memory-owner.json':valid}
+     if evidence is None:del records[name]
+     else:records[name]=evidence+'\r\n'
+     result,_=self.run_memory_recipe(directory,records)
+     self.assertEqual(result['outcome'],'failed')
+     self.assertEqual(result['files'],records)
+     for record,data in records.items():self.assertEqual((directory/record).read_bytes(),data.encode())
+ def test_memory_smoke_requires_every_command_to_pass_and_retains_available_evidence(self):
+  records={'smoke.json':'{"executed":1,"passed":1}\n','memory-owner.json':'{"executed":1,"passed":1}\n'}
+  for index in range(3):
+   with self.subTest(command=index),tempfile.TemporaryDirectory() as d:
+    exits=[0,0,0];exits[index]=1
+    result,commands=self.run_memory_recipe(Path(d),records,exits)
+    self.assertEqual(result['outcome'],'failed')
+    self.assertEqual(len(commands),index+1)
+    self.assertEqual(result['files'],records)
+ def test_memory_smoke_fails_without_records(self):
+  with tempfile.TemporaryDirectory() as d:
+   result,_=self.run_memory_recipe(Path(d),{})
+  self.assertEqual(result['outcome'],'failed')
+  self.assertEqual(result['files'],{})
+ def test_memory_smoke_over_four_mib_uses_the_current_manifest_contract(self):
+  records={'smoke.json':'{"executed":1,"passed":1}\r\n',
+           'memory-owner.json':json.dumps({'executed':1,'passed':1,'diagnostic':'x'*(4*1024*1024)})+'\r\n'}
+  with tempfile.TemporaryDirectory() as d:
+   directory=Path(d);result,_=self.run_memory_recipe(directory,records)
+   self.assertEqual((directory/'memory-owner.json').read_bytes(),records['memory-owner.json'].encode())
+  self.assertEqual(result['outcome'],'completed')
+  self.assertEqual(result['files'],records)
+  manifest=m.artifact_manifest(result['files'])
+  self.assertGreater(manifest['totalBytes'],4*1024*1024)
+  self.assertLessEqual(manifest['totalBytes'],m.ARTIFACT_BYTES)
+  for entry in manifest['files']:
+   data=records[entry['path']].encode()
+   self.assertEqual(entry['bytes'],len(data))
+   self.assertEqual(entry['sha256'],hashlib.sha256(data).hexdigest())
+   self.assertEqual(entry['chunks'],[hashlib.sha256(data[i:i+m.CHUNK_BYTES]).hexdigest() for i in range(0,len(data),m.CHUNK_BYTES)])
+ def test_memory_smoke_preserves_private_records_when_current_total_bounds_are_exceeded(self):
+  records={'smoke.json':'{"executed":1,"passed":1}\r\n','memory-owner.json':'{"executed":1,"passed":1}\r\n'}
+  limit=sum(len(data.encode()) for data in records.values())-1
+  with tempfile.TemporaryDirectory() as d:
+   directory=Path(d)
+   with patch.object(m,'ARTIFACT_BYTES',limit),self.assertRaisesRegex(RuntimeError,'Task artifacts exceed total bounds'):
+    self.run_memory_recipe(directory,records)
+   for name,data in records.items():self.assertEqual((directory/name).read_bytes(),data.encode())
+ def test_memory_smoke_worker_returns_malformed_records_as_failed_diagnostics(self):
+  records={'smoke.json':'malformed installer\r\n','memory-owner.json':'{"executed":1,"passed":1}\r\n'}
+  with tempfile.TemporaryDirectory() as d:
+   directory=Path(d)
+   m.atomic(directory/'task.json',{'request':{'recipe':'memory-runtime-smoke','capability':'linux-amd64','revision':'a'*40}})
+   m.atomic(directory/'paths.json',{'core':'configured-core'})
+   def execute(argv,cwd,log,env):
+    for name,data in records.items():
+     with (directory/name).open('w',newline='') as record:record.write(data)
+    return 0
+   with patch.object(m.sys,'argv',['fleet-support.py','--worker',d]),patch.object(m,'clone'),patch.object(m,'execute',side_effect=execute):m.main()
+   result=json.loads((directory/'result.json').read_text())
+   self.assertEqual(result['outcome'],'failed')
+   self.assertEqual(result['files'],records)
  def test_android_bundle_over_four_mib_keeps_every_record_and_execution_outcome(self):
   with tempfile.TemporaryDirectory() as d:
    directory=Path(d);capture=directory/'capture';capture.mkdir()

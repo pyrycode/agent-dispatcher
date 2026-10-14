@@ -318,7 +318,7 @@ const defaultBranch = resolveDefaultBranch(process.env.TARGET_DEFAULT_BRANCH);
 // with pyrycode + relay; consumers in other ecosystems set `SALVAGE_GATES`
 // (`;`-delimited shell commands), or `SALVAGE_GATES=""` to opt out of
 // gating entirely.
-const salvageGates = parseSalvageGates(process.env.SALVAGE_GATES);
+const configuredSalvageGates = parseSalvageGates(process.env.SALVAGE_GATES);
 
 // Environment variables this fork cannot work without, from
 // `PYRY_REQUIRED_ENV` (comma- or space-separated names). Empty by default,
@@ -1837,6 +1837,7 @@ async function attemptSaferSalvage(opts: {
   deps: DispatchDeps;
 }): Promise<boolean> {
   const { execSync, spawnSync, notifyDiscord } = opts.deps;
+  const salvageGates = opts.deps.salvageGates ?? configuredSalvageGates;
   try {
     const dirty = execSync(`git status --porcelain`, {
       cwd: opts.agentCwd, encoding: "utf-8", timeout: 15_000,
@@ -2049,6 +2050,7 @@ async function attemptPermissionDenialSalvage(opts: {
   deps: DispatchDeps;
 }): Promise<boolean> {
   const { execSync, spawnSync, notifyDiscord } = opts.deps;
+  const salvageGates = opts.deps.salvageGates ?? configuredSalvageGates;
   const label = `error:${opts.agent.name}:permission_denied`;
   try {
     const dirty = execSync(`git status --porcelain`, {
@@ -2307,6 +2309,8 @@ export interface DispatchClient {
 // `attemptSaferSalvage` accepts deps as part of its opts (called from
 // `handleAgentResultErrors`).
 export type DispatchDeps = {
+  /** Fixtures supply their own gates; production retains the consumer's startup policy. */
+  salvageGates?: readonly string[];
   // child_process
   execSync: typeof execSync;
   spawnSync: typeof spawnSync;

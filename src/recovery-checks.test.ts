@@ -8,8 +8,11 @@ import {syncBuiltinESMExports} from 'node:module';
 import {recoveryCheckEnv,runRecoveryCheck,repairDiagnostics} from './recovery-checks.js';
 
 test('repair checks do not inherit another consumers production role or checkout',()=>{
- const env=recoveryCheckEnv({PATH:'/tools',HOME:'/private/home',PYRY_STAGE_SET:'builder',PYRY_VERIFIER_GATES:'production gate',AGENTS_REPO_PATH:'/production/agents',TARGET_REPO_PATH:'/production/core',FLEET_ADMIN:'fixture',GITHUB_TOKEN:'fixture'});
- assert.deepEqual(env,{PATH:'/tools',HOME:'/private/home'});
+ for(const SALVAGE_GATES of ['', 'consumer-build --check']) {
+  const parent={PATH:'/tools',HOME:'/private/home',SALVAGE_GATES,PYRY_STAGE_SET:'builder',PYRY_VERIFIER_GATES:'production gate',AGENTS_REPO_PATH:'/production/agents',TARGET_REPO_PATH:'/production/core',FLEET_ADMIN:'fixture',GITHUB_TOKEN:'fixture'};
+  assert.deepEqual(recoveryCheckEnv(parent),{PATH:'/tools',HOME:'/private/home'});
+  assert.equal(parent.SALVAGE_GATES,SALVAGE_GATES,'check isolation must not change production policy');
+ }
 });
 
 test('real pnpm repairs mismatched stores with stdin ignored and the unchanged parent runs postinstall', {timeout:60000}, t=>{

@@ -327,6 +327,23 @@ class DeadOrSilentWorkers(unittest.TestCase):
             f.now[0] -= 2
             self.assertEqual(f.supervisor_pass(custody='alive'), [])
 
+    def test_memory_smoke_budget_includes_installer_and_owner_commands(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Fleet(d)
+            # Three hour-long commands and four checkout steps of five minutes.
+            budget = 3 * 3600 + 4 * 300
+            limit = budget + f.watchdog.settings['runningMarginSeconds']
+            folder, receipt = f.task(result=False, created=FINISHED - limit)
+            task = json.loads((folder / 'task.json').read_text())
+            task['request']['recipe'] = 'memory-runtime-smoke'
+            m.atomic(folder / 'task.json', task)
+            stamp(folder / 'task.json', FINISHED - limit)
+            self.assertEqual(f.supervisor_pass(custody='alive'), [])
+            f.now[0] += 1
+            [item] = f.supervisor_pass(custody='alive')
+            self.assertEqual((item['kind'], item['worker'], item['limitSeconds']), ('stalled', 'alive', limit))
+            self.assertEqual(f.ops('complete'), []); self.assertEqual(f.ops('uncertain'), [])
+
     def test_a_finding_is_recorded_once_and_its_text_is_stable_across_passes_and_restarts(self):
         with tempfile.TemporaryDirectory() as d:
             f = Fleet(d)

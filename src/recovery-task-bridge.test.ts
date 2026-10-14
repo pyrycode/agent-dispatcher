@@ -13,6 +13,59 @@ import {taskBridge} from './recovery-task-bridge.js';
 import {ARTIFACT_LIMITS,artifactManifest,manifestHash,sha256} from './recovery-artifacts.js';
 
 const execute=promisify(execFile);
+for(const capability of ['linux-amd64','macos-arm64'] as const) {
+ test(`the Python helper retrieves unchanged installer and owner records for ${capability}`,async t=>{
+  const store=new FleetStore(':memory:',{box:{heavyLimit:1,combinedLimit:2},native:{heavyLimit:1,combinedLimit:2}});
+  const authority=await serveFleet(store,{box:'box-token',native:'native-token'},'admin-token',0);
+  const address=authority.address();assert.ok(address&&typeof address!=='string');
+  const manager=new MachineManager({machine:'box',projects:['org/core'],heavyLimit:1,combinedLimit:2},new FleetClient('http://127.0.0.1:'+address.port,'box-token'));
+  const local=await serveManager(manager,{'org/core':'project-token'},'local-admin-token',0);
+  const localAddress=local.address();assert.ok(localAddress&&typeof localAddress!=='string');
+  const source={id:'builder',machine:'box',session:'s',project:'org/core',ticket:'org/core#3290',role:'builder',resource:'medium' as const,locks:[]};
+  assert.equal(store.start(source).ok,true);
+  const run=store.snapshot().runs.find(r=>r.id===source.id)!;
+  const bridge=await taskBridge(new JsonClient('http://127.0.0.1:'+localAddress.port,'project-token'),run);
+  const directory=mkdtempSync(join(tmpdir(),'memory-task-client-'));
+  t.after(async()=>{await bridge.close();await new Promise<void>(r=>local.close(()=>r()));await new Promise<void>(r=>authority.close(()=>r()));store.close();rmSync(directory,{recursive:true});});
+  const request={recipe:'memory-runtime-smoke' as const,capability,revision:'b'.repeat(40),reason:'Installer and owner evidence from the full pushed product candidate'};
+  const file=join(directory,'request.json');writeFileSync(file,JSON.stringify(request));
+  const helper=fileURLToPath(new URL('../scripts/fleet-task.py',import.meta.url));
+  const env={PATH:process.env.PATH,PYRY_TASK_SOCKET:bridge.socket};
+  const call=async(...args:string[])=>JSON.parse((await execute('python3',[helper,...args],{env})).stdout);
+  const task=await call('request',file);
+  assert.equal(task.ticket,source.ticket);assert.deepEqual(task.request,request);assert.equal(task.state,'queued');
+  assert.equal((await call('request',file)).id,task.id);
+  store.tasks.report('native',{capabilities:[capability],ready:true});
+  assert.equal(store.taskStart('native',task.id,'smoke').ok,true);
+  const records={'smoke.json':'{ "executed": 2, "passed": 2, "suite": "installer" }\r\n',
+                 'memory-owner.json':'{ "executed": 3, "passed": 3, "suite": "owner" }\r\n'};
+  const manifest=artifactManifest(records),digest=manifestHash(manifest);
+  const native=new JsonClient('http://127.0.0.1:'+address.port,'native-token');
+  const actor={id:task.id,session:'smoke'};
+  const begin=await native.call<{digest:string;missing:Record<string,number[]>}>('/tasks/artifacts-begin',{...actor,manifest});
+  assert.equal(begin.digest,digest);
+  for(const entry of manifest.files) for(const part of begin.missing[entry.path]) await native.call('/tasks/artifacts-put',{...actor,digest,path:entry.path,part,
+   data:Buffer.from(records[entry.path as keyof typeof records]).subarray(part*ARTIFACT_LIMITS.chunkBytes,(part+1)*ARTIFACT_LIMITS.chunkBytes).toString('base64')});
+  await native.call('/tasks/artifacts-commit',{...actor,digest,result:{outcome:'completed',summary:'Installer and owner checks passed',files:{}}});
+  const output=join(directory,'evidence');
+  const completed=await call('await',task.id,'--out',output);
+  assert.equal(completed.state,'complete');
+  assert.deepEqual(completed.result.files,manifest.files.map(entry=>entry.path));
+  assert.deepEqual(completed.request,request);
+  for(const [name,record] of Object.entries(records)) {
+   assert.equal(readFileSync(join(output,name),'utf8'),record);
+   assert.equal(statSync(join(output,name)).mode&0o777,0o600);
+  }
+  assert.equal(store.snapshot().claims.find(c=>c.ticket===source.ticket)?.machine,'box');
+  assert.equal(store.tasks.list(source.ticket).length,1);
+  const conflict=mkdtempSync(join(directory,'existing-evidence-'));
+  writeFileSync(join(conflict,'smoke.json'),'existing local evidence');
+  await assert.rejects(call('await',task.id,'--out',conflict),/Existing artifact differs/);
+  assert.equal(readFileSync(join(conflict,'smoke.json'),'utf8'),'existing local evidence');
+  assert.equal(readFileSync(join(conflict,'memory-owner.json'),'utf8'),records['memory-owner.json']);
+ });
+}
+
 test('the credential-free Python helper requests and retrieves native evidence through real admission',async t=>{
  const store=new FleetStore(':memory:',{box:{heavyLimit:1,combinedLimit:2},hp:{heavyLimit:1,combinedLimit:2}});
  const authority=await serveFleet(store,{box:'box-token',hp:'hp-token'},'admin-token',0);

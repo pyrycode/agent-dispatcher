@@ -287,15 +287,25 @@ def native_recipe(task,paths,directory):
     clone(paths['core'],core,request['revision'])
     env=clean_env()
     if recipe=='memory-runtime-smoke':
-        record=directory/'smoke.json';env['PYRY_MEMORY_SMOKE_EVIDENCE']=str(record)
+        records={'smoke.json':directory/'smoke.json','memory-owner.json':directory/'memory-owner.json'}
+        env['PYRY_MEMORY_SMOKE_EVIDENCE']=str(records['smoke.json'])
+        env['PYRY_MEMORY_OWNER_EVIDENCE']=str(records['memory-owner.json'])
         code=execute(['go','test','-race','-count=1','./internal/memoryruntime'],core,log,env)
         if code==0:code=execute(['go','test','-tags','memory_runtime_smoke','-run','^TestSmoke$','-count=1','-v','./internal/memoryruntime'],core,log,env)
-        if record.is_file():
-            files['smoke.json']=record.read_text()
-            counted=json.loads(files['smoke.json'])
-            if not counted.get('executed') or counted.get('passed')!=counted.get('executed'):code=1
-        elif code==0:code=1
-        summary='Native package and installer smoke execution completed.' if code==0 else 'Native check failed. Exact candidate and private diagnostic log retained.'
+        if code==0:code=execute(['go','test','-tags','memory_runtime_smoke','-run','^TestSmoke$','-count=1','-v','./cmd/pyry'],core,log,env)
+        # Retain every produced record before parsing, including failed diagnostics.
+        for name,record in records.items():
+            if record.is_file():
+                with record.open(encoding='utf-8',newline='') as evidence:files[name]=evidence.read()
+        def reject_constant(value):raise ValueError('Non-JSON numeric constant: '+value)
+        for name in records:
+            try:counted=json.loads(files.get(name,''),parse_constant=reject_constant)
+            except (ValueError,RecursionError):
+                code=1;continue
+            if (not isinstance(counted,dict) or type(counted.get('executed')) is not int
+                or counted['executed']<=0 or type(counted.get('passed')) is not int
+                or counted['passed']!=counted['executed']):code=1
+        summary='Native package, installer and owner smoke execution completed.' if code==0 else 'Native check failed. Exact candidate and private diagnostic log retained.'
     else:
         if os.environ.get('CLAUDE_CODE_OAUTH_TOKEN'):env['CLAUDE_CODE_OAUTH_TOKEN']=os.environ['CLAUDE_CODE_OAUTH_TOKEN']
         if os.environ.get('PYRY_LIVE_CLAUDE_TOKEN'):env['PYRY_LIVE_CLAUDE_TOKEN']=os.environ['PYRY_LIVE_CLAUDE_TOKEN']
