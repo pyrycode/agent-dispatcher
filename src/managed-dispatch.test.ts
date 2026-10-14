@@ -65,21 +65,36 @@ test("repair priority follows labels across builder, verification and live-gate 
 
 // Mobile #2148 / PR #2150, 2026-10-14: a saved verdict for a PR went to the
 // workflow store as a ticket comment and was refused as an unknown ticket.
-test("a PR comment is authorized against its ticket and goes to GitHub, not the workflow store", async () => {
+function prCommentClient(refuse?: string) {
   const managed = new ManagedDispatch("org/mobile", { PYRY_MANAGER_URL: "http://localhost:1", PYRY_MANAGER_TOKEN: "test" });
-  const calls: Array<{ path: string; ticket?: string }> = [];
-  (managed as any).connection = { call: async (path: string, body: any) => { calls.push({ path, ticket: body?.ticket }); return {}; } };
+  const calls: Array<{ path: string; ticket?: string; project?: string }> = [];
+  (managed as any).connection = { call: async (path: string, body: any) => {
+    calls.push({ path, ticket: body?.ticket, project: body?.project });
+    if (refuse && path === "/workflow/authorize") throw new Error(refuse);
+    return {};
+  } };
   (managed as any).state = { ...(managed as any).state, workflowProjects: ["org/mobile"], claims: [], runs: [] };
   const posted: Array<[number, number, string]> = [];
   const base = {
     addComment: async (_n: number, _body: string): Promise<void> => { throw new Error("ticket comments must go to the store"); },
     addPullRequestComment: async (n: number, pr: number, body: string): Promise<void> => { posted.push([n, pr, body]); },
   };
-  const client = managed.client(base);
+  return { client: managed.client(base), calls, posted };
+}
+
+test("a PR comment is authorized like a workflow write on its ticket and goes to GitHub, not the store", async () => {
+  const { client, calls, posted } = prCommentClient();
   await client.addPullRequestComment(2148, 2150, "## Verifier Review: #2148");
   assert.deepEqual(posted, [[2148, 2150, "## Verifier Review: #2148"]]);
-  assert.deepEqual(calls, [{ path: "/authorize", ticket: "org/mobile#2148" }], "only the ticket's ownership is checked; nothing reaches /workflow/comment");
+  assert.deepEqual(calls, [{ path: "/workflow/authorize", ticket: "org/mobile#2148", project: "org/mobile" }],
+    "the run-aware check on the ticket, and nothing reaches /workflow/comment");
   calls.length = 0;
   await client.addComment(2148, "ticket note");
   assert.deepEqual(calls.map(c => [c.path, c.ticket]), [["/authorize", "org/mobile#2148"], ["/workflow/comment", "org/mobile#2148"]], "ticket comments still go to the store");
+});
+
+test("a PR comment from a finished run is refused before anything reaches GitHub", async () => {
+  const { client, posted } = prCommentClient("Service 409: Workflow run has finished or lost ownership");
+  await assert.rejects(client.addPullRequestComment(2148, 2150, "late verdict"), /finished or lost ownership/);
+  assert.deepEqual(posted, []);
 });

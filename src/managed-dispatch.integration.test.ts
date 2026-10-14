@@ -269,3 +269,18 @@ test("withdrawing outdated offers preserves an already running job", async t => 
   assert.deepEqual(store.snapshot().runs, []);
   assert.equal(store.snapshot().claims[0]?.ticket, "org/core#1");
 });
+
+test("a PR comment's ownership check travels through the machine manager to the store (#2148 / PR #2150)", async t => {
+  const store = new FleetStore(":memory:", { mac: { heavyLimit: 1, combinedLimit: 1 } });
+  const claimsServer = await serveFleet(store, { mac: "mac-test" }, "admin-test", 0);
+  const manager = new MachineManager({ machine: "mac", heavyLimit: 1, combinedLimit: 1, projects: ["org/core"] }, new FleetClient(url(claimsServer), "mac-test"));
+  const managerServer = await serveManager(manager, { "org/core": "project-test" }, "operator-test", 0);
+  const managed = new ManagedDispatch("org/core", { PYRY_MANAGER_URL: url(managerServer), PYRY_MANAGER_TOKEN: "project-test" });
+  t.after(async () => { await close(managerServer); await close(claimsServer); store.close(); });
+  const posted: number[] = [];
+  const client = managed.client({ addPullRequestComment: async (_n: number, pr: number, _body: string) => { posted.push(pr); } });
+  // No claim and no admitted run: the store's own refusal comes back, not
+  // the manager's "Unsupported project workflow operation".
+  await assert.rejects(client.addPullRequestComment(3248, 3250, "verdict"), /Unclaimed workflow writes require a run grant/);
+  assert.deepEqual(posted, []);
+});
