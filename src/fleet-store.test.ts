@@ -226,3 +226,21 @@ test("reopening with a lower combined limit keeps medium reservations occupied",
   restarted.finish("mac", "session-1", "b");
   assert.equal(restarted.start(request("new", "mac", "org/core#3")).ok, true);
 });
+
+test("a light merge is admitted at full capacity and stays singly owned", async t => {
+  const { mergeOfferShape } = await import("./managed-dispatch.js");
+  const { store } = fixture(t);
+  const merge = (id: string, machine: string, ticket: string) => ({ ...request(id, machine, ticket), ...mergeOfferShape("org/mobile") });
+  assert.equal(store.start(request("doc", "mac", "org/mobile#1977")).ok, true);
+  store.finish("mac", "session-1", "doc");
+  // Both heavy places on the owner are taken.
+  assert.equal(store.start(request("h1", "mac", "org/core#1")).ok, true);
+  assert.equal(store.start(request("h2", "mac", "org/core#2")).ok, true);
+  assert.deepEqual(store.start(merge("foreign", "linux", "org/mobile#1977")), { ok: false, reason: "foreign-claim" });
+  assert.equal(store.start(merge("m1", "mac", "org/mobile#1977")).ok, true);
+  // A second merge on the board waits for the first, on any computer.
+  assert.deepEqual(store.start(merge("m2", "linux", "org/mobile#1978")), { ok: false, reason: "locked" });
+  assert.deepEqual(store.start(merge("m1b", "mac", "org/mobile#1977")), { ok: false, reason: "running" });
+  store.finish("mac", "session-1", "m1");
+  assert.equal(store.start(merge("m2", "linux", "org/mobile#1978")).ok, true);
+});
