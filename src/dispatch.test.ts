@@ -12676,16 +12676,15 @@ describe("runAutoMerge: mergeability still settling", () => {
     assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1977 && c.label === "done:documentation"));
   });
 
-  test("#1977 shape: refused as not mergeable, then GitHub says MERGEABLE → merged at once, no conflict counted", async () => {
-    // The post-rebase read raced too and saw a stale MERGEABLE of the old head.
-    const { client, deps, calls, merges } = setup({ views: [`MERGEABLE ${HEAD2}`, `MERGEABLE ${HEAD}`], merges: ["refused", "ok"] });
+  test("#1977 shape: refused as not mergeable, then GitHub says MERGEABLE for the same head → merged at once, no conflict counted", async () => {
+    const { client, deps, calls, merges } = setup({ views: [`MERGEABLE ${HEAD}`], merges: ["refused", "ok"] });
 
     await runAutoMerge(client, deps);
 
     assert.deepEqual(merges(), [
-      `gh pr merge 1980 --merge --delete-branch --match-head-commit ${HEAD2}`,
       `gh pr merge 1980 --merge --delete-branch --match-head-commit ${HEAD}`,
-    ], "one immediate retry, of the head GitHub then reported");
+      `gh pr merge 1980 --merge --delete-branch --match-head-commit ${HEAD}`,
+    ], "one immediate retry, of the same head");
     assert.ok(!client.addLabelCalls.some(c => c.label.startsWith("merge-attempt:") || c.label === "error:merge-conflict"));
     assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1977 && c.label === "done:documentation"));
     assert.ok(calls.exec.some(c => c.cmd === "git checkout main && git pull"), "post-merge bookkeeping still runs");
@@ -12731,6 +12730,16 @@ describe("runAutoMerge: mergeability still settling", () => {
     assert.deepEqual(merges(), [`gh pr merge 1980 --merge --delete-branch --match-head-commit ${HEAD}`]);
     assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1977 && c.label === "done:documentation"));
     assert.deepEqual(client.addLabelCalls, []);
+  });
+
+  test("head moved between the refusal and the re-read → not merged unseen, retried next cycle uncounted", async () => {
+    const { client, deps, merges } = setup({ views: [`MERGEABLE ${HEAD2}`, `MERGEABLE ${HEAD}`], merges: ["refused", "ok"] });
+
+    await runAutoMerge(client, deps);
+
+    assert.deepEqual(merges(), [`gh pr merge 1980 --merge --delete-branch --match-head-commit ${HEAD2}`], "the new head is never merged in this pass");
+    assert.deepEqual(client.addLabelCalls, []);
+    assert.deepEqual(client.removeLabelCalls, []);
   });
 
   test("CONFLICTING → counted as a conflict exactly as before", async () => {

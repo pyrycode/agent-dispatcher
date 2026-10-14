@@ -69,12 +69,15 @@ export function resourceClasses(raw: string | undefined): Record<string, Resourc
 /**
  * The managed offer for the post-merge codegraph refresh on one computer.
  * Medium, so it is charged against the computer's combined capacity like a
- * build. Named per computer: each computer refreshes its own checkout, and
- * the authority admits one unfinished run per name, so refreshes on one
- * computer never overlap.
+ * build. Named per computer and, through the offer's project prefix, per
+ * project: each computer refreshes its own checkout, and the authority
+ * admits one unfinished run per name, so refreshes of one checkout never
+ * overlap. It carries no ticket claim, so on a busy computer it waits
+ * behind claimed ticket work for a combined place; agents fall back to
+ * grep on a stale index meanwhile. Null for a name a ticket cannot carry.
  */
-export function codegraphOfferShape(machine: string): { ticket: string; role: "codegraph"; resource: ResourceClass; locks: string[]; order: number } {
-  if (!/^[\w.-]+$/.test(machine)) throw new Error("Invalid machine name for a codegraph refresh");
+export function codegraphOfferShape(machine: string): { ticket: string; role: "codegraph"; resource: ResourceClass; locks: string[]; order: number } | null {
+  if (!/^[\w.-]+$/.test(machine)) return null;
   return { ticket: `@codegraph-${machine}`, role: "codegraph", resource: "medium", locks: [], order: -1 };
 }
 
@@ -183,6 +186,7 @@ export class ManagedDispatch {
     const machine = (this.state as FleetSnapshot & { machine?: string }).machine;
     if (!machine) return null;
     const shape = codegraphOfferShape(machine);
+    if (shape === null) return null;
     return this.offer(shape.ticket, shape.role, shape.resource, shape.locks, shape.order);
   }
   mergeOffer(issue: number): Pending {

@@ -9070,8 +9070,15 @@ export async function runAutoMerge(
           }
           mergeUnknownSkips.delete(prNumber);
           if (after?.state !== "MERGEABLE") throw first;
+          // Retry only the head the first attempt was allowed to merge. A
+          // head that moved in between is one nobody read before merging;
+          // the next cycle reads it fresh.
+          if (before?.head && after.head !== before.head) {
+            console.warn(`   ⏳ PR #${prNumber} for #${item.issueNumber}: head moved from ${before.head.slice(0, 12)} to ${after.head?.slice(0, 12) ?? "unknown"} during the merge; retrying next cycle without counting a conflict`);
+            continue;
+          }
           console.log(`   🔁 PR #${prNumber} for #${item.issueNumber}: refused while GitHub was settling mergeability, now mergeable; merging again`);
-          merge(after.head);
+          merge(before?.head ?? after.head);
         }
         mergeUnknownSkips.delete(prNumber);
         await client.recordMergedIssue?.(item.issueNumber);

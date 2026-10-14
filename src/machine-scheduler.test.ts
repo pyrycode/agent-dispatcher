@@ -216,12 +216,12 @@ test("a Done ticket's merge starts beside a running heavy job, still singly owne
 
 test("the post-merge codegraph refresh is charged as medium work, one per computer", async () => {
   const { codegraphOfferShape } = await import("./managed-dispatch.js");
-  const shape = codegraphOfferShape("build-hp-1");
+  const shape = codegraphOfferShape("build-hp-1")!;
   assert.equal(shape.resource, "medium");
   assert.equal(shape.ticket, "@codegraph-build-hp-1");
   const refresh: WorkOffer = { project: "org/mobile", ...shape, ticket: `org/mobile#${shape.ticket}`, key: "c" };
   const full: FleetSnapshot = { claims: [], runs: [1, 2].map(n => ({ ...offer("org/core", n), resource: "medium" as const, id: `r${n}`, machine: "mac", session: "s", generation: "g", created: 1 })) };
   assert.deepEqual(scheduleMachine({ machine: "mac", heavyLimit: 1, combinedLimit: 2, projects: ["org/core", "org/mobile"], offers: [refresh], state: full }), [], "waits for a combined place");
   assert.equal(scheduleMachine({ machine: "mac", heavyLimit: 1, combinedLimit: 2, projects: ["org/core", "org/mobile"], offers: [refresh], state: { claims: [], runs: [] } }).length, 1);
-  assert.throws(() => codegraphOfferShape("bad name"), /Invalid machine/);
+  assert.equal(codegraphOfferShape("bad name"), null, "a name a ticket cannot carry skips the refresh instead of failing the cycle");
 });
