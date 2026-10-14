@@ -108,6 +108,13 @@ export interface StartRequest {
 export interface Claim { ticket: string; machine: string; generation: string; created: number }
 export interface FleetRun extends StartRequest { generation: string; created: number; runnerPolicy?: RunnerPolicy }
 export interface FleetSnapshot { workflowProjects?: string[]; claims: Claim[]; runs: FleetRun[]; runnerPolicy?: RunnerPolicy; idleRecoveryTickets?: string[]; priorityHighTickets?: string[]; releasedAssessmentClaims?: Claim[]; features?: {recoveryTasks:boolean}; requiredRepairs?: Record<string,string[]>; codexPause?: CodexPauseState;
+  /**
+   * Open tickets of adopted projects waiting for review with nothing holding
+   * them (see awaitsReview), whoever owns them. Present, possibly empty,
+   * whenever any project is adopted; an older claim service leaves it out,
+   * and a manager then applies no review queue limit.
+   */
+  reviewReadyTickets?: string[];
   /** Present only while a new Codex start would be refused for spacing. */
   codexSpacing?: CodexSpacingState }
 export type StartResult = { ok: true; generation: string } | {
@@ -655,6 +662,7 @@ export class FleetStore {
       ...(runnerPolicy ? { runnerPolicy } : {}),
       ...(idleRecoveryTickets.length ? { idleRecoveryTickets } : {}),
       ...(priorityHighTickets.length ? { priorityHighTickets } : {}),
+      ...(this.workflow.projects().length ? { reviewReadyTickets: this.workflow.reviewReadyTickets() } : {}),
       ...(releasedAssessmentClaims.length ? { releasedAssessmentClaims } : {}),
       claims: this.db.prepare("SELECT * FROM fleet_claims ORDER BY created,ticket").all() as unknown as Claim[],
       runs: this.db.prepare("SELECT request,generation,created FROM fleet_runs WHERE finished IS NULL ORDER BY created,id").all()

@@ -72,9 +72,42 @@ export function runnableTickets(machine: string, offers: readonly WorkOffer[], s
   ].filter(ticket => /#[1-9]\d*$/.test(ticket)));
 }
 
+/** A numbered ticket no computer owns yet. Taking it is taking a new ticket. */
+export function isNewTicket(ticket: string, state: FleetSnapshot): boolean {
+  return /#[1-9]\d*$/.test(ticket) && !state.claims.some(c => c.ticket === ticket);
+}
+
+/**
+ * This computer's review queue: tickets it owns, across all its projects,
+ * that the authority reports waiting for review and that no run holds,
+ * including a support task serving the ticket. Undefined when the claim
+ * service predates the report, so an older authority holds nothing.
+ */
+export function reviewQueue(machine: string, state: FleetSnapshot): string[] | undefined {
+  if (!state.reviewReadyTickets) return undefined;
+  const owned = new Set(state.claims.filter(c => c.machine === machine).map(c => c.ticket));
+  const running = new Set(state.runs.flatMap(r => r.parentTicket ? [r.ticket, r.parentTicket] : [r.ticket]));
+  return state.reviewReadyTickets.filter(t => owned.has(t) && !running.has(t));
+}
+
+/**
+ * The review queue limit in force: the configured reviewQueueLimit, or the
+ * heavy limit when none is set, since review takes a heavy place. 0 turns the
+ * hold off.
+ */
+export function effectiveReviewQueueLimit(limits: { heavyLimit: number; reviewQueueLimit?: number }): number {
+  return limits.reviewQueueLimit ?? limits.heavyLimit;
+}
+
 /** Offers are already eligible: blockers, errors and backoff belong to the dispatcher. */
 export function scheduleMachine(opts: {
   machine: string; projects: readonly string[]; drainingProjects?: readonly string[]; ticketLimit?: number;
+  /**
+   * While this computer has at least this many owned tickets waiting for
+   * review, it takes no new ticket. Owned work always continues. Defaults to
+   * heavyLimit; 0 turns the hold off. See reviewQueue.
+   */
+  reviewQueueLimit?: number;
   offers: readonly WorkOffer[]; state: FleetSnapshot;
 } & MachineLimits): WorkOffer[] {
   const claims = new Map(opts.state.claims.map(c => [c.ticket, c]));
@@ -88,6 +121,10 @@ export function scheduleMachine(opts: {
     [project, Math.max(0, limit - localRuns.filter(r => r.resource === "heavy" && heavyProject(r) === project).length)]));
   const runnable = runnableTickets(opts.machine, opts.offers, opts.state);
   let ticketPlaces = Math.max(0, (opts.ticketLimit ?? Infinity) - runnable.size);
+  const reviewLimit = effectiveReviewQueueLimit(opts);
+  // A ticket leaves the queue once a run selected here takes it.
+  const waitingReview = new Set(reviewQueue(opts.machine, opts.state) ?? []);
+  const reviewQueueFull = () => reviewLimit > 0 && opts.state.reviewReadyTickets !== undefined && waitingReview.size >= reviewLimit;
   const rank = new Map(opts.projects.map((p, i) => [p, i]));
   const priorityHigh = new Set(opts.state.priorityHighTickets ?? []);
   const ready = opts.offers.filter(o => rank.has(o.project) && (!claims.has(o.ticket) || claims.get(o.ticket)!.machine === opts.machine)
@@ -111,6 +148,7 @@ export function scheduleMachine(opts: {
     if (job.roleLimit !== undefined && [...opts.state.runs, ...selected].filter(r => countsForRoleLimit(r, job, opts.machine)).length >= job.roleLimit) continue;
     const newTicket = /#[1-9]\d*$/.test(job.ticket) && !claims.has(job.ticket);
     if (newTicket && ticketPlaces === 0) continue;
+    if (newTicket && reviewQueueFull()) continue;
     if (job.resource !== "light" && combinedPlaces === 0) continue;
     if (job.resource === "heavy" && heavyPlaces === 0) continue;
     if (job.resource === "heavy" && projectHeavy.get(heavyProject(job)) === 0) continue;
@@ -121,6 +159,8 @@ export function scheduleMachine(opts: {
     }
     if (job.resource !== "light") combinedPlaces--;
     if (newTicket) ticketPlaces--;
+    waitingReview.delete(job.ticket);
+    if (job.parentTicket) waitingReview.delete(job.parentTicket);
     active.add(job.ticket);
     job.locks.forEach(l => locks.add(l));
     selected.push(job);

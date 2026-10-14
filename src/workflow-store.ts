@@ -2,7 +2,7 @@ import type { EvidenceSeen } from "./evidence-revision.js";
 import type { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import type { ProjectItem } from "./types.js";
-import { RECOVERY_PRIORITY, RECOVERY_REPAIRING, LEGACY_RECOVERY_REPAIRING, LEGACY_RECOVERY_PRIORITY, WRITE_LEGACY_RECOVERY_PRIORITY, isRepairWip } from "./recovery-labels.js";
+import { RECOVERY_PRIORITY, RECOVERY_REPAIRING, LEGACY_RECOVERY_REPAIRING, LEGACY_RECOVERY_PRIORITY, WRITE_LEGACY_RECOVERY_PRIORITY, isRepairWip, hasRunningWip } from "./recovery-labels.js";
 
 export type WorkflowItem = ProjectItem & {
   state: "OPEN" | "CLOSED";
@@ -36,9 +36,38 @@ export interface FiledTicket {
 }
 const projectPattern = /^[\w.-]+\/[\w.-]+$/;
 
+/**
+ * Columns whose next stage is a review, with the done labels that mean that
+ * review has already passed. "In Code Review" is the builder set's verifier
+ * and the classic code-review; "In QA" is the classic qa.
+ */
+const REVIEW_COLUMNS: Record<string, readonly string[]> = {
+  "In Code Review": ["done:verifier", "done:code-review"],
+  "In QA": ["done:qa"],
+};
+
+/**
+ * True when an open ticket waits for its review stage and nothing holds it:
+ * no open blocker, no `error:` label, no rework on its way back
+ * (`needs-rework:`), no operator hold (`needs-human:` except sizing, or
+ * `health-hold:`), no running agent label and no passed review. The review
+ * queue limit counts these per owning computer. Added 2026-10-14:
+ * build-fractal-2 owned six runnable tickets, three of them waiting for its
+ * one heavy place, while build-hp-1 sat half idle.
+ */
+export function awaitsReview(item: Pick<WorkflowItem, "state" | "status" | "labels" | "blockedBy">): boolean {
+  const passed = REVIEW_COLUMNS[item.status];
+  return item.state === "OPEN" && passed !== undefined
+    && !item.labels.some(l => passed.includes(l) || l.startsWith("error:") || l.startsWith("needs-rework:")
+      || (l.startsWith("needs-human:") && l !== "needs-human:sizing") || l.startsWith("health-hold:"))
+    && !hasRunningWip(item.labels)
+    && !item.blockedBy.some(b => b.state === "OPEN");
+}
+
 /** Workflow authority. GitHub observations never overwrite an adopted ticket's controls. */
 export class WorkflowStore {
   private readonly labelTickets = new Map<string, { version: number; tickets: string[] }>();
+  private reviewTickets: { version: number; tickets: string[] } | undefined;
   constructor(private readonly db: DatabaseSync) {
     db.exec(`CREATE TABLE IF NOT EXISTS workflow_projects (project TEXT PRIMARY KEY, config TEXT NOT NULL) STRICT;
       CREATE TABLE IF NOT EXISTS workflow_migrations (project TEXT PRIMARY KEY) STRICT;
@@ -210,6 +239,32 @@ export class WorkflowStore {
     if (!inTransaction) this.labelTickets.set(label, { version, tickets });
     return [...tickets];
   }
+  /**
+   * Open tickets of adopted projects that wait for review, see awaitsReview,
+   * in ticket order, whoever owns them. Kept like openTicketsWithLabel, since
+   * every scheduler snapshot asks; a blocker's state is a ticket row too, so
+   * data_version covers it.
+   */
+  reviewReadyTickets(): string[] {
+    const inTransaction = (this.db as { isTransaction?: boolean }).isTransaction !== false;
+    const version = Number(this.db.prepare("PRAGMA data_version").get()?.data_version);
+    const kept = inTransaction ? undefined : this.reviewTickets;
+    if (kept && kept.version === version) return [...kept.tickets];
+    const columns = Object.keys(REVIEW_COLUMNS);
+    const tickets = this.db
+      .prepare(
+        `SELECT * FROM workflow_tickets
+         WHERE project IN (SELECT project FROM workflow_projects)
+           AND json_extract(item,'$.state') IS NOT 'CLOSED'
+           AND json_extract(item,'$.status') IN (${columns.map(() => "?").join(",")})
+         ORDER BY ticket`,
+      )
+      .all(...columns)
+      .filter((r) => awaitsReview(this.decode(r)))
+      .map((r) => String(r.ticket));
+    if (!inTransaction) this.reviewTickets = { version, tickets };
+    return [...tickets];
+  }
   config(project: string): WorkflowProject | undefined {
     return this.projects().find((p) => p.project === project);
   }
@@ -244,6 +299,7 @@ export class WorkflowStore {
   }
   transaction<T>(work: () => T): T {
     this.labelTickets.clear();
+    this.reviewTickets = undefined;
     this.db.exec("SAVEPOINT workflow");
     try {
       const value = work();
