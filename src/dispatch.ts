@@ -9,13 +9,15 @@ import { fileURLToPath } from "node:url";
 import { config } from "dotenv";
 import { githubPauseMs, freshGitHubRead } from "./github-transport.js";
 import { decidePollFailure, newPollOutage, pollRecovered, transientPollFailure } from "./poll-failure.js";
-import { runRecoveryWork, recoveryHandoff, parseRecoveryDecision, RECOVERY_INSTRUCTIONS, RECOVERY_EFFORT, RECOVERY_MAX_TURNS, RECOVERY_TIMEOUT_MS, cleanRecoveryLabels, repairStartComment } from "./recovery-work.js";
+import { runRecoveryWork, CodexRateLimitError, recoveryHandoff, parseRecoveryDecision, RECOVERY_INSTRUCTIONS, RECOVERY_EFFORT, RECOVERY_MAX_TURNS, RECOVERY_TIMEOUT_MS, cleanRecoveryLabels, repairStartComment } from "./recovery-work.js";
 import { RECOVERY_REPAIRING_LABELS, hasRunningWip } from "./recovery-labels.js";
 import { verifyCoordination } from "./recovery-coordination.js";
 import { recoveryInventory, relatedTickets, relatedEvidence } from "./recovery-evidence.js";
 import { recoveryLogContext } from "./recovery-context.js";
 import { RECOVERY_RETURNED_INBOX, type RecoveryIncident, type RecoveryDecision } from "./fleet-recovery.js";
-import { ManagedDispatch, managedTaskEnv, managedRunRunner, trackManagedChild } from "./managed-dispatch.js";
+import { ManagedDispatch, managedTaskEnv, managedRunRunner, trackManagedChild, managedCodexReporter } from "./managed-dispatch.js";
+import { codexStartJitterMaxMs, armCodexStartJitter, codexStartHoldMs, rateLimitWaitsUncounted } from "./codex-throttle.js";
+export { armCodexStartJitter } from "./codex-throttle.js";
 import { DispatchPool, excludeInFlight, freeSeats, launchCandidates, liveGateRunnerFor, mayStartMainSweep, resolvePollIntervalMs } from "./dispatch-pool.js";
 import { countVerdictsSince, isStaleBaseFinding, parseBuilderCompletions, parseVerdictArtifacts, pickVerdictPr, shouldFlagMissingVerdict } from "./verdict-guard.js";
 import { countOpenPrs, shouldFlagMissingPr } from "./pr-guard.js";
@@ -648,6 +650,13 @@ export interface StreamResult {
    *  from Codex's own output, never the agent's summary. A blocked run with
    *  this set and no rejection retries (#121). */
   approvalReviewFailed?: boolean;
+  /** Codex only: OpenAI refused the run with a rate or usage limit (429),
+   *  read from Codex's own failed-turn message (`CODEX_RATE_LIMIT`). */
+  codexRateLimited?: boolean;
+  /** The fleet's claim service took the 429 report and new Codex starts are
+   *  paused. The failure then waits out the pause without counting against
+   *  the ticket. False or absent when no pause could be confirmed. */
+  codexRateLimitPaused?: boolean;
   /** True when the run ended with no tool use after its most recent
    *  denial: the agent stopped there rather than carrying on. A clean
    *  exit with this set routes to the permission-denied path. */
@@ -908,6 +917,9 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
   return new Promise((resolve, reject) => {
     const isCodex = opts.runner === "codex";
     const codex = isCodex ? new CodexStreamAdapter() : null;
+    // Captured here: stream callbacks need not carry the admitted run's context.
+    const reportCodex = isCodex ? managedCodexReporter() : null;
+    let codexCleanReported = false;
     const startedAt = Date.now();
     // Phase C cutover (2026-05-14, pyrycode/pyrycode#329): default-spawn
     // `pyry agent-run` instead of `claude -p`. Both produce stream-json on
@@ -1183,6 +1195,9 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
           agentOutput = isCodex ? advanceCodexAgentOutput(agentOutput, msg) : advanceClaudeAgentOutput(agentOutput, msg);
           if (codex) {
             codex.accept(msg);
+            // The model answered, so OpenAI admitted this run: a clean start
+            // resets the fleet's Codex backoff.
+            if (reportCodex && !codexCleanReported && codex.responded) { codexCleanReported = true; void reportCodex("clean"); }
             logStreamMessage(opts.logFile, msg);
             if (msg.type === "turn.started") codexTurnEnded = false;
             if (msg.type === "turn.completed" || msg.type === "turn.failed") codexTurnEnded = true;
@@ -1393,6 +1408,19 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
  * `TOOL_UNAVAILABLE` stop line, is retried a few times too, see
  * `retryRequiredMcpStartup`.
  */
+/**
+ * Wait out this dispatcher's random Codex start spread (`armCodexStartJitter`,
+ * armed from `pollLoop` only, so tests and one-off tools never wait). A
+ * managed dispatcher holds its Codex offers back until then instead, so it
+ * never sits on an admitted place; this wait covers independent dispatchers.
+ */
+async function waitForCodexStartJitter(log: (msg: string) => void): Promise<void> {
+  const wait = codexStartHoldMs();
+  if (wait <= 0) return;
+  log(`Codex start spread: waiting ${Math.ceil(wait / 1000)}s so restarted dispatchers do not start Codex together`);
+  await new Promise(resolve => setTimeout(resolve, wait));
+}
+
 export async function runClaudeStreaming(opts: RunClaudeOpts): Promise<StreamResult> {
   const sourceCwd = opts.sourceReview ? mkdtempSync(resolve(tmpdir(), "pyry-source-review-")) : null;
   if (sourceCwd) opts = { ...opts, cwd: sourceCwd };
@@ -1404,10 +1432,23 @@ export async function runClaudeStreaming(opts: RunClaudeOpts): Promise<StreamRes
     console.log(`   ♻️  ${msg}`);
   };
   try {
-    return await retryRequiredMcpStartup(
+    const reportCodex = opts.runner === "codex" ? managedCodexReporter() : null;
+    // A managed dispatcher spreads its starts by holding offers back, so an
+    // admitted run (a verifier's final review, a resume leg) never waits here.
+    if (opts.runner === "codex" && !reportCodex) await waitForCodexStartJitter(logger);
+    const result = await retryRequiredMcpStartup(
       () => retrySpawnOnTransientError(() => runClaudeStreamingOnce(opts), { logger }),
       { log: logger },
     );
+    if (!result.codexRateLimited || !reportCodex) return result;
+    // Every Codex start in the fleet waits while the limit lasts. The claim
+    // service confirms a pause is in force before this failure is allowed to
+    // skip the ticket's retry count.
+    const pause = await reportCodex("rate-limited");
+    logger(rateLimitWaitsUncounted(pause)
+      ? `Codex rate limit (429): fleet Codex starts paused for ${pause!.remainingSeconds}s (pause of ${Math.round(pause!.durationMs / 1000)}s); this attempt is not counted against the ticket`
+      : `Codex rate limit (429): ${!pause ? "report not delivered" : !pause.active ? "throttle off" : `${pause.ticketReports} in a row on this ticket`}; ordinary transient retry`);
+    return { ...result, codexRateLimitPaused: rateLimitWaitsUncounted(pause) };
   } finally {
     // Empty by design. Never recursively delete anything an agent wrote.
     if (sourceCwd) { try { rmdirSync(sourceCwd); } catch {} }
@@ -3156,6 +3197,14 @@ export async function handleDispatchError(
   // output into it) plus the errno for the resource-exhaustion case. The
   // ResourceExhaustedError's own spawn-retry budget only covers sub-second
   // EAGAIN spikes; this backoff is the multi-minute-pressure fallback.
+  // A Codex 429 while the fleet pause is confirmed: the limit belongs to the
+  // whole fleet, not this ticket. Nothing is labelled or counted; the ticket
+  // is offered again and the claim service admits it once the pause ends.
+  if (item.issueNumber > 0 && (streamResult?.codexRateLimitPaused === true || error?.codexRateLimitPaused === true) && !isResourceExhausted) {
+    ctx.deps.writeLog(logFile, "CODEX_RATE_LIMIT", "OpenAI rate limit (429). New Codex runs are paused fleet-wide; this ticket runs again when the pause ends. Not counted as a retry or an error.");
+    console.log(`   ⏸️  #${item.issueNumber} Codex rate limit: waits for the fleet Codex pause, no retry counted`);
+    return;
+  }
   if (item.issueNumber > 0) {
     const classifyText = isResourceExhausted
       ? `${error.message} ${(error as ResourceExhaustedError).errno}`
@@ -4180,6 +4229,8 @@ async function runParallelVerifierReview(
   ctx.deps.writeLog(ctx.logFile, "SOURCE REVIEW RESULT", source.output);
   if (source.isError || source.terminalReason !== "stop" || !source.output.trim()) {
     const detail = `${source.output || source.terminalReason}. No verdict published.`;
+    // The error path reads the pause from the error, since this run returns no stream result.
+    if (source.codexRateLimited) throw Object.assign(new Error(`Preliminary source review hit a Codex rate limit: ${detail}`), { codexRateLimitPaused: source.codexRateLimitPaused === true });
     if (source.timedOut) throw new ReviewBudgetExhaustedError(`Preliminary source review ran out of time: ${detail}`, "time");
     throw new Error(`Preliminary source review did not complete: ${detail}`);
   }
@@ -9599,6 +9650,10 @@ export async function pollLoop(): Promise<void> {
   });
   const managed = ManagedDispatch.fromEnv(process.env);
   if (managed && AUTOCURATE_MEMORY) throw new Error("Managed dispatch requires PYRY_AUTOCURATE_MEMORY=0");
+  // Agent offers state this dispatcher's own runner, so the claim service can
+  // hold Codex work during a fleet pause even without a central runner choice.
+  // Without the admitted run's frozen central choice: the offer states the local answer only.
+  if (managed) managed.localRunner = createRunnerSelector({ path: () => runnerFilePath(process.env, agentsRepoRoot), env: process.env, warn: () => {} });
   if (managed) {await managed.start();rawClient=managed.authorityClient(rawClient);}
   const client = managed ? managed.client(rawClient) : rawClient;
   const maintenanceClient = managed ? managed.client(rawClient, true) : rawClient;
@@ -9716,6 +9771,10 @@ export async function pollLoop(): Promise<void> {
     }
   }
   console.log("   Family dispatch counts: history only; no family limit");
+  {
+    const jitter = armCodexStartJitter();
+    console.log(`   Codex start spread: first Codex start waits ${Math.round(jitter / 1000)}s after startup (random, up to ${Math.round(codexStartJitterMaxMs(process.env.PYRY_CODEX_START_JITTER_MS) / 1000)}s, PYRY_CODEX_START_JITTER_MS)`);
+  }
   console.log(`   Rework breaker: ${REWORK_ROUTING_OPTIONS.hardCap} builder reworks, or a repeated verifier finding (PYRY_BUILDER_REWORK_CAP)`);
   if (REAL_CLAUDE_GATE_CMD !== "") {
     console.log(INFRA_BREAKER.enabled
@@ -10235,6 +10294,7 @@ export async function pollLoop(): Promise<void> {
                   effort: RECOVERY_EFFORT, maxTurns: RECOVERY_MAX_TURNS, timeoutMs: RECOVERY_TIMEOUT_MS,
                   allowedTools: "Read,Glob,Grep", disallowedTools: "Bash,Write,Edit,Agent",
                   env: { ...scrubSpawnEnv(process.env),...managedTaskEnv(), CLAUDE_CODE_ENTRYPOINT: "recovery" } });
+                if (result.codexRateLimited) throw new CodexRateLimitError("Codex rate limit (429) before the assessment could run");
                 if (result.isError || result.timedOut || result.hadPermissionDenial) throw new Error("Recovery assessment failed");
                 return parseRecoveryDecision(result.output);
               },

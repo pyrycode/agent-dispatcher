@@ -620,3 +620,48 @@ describe("TOOL_UNAVAILABLE stop line retry", () => {
     assert.equal(result.terminalReason, "codex_blocked");
   });
 });
+
+describe("Codex rate limit detection", () => {
+  const limitedRun = (message = "exceeded retry limit, last status: 429 Too Many Requests") => {
+    const s = new CodexStreamAdapter();
+    s.accept({ type: "thread.started", thread_id: "t" });
+    s.accept({ type: "turn.started" });
+    s.accept({ type: "error", message: "Reconnecting... 2/5 (unexpected status 503 Service Unavailable)" });
+    s.accept({ type: "error", message });
+    s.accept({ type: "turn.failed", error: { message } });
+    return s;
+  };
+  test("Codex's own failed-turn 429 is flagged, and the model never answered", () => {
+    const s = limitedRun();
+    assert.equal(s.responded, false);
+    const r = s.finish(1, false, 4000);
+    assert.equal(r.terminalReason, "codex_error");
+    assert.equal(r.codexRateLimited, true);
+    assert.equal(limitedRun("You've hit your usage limit. Upgrade to Pro or try again later.").finish(1, false, 1).codexRateLimited, true);
+  });
+  test("other failures, a reconnect that recovered, a timeout and agent prose are not rate limits", () => {
+    assert.equal(limitedRun("stream disconnected before completion").finish(1, false, 1).codexRateLimited, undefined);
+    assert.equal(limitedRun().finish(1, true, 1).codexRateLimited, undefined, "the wall clock fired: a timeout, not a rate limit");
+    const recovered = new CodexStreamAdapter();
+    recovered.accept({ type: "error", message: "exceeded retry limit, last status: 429 Too Many Requests" });
+    recovered.accept({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ status: "completed", summary: "done" }) } });
+    recovered.accept({ type: "turn.completed", usage: {} });
+    const ok = recovered.finish(0, false, 1);
+    assert.equal(ok.isError, false);
+    assert.equal(ok.codexRateLimited, undefined);
+    assert.equal(recovered.responded, true);
+    const prose = new CodexStreamAdapter();
+    prose.accept({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ status: "blocked", summary: "The API said 429 Too Many Requests" }) } });
+    prose.accept({ type: "turn.completed", usage: {} });
+    assert.equal(prose.finish(0, false, 1).codexRateLimited, undefined);
+  });
+  test("any completed item means the model answered", () => {
+    const s = new CodexStreamAdapter();
+    s.accept({ type: "turn.started" });
+    assert.equal(s.responded, false);
+    s.accept({ type: "item.completed", item: { type: "error", message: "a notice, not a model answer" } });
+    assert.equal(s.responded, false);
+    s.accept({ type: "item.completed", item: { type: "reasoning", text: "thinking" } });
+    assert.equal(s.responded, true);
+  });
+});

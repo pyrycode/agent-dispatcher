@@ -13,6 +13,7 @@ import {RecoveryTasks, assessmentTasks, type RecoveryTaskRequest, type RecoveryT
 import {createHash} from 'node:crypto';
 import {manifestHash} from './recovery-artifacts.js';
 import type { AgentRunner } from './agent-runner.js';
+import { CodexThrottle, startsCodex, DEFAULT_CODEX_THROTTLE, type CodexThrottleConfig, type CodexPauseState } from './codex-throttle.js';
 
 /** An operator choice, frozen into each new grant. Null restores local settings. */
 export interface RunnerPolicy { runner: AgentRunner | null; revision: number }
@@ -39,12 +40,14 @@ export interface StartRequest {
   requiresRecovery?: boolean;
   readyRepairs?: string[];
   supportTaskId?: string; parentTicket?: string;
+  /** The dispatcher's own runner for an agent role. The central choice still wins; this decides only without one. */
+  runner?: AgentRunner;
 }
 export interface Claim { ticket: string; machine: string; generation: string; created: number }
 export interface FleetRun extends StartRequest { generation: string; created: number; runnerPolicy?: RunnerPolicy }
-export interface FleetSnapshot { workflowProjects?: string[]; claims: Claim[]; runs: FleetRun[]; runnerPolicy?: RunnerPolicy; idleRecoveryTickets?: string[]; priorityHighTickets?: string[]; releasedAssessmentClaims?: Claim[]; features?: {recoveryTasks:boolean}; requiredRepairs?: Record<string,string[]> }
+export interface FleetSnapshot { workflowProjects?: string[]; claims: Claim[]; runs: FleetRun[]; runnerPolicy?: RunnerPolicy; idleRecoveryTickets?: string[]; priorityHighTickets?: string[]; releasedAssessmentClaims?: Claim[]; features?: {recoveryTasks:boolean}; requiredRepairs?: Record<string,string[]>; codexPause?: CodexPauseState }
 export type StartResult = { ok: true; generation: string } | {
-  ok: false; reason: "foreign-claim" | "running" | "capacity" | "locked" | "finished";
+  ok: false; reason: "foreign-claim" | "running" | "capacity" | "locked" | "finished" | "codex-paused";
 };
 
 export function validateStart(req: StartRequest): void {
@@ -59,6 +62,7 @@ export function validateStart(req: StartRequest): void {
   }
   if (req.resource !== "heavy" && req.resource !== "medium" && req.resource !== "light") throw new Error("Invalid resource class");
   if (req.roleLimit !== undefined && (!Number.isSafeInteger(req.roleLimit) || req.roleLimit < 1)) throw new Error("Invalid role limit");
+  if (req.runner !== undefined && req.runner !== 'claude' && req.runner !== 'codex') throw new Error('Invalid runner');
   if (req.requiresRecovery !== undefined && (typeof req.requiresRecovery !== 'boolean' || req.role !== 'recovery')) throw new Error('Invalid recovery requirement');
   if(req.readyRepairs!==undefined && (!Array.isArray(req.readyRepairs)||req.readyRepairs.length>10||req.readyRepairs.some(s=>! /^[a-f0-9]{40}$/.test(s)))) throw new Error("Invalid repair readiness");
   if(req.supportTaskId!==undefined && (req.role!=="recovery-task"||! /^[a-f0-9]{64}$/.test(req.supportTaskId)||! /^[\w.-]+\/[\w.-]+#[1-9]\d*$/.test(req.parentTicket??""))) throw new Error("Invalid support task admission");
@@ -71,6 +75,10 @@ export interface FleetStoreOptions extends RecoveryLedgerOptions {
   /** How long a running or attention task may have no holder before it is reported. Default one hour. */
   orphanedTaskMs?: number;
   now?: () => number;
+  /** The fleet-wide Codex rate-limit pause. Default two minutes doubling to thirty. */
+  codexThrottle?: CodexThrottleConfig;
+  /** Where throttle pause starts and ends are logged. Default the console. */
+  log?: (line: string) => void;
 }
 
 export class FleetStore {
@@ -81,6 +89,8 @@ export class FleetStore {
   readonly operations: OperationReports;
   readonly tasks: RecoveryTasks;
   readonly orphans: OrphanedTaskWatch;
+  readonly codex: CodexThrottle;
+  private readonly clock: () => number;
   constructor(path: string, private readonly limits: Readonly<Record<string, MachineLimits>>, options: FleetStoreOptions = {}) {
     for (const value of Object.values(limits)) validateLimits(value);
     this.db = new DatabaseSync(path);
@@ -116,6 +126,8 @@ export class FleetStore {
     const clock = options.now ?? Date.now;
     this.operations = new OperationReports(this.db, Object.keys(limits), clock);
     this.orphans = new OrphanedTaskWatch(this.db, this.tasks, this.operations, clock, options.orphanedTaskMs);
+    this.clock = clock;
+    this.codex = new CodexThrottle(this.db, clock, options.codexThrottle ?? DEFAULT_CODEX_THROTTLE, options.log);
   }
   close(): void { this.db.close(); }
 
@@ -417,6 +429,10 @@ export class FleetStore {
       const claim = this.db.prepare("SELECT * FROM fleet_claims WHERE ticket=?").get(req.ticket);
       if (claim && claim.machine !== req.machine) return { ok: false, reason: "foreign-claim" };
       if (this.db.prepare("SELECT 1 FROM fleet_runs WHERE ticket=? AND finished IS NULL").get(req.ticket)) return { ok: false, reason: "running" };
+      // A Codex rate limit pauses new Codex starts across the fleet. Admitted
+      // runs and work that starts no Codex agent are untouched.
+      if (startsCodex(req, this.runnerPolicy(), req.supportTaskId ? this.tasks.get(req.supportTaskId).request.recipe : undefined)
+        && this.codex.paused(this.clock())) return { ok: false, reason: "codex-paused" };
       if (req.resource !== "light") {
         const row = this.db.prepare(`SELECT
           count(CASE WHEN resource='heavy' THEN 1 END) AS heavy,
@@ -434,7 +450,7 @@ export class FleetStore {
         if (this.db.prepare("SELECT 1 FROM fleet_locks WHERE name=?").get(lock)) return { ok: false, reason: "locked" };
       }
       const generation = claim ? String(claim.generation) : randomUUID();
-      const now = Date.now();
+      const now = this.clock();
       const runnerPolicy = this.runnerPolicy();
       const admitted = runnerPolicy ? JSON.stringify({ ...JSON.parse(request), runnerPolicy }) : request;
       this.db.prepare("INSERT OR IGNORE INTO fleet_claims VALUES (?,?,?,?)").run(req.ticket, req.machine, generation, now);
@@ -501,6 +517,29 @@ export class FleetStore {
     });
   }
 
+  /**
+   * A dispatcher's report about one of its admitted Codex runs: it hit a rate
+   * limit, or it got a model response. Only the run's own computer and
+   * session can report it, and a finished run can still be reported, since
+   * the report races the run's completion.
+   */
+  codexReport(machine: string, session: string, project: string, runId: string, event: unknown): CodexPauseState {
+    if (event !== "rate-limited" && event !== "clean") throw new Error("Codex report must be rate-limited or clean");
+    if (typeof runId !== "string" || typeof session !== "string" || typeof project !== "string") throw new Error("Invalid Codex report");
+    return this.transaction(() => {
+      const run = this.db.prepare("SELECT machine,session,ticket,request,created FROM fleet_runs WHERE id=?").get(runId);
+      if (!run || run.machine !== machine || run.session !== session) throw new Error("Codex report needs its own admitted run");
+      const request = JSON.parse(String(run.request)) as StartRequest;
+      if (request.project !== project) throw new Error("Codex report project mismatch");
+      const source = { machine, project, ticket: String(run.ticket), role: request.role, runId, admittedAt: Number(run.created) };
+      return event === "clean" ? this.codex.clean(source) : this.codex.rateLimited(source);
+    });
+  }
+  /** Operator: end a Codex pause early and reset its backoff. */
+  clearCodexPause(): CodexPauseState { return this.transaction(() => this.codex.clear()); }
+  /** Log a Codex pause that has run out. Called on a timer by the claim service. */
+  codexTick(): void { this.transaction(() => this.codex.tick()); }
+
   // Operator recovery only. The caller must disable/stop the old worker first.
   // Matching the generation prevents an old confirmation from releasing a new owner.
   free(ticket: string, generation: string, stopped: boolean): void {
@@ -519,9 +558,11 @@ export class FleetStore {
     const idleRecoveryTickets = this.db.prepare(`SELECT ticket FROM fleet_recovery WHERE present=1 AND state='queued' AND reason IN (${IDLE_RECOVERY_REASONS.map(() => '?').join(',')})`)
       .all(...IDLE_RECOVERY_REASONS).map(r => String(r.ticket));
     const releasedAssessmentClaims = this.db.prepare("SELECT * FROM fleet_assessment_releases").all() as unknown as Claim[];
+    const codexPause = this.codex.snapshot();
     // Read from the workflow authority, so offers from older workers are ranked too.
     const priorityHighTickets = this.workflow.openTicketsWithLabel(PRIORITY_HIGH);
     return {
+      ...(codexPause ? { codexPause } : {}),
       ...(this.workflow.projects().length ? {workflowProjects:this.workflow.projects().map(p=>p.project)} : {}),
       ...(runnerPolicy ? { runnerPolicy } : {}),
       ...(idleRecoveryTickets.length ? { idleRecoveryTickets } : {}),

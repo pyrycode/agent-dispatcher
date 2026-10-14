@@ -19,6 +19,7 @@ import { FleetUpdates } from "./fleet-updates.js";
 import { recoveryReport } from "./recovery-report.js";
 import { persistProjectDrains } from "./fleet-config.js";
 import { ServiceShutdown, SHUTDOWN_DEADLINE_MS } from "./service-shutdown.js";
+import { readCodexThrottleConfig, codexPauseAttention, type CodexPauseState } from "./codex-throttle.js";
 
 function secret(name: string): string {
   if (typeof name !== "string" || !name || !process.env[name]) throw new Error(`Missing credential environment variable: ${name}`);
@@ -32,8 +33,8 @@ function shutdownDeadline(seconds: unknown): number {
 }
 async function main(): Promise<void> {
   const [command, configPath, ...args] = process.argv.slice(2);
-  if (!configPath || !["workflow", "control", "recovery-task", "claims", "manager", "status", "runner", "desired", "attention", "report-attention", "pause", "coordination", "recovery", "drain", "drain-project", "resume-project", "free"].includes(command)) {
-    throw new Error("Usage: fleet-bin.ts claims|manager|status|runner|recovery|drain|drain-project|resume-project|free CONFIG [claude|codex|local | PROJECT | TICKET GENERATION --confirmed-stopped]");
+  if (!configPath || !["workflow", "control", "recovery-task", "claims", "manager", "status", "runner", "codex", "desired", "attention", "report-attention", "pause", "coordination", "recovery", "drain", "drain-project", "resume-project", "free"].includes(command)) {
+    throw new Error("Usage: fleet-bin.ts claims|manager|status|runner|codex|recovery|drain|drain-project|resume-project|free CONFIG [claude|codex|local | PROJECT | TICKET GENERATION --confirmed-stopped]");
   }
   const config = JSON.parse(readFileSync(configPath, "utf8"));
   if(command==='workflow') {
@@ -82,6 +83,12 @@ async function main(): Promise<void> {
     console.log(JSON.stringify(await claims.call('/runner', args.length ? { runner: args[0] === 'local' ? null : args[0] } : undefined)));
     return;
   }
+  if (command === 'codex') {
+    if (args.length > 1 || (args.length === 1 && args[0] !== 'clear')) throw new Error('codex shows the fleet Codex rate-limit pause; codex clear ends it early and resets the backoff');
+    const claims = new JsonClient(config.claimsUrl, secret(config.claimsOperatorTokenEnv ?? config.claimsTokenEnv));
+    console.log(JSON.stringify(await claims.call(args.length ? '/codex/clear' : '/codex', args.length ? {} : undefined), null, 2));
+    return;
+  }
   if (command === "claims") {
     const stopDeadline = shutdownDeadline(config.shutdownDeadlineSeconds);
     const database = resolve(config.database);
@@ -95,7 +102,10 @@ async function main(): Promise<void> {
     const orphanMinutes = config.recovery?.orphanedTaskMinutes;
     if (orphanMinutes !== undefined && (typeof orphanMinutes !== "number" || !Number.isFinite(orphanMinutes) || orphanMinutes < 1)) throw new Error("recovery.orphanedTaskMinutes must be a number of at least 1");
     const store = new FleetStore(database, limits, { ...(safetyHours === undefined ? {} : { safetyRecheckMs: Math.round(safetyHours * 3600_000) }),
-      ...(orphanMinutes === undefined ? {} : { orphanedTaskMs: Math.round(orphanMinutes * 60_000) }) });
+      ...(orphanMinutes === undefined ? {} : { orphanedTaskMs: Math.round(orphanMinutes * 60_000) }),
+      codexThrottle: readCodexThrottleConfig(config.codexThrottle) });
+    // Logs a Codex pause's end once, when it runs out, rather than at the next report.
+    const codexTimer = setInterval(() => { try { store.codexTick(); } catch (e) { console.warn("Codex throttle tick failed:", (e as Error).message); } }, 5_000);
     const github = config.github ? new GitHubBroker({ ...config.github,
       projects: [...new Set([...config.github.projects, ...Object.values(config.updates?.consumers ?? {}), ...(config.updates?.dispatcherRepository ? [config.updates.dispatcherRepository] : [])])], token: secret(config.github.tokenEnv) }) : undefined;
     const updates = config.updates && github ? new FleetUpdates(github, config.updates.consumers, config.updates.dispatcherRepository) : undefined;
@@ -129,7 +139,7 @@ async function main(): Promise<void> {
     const stopLabels = startClaimLabelSync(config.githubLabels, () => store.snapshot().claims, process.env, labelFetch, () => store.recovery.escalatedTickets(), project=>store.workflow.enabled(project));
     // A display pass writes the database after its GitHub calls, so it may finish.
     const shutdown = new ServiceShutdown({ servers: cli ? [server, cli] : [server],
-      stop: [() => clearInterval(updateTimer), () => clearInterval(workflowTimer), stopLabels],
+      stop: [() => clearInterval(updateTimer), () => clearInterval(workflowTimer), () => clearInterval(codexTimer), stopLabels],
       pending: () => publishing, close: () => store.close(), deadlineMs: stopDeadline });
     process.on("SIGTERM", () => void shutdown.stop("SIGTERM")); process.on("SIGINT", () => void shutdown.stop("SIGINT"));
     console.log("Claim service listening", server.address());
@@ -183,7 +193,9 @@ async function main(): Promise<void> {
     let orphanedError: string | undefined;
     const [incidents, state, operations, orphaned] = await Promise.all([claims.call<import("./fleet-recovery.js").RecoveryIncident[]>("/recovery/state"), client.call<any>("/state"),claims.call<any[]>('/operations/reports'),
       claims.call<any[]>('/tasks/orphaned').catch((error: Error) => { orphanedError = String(error.message).slice(0, 200); return null; })]);
-    console.log(JSON.stringify({...recoveryReport(incidents, state),operationReports:operations,orphanedTasks:orphaned,...(orphanedError ? {orphanedTasksError:orphanedError} : {})}, null, 2)); return;
+    // A pause at the ceiling means the limit outlasted the whole backoff: someone should look at OpenAI usage.
+    const codexPause = codexPauseAttention(state.codexPause as CodexPauseState | undefined);
+    console.log(JSON.stringify({...recoveryReport(incidents, state),operationReports:operations,orphanedTasks:orphaned,...(orphanedError ? {orphanedTasksError:orphanedError} : {}),...(codexPause ? {codexPause} : {})}, null, 2)); return;
   }
   if (command === "drain") { await client.call("/drain", {}); console.log("Draining: no new grants. Existing grants remain reserved."); }
   else if (command === "drain-project" || command === "resume-project") {

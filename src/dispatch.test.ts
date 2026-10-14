@@ -3752,6 +3752,43 @@ describe("handleDispatchError", () => {
     assert.equal(calls.discord.length, 1);
   });
 
+  test("a Codex 429 under a confirmed fleet pause is neither an error nor a counted retry", async () => {
+    const { ctx, client, calls } = makeTestContext({ item: { issueNumber: 504 } });
+    await handleDispatchError(
+      new Error("Agent error (codex_error): subtype=codex_error. Ran 0m 4s. exceeded retry limit, last status: 429 Too Many Requests"),
+      ctx,
+      streamResult({ runner: "codex", isError: true, terminalReason: "codex_error", codexRateLimited: true, codexRateLimitPaused: true }),
+    );
+    assert.deepEqual(client.addLabelCalls, [], "no error label and no error-retry-count");
+    assert.equal(client.comments.length, 0);
+    assert.equal(calls.discord.length, 0);
+    const logged = calls.logs.find(l => l.section === "CODEX_RATE_LIMIT");
+    assert.match(logged?.content ?? "", /paused fleet-wide.*Not counted as a retry or an error/);
+  });
+
+  test("a parallel review's source review that hit a paused Codex limit is not counted either", async () => {
+    const { ctx, client } = makeTestContext({ item: { issueNumber: 506 } });
+    await handleDispatchError(
+      Object.assign(new Error("Preliminary source review hit a Codex rate limit: exceeded retry limit, last status: 429 Too Many Requests. No verdict published."), { codexRateLimitPaused: true }),
+      ctx,
+      null,
+    );
+    assert.deepEqual(client.addLabelCalls, []);
+    assert.equal(client.comments.length, 0);
+  });
+
+  test("a Codex 429 with no confirmed pause takes the ordinary counted transient retry", async () => {
+    const { ctx, client } = makeTestContext({ item: { issueNumber: 505 } });
+    await handleDispatchError(
+      new Error("Agent error (codex_error): exceeded retry limit, last status: 429 Too Many Requests"),
+      ctx,
+      streamResult({ runner: "codex", isError: true, terminalReason: "codex_error", codexRateLimited: true, codexRateLimitPaused: false }),
+    );
+    const labels = client.addLabelCalls.map(c => c.label);
+    assert.ok(labels.includes("error-retry-count:1"), "the existing capped retry still bounds it");
+    assert.ok(!labels.includes("error:developer"));
+  });
+
   test("ResourceExhaustedError (EAGAIN) is transient → schedules a backoff retry on the first failure", async () => {
     // agent-dispatcher#25: EAGAIN host pressure is on the auto-retry
     // allowlist, so the first ResourceExhaustedError schedules a backoff
@@ -3866,6 +3903,21 @@ describe("parallel verifier source review", () => {
     });
     return { client, deps, calls, run: () => dispatchToAgent(builderAgent("verifier"), makeProjectItem({ issueNumber: 1330 }), client, deps) };
   }
+  test("codex: a source review refused by a paused Codex rate limit is neither an error nor a counted retry", async () => {
+    await withParallelReview(async () => {
+      const f = fixture();
+      let finalized = false;
+      f.deps.spawnGate = async () => ({ exitCode: 0, timedOut: false, spawnError: null });
+      f.deps.runClaudeStreaming = async opts => {
+        if (!opts.sourceReview) { finalized = true; return streamResult(); }
+        return streamResult({ runner: "codex", isError: true, terminalReason: "codex_error", output: "exceeded retry limit, last status: 429 Too Many Requests", codexRateLimited: true, codexRateLimitPaused: true });
+      };
+      await f.run();
+      assert.equal(finalized, false);
+      assert.ok(!f.client.addLabelCalls.some(x => x.label.startsWith("error:verifier") || x.label.startsWith("error-retry-count:")), JSON.stringify(f.client.addLabelCalls));
+      assert.ok(!f.client.addLabelCalls.some(x => x.label === "done:verifier"));
+    });
+  });
   function deferred<T>() {
     let resolve!: (value: T) => void;
     const promise = new Promise<T>(r => { resolve = r; });

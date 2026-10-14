@@ -297,6 +297,14 @@ export function failedMcpCallLogLine(item: Record<string, any> | null | undefine
   return `MCP tool call failed, reported by ${source}: ${String(item.server ?? "?")}.${String(item.tool ?? "?")}: ${scrubCredentials(capped)}`;
 }
 
+/**
+ * Codex's own wording when OpenAI refused a turn for rate or usage limits.
+ * Read only from Codex's failed-turn message, never from agent prose or
+ * command output. The first is what every 2026-10-14 failure said:
+ * `exceeded retry limit, last status: 429 Too Many Requests`.
+ */
+export const CODEX_RATE_LIMIT = /\blast status: 429\b|\b429 Too Many Requests\b|\bhit your usage limit\b/i;
+
 /** Native Codex JSONL is not Claude stream-json. A process exit alone is not success. */
 export class CodexStreamAdapter {
   private sessionId = "";
@@ -308,8 +316,11 @@ export class CodexStreamAdapter {
   private completed = false;
   private turns = 0;
   private usage: Record<string, unknown> = {};
+  /** True once the model has answered at all: OpenAI admitted the run. */
+  responded = false;
 
   accept(event: Record<string, any>): void {
+    if ((event.type === "item.completed" && event.item?.type !== "error") || event.type === "turn.completed") this.responded = true;
     switch (event.type) {
       case "thread.started":
         if (typeof event.thread_id === "string") this.sessionId = event.thread_id;
@@ -399,6 +410,7 @@ export class CodexStreamAdapter {
       totalCostUsd: 0, durationMs, usage: this.usage, terminalReason,
       rawResult: { is_error: isError, subtype: isError ? terminalReason : "success", result: isError ? failure : outcome!.summary },
       hadPermissionDenial: this.approvalRejected, approvalReviewFailed: this.approvalReviewFailed,
+      ...(terminalReason === "codex_error" && this.failed && CODEX_RATE_LIMIT.test(this.errorText) ? { codexRateLimited: true } : {}),
       stoppedAtDenial: false, deniedOpContent: null,
       lastAssistantText: this.lastText || null, timedOut,
     };

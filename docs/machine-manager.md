@@ -46,6 +46,35 @@ project credentials can read it and receive grants, but cannot override it.
 The existing admission and status channels distribute the choice. No new
 monitoring or reporting process is added.
 
+## Codex rate-limit pause
+
+On 2026-10-14 Codex runs failed with `exceeded retry limit, last status: 429 Too Many Requests` seconds into their first turn: on pyrybox at 10:07, 15:34 (twice), 15:36 and 16:06 EEST, and on Fractal at 11:07. The 15:34 pair came when the dispatchers restarted together after a token rotation. Each dispatcher retried on its own schedule, so nothing stopped the next start from meeting the same limit.
+
+The claim service now keeps one fleet-wide pause:
+
+- When any Codex run anywhere reports a 429, new Codex runs are refused admission across the fleet for two minutes. The refusal reason is `codex-paused`. Runs already admitted carry on. Work that starts no Codex agent is admitted as usual: merges, live gates, main sweeps, housekeeping, codegraph refreshes and Claude runs.
+- A 429 during a pause is counted but neither extends it nor doubles it twice, so one burst of simultaneous failures is one step. A 429 after a pause ends, before any Codex run has started cleanly, starts the next pause at double the length: 2, 4, 8, 16, then 30 minutes, the ceiling.
+- A Codex run admitted after the latest pause began that gets any model response resets the backoff to two minutes. A run admitted before the pause says nothing about new starts and resets nothing.
+- A 429 more than one ceiling after the last pause ended, with no Codex start in between, starts over at two minutes. The ceiling doubles as this quiet gap, so a larger configured ceiling stretches it too.
+- The state is one row in the claims database, so a claim service restart keeps a pause.
+
+A run counts as Codex when the central runner choice is `codex`. Without a central choice, the runner the dispatcher states on its agent offers decides; offers from older dispatchers, which state none, are not paused then. A local runner switch replaces an ungranted offer, since the runner is part of the admission request. A support task counts only for the `dispatcher-repair` recipe, and only at admission: the repair runs outside a dispatcher, so its own 429s are not reported. The machine manager passes over paused Codex offers so fitting non-Codex work can start; the claim service makes the final decision.
+
+The dispatcher reports through its existing manager connection. Its Codex runner reads Codex's own failed-turn message (`last status: 429`, `429 Too Many Requests`, or `hit your usage limit`), never the agent's prose. A failed run is reported once it ends; a clean start is reported once per admitted run at its first completed item that is not an error. A ticket whose run hit the limit is not given an error label or an `error-retry-count`; it is offered again and admitted when the pause ends. That happens only when the claim service confirms a pause is in force, and for at most four 429s on one ticket while other Codex runs get through. A ticket that keeps meeting a 429 while others start cleanly has a limit of its own, such as an oversized request, so from the fifth it counts. A 429 counts towards that limit only if some Codex run started cleanly since the ticket's previous one, so an account-wide limit that stops every run never counts against a ticket; the ticket's own clean start resets it. If the report cannot be delivered, or the throttle is off, the failure also takes the ordinary capped transient retry. A recovery assessment whose Codex run hits the limit waits out the existing thirty-minute transport cooldown as an operational escalation instead of escalating to a person. The live gate's infrastructure breaker does not count a model provider's own 429 lines as relay admission rejections, so a Codex limit seen inside a live test cannot halt a ticket with `error:infra`.
+
+After a restart, and again when it sees a pause end, each dispatcher holds its Codex offers back for a random time of up to a minute (`PYRY_CODEX_START_JITTER_MS`), so a fleet-wide restart or the end of a pause does not send every Codex start to OpenAI in the same second. Holding the offer rather than the run means the wait occupies no place; an independent dispatcher waits just before the spawn instead. A run already admitted never waits.
+
+Visibility:
+
+- `operator.sh status` carries `codexPause` once any pause has begun (never with the throttle off): `active`, `since`, `until`, `remainingSeconds`, `durationMs`, `nextDurationMs`, `level`, `atCeiling`, `reports` and the `cause` that began the pause. A queued offer held by it shows the state `codex-paused`.
+- `operator.sh attention` carries a `codexPause` item while a pause at the ceiling is active, which means the limit outlasted the whole backoff. Check the account's usage with OpenAI.
+- `operator.sh codex` shows the state, the configuration and the last fifty events. `operator.sh codex clear` ends a pause early and resets the backoff; it needs the operator credential.
+- The claim service logs each pause start and end once, as `Codex throttle: pause-started: ...` and `Codex throttle: pause-ended: ...`, along with 429s during a pause, resets and operator clears. The last 200 events stay in the database.
+
+Optional claim service configuration: `"codexThrottle": {"baseSeconds": 120, "ceilingSeconds": 1800, "enabled": true}`. `enabled: false` records reports and pauses nothing, so dispatchers fall back to the counted transient retry.
+
+Upgrade order is the usual one: claim service and machine managers, then dispatchers. A controller alone already pauses Codex admissions under the central `codex` choice; it learns of a 429 only from updated dispatchers.
+
 ## Scheduling
 
 Each manager configuration lists projects in priority order. It first considers runnable locally claimed recovery and repair work, then locally claimed ordinary work, then unclaimed recovery and repair work, then unclaimed ordinary work. Recovery includes assessments and tickets labelled `orchestrator:recovery-priority`, or its old name `orchestrator:fixing`. Routine dependency assessments and quiet Inbox readiness checks form a final idle-only group, after all actionable ticket offers regardless of ownership. They run only when the local computer has no active ticket reservation and selects no ready ticket stage. Actual stage errors and assigned repairs retain the existing recovery order. Within the claimed groups, oldest claim comes next. Within the unclaimed groups, project order comes next. The dispatcher's ticket priority labels and stage order break ties. The manager rereads offers and reservations before every admission. An owned offer that cannot fit the remaining capacity does not prevent fitting unclaimed work from starting. Running work is never pre-empted. A blocked or errored ticket stays owned but is absent from ordinary eligible offers, so other work can proceed. Strict project priority can starve a lower project if higher projects always have eligible work.

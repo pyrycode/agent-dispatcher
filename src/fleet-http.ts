@@ -51,6 +51,7 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
       if (req.method === "GET" && req.url === "/tasks/orphaned") return send(200, store.orphans.list());
       if (req.method === "GET" && req.url === "/state") return send(200, {...store.snapshot(), features:{recoveryTasks:true},requiredRepairs:store.requiredRepairs()});
       if (req.method === "GET" && req.url === "/runner") return send(200, store.runnerPolicy() ?? null);
+      if (req.method === "GET" && req.url === "/codex") return send(200, { pause: store.codex.state(), config: store.codex.config, events: store.codex.events() });
       if (req.method === "GET" && req.url === "/recovery/state") return send(200, store.recovery.list());
       if (req.method === "GET" && req.url === "/github/status" && isAdmin) return send(200, github?.status() ?? { enabled: false });
       if (req.method !== "POST") return send(404, { error: "Unknown operation" });
@@ -63,6 +64,14 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
       if (req.url === '/runner') {
         if (!isAdmin) return send(403, { error: 'Operator credential required' });
         return send(200, store.setRunner(body.runner));
+      }
+      if (req.url === '/codex/report') {
+        if (!machine) return send(403, { error: 'Machine credential required' });
+        return send(200, store.codexReport(machine, body.session, body.project, body.runId, body.event));
+      }
+      if (req.url === '/codex/clear') {
+        if (!isAdmin) return send(403, { error: 'Operator credential required' });
+        return send(200, store.clearCodexPause());
       }
       if (req.url === '/operations/report') {
         if (!isAdmin && body.machine !== machine) return send(403, {error:'Machine identity mismatch'});
