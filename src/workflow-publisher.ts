@@ -4,6 +4,7 @@ import type { GitHubBroker, GitHubRequest } from "./github-broker.js";
 import type { WorkflowProject, WorkflowItem } from "./workflow-store.js";
 import { WorkflowGitHub } from "./workflow-github.js";
 import { RECOVERY_LABEL_DEFINITIONS } from "./recovery-labels.js";
+import { labelColor } from "./label-colors.js";
 
 type GraphQLError = { message?: string; path?: Array<string | number> };
 
@@ -224,7 +225,7 @@ export class WorkflowPublisher {
           body: JSON.stringify(
             RECOVERY_LABEL_DEFINITIONS[name]
               ? { name, ...RECOVERY_LABEL_DEFINITIONS[name] }
-              : { name, color: "ededed" },
+              : { name, color: labelColor(name) },
           ),
         });
         labels = await this.compatibility.labels(project, true);

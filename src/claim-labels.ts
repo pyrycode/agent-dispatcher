@@ -1,3 +1,4 @@
+import { labelColor } from "./label-colors.js";
 import type { Claim } from "./fleet-store.js";
 
 const PREFIX = "claim:";
@@ -100,7 +101,7 @@ export class GitHubClaimLabels implements ClaimLabelApi {
   }
   async createLabel(project: string, label: string): Promise<void> {
     try {
-      await this.request(`${project}/labels`, "POST", { name: label, color: label === ESCALATED_LABEL ? "D93F0B" : "1D76DB", description: label === ESCALATED_LABEL ? "Recovery escalated. See the latest orchestrator decision for the missing action." : "Computer owning this ticket. Managed by the fleet claim service." });
+      await this.request(`${project}/labels`, "POST", { name: label, color: labelColor(label), description: label === ESCALATED_LABEL ? "Recovery escalated. See the latest orchestrator decision for the missing action." : "Computer owning this ticket. Managed by the fleet claim service." });
     } catch (error) {
       // Another writer may have created the same label. Verify it exists;
       // failures still reach the next periodic retry without touching claims.

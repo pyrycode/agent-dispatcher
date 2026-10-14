@@ -1097,9 +1097,9 @@ test("the publisher settles repair markers and creates the recovery labels with 
   assert.deepEqual(created, [
     {
       name: PRIORITY,
-      color: "FF1493",
+      color: "0B6E65",
       description: "Orchestrator repair assigned. Its stages get recovery priority until Done, a hold or a new error.",
     },
-    { name: LEGACY, color: "ededed" },
+    { name: LEGACY, color: "0B6E65" },
   ]);
 });

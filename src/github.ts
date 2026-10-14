@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { graphql } from "@octokit/graphql";
+import { labelColor } from "./label-colors.js";
 import { githubFetch, freshGitHubRead } from "./github-transport.js";
 import { GitHubNoDataError } from "./poll-failure.js";
 import type { ProjectConfig, ProjectItem } from "./types.js";
@@ -1014,7 +1015,30 @@ export class GitHubProjectClient {
     return result.addProjectV2ItemById.item.id;
   }
 
+  /** Labels this client has already made sure exist with their scheme colour. */
+  private readonly ensuredLabels = new Set<string>();
+
+  /**
+   * GitHub's add-label endpoint creates an unknown label with a default grey.
+   * Create it first with the shared scheme colour. A label that already exists
+   * answers 422 and is left alone, so existing colours are never overwritten.
+   */
+  private async ensureLabel(label: string): Promise<void> {
+    if (this.ensuredLabels.has(label)) return;
+    try {
+      await fetch(`https://api.github.com/repos/${this.config.owner}/${this.config.repo}/labels`, {
+        method: "POST",
+        headers: { Authorization: `token ${this.config.token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ name: label, color: labelColor(label) }),
+      });
+      this.ensuredLabels.add(label);
+    } catch {
+      // Best effort: adding the label below still creates it, just in grey.
+    }
+  }
+
   async addLabel(issueNumber: number, label: string): Promise<void> {
+    await this.ensureLabel(label);
     const response = await fetchWithRetry(
       `https://api.github.com/repos/${this.config.owner}/${this.config.repo}/issues/${issueNumber}/labels`,
       {
