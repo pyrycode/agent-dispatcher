@@ -9636,6 +9636,17 @@ describe("Codex blocked on a missing tool or variable — auto-retry", () => {
     assert.deepEqual(client.addLabelCalls.map(c => c.label), ["error-retry-count:1"]);
   });
 
+  test("an unprovisioned sign-in retries, then parks at the cap like any transient (desktop #1809)", async () => {
+    const text = "Codex task blocked: PYRY_CODEX_CAPTURE_HOME is unset. A separately provisioned Codex sign-in is required; the operator must provision the dedicated home.";
+    const first = makeTestContext({ item: { issueNumber: 1809 } });
+    await handleDispatchError(new Error(text), first.ctx, streamResult({ runner: "codex", isError: true, terminalReason: "codex_blocked" }));
+    assert.deepEqual(first.client.addLabelCalls.map(c => c.label), ["error-retry-count:1"]);
+    const capped = makeTestContext({ item: { issueNumber: 1809, labels: ["error-retry-count:4"] } });
+    await handleDispatchError(new Error(text), capped.ctx, streamResult({ runner: "codex", isError: true, terminalReason: "codex_blocked" }));
+    assert.ok(capped.client.addLabelCalls.some(c => c.label === "error:developer"));
+    assert.ok(capped.client.comments.some(c => c.body.includes("Transient retries exhausted")));
+  });
+
   test("at the retry cap it parks with error:<agent>, as any transient does", async () => {
     const { ctx, client } = makeTestContext({ item: { issueNumber: 1668, labels: ["error-retry-count:4"] } });
     await handleDispatchError(new Error(figma), ctx,

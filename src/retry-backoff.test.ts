@@ -210,6 +210,18 @@ describe("classifyBlockedRun — missing tools and environment retry, everything
     }
   });
 
+  test("sign-in and provisioning blocks retry like a missing variable, then park at the cap (2026-10-14)", () => {
+    // A bridge restart reads exactly like a missing sign-in from inside the
+    // sandbox, so neither parks at once. See the note at BLOCKED_NEVER_RETRY.
+    for (const summary of [
+      "gh authentication is unavailable in this sandbox; GITHUB_TOKEN is not set",
+      // Desktop #1809's shape: an unprovisioned dedicated Codex sign-in.
+      "PYRY_CODEX_CAPTURE_HOME is unset. A separately provisioned Codex sign-in is required; the operator must provision the dedicated home.",
+    ]) assert.deepEqual(classifyBlockedRun(blocked(summary)), { transient: true, signature: "environment variable missing" }, summary);
+    // Naming a person or a decision still parks at once.
+    assert.equal(classifyBlockedRun(blocked("Codex sign-in is missing; a human must decide which account the tests use.")).transient, false);
+  });
+
   test("a block that needs a person still parks at once", () => {
     const parks = [
       // The automatic approval reviewer refused an action. Retrying would repeat it.
