@@ -35,6 +35,16 @@ function idleAssessment(offer: WorkOffer, state: FleetSnapshot): boolean {
   return offer.role === "recovery" && !!state.idleRecoveryTickets?.includes(offer.ticket);
 }
 
+/**
+ * A priority:high ticket waiting for its verifier. It ranks ahead of recovery
+ * checks, assigned repairs and support tasks, so it also ranks ahead of all
+ * other waiting work. Ranking only: every admission check below still applies.
+ * The authority names the tickets from its workflow labels.
+ */
+function urgentVerifier(offer: WorkOffer, priorityHigh: ReadonlySet<string>): boolean {
+  return offer.role === "verifier" && /#[1-9]\d*$/.test(offer.ticket) && priorityHigh.has(offer.ticket);
+}
+
 /** Draining stops new tickets, while reconciliation can still advance owned work. */
 export function acceptsDuringProjectDrain(offer: WorkOffer, machine: string, drainingProjects: readonly string[], state: FleetSnapshot): boolean {
   return offer.role==="recovery-task" && !!offer.supportTaskId
@@ -66,12 +76,14 @@ export function scheduleMachine(opts: {
   const runnable = runnableTickets(opts.machine, opts.offers, opts.state);
   let ticketPlaces = Math.max(0, (opts.ticketLimit ?? Infinity) - runnable.size);
   const rank = new Map(opts.projects.map((p, i) => [p, i]));
+  const priorityHigh = new Set(opts.state.priorityHighTickets ?? []);
   const ready = opts.offers.filter(o => rank.has(o.project) && (!claims.has(o.ticket) || claims.get(o.ticket)!.machine === opts.machine)
     && acceptsDuringProjectDrain(o, opts.machine, opts.drainingProjects ?? [], opts.state));
   ready.sort((a, b) => {
     const parentClaim=(o:WorkOffer)=>o.supportTaskId&&o.parentTicket?claims.get(o.parentTicket):undefined;
     const ac=claims.get(a.ticket)??parentClaim(a),bc=claims.get(b.ticket)??parentClaim(b);
     return Number(idleAssessment(a, opts.state)) - Number(idleAssessment(b, opts.state))
+      || Number(!urgentVerifier(a, priorityHigh)) - Number(!urgentVerifier(b, priorityHigh))
       || Number(!ac) - Number(!bc)
       || Number(!(a.role === "recovery" || a.recovery)) - Number(!(b.role === "recovery" || b.recovery))
       || Number(!a.recoveryError) - Number(!b.recoveryError)

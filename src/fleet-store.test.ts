@@ -244,3 +244,56 @@ test("a light merge is admitted at full capacity and stays singly owned", async 
   store.finish("mac", "session-1", "m1");
   assert.equal(store.start(merge("m2", "linux", "org/mobile#1978")).ok, true);
 });
+
+test("the snapshot names open priority:high tickets of adopted projects for the scheduler", async t => {
+  const { store } = fixture(t);
+  const { scheduleMachine } = await import("./machine-scheduler.js");
+  const project = { project: "org/core", projectId: "P", statusFieldId: "S", options: { Inbox: "i", "In Development": "d", Done: "done" } };
+  const item = (n: number, labels: string[] = [], state: "OPEN" | "CLOSED" = "OPEN") => ({ id: `P${n}`, issueId: `I${n}`, issueNumber: n, title: "t", body: "b",
+    url: `https://github.com/org/core/issues/${n}`, status: "In Development", labels, blockedBy: [], parentNumber: null, grandparentNumber: null, state, revision: 1, position: n });
+  store.workflow.import(project, [item(1, ["priority:high"]), item(2, ["priority:normal"]), item(3, ["priority:high"], "CLOSED"), item(4, ["priority:high", "orchestrator:recovery-priority"]), item(9)]);
+  assert.deepEqual(store.snapshot().priorityHighTickets, ["org/core#1", "org/core#4"]);
+
+  // The admission path reads it: the labelled verifier takes the one heavy place ahead of an owned recovery check.
+  assert.equal(store.start({ ...request("check-claim", "mac", "org/core#9"), role: "builder", workflowVersion: 1 }).ok, true);
+  store.finish("mac", "session-1", "check-claim", false, false);
+  const offer = (ticket: string, role: string) => ({ project: "org/core", ticket, role, resource: "heavy" as const, locks: [], key: ticket, order: 0 });
+  const pick = () => scheduleMachine({ machine: "mac", heavyLimit: 1, combinedLimit: 1, projects: ["org/core"], state: store.snapshot(),
+    offers: [offer("org/core#9", "recovery"), offer("org/core#1", "verifier")] })[0]?.ticket;
+  assert.equal(pick(), "org/core#1");
+
+  // Removing the label restores today's order, and an empty list leaves the snapshot unchanged.
+  store.workflow.change("org/core#1", { removeLabels: ["priority:high"] }, "test", "drop-1");
+  store.workflow.change("org/core#4", { removeLabels: ["priority:high"] }, "test", "drop-4");
+  assert.equal(store.snapshot().priorityHighTickets, undefined);
+  assert.equal(pick(), "org/core#9");
+});
+
+test("the kept priority:high list follows commits, rollbacks and other connections", t => {
+  const { store, path } = fixture(t);
+  const project = { project: "org/core", projectId: "P", statusFieldId: "S", options: { Inbox: "i", "In Development": "d", Done: "done" } };
+  const item = (n: number, labels: string[] = []) => ({ id: `P${n}`, issueId: `I${n}`, issueNumber: n, title: "t", body: "b",
+    url: `https://github.com/org/core/issues/${n}`, status: "In Development", labels, blockedBy: [], parentNumber: null, grandparentNumber: null, state: "OPEN" as const, revision: 1, position: n });
+  store.workflow.import(project, [item(1, ["priority:high"]), item(2)]);
+  assert.deepEqual(store.snapshot().priorityHighTickets, ["org/core#1"]);
+  assert.deepEqual(store.snapshot().priorityHighTickets, ["org/core#1"]);
+
+  // A change that rolls back is seen inside its transaction and forgotten after it.
+  assert.throws(() => store.workflow.transaction(() => {
+    store.workflow.change("org/core#2", { addLabels: ["priority:high"] }, "test", "rolled-back");
+    assert.deepEqual(store.snapshot().priorityHighTickets, ["org/core#1", "org/core#2"]);
+    throw new Error("abort");
+  }), /abort/);
+  assert.deepEqual(store.snapshot().priorityHighTickets, ["org/core#1"]);
+
+  // A commit through another connection to the same file is seen at once.
+  const other = new FleetStore(path, { mac: { heavyLimit: 2, combinedLimit: 2 }, linux: { heavyLimit: 2, combinedLimit: 2 } });
+  t.after(() => other.close());
+  other.workflow.change("org/core#2", { addLabels: ["priority:high"] }, "test", "other-connection");
+  assert.deepEqual(store.snapshot().priorityHighTickets, ["org/core#1", "org/core#2"]);
+  other.workflow.change("org/core#1", { state: "CLOSED", status: "Done" }, "test", "closed-elsewhere");
+  assert.deepEqual(store.snapshot().priorityHighTickets, ["org/core#2"]);
+  // Callers cannot alter the kept list.
+  store.snapshot().priorityHighTickets!.push("org/core#99");
+  assert.deepEqual(store.snapshot().priorityHighTickets, ["org/core#2"]);
+});
