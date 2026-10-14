@@ -1015,7 +1015,7 @@ The consumer launcher exposes it as `bin/pyry-test --slow`.
 
 Optional [managed dispatch](docs/machine-manager.md) shares heavy capacity across projects on each computer and reserves tickets across computers. The guide covers configuration, Linux and macOS services, draining and manual ticket release.
 
-A Codex run that OpenAI refuses with a rate limit (429) pauses new Codex starts across the whole fleet, doubling while the limit lasts. While the claim service confirms that pause, the ticket is not errored and its retry count does not move, for up to four 429s in a row on one ticket; otherwise the ordinary capped transient retry applies. See [Codex rate-limit pause](docs/machine-manager.md#codex-rate-limit-pause).
+A Codex run that OpenAI refuses with a rate limit (429) pauses new Codex starts across the whole fleet, doubling while the limit lasts. While the claim service confirms that pause, the ticket is not errored and its retry count does not move, for up to four 429s on one ticket while other Codex runs get through; otherwise the ordinary capped transient retry applies. See [Codex rate-limit pause](docs/machine-manager.md#codex-rate-limit-pause).
 
 ### Incomplete verification
 

@@ -402,8 +402,14 @@ test("in a managed run a Codex 429 pauses the fleet, and a later clean start res
   clock += 2 * 60_000;
   await managed.sync(); await manager.tick(); await managed.sync();
   assert.equal(managed.ready(second), true, "admitted once the pause ends");
-  const ok = await managed.run(second, () => runClaudeStreaming(fixture(t, "normal").options));
+  // A start spread drawn now holds offers, never a run that is already admitted.
+  armCodexStartJitter({ PYRY_CODEX_START_JITTER_MS: "60000" }, Date.now(), () => 1);
+  const startedAt = Date.now();
+  let ok;
+  try { ok = await managed.run(second, () => runClaudeStreaming(fixture(t, "normal").options)); }
+  finally { armCodexStartJitter({ PYRY_CODEX_START_JITTER_MS: "0" }); }
   assert.equal(ok.isError, false);
+  assert.ok(Date.now() - startedAt < 30_000, "an admitted managed run does not wait for the spread");
   // The clean report is fire-and-forget from the stream; give it a moment.
   for (let i = 0; i < 100 && !store.codex.events().some(e => e.kind === "reset"); i++) await new Promise(r => setTimeout(r, 20));
   assert.equal(store.codex.state().level, 0);
@@ -419,8 +425,8 @@ test("after a dispatcher restart the first Codex start waits its random spread, 
   const result = await runClaudeStreaming(f.options);
   assert.equal(result.isError, false);
   assert.ok(Date.now() - started >= 350, "the first start waited");
-  assert.match(readFileSync(f.options.logFile, "utf8"), /First Codex start after a dispatcher restart: waiting 1s/);
+  assert.match(readFileSync(f.options.logFile, "utf8"), /Codex start spread: waiting 1s/);
   const g = fixture(t, "normal");
   await runClaudeStreaming(g.options);
-  assert.doesNotMatch(readFileSync(g.options.logFile, "utf8"), /First Codex start/, "later starts do not wait");
+  assert.doesNotMatch(readFileSync(g.options.logFile, "utf8"), /Codex start spread/, "later starts do not wait");
 });

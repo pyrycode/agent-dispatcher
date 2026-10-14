@@ -187,10 +187,15 @@ export class CodexThrottle {
     const t = this.now();
     this.tick(t);
     this.db.prepare("DELETE FROM fleet_codex_ticket_reports WHERE updated < ?").run(t - 7 * 86400_000);
-    this.db.prepare(`INSERT INTO fleet_codex_ticket_reports VALUES (?,1,?)
-      ON CONFLICT(ticket) DO UPDATE SET reports=reports+1, updated=excluded.updated`).run(source.ticket, t);
-    const ticketReports = Number(this.db.prepare("SELECT reports FROM fleet_codex_ticket_reports WHERE ticket=?").get(source.ticket)!.reports);
     const r = this.row();
+    // A 429 counts towards the ticket's own run only when some Codex run got
+    // through since its previous one. During an account-wide limit nothing
+    // starts cleanly anywhere, and no ticket should pay for that.
+    const previous = this.db.prepare("SELECT reports,updated FROM fleet_codex_ticket_reports WHERE ticket=?").get(source.ticket);
+    const ticketReports = !previous ? 1
+      : r?.lastClean != null && r.lastClean > Number(previous.updated) ? Number(previous.reports) + 1 : Number(previous.reports);
+    this.db.prepare(`INSERT INTO fleet_codex_ticket_reports VALUES (?,?,?)
+      ON CONFLICT(ticket) DO UPDATE SET reports=excluded.reports, updated=excluded.updated`).run(source.ticket, ticketReports, t);
     const where = `${source.role} on ${source.ticket} (${source.machine})`;
     const counted = ticketReports > CODEX_UNCOUNTED_PER_TICKET ? ` That is ${ticketReports} 429s in a row on this ticket, so this one counts against it.` : "";
     if (r && r.until !== null && t < r.until) {
@@ -222,11 +227,13 @@ export class CodexThrottle {
     // The ticket itself got through, so its own run of 429s is over.
     this.db.prepare("DELETE FROM fleet_codex_ticket_reports WHERE ticket=?").run(source.ticket);
     const r = this.row();
+    if (!r) return this.state(t);
+    // Any clean start shows Codex is getting through, which the per-ticket count reads.
+    r.lastClean = t;
     // A run admitted in the pause's first millisecond was admitted before it:
     // from then on Codex admissions are refused until the pause ends.
-    if (!r || r.level === 0 || (r.until !== null && t < r.until) || (r.since !== null && source.admittedAt <= r.since)) return this.state(t);
+    if (r.level === 0 || (r.until !== null && t < r.until) || (r.since !== null && source.admittedAt <= r.since)) { this.save(r); return this.state(t); }
     r.level = 0;
-    r.lastClean = t;
     this.save(r);
     this.event("reset", `${source.role} on ${source.ticket} (${source.machine}) started Codex cleanly; the next pause is back to ${minutes(this.durationFor(0))}.`, t);
     return this.state(t);

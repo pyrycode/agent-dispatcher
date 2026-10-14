@@ -363,6 +363,20 @@ describe("per-ticket limit on uncounted waits", () => {
     assert.equal(limited(store, admit(store, "builder", { ticket, id: "t900-again" })).ticketReports, 1);
   });
 
+  test("an account-wide limit with nothing getting through never counts against a ticket", t => {
+    const { store, advance } = fixture(t);
+    store.setRunner("codex");
+    for (let i = 0; i < 8; i++) {
+      const run = admit(store, "builder", { ticket: "org/core#901", id: `t901-${i}` });
+      const state = limited(store, run);
+      assert.equal(state.ticketReports, 1);
+      assert.equal(rateLimitWaitsUncounted(state), true);
+      store.finish("box", "s1", run.id, false);
+      advance(state.durationMs);
+    }
+    assert.equal(store.codex.state().nextDurationMs, 30 * MIN, "the fleet backoff still climbs to the ceiling");
+  });
+
   test("no pause, or a failed delivery, never waits uncounted", () => {
     assert.equal(rateLimitWaitsUncounted(null), false);
     assert.equal(rateLimitWaitsUncounted({ active: false } as CodexPauseState), false);

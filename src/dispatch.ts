@@ -1417,7 +1417,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
 async function waitForCodexStartJitter(log: (msg: string) => void): Promise<void> {
   const wait = codexStartHoldMs();
   if (wait <= 0) return;
-  log(`First Codex start after a dispatcher restart: waiting ${Math.ceil(wait / 1000)}s so restarted dispatchers do not start Codex together`);
+  log(`Codex start spread: waiting ${Math.ceil(wait / 1000)}s so restarted dispatchers do not start Codex together`);
   await new Promise(resolve => setTimeout(resolve, wait));
 }
 
@@ -1432,8 +1432,10 @@ export async function runClaudeStreaming(opts: RunClaudeOpts): Promise<StreamRes
     console.log(`   ♻️  ${msg}`);
   };
   try {
-    if (opts.runner === "codex") await waitForCodexStartJitter(logger);
     const reportCodex = opts.runner === "codex" ? managedCodexReporter() : null;
+    // A managed dispatcher spreads its starts by holding offers back, so an
+    // admitted run (a verifier's final review, a resume leg) never waits here.
+    if (opts.runner === "codex" && !reportCodex) await waitForCodexStartJitter(logger);
     const result = await retryRequiredMcpStartup(
       () => retrySpawnOnTransientError(() => runClaudeStreamingOnce(opts), { logger }),
       { log: logger },
@@ -9650,7 +9652,8 @@ export async function pollLoop(): Promise<void> {
   if (managed && AUTOCURATE_MEMORY) throw new Error("Managed dispatch requires PYRY_AUTOCURATE_MEMORY=0");
   // Agent offers state this dispatcher's own runner, so the claim service can
   // hold Codex work during a fleet pause even without a central runner choice.
-  if (managed) managed.localRunner = selectRunner;
+  // Without the admitted run's frozen central choice: the offer states the local answer only.
+  if (managed) managed.localRunner = createRunnerSelector({ path: () => runnerFilePath(process.env, agentsRepoRoot), env: process.env, warn: () => {} });
   if (managed) {await managed.start();rawClient=managed.authorityClient(rawClient);}
   const client = managed ? managed.client(rawClient) : rawClient;
   const maintenanceClient = managed ? managed.client(rawClient, true) : rawClient;

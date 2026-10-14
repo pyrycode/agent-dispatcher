@@ -161,7 +161,10 @@ const PROVIDER_RATE_LIMIT: readonly RegExp[] = [
 ];
 
 /** A refused WebSocket upgrade. Always an admission rejection, whatever else the line says. */
-const HANDSHAKE_REJECTION: readonly RegExp[] = ADMISSION_SIGNATURES.slice(0, 2);
+const HANDSHAKE_REJECTION: readonly RegExp[] = [
+  /\bexpected handshake response status code 101 but got (?:429|503)\b/i,
+  /\bExpected HTTP 101 response but was '(?:429|503)\b/i,
+];
 
 /** One line naming a refused admission, and not a model provider's own limit. */
 function isAdmissionLine(line: string): boolean {
