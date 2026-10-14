@@ -38,6 +38,23 @@ class Tests(unittest.TestCase):
                 if args[0]=='podman':raise RuntimeError('old container was removed')
                 return 'dispatcher' if str(args[2]).endswith('/dispatcher') else 'consumer'
             with patch.object(module,'execute',side_effect=execute):adapter.update('org/core',{'consumer':'consumer','dispatcher':'dispatcher'})
+    def test_update_fast_forwards_to_exactly_the_queued_consumer(self):
+        # 2026-10-13 22:59: consumer main moved again before the drain finished.
+        with tempfile.TemporaryDirectory() as d:
+            adapter=module.NativeAdapter({'stateDirectory':d,'platform':'mac','projects':{'org/core':{'agents':d+'/agents'}}})
+            adapter.preflight=lambda project,desired:True
+            commands=[];head=['queued']
+            def execute(args,**kwargs):
+                commands.append([str(a) for a in args[3:]])
+                if args[3:5]==['rev-parse','HEAD']:return 'pinned' if str(args[2]).endswith('/dispatcher') else head[0]
+                return ''
+            with patch.object(module,'execute',side_effect=execute):adapter.update('org/core',{'consumer':'queued','dispatcher':'pinned'})
+            self.assertEqual(commands[:3],[['fetch','--quiet'],['merge','--ff-only','--quiet','queued'],['rev-parse','HEAD']])
+            self.assertNotIn('pull',[c[0] for c in commands])
+            head[0]='newer';commands.clear()
+            with patch.object(module,'execute',side_effect=execute),self.assertRaisesRegex(RuntimeError,'does not match the queued update'):
+                adapter.update('org/core',{'consumer':'queued','dispatcher':'pinned'})
+            self.assertNotIn(['submodule','update','--init','dispatcher'],commands)
     def test_restart_verification_requires_the_configured_persistent_publish_mount(self):
         with tempfile.TemporaryDirectory() as d:
             adapter=module.NativeAdapter({'stateDirectory':d,'platform':'linux','projects':{'org/core':{'container':'core','publishStorage':d+'/publish'}}})

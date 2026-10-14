@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 import errno
+import sys
 import os
 import signal
 import time
@@ -650,4 +651,192 @@ class SupportTests(unittest.TestCase):
    with patch.object(m,'route_available',return_value=True),patch.object(m.subprocess,'Popen') as spawn:s.tick();s.tick();spawn.assert_not_called()
    self.assertEqual(calls.count('uncertain'),1)
    self.assertEqual(json.loads(receipt.read_text())['phase'],'attention')
+TASK='29219c8b8ff620429a99de07365c889b44ecc0c3bc1d75c99525f7feea9ab1d4'
+nspec=importlib.util.spec_from_file_location('native',Path(__file__).with_name('fleet-native.py'))
+native=importlib.util.module_from_spec(nspec);nspec.loader.exec_module(native)
+
+class Child:
+ pid=4242
+ def poll(self):return None
+
+class NativeTaskDuringDrainTests(unittest.TestCase):
+ """Modelled on pyrybox Core, 2026-10-13: the #3247 repair task admitted 17:12 and the
+ Desktop #1809 repair task admitted 22:48:43, both into the Core container while the
+ supervisor drained it. Each worker died with the container and its reservation stayed."""
+ def support(self,d,phase=None):
+  route={'capability':'dispatcher-repair','container':'core','directory':d+'/work','containerDirectory':'/work','paths':{}}
+  probe={'capability':'linux-amd64','container':'desktop','directory':d+'/work','containerDirectory':'/work','paths':{}}
+  state={'machine':'pyrybox','draining':False,'runs':[]}
+  class Adapter:
+   def status(self):return state
+   def operator_command(self,*args):return ['operator',*args]
+  s=m.SupportSupervisor(Adapter(),{'stateDirectory':d,'projects':{'org/core':{'container':'core'},'org/desktop':{'container':'desktop'}},
+                                    'recoveryTasks':{'dispatcher-repair:dispatcher-repair':route,'platform-probe:linux-amd64':probe}})
+  if phase:m.atomic(Path(d)/'org_core.json',{'phase':phase})
+  logged=[];s.housekeeping=lambda kind,subject,reason:logged.append((kind,subject,reason))
+  calls=[]
+  grant={'task':{'id':TASK,'ticket':'org/desktop#1809','request':{'recipe':'dispatcher-repair','capability':'dispatcher-repair','reason':'r'}},
+         'run':{'id':'run-1809','session':'scheduler','supportTaskId':TASK}}
+  def rpc(op,body):
+   calls.append((op,body))
+   return [grant] if op=='schedule' else {}
+  s.rpc=rpc
+  return s,state,calls,logged,grant
+ def adapter(self,d,state):
+  a=native.NativeAdapter({'stateDirectory':d,'platform':'linux','projects':{'org/core':{'container':'core'}}})
+  a.status=lambda:state
+  return a
+
+ def test_grant_into_a_draining_container_is_deferred_and_does_not_hold_the_drain(self):
+  with tempfile.TemporaryDirectory() as d:
+   s,state,calls,logged,grant=self.support(d,'draining')
+   state['runs']=[{'machine':'pyrybox','supportTaskId':TASK,'id':'run-1809','session':'scheduler'}]
+   with patch.object(m,'route_available',return_value=True),patch.object(m.subprocess,'Popen') as spawn:
+    entries=s.tick();s.tick()
+   spawn.assert_not_called()
+   self.assertEqual([e['phase'] for e in entries],['deferred'])
+   self.assertFalse((s.directory/(TASK+'.receipt.json')).exists())
+   self.assertEqual([c[1]['record']['capabilities'] for c in calls if c[0]=='capabilities'],[['linux-amd64'],['linux-amd64']])
+   self.assertEqual([k for k,_,_ in logged],['native-task-deferred'])
+   # The supervisor's drain no longer waits for a task that was never started.
+   self.assertFalse(self.adapter(d,state).helpers_active('org/core'))
+   # A deferral for another run or session proves nothing about this reservation.
+   state['runs']=[{'machine':'pyrybox','supportTaskId':TASK,'id':'run-other','session':'scheduler'}]
+   self.assertTrue(self.adapter(d,state).helpers_active('org/core'))
+
+ def test_deferred_task_starts_once_its_container_update_completes(self):
+  with tempfile.TemporaryDirectory() as d:
+   s,state,calls,logged,grant=self.support(d,'draining')
+   with patch.object(m,'route_available',return_value=True),patch.object(m.subprocess,'Popen') as spawn:s.tick()
+   m.atomic(Path(d)/'org_core.json',{'phase':'complete'})
+   with patch.object(m,'route_available',return_value=True),patch.object(m.subprocess,'Popen',return_value=Child()) as spawn:
+    entries=s.tick()
+   self.assertEqual(spawn.call_count,1)
+   self.assertEqual(spawn.call_args[0][0][:4],['podman','exec','core','python3'])
+   self.assertEqual(entries[-1]['phase'],'running')
+   self.assertFalse((s.directory/(TASK+'.deferred.json')).exists())
+   state['runs']=[{'machine':'pyrybox','supportTaskId':TASK,'id':'run-1809','session':'scheduler'}]
+   self.assertTrue(self.adapter(d,state).helpers_active('org/core'))
+
+ def test_withhold_removes_only_the_draining_containers_capabilities(self):
+  with tempfile.TemporaryDirectory() as d:
+   s,state,calls,logged,grant=self.support(d)
+   with patch.object(m,'route_available',return_value=True):
+    s.withhold('org/core');s.withhold('org/unconfigured')
+   self.assertEqual(calls,[('capabilities',{'machine':'pyrybox','record':{'capabilities':['linux-amd64'],'ready':True}})])
+   with patch.object(m,'route_available',return_value=True):s.withhold('org/desktop')
+   self.assertEqual(calls[-1][1]['record']['capabilities'],['dispatcher-repair'])
+
+ def orphan(self,d,phase='running',wrote_at=None):
+  s,state,calls,logged,grant=self.support(d)
+  folder=Path(d)/'work'/TASK;folder.mkdir(parents=True)
+  (folder/'execution.log').write_text('repair started\n')
+  if wrote_at is not None:os.utime(folder/'execution.log',ns=(wrote_at,wrote_at))
+  receipt=s.directory/(TASK+'.receipt.json')
+  m.atomic(receipt,{'id':TASK,'session':'scheduler','phase':phase,'result':str(folder/'result.json'),'created':1,'container':'core',
+                    'directory':str(folder),'containerDirectory':'/work/'+TASK,'pid':4242,'custody':{'root':{'pid':4242,'identity':'exec-client'},'owned':{}}})
+  return s,calls,logged,receipt
+
+ def pass_with(self,s,container,custody='drained'):
+  with patch.object(m,'process_snapshot',return_value={}),patch.object(m,'observe_custody',return_value=custody),\
+       patch.object(m,'container_instance',return_value=container),patch.object(s,'route_ready',return_value=False):
+   return s.tick()
+
+ def test_worker_in_a_stopped_container_releases_its_reservation_as_interrupted(self):
+  # 22:49:52: the Core container exited and the #1809 worker died with it.
+  with tempfile.TemporaryDirectory() as d:
+   s,calls,logged,receipt=self.orphan(d)
+   self.assertEqual(self.pass_with(s,{'running':False}),[])
+   [(op,body)]=[c for c in calls if c[0] in {'complete','uncertain'}]
+   self.assertEqual(op,'complete');self.assertEqual((body['machine'],body['id'],body['session']),('pyrybox',TASK,'scheduler'))
+   self.assertEqual(body['result']['outcome'],'failed');self.assertEqual(body['result']['files'],{})
+   self.assertIn('not running',body['result']['summary']);self.assertIn('interrupted work, not completed and not unused',body['result']['summary'])
+   saved=json.loads(receipt.read_text())
+   self.assertEqual(saved['phase'],'complete');self.assertEqual(saved['interrupted']['result'],body['result'])
+   self.assertEqual([k for k,_,_ in logged],['native-task-interrupted'])
+   self.pass_with(s,{'running':False})
+   self.assertEqual([c[0] for c in calls if c[0] in {'complete','uncertain'}],['complete'])
+
+ def test_worker_in_a_container_restarted_after_its_last_write_is_interrupted(self):
+  # 17:15:54: the Core container restarted after the #3247 worker last wrote at 17:12:37.
+  with tempfile.TemporaryDirectory() as d:
+   wrote=1791900757*10**9
+   s,calls,logged,receipt=self.orphan(d,wrote_at=wrote)
+   self.pass_with(s,{'running':True,'startedAt':wrote+197*10**9,'id':'new-instance'})
+   self.assertEqual([c[0] for c in calls if c[0] in {'complete','uncertain'}],['complete'])
+   self.assertIn('restarted after the worker last wrote',json.loads(receipt.read_text())['interrupted']['reason'])
+
+ def test_already_escalated_orphan_is_released_once_its_container_is_gone(self):
+  # The receipt state the #1809 task was left in overnight.
+  with tempfile.TemporaryDirectory() as d:
+   s,calls,logged,receipt=self.orphan(d,phase='attention')
+   self.pass_with(s,{'running':False})
+   self.assertEqual([c[0] for c in calls if c[0] in {'complete','uncertain'}],['complete'])
+   self.assertEqual(json.loads(receipt.read_text())['phase'],'complete')
+
+ def test_no_release_without_proof_that_the_worker_is_gone(self):
+  wrote=1791900757*10**9
+  cases=[('worker may be in the running instance',{'running':True,'startedAt':wrote-10**9,'id':'i'},'drained',wrote),
+         ('write within the clock margin',{'running':True,'startedAt':wrote+10**9,'id':'i'},'drained',wrote),
+         ('podman state unknown',None,'drained',wrote),
+         ('exec client still alive',{'running':False},'alive',wrote),
+         ('exec client uncertain',{'running':False},'uncertain',wrote)]
+  for name,container,custody,stamp in cases:
+   with self.subTest(name),tempfile.TemporaryDirectory() as d:
+    s,calls,logged,receipt=self.orphan(d,wrote_at=stamp)
+    self.pass_with(s,container,custody)
+    self.assertNotIn('complete',[c[0] for c in calls])
+    self.assertNotEqual(json.loads(receipt.read_text())['phase'],'complete')
+
+ def test_a_restarted_container_proves_nothing_when_the_worker_never_wrote(self):
+  with tempfile.TemporaryDirectory() as d:
+   s,calls,logged,receipt=self.orphan(d)
+   (Path(d)/'work'/TASK/'execution.log').unlink()
+   self.pass_with(s,{'running':True,'startedAt':10**30,'id':'i'})
+   self.assertEqual([c[0] for c in calls if c[0] in {'complete','uncertain'}],['uncertain'])
+
+ def test_a_written_result_is_never_replaced_by_an_interruption(self):
+  with tempfile.TemporaryDirectory() as d:
+   s,calls,logged,receipt=self.orphan(d)
+   m.atomic(Path(d)/'work'/TASK/'result.json',{'outcome':'completed','summary':'Repair passed.','files':{}})
+   with patch.object(s,'drained',return_value=False):self.pass_with(s,{'running':False})
+   self.assertNotIn('complete',[c[0] for c in calls])
+
+ def test_a_lost_release_reply_is_retried_with_the_identical_result(self):
+  with tempfile.TemporaryDirectory() as d:
+   s,calls,logged,receipt=self.orphan(d)
+   rpc=s.rpc
+   def failing(op,body):
+    if op=='complete':calls.append(('lost',body));raise RuntimeError('connection reset')
+    return rpc(op,body)
+   s.rpc=failing
+   [entry]=self.pass_with(s,{'running':False})
+   self.assertEqual(entry['phase'],'error')
+   first=json.loads(receipt.read_text())['interrupted']
+   s.rpc=rpc
+   self.pass_with(s,{'running':True,'startedAt':0,'id':'later'})
+   sent=[body['result'] for op,body in calls if op in {'lost','complete'}]
+   self.assertEqual(sent,[first['result'],first['result']])
+   self.assertEqual(json.loads(receipt.read_text())['phase'],'complete')
+
+ def test_only_an_absent_or_fully_stopped_container_counts_as_not_running(self):
+  class Done:
+   def __init__(self,code):self.returncode=code
+  cases=[(1,None,{'running':False}),(0,'exited 0 1791950665477082324 abc',{'running':False}),
+         (0,'stopping 4242 1791950665477082324 abc',None),(0,'exited 4242 1791950665477082324 abc',None),
+         (0,'running 4242 1791950665477082324 abc',{'running':True,'startedAt':1791950665477082324,'id':'abc'}),
+         (0,'running 0 1791950665477082324 abc',None),(0,'garbled',None),(125,None,None)]
+  for code,inspect,expected in cases:
+   with self.subTest(code=code,inspect=inspect),patch.object(m.subprocess,'run',return_value=Done(code)),\
+        patch.object(m.subprocess,'check_output',return_value=inspect or ''):
+    self.assertEqual(m.container_instance('core'),expected)
+
+ def test_worker_marks_its_start_before_running_the_recipe(self):
+  with tempfile.TemporaryDirectory() as d:
+   folder=Path(d);m.atomic(folder/'task.json',{'request':{'recipe':'platform-probe'}});m.atomic(folder/'paths.json',{})
+   import subprocess
+   subprocess.run([sys.executable,str(Path(__file__).with_name('fleet-support.py')),'--worker',str(folder)],check=True,timeout=30)
+   self.assertTrue((folder/'started.json').is_file())
+   self.assertLessEqual((folder/'started.json').stat().st_mtime_ns,(folder/'result.json').stat().st_mtime_ns)
+
 if __name__=='__main__':unittest.main()
