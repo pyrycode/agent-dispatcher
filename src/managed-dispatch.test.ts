@@ -62,3 +62,24 @@ test("repair priority follows labels across builder, verification and live-gate 
   managed.setRecoveryTickets([{...ticket, labels: []}]);
   assert.equal(gate.offer.recovery, false);
 });
+
+// Mobile #2148 / PR #2150, 2026-10-14: a saved verdict for a PR went to the
+// workflow store as a ticket comment and was refused as an unknown ticket.
+test("a PR comment is authorized against its ticket and goes to GitHub, not the workflow store", async () => {
+  const managed = new ManagedDispatch("org/mobile", { PYRY_MANAGER_URL: "http://localhost:1", PYRY_MANAGER_TOKEN: "test" });
+  const calls: Array<{ path: string; ticket?: string }> = [];
+  (managed as any).connection = { call: async (path: string, body: any) => { calls.push({ path, ticket: body?.ticket }); return {}; } };
+  (managed as any).state = { ...(managed as any).state, workflowProjects: ["org/mobile"], claims: [], runs: [] };
+  const posted: Array<[number, number, string]> = [];
+  const base = {
+    addComment: async (_n: number, _body: string): Promise<void> => { throw new Error("ticket comments must go to the store"); },
+    addPullRequestComment: async (n: number, pr: number, body: string): Promise<void> => { posted.push([n, pr, body]); },
+  };
+  const client = managed.client(base);
+  await client.addPullRequestComment(2148, 2150, "## Verifier Review: #2148");
+  assert.deepEqual(posted, [[2148, 2150, "## Verifier Review: #2148"]]);
+  assert.deepEqual(calls, [{ path: "/authorize", ticket: "org/mobile#2148" }], "only the ticket's ownership is checked; nothing reaches /workflow/comment");
+  calls.length = 0;
+  await client.addComment(2148, "ticket note");
+  assert.deepEqual(calls.map(c => [c.path, c.ticket]), [["/authorize", "org/mobile#2148"], ["/workflow/comment", "org/mobile#2148"]], "ticket comments still go to the store");
+});

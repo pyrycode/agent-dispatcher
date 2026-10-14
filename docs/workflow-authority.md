@@ -47,6 +47,16 @@ refuses a dependency as a cycle because it still shows the reverse link, the
 publisher removes that link when the blocker's own database record does not want
 it. A cycle recorded in the database itself is reported and left for an operator.
 
+A pull request is not a workflow ticket. Comments on a PR go straight to GitHub,
+both from agents through the bridge and from the dispatcher's
+`addPullRequestComment`, after an ownership check against the PR's ticket. The
+store never queues them. Until 2026-10-14 the dispatcher sent a saved verifier
+verdict to the store as a ticket comment on the PR number, and the store refused
+it as an unknown ticket (Mobile #2148, PR #2150). A saved verdict is idempotent
+on its own terms: before posting, the dispatcher reads the PR back and skips the
+post when its run marker or the same body is already there, including a copy a
+human pasted by hand.
+
 Result comments are saved before publication. The publisher uses a stable marker
 to find an earlier successful POST after an uncertain response. Workflow counters
 read saved history. Issue discussion remains available through GitHub. A five

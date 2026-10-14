@@ -492,10 +492,15 @@ export class MockGitHubClient implements DispatchClient {
   /** Clock stamped onto comments posted through this client. Overridable so
    *  a test can post a marker and then have it read back as old. */
   commentClock: () => Date = () => new Date();
+  /** When set, `addComment` behaves like the workflow store: it accepts
+   *  only these ticket numbers and refuses anything else. */
+  workflowTickets?: Set<number>;
+  pullRequestCommentCalls: { issueNumber: number; pr: number }[] = [];
   failures: {
     addLabel?: Error | ((issueNumber: number, label: string) => Error | null);
     removeLabel?: Error | ((issueNumber: number, label: string) => Error | null);
     addComment?: Error;
+    addPullRequestComment?: Error;
     getIssueLabels?: Error;
     getOpenBlockers?: Error;
     getItemStatus?: Error;
@@ -571,8 +576,22 @@ export class MockGitHubClient implements DispatchClient {
   }
 
   async addComment(issueNumber: number, body: string): Promise<void> {
+    if (this.workflowTickets && !this.workflowTickets.has(issueNumber)) {
+      // What the orchestrator's workflow store answers for a number it does
+      // not hold as a ticket, a PR for example (#2148 / PR #2150).
+      throw new Error('Service 409 "Unknown workflow ticket"');
+    }
     this.comments.push({ issueNumber, body, postedAt: this.commentClock() });
     if (this.failures.addComment) throw this.failures.addComment;
+  }
+
+  async addPullRequestComment(issueNumber: number, pr: number, body: string): Promise<void> {
+    this.pullRequestCommentCalls.push({ issueNumber, pr });
+    // Recorded under the PR's number, like a real PR comment, so a read of
+    // the PR sees it; recorded before throwing, like a write GitHub stored
+    // but reported as failed.
+    this.comments.push({ issueNumber: pr, body, postedAt: this.commentClock() });
+    if (this.failures.addPullRequestComment) throw this.failures.addPullRequestComment;
   }
 
   async getIssueLabels(issueNumber: number): Promise<string[]> {
@@ -11304,7 +11323,7 @@ describe("verdict handoff (#118)", () => {
     for (const earlierLanded of [true, false]) {
       test(`pending marker, no re-dispatch, next cycle completes it${earlierLanded ? " without a duplicate when the failed post actually landed" : ""}`, async () => {
         const f = fixture();
-        f.client.failures.addComment = new Error("HTTP 503");
+        f.client.failures.addPullRequestComment = new Error("HTTP 503");
         await f.run();
         assert.ok(f.labels().includes("pending-verdict:verifier"), "held with a pending marker");
         assert.ok(!f.labels().some(l => l.startsWith("error:") || l.startsWith("done:")));
@@ -11320,7 +11339,7 @@ describe("verdict handoff (#118)", () => {
           assert.ok(f.labels().includes("pending-verdict:verifier"));
         }
 
-        delete f.client.failures.addComment;
+        delete f.client.failures.addPullRequestComment;
         await f.sweep();
         assert.equal(f.prComments().length, 1, "exactly one verdict on the PR");
         assert.ok(f.labels().includes("done:verifier"));
@@ -11342,10 +11361,10 @@ describe("verdict handoff (#118)", () => {
 
     test("a FAIL completed on a later cycle leaves the rework label and no done label", async () => {
       const f = fixture({ handoff: handoffFile("FAIL", "needs-rework:builder") });
-      f.client.failures.addComment = new Error("HTTP 503");
+      f.client.failures.addPullRequestComment = new Error("HTTP 503");
       await f.run();
       f.client.comments = f.client.comments.filter(c => c.issueNumber !== PR);
-      delete f.client.failures.addComment;
+      delete f.client.failures.addPullRequestComment;
       await f.sweep();
       assert.equal(f.prComments().length, 1);
       assert.ok(f.labels().includes("needs-rework:builder"));
@@ -11354,10 +11373,10 @@ describe("verdict handoff (#118)", () => {
 
     test("the head moving while it waits parks the ticket on the next cycle", async () => {
       const f = fixture();
-      f.client.failures.addComment = new Error("HTTP 503");
+      f.client.failures.addPullRequestComment = new Error("HTTP 503");
       await f.run();
       f.client.comments = f.client.comments.filter(c => c.issueNumber !== PR);
-      delete f.client.failures.addComment;
+      delete f.client.failures.addPullRequestComment;
       f.moveHead(MOVED);
       await f.sweep();
       assert.ok(f.labels().includes("error:verifier"));
@@ -11375,6 +11394,116 @@ describe("verdict handoff (#118)", () => {
       const labels = client.labelsByIssue.get(ISSUE) ?? [];
       assert.ok(labels.includes("error:verifier"));
       assert.ok(!labels.includes("pending-verdict:verifier"));
+    });
+  });
+
+  // 2026-10-14, Mobile #2148 / PR #2150: once the orchestrator's workflow
+  // store became authoritative (67e9506), the saved verdict went to the PR
+  // through the workflow client as if the PR were a ticket. The store
+  // answered `Service 409 "Unknown workflow ticket"` on every cycle and the
+  // verdict never reached GitHub. A PR comment is discussion, not workflow,
+  // so it goes straight to GitHub; the ticket keeps its labels in the store.
+  describe("saved verdict on a store-authoritative board (#2148 / PR #2150)", () => {
+    const TICKET = 2148;
+    const PULL = 2150;
+    const REVIEWED = "d356f630620c33f5d7ddc8378d6f1ebb7a0df885";
+    const BODY = `## Verifier Review: #${TICKET}\n\n**Decision: FAIL**\n**Reviewed commit:** \`${REVIEWED}\`\n\n1. Remote query slot is never released.\n`;
+    const STARTED = Date.parse("2026-10-14T04:10:00Z");
+
+    function sweepFixture(prior: Array<{ body: string; at?: Date }> = []) {
+      const client = new MockGitHubClient({
+        items: [{ issueNumber: TICKET, status: "In Code Review", labels: ["pending-verdict:verifier"], state: "OPEN" }],
+      });
+      // The store holds the ticket and nothing else, exactly as live.
+      client.workflowTickets = new Set([TICKET]);
+      for (const p of prior) client.comments.push({ issueNumber: PULL, body: p.body, postedAt: p.at ?? new Date(STARTED + 60_000) });
+      const state = {
+        agent: "verifier", issueNumber: TICKET, pr: PULL, startedAtMs: STARTED,
+        handoff: { decision: "FAIL", commit: REVIEWED, labels: ["needs-rework:builder"], body: BODY },
+      };
+      const { deps } = makeMockDeps({
+        execImpls: {
+          [`gh pr view ${PULL}`]: () => JSON.stringify({
+            headRefOid: REVIEWED, state: "OPEN", reviews: [],
+            comments: client.comments.filter(c => c.issueNumber === PULL).map(c => ({ createdAt: c.postedAt.toISOString(), body: c.body })),
+          }),
+        },
+        fsMap: { [pendingVerdictStatePath("verifier", TICKET)]: JSON.stringify(state) },
+      });
+      const sweep = () => withStageSet("builder", () => runPendingVerdictPublish(client, deps));
+      return {
+        client, sweep,
+        prComments: () => client.comments.filter(c => c.issueNumber === PULL),
+        labels: () => client.labelsByIssue.get(TICKET) ?? [],
+      };
+    }
+
+    const completed = (f: ReturnType<typeof sweepFixture>) => {
+      assert.ok(f.labels().includes("needs-rework:builder"), "the verdict's label reaches the ticket");
+      assert.ok(f.labels().includes("pending-done:verifier"));
+      assert.ok(!f.labels().some(l => l.startsWith("pending-verdict:") || l.startsWith("error:")));
+    };
+
+    test("the verdict is posted on the PR directly, never sent to the store as a ticket comment", async () => {
+      const f = sweepFixture();
+      await f.sweep();
+      assert.equal(f.prComments().length, 1, "posted once on PR #2150");
+      assert.ok(f.prComments()[0]!.body.startsWith(BODY));
+      assert.match(f.prComments()[0]!.body, new RegExp(`pyry-verdict-handoff agent=verifier issue=${TICKET} run=${STARTED}`));
+      assert.deepEqual(f.client.pullRequestCommentCalls, [{ issueNumber: TICKET, pr: PULL }], "ownership is the ticket's");
+      completed(f);
+    });
+
+    test("the store refusal that stuck #2148 is what a ticket-comment post of the PR still gets", async () => {
+      const f = sweepFixture();
+      await assert.rejects(() => f.client.addComment(PULL, BODY), /Unknown workflow ticket/);
+    });
+
+    test("marker already present on the PR: nothing is posted again, the labels still land", async () => {
+      const marker = `<!-- pyry-verdict-handoff agent=verifier issue=${TICKET} run=${STARTED} -->`;
+      const f = sweepFixture([{ body: `${BODY}\n\n${marker}` }]);
+      await f.sweep();
+      assert.equal(f.prComments().length, 1, "no second copy");
+      assert.equal(f.client.pullRequestCommentCalls.length, 0);
+      completed(f);
+    });
+
+    test("a human already posted the same body by hand: no duplicate, even with CRLF and no marker", async () => {
+      const byHand = BODY.replace(/\n/g, "  \r\n") + "\r\n";
+      const f = sweepFixture([{ body: byHand }]);
+      await f.sweep();
+      assert.equal(f.prComments().length, 1, "the hand-posted copy is the only one");
+      assert.equal(f.client.pullRequestCommentCalls.length, 0);
+      completed(f);
+    });
+
+    test("a hand-posted copy from before the run, or a different body, does not count as landed", async () => {
+      for (const prior of [
+        { body: BODY, at: new Date(STARTED - 60_000) },
+        { body: BODY.replace("never released", "released late") },
+      ]) {
+        const f = sweepFixture([prior]);
+        await f.sweep();
+        assert.equal(f.client.pullRequestCommentCalls.length, 1, JSON.stringify(prior.body.slice(-40)));
+        completed(f);
+      }
+    });
+
+    test("a second sweep after success posts nothing more", async () => {
+      const f = sweepFixture();
+      await f.sweep();
+      await f.sweep();
+      assert.equal(f.prComments().length, 1);
+      assert.equal(f.client.pullRequestCommentCalls.length, 1);
+    });
+
+    test("the run's own recovery posts on the PR when the store holds only tickets", async () => {
+      const f = fixture();
+      f.client.workflowTickets = new Set([ISSUE]);
+      await f.run();
+      assert.equal(f.prComments().length, 1);
+      assert.ok(f.labels().includes("done:verifier"));
+      assert.ok(!f.labels().some(l => l.startsWith("pending-") || l.startsWith("error:")));
     });
   });
 

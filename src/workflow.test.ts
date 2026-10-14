@@ -463,6 +463,34 @@ test("dispatcher reads and changes workflow through the central API with no GitH
     "done:builder",
   ]);
 });
+test("a PR comment bypasses the workflow store; the store still refuses a PR as a ticket (#2148 / PR #2150)", async (t) => {
+  const { store } = fixture(t);
+  store.workflow.import(config, [item(), item(2148)]);
+  assert.equal(store.start(run()).ok, true);
+  const server = await serveFleet(store, { mac: "machine" }, "operator", 0);
+  t.after(() => server.close());
+  const connection = new JsonClient(`http://127.0.0.1:${(server.address() as any).port}`, "machine");
+  const posted: Array<[number, number, string]> = [];
+  const client = workflowClient(
+    {
+      addComment: async (_n: number, _body: string): Promise<void> => {
+        throw new Error("GitHub must not be written for a ticket comment");
+      },
+      addPullRequestComment: async (n: number, pr: number, body: string): Promise<void> => {
+        posted.push([n, pr, body]);
+      },
+    },
+    connection,
+    config.project,
+    () => true,
+    () => ({ session: "s", runId: "builder" }),
+  );
+  await assert.rejects(client.addComment(2150, "verdict"), /Unknown workflow ticket/);
+  await client.addPullRequestComment(2148, 2150, "verdict");
+  assert.deepEqual(posted, [[2148, 2150, "verdict"]]);
+  assert.equal(store.workflow.comments("org/mobile#2148").length, 0, "nothing queued on the ticket");
+  assert.equal(store.workflow.pendingComments().length, 0);
+});
 test("a finished worker cannot enqueue a late result comment", (t) => {
   const { store } = fixture(t);
   store.workflow.import(config, [item()]);

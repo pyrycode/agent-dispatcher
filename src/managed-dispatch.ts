@@ -328,7 +328,9 @@ export class ManagedDispatch {
     base = this.authorityClient(base);
     const itemNumbers = new Map<string, number>();
     const createdNumbers = new Map<string, number>();
-    const numbers = new Set(["addLabel", "removeLabel", "addComment", "closeIssue", "addBlocker", "removeBlocker"]);
+    // addPullRequestComment's first argument is the PR's ticket, so the same
+    // ownership check covers it. Its body goes to GitHub, not the store.
+    const numbers = new Set(["addLabel", "removeLabel", "addComment", "addPullRequestComment", "closeIssue", "addBlocker", "removeBlocker"]);
     const items = new Set(["updateItemStatus", "moveItemToTop"]);
     const lists = new Set(["getAllProjectItems", "getOpenProjectItems", "getItemsByStatus", "getClosedItemsNotInDone"]);
     return new Proxy(base, {

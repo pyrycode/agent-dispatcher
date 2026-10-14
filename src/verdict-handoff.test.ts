@@ -159,6 +159,34 @@ describe("parsePrVerdictView + verdictLanded", () => {
     const v = parsePrVerdictView(view([{ createdAt: "2026-10-03T10:00:00Z", body: "## Verifier Review" }]));
     assert.equal(verdictLanded(v.artifacts, { startedAtMs: start, marker: "<!-- m -->", body: "## Verifier Review" }), false);
   });
+
+  // PR #2150, 2026-10-14: while the dispatcher could not post, the saved
+  // verdict was pasted by hand. That copy must stop the dispatcher posting.
+  describe("a hand-posted copy of the saved body (PR #2150)", () => {
+    const start = Date.parse("2026-10-14T04:10:00Z");
+    const body = "## Verifier Review: #2148\n\n**Decision: FAIL**\n\n1. Slot never released.\n";
+    const mine = handoffMarker({ agent: "verifier", issueNumber: 2148, startedAtMs: start });
+    const landed = (posted: string) =>
+      verdictLanded([{ at: "2026-10-14T05:00:00Z", body: posted }], { startedAtMs: start, marker: mine, body });
+
+    test("web editor CRLF line endings and trailing spaces still match", () => {
+      assert.equal(landed(body.replace(/\n/g, " \r\n")), true);
+    });
+
+    test("another run's marker line is ignored when comparing the body", () => {
+      const other = handoffMarker({ agent: "verifier", issueNumber: 2148, startedAtMs: start - 1 });
+      assert.equal(landed(`${body}\n${other}`), true);
+    });
+
+    test("an edited body does not match", () => {
+      assert.equal(landed(body.replace("never released", "released late")), false);
+      assert.equal(landed(`Posted by hand:\n\n${body}`), false);
+    });
+
+    test("an empty saved body never matches an empty comment", () => {
+      assert.equal(verdictLanded([{ at: "2026-10-14T05:00:00Z", body: mine.replace("2148", "1") }], { startedAtMs: start, marker: mine, body: "" }), false);
+    });
+  });
 });
 
 describe("decideVerdictRecovery", () => {

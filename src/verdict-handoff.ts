@@ -145,19 +145,36 @@ export function handoffMarker(opts: { agent: string; issueNumber: number; starte
 }
 
 /**
+ * A verdict body as a comparison key. Line endings, trailing spaces and any
+ * handoff marker line are dropped, because the same verdict reaches GitHub
+ * in several shapes: the agent's own post, the dispatcher's post with its
+ * marker, and a human pasting the saved body by hand, which the web editor
+ * sends with CRLF line endings.
+ */
+function verdictBodyKey(body: string): string {
+  return body
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .filter((line) => !/^\s*<!-- pyry-verdict-handoff [^>]*-->\s*$/.test(line))
+    .map((line) => line.trimEnd())
+    .join("\n")
+    .trim();
+}
+
+/**
  * True when this run's verdict is already on the PR: an artifact since the
- * run began that carries the run's marker, or the agent's own post of the
- * same body that landed late.
+ * run began that carries the run's marker, or the same body posted by the
+ * agent late or by a human as a workaround.
  */
 export function verdictLanded(
   artifacts: readonly PrArtifact[],
   opts: { startedAtMs: number; marker: string; body: string },
 ): boolean {
-  const body = opts.body.trim();
+  const body = verdictBodyKey(opts.body);
   return artifacts.some((a) => {
     const t = Date.parse(a.at);
     if (!Number.isFinite(t) || t < opts.startedAtMs) return false;
-    return a.body.includes(opts.marker) || a.body.trim() === body;
+    return a.body.includes(opts.marker) || (body !== "" && verdictBodyKey(a.body) === body);
   });
 }
 
