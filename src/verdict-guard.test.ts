@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 
 import {
   countVerdictsSince,
+  extractFixedFindings,
   extractMustFixFindings,
   extractMustFixKeys,
   findRepeatedMustFix,
@@ -260,6 +261,154 @@ describe("repeated verifier finding compares the finding text, not only its loca
       { key: "a.kt → A", text: ", `helper`: second defect" },
     ]);
     assert.deepStrictEqual(extractMustFixKeys(body), ["a.kt → A"]);
+  });
+});
+
+describe("a finding the newer verdict lists as fixed is never repeated (desktop #1935, 2026-10-14)", () => {
+  // Verbatim verifier comments for desktop #1935 on pyrycode/pyrycode-desktop#1951.
+  // 16:06 raised two defects, a stall and a thinking-progress leak, both at
+  // `threadLiveState.ts` → `dispatch`; `threadLiveInputs.ts` → `threadLiveInputs`.
+  // The builder finished at 17:18. 18:19 lists both as `Fixed:` and raises a
+  // third, the session-error lifecycle, at the same two locations. Its text
+  // scored 0.327 against the stall finding, over the 0.3 threshold, mostly on
+  // the shared file path words, and the ticket parked after one rework.
+  const fixture = JSON.parse(readFileSync(new URL("./fixtures/desktop-1951-verdicts.json", import.meta.url), "utf8")) as {
+    comments: Array<{ createdAt: string; body: string }>;
+  };
+  const [first, second] = fixture.comments;
+  const builderDone = ["2026-10-14T17:18:24Z"];
+  const key = "src/renderer/src/store/threadLiveState.ts → dispatch";
+  const artifacts = (...comments: Array<{ createdAt: string; body: string }>) => parseVerdictArtifacts(JSON.stringify({ comments }));
+  const firstFindings = extractMustFixFindings(first.body);
+
+  test("the fixture is the parked shape: both FAILs carry MUST FIX findings under one key", () => {
+    assert.equal(first.createdAt, "2026-10-14T16:06:37Z");
+    assert.equal(second.createdAt, "2026-10-14T18:19:00Z");
+    assert.deepStrictEqual(extractMustFixKeys(first.body), [key]);
+    assert.deepStrictEqual(extractMustFixKeys(second.body), [key]);
+    assert.equal(firstFindings.length, 2);
+  });
+
+  test("extractFixedFindings reads the re-review's two Fixed lines, not its MUST FIX line", () => {
+    const fixed = extractFixedFindings(second.body);
+    assert.deepStrictEqual(fixed.map((f) => f.key), [key, key]);
+    assert.match(fixed[0].text, /clear stalls atomically/);
+    assert.match(fixed[1].text, /clear thinking progress/);
+    assert.deepStrictEqual(extractFixedFindings(first.body), []);
+  });
+
+  test("#1935: both earlier findings are listed as fixed, so the new session-error finding is not a repeat", () => {
+    assert.deepStrictEqual(findRepeatedMustFix(artifacts(first, second), builderDone), []);
+  });
+
+  test("true repeat: the stall finding raised again in other words, with only the thinking finding fixed, still parks", () => {
+    // Reworded the way a verifier writes "remains": it scores 0.375 against
+    // the 16:06 stall finding once locations are left out, not near 1.
+    const again = second.body
+      .replace(/^- Fixed: .*clear stalls atomically.*$/m, "")
+      .replace(/^- \[MUST FIX\] .*session-error lifecycle.*$/m,
+        "- [MUST FIX] `src/renderer/src/store/threadLiveState.ts` → `dispatch`; " +
+        "`src/renderer/src/screens/conversation/threadLiveInputs.ts` → `threadLiveInputs`: the previously reported " +
+        "stall defect remains. After `stallDetected`, an admitted `turnState(responding)` or `turnState(idle)` still " +
+        "leaves `status.stalled` true, so the stalled indicator keeps showing. Clear the held stall on every admitted " +
+        "turn-state update and add the supplied-input regression.");
+    assert.equal(extractFixedFindings(again).length, 1, "only the thinking finding is fixed");
+    assert.deepStrictEqual(findRepeatedMustFix(artifacts(first, { createdAt: second.createdAt, body: again }), builderDone), [key]);
+  });
+
+  test("a Fixed line with only its location retires the earlier finding not raised again", () => {
+    const verdict = (findings: string[]) => `## Verifier Review: #1\n\n**Decision: FAIL**\n\n### Findings\n${findings.map((f) => `- ${f}`).join("\n")}\n`;
+    const retry = "`app/src/Screen.kt` → `Screen`: the retry button stays enabled while a request is in flight, so a double tap sends two requests";
+    const colour = "`app/src/Screen.kt` → `Screen`: the header title uses a hardcoded colour instead of the theme token";
+    const comments = (newer: string[]) => artifacts(
+      { createdAt: "2026-10-05T09:00:00Z", body: verdict([`[MUST FIX] ${retry}`, `[MUST FIX] ${colour}`]) },
+      { createdAt: "2026-10-05T10:00:00Z", body: verdict(newer) },
+    );
+    const done = ["2026-10-05T09:30:00Z"];
+    assert.deepStrictEqual(findRepeatedMustFix(comments(["Fixed: `app/src/Screen.kt` → `Screen`", `[MUST FIX] ${retry.replace("double tap", "double-tap")}`]), done),
+      ["app/src/Screen.kt → Screen"], "the colour finding was the fixed one");
+    assert.deepStrictEqual(findRepeatedMustFix(comments(["Fixed: `app/src/Screen.kt` → `Screen`", "Fixed: `app/src/Screen.kt` → `Screen`",
+      `[MUST FIX] ${retry}`]), done), [], "both listed fixed, whatever the newer text says");
+    assert.deepStrictEqual(findRepeatedMustFix(comments(["Fixed: `app/src/Other.kt` → `Other`", `[MUST FIX] ${retry}`]), done),
+      ["app/src/Screen.kt → Screen"], "a Fixed line elsewhere retires nothing here");
+  });
+
+  test("a fixed SHOULD FIX beside a MUST FIX raised again retires the SHOULD FIX, so the repeat still parks", () => {
+    const verdict = (findings: string[]) => `## Verifier Review: #1\n\n**Decision: FAIL**\n\n### Findings\n${findings.map((f) => `- ${f}`).join("\n")}\n`;
+    const retry = "`app/src/Screen.kt` → `Screen`: the retry button stays enabled while a request is in flight, so a double tap sends two requests";
+    const comments = artifacts(
+      { createdAt: "2026-10-05T09:00:00Z", body: verdict([`[MUST FIX] ${retry}`, "[SHOULD FIX] `app/src/Screen.kt` → `Screen`: the header title uses a hardcoded colour"]) },
+      { createdAt: "2026-10-05T10:00:00Z", body: verdict([
+        "Fixed: `app/src/Screen.kt` → `Screen`: the header title now uses the theme token",
+        `[MUST FIX] ${retry.replace("the retry", "the previously reported defect remains: the retry")}`,
+      ]) },
+    );
+    assert.deepStrictEqual(findRepeatedMustFix(comments, ["2026-10-05T09:30:00Z"]), ["app/src/Screen.kt → Screen"]);
+  });
+
+  test("a location-only Fixed line retires the MUST FIX when the SHOULD FIX beside it is raised again", () => {
+    const verdict = (findings: string[]) => `## Verifier Review: #1\n\n**Decision: FAIL**\n\n### Findings\n${findings.map((f) => `- ${f}`).join("\n")}\n`;
+    const colour = "[SHOULD FIX] `app/src/Screen.kt` → `Screen`: the header title uses a hardcoded colour instead of the theme token";
+    const comments = artifacts(
+      { createdAt: "2026-10-05T09:00:00Z", body: verdict([
+        "[MUST FIX] `app/src/Screen.kt` → `Screen`: the retry button stays enabled while a request is in flight, so a double tap sends two requests",
+        colour,
+      ]) },
+      { createdAt: "2026-10-05T10:00:00Z", body: verdict([
+        "Fixed: `app/src/Screen.kt` → `Screen`",
+        colour,
+        // A different defect that reads close to the retry one (0.3 or more),
+        // the #1951 shape: only the Fixed line keeps it from counting.
+        "[MUST FIX] `app/src/Screen.kt` → `Screen`: the cancel button stays enabled while a request is in flight, so a tap after cancel sends a stale request",
+      ]) },
+    );
+    assert.deepStrictEqual(findRepeatedMustFix(comments, ["2026-10-05T09:30:00Z"]), []);
+  });
+
+  test("Fixed lines retire the same findings whatever order the verifier lists them in", () => {
+    const verdict = (findings: string[]) => `## Verifier Review: #1\n\n**Decision: FAIL**\n\n### Findings\n${findings.map((f) => `- ${f}`).join("\n")}\n`;
+    const p1 = "[MUST FIX] `a.ts` → `A`; `b.ts` → `B`: the cache is never invalidated after a host switch";
+    const p2 = "[MUST FIX] `a.ts` → `A`: the retry button stays enabled while a request is in flight, so a double tap sends two requests";
+    const fixed = ["Fixed: `a.ts` → `A`", "Fixed: `b.ts` → `B`"];
+    const raised = "[MUST FIX] `a.ts` → `A`: the retry button now debounces but still sends two requests on a double tap while in flight";
+    for (const order of [fixed, [...fixed].reverse()]) {
+      const comments = artifacts(
+        { createdAt: "2026-10-05T09:00:00Z", body: verdict([p1, p2]) },
+        { createdAt: "2026-10-05T10:00:00Z", body: verdict([...order, raised]) },
+      );
+      assert.deepStrictEqual(findRepeatedMustFix(comments, ["2026-10-05T09:30:00Z"]), [], JSON.stringify(order));
+    }
+  });
+
+  test("a location named in a finding's description is not one of its locations", () => {
+    const verdict = (finding: string) => `## Verifier Review: #1\n\n**Decision: FAIL**\n\n### Findings\n- ${finding}\n`;
+    const text = "the retry button stays enabled while a request is in flight, so a double tap sends two requests";
+    const comments = artifacts(
+      { createdAt: "2026-10-05T09:00:00Z", body: verdict(`[MUST FIX] \`app/src/Other.kt\` → \`Other\`: ${text}`) },
+      { createdAt: "2026-10-05T10:00:00Z", body: verdict(`[MUST FIX] \`app/src/Screen.kt\` → \`Screen\`: unlike \`app/src/Other.kt\` → \`Other\`, ${text}`) },
+    );
+    assert.deepStrictEqual(findRepeatedMustFix(comments, ["2026-10-05T09:30:00Z"]), []);
+  });
+
+  test("a repeat is found when the verifier lists the same locations in another order", () => {
+    const verdict = (finding: string) => `## Verifier Review: #1\n\n**Decision: FAIL**\n\n### Findings\n- ${finding}\n`;
+    const text = "the retry button stays enabled while a request is in flight, so a double tap sends two requests";
+    const comments = artifacts(
+      { createdAt: "2026-10-05T09:00:00Z", body: verdict(`[MUST FIX] \`a.ts\` → \`A\`; \`b.ts\` → \`B\`: ${text}`) },
+      { createdAt: "2026-10-05T10:00:00Z", body: verdict(`[MUST FIX] \`b.ts\` → \`B\`; \`a.ts\` → \`A\`: ${text} again`) },
+    );
+    assert.deepStrictEqual(findRepeatedMustFix(comments, ["2026-10-05T09:30:00Z"]), ["b.ts → B"]);
+  });
+
+  test("extractFixedFindings accepts bold and bracketed tags and skips Fixed in running text", () => {
+    const body = [
+      "- **Fixed:** `a.ts` → `A`: bold",
+      "* [Fixed] `b.ts` → `B`",
+      "- fixed: `c.ts` -> c: lower case, plain arrow",
+      "Both previous findings are fixed: `d.ts` → `D` now passes.",
+      "- [MUST FIX] `e.ts` → `E`: open",
+    ].join("\n");
+    assert.deepStrictEqual(extractFixedFindings(body).map((f) => f.key), ["a.ts → A", "b.ts → B", "c.ts → c"]);
   });
 });
 
