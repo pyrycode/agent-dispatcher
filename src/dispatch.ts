@@ -21,6 +21,7 @@ import { countOpenPrs, shouldFlagMissingPr } from "./pr-guard.js";
 import { PENDING_VERDICT_PREFIX, REREVIEW_PATCH_CAP, decideVerdictRecovery, extractVerdictFindings, reworkFindingsNote, handoffMarker, isVerdictPublishFailure, parseLastVerdict, parsePendingVerdictState, parsePrVerdictView, parseVerdictHandoff, reReviewNote, serializeLastVerdict, serializePendingVerdictState, verdictHandoffNote, type HandoffParse, type PendingVerdictState, type VerdictHandoff, type VerdictPrLookup } from "./verdict-handoff.js";
 import { resolveImportOnlyMerge } from "./merge-resolve.js";
 import { gateReportSection, gateRunMetaPath, serializeGateRunMeta } from "./gate-report.js";
+import { GATE_EVIDENCE_ENV, gateEvidenceEnv, prepareGateRunEvidence } from "./gate-artifacts.js";
 import { FINAL_MERGE_HANDOFF_MARKER, FINAL_MERGE_HANDOFF_MAX, MERGE_HANDOFF_LABEL, checkMergeResolution, decideConflictRoute, decideFinalMergeRoute, findMergeCommit, mergeHandoffNote, mergeResolutionComment, mergeResolutionSection, readPendingMerge, type PendingMerge, type ResolutionNote } from "./merge-handoff.js";
 
 import {
@@ -6962,6 +6963,9 @@ export type GateSpawner = (req: GateSpawnRequest) => Promise<GateSpawnOutcome>;
 export function buildGateSpawnEnv(parentEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env = scrubSpawnEnv(parentEnv);
   delete env.ANTHROPIC_API_KEY;
+  // Only a gate run the dispatcher made a folder for may name one; an
+  // inherited value would send captures to some other run's folder.
+  delete env[GATE_EVIDENCE_ENV];
   return env;
 }
 
@@ -7152,6 +7156,8 @@ export interface GateRunnerDeps {
   /** The selection backstop's record of the last passing full run. */
   readGateFullState: () => string | null;
   writeGateFullState: (json: string) => void;
+  /** Make the run's raw evidence folder (gate-artifacts.ts). Null runs without one. */
+  prepareEvidence: (logsDir: string, issueNumber: number, stamp: string) => string | null;
 }
 
 const GATE_FULL_STATE_FILE = "real-claude-gate-full-state.json";
@@ -7172,6 +7178,7 @@ export const DEFAULT_GATE_RUNNER_DEPS: GateRunnerDeps = {
     mkdirSync(LOGS_DIR, { recursive: true });
     writeFileSync(resolve(LOGS_DIR, GATE_FULL_STATE_FILE), json);
   },
+  prepareEvidence: (logsDir, issueNumber, stamp) => prepareGateRunEvidence(logsDir, issueNumber, stamp),
 };
 
 /**
@@ -7463,10 +7470,13 @@ export async function runRealClaudeGateSuite(opts: {
   // 5. Run it, then judge what landed on disk.
   try {
     deps.mkdirSync(logsDir, { recursive: true });
+    // Raw captures go outside the worktree, which is removed below
+    // (gate-artifacts.ts). Each part of the run gets its own folder.
+    report.evidenceDir = deps.prepareEvidence(logsDir, opts.issueNumber, stamp);
     const outcome = await deps.spawnGate({
       command,
       cwd: worktreeDir,
-      env: {...buildGateSpawnEnv(process.env),...managedTaskEnv()},
+      env: {...buildGateSpawnEnv(process.env),...managedTaskEnv(),...gateEvidenceEnv(report.evidenceDir, "main", deps.mkdirSync)},
       timeoutMs: opts.timeoutMs,
       stdoutPath,
       stderrPath,
@@ -7577,6 +7587,7 @@ export async function runRealClaudeGateSuite(opts: {
             stamp,
             label: "real-claude-gate-infra-check",
             who: "Real-claude gate infrastructure check",
+            evidence: { runDir: report.evidenceDir ?? null, part: "infra-check" },
             deps,
           });
           failedOnBase = check.failures;
@@ -7713,7 +7724,10 @@ async function runBaselineComparison(opts: {
   deps: GateRunnerDeps;
 }): Promise<void> {
   const { report } = opts;
-  const result = await runFailuresOnBase({ ...opts, label: "real-claude-gate-base", who: "Real-claude gate" });
+  const result = await runFailuresOnBase({
+    ...opts, label: "real-claude-gate-base", who: "Real-claude gate",
+    evidence: { runDir: opts.report.evidenceDir ?? null, part: "base" },
+  });
   if (result.outputPath !== null) report.baselineOutputPath = result.outputPath;
   report.baselineFailures = result.failures;
   report.baselineSkipReason = result.skipReason;
@@ -7743,7 +7757,9 @@ async function runFailuresOnBase(opts: {
   label: string;
   /** Log prefix naming the caller. */
   who: string;
-  deps: Pick<GateRunnerDeps, "execSync" | "spawnGate" | "readFileSync">;
+  /** The live gate run's evidence folder and this part's name in it. Absent for the verifier gates. */
+  evidence?: { runDir: string | null; part: string };
+  deps: Pick<GateRunnerDeps, "execSync" | "spawnGate" | "readFileSync"> & { mkdirSync?: GateRunnerDeps["mkdirSync"] };
 }): Promise<{ failures: string[] | null; skipReason: string | null; outputPath: string | null }> {
   const { deps, targetRepo } = opts;
   const skip = (skipReason: string, outputPath: string | null = null) => ({ failures: null, skipReason, outputPath });
@@ -7780,7 +7796,8 @@ async function runFailuresOnBase(opts: {
     const outcome = await deps.spawnGate({
       command,
       cwd: worktreeDir,
-      env: {...buildGateSpawnEnv(process.env),...managedTaskEnv()},
+      env: {...buildGateSpawnEnv(process.env),...managedTaskEnv(),
+        ...gateEvidenceEnv(opts.evidence?.runDir, opts.evidence?.part ?? "base", deps.mkdirSync ?? mkdirSync)},
       timeoutMs: opts.timeoutMs,
       stdoutPath,
       stderrPath,
@@ -7872,7 +7889,7 @@ async function runBranchRerun(opts: {
     const outcome = await deps.spawnGate({
       command,
       cwd: opts.worktreeDir,
-      env: {...buildGateSpawnEnv(process.env),...managedTaskEnv()},
+      env: {...buildGateSpawnEnv(process.env),...managedTaskEnv(),...gateEvidenceEnv(report.evidenceDir, "rerun", deps.mkdirSync)},
       timeoutMs: opts.timeoutMs,
       stdoutPath,
       stderrPath,
