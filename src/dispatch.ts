@@ -2286,6 +2286,9 @@ export type DispatchDeps = {
   /** Start a post-merge codegraph reindex in the background and return at
    *  once. See `createCodegraphReindexer`. */
   reindexCodegraph: (repoRoot: string) => void;
+  /** Wait between mergeability reads in `runAutoMerge`. Optional so the
+   *  many hand-built deps keep compiling; a real timer when absent. */
+  sleepMs?: (ms: number) => Promise<void>;
 };
 
 // Default curation runner: spawn the memory-curation shell runner in inline
@@ -8867,6 +8870,37 @@ async function handleMergeConflict(
   }
 }
 
+/** Polls of an UNKNOWN mergeability, and the wait between them. */
+const MERGEABLE_POLLS = 6;
+const MERGEABLE_POLL_MS = 5_000;
+
+/**
+ * GitHub's mergeability for a PR once it has settled: MERGEABLE,
+ * CONFLICTING, or UNKNOWN when it is still computing after about 30
+ * seconds. Null when it could not be read. The read goes to GitHub fresh,
+ * also through the shared connection, which never caches pull request reads.
+ */
+async function settleMergeable(prNumber: number, deps: DispatchDeps): Promise<string | null> {
+  const sleep = deps.sleepMs ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const read = (): string | null => {
+    try {
+      const out = deps.execSync(
+        `gh pr view ${prNumber} --json mergeable --jq .mergeable`,
+        { cwd: repoRoot, encoding: "utf-8", timeout: 15_000 },
+      ).toString().trim();
+      return out === "MERGEABLE" || out === "CONFLICTING" || out === "UNKNOWN" ? out : null;
+    } catch {
+      return null;
+    }
+  };
+  let state = read();
+  for (let i = 0; state === "UNKNOWN" && i < MERGEABLE_POLLS; i++) {
+    await sleep(MERGEABLE_POLL_MS);
+    state = read();
+  }
+  return state;
+}
+
 /**
  * Auto-merge any open PR for tickets sitting in the Done column.
  *
@@ -8879,8 +8913,12 @@ async function handleMergeConflict(
  *     onto current main. Conflict here → fall through to the plain
  *     merge, which may still be clean (2026-09-23, #823). Transient
  *     failure → logged skip, retry next cycle (same posture as PR-list
- *     transient).
- *   - `gh pr merge <n> --merge --delete-branch`. On success: pull
+ *     transient). After a successful rebase, wait up to about 30s for
+ *     GitHub to settle the PR's mergeability (`settleMergeable`).
+ *   - `gh pr merge <n> --merge --delete-branch`. A conflict-shaped refusal
+ *     is checked against GitHub's settled mergeability first: still
+ *     UNKNOWN → retry next cycle, uncounted; MERGEABLE → one immediate
+ *     retry (2026-10-14, mobile #1977). On success: pull
  *     merged changes to local main (non-fatal failure), strip pipeline
  *     labels from the issue, Discord notify. On conflict (detected
  *     via `isMergeConflictError` on stderr): `handleConflictWithRetry`,
@@ -8965,6 +9003,10 @@ export async function runAutoMerge(
           `gh pr update-branch ${prNumber} --rebase`,
           { cwd: repoRoot, encoding: "utf-8", timeout: 30_000 }
         );
+        // A rebase that moved the head leaves GitHub's mergeability
+        // UNKNOWN for a few seconds, and a merge in that window is refused
+        // as "not mergeable". Wait for the answer before merging.
+        await settleMergeable(prNumber, deps);
       } catch (e: any) {
         const errOut = `${e.stderr ?? ""}\n${e.message ?? ""}`;
         if (isMergeConflictError(errOut)) {
@@ -8976,12 +9018,38 @@ export async function runAutoMerge(
       }
 
       // Step 2: Try the actual merge. Conflict path is the special case.
-      try {
-        console.log(`   🔀 Auto-merging PR #${prNumber} for #${item.issueNumber} (moved to Done)`);
+      const merge = (): void => {
         execSync(
           `gh pr merge ${prNumber} --merge --delete-branch`,
           { cwd: repoRoot, encoding: "utf-8", timeout: 30_000 }
         );
+      };
+      try {
+        console.log(`   🔀 Auto-merging PR #${prNumber} for #${item.issueNumber} (moved to Done)`);
+        try {
+          merge();
+        } catch (first: any) {
+          // "Not mergeable" is also what GitHub answers while it is still
+          // computing mergeability, typically right after a push or the
+          // rebase above. Counting that as a conflict spent a retry on
+          // pyrycode-mobile #1977 (PR #1980) on 2026-10-14: the rebase
+          // force-pushed at 12:19:11 and the merge was refused one second
+          // later, on a PR GitHub then reported clean. So ask GitHub
+          // before counting. CONFLICTING, or no readable answer, takes the
+          // conflict path exactly as before. UNKNOWN after the wait is a
+          // transient failure, retried next cycle without a count.
+          // MERGEABLE gets one immediate retry, and a second refusal is
+          // counted.
+          if (!isMergeConflictError(`${first?.stderr ?? ""}\n${first?.message ?? ""}`)) throw first;
+          const state = await settleMergeable(prNumber, deps);
+          if (state === "UNKNOWN") {
+            console.warn(`   ⏳ PR #${prNumber} for #${item.issueNumber}: GitHub has not settled whether it is mergeable; retrying next cycle without counting a conflict`);
+            continue;
+          }
+          if (state !== "MERGEABLE") throw first;
+          console.log(`   🔁 PR #${prNumber} for #${item.issueNumber}: refused while GitHub was settling mergeability, now mergeable; merging again`);
+          merge();
+        }
         await client.recordMergedIssue?.(item.issueNumber);
         // Pull merged changes to local main. Failure is non-fatal — the
         // PR already merged on origin, so the next cycle's dispatch will
@@ -9483,7 +9551,7 @@ export async function pollLoop(): Promise<void> {
     if (!managed) return runAutoMerge(client);
     for (const item of await client.getItemsByStatus("Done")) {
       if (item.issueNumber <= 0 || item.labels.includes("merged") || item.labels.some(l => l.startsWith("error:"))) continue;
-      const offer = managed.offer(item.issueNumber, "merge", "heavy", [`${managed.project}:merge`], -2);
+      const offer = managed.mergeOffer(item.issueNumber);
       if (managed.ready(offer)) await managed.run(offer, () => runAutoMerge(managed.client(rawClient, false, item.issueNumber)));
     }
   };

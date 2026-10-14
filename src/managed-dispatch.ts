@@ -49,6 +49,25 @@ export function resourceClasses(raw: string | undefined): Record<string, Resourc
   return parsed;
 }
 
+/**
+ * The managed offer for one Done ticket's merge.
+ *
+ * Light, so it never waits for heavy or combined capacity. A merge is a few
+ * GitHub calls, a pull of main and a background index refresh. While it was
+ * heavy, a ticket that reached Done waited for the claiming computer's one
+ * heavy place: pyrycode-mobile #1977 reached Done at 12:05:56 on 2026-10-14
+ * and its merge was granted at 12:19:04, the second a core repair task
+ * released that computer's heavy place.
+ *
+ * Capacity was never what kept merges single. One actor still owns each
+ * merge: only the ticket's claiming computer is granted it, the authority
+ * admits one unfinished run per ticket, and the project lock admits one
+ * merge per board across all computers.
+ */
+export function mergeOfferShape(project: string): { role: "merge"; resource: ResourceClass; locks: string[]; order: number } {
+  return { role: "merge", resource: "light", locks: [`${project}:merge`], order: -2 };
+}
+
 interface Pending { offer: WorkOffer; run?: FleetRun; retired?: boolean }
 interface CompletionRecovery { observe: () => Promise<ProjectItem | undefined>; onRecovery: (incidents: RecoveryIncident[]) => void }
 export class ManagedDispatch {
@@ -144,6 +163,10 @@ export class ManagedDispatch {
       pending.offer.recovery = this.recoveryTickets.has(ticket);
     }
     return pending;
+  }
+  mergeOffer(issue: number): Pending {
+    const shape = mergeOfferShape(this.project);
+    return this.offer(issue, shape.role, shape.resource, shape.locks, shape.order);
   }
   agentOffer(agent: AgentConfig, item: ProjectItem, order: number): Pending {
     const pending = this.offer(item.issueNumber, agent.name, this.classes[agent.name] ?? DEFAULT_RESOURCE_CLASSES[agent.name] ?? "heavy",
