@@ -24,6 +24,7 @@
 // `process.exit(1)` on missing config — fine for production, fatal for
 // tests).
 
+import { readFileSync } from "node:fs";
 import type { GitHubProjectClient } from "./github.js";
 import { type ProjectItem } from "./types.js";
 import { activeStageSet } from "./stage-sets.js";
@@ -62,7 +63,8 @@ import {
 } from "./merge-handoff.js";
 import { selectDispatches } from "./dispatch-selection.js";
 import { findRepeatedMustFix, newestFailVerdict, parseVerdictArtifacts, staleBaseFindings, type VerdictArtifact } from "./verdict-guard.js";
-import { formatGateEvidenceComment, gateRunFloor, type GateRunReport } from "./gate-output.js";
+import { GATE_PARSER_VERSION, formatGateEvidenceComment, gateCommandProvenance, gateRunFloor, parseGateOutput, validateGateOutputProvenance, type GateOutputFormat, type GateRunReport } from "./gate-output.js";
+import { gateRunMetaMatches, gateRunMetaPath, parseGateRunMeta, type GateRunMeta } from "./gate-report.js";
 import type { FlakyRunContext, FlakyTicketResult } from "./flaky-tickets.js";
 import type { InheritedTicketResult } from "./inherited-tickets.js";
 
@@ -700,6 +702,9 @@ export async function runRealClaudeGateExecution(
   recordFlaky: (flaky: readonly string[], ctx: FlakyRunContext) => Promise<FlakyTicketResult> = noFlakyTickets,
   background?: RealClaudeGateBackground,
   recordInherited: (failures: readonly string[], ctx: FlakyRunContext) => Promise<InheritedTicketResult> = noInheritedTickets,
+  /** The fork's configured gate format, used only for a saved report that
+   *  predates recorded formats and whose command names no reporter. */
+  options: { legacyFormat?: GateOutputFormat } = {},
 ): Promise<boolean> {
   // Off switch. No command configured means this step never touches the
   // board, so the whole feature can land on a live dispatcher before any
@@ -829,12 +834,53 @@ export async function runRealClaudeGateExecution(
         conflictParkNote = handoff.reason;
       }
 
+      // Saved reports from before structured skips/attempt evidence must use
+      // the retained artifact. Never recover identities from display strings,
+      // or fall back to an old green tally when that artifact cannot be read.
+      let format = report.outputFormat;
+      // Check all available provenance even on complete tallies. An absent
+      // command flag is recoverable; a conflicting reporter is never absent.
+      if (report.tally) {
+        let meta: GateRunMeta | null = null, invalidMeta = false;
+        try {
+          meta = parseGateRunMeta(readFileSync(gateRunMetaPath(report.outputPath), "utf8"));
+          invalidMeta = !meta || !gateRunMetaMatches(meta, report);
+        } catch (error: any) { invalidMeta = error?.code !== "ENOENT"; }
+        // A report written before formats were recorded, with a gate command
+        // that names no reporter (Mobile's Gradle wrapper), was parsed with
+        // the fork's configured format, as every run then was. Keep judging
+        // it that way, so the deploy itself parks nothing. Any recorded or
+        // literal format still has to agree.
+        const legacyFormat = format === undefined && meta?.outputFormat === undefined
+          && gateCommandProvenance(report.command).kind === "missing" ? options.legacyFormat : undefined;
+        const provenance = validateGateOutputProvenance(report.command, [format ?? legacyFormat, meta?.outputFormat]);
+        if (invalidMeta || provenance.error !== null) {
+          report.tally = null;
+          report.runError ||= invalidMeta ? "retained live evidence metadata is invalid or does not match the report"
+            : provenance.error;
+        } else {
+          format = provenance.format;
+          const needsRecovery = report.tally.parserVersion !== GATE_PARSER_VERSION || report.tally.completeParse !== true || report.outputFormat === undefined || report.tally.skippedTests === undefined ||
+            (format === "playwright-json" && report.tally.testDetails === undefined);
+          report.outputFormat = format;
+          if (needsRecovery) {
+            try {
+              report.tally = parseGateOutput(readFileSync(report.outputPath, "utf8"), format);
+            } catch {
+              report.tally = null;
+            }
+          }
+        }
+      }
+
       const raw = decideGateVerdict({
         runError: report.runError,
         timedOut: report.timedOut,
         tally: report.tally,
         exitCode: report.exitCode,
         minExecuted: gateRunFloor(report, minExecuted),
+        command: report.command,
+        outputFormat: format,
       });
       // A failure in the shape of a shared environment failure is not judged
       // at all: the runner skipped the re-run and the base comparison, and

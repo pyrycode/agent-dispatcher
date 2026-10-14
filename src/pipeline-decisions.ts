@@ -10,6 +10,7 @@
 import { hasOpenBlockers } from "./blockers.js";
 import { byTicketPriority } from "./ticket-priority.js";
 import { MERGE_HANDOFF_LABEL } from "./merge-handoff.js";
+import { GATE_PARSER_VERSION, parseGateOutput, validateGateOutputProvenance, type GateOutputFormat, type GateTestDetail } from "./gate-output.js";
 
 // --------- Auto-advance rules ---------
 
@@ -732,6 +733,11 @@ export type GateVerdict =
 
 /** Everything `decideGateVerdict` is allowed to look at. */
 export interface GateVerdictInput {
+  /** When supplied, each invocation must agree with the recorded format. */
+  command?: string;
+  /** Retained raw evidence takes precedence over a legacy/incomplete tally. */
+  rawOutput?: string | null;
+  outputFormat?: GateOutputFormat;
   /** Non-null when the run could not be started or completed at all. */
   runError: string | null;
   /** True when the outer wall clock fired. */
@@ -745,12 +751,18 @@ export interface GateVerdictInput {
 }
 
 /**
- * The slice of `GateTally` the verdict depends on. Declared structurally so
- * pipeline-decisions.ts stays free of a runtime import on the parser — this
- * file is the pure decision layer and has no business knowing how a Go test
- * event is shaped.
+ * The slice of `GateTally` the verdict depends on. Raw artifacts, when
+ * supplied, go through the same pure parser as freshly executed runs.
  */
 export interface GateTallyLike {
+  completeParse?: boolean;
+  parserVersion?: number;
+  skipped?: number;
+  skippedTests?: readonly { name: string; reason: string }[];
+  passedNames?: readonly string[];
+  failedNames?: readonly string[];
+  skipReasons?: readonly string[];
+  testDetails?: readonly GateTestDetail[];
   executed: number;
   failed: number;
   packageFailed: boolean;
@@ -788,7 +800,13 @@ export function decideGateVerdict(input: GateVerdictInput): GateVerdictDecision 
     };
   }
 
-  const tally = input.tally;
+  const format = input.outputFormat;
+  if (input.command !== undefined) {
+    const provenance = validateGateOutputProvenance(input.command, [format]);
+    if (provenance.error !== null) return { verdict: "unusable", reason: provenance.error };
+  }
+  const tally = input.rawOutput === undefined ? input.tally
+    : input.rawOutput !== null && format ? parseGateOutput(input.rawOutput, format) : null;
   if (tally === null || tally.recognizedLines <= 0) {
     return {
       verdict: "unusable",
@@ -816,6 +834,10 @@ export function decideGateVerdict(input: GateVerdictInput): GateVerdictDecision 
     };
   }
 
+  if (tally.completeParse === false) {
+    return { verdict: "unusable", reason: "gate output contains malformed, mixed or unfinished test records; the readable passing fragment cannot establish acceptance" };
+  }
+
   // A floor of 0 would disable the guard this whole file exists for, so a
   // misconfigured fork gets 1 rather than an unguarded gate.
   const floor = Math.max(1, input.minExecuted);
@@ -826,6 +848,19 @@ export function decideGateVerdict(input: GateVerdictInput): GateVerdictDecision 
         `only ${tally.executed} test(s) actually executed, below the floor of ${floor}. ` +
         "The full run is incomplete; rerunning only its failures cannot establish a pass",
     };
+  }
+
+  // Identities and attempt evidence must come from the current reader.
+  // Reparse retained raw evidence rather than trusting a legacy tally.
+  if (tally.parserVersion !== GATE_PARSER_VERSION || tally.completeParse !== true ||
+      (tally.passedNames !== undefined && tally.skippedTests === undefined)) {
+    return { verdict: "unusable", reason: "test identities and attempt evidence use a legacy tally; reparse retained raw evidence before judging live acceptance" };
+  }
+  const skippedNames = tally.skippedTests?.map(t => t.name)
+    ?? tally.testDetails?.filter(d => d.status === "skipped").map(d => d.name) ?? [];
+  const skipCount = Math.max(tally.skipped ?? 0, tally.skipReasons?.length ?? 0);
+  if (skippedNames.length !== skipCount) {
+    return { verdict: "unusable", reason: "skipped test identities are incomplete; reparse retained raw evidence before judging live acceptance" };
   }
 
   if (tally.failed > 0 || tally.packageFailed) {

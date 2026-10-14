@@ -67,12 +67,6 @@ function wordPattern(method: string): RegExp {
   return new RegExp(`(?<![\\w$])${escaped}(?![\\w$])`);
 }
 
-/** The test name of a skip; every parser writes one as `<name>: <reason>`. */
-function skipName(reason: string): string {
-  const end = reason.indexOf(": ");
-  return end < 0 ? reason : reason.slice(0, end);
-}
-
 /** Tests the text names that no log may contain: `Class#method` references
  *  and Go `TestName` functions. Without these, a named test that never ran
  *  would not be listed at all. */
@@ -89,7 +83,7 @@ function outcomeIn(method: string, format: GateOutputFormat, tally: GateTally): 
   const has = (names: readonly string[]) => names.some((n) => testMethod(n, format) === method);
   if (has(tally.failedNames)) return "failed";
   if (has(tally.passedNames)) return "passed";
-  if (has(tally.skipReasons.map(skipName))) return "skipped";
+  if (has((tally.skippedTests ?? []).map(t => t.name))) return "skipped";
   return "not run";
 }
 
@@ -129,9 +123,9 @@ export function buildGateReportSection(input: {
       lines.push(`- ${head}: log missing, so no per-test counts.`);
     } else {
       tally = parseGateOutput(run.raw, run.format);
-      if (tally.recognizedLines === 0) {
+      if (tally.completeParse !== true) {
         tally = null;
-        lines.push(`- ${head}: unreadable, so no per-test counts.`);
+        lines.push(`- ${head}: unreadable or incomplete, so no per-test counts.`);
       } else {
         lines.push(`- ${head}: ${tally.executed} executed, ${tally.passed} passed, ${tally.failed} failed, ${tally.skipped} skipped.`);
       }
@@ -149,7 +143,7 @@ export function buildGateReportSection(input: {
   input.runs.forEach((run, i) => {
     const tally = tallies[i];
     if (tally === null || run.format === null) return;
-    for (const n of [...tally.passedNames, ...tally.failedNames, ...tally.skipReasons.map(skipName)]) {
+    for (const n of [...tally.passedNames, ...tally.failedNames, ...(tally.skippedTests ?? []).map(t => t.name)]) {
       candidates.add(testMethod(n, run.format));
     }
   });
@@ -264,6 +258,7 @@ export interface LiveGateRun {
  * suffix keeps it under the log rotation.
  */
 export interface GateRunMeta {
+  outputFormat?: GateOutputFormat;
   branchName: string;
   headSha: string;
   baseRef: string;
@@ -290,6 +285,7 @@ export function gateRunMetaPath(outputPath: string): string {
 
 export function serializeGateRunMeta(report: GateRunReport, env: NodeJS.ProcessEnv, now: Date): string {
   const meta: GateRunMeta = {
+    outputFormat: report.outputFormat,
     branchName: report.branchName,
     headSha: report.headSha,
     baseRef: report.baseRef,
@@ -309,11 +305,23 @@ export function serializeGateRunMeta(report: GateRunReport, env: NodeJS.ProcessE
 }
 
 /** Null for anything that is not a run record. */
+/** The sidecar describes this exact run: the same commits and command, and
+ *  the same process outcome. A sidecar that disagrees on any of these was
+ *  written for a different run and cannot vouch for the retained bytes. */
+export function gateRunMetaMatches(meta: GateRunMeta, report: Pick<GateRunReport,
+  "headSha" | "baseSha" | "command" | "runError" | "timedOut" | "exitCode">): boolean {
+  return meta.headSha === report.headSha && meta.baseSha === report.baseSha && meta.command === report.command &&
+    meta.runError === (report.runError ?? null) && meta.timedOut === (report.timedOut === true) &&
+    meta.exitCode === (report.exitCode ?? null);
+}
+
 export function parseGateRunMeta(raw: string): GateRunMeta | null {
   let m: any;
   try { m = JSON.parse(raw); } catch { return null; }
   if (!m || typeof m !== "object" || typeof m.headSha !== "string" || typeof m.baseSha !== "string") return null;
+  if (m.outputFormat !== undefined && !isGateOutputFormat(m.outputFormat)) return null;
   return {
+    ...(isGateOutputFormat(m.outputFormat) ? { outputFormat: m.outputFormat } : {}),
     branchName: typeof m.branchName === "string" ? m.branchName : "",
     headSha: m.headSha,
     baseRef: typeof m.baseRef === "string" ? m.baseRef : "",
@@ -383,7 +391,7 @@ export function liveGateLines(live: LiveGateRun, namingText: string): string[] {
   }
   const details = parseGateTestDetails(live.raw, live.format);
   if (details === null) {
-    lines.push("- The output is unreadable, so there are no per-test results.");
+    lines.push("- The output is unreadable or incomplete, so there are no per-test results.");
     return lines;
   }
 
