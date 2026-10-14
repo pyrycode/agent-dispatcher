@@ -930,7 +930,25 @@ export interface GateTestDetail {
     /** The `daemon-revision` annotation on that attempt, when its
      *  `daemon-revision` attachment carries the same value. */
     daemonRevision: string | null;
+    /** Inline attachment bodies on that attempt, decoded, by name. Files on
+     *  disk and bodies over `MAX_ATTACHMENT_BYTES` are left out. Read by a
+     *  fork's evidence rules (gate-test-evidence.ts). */
+    attachments?: Record<string, string>;
   };
+}
+
+/** Largest inline attachment kept on a passing attempt. */
+export const MAX_ATTACHMENT_BYTES = 64 * 1024;
+
+/** Every inline attachment on one attempt, decoded, within the size cap. */
+function inlineAttachments(result: any): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const a of Array.isArray(result?.attachments) ? result.attachments : []) {
+    if (typeof a?.name !== "string" || typeof a.body !== "string" || a.name in out) continue;
+    const text = Buffer.from(a.body, "base64").toString("utf8").trim();
+    if (text !== "" && Buffer.byteLength(text) <= MAX_ATTACHMENT_BYTES) out[a.name] = text;
+  }
+  return out;
 }
 
 /** The text of a named attachment on one Playwright attempt, decoded. */
@@ -1027,6 +1045,7 @@ function playwrightTestDetails(raw: string): GateTestDetail[] | null {
             passingAttempt: {
               attempt: results.length,
               daemonRevision: attachedRevision !== null && passingRevisions.has(attachedRevision) ? attachedRevision : null,
+              attachments: inlineAttachments(last),
             },
           } : {}),
         });

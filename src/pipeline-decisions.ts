@@ -11,6 +11,7 @@ import { hasOpenBlockers } from "./blockers.js";
 import { byTicketPriority } from "./ticket-priority.js";
 import { MERGE_HANDOFF_LABEL } from "./merge-handoff.js";
 import { GATE_PARSER_VERSION, parseGateOutput, validateGateOutputProvenance, type GateOutputFormat, type GateTestDetail } from "./gate-output.js";
+import { missingTestEvidence, reportedRequiredTests, rulesFor, type TestEvidenceRule } from "./gate-test-evidence.js";
 
 // --------- Auto-advance rules ---------
 
@@ -741,6 +742,8 @@ export interface GateVerdictInput {
   /** Named live acceptance. Survives a full-suite selection: each name must
    *  execute and pass, whatever the suite totals say. */
   requiredTests?: readonly string[];
+  /** The fork's evidence rules for named tests (gate-test-evidence.ts). */
+  testEvidence?: readonly TestEvidenceRule[];
   /** Non-null when the run could not be started or completed at all. */
   runError: string | null;
   /** True when the outer wall clock fired. */
@@ -784,6 +787,10 @@ export interface GateTallyLike {
 
 export interface GateVerdictDecision {
   verdict: GateVerdict;
+  /** A required test with configured evidence failed in the full run. Its
+   *  failure routes to repair, but a failure-only re-run cannot supply the
+   *  evidence the full run never produced, so it cannot make a flaky pass. */
+  missingLiveAcceptance?: string;
   /** One line, suitable for a log and for the evidence comment. */
   reason: string;
 }
@@ -880,18 +887,30 @@ export function decideGateVerdict(input: GateVerdictInput): GateVerdictDecision 
   // Suite totals cannot replace a required named result. Judge acceptance
   // before failure attribution, which could otherwise turn an unrelated
   // failure into a flaky pass that never ran the named test.
-  for (const name of new Set(input.requiredTests ?? [])) {
+  const evidence = input.testEvidence ?? [];
+  const observed = [...(tally.passedNames ?? []), ...(tally.failedNames ?? []),
+    ...(tally.testDetails ?? []).map(d => d.name), ...skippedNames];
+  let missingLiveAcceptance: string | undefined;
+  for (const name of new Set([...(input.requiredTests ?? []), ...reportedRequiredTests(observed, evidence)])) {
     const matches = (actual: string) => matchesRequiredTest(actual, name);
     const details = (tally.testDetails ?? []).filter(d => matches(d.name));
     const skipped = details.some(d => d.status === "skipped") || skippedNames.some(matches);
     const failed = tally.failedNames?.some(matches) === true;
+    const rules = rulesFor(name, evidence);
     // A genuine named failure routes to repair through the failure path below.
-    if (failed && !skipped) continue;
+    if (failed && !skipped) {
+      if (rules.length > 0) missingLiveAcceptance = `required live test ${name} has no passing attempt with its configured live evidence in the full run`;
+      continue;
+    }
     const passed = tally.passedNames?.some(matches) === true && !skipped;
     if (!passed) return { verdict: "unusable", reason: `required live test ${name} ${skipped ? "skipped" : "has no passing execution"}; live acceptance remains missing` };
-    if ((tally.testDetails || format === "playwright-json" || name.includes(" › ")) &&
+    if ((tally.testDetails || format === "playwright-json" || name.includes(" › ") || rules.length > 0) &&
       (details.length === 0 || details.some(d => !d.passingAttempt))) {
       return { verdict: "unusable", reason: `required live test ${name} has no actual passing attempt; live acceptance remains missing` };
+    }
+    for (const detail of rules.length > 0 ? details : []) {
+      const missing = missingTestEvidence(detail, rules);
+      if (missing !== null) return { verdict: "unusable", reason: `required live test ${name} ${missing}; live acceptance remains missing` };
     }
   }
 
@@ -899,7 +918,7 @@ export function decideGateVerdict(input: GateVerdictInput): GateVerdictDecision 
     const detail = tally.failed > 0
       ? `${tally.failed} test(s) failed`
       : "a suite-level failure with no failing test (build error, panic, or harness crash)";
-    return { verdict: "fail", reason: detail };
+    return { verdict: "fail", reason: detail, ...(missingLiveAcceptance ? { missingLiveAcceptance } : {}) };
   }
 
   if (input.exitCode !== 0) {

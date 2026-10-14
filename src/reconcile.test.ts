@@ -30,6 +30,10 @@ import { join } from "node:path";
 import { GATE_PARSER_VERSION, parseGateOutput, type GateRunReport, type GateTally } from "./gate-output.js";
 import { gateRunMetaPath, serializeGateRunMeta } from "./gate-report.js";
 import { requiredLiveTestNames } from "./live-tests.js";
+import { parseTestEvidenceRules } from "./gate-test-evidence.js";
+
+// Desktop's rule file, as shipped in its agents repo.
+const desktopEvidence = parseTestEvidenceRules(readFileSync(new URL("./fixtures/desktop-live-test-evidence.json", import.meta.url), "utf8")).rules;
 import type { ProjectItem } from "./types.js";
 import { resetActiveStageSetForTests } from "./stage-sets.js";
 import { REAL_CLAUDE_GATE_RUNNING_LABEL } from "./pipeline-decisions.js";
@@ -1505,6 +1509,55 @@ describe("runRealClaudeGateExecution — outcomes", () => {
           }
         }
       }
+    }
+  });
+
+  test("saved #1809 skipped, absent or incomplete required acceptance parks without changing ownership or retries", async () => {
+    const captured = readFileSync(new URL("./fixtures/desktop-1809-live-report.json", import.meta.url), "utf8");
+    const luna = "real-claude-codex-channel.spec.ts › real GPT-6 Luna channel replies with Low effort from creation";
+    const absent = JSON.parse(captured);
+    absent.suites = absent.suites.filter((s: any) => s.title !== "real-claude-codex-channel.spec.ts");
+    const incomplete = JSON.parse(captured);
+    // A synthetic parser fixture with a pass but no live attachments.
+    incomplete.suites.find((s: any) => s.title === "real-claude-codex-channel.spec.ts").specs[0].tests = [
+      { status: "expected", results: [{ status: "passed", attachments: [], annotations: [] }] },
+    ];
+    const scenarios = [
+      { output: captured, reason: /Luna.*skipped/ },
+      { output: JSON.stringify(absent), reason: /Luna.*has no passing execution/ },
+      { output: JSON.stringify(incomplete), reason: /Luna.*lacks a daemon-revision attachment/ },
+    ];
+    for (const selection of [undefined, { mode: "full" as const, reason: "full" },
+      { mode: "selected" as const, tests: [luna], filter: "x", reason: "named" }]) {
+      for (const { output, reason } of scenarios) {
+        const item = parkedItem({ labels: ["done:code-review", "needs-real-claude", "rework-count:3", "claim:mac"] });
+        const client = new MockClient([item]);
+        const saved = JSON.parse(JSON.stringify(report({ selection, requiredTests: [luna], tally: parseGateOutput(output, "playwright-json") })));
+        await runRealClaudeGateExecution(client, async () => saved, 10, async () => {}, 0, undefined, undefined, undefined, { testEvidence: desktopEvidence });
+        assert.equal(item.status, "Inbox");
+        for (const label of ["needs-real-claude", "rework-count:3", "claim:mac", "done:code-review"]) assert.ok(item.labels.includes(label));
+        assert.ok(item.labels.includes("error:real-claude-gate"));
+        assert.ok(!client.updateItemStatusCalls.length);
+        assert.ok(!client.removeLabelCalls.some(c => c.label === "needs-real-claude" || c.label === "claim:mac"));
+        assert.match(client.addCommentCalls[0].body, reason);
+      }
+    }
+  });
+
+  test("a genuine Luna failure routes to repair and a retry cannot supply missing live proof", async () => {
+    const doc = JSON.parse(readFileSync(new URL("./fixtures/desktop-1809-live-report.json", import.meta.url), "utf8"));
+    const suite = doc.suites.find((s: any) => s.title === "real-claude-codex-channel.spec.ts");
+    suite.specs[0].tests = [{ status: "unexpected", results: [{ status: "failed" }] }];
+    const requiredTests = ["real-claude-codex-channel.spec.ts › real GPT-6 Luna channel replies with Low effort from creation"];
+    for (const rerunFailures of [null, []]) {
+      const item = parkedItem();
+      const client = new MockClient([item]);
+      await runRealClaudeGateExecution(client, async () => report({
+        requiredTests, exitCode: 1, tally: parseGateOutput(JSON.stringify(doc), "playwright-json"), rerunFailures,
+      }), 10, async () => {}, 0, undefined, undefined, undefined, { testEvidence: desktopEvidence });
+      assert.equal(item.status, rerunFailures === null ? "In Development" : "Inbox");
+      assert.ok(item.labels.includes("needs-real-claude"));
+      assert.ok(item.labels.includes(rerunFailures === null ? "needs-rework:developer" : "error:real-claude-gate"));
     }
   });
 
