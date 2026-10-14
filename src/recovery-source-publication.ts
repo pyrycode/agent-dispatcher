@@ -56,6 +56,17 @@ function touchesChange(source:string,changed:boolean[]):(start:number,end:number
  };
 }
 
+/**
+ * Whether a name reads as source words rather than a value: letters only,
+ * and no camelCase or snake_case word longer than 16 letters. A name a repair
+ * declares itself can otherwise smuggle a low-entropy secret such as
+ * `hunter2hunter2hunter2` past the credential shapes.
+ */
+function wordy(name:string):boolean {
+ if(!/^[A-Za-z_$]+$/.test(name)) return false;
+ return name.replace(/([a-z])([A-Z])/g,'$1_$2').replace(/([A-Z]+)([A-Z][a-z])/g,'$1_$2').split(/[_$]+/).every(word=>word.length<=16);
+}
+
 /** The ordinary credential shapes, judged only where they touch an added or changed line. */
 function refuseChanged(text:string,touches:(start:number,end:number)=>boolean):void {
  if(credentialMatches(text).some(([start,end])=>touches(start,end))) throw new RepairRefusal(CREDENTIAL_REFUSAL);
@@ -72,14 +83,20 @@ function checkSource(path:string,source:string,base:string|null|undefined):void 
  const masks:Array<[number,number]>=[];
  // Names this file declares. A credential value pasted without quotes also
  // parses as an identifier, but it is never declared anywhere in the file.
- const declared=new Set<string>();
+ // A name declared on an unchanged line is already in the repository. A name
+ // the repair declares itself must also read as source words.
+ const declared=new Set<string>(),unchangedDeclarations=new Set<string>();
  function declarations(node:ts.Node):void {
   if((ts.isVariableDeclaration(node)||ts.isParameter(node)||ts.isBindingElement(node)||ts.isFunctionDeclaration(node)
    ||ts.isClassDeclaration(node)||ts.isEnumDeclaration(node)||ts.isImportSpecifier(node)||ts.isImportClause(node)
-   ||ts.isNamespaceImport(node)||ts.isImportEqualsDeclaration(node))&&node.name&&ts.isIdentifier(node.name)) declared.add(node.name.text);
+   ||ts.isNamespaceImport(node)||ts.isImportEqualsDeclaration(node))&&node.name&&ts.isIdentifier(node.name)) {
+   declared.add(node.name.text);
+   if(!touches(node.name.getStart(file),node.name.end)) unchangedDeclarations.add(node.name.text);
+  }
   ts.forEachChild(node,declarations);
  }
  declarations(file);
+ const knownName=(name:string)=>unchangedDeclarations.has(name)||declared.has(name)&&wordy(name);
  // Only these complete illustrative examples are exempt, and only in comments.
  // Provider keys and URL passwords elsewhere in a comment still receive the ordinary check.
  function commentRange(start:number,end:number):void {
@@ -89,10 +106,11 @@ function checkSource(path:string,source:string,base:string|null|undefined):void 
   }
   // A comment quoting source such as `token: process.env.GITHUB_TOKEN!`
   // names where a credential comes from, not the credential. Only an
-  // environment read, or a read on `this` or a name this file declares.
+  // environment read with a conventional name, or a read on `this` or a
+  // known name whose property names read as source words.
   for(const match of comment.matchAll(/\b[A-Za-z0-9_-]*(?:token|key|secret|password)["']?[ \t]*[=:][ \t]*["']?((?:[A-Za-z_$][\w$]*)(?:\.[A-Za-z_$][\w$]*)*)(?![\w$.])/gi)) {
-   const reference=match[1],root=reference.split('.')[0];
-   if(!(/^process\.env\.[A-Za-z_][\w]*$/.test(reference)||root==='this'||declared.has(root))) continue;
+   const reference=match[1],[root,...rest]=reference.split('.');
+   if(!(/^process\.env\.[A-Z][A-Z0-9_]*$/.test(reference)||(root==='this'?rest.length>0:knownName(root))&&rest.every(wordy))) continue;
    const at=start+match.index!+match[0].length-reference.length;
    // Provider shapes inside the reference itself are still credentials.
    if(touches(at,at+reference.length)) refuseCredentials(reference);
@@ -111,7 +129,10 @@ function checkSource(path:string,source:string,base:string|null|undefined):void 
  }
  function memberRead(node:ts.Node):boolean {
   if(ts.isNonNullExpression(node)||ts.isParenthesizedExpression(node)) return memberRead(node.expression);
-  return ts.isPropertyAccessExpression(node)&&(ts.isIdentifier(node.expression)||node.expression.kind===ts.SyntaxKind.ThisKeyword||memberRead(node.expression));
+  if(!ts.isPropertyAccessExpression(node)) return false;
+  // A read on `this` names only properties, so each must read as source words.
+  if(node.expression.kind===ts.SyntaxKind.ThisKeyword) return wordy(node.name.text);
+  return ts.isIdentifier(node.expression)||memberRead(node.expression);
  }
  function assignment(name:ts.Node,initializer:ts.Expression|undefined):void {
   if(!initializer||!sensitiveName.test(ts.isStringLiteralLike(name)?name.text:name.getText(file))) return;
@@ -119,7 +140,7 @@ function checkSource(path:string,source:string,base:string|null|undefined):void 
   // A property read, or a name this file declares, is source syntax, not an
   // unquoted diagnostic credential. Non-null assertions and casts do not change that.
   // Strings, calls, element access and undeclared bare identifiers retain conservative checking.
-  if(memberRead(value)||ts.isIdentifier(value)&&declared.has(value.text)) {
+  if(memberRead(value)||ts.isIdentifier(value)&&knownName(value.text)) {
    if(touches(initializer.getStart(file),initializer.end)) refuseCredentials(initializer.getText(file));
    masks.push([initializer.getStart(file),initializer.end]);
   }
@@ -145,18 +166,23 @@ function checkSource(path:string,source:string,base:string|null|undefined):void 
  */
 export async function loadRepairBase(github:GitHubBroker,repository:string,revision:string,paths:string[]):Promise<Record<string,string|null>> {
  if(!/^[a-f0-9]{40}$/.test(revision)) throw new RepairBaseUnavailable('Repair base revision is not exact');
+ const read=async(path:string,accept:string)=>{
+  try {return await github.request(repository,{method:'GET',path:'/repos/'+repository+path,headers:{accept}});}
+  catch {throw new RepairBaseUnavailable('Repair base sources unavailable');}
+ };
+ // A per-path 404 means the base lacks the file only once the base itself is readable.
+ const commit=await read('/git/commits/'+revision,'application/vnd.github+json');
+ if(commit.status!==200) throw new RepairBaseUnavailable('Repair base revision unavailable: HTTP '+commit.status);
+ // Paths are validated again in full before any check relies on them.
+ const valid=paths.filter(path=>/^[\w./-]+$/.test(path)&&!path.startsWith('/')&&!path.split('/').some(part=>!part||part==='.'||part==='..'));
+ const responses=await Promise.all(valid.map(path=>read('/contents/'+path+'?ref='+revision,'application/vnd.github.raw+json')));
  const base:Record<string,string|null>={};
- for(const path of paths) {
-  // Paths are validated again in full before any check relies on them.
-  if(!/^[\w./-]+$/.test(path)||path.startsWith('/')||path.split('/').some(part=>!part||part==='.'||part==='..')) continue;
-  let response;
-  try {
-   response=await github.request(repository,{method:'GET',path:'/repos/'+repository+'/contents/'+path+'?ref='+revision,headers:{accept:'application/vnd.github.raw+json'}});
-  }catch {throw new RepairBaseUnavailable('Repair base sources unavailable');}
+ valid.forEach((path,i)=>{
+  const response=responses[i];
   if(response.status===404) base[path]=null;
   else if(response.status===200) base[path]=response.body;
   else throw new RepairBaseUnavailable('Repair base sources unavailable: HTTP '+response.status);
- }
+ });
  return base;
 }
 

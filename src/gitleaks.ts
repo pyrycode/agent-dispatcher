@@ -93,7 +93,7 @@ export function scanSourcePackage(files:Record<string,string|null>):void {
  }finally {
   if(directory) {
    try {fs.rmSync(directory,{recursive:true,force:true});}
-   catch {throw new Error(FAILURE);}
+   catch {throw findings?new SourceScanFindings(FAILURE):new Error(FAILURE);}
   }
  }
 }

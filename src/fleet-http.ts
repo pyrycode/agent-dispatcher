@@ -132,6 +132,8 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
         if ((!isAdmin&&!machine) || !github || !repairRepository) return send(403,{error:'Configured repair authority required'});
         const task=store.tasks.get(body.id);
         if(task.machine!==(isAdmin?body.machine:machine) || task.session!==body.session) return send(403,{error:'Task actor mismatch'});
+        // Only a prepared repair publishes, so every published byte passed the source scan.
+        if(task.state!=='publishing') return send(409,{error:'Repair must be prepared before publication'});
         let work=repairWrites.get(task.id);
         if(!work) {
           work=publishRepair(github,repairRepository,task,body.publication,repairConsumers,sha=>{store.controlTarget(sha);return store.controlsReady(sha,controlRevision);}).finally(()=>repairWrites.delete(task.id));
@@ -262,7 +264,8 @@ export class JsonClient {
     } else if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("Invalid service connection");
   }
   async call<T>(path: string, body?: unknown): Promise<T> {
-    const timeoutMs = path === "/tasks/publish-repair" ? 120_000 : path === "/github" || path === "/workflow/file" ? 60_000 : 10_000;
+    // Preparation reads the repair's base from GitHub and scans it twice.
+    const timeoutMs = path === "/tasks/publish-repair" || path === "/tasks/prepare-repair" ? 120_000 : path === "/github" || path === "/workflow/file" ? 60_000 : 10_000;
     if (this.socketPath) return new Promise<T>((resolve, reject) => {
       const req = request({ socketPath: this.socketPath, path, method: body === undefined ? "GET" : "POST",
         headers: { Authorization: `Bearer ${this.token}`, "Content-Type": "application/json" },

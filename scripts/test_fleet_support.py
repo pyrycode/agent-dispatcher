@@ -1016,3 +1016,27 @@ class PublicationRefusalTests(unittest.TestCase):
    self.assertEqual(run.call_args[0][0],['operator','recovery-task','prepare-repair',str(s.directory/'prepare-repair.request.json')])
    with patch.object(m.subprocess,'run',return_value=Done(0,'{"ok":true}','')):
     self.assertEqual(s.rpc('complete',{}),{'ok':True})
+
+ def test_repeated_temporary_failures_are_raised_for_attention_once(self):
+  with tempfile.TemporaryDirectory() as d:
+   s,calls,logged,receipt,work=self.support(d,{'prepare-repair':m.RpcError('prepare-repair','Service 409: {"error":"Repair actor mismatch"}')})
+   now=1_000_000.0
+   for i in range(8):
+    old=json.loads(receipt.read_text());retry=old.get('publicationRetry')
+    if retry:now=retry['next']+1
+    with patch.object(m.time,'time',return_value=now):s.tick()
+   self.assertEqual([k for k,_,_ in logged].count('native-task-publication-stuck'),1)
+   self.assertEqual(json.loads(receipt.read_text())['publicationRetry']['failures'],8)
+   self.assertNotIn('complete',[op for op,_ in calls],'a failure that may clear never ends the task')
+   with patch.object(m.time,'time',return_value=now+1):entries=s.tick()
+   self.assertEqual(entries[0]['phase'],'attention')
+
+ def test_service_line_is_found_when_the_operator_writes_after_it(self):
+  error=m.RpcError('prepare-repair',REFUSED+'    at main (fleet-bin.ts:1)\n')
+  self.assertTrue(error.refused)
+  with tempfile.TemporaryDirectory() as d:
+   s,calls,logged,receipt,work=self.support(d,{});del s.rpc
+   class Done:returncode=1;stdout='';stderr=REFUSED
+   with patch.object(m.subprocess,'run',return_value=Done()),patch.object(m.sys,'stderr') as stream:
+    with self.assertRaises(m.RpcError):s.rpc('prepare-repair',{})
+   stream.write.assert_called_with(REFUSED)

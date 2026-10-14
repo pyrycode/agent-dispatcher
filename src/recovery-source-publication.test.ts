@@ -453,8 +453,9 @@ test('#3289 over HTTP: the base is read from GitHub at the repair revision, and 
  const reads:string[]=[];let failing=false;
  const github=new GitHubBroker({token:'central',projects:['org/dispatcher'],fetcher:async(input,init)=>{
   const url=new URL(String(input));reads.push(url.pathname+url.search);
-  assert.equal(new Headers(init?.headers).get('accept'),'application/vnd.github.raw+json');
   if(failing) return new Response('unavailable',{status:502});
+  if(url.pathname==='/repos/org/dispatcher/git/commits/'+revision) return new Response('{"sha":"'+revision+'"}');
+  assert.equal(new Headers(init?.headers).get('accept'),'application/vnd.github.raw+json');
   const path=url.pathname.replace('/repos/org/dispatcher/contents/','');
   assert.equal(url.searchParams.get('ref'),revision);
   return Object.hasOwn(base3289,path)?new Response(base3289[path as keyof typeof base3289]):new Response('{"message":"Not Found"}',{status:404});
@@ -486,4 +487,55 @@ test('#3289 over HTTP: the base is read from GitHub at the repair revision, and 
  assert.equal(response.status,422);
  assert.deepEqual(await response.json(),{error:'Repair contains credential-shaped text; retain it privately',refused:true});
  assert.deepEqual(other.store.snapshot(),before);assert.equal(other.store.tasks.get(other.id).state,'running');
+});
+
+test('a name the repair declares itself must read as source words to be exempt',async t=>{
+ // Review of the #3289 fix: a declared name or a read on `this` could carry a
+ // low-entropy secret that neither the shapes nor gitleaks would catch.
+ for(const value of ['hunter2hunter2hunter2','Summer2026Summer2026x','deadbeefdeadbeefdeadbeef00','abcdefghijklmnopqrstuvwx']) await t.test(value,()=>{
+  for(const source of [
+   'function '+value+'(){}\nexport const c = { token: '+value+' };\n',
+   'class C { m(){ return { token: this.'+value+' }; } }\n',
+   'const cfg = {};\n// password: cfg.'+value+'\nexport {};\n',
+   '// token: process.env.'+value+'\nexport {};\n',
+  ]) assert.throws(()=>validateRepairPublication(publication({'src/a.ts':source})),RepairRefusal,source);
+ });
+ // A name already declared on an unchanged line is in the repository, whatever it looks like.
+ const baseSource='const deadbeefdeadbeefdeadbeef00 = read();\nexport const c = {};\n';
+ const changed=baseSource.replace('export const c = {};','export const c = { token: deadbeefdeadbeefdeadbeef00 };');
+ assert.doesNotThrow(()=>validateRepairPublication(publication({'src/a.ts':changed}),{'src/a.ts':baseSource}));
+ assert.throws(()=>validateRepairPublication(publication({'src/a.ts':changed})),RepairRefusal);
+});
+
+test('a task that is not running is refused for its state, not its content',()=>{
+ const {store,id}=admitted();try {
+  store.taskComplete('mac',id,'repair',{outcome:'failed',summary:'ended',files:{}});
+  // Strict content, no base: still a state error, never a final content refusal.
+  assert.throws(()=>store.prepareRepair('mac',id,'repair',publication({'src/new.ts':fixtureLines[0]+'\n'})),
+   (error:Error)=>!(error instanceof RepairRefusal)&&error.message==='Repair is not running');
+ }finally{store.close();}
+});
+
+test('base reads need the revision itself, and publication needs a prepared repair',async t=>{
+ let commitStatus=404;
+ const github=new GitHubBroker({token:'central',projects:['org/dispatcher'],fetcher:async input=>{
+  const url=new URL(String(input));
+  if(url.pathname==='/repos/org/dispatcher/git/commits/'+revision) return new Response('{"sha":"'+revision+'"}',{status:commitStatus});
+  return new Response('{"message":"Not Found"}',{status:404});
+ }});
+ const {store,id}=admitted(),server=await serveFleet(store,{box:'b-test',mac:'m-test'},'a-test',0,'127.0.0.1',github,undefined,'org/dispatcher');
+ t.after(async()=>{await new Promise<void>(resolve=>server.close(()=>resolve()));store.close();});
+ const address=server.address();assert.ok(address&&typeof address!=='string');
+ const post=(route:string,p:unknown)=>fetch('http://127.0.0.1:'+address.port+route,{method:'POST',headers:{authorization:'Bearer m-test','content-type':'application/json'},body:JSON.stringify({id,session:'repair',publication:p})});
+ const value=publication({'src/dispatch.test.ts':repairedTest});
+ // Every path 404s, but so does the revision. That is not "every file is new".
+ const before=store.snapshot();
+ assert.equal((await post('/tasks/prepare-repair',value)).status,503);
+ assert.deepEqual(store.snapshot(),before);
+ // Publication without preparation would skip the source scan entirely.
+ const response=await post('/tasks/publish-repair',value);
+ assert.equal(response.status,409);
+ assert.equal((await response.json()).error,'Repair must be prepared before publication');
+ commitStatus=200;
+ assert.equal((await post('/tasks/prepare-repair',value)).status,422,'with a readable revision a missing path is a new file');
 });

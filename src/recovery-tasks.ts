@@ -164,8 +164,9 @@ export class RecoveryTasks {
    if(task.result?.files['publication.json']!==JSON.stringify(publication)) throw new Error('Prepared repair changed');
    return task;
   }
-  const serialized=JSON.stringify(validateRepairPublication(publication,base));
+  // A finished or queued task is refused for its state, never for its content.
   if(!['running','attention'].includes(task.state)) throw new Error('Repair is not running');
+  const serialized=JSON.stringify(validateRepairPublication(publication,base));
   const result:RecoveryTaskResult={outcome:'completed',summary:'Verified repair prepared; publication and deployment remain pending.',files:{'publication.json':serialized}};
   this.db.prepare("UPDATE fleet_recovery_tasks SET state='publishing',result=?,updated=? WHERE id=?").run(JSON.stringify(result),this.now(),id);
   return this.get(id);

@@ -325,7 +325,9 @@ class RpcError(Exception):
     """A recovery-task operation failed. `status` is the service's HTTP status when it answered."""
     def __init__(self,operation,detail):
         self.operation=operation
-        line=(detail.strip().splitlines() or [''])[-1]
+        lines=detail.strip().splitlines() or ['']
+        # The service's own line, even when the operator writes after it.
+        line=next((l for l in reversed(lines) if re.match(r'Service \d{3}: ',l)),lines[-1])
         match=re.match(r'Service (\d{3}): (.*)$',line)
         self.status=int(match.group(1)) if match else None
         body=None
@@ -340,6 +342,9 @@ class RpcError(Exception):
 # doubling each time up to the cap. A definitive refusal never retries.
 PUBLICATION_RETRY_SECONDS=60
 PUBLICATION_RETRY_CAP_SECONDS=1800
+# After this many failures in a row the record is raised once for attention.
+# It keeps retrying, because nothing proves the failure is permanent.
+PUBLICATION_ATTENTION_FAILURES=6
 
 def route_available(route):
     capability=route['capability']
@@ -426,6 +431,8 @@ class SupportSupervisor:
                             stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=150)
         # The operator prints the service's own error line, for example
         # `Service 422: {"error":...,"refused":true}`, which says whether a retry can help.
+        # Diagnostics still reach the journal as before.
+        if done.stderr:sys.stderr.write(done.stderr);sys.stderr.flush()
         if done.returncode!=0:raise RpcError(operation,done.stderr or '')
         return json.loads(done.stdout)
 
@@ -563,7 +570,8 @@ class SupportSupervisor:
                 if old.get('publicationRefused'):return self.refuse_publication(machine,receipt,old)
                 retry=old.get('publicationRetry')
                 if retry and retry.get('next',0)>time.time():
-                    running.append({'id':old['id'],'phase':'publication-retry','reason':retry.get('reason'),'next':retry['next']});return
+                    running.append({'id':old['id'],'phase':'attention' if retry.get('attention') else 'publication-retry',
+                                    'reason':retry.get('reason'),'next':retry['next'],'failures':retry.get('failures')});return
                 try:
                     self.rpc('prepare-repair',{'machine':machine,'id':old['id'],'session':old['session'],'publication':json.loads(publication)})
                     old['phase']='publishing';atomic(receipt,old)
@@ -609,8 +617,12 @@ class SupportSupervisor:
         failures=old.get('publicationRetry',{}).get('failures',0)+1
         delay=min(PUBLICATION_RETRY_SECONDS*2**(failures-1),PUBLICATION_RETRY_CAP_SECONDS)
         detail=str(error) if isinstance(error,RpcError) else type(error).__name__+': '+str(error)
-        old['publicationRetry']={'failures':failures,'next':time.time()+delay,'reason':detail[:300]}
+        raised=old.get('publicationRetry',{}).get('attention',False)
+        old['publicationRetry']={'failures':failures,'next':time.time()+delay,'reason':detail[:300],'attention':raised or failures>=PUBLICATION_ATTENTION_FAILURES}
         atomic(receipt,old)
+        if failures>=PUBLICATION_ATTENTION_FAILURES and not raised and self.housekeeping:
+            self.housekeeping('native-task-publication-stuck',old['id'],
+                              'Repair publication failed '+str(failures)+' times in a row and still holds its reservation. Last: '+detail[:300])
         raise PublicationPassError(error) from error
 
     def refuse_publication(self,machine,receipt,old):
@@ -672,7 +684,7 @@ class SupportSupervisor:
                 self.receipt_pass(machine,receipt,running)
                 # Waiting out a publication retry keeps the failure it waits on,
                 # so the same failure is not logged again after each wait.
-                if running and running[-1].get('id')==task and running[-1].get('phase')=='publication-retry' and task in self.reported_errors:
+                if running and running[-1].get('id')==task and 'next' in running[-1] and task in self.reported_errors:
                     errors[task]=self.reported_errors[task]
             except Exception as error:
                 detail=str(error) if isinstance(error,ArtifactPassError) else type(error).__name__+': '+str(error)
