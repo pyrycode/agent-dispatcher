@@ -199,11 +199,12 @@ test("a refined or repair-assigned Backlog ticket is still checked for stalls wi
     backlog(2, [RECOVERY_PRIORITY, RECOVERY_REPAIRING]), // a refine repair that never started
     backlog(3, ["done:refiner", "needs-human:sizing"]), // refined, never built
     backlog(4, ["done:po"]),
+    backlog(5, [RECOVERY_PRIORITY]), // a coordinate or unblock repair waiting in Backlog
   ];
   assert.deepEqual(ledger.report("mac", project, observed, empty), []);
   now += 24 * 3600000;
   const incidents = ledger.report("mac", project, observed, empty);
-  assert.deepEqual(incidents.map(i => [i.ticket, i.state, i.reason]).sort(), [2, 3, 4].map(n => [`${project}#${n}`, "queued", "No workflow progress for 24 hours"]));
+  assert.deepEqual(incidents.map(i => [i.ticket, i.state, i.reason]).sort(), [2, 3, 4, 5].map(n => [`${project}#${n}`, "queued", "No workflow progress for 24 hours"]));
   db.close();
 });
 
@@ -222,6 +223,9 @@ test("only the computer running an unowned ticket's job raises its retained-run 
   const [alert] = ledger.report("mac", project, [backlog], fleet);
   assert.equal(alert?.state, "escalated");
   assert.equal(alert?.runId, "refine");
+  // Once the run ends, any computer that observes progress resolves the alert.
+  assert.deepEqual(ledger.report("linux", project, [{ ...backlog, labels: ["done:refiner"] }], { claims: [], runs: [] }), []);
+  assert.equal(ledger.incident(alert!.id).state, "resolved");
   db.close();
 });
 
