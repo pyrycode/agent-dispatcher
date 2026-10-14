@@ -3,7 +3,7 @@ import type { DatabaseSync } from "node:sqlite";
 import type { FleetSnapshot } from "./fleet-store.js";
 import {validateTaskRequest, CAPABILITY_FRESH_MS, type RecoveryTaskRequest} from "./recovery-tasks.js";
 import type { PauseRecord } from "./recovery-facts.js";
-import { hasRecoveryPriority } from "./recovery-labels.js";
+import { hasRecoveryPriority, hasRunningWip } from "./recovery-labels.js";
 
 export interface RecoveryObservation {
   ticket: string; status: string; labels: string[]; blocked: boolean;
@@ -70,7 +70,7 @@ export function hasOperatorHold(labels: readonly string[]): boolean {
 /** Inspection can establish pause provenance, but cannot authorise reopening. */
 export function canInspectUnknownPause(o: RecoveryObservation): boolean {
   return o.status === "Halted" && !o.pause && !hasOperatorHold(o.labels)
-    && !o.labels.some(l => /permission_denied/.test(l) || l.startsWith("wip:"));
+    && !o.labels.some(l => /permission_denied/.test(l)) && !hasRunningWip(o.labels);
 }
 
 export function validateObservations(project: string, observations: RecoveryObservation[]): void {
@@ -286,7 +286,9 @@ export class RecoveryLedger {
         continue;
       }
       let trigger = recoveryTrigger(o);
-      const wip = o.labels.some(l => l.startsWith("wip:"));
+      // An agent run label. The repair marker (wip:repair) only says a repair run is due, so a ticket that
+      // carries just that stays assessable: a repair that never starts must be able to reopen.
+      const wip = hasRunningWip(o.labels);
       const upgraded = (o.assessmentPolicy ?? 0) >= RECOVERY_ASSESSMENT_POLICY;
       const policyRecorded = old && this.db.prepare("SELECT 1 FROM fleet_recovery_assessment_policy WHERE incident_id=? AND version>=?").get(old.id, RECOVERY_ASSESSMENT_POLICY);
       // A delayed old-worker observation cannot undo upgraded assessment work.
@@ -351,7 +353,7 @@ export class RecoveryLedger {
     }
     return this.list(project).filter(i => newAlerts.has(i.id) || (i.state === "queued" && seen.has(i.ticket)
       && (i.reason !== RECOVERY_UNKNOWN_PAUSE_REASON || (observations.find(o => o.ticket === i.ticket)?.assessmentPolicy ?? 0) >= RECOVERY_ASSESSMENT_POLICY)
-      && !observations.find(o => o.ticket === i.ticket)?.labels.some(l => l.startsWith("wip:"))
+      && !hasRunningWip(observations.find(o => o.ticket === i.ticket)?.labels ?? [])
       && (!active.has(i.ticket) || fleet.runs.some(r => r.ticket === i.ticket && r.role === "recovery" && r.machine === machine))));
   }
   incident(id: string): RecoveryIncident {

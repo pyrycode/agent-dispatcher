@@ -7,6 +7,7 @@
 // Split from lib.ts on 2026-05-09. Imports `hasOpenBlockers` from blockers.ts
 // (the only cross-file dependency in this file).
 
+import { hasRunningWip, isRepairWip } from "./recovery-labels.js";
 import { hasOpenBlockers } from "./blockers.js";
 import { byTicketPriority } from "./ticket-priority.js";
 import { MERGE_HANDOFF_LABEL } from "./merge-handoff.js";
@@ -386,8 +387,11 @@ export function decideReworkRoutes(
       // routing runs while agents are still working (dispatch-pool.ts), so
       // a ticket carrying wip:<agent> waits for the next pass: the rework
       // label is still there then, and a dead run's stale wip is cleared
-      // by the stranded-wip sweep after its age gate.
-      if (item.labels.some((l) => l.startsWith("wip:"))) continue;
+      // by the stranded-wip sweep after its age gate. The repair marker
+      // (wip:repair) is no agent: a leftover one must not stop a rework
+      // label from routing, and this route strips it with the other wip:
+      // labels, so a failed marker removal cannot deadlock the ticket.
+      if (hasRunningWip(item.labels)) continue;
 
       // First valid rework label wins. Iterate in array order for
       // determinism — same order GitHub returns from the labels query.
@@ -1438,7 +1442,13 @@ export function selectStrandedWipCandidates(
     if (item.status === "Done") continue;
     const wipLabels = item.labels.filter((l) => l.startsWith("wip:"));
     if (wipLabels.length === 0) continue;
-    const running = wipLabels.some((l) => inFlight.has(`${l.slice("wip:".length)}#${item.issueNumber}`));
+    // `wip:repair` marks the repair run the orchestrator assigned. It appears
+    // at the handback, before any agent run has started, so a ticket carrying
+    // only that marker is waiting for its run, not stranded. Cleanup of a
+    // leftover marker belongs to cleanRecoveryLabels and the central store.
+    // When a real agent label is stranded beside it, it goes with that label.
+    if (!hasRunningWip(wipLabels)) continue;
+    const running = wipLabels.some((l) => !isRepairWip(l) && inFlight.has(`${l.slice("wip:".length)}#${item.issueNumber}`));
     if (running) continue;
     out.push({ issueNumber: item.issueNumber, wipLabels });
   }
@@ -2649,5 +2659,5 @@ export function extractErrorRetryCount(labels: string[]): number {
  */
 export function isRetryWaiting(labels: string[]): boolean {
   if (!labels.some(l => l.startsWith(ERROR_RETRY_COUNT_PREFIX))) return false;
-  return !labels.some(l => l.startsWith("wip:"));
+  return !hasRunningWip(labels);
 }

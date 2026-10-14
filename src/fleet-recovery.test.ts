@@ -453,13 +453,37 @@ test("unrelated tickets cannot exhaust each other's assessments or repairs", () 
   db.close();
 });
 
+test("wip:repair is not a running agent for recovery: a repair that never starts can reopen, a live run label still blocks", () => {
+  const waiting = item(["orchestrator:recovery-priority", "wip:repair", "error:builder", "done:refiner"]);
+  const rework = { action: "rework", reason: "Repair repeated defect" } as const;
+  assert.equal(recoveryPlan(waiting, rework, agents).status, "In Development", "the marker alone is a planable ticket");
+  const running = item(["orchestrator:recovery-priority", "wip:repair", "wip:builder", "error:builder", "done:refiner"]);
+  assert.throws(() => recoveryPlan(running, rework, agents), /not safe for automatic recovery/);
+  const db = new DatabaseSync(":memory:"); let now = 1000;
+  const ledger = new RecoveryLedger(db, () => now);
+  const markerOnly = { ...observation(1, ["orchestrator:recovery-priority", "wip:repair"]), status: "In Development" };
+  ledger.report("mac", project, [markerOnly], { claims: [], runs: [] });
+  now += 3 * 3600000;
+  assert.equal(ledger.report("mac", project, [markerOnly], { claims: [], runs: [] }).length, 0,
+    "three hours of waiting is not a running label without a reservation");
+  now += 22 * 3600000;
+  const [reopened] = ledger.report("mac", project, [markerOnly], { claims: [], runs: [] });
+  assert.equal(reopened?.state, "queued", "a day without progress reopens the ticket despite the marker");
+  const live = { ...observation(2, ["wip:repair", "wip:builder"]), status: "In Development" };
+  ledger.report("mac", project, [live], { claims: [], runs: [] });
+  now += 3 * 3600000;
+  const [alert] = ledger.report("mac", project, [live], { claims: [], runs: [] });
+  assert.equal(alert?.state, "escalated", "a real running label without a reservation still escalates");
+  db.close();
+});
+
 test("sizing review remains informational while real operator holds stay manual", async () => {
   const current = item(["needs-human:sizing", "error:rework-loop", "done:builder"]);
   assert.equal(recoveryTrigger(observationFor(project, current))?.manual, false);
   assert.equal(recoveryTrigger(observation(1, ["needs-human:sizing"])), null);
   assert.equal(recoveryTrigger(observation(1, ["needs-human:sizing", "needs-human:decision", "error:builder"]))?.manual, true);
   assert.equal(recoveryPlan(current, { action: "rework", reason: "Repair repeated source provenance defect" }, agents).status, "In Development");
-  current.labels = ["needs-human:sizing", "orchestrator:recovery-priority", "orchestrator:repairing"];
+  current.labels = ["needs-human:sizing", "orchestrator:recovery-priority", "wip:repair"];
   const removed: string[] = [];
   await cleanRecoveryLabels([current], async (_n, label) => { removed.push(label); });
   assert.deepEqual(removed, [], "informational sizing must not remove repair priority");
@@ -731,14 +755,14 @@ test("investigating is visible during assessment; priority and repairing survive
     });
     if (mode === "interrupted") await assert.rejects(run, /outage/); else await run;
     assert.equal(current.labels.includes("orchestrator:investigating"), false);
-    for (const label of ["orchestrator:recovery-priority", "orchestrator:fixing", "orchestrator:repairing"])
+    for (const label of ["orchestrator:recovery-priority", "orchestrator:fixing", "wip:repair"])
       assert.equal(current.labels.includes(label), mode === "rework" || mode === "retry", `${mode} ${label}`);
     assert.equal(current.labels.includes("error:builder"), mode !== "rework" && mode !== "retry");
   }
 });
 
 test("idle-ticket reconciliation repairs stale labels after outage or restart", async () => {
-  const assigned = ["orchestrator:recovery-priority", "orchestrator:fixing", "orchestrator:repairing"];
+  const assigned = ["orchestrator:recovery-priority", "orchestrator:fixing", "wip:repair"];
   const activeRepair = item([...assigned]);
   const laterStage = {...item(["orchestrator:recovery-priority", "orchestrator:fixing"]), issueNumber: 6, status: "In Code Review"};
   const legacyOnly = {...item(["orchestrator:fixing"]), issueNumber: 7, status: "In QA"};
@@ -746,13 +770,18 @@ test("idle-ticket reconciliation repairs stale labels after outage or restart", 
   const failed = {...item([...assigned, "error:builder"]), issueNumber: 3};
   const done = {...item([...assigned, "orchestrator:investigating"]), issueNumber: 4, status: "Done"};
   const interrupted = {...item(["orchestrator:investigating"]), issueNumber: 5};
-  const operatorHold = {...item(["orchestrator:recovery-priority", "orchestrator:repairing", "needs-human:decision"]), issueNumber: 8};
-  const orphan = {...item(["orchestrator:repairing"]), issueNumber: 9};
+  const operatorHold = {...item(["orchestrator:recovery-priority", "wip:repair", "needs-human:decision"]), issueNumber: 8};
+  const orphan = {...item(["wip:repair"]), issueNumber: 9};
+  const legacyOrphan = {...item(["orchestrator:repairing"]), issueNumber: 10};
+  const legacyHeld = {...item(["orchestrator:recovery-priority", "orchestrator:repairing"]), issueNumber: 11, status: "Halted"};
+  const legacyActive = {...item(["orchestrator:recovery-priority", "orchestrator:repairing"]), issueNumber: 12};
   const removed: string[] = [];
-  await cleanRecoveryLabels([activeRepair, laterStage, legacyOnly, held, failed, done, interrupted, operatorHold, orphan], async (n,l) => {removed.push(`${n}:${l}`);});
+  await cleanRecoveryLabels([activeRepair, laterStage, legacyOnly, held, failed, done, interrupted, operatorHold, orphan, legacyOrphan, legacyHeld, legacyActive], async (n,l) => {removed.push(`${n}:${l}`);});
   assert.deepEqual(removed, [
     ...assigned.map(l => `2:${l}`), ...assigned.map(l => `3:${l}`), ...assigned.map(l => `4:${l}`), "4:orchestrator:investigating",
-    "5:orchestrator:investigating", "8:orchestrator:recovery-priority", "8:orchestrator:repairing", "9:orchestrator:repairing"]);
+    "5:orchestrator:investigating", "8:orchestrator:recovery-priority", "8:wip:repair", "9:wip:repair",
+    "10:orchestrator:repairing", "11:orchestrator:recovery-priority", "11:orchestrator:repairing"]);
+  assert.deepEqual(legacyActive.labels, ["orchestrator:recovery-priority", "orchestrator:repairing"], "a legacy marker with priority and a live repair is kept");
   assert.deepEqual(activeRepair.labels, assigned, "a repair waiting for or in its run keeps both labels");
   assert.deepEqual(laterStage.labels, ["orchestrator:recovery-priority", "orchestrator:fixing"], "later stages and waits keep priority");
   assert.deepEqual(legacyOnly.labels, ["orchestrator:fixing"], "the old name still means priority");
@@ -761,9 +790,11 @@ test("idle-ticket reconciliation repairs stale labels after outage or restart", 
 
 test("each repair decision writes the labels its handback needs", () => {
   const priority = ["orchestrator:recovery-priority", "orchestrator:fixing"];
-  for (const action of ["retry", "rework", "resume", "refine"]) assert.deepEqual(recoveryAssignmentLabels(action), [...priority, "orchestrator:repairing"], action);
+  for (const action of ["retry", "rework", "resume", "refine"]) assert.deepEqual(recoveryAssignmentLabels(action), [...priority, "wip:repair"], action);
   for (const action of ["unblock", "coordinate"]) assert.deepEqual(recoveryAssignmentLabels(action), priority, `${action} assigns no stage run`);
   for (const action of ["wait", "escalate", "propose-close"]) assert.deepEqual(recoveryAssignmentLabels(action), [], action);
+  assert.equal(RECOVERY_LABEL_DEFINITIONS["wip:repair"]?.color, "0B5CAD", "wip:repair takes the wip family colour");
+  assert.equal(RECOVERY_LABEL_DEFINITIONS["orchestrator:repairing"], undefined, "the old name is never created again");
   for (const definition of Object.values(RECOVERY_LABEL_DEFINITIONS)) {
     assert.match(definition.color, /^[0-9A-F]{6}$/);
     assert.ok(definition.description.length <= 100, "GitHub refuses longer label descriptions");
@@ -780,6 +811,6 @@ test("scheduler readers accept the new and the old priority name", () => {
     assert.equal(managed.agentOffer({name: "verifier"} as any, ticket, 0).offer.recovery, true, label);
   }
   const managed = new ManagedDispatch(project, {PYRY_MANAGER_URL: "http://localhost:1", PYRY_MANAGER_TOKEN: "test"});
-  assert.equal(managed.agentOffer({name: "builder"} as any, {issueNumber: 2, labels: ["orchestrator:repairing"]} as any, 0).offer.recovery, false,
+  assert.equal(managed.agentOffer({name: "builder"} as any, {issueNumber: 2, labels: ["wip:repair"]} as any, 0).offer.recovery, false,
     "priority comes from the priority label, not the run marker");
 });

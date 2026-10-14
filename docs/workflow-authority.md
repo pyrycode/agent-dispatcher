@@ -183,7 +183,7 @@ refuses only when the ticket meanwhile has an active reservation.
 
 Recovery priority and the repair run have separate labels since 2026-10-14.
 `orchestrator:recovery-priority` gives an assigned repair recovery priority
-through all later stages and waits. `orchestrator:repairing` shows only the
+through all later stages and waits. `wip:repair` shows only the
 assigned repair run, from the handback until that run finishes. The
 [machine manager](machine-manager.md) describes when each appears and goes.
 
@@ -207,9 +207,26 @@ dispatcher reads only the old name.
    repository, for example
    `gh label delete orchestrator:fixing -R pyrycode/pyrycode --yes`.
 
-The publisher creates `orchestrator:recovery-priority` and `orchestrator:repairing`
-on GitHub the first time a ticket needs them, both in colour `FF1493` with a short
+The publisher creates `orchestrator:recovery-priority` and `wip:repair`
+on GitHub the first time a ticket needs them, each with its family colour from
+`src/label-colors.ts` (`wip:repair` is the blue of every `wip:` label) and a short
 description. A label that already exists keeps its colour and description.
+
+The repair marker was named `orchestrator:repairing` for a day (PR 238) and was
+renamed to `wip:repair`. Handbacks write only the new name. Every reader and the
+cleanup take either, because a dispatcher from before the rename can still hand
+back with the old one. When the central service starts, it replaces
+`orchestrator:repairing` with `wip:repair` on every saved ticket, one recorded
+workflow command by `migration:wip-repair` each. A converged store changes
+nothing, so restarts are safe. The migration is not a new assignment: the
+settling rule still dates the repair from the handback that wrote the old name.
+Roll the central service out before any dispatcher: an old central refuses a stage run
+on a ticket that carries any `wip:` label, `wip:repair` included, and would never settle
+it. Rework routing waits only for a running agent label, so a leftover marker cannot
+block a `needs-rework:` route, and the route strips it.
+Once the boards show no `orchestrator:repairing`, delete the GitHub label in each
+repository, for example
+`gh label delete orchestrator:repairing -R pyrycode/pyrycode --yes`.
 
 ## Recovery and rollback
 

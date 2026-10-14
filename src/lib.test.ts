@@ -17,6 +17,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 
 import { AGENTS } from "./types.js";
+import { hasRunningWip } from "./recovery-labels.js";
 import {
   appendStderrTail,
   noResultErrorMessage,
@@ -89,6 +90,7 @@ import {
   decideAutoAdvance,
   decideDoneCleanup,
   decideStrandedWip,
+  isRetryWaiting,
   selectStrandedWipCandidates,
   decideMergeRetry,
   decidePostRunLabels,
@@ -1544,6 +1546,24 @@ describe("decideReworkRoutes", () => {
     assert.equal(r.length, 0);
   });
 
+  test("a leftover wip:repair never blocks rework routing, and the route strips it; a running agent label still does (2026-10-14)", () => {
+    const routed = decideReworkRoutes(
+      AGENT_COLUMN_MAP,
+      items(["In Architecture", [{ id: "i1", issueNumber: 27, labels: ["needs-rework:po", "wip:repair"] }]]),
+    );
+    assert.equal(routed.length, 1, "a marker whose removal failed cannot deadlock the ticket");
+    assert.ok(routed[0].labelsToStrip.includes("wip:repair"));
+    const busy = decideReworkRoutes(
+      AGENT_COLUMN_MAP,
+      items(["In Architecture", [{ id: "i1", issueNumber: 27, labels: ["needs-rework:po", "wip:repair", "wip:architect"] }]]),
+    );
+    assert.equal(busy.length, 0, "a live agent still owns the ticket");
+    assert.equal(hasRunningWip(["wip:repair"]), false);
+    assert.equal(hasRunningWip(["wip:repair", "wip:builder"]), true);
+    assert.equal(isRetryWaiting(["error-retry-count:1", "wip:repair"]), true, "a repair marker does not hold a retry seat");
+    assert.equal(isRetryWaiting(["error-retry-count:1", "wip:builder"]), false);
+  });
+
   test("malformed needs-rework: (no target) → no route", () => {
     // extractReworkTarget returns null for bare "needs-rework:" — guards
     // against typos producing accidental routes.
@@ -1834,6 +1854,30 @@ describe("selectStrandedWipCandidates", () => {
     assert.equal(c.length, 1);
     assert.equal(c[0].issueNumber, 2191);
     assert.deepEqual(c[0].wipLabels, ["wip:verifier"]);
+  });
+
+  test("wip:repair alone is a repair waiting for its run, never stranded (2026-10-14)", () => {
+    // The marker lands at the handback, before any agent run exists. Sweeping
+    // it would observe-comment every repair in the seconds before it starts.
+    const items: Item[] = [
+      { id: "i1", issueNumber: 3290, labels: ["orchestrator:recovery-priority", "wip:repair"], status: "In Development" },
+      { id: "i2", issueNumber: 3291, labels: ["orchestrator:repairing"], status: "In Development" },
+    ];
+    assert.deepEqual(selectStrandedWipCandidates(items), []);
+  });
+
+  test("wip:repair is never stripped while its repair run is in flight, and goes with a stranded run label (2026-10-14)", () => {
+    const items: Item[] = [
+      { id: "i1", issueNumber: 3290, labels: ["wip:builder", "wip:repair"], status: "In Development" },
+    ];
+    assert.deepEqual(selectStrandedWipCandidates(items, new Set(["builder#3290"])), [], "the run is alive");
+    assert.deepEqual(selectStrandedWipCandidates(items, new Set(["repair#3290"])).map((x) => x.issueNumber), [3290],
+      "the marker's name is not an agent run");
+    const [stranded] = selectStrandedWipCandidates(items);
+    const minAge = 120 * 60_000, now = new Date("2026-10-14T12:00:00Z").getTime();
+    assert.deepEqual(stranded.wipLabels, ["wip:builder", "wip:repair"], "a crash leaves both, and both are stripped together");
+    const a = decideStrandedWip({ issueNumber: 3290, wipLabels: stranded.wipLabels, markers: { observedAt: new Date(now - 3 * minAge), sweptAt: null }, minAgeMs: minAge, now });
+    assert.deepEqual(a, { kind: "strip", issueNumber: 3290, labelsToStrip: ["wip:builder", "wip:repair"] });
   });
 
   test("Done column is left to the Done cleanup", () => {

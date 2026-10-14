@@ -465,7 +465,7 @@ export class WorkflowPublisher {
             (issue.comments?.nodes ?? [])
               .filter(
                 (c: any) =>
-                  !/^(<!-- (?:fleet-recovery|family-dispatch|stranded-wip|auto-retry)|## Orchestrator recovery)/.test(
+                  !/^(<!-- (?:fleet-recovery|family-dispatch|stranded-wip|auto-retry|pyry-repair-start)|## Orchestrator recovery)/.test(
                     c.body ?? "",
                   ),
               )

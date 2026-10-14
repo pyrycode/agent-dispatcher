@@ -181,6 +181,10 @@ export class ManagedDispatch {
     }
     return pending;
   }
+  /** This computer's name in the fleet, or undefined until the first sync has named it. */
+  get machine(): string | undefined {
+    return (this.state as FleetSnapshot & { machine?: string }).machine;
+  }
   /** Null until the first sync has named this computer. */
   codegraphOffer(): Pending | null {
     const machine = (this.state as FleetSnapshot & { machine?: string }).machine;

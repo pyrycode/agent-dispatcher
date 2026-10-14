@@ -979,7 +979,8 @@ test("bridge mutation responses carry only the fields the caller selected", asyn
 
 const PRIORITY = "orchestrator:recovery-priority",
   LEGACY = "orchestrator:fixing",
-  REPAIRING = "orchestrator:repairing";
+  REPAIRING = "wip:repair",
+  LEGACY_REPAIRING = "orchestrator:repairing";
 const events = (path: string, ticket: string) => {
   const db = new DatabaseSync(path);
   try {
@@ -1022,6 +1023,41 @@ test("the saved fixing label migrates once at central start, keeps the old name 
   assert.deepEqual(restarted.workflow.get("org/mobile#1947").labels, ["rework-count:2", PRIORITY]);
   assert.deepEqual(restarted.workflow.get("org/mobile#1948").labels, [PRIORITY]);
 });
+test("the saved orchestrator:repairing marker becomes wip:repair once at central start and is recorded", (t) => {
+  const { store, path } = fixture(t);
+  store.workflow.import(config, [
+    { ...item(1947), labels: [PRIORITY, LEGACY, LEGACY_REPAIRING, "wip:builder"] },
+    { ...item(1948), labels: [PRIORITY, REPAIRING] },
+    { ...item(1949), labels: [LEGACY_REPAIRING, REPAIRING] },
+    { ...item(1950), labels: ["priority:high"] },
+  ]);
+  const open = () => {
+    const s = new FleetStore(path, { mac: { heavyLimit: 2, combinedLimit: 2 } });
+    t.after(() => s.close());
+    return s;
+  };
+  const started = open();
+  assert.deepEqual(started.workflow.get("org/mobile#1947").labels, [PRIORITY, LEGACY, "wip:builder", REPAIRING]);
+  assert.deepEqual(started.workflow.get("org/mobile#1948").labels, [PRIORITY, REPAIRING], "already migrated");
+  assert.equal(started.workflow.get("org/mobile#1948").revision, 1);
+  assert.deepEqual(started.workflow.get("org/mobile#1949").labels, [REPAIRING], "a ticket with both names keeps one");
+  assert.equal(started.workflow.get("org/mobile#1950").revision, 1);
+  assert.deepEqual(events(path, "org/mobile#1947"), [
+    { actor: "migration:wip-repair", change: JSON.stringify({ addLabels: [REPAIRING], removeLabels: [LEGACY_REPAIRING] }) },
+  ]);
+  const restarted = open();
+  assert.equal(restarted.workflow.migrateRepairing(), 0, "a converged store changes nothing");
+  assert.equal(events(path, "org/mobile#1947").length, 1);
+});
+test("wip:repair does not lock the repair run out of admission, and any other wip label still does", (t) => {
+  const { store } = fixture(t);
+  store.workflow.import(config, [{ ...item(1947), status: "In Development", labels: [PRIORITY, REPAIRING] }]);
+  const ticket = "org/mobile#1947";
+  store.workflow.change(ticket, { addLabels: ["wip:verifier"] }, "mac:s", "other-wip");
+  assert.deepEqual(store.start({ ...run("blocked"), role: "builder", ticket }), { ok: false, reason: "locked" });
+  store.workflow.change(ticket, { removeLabels: ["wip:verifier"] }, "mac:s", "other-wip-gone");
+  assert.equal(store.start({ ...run("repair"), role: "builder", ticket }).ok, true, "the assigned run starts while the marker waits");
+});
 test("the repairing marker lasts from the handback until the assigned run ends, including an interrupted run", (t) => {
   const { store } = fixture(t);
   store.workflow.import(config, [item(1947), item(1950)]);
@@ -1054,6 +1090,27 @@ test("the repairing marker lasts from the handback until the assigned run ends, 
   store.workflow.change("org/mobile#1947", { addLabels: [REPAIRING] }, "mac:s", "second-handback");
   assert.deepEqual(store.workflow.settleRepairing(config.project), []);
   assert.ok(labels("org/mobile#1947").includes(REPAIRING));
+});
+test("a legacy marker migrated while its run is live still settles when the run ends, under the new name", (t) => {
+  const { store } = fixture(t);
+  store.workflow.import(config, [item(1947)]);
+  const ticket = "org/mobile#1947";
+  store.workflow.change(ticket, { addLabels: [PRIORITY, LEGACY, LEGACY_REPAIRING] }, "mac:s", "old-handback");
+  store.start({ ...run("legacy"), role: "builder", ticket });
+  store.workflowChange("mac", "s", "legacy", ticket, { addLabels: ["wip:builder"] }, "claim-legacy");
+  assert.equal(store.workflow.migrateRepairing(), 1, "central restart while the run is live");
+  assert.ok(store.workflow.get(ticket).labels.includes(REPAIRING));
+  assert.deepEqual(store.workflow.settleRepairing(config.project), [], "still running");
+  store.finish("mac", "s", "legacy");
+  assert.deepEqual(store.workflow.settleRepairing(config.project), [ticket], "the migration is not a new assignment");
+  assert.ok(!store.workflow.get(ticket).labels.includes(REPAIRING));
+  // A leftover old name from an older dispatcher settles too.
+  store.workflow.change(ticket, { addLabels: [LEGACY_REPAIRING] }, "mac:s", "old-handback-2");
+  store.start({ ...run("legacy2"), role: "builder", ticket });
+  store.workflowChange("mac", "s", "legacy2", ticket, { addLabels: ["wip:builder"] }, "claim-legacy2");
+  store.finish("mac", "s", "legacy2");
+  assert.deepEqual(store.workflow.settleRepairing(config.project), [ticket]);
+  assert.ok(!store.workflow.get(ticket).labels.includes(LEGACY_REPAIRING));
 });
 test("the publisher settles repair markers and creates the recovery labels with their colour and description", async (t) => {
   const { store } = fixture(t);

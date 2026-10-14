@@ -1,3 +1,4 @@
+import { isRepairWip } from "./recovery-labels.js";
 import { WorkflowStore, type WorkflowChange } from "./workflow-store.js";
 // The one authority for fleet ownership. No heartbeat expires a claim or run.
 // Keep this file on the claim server's local disk, never on a shared filesystem.
@@ -397,7 +398,7 @@ export class FleetStore {
     if(this.workflow.enabled(req.project) && /#[1-9]\d*$/.test(req.ticket)) {
       const item=this.workflow.get(req.ticket);
       const columns:Record<string,string>={po:'Backlog',refiner:'Backlog',architect:'In Architecture',developer:'In Development',builder:'In Development',qa:'In QA','code-review':'In Code Review',verifier:'In Code Review',documentation:'In Documentation'};
-      if(columns[req.role] && (item.state!=='OPEN' || item.status!==columns[req.role] || item.labels.some(l=>l.startsWith('error:')||l.startsWith('needs-rework:')||l.startsWith('wip:')||l.startsWith('needs-human:')&&l!=='needs-human:sizing') || item.blockedBy.some(b=>b.state==='OPEN'))) return {ok:false,reason:'locked'};
+      if(columns[req.role] && (item.state!=='OPEN' || item.status!==columns[req.role] || item.labels.some(l=>l.startsWith('error:')||l.startsWith('needs-rework:')||(l.startsWith('wip:')&&!isRepairWip(l))||l.startsWith('needs-human:')&&l!=='needs-human:sizing') || item.blockedBy.some(b=>b.state==='OPEN'))) return {ok:false,reason:'locked'};
     }
     if(/#[1-9]\d*$/.test(req.ticket) && req.role!=='recovery') {
       const required=this.requiredRepairs()[req.ticket]??[];
