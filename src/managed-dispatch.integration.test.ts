@@ -297,8 +297,9 @@ test("a drain releases idle grants, including reconcile's project lock, and leav
   let started!: () => void;
   const starting = new Promise<void>(resolve => { started = resolve; });
   let activeRun: Promise<unknown> | undefined;
-  t.after(async () => { release(); await activeRun; await managed.stop(); await close(managerServer); await close(claimsServer); store.close(); });
-  await managed.start();
+  t.after(async () => { release(); await activeRun?.catch(() => {}); await managed.stop(); await close(managerServer); await close(claimsServer); store.close(); });
+  // Syncs are driven by hand here: the 2 s timer would make a manual sync return early.
+  await managed.sync();
   const reconcileLocked = () => store.snapshot().runs.some(run => run.locks.includes("org/core:reconcile"));
 
   // A long run is in flight.
@@ -331,10 +332,12 @@ test("a drain releases idle grants, including reconcile's project lock, and leav
   await other.finish("linux-session", "linux-reconcile", true);
 
   // Work offered during the drain, such as a failed run's recovery successor, is not granted here.
+  // Checked right after the manager's tick: a grant that a later sync released would still have held its place meanwhile.
   const late = managed.offer(3, "recovery", "heavy", [], -4);
-  await manager.tick(); await managed.sync();
+  await managed.sync(); await manager.tick();
+  assert.deepEqual(store.snapshot().runs.map(run => run.ticket), ["org/core#1"], "the late offer was never published");
+  await managed.sync();
   assert.equal(managed.ready(late), false);
-  assert.deepEqual(store.snapshot().runs.map(run => run.ticket), ["org/core#1"]);
 
   // The run in flight is undisturbed and finishes as completed.
   assert.equal(managed.ready(active), false);
@@ -353,14 +356,39 @@ test("a grant reaching a draining dispatcher is released by its next sync", asyn
   const managerServer = await serveManager(manager, { "org/core": "project-test" }, "operator-test", 0);
   const managed = new ManagedDispatch("org/core", { PYRY_MANAGER_URL: url(managerServer), PYRY_MANAGER_TOKEN: "project-test" });
   t.after(async () => { await managed.stop(); await close(managerServer); await close(claimsServer); store.close(); });
-  await managed.start();
+  await managed.sync();
   managed.beginCycle();
   const reconcile = managed.offer("@reconcile", "reconcile", "light", ["org/core:reconcile"], -3);
   await managed.endCycle(); await manager.tick(); await managed.sync();
   assert.equal(managed.ready(reconcile), true);
-  // The manager's drain flag, or a failed drain(), leaves the grant for the timer.
-  managed.draining = true;
+  // The manager's own drain flag reaches the dispatcher through its next sync.
+  manager.draining = true;
   await managed.sync();
+  assert.equal(managed.draining, true);
   assert.deepEqual(store.snapshot().runs, [], "the idle grant is released as unused");
   assert.equal(managed.ready(reconcile), false);
+});
+
+test("a grant left by a failed drain() is released by the next sync", async t => {
+  const store = new FleetStore(":memory:", { mac: { heavyLimit: 1, combinedLimit: 1 } });
+  const claimsServer = await serveFleet(store, { mac: "mac-test" }, "admin-test", 0);
+  const manager = new MachineManager({ machine: "mac", heavyLimit: 1, combinedLimit: 1, projects: ["org/core"] }, new FleetClient(url(claimsServer), "mac-test"));
+  const managerServer = await serveManager(manager, { "org/core": "project-test" }, "operator-test", 0);
+  const managed = new ManagedDispatch("org/core", { PYRY_MANAGER_URL: url(managerServer), PYRY_MANAGER_TOKEN: "project-test" });
+  t.after(async () => { await managed.stop(); await close(managerServer); await close(claimsServer); store.close(); });
+  await managed.sync();
+  managed.beginCycle();
+  const reconcile = managed.offer("@reconcile", "reconcile", "light", ["org/core:reconcile"], -3);
+  await managed.endCycle(); await manager.tick(); await managed.sync();
+  assert.equal(managed.ready(reconcile), true);
+  // drain() marks the dispatcher draining before it calls the manager, so a failed call still leaves it draining.
+  const replace = managed.connection.call.bind(managed.connection);
+  managed.connection.call = (async (path: string, body?: unknown) => {
+    if (path === "/replace") throw new Error("manager unreachable");
+    return replace(path, body);
+  }) as typeof managed.connection.call;
+  await assert.rejects(managed.drain(), /manager unreachable/);
+  assert.equal(store.snapshot().runs.length, 1, "the failed drain left the grant in place");
+  await managed.sync();
+  assert.deepEqual(store.snapshot().runs, [], "the timer's sync releases it");
 });
