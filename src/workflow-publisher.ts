@@ -3,6 +3,7 @@ import type { FleetStore } from "./fleet-store.js";
 import type { GitHubBroker, GitHubRequest } from "./github-broker.js";
 import type { WorkflowProject, WorkflowItem } from "./workflow-store.js";
 import { WorkflowGitHub } from "./workflow-github.js";
+import { RECOVERY_LABEL_DEFINITIONS } from "./recovery-labels.js";
 
 type GraphQLError = { message?: string; path?: Array<string | number> };
 
@@ -119,6 +120,8 @@ export class WorkflowPublisher {
     const state = this.store.snapshot(),
       escalated = new Set(this.store.recovery.escalatedTickets());
     for (const config of configs)
+      this.store.workflow.settleRepairing(config.project);
+    for (const config of configs)
       for (const item of this.store.workflow.list(config.project)) {
         const ticket = `${config.project}#${item.issueNumber}`,
           claim = state.claims.find((c) => c.ticket === ticket);
@@ -218,7 +221,11 @@ export class WorkflowPublisher {
         await this.call(project, {
           method: "POST",
           path: `/repos/${project}/labels`,
-          body: JSON.stringify({ name, color: "ededed" }),
+          body: JSON.stringify(
+            RECOVERY_LABEL_DEFINITIONS[name]
+              ? { name, ...RECOVERY_LABEL_DEFINITIONS[name] }
+              : { name, color: "ededed" },
+          ),
         });
         labels = await this.compatibility.labels(project, true);
       }

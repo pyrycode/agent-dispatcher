@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { config } from "dotenv";
 import { githubPauseMs, freshGitHubRead } from "./github-transport.js";
 import { decidePollFailure, newPollOutage, pollRecovered, transientPollFailure } from "./poll-failure.js";
-import { runRecoveryWork, recoveryHandoff, parseRecoveryDecision, RECOVERY_INSTRUCTIONS, RECOVERY_EFFORT, RECOVERY_MAX_TURNS, RECOVERY_TIMEOUT_MS, cleanRecoveryLabels } from "./recovery-work.js";
+import { runRecoveryWork, recoveryHandoff, parseRecoveryDecision, RECOVERY_INSTRUCTIONS, RECOVERY_EFFORT, RECOVERY_MAX_TURNS, RECOVERY_TIMEOUT_MS, cleanRecoveryLabels, RECOVERY_REPAIRING } from "./recovery-work.js";
 import { verifyCoordination } from "./recovery-coordination.js";
 import { recoveryInventory, relatedTickets, relatedEvidence } from "./recovery-evidence.js";
 import { recoveryLogContext } from "./recovery-context.js";
@@ -8588,6 +8588,13 @@ export async function runConcurrentDispatches(
       } catch (error: any) {
         console.error(`Error dispatching ${agent.name} on #${item.issueNumber}: ${error.message}`);
       } finally {
+        // This run was the repair the orchestrator assigned. Recovery priority
+        // stays; only the marker for the repair run itself ends here. The
+        // central store removes a marker this write leaves behind.
+        if (item.labels.includes(RECOVERY_REPAIRING)) {
+          try { await client.removeLabel(item.issueNumber, RECOVERY_REPAIRING); }
+          catch (e) { warnOnceCleanup(item.issueNumber, RECOVERY_REPAIRING, "post-dispatch removeLabel", e); }
+        }
         try {
           await client.removeLabel(item.issueNumber, wipLabel);
         } catch (e) {

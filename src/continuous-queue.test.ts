@@ -113,7 +113,7 @@ test('completion queues a fresh error before the next admission, without retirin
 });
 
 test('a repair in progress does not requeue historical review counts', () => {
-  const observation = { ticket: `${mobile}#2009`, status: 'In Build', blocked: false, labels: ['rework-count:2', 'orchestrator:fixing'] };
+  const observation = { ticket: `${mobile}#2009`, status: 'In Build', blocked: false, labels: ['rework-count:2', 'orchestrator:recovery-priority'] };
   assert.equal(recoveryTrigger(observation), null);
   assert.equal(recoveryTrigger({ ...observation, labels: [...observation.labels, 'error:builder'] })?.reason, 'error:builder');
 });

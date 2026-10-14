@@ -2,9 +2,9 @@ import { recoveryFingerprint, recoveryTrigger, hasOperatorHold, canInspectUnknow
 import type { AgentConfig, ProjectItem } from "./types.js";
 import { AUTO_RETRY_RESET_COMMENT_MARKER } from "./pipeline-decisions.js";
 import { githubPauseMs } from "./github-transport.js";
+import { RECOVERY_INVESTIGATING, RECOVERY_REPAIRING, RECOVERY_ASSIGNMENT_LABELS, RECOVERY_PRIORITY_LABELS, hasRecoveryPriority, recoveryAssignmentLabels } from "./recovery-labels.js";
 
-export const RECOVERY_INVESTIGATING = "orchestrator:investigating";
-export const RECOVERY_FIXING = "orchestrator:fixing";
+export { RECOVERY_INVESTIGATING, RECOVERY_PRIORITY, RECOVERY_REPAIRING, LEGACY_RECOVERY_PRIORITY } from "./recovery-labels.js";
 
 export const RECOVERY_MARKER = "<!-- fleet-recovery:";
 export const RECOVERY_EFFORT = "xhigh";
@@ -123,7 +123,7 @@ export async function runRecoveryWork(incident: RecoveryIncident, deps: Recovery
     return;
   }
   const issue = Number(incident.ticket.split("#")[1]);
-  let fixing = false;
+  const assigned: string[] = [];
   let handedOff = false;
   let escalated = false;
   let deciding = false;
@@ -160,9 +160,9 @@ export async function runRecoveryWork(incident: RecoveryIncident, deps: Recovery
     decision = await deps.decide(decision);
     escalated = decision.action === "escalate";
     const plan = recoveryPlan(item, decision, deps.agents);
-    if (["retry", "rework", "resume", "refine", "unblock", "coordinate"].includes(decision.action)) {
-      fixing = true; // Even a lost acknowledgement can have applied the label.
-      await deps.addLabel(issue, RECOVERY_FIXING);
+    for (const label of recoveryAssignmentLabels(decision.action)) {
+      assigned.push(label); // Even a lost acknowledgement can have applied the label.
+      await deps.addLabel(issue, label);
     }
     await deps.comment(item.issueNumber, `${RECOVERY_MARKER}${incident.id} -->\n${decision.retryReset ? `${AUTO_RETRY_RESET_COMMENT_MARKER}\n` : ""}## Orchestrator recovery\n\nAction: ${decision.action}\n\n${decision.reason}${decision.retryReset ? `\n\nOrdinary retry count reset finding: ${decision.retryReset}` : ""}`);
     if (plan.unblock) {
@@ -172,7 +172,7 @@ export async function runRecoveryWork(incident: RecoveryIncident, deps: Recovery
     if (plan.status) await deps.move(item.id, plan.status);
     // Keep the error until the very end so interrupted handbacks cannot launch halfway through.
     for (const label of plan.remove.sort((a, b) => Number(a.startsWith("error:")) - Number(b.startsWith("error:")))) await deps.removeLabel(item.issueNumber, label);
-    handedOff = fixing;
+    handedOff = assigned.length > 0;
     await deps.complete();
     if (decision.action !== "wait") await deps.notify(`${incident.ticket}: recovery ${decision.action}. ${decision.reason}`);
   } catch (error) {
@@ -186,18 +186,26 @@ export async function runRecoveryWork(incident: RecoveryIncident, deps: Recovery
     });
   } finally {
     // A failed cleanup is retried by owned, idle-ticket reconciliation next cycle.
-    for (const label of [RECOVERY_INVESTIGATING, ...(escalated || fixing && !handedOff ? [RECOVERY_FIXING] : [])]) {
+    for (const label of [RECOVERY_INVESTIGATING, ...(escalated ? RECOVERY_ASSIGNMENT_LABELS : handedOff ? [] : assigned)]) {
       try { await deps.removeLabel(issue, label); }
       catch { console.warn(`${incident.ticket}: recovery label cleanup deferred for ${label}`); }
     }
   }
 }
 
-/** Called only for owned tickets without any active run, under reconciliation admission. */
+/**
+ * Called only for owned tickets without any active run, under reconciliation
+ * admission. Recovery priority and the repairing marker end at Done, Halted,
+ * an operator hold or a new error. A repairing marker without priority is left
+ * over from an ended repair. The central store also removes a repairing marker
+ * once its repair run has started and no run remains active.
+ */
 export async function cleanRecoveryLabels(items: readonly ProjectItem[], remove: (issue: number, label: string) => Promise<void>): Promise<void> {
   for (const item of items) {
     const stop = ["Done", "Halted"].includes(item.status) || hasOperatorHold(item.labels) || item.labels.some(l => l.startsWith("error:"));
-    for (const label of item.labels.filter(l => l === RECOVERY_INVESTIGATING || l === RECOVERY_FIXING && stop
+    for (const label of item.labels.filter(l => l === RECOVERY_INVESTIGATING
+      || (RECOVERY_PRIORITY_LABELS.includes(l) || l === RECOVERY_REPAIRING) && stop
+      || l === RECOVERY_REPAIRING && !hasRecoveryPriority(item.labels)
       || l === RECOVERY_RETURNED_INBOX && item.status !== "Inbox")) {
       await remove(item.issueNumber, label);
       item.labels = item.labels.filter(l => l !== label);
