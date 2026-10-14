@@ -4,6 +4,7 @@ import { timingSafeEqual } from "node:crypto";
 import { chmodSync } from "node:fs";
 import type { GitHubBroker, GitHubRequest, GitHubResponse } from "./github-broker.js";
 import {publishRepair} from "./recovery-repair-publication.js";
+import {loadRepairBase,RepairBaseUnavailable,RepairRefusal} from "./recovery-source-publication.js";
 import type { Claim, FleetStore, FleetSnapshot, StartRequest, StartResult } from "./fleet-store.js";
 
 export async function readJson(req: IncomingMessage, maxBytes = 1024 * 1024): Promise<any> {
@@ -119,12 +120,23 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
       }
       if(req.url==='/tasks/prepare-repair') {
         if(!isAdmin&&!machine) return send(403,{error:'Configured repair executor required'});
-        return send(200,store.prepareRepair(isAdmin?body.machine:machine!,body.id,body.session,body.publication));
+        const actor=isAdmin?body.machine:machine!;
+        // Credential shapes are judged on the lines the repair changes, so read
+        // the base it was built on. Without GitHub every line counts as new.
+        let base:Record<string,string|null>|undefined;
+        let task;try{task=typeof body.id==='string'?store.tasks.get(body.id):undefined;}catch{task=undefined;}
+        const files=body.publication?.files;
+        if(github&&repairRepository&&task&&task.machine===actor&&task.session===body.session&&['running','attention'].includes(task.state)
+          &&task.request.recipe==='dispatcher-repair'&&task.request.revision&&files&&typeof files==='object'&&!Array.isArray(files)&&Object.keys(files).length<=100)
+          base=await loadRepairBase(github,repairRepository,task.request.revision,Object.keys(files));
+        return send(200,store.prepareRepair(actor,body.id,body.session,body.publication,base));
       }
       if (req.url === '/tasks/publish-repair') {
         if ((!isAdmin&&!machine) || !github || !repairRepository) return send(403,{error:'Configured repair authority required'});
         const task=store.tasks.get(body.id);
         if(task.machine!==(isAdmin?body.machine:machine) || task.session!==body.session) return send(403,{error:'Task actor mismatch'});
+        // Only a prepared repair publishes, so every published byte passed the source scan.
+        if(task.state!=='publishing') return send(409,{error:'Repair must be prepared before publication'});
         let work=repairWrites.get(task.id);
         if(!work) {
           work=publishRepair(github,repairRepository,task,body.publication,repairConsumers,sha=>{store.controlTarget(sha);return store.controlsReady(sha,controlRevision);}).finally(()=>repairWrites.delete(task.id));
@@ -231,6 +243,10 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
       }
       return send(404, { error: "Unknown operation" });
     } catch (error) {
+      // A refused publication is final for those bytes; the caller ends the task.
+      // An unreadable base is temporary; the caller retries later.
+      if (error instanceof RepairRefusal) return send(422, { error: error.message, refused: true });
+      if (error instanceof RepairBaseUnavailable) return send(503, { error: error.message });
       send(409, { error: error instanceof Error ? error.message : "Operation failed" });
     }
   });
@@ -251,7 +267,8 @@ export class JsonClient {
     } else if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("Invalid service connection");
   }
   async call<T>(path: string, body?: unknown): Promise<T> {
-    const timeoutMs = path === "/tasks/publish-repair" ? 120_000 : path === "/github" || path === "/workflow/file" ? 60_000 : 10_000;
+    // Preparation reads the repair's base from GitHub and scans it twice.
+    const timeoutMs = path === "/tasks/publish-repair" || path === "/tasks/prepare-repair" ? 120_000 : path === "/github" || path === "/workflow/file" ? 60_000 : 10_000;
     if (this.socketPath) return new Promise<T>((resolve, reject) => {
       const req = request({ socketPath: this.socketPath, path, method: body === undefined ? "GET" : "POST",
         headers: { Authorization: `Bearer ${this.token}`, "Content-Type": "application/json" },

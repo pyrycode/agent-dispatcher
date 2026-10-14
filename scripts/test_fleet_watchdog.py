@@ -280,10 +280,12 @@ class FinishedButRefused(unittest.TestCase):
             f.adapter.operator_command = lambda *args: [str(operator), *args]
             del f.support.rpc
             running = []
-            with patch.object(m, 'process_snapshot', return_value={}), self.assertRaises(m.ServiceRefusal) as caught:
+            # The record-local pass error keeps the typed refusal as its cause.
+            with patch.object(m, 'process_snapshot', return_value={}), self.assertRaises(m.PublicationPassError) as caught:
                 f.support.receipt_pass('pyrybox', receipt, running)
-            self.assertEqual((caught.exception.operation, caught.exception.status), ('prepare-repair', 409))
-            self.assertEqual(caught.exception.detail, DETAIL)
+            refusal = m.service_refusal(caught.exception)
+            self.assertEqual((refusal.operation, refusal.status), ('prepare-repair', 409))
+            self.assertEqual(refusal.detail, DETAIL)
 
 class DeadOrSilentWorkers(unittest.TestCase):
     """#3247 and #1809: repair workers that died, and live workers that went quiet."""

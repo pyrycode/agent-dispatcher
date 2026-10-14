@@ -878,3 +878,167 @@ class NativeTaskDuringDrainTests(unittest.TestCase):
    self.assertLessEqual((folder/'started.json').stat().st_mtime_ns,(folder/'result.json').stat().st_mtime_ns)
 
 if __name__=='__main__':unittest.main()
+
+REPAIR='58915c353ee70b722a335cd603c0d2c22439bc70bbdd083a50bc1da8b686d84e'
+REFUSED='Service 422: {"error":"Repair contains credential-shaped text; retain it privately","refused":true}\n'
+
+class PublicationRefusalTests(unittest.TestCase):
+ """Modelled on pyrybox, 2026-10-14: the pyrycode/pyrycode#3289 dispatcher repair passed
+ full checks and independent review at 09:31:47, then the authority refused its
+ publication as credential-shaped on every pass. Nothing ended the task, so it held
+ pyrybox's only heavy place for about three hours."""
+ def support(self,d,replies):
+  state={'machine':'pyrybox','draining':False,'runs':[]}
+  class Adapter:
+   def status(self):return state
+   def operator_command(self,*args):return ['operator',*args]
+  route={'capability':'dispatcher-repair','container':'core','directory':d+'/work','containerDirectory':'/work','paths':{}}
+  s=m.SupportSupervisor(Adapter(),{'stateDirectory':d,'projects':{'org/core':{'container':'core'}},
+                                    'recoveryTasks':{'dispatcher-repair:dispatcher-repair':route}})
+  logged=[];s.housekeeping=lambda kind,subject,reason:logged.append((kind,subject,reason))
+  calls=[]
+  def rpc(op,body):
+   calls.append((op,body))
+   reply=replies.get(op)
+   if isinstance(reply,list):reply=reply.pop(0) if reply else None
+   if isinstance(reply,Exception):raise reply
+   if callable(reply):return reply(op,body)
+   return [] if op=='schedule' else reply if reply is not None else {}
+  s.rpc=rpc
+  work=Path(d)/'work'/REPAIR;work.mkdir(parents=True)
+  publication=json.dumps({'files':{'src/dispatch.ts':'patched'},'message':'Fix dispatcher recovery for pyrycode/pyrycode#3289','review':'PASS','checksPassed':True})
+  (work/'publication.json').write_text(publication)
+  (work/'result.json').write_text(json.dumps({'outcome':'completed','summary':'Dispatcher patch passed full checks and independent review. Publication is prepared for the existing fleet authority.','files':{'publication.json':publication}}))
+  receipt=s.directory/(REPAIR+'.receipt.json')
+  # The exact receipt shape on pyrybox: worker exited normally and drained.
+  m.atomic(receipt,{'id':REPAIR,'session':'d140fab3c09646489abec737e2abade7','phase':'running','result':str(work/'result.json'),
+                    'container':'core','directory':str(work),'containerDirectory':'/work/'+REPAIR,'pid':3412049,
+                    'custody':{'root':{'pid':3412049,'identity':'x'},'owned':{},'phase':'drained'},'drainConfirmed':True})
+  return s,calls,logged,receipt,work
+
+ def test_refused_publication_ends_the_task_as_failed_once_and_keeps_the_patch(self):
+  with tempfile.TemporaryDirectory() as d:
+   s,calls,logged,receipt,work=self.support(d,{'prepare-repair':m.rpc_failure('prepare-repair',1,REFUSED)})
+   first=s.tick();second=s.tick()
+   ops=[op for op,_ in calls]
+   self.assertEqual(ops.count('prepare-repair'),1,'a definitive refusal is never asked again')
+   self.assertNotIn('publish-repair',ops)
+   completes=[body for op,body in calls if op=='complete']
+   self.assertEqual(len(completes),1)
+   result=completes[0]['result']
+   self.assertEqual(result['outcome'],'failed');self.assertEqual(result['files'],{})
+   self.assertIn('Repair contains credential-shaped text; retain it privately',result['summary'])
+   self.assertIn(str(work),result['summary'])
+   saved=json.loads(receipt.read_text())
+   self.assertEqual(saved['phase'],'complete')
+   self.assertEqual(saved['publicationRefused']['result'],result)
+   # The reviewed patch stays on the host; nothing returned it to the authority.
+   self.assertTrue((work/'publication.json').is_file())
+   self.assertNotIn('artifacts-begin',ops)
+   self.assertEqual([k for k,_,_ in logged],['native-task-publication-refused'])
+   self.assertIn('reservation released',logged[0][2])
+   # Record-local: new work is still offered on this host, and nothing stays running.
+   self.assertEqual(ops.count('schedule'),2)
+   self.assertEqual(first,[]);self.assertEqual(second,[])
+
+ def test_a_lost_release_retries_the_saved_result_without_asking_again(self):
+  with tempfile.TemporaryDirectory() as d:
+   s,calls,logged,receipt,work=self.support(d,{'prepare-repair':m.rpc_failure('prepare-repair',1,REFUSED),
+                                              'complete':[m.rpc_failure('complete',1,'fetch failed'),{}]})
+   entries=s.tick()
+   self.assertEqual([e['phase'] for e in entries],['error'])
+   self.assertIn('call complete failed without a service reply',entries[0]['reason'])
+   self.assertEqual(json.loads(receipt.read_text())['phase'],'running')
+   self.assertIn('schedule',[op for op,_ in calls],'a release failure is local to the record')
+   s.tick()
+   completes=[body['result'] for op,body in calls if op=='complete']
+   self.assertEqual(len(completes),2);self.assertEqual(completes[0],completes[1])
+   self.assertEqual([op for op,_ in calls].count('prepare-repair'),1)
+   self.assertEqual(json.loads(receipt.read_text())['phase'],'complete')
+   self.assertEqual([k for k,_,_ in logged],['native-task-skipped','native-task-publication-refused'])
+
+ def test_temporary_publication_failures_back_off_and_keep_the_reservation(self):
+  with tempfile.TemporaryDirectory() as d:
+   published={'url':'https://github.com/org/agent-dispatcher/pull/9','merged':True,'dispatcherSHA':'b'*40}
+   s,calls,logged,receipt,work=self.support(d,{
+    'prepare-repair':[m.rpc_failure('prepare-repair',1,'Service 503: {"error":"Repair base sources unavailable: HTTP 502"}'),
+                      m.rpc_failure('prepare-repair',1,'Error: fetch failed'),{},{}],
+    'publish-repair':published,
+    'artifacts-begin':artifact_reply,'artifacts-put':{},'artifacts-commit':{}})
+   now=1_000_000.0
+   with patch.object(m.time,'time',return_value=now):entries=s.tick()
+   self.assertEqual([e['phase'] for e in entries],['error'])
+   saved=json.loads(receipt.read_text())
+   self.assertEqual(saved['phase'],'running');self.assertNotIn('publicationRefused',saved)
+   self.assertEqual(saved['publicationRetry']['failures'],1);self.assertEqual(saved['publicationRetry']['next'],now+60)
+   self.assertIn('schedule',[op for op,_ in calls])
+   # Within the wait nothing is asked, and the report says when the next attempt is.
+   with patch.object(m.time,'time',return_value=now+30):entries=s.tick()
+   self.assertEqual([op for op,_ in calls].count('prepare-repair'),1)
+   self.assertEqual([(e['phase'],e['next']) for e in entries],[('publication-retry',now+60)])
+   self.assertEqual(len(logged),1);self.assertIn(REPAIR,s.reported_errors)
+   # A failure with no service reply is retried too, after twice the wait.
+   with patch.object(m.time,'time',return_value=now+61):s.tick()
+   saved=json.loads(receipt.read_text())
+   self.assertEqual(saved['publicationRetry']['failures'],2);self.assertEqual(saved['publicationRetry']['next'],now+61+120)
+   self.assertNotIn('complete',[op for op,_ in calls])
+   with patch.object(m.time,'time',return_value=now+200):s.tick()
+   saved=json.loads(receipt.read_text())
+   self.assertEqual(saved['phase'],'complete');self.assertNotIn('publicationRetry',saved)
+   self.assertEqual([op for op,_ in calls].count('publish-repair'),1)
+   # Each distinct failure is logged once, not again after each wait. Nothing was refused.
+   self.assertEqual([k for k,_,_ in logged],['native-task-skipped','native-task-skipped'])
+   self.assertIn('Service 503',logged[0][2]);self.assertIn('without a service reply',logged[1][2])
+
+ def test_retry_wait_is_capped(self):
+  with tempfile.TemporaryDirectory() as d:
+   s,calls,logged,receipt,work=self.support(d,{})
+   old=json.loads(receipt.read_text());old['publicationRetry']={'failures':12,'next':0}
+   with patch.object(m.time,'time',return_value=5000.0),self.assertRaises(m.PublicationPassError):
+    s.publication_retry(receipt,old,m.rpc_failure('publish-repair',1,'Service 503: {"error":"unavailable"}'))
+   self.assertEqual(json.loads(receipt.read_text())['publicationRetry']['next'],5000.0+1800)
+
+ def test_operator_errors_are_classified_from_the_service_line(self):
+  refused=m.rpc_failure('prepare-repair',1,'(node:1) warning\n'+REFUSED)
+  self.assertIsInstance(refused,m.ServiceRefusal)
+  self.assertEqual((refused.status,refused.refused),(422,True))
+  self.assertEqual(refused.message,'Repair contains credential-shaped text; retain it privately')
+  for detail,status in [('Service 409: {"error":"Prepared repair changed"}',409),('Service 422: {"error":"x"}',422),
+                        ('Service 503: {"error":"Repair base sources unavailable"}',503)]:
+   error=m.rpc_failure('prepare-repair',1,detail)
+   self.assertEqual(error.status,status);self.assertFalse(error.refused,detail)
+  for detail in ['fetch failed','']:self.assertNotIsInstance(m.rpc_failure('prepare-repair',1,detail),m.ServiceRefusal)
+
+ def test_a_definite_refusal_other_than_422_is_asked_again_each_pass(self):
+  # Left to the watchdog, which counts the same refusal on consecutive passes.
+  with tempfile.TemporaryDirectory() as d:
+   s,calls,logged,receipt,work=self.support(d,{'prepare-repair':m.rpc_failure('prepare-repair',1,'Service 409: {"error":"Repair actor mismatch"}')})
+   s.tick();s.tick()
+   self.assertEqual([op for op,_ in calls].count('prepare-repair'),2)
+   self.assertNotIn('publicationRetry',json.loads(receipt.read_text()))
+   self.assertEqual(s.refusals[REPAIR]['status'],409)
+   self.assertNotIn('complete',[op for op,_ in calls])
+
+ def test_repeated_temporary_failures_are_raised_for_attention_once(self):
+  with tempfile.TemporaryDirectory() as d:
+   s,calls,logged,receipt,work=self.support(d,{'prepare-repair':m.rpc_failure('prepare-repair',1,'Service 503: {"error":"Repair base sources unavailable: HTTP 502"}')})
+   now=1_000_000.0
+   for i in range(8):
+    old=json.loads(receipt.read_text());retry=old.get('publicationRetry')
+    if retry:now=retry['next']+1
+    with patch.object(m.time,'time',return_value=now):s.tick()
+   self.assertEqual([k for k,_,_ in logged].count('native-task-publication-stuck'),1)
+   self.assertEqual(json.loads(receipt.read_text())['publicationRetry']['failures'],8)
+   self.assertNotIn('complete',[op for op,_ in calls],'a failure that may clear never ends the task')
+   with patch.object(m.time,'time',return_value=now+1):entries=s.tick()
+   self.assertEqual(entries[0]['phase'],'attention')
+
+ def test_service_line_is_found_when_the_operator_writes_after_it(self):
+  error=m.rpc_failure('prepare-repair',1,REFUSED+'    at main (fleet-bin.ts:1)\nNode.js v24.13.0\n')
+  self.assertTrue(error.refused)
+  with tempfile.TemporaryDirectory() as d:
+   s,calls,logged,receipt,work=self.support(d,{});del s.rpc
+   class Done:returncode=1;stdout='';stderr=REFUSED
+   with patch.object(m.subprocess,'run',return_value=Done()),patch.object(m.sys,'stderr') as stream:
+    with self.assertRaises(m.ServiceRefusal):s.rpc('prepare-repair',{})
+   stream.write.assert_called_with(REFUSED)
