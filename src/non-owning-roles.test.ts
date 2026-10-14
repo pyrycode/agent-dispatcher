@@ -2,7 +2,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { FleetStore, NON_OWNING_ROLES, startsOwnership, type StartRequest } from "./fleet-store.js";
 import { scheduleMachine, type WorkOffer } from "./machine-scheduler.js";
-import type { RecoveryObservation } from "./fleet-recovery.js";
+import { DatabaseSync } from "node:sqlite";
+import { RecoveryLedger, RECOVERY_STALLED_RUN_MS, type RecoveryObservation } from "./fleet-recovery.js";
+import { RECOVERY_PRIORITY, RECOVERY_REPAIRING } from "./recovery-labels.js";
 
 // Decided 2026-10-14: recovery assessments and refinement start no ticket
 // ownership. Ownership starts with the first stage that makes local work.
@@ -185,4 +187,59 @@ test("a refined ticket's builder counts against the claim budget like any new ti
     offers: [offer(1), offer(2)], state: store.snapshot() });
   assert.deepEqual(selected.map(o => o.ticket), [`${project}#2`], "the refiner did not reserve the refined ticket");
   store.close();
+});
+
+test("a refined or repair-assigned Backlog ticket is still checked for stalls without a claim", () => {
+  const db = new DatabaseSync(":memory:"); let now = 1000;
+  const ledger = new RecoveryLedger(db, () => now);
+  const empty = { claims: [], runs: [] };
+  const backlog = (n: number, labels: string[]): RecoveryObservation => ({ ticket: `${project}#${n}`, status: "Backlog", labels, blocked: false });
+  const observed = [
+    backlog(1, []), // an ordinary Backlog wait
+    backlog(2, [RECOVERY_PRIORITY, RECOVERY_REPAIRING]), // a refine repair that never started
+    backlog(3, ["done:refiner", "needs-human:sizing"]), // refined, never built
+    backlog(4, ["done:po"]),
+  ];
+  assert.deepEqual(ledger.report("mac", project, observed, empty), []);
+  now += 24 * 3600000;
+  const incidents = ledger.report("mac", project, observed, empty);
+  assert.deepEqual(incidents.map(i => [i.ticket, i.state, i.reason]).sort(), [2, 3, 4].map(n => [`${project}#${n}`, "queued", "No workflow progress for 24 hours"]));
+  db.close();
+});
+
+test("only the computer running an unowned ticket's job raises its retained-run alert", () => {
+  const store = new FleetStore(":memory:", limits);
+  assert.equal(store.start(start("refine", "refiner")).ok, true);
+  const fleet = store.snapshot();
+  store.close();
+  const db = new DatabaseSync(":memory:"); let now = fleet.runs[0].created;
+  const ledger = new RecoveryLedger(db, () => now);
+  const backlog: RecoveryObservation = { ticket, status: "Backlog", labels: [], blocked: false };
+  ledger.report("linux", project, [backlog], fleet);
+  ledger.report("mac", project, [backlog], fleet);
+  now += RECOVERY_STALLED_RUN_MS;
+  assert.deepEqual(ledger.report("linux", project, [backlog], fleet), [], "linux cannot inspect mac's processes");
+  const [alert] = ledger.report("mac", project, [backlog], fleet);
+  assert.equal(alert?.state, "escalated");
+  assert.equal(alert?.runId, "refine");
+  db.close();
+});
+
+test("other writers stay out while a non-owning run holds an unowned ticket, and an unused one leaves a legacy owner alone", () => {
+  const store = new FleetStore(":memory:", limits);
+  assert.equal(store.start(start("refine", "refiner")).ok, true);
+  assert.equal(store.start(start("gate", "real-claude-gate", { ticket: `${project}#5` })).ok, true);
+  assert.throws(() => store.authorize("mac", "session", ticket, "gate"), /active run/, "another run cannot write it as a follow-up");
+  assert.equal(store.start({ ...start("reconcile", "reconcile", { ticket: `${project}#@reconcile`, locks: [`${project}:reconcile`] }), resource: "light" }).ok, true);
+  assert.throws(() => store.authorize("mac", "session", ticket, "reconcile"), /active run/, "housekeeping cannot write the running ticket");
+  store.close();
+  // An unused reservation on an owned ticket keeps the owner, whatever the role.
+  const owned = new FleetStore(":memory:", limits);
+  owned.start(start("builder", "builder"));
+  owned.finish("mac", "session", "builder");
+  const [owner] = owned.snapshot().claims;
+  assert.equal(owned.start(start("refine", "refiner")).ok, true);
+  owned.finish("mac", "session", "refine", false, true);
+  assert.deepEqual(owned.snapshot().claims, [owner]);
+  owned.close();
 });

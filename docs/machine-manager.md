@@ -223,8 +223,16 @@ assessment of a ticket its computer already owns runs under that claim and
 leaves it unchanged; an assessment cannot run on a ticket another computer owns.
 The assessment's evidence inventory is shared through the authority, but its
 log excerpts are read from the assessing computer. The run that hit an error
-publishes its follow-up assessment offer before freeing its place, so that
-computer normally assesses its own failure.
+publishes its follow-up assessment offer before freeing its place. On an
+unclaimed ticket, such as one whose refiner failed, another computer can still
+win that assessment; it then sees the GitHub comments and the evidence
+inventory, but not the failed run's log excerpts. A coordinated repair task
+whose ticket is unclaimed ranks with unclaimed work, not owned work. Only the
+computer running a job raises the three-hour retained-reservation alert for it.
+A Backlog ticket counts as started for the 24-hour no-progress check when it
+is owned, has a running label or the repair marker, carries recovery priority,
+or has finished refinement (`done:refiner` or `done:po`). An ordinary Backlog
+wait stays quiet.
 An earlier claim whose ownership generation contains only completed read-only
 assessments or explicitly unused reservations is still released when a
 confirmed completed assessment says `wait`. Any implementation run, uncertain

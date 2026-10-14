@@ -3,7 +3,7 @@ import type { DatabaseSync } from "node:sqlite";
 import type { FleetSnapshot } from "./fleet-store.js";
 import {validateTaskRequest, CAPABILITY_FRESH_MS, type RecoveryTaskRequest} from "./recovery-tasks.js";
 import type { PauseRecord } from "./recovery-facts.js";
-import { hasRecoveryPriority, hasRunningWip } from "./recovery-labels.js";
+import { hasRecoveryPriority, hasRepairMarker, hasRunningWip } from "./recovery-labels.js";
 
 export interface RecoveryObservation {
   ticket: string; status: string; labels: string[]; blocked: boolean;
@@ -344,7 +344,9 @@ export class RecoveryLedger {
         old = undefined;
       }
       if (run) {
-        if (this.now() - Math.max(Number(progress.since), run.created) >= RECOVERY_STALLED_RUN_MS
+        // Only the run's own computer can inspect its child processes. On an
+        // unowned ticket, such as during an assessment, others observe it too.
+        if (run.machine === machine && this.now() - Math.max(Number(progress.since), run.created) >= RECOVERY_STALLED_RUN_MS
           && !["assessing", "applying"].includes(String(old?.state))
           && (!old || old.fingerprint !== fingerprint || ["queued", "complete", "resolved"].includes(String(old.state)))) {
           if (old) this.db.prepare("UPDATE fleet_recovery SET present=0 WHERE id=?").run(old.id);
@@ -370,7 +372,13 @@ export class RecoveryLedger {
       // A delayed old-worker observation cannot undo upgraded assessment work.
       // Only an upgraded worker receives that queued read-only offer below.
       const pauseInspection = (upgraded || !!policyRecorded) && canInspectUnknownPause(o);
-      const workflowColumn = o.status === "Inbox" || o.status.startsWith("In ") || o.status === "Backlog" && (wip || !!owner);
+      // A Backlog ticket whose work has started: owned, running, assigned a
+      // repair, or refined. Refinement and assessments own nothing since
+      // 2026-10-14, so a refined ticket or a refine repair that never starts
+      // is recognised by its labels rather than by a claim.
+      const backlogStarted = wip || !!owner || hasRepairMarker(o.labels) || hasRecoveryPriority(o.labels)
+        || o.labels.some(l => l === "done:refiner" || l === "done:po");
+      const workflowColumn = o.status === "Inbox" || o.status.startsWith("In ") || o.status === "Backlog" && backlogStarted;
       if ((!trigger || wip) && !o.blocked && workflowColumn && this.now() - Number(progress.since) >= (wip ? 3 : 24) * 3600000) {
         trigger = { reason: wip ? "Running label without a reservation; verify the worker stopped" : "No workflow progress for 24 hours", manual: wip };
       }
