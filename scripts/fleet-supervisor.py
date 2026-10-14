@@ -481,6 +481,7 @@ def main():
         housekeeping = Housekeeping(state)
         supervisor = Supervisor(state, adapter, settings=config, housekeeping=housekeeping)
         support = None
+        support_module = None
         control_module = None
         if config.get('recoveryTasks'):
             support_spec = importlib.util.spec_from_file_location('fleet_support', Path(__file__).with_name('fleet-support.py'))
@@ -488,6 +489,12 @@ def main():
             support = support_module.SupportSupervisor(adapter, config)
             support.housekeeping = housekeeping.record
             supervisor.withhold = getattr(support, 'withhold', None)
+        watchdog = None
+        watchdog_source = Path(__file__).with_name('fleet-watchdog.py')
+        if watchdog_source.is_file():
+            watchdog_spec = importlib.util.spec_from_file_location('fleet_watchdog', watchdog_source)
+            watchdog_module = importlib.util.module_from_spec(watchdog_spec); watchdog_spec.loader.exec_module(watchdog_module)
+            watchdog = watchdog_module.Watchdog(adapter, config, support, housekeeping.record, support_module=support_module)
         if config.get('control'):
             control_spec = importlib.util.spec_from_file_location('fleet_control', Path(__file__).with_name('fleet-control.py'))
             control_module = importlib.util.module_from_spec(control_spec); control_spec.loader.exec_module(control_module)
@@ -524,8 +531,20 @@ def main():
                     # The native-task pass must not hide the operation report.
                     support_results = []
                     support_failure = 'Native task pass failed. ' + type(error).__name__ + ': ' + redact_paths(str(error))[:300]
+                watch = None
+                if watchdog:
+                    # Per-record refusals from this pass. A failed pass gives
+                    # none, and without them nothing is finished automatically.
+                    errors = dict(support.reported_errors) if support and support_failure is None else None
+                    try:
+                        watch = watchdog.tick(errors, results)
+                    except Exception as error:
+                        watch = [{'kind': 'error', 'subject': 'watchdog', 'since': time.time(), 'action': 'attention',
+                                  'reason': 'Watchdog pass failed. ' + type(error).__name__ + ': ' + redact_paths(str(error))[:300]}]
                 attention = adapter.attention()
                 attention["recoveryTasks"] = support_results
+                if watch is not None:
+                    attention['watchdog'] = [{k: redact_paths(v) if isinstance(v, str) else v for k, v in item.items()} for item in watch]
                 attention['operations'] = results
                 attention['housekeeping'] = housekeeping.recent()
                 if support_failure:

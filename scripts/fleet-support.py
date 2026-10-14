@@ -399,8 +399,13 @@ class SupportSupervisor:
 
     def rpc(self,operation,body):
         path=self.directory/(operation+'.request.json');atomic(path,body)
-        output=subprocess.check_output(self.adapter.operator_command('recovery-task',operation,str(path)),text=True,timeout=150)
-        return json.loads(output)
+        done=subprocess.run(self.adapter.operator_command('recovery-task',operation,str(path)),stdin=subprocess.DEVNULL,capture_output=True,text=True,timeout=150)
+        if done.returncode:
+            # The service's own refusal, such as a 409 reason, names the problem.
+            # Its last line only: the command prints nothing else on failure.
+            lines=[line for line in done.stderr.splitlines() if line.strip()]
+            raise RuntimeError('Control service refused '+operation+': '+(lines[-1][:300] if lines else 'exit '+str(done.returncode)))
+        return json.loads(done.stdout)
 
     def capability_record(self,state,withheld=()):
         routes=self.config.get('recoveryTasks',{})
@@ -484,7 +489,7 @@ class SupportSupervisor:
 
     def receipt_pass(self,machine,receipt,running):
         old=json.loads(receipt.read_text())
-        if old['phase']=='complete' and (old.get('artifactDigest') or old.get('artifactUnrecoverable') or old.get('interrupted')):return
+        if old['phase']=='complete' and (old.get('artifactDigest') or old.get('artifactUnrecoverable') or old.get('interrupted') or old.get('finalized')):return
         result=Path(old['result'])
         if old['phase']=='complete' and not result.is_file():return
         if old['phase']=='complete':

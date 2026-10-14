@@ -451,6 +451,46 @@ stopped with no process, or the worker's own files written before the running
 container instance started. A stopping container, an unknown container state
 or a worker that never wrote proves nothing, and the record stays in attention.
 
+### No-progress watchdog
+
+Each supervisor pass also runs `scripts/fleet-watchdog.py` over the places held
+on its own computer. It never signals, starts or reaps a process. It measures
+each holder against a limit for its phase, set under `watchdog` in the
+supervisor configuration:
+
+- A native task running: its recipe's own time limits plus 15 minutes.
+- A native task that wrote its result, while its completion or publication
+  preparation is refused: 10 minutes after its last worker write.
+- A native task publishing: 10 minutes after the phase was first seen.
+- A native task in attention: 30 minutes. A deferred grant: 60 minutes.
+- A dispatcher run: 60 minutes with none of its ticket's logs written.
+
+Progress is a phase change or a write by the worker itself: its logs, check
+results, result or publication. Files the supervisor writes, such as the custody
+journal, do not count.
+
+Its one automatic action is to finish a native task as failed when every one of
+these holds: the record is `running` or in `attention`, never `publishing`; its
+result is written; the supervisor's own custody proof has confirmed its worker
+drained; the ordinary pass was refused on that record in this pass; and the
+limit has passed. The summary names the refusal and the folder where the result,
+logs and any prepared publication stay private. Nothing is published. Anything
+else past its limit, including a live worker, a worker whose absence is not
+proven and every dispatcher run, becomes an attention item and nothing is released.
+
+A heavy job waiting for capacity for 60 minutes while every heavy place is held
+by work with no progress for 30 minutes produces a starvation item naming both.
+So does a supervised update waiting that long for native work with no progress.
+
+The findings are published as the operation report's `watchdog` list, which
+`operator.sh attention` returns under each computer in `operationReports`.
+Each item has `kind` (`stalled`, `starvation`, `finalize-refused`, `finalized`,
+`released` or `error`), `action`, `reason`, and where known `subject`, `ticket`,
+`phase`, `worker`, `holder`, `since`, `lastProgress` and `limitSeconds`. Times are
+Unix seconds. Releases by the dead-worker path and by the watchdog stay listed as
+notices for a day. Each new finding and each release is also written to
+housekeeping once.
+
 The fixed recipes are `platform-probe`, `memory-runtime-smoke`,
 `android-tool-then-text` and `dispatcher-repair`. Executed recipes require an exact
 candidate revision. There is no model-supplied shell command. Requests are stable

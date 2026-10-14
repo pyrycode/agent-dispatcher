@@ -75,6 +75,34 @@ test('supervisor reports keep automatic clears and retirements visible without r
     {at:1791920936,kind:'native-task-deferred',subject:'29219c8b',reason:'Admitted while its container was draining or updating.'}]);
 });
 
+test('supervisor reports carry the no-progress watchdog findings, bounded and scrubbed, without risking the report', async t => {
+  const store = new FleetStore(':memory:', {pyrybox:{heavyLimit:1,combinedLimit:2}});
+  const server = await serveFleet(store,{pyrybox:'pyrybox-fixture'},'admin-fixture',0);
+  t.after(async () => {await new Promise<void>(r=>server.close(()=>r()));store.close();});
+  const address=server.address(); assert.ok(address && typeof address !== 'string');
+  const client=new JsonClient(`http://127.0.0.1:${address.port}`,'pyrybox-fixture');
+  // Modelled on the #3289 repair task, 2026-10-14: finished 09:31:47, its publication refused every pass.
+  const finalized={kind:'finalized',subject:'58915c35',ticket:'pyrycode/pyrycode#3289',phase:'finalizing',since:1791959507,lastProgress:1791959507,
+    limitSeconds:600,worker:'finished',action:'released',reason:'Native task finished and drained, but completing it was refused. Reservation released as failed; files kept.'};
+  const starvation={kind:'starvation',subject:'pyrycode/pyrycode-desktop#1809 real-claude-gate',ticket:'pyrycode/pyrycode-desktop#1809',phase:'real-claude-gate',
+    since:1791962760,lastProgress:1791959507,limitSeconds:3600,holder:'pyrycode/pyrycode#3289 native task',action:'attention',reason:'A heavy job has waited for capacity.'};
+  const credential=['Bearer','Q7'.repeat(12)].join(' ');
+  const watchdog=[finalized,starvation,{kind:'restart-worker',reason:'unknown kind'},{kind:'stalled'},null,
+    {kind:'stalled',subject:7,since:'soon',limitSeconds:Infinity,extra:'dropped',reason:'Last refusal: '+credential}];
+  await client.call('/operations/report',{machine:'pyrybox',report:{operations:[{project,phase:'waiting-for-native-task'}],watchdog,
+    housekeeping:[{at:1791960107,kind:'native-task-finalized',subject:'58915c35',reason:finalized.reason},{at:1791960107,kind:'watchdog-starvation',subject:'x',reason:'waited'}]}});
+  const [record]=await client.call<any[]>('/operations/reports');
+  assert.deepEqual(record.watchdog.slice(0,2),[finalized,starvation]);
+  assert.equal(record.watchdog.length,3);
+  assert.deepEqual(Object.keys(record.watchdog[2]).sort(),['kind','reason']);
+  assert.ok(!record.watchdog[2].reason.includes(credential));
+  assert.deepEqual(record.housekeeping.map((h:any)=>h.kind),['native-task-finalized','watchdog-starvation']);
+  await client.call('/operations/report',{machine:'pyrybox',report:{operations:[],watchdog:Array.from({length:30},(_,i)=>({...starvation,subject:'s'+i}))}});
+  assert.equal((await client.call<any[]>('/operations/reports'))[0].watchdog.length,20);
+  await client.call('/operations/report',{machine:'pyrybox',report:{operations:[],watchdog:'not a list'}});
+  assert.equal((await client.call<any[]>('/operations/reports'))[0].watchdog,undefined);
+});
+
 test('unavailable optional related evidence preserves the other ticket evidence', async () => {
   const original = globalThis.fetch;
   globalThis.fetch = async input => {
