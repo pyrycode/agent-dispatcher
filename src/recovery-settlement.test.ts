@@ -182,7 +182,7 @@ test("operational escalations wait for a change instead of a thirty-minute timer
   ledger.begin(incident.id, "r1");
   ledger.decide(incident.id, "r1", { action: "escalate", category: "operational", reason: "No ready Android emulator" });
   assert.deepEqual(poll(ledger, clock, mobile, mobile2152, 4 * 3600_000), [], "an assessment cannot request the short cooldown by itself");
-  db.prepare("UPDATE fleet_capabilities SET record=? WHERE machine='hp'").run(JSON.stringify({ capabilities: ["android-emulator"], ready: true }));
+  db.prepare("UPDATE fleet_capabilities SET record=?,updated=? WHERE machine='hp'").run(JSON.stringify({ capabilities: ["android-emulator"], ready: true }), clock.now);
   assert.equal(ledger.report("hp", mobile, [mobile2152], empty)[0]?.state, "queued");
   assert.equal(ledger.settlement(incident.id)?.reopened, "capability android-emulator ready");
   // Transient transport failures are marked by code and keep the bounded cooldown.
@@ -217,4 +217,21 @@ test("FleetStore wires the configured safety interval and reports the settlement
   assert.deepEqual(store.recoveryReport("hp", relay, [relay170]), []);
   assert.deepEqual(recoveryReport(store.recovery.list(), {}).decisions, [], "a settled wait is not an operator decision");
   store.close();
+});
+
+test("a capability provider that was offline with a stale ready record reopens the escalation when it reports fresh", () => {
+  const { db, clock, ledger, tasks } = setup();
+  // The emulator host last reported ready long ago, then went offline.
+  tasks.report("fractal", { capabilities: ["android-emulator"], ready: true });
+  clock.now += 3600_000;
+  const [incident] = ledger.report("fractal", mobile, [mobile2152], empty);
+  ledger.begin(incident.id, "r1");
+  ledger.decide(incident.id, "r1", { action: "escalate", category: "operational", reason: "No reachable Android emulator host" });
+  assert.deepEqual(ledger.settlement(incident.id)?.basis.capabilities, [], "a stale ready record is not a present capability");
+  assert.deepEqual(poll(ledger, clock, mobile, mobile2152, 2 * 3600_000), []);
+  tasks.report("fractal", { capabilities: ["android-emulator"], ready: true });
+  const [next] = ledger.report("fractal", mobile, [mobile2152], empty);
+  assert.equal(next?.state, "queued", "the returning provider reopens on the next poll, not after the safety interval");
+  assert.equal(ledger.settlement(incident.id)?.reopened, "capability android-emulator ready");
+  db.close();
 });

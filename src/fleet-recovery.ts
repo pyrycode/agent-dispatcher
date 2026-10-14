@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { FleetSnapshot } from "./fleet-store.js";
-import {validateTaskRequest, type RecoveryTaskRequest} from "./recovery-tasks.js";
+import {validateTaskRequest, CAPABILITY_FRESH_MS, type RecoveryTaskRequest} from "./recovery-tasks.js";
 import type { PauseRecord } from "./recovery-facts.js";
 
 export interface RecoveryObservation {
@@ -166,10 +166,12 @@ export class RecoveryLedger {
     }));
     const coordination = this.hasTable("fleet_coordination")
       ? this.db.prepare("SELECT blocker,record FROM fleet_coordination WHERE ticket=? ORDER BY blocker").all(ticket).map(r => [String(r.blocker), String(r.record)]) : [];
+    // Same freshness rule as task admission: a stale ready record is an
+    // offline machine, so its return must count as a gained capability.
     const capabilities = operational && this.hasTable("fleet_capabilities")
-      ? [...new Set(this.db.prepare("SELECT record FROM fleet_capabilities").all().flatMap(r => {
+      ? [...new Set(this.db.prepare("SELECT record,updated FROM fleet_capabilities").all().flatMap(r => {
           const record = JSON.parse(String(r.record)) as { ready?: boolean; capabilities?: string[] };
-          return record.ready ? record.capabilities ?? [] : [];
+          return record.ready && this.now() - Number(r.updated) < CAPABILITY_FRESH_MS ? record.capabilities ?? [] : [];
         }))].sort() : undefined;
     return { fingerprint, tasks: taskStates, tickets: ticketStates,
       coordination: coordination.length ? createHash("sha256").update(JSON.stringify(coordination)).digest("hex") : null,
