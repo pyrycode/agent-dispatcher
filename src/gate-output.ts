@@ -35,7 +35,9 @@ export const GATE_OUTPUT_FORMATS: readonly GateOutputFormat[] = ["go-json", "pla
 
 /** Bump when completeness validation changes. A saved completeParse flag
  * certifies only its reader's rules, so older tallies must be reparsed. */
-export const GATE_PARSER_VERSION = 4;
+// 5: Go runs record a non-deadline panic or data race (`abnormalExit`), which
+// a saved version 4 tally lacks, so those are re-parsed from the raw output.
+export const GATE_PARSER_VERSION = 5;
 
 /**
  * Type guard for the env-configured format string. An unrecognised value

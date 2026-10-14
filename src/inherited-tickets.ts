@@ -45,8 +45,9 @@ function hasMarker(issue: { body: string }, name: string): boolean {
 function namesExactly(issue: { title?: string; body: string }, name: string): boolean {
   if (hasMarker(issue, name) || issue.body.includes(`\`${name}\``)) return true;
   // The whole name, not the start of a longer one: `C#bar` is not `C#barBaz`.
+  // A full stop ending the sentence still counts.
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(?<![\\w$#./])${escaped}(?![\\w$#./])`).test(issue.title ?? "");
+  return new RegExp(`(?<![\\w$#./])${escaped}(?![\\w$#/]|\\.[\\w$#])`).test(issue.title ?? "");
 }
 function matchesTrackingTicket(issue: { title?: string; body: string }, name: string): boolean {
   if (issue.body.includes(`\`${name}\``)) return true;

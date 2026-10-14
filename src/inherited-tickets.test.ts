@@ -363,3 +363,9 @@ test("a gated ticket naming the inherited test itself parks, even without the bu
   assert.match(result.fallbackReason!, /names p.C#permissionAnswer itself/);
   assert.deepEqual(client.linked, [1480]);
 });
+test("a title ending the test name with a full stop still names it exactly", async () => {
+  const client = new Client();
+  client.open.push({ number: 1402, nodeId: "node-1402", title: `Broken on main: ${name}.`, body: "seen" });
+  assert.deepEqual((await recordInheritedTests(client, [name], ctx, { advance: true })).tracked, [{ name, issue: 1402 }]);
+  assert.equal(client.created.length, 0);
+});
