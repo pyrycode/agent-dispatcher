@@ -7193,6 +7193,37 @@ describe("runRealClaudeGateSuite — per-ticket selection", () => {
     assert.deepEqual(fallback.requiredTests, ["p.TestPing"]);
   });
 
+  test("a JUnit name cut at '#' is not required, so the mobile gate still judges its run", async () => {
+    // An env-file loader that treats `#` as a comment turns
+    // `de.pyryco.mobile.e2e.InteractiveStreamE2ETest#interactiveTurn` into the
+    // bare class name. Required as is, it never matches a test and every run
+    // is unusable.
+    const cls = "de.pyryco.mobile.e2e.InteractiveStreamE2ETest";
+    const junit = '<testsuite name="live" tests="2">' +
+      `<testcase classname="${cls}" name="interactiveTurn"/><testcase classname="${cls}" name="reconnects"/></testsuite>`;
+    for (const [always, body, required] of [
+      [[cls], "## Summary\nno list", []],
+      [[cls, `${cls}#interactiveTurn`], "## Summary\nno list", [`${cls}#interactiveTurn`]],
+      [[], `## Live tests\n- ${cls}\n- ${cls}#reconnects`, [`${cls}#reconnects`]],
+    ] as const) {
+      const harness = makeGateDeps({
+        gitOut: cmd => cmd.startsWith("gh pr list") ? body : cmd.includes("--count --merges") ? "0" : GATE_SHAS[cmd] ?? "",
+        fileContents: junit,
+        readGateFullState: () => JSON.stringify({ lastFullPassSha: "f".repeat(40) }),
+        writeGateFullState: () => {},
+      });
+      const report = await runRealClaudeGateSuite({
+        issueNumber: 2153, command: "./gradlew connectedDebugAndroidTest", format: "junit-xml", timeoutMs: 60_000, minExecuted: 2,
+        baselineCommand: "./gradlew connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class={{TESTS}}",
+        selection: { alwaysTests: [...always], fullPaths: [], fullEvery: 10 }, requiredTests: [...always],
+        repoRoot: "/tmp/fake-repo", logsDir: "/tmp/fake-logs", defaultBranch: "main", deps: harness.deps,
+      });
+      assert.equal(report.runError, null);
+      assert.deepEqual(report.requiredTests, required);
+      assert.equal(decideGateVerdict({ ...report, minExecuted: gateRunFloor(report, 2), requiredTests: gateRunRequiredTests(report) }).verdict, "pass", JSON.stringify(always));
+    }
+  });
+
   test("an invalid ## Live tests section names nothing and runs the full suite (mobile #2132, #1847)", async () => {
     for (const body of [
       "## Live tests\n\nde.pyryco.mobile.e2e.InteractiveStreamE2ETest#interactiveTurn_backgroundAgent_followsBottomUntilFinished\n\nReview: self-reviewed reply identity, fragment completeness, cancellation, private diagnostics and navigation assertions.",

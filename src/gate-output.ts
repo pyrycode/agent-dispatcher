@@ -1323,6 +1323,20 @@ export function gateRunFloor(report: GateRunReport, forkFloor: number): number {
   return report.selection?.mode === "selected" ? report.selection.tests.length : forkFloor;
 }
 
+/**
+ * Split required names into those a run can judge and those it cannot. A
+ * JUnit test is `Class#method`; a bare class name cannot name one test. It
+ * is what an env-file loader leaves of `PYRY_REAL_CLAUDE_GATE_ALWAYS_TESTS`
+ * when it cuts the value at a `#`, and as a requirement it would never
+ * match, so every gate run would be unusable. It is left out instead; the
+ * dispatcher's startup warning already names it.
+ */
+export function judgeableRequiredTests(names: readonly string[], format: GateOutputFormat): { kept: string[]; dropped: string[] } {
+  const kept: string[] = [], dropped: string[] = [];
+  for (const name of new Set(names)) (format === "junit-xml" && !name.includes("#") ? dropped : kept).push(name);
+  return { kept, dropped };
+}
+
 /** Every name the run must pass: its recorded requirements, plus a selected
  *  run's names, which older saved reports carried only as their selection. */
 export function gateRunRequiredTests(report: Pick<GateRunReport, "requiredTests" | "selection">): string[] {

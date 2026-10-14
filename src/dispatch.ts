@@ -218,6 +218,7 @@ import {
   buildBaselineCommand,
   buildBaselineFilter,
   gateRunRequiredTests,
+  judgeableRequiredTests,
   isGateOutputFormat,
   parseGateOutput,
   validateGateOutputProvenance,
@@ -443,7 +444,8 @@ const REAL_CLAUDE_GATE_SELECTION: GateSelectionConfig | null = (() => {
   if (cut.length > 0) {
     console.warn(
       `   ⚠️  PYRY_REAL_CLAUDE_GATE_ALWAYS_TESTS holds a name with no #method (${cut.join(", ")}). ` +
-      `An env-file loader may have cut the value at a #; quote it. Until then every gate run uses the full suite.`,
+      `An env-file loader may have cut the value at a #; quote it. Until then every gate run uses the full suite, ` +
+      `and a JUnit gate does not require that name.`,
     );
   }
   return config;
@@ -7336,6 +7338,12 @@ export async function runRealClaudeGateSuite(opts: {
     report.requiredTests = [...new Set([...(report.requiredTests ?? []), ...requiredLiveTestNames(body)])];
   } catch (e: any) {
     console.warn(`   ⚠️  Real-claude gate: could not read the pull request's live tests (${e?.message ?? e}); running the full suite with the fork's required tests only`);
+  }
+  const required = judgeableRequiredTests(report.requiredTests ?? [], opts.format);
+  report.requiredTests = required.kept;
+  if (required.dropped.length > 0) {
+    console.warn(`   ⚠️  Real-claude gate: not requiring ${required.dropped.join(", ")}, a JUnit name with no #method, which cannot name one test. ` +
+      `If it came from PYRY_REAL_CLAUDE_GATE_ALWAYS_TESTS, an env-file loader may have cut the value at a #; quote it.`);
   }
   if (opts.selection) {
     let changedPaths: string[] | null = null;
