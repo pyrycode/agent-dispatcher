@@ -18,10 +18,17 @@ import { configureGitHubCLI, serveGitHubBridge } from "./github-bridge.js";
 import { FleetUpdates } from "./fleet-updates.js";
 import { recoveryReport } from "./recovery-report.js";
 import { persistProjectDrains } from "./fleet-config.js";
+import { ServiceShutdown, SHUTDOWN_DEADLINE_MS } from "./service-shutdown.js";
 
 function secret(name: string): string {
   if (typeof name !== "string" || !name || !process.env[name]) throw new Error(`Missing credential environment variable: ${name}`);
   return process.env[name]!;
+}
+/** Seconds a stop may wait for running requests. Must stay under systemd's TimeoutStopSec=30. */
+function shutdownDeadline(seconds: unknown): number {
+  if (seconds === undefined) return SHUTDOWN_DEADLINE_MS;
+  if (typeof seconds !== "number" || !(seconds > 0 && seconds <= 25)) throw new Error("shutdownDeadlineSeconds must be a number above 0 and at most 25");
+  return seconds * 1000;
 }
 async function main(): Promise<void> {
   const [command, configPath, ...args] = process.argv.slice(2);
@@ -76,6 +83,7 @@ async function main(): Promise<void> {
     return;
   }
   if (command === "claims") {
+    const stopDeadline = shutdownDeadline(config.shutdownDeadlineSeconds);
     const database = resolve(config.database);
     mkdirSync(dirname(database), { recursive: true, mode: 0o700 });
     const machines = Object.fromEntries(Object.entries(config.machines).map(([id, value]) => [id, secret((value as any).tokenEnv)]));
@@ -109,10 +117,17 @@ async function main(): Promise<void> {
         ...(!["GET", "HEAD"].includes(req.method) ? { body: await req.text() } : {}) }));
     } : fetch;
     const workflowPublisher=github?new WorkflowPublisher(store,github):undefined;
-    const workflowTimer=workflowPublisher?setInterval(()=>{void workflowPublisher.tick().catch(e=>console.warn(e.message));},30_000):undefined;
+    const publishing=new Set<Promise<unknown>>();
+    const workflowTimer=workflowPublisher?setInterval(()=>{
+      const work=workflowPublisher.tick().catch(e=>console.warn(e.message)).finally(()=>publishing.delete(work));
+      publishing.add(work);
+    },30_000):undefined;
     const stopLabels = startClaimLabelSync(config.githubLabels, () => store.snapshot().claims, process.env, labelFetch, () => store.recovery.escalatedTickets(), project=>store.workflow.enabled(project));
-    const close = () => { if (updateTimer) clearInterval(updateTimer); if(workflowTimer)clearInterval(workflowTimer); stopLabels(); cli?.close(); server.close(() => { store.close(); process.exit(0); }); };
-    process.on("SIGTERM", close); process.on("SIGINT", close);
+    // A display pass writes the database after its GitHub calls, so it may finish.
+    const shutdown = new ServiceShutdown({ servers: cli ? [server, cli] : [server],
+      stop: [() => clearInterval(updateTimer), () => clearInterval(workflowTimer), stopLabels],
+      pending: () => publishing, close: () => store.close(), deadlineMs: stopDeadline });
+    process.on("SIGTERM", () => void shutdown.stop("SIGTERM")); process.on("SIGINT", () => void shutdown.stop("SIGINT"));
     console.log("Claim service listening", server.address());
     return;
   }
