@@ -6181,7 +6181,7 @@ export async function maybeRunPreSpawnGates(
       result.promptNote,
       "",
       "",
-      "## Pull request `## Live tests` section — TRIAGE MODE",
+      "## Pull request `## Live tests` section: TRIAGE MODE",
       "",
       error,
       "",

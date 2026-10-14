@@ -9131,7 +9131,7 @@ describe("pre-verifier gates — dispatchToAgent wiring", () => {
         assert.equal(ctx.failedPreSpawnGate, red ? LIVE_TESTS_SECTION_GATE : undefined, String(body));
         assert.match(result.promptNote, /make check/, "the configured gates still ran");
         if (red) {
-          assert.match(result.promptNote, /Live tests` section — TRIAGE MODE/);
+          assert.match(result.promptNote, /Live tests` section: TRIAGE MODE/);
           assert.match(result.promptNote, /Review: self-reviewed reply identity/);
           assert.match(result.promptNote, /cannot advance or publish PASS/);
           assert.match(loggedText(calls), /## Live tests section: invalid/);
