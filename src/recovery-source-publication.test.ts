@@ -492,12 +492,13 @@ test('#3289 over HTTP: the base is read from GitHub at the repair revision, and 
 test('a name the repair declares itself must read as source words to be exempt',async t=>{
  // Review of the #3289 fix: a declared name or a read on `this` could carry a
  // low-entropy secret that neither the shapes nor gitleaks would catch.
- for(const value of ['hunter2hunter2hunter2','Summer2026Summer2026x','deadbeefdeadbeefdeadbeef00','abcdefghijklmnopqrstuvwx']) await t.test(value,()=>{
+ for(const value of ['hunter2hunter2hunter2','Summer2026Summer2026x','deadbeefdeadbeefdeadbeef00','abcdefghijklmnopqrstuvwx','QwErTyUiOpAsDfGhJkLzXcVb','JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP']) await t.test(value,()=>{
   for(const source of [
    'function '+value+'(){}\nexport const c = { token: '+value+' };\n',
    'class C { m(){ return { token: this.'+value+' }; } }\n',
    'const cfg = {};\n// password: cfg.'+value+'\nexport {};\n',
    '// token: process.env.'+value+'\nexport {};\n',
+   'class C { a:any; m(){ return { token: this.a.'+value+' }; } }\n',
   ]) assert.throws(()=>validateRepairPublication(publication({'src/a.ts':source})),RepairRefusal,source);
  });
  // A name already declared on an unchanged line is in the repository, whatever it looks like.

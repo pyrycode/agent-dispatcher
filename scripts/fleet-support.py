@@ -622,7 +622,8 @@ class SupportSupervisor:
         atomic(receipt,old)
         if failures>=PUBLICATION_ATTENTION_FAILURES and not raised and self.housekeeping:
             self.housekeeping('native-task-publication-stuck',old['id'],
-                              'Repair publication failed '+str(failures)+' times in a row and still holds its reservation. Last: '+detail[:300])
+                              'Repair publication failed '+str(failures)+' times in a row'+
+                              (', after preparation released its reservation. ' if old.get('phase')=='publishing' else ' and still holds its reservation. ')+'Last: '+detail[:300])
         raise PublicationPassError(error) from error
 
     def refuse_publication(self,machine,receipt,old):

@@ -58,13 +58,20 @@ function touchesChange(source:string,changed:boolean[]):(start:number,end:number
 
 /**
  * Whether a name reads as source words rather than a value: letters only,
- * and no camelCase or snake_case word longer than 16 letters. A name a repair
- * declares itself can otherwise smuggle a low-entropy secret such as
- * `hunter2hunter2hunter2` past the credential shapes.
+ * no camelCase or snake_case word longer than 16 letters, and at most one
+ * word shorter than three. A name a repair declares itself can otherwise
+ * smuggle a low-entropy secret such as `hunter2hunter2hunter2`, or a
+ * mixed-case one such as `QwErTyUiOp...`, past the credential shapes.
  */
 function wordy(name:string):boolean {
  if(!/^[A-Za-z_$]+$/.test(name)) return false;
- return name.replace(/([a-z])([A-Z])/g,'$1_$2').replace(/([A-Z]+)([A-Z][a-z])/g,'$1_$2').split(/[_$]+/).every(word=>word.length<=16);
+ const words=name.replace(/([a-z])([A-Z])/g,'$1_$2').replace(/([A-Z]+)([A-Z][a-z])/g,'$1_$2').split(/[_$]+/).filter(Boolean);
+ return words.every(word=>word.length<=16)&&words.filter(word=>word.length<3).length<=1;
+}
+
+/** A conventional environment variable name, such as GITHUB_TOKEN. */
+function environmentName(name:string):boolean {
+ return /^[A-Z][A-Z0-9_]*$/.test(name)&&name.split('_').every(word=>word.length<=16&&!/\d{3}/.test(word));
 }
 
 /** The ordinary credential shapes, judged only where they touch an added or changed line. */
@@ -110,7 +117,7 @@ function checkSource(path:string,source:string,base:string|null|undefined):void 
   // known name whose property names read as source words.
   for(const match of comment.matchAll(/\b[A-Za-z0-9_-]*(?:token|key|secret|password)["']?[ \t]*[=:][ \t]*["']?((?:[A-Za-z_$][\w$]*)(?:\.[A-Za-z_$][\w$]*)*)(?![\w$.])/gi)) {
    const reference=match[1],[root,...rest]=reference.split('.');
-   if(!(/^process\.env\.[A-Z][A-Z0-9_]*$/.test(reference)||(root==='this'?rest.length>0:knownName(root))&&rest.every(wordy))) continue;
+   if(!(rest.length===2&&root==='process'&&rest[0]==='env'&&environmentName(rest[1])||(root==='this'?rest.length>0:knownName(root))&&rest.every(wordy))) continue;
    const at=start+match.index!+match[0].length-reference.length;
    // Provider shapes inside the reference itself are still credentials.
    if(touches(at,at+reference.length)) refuseCredentials(reference);
@@ -130,9 +137,15 @@ function checkSource(path:string,source:string,base:string|null|undefined):void 
  function memberRead(node:ts.Node):boolean {
   if(ts.isNonNullExpression(node)||ts.isParenthesizedExpression(node)) return memberRead(node.expression);
   if(!ts.isPropertyAccessExpression(node)) return false;
-  // A read on `this` names only properties, so each must read as source words.
-  if(node.expression.kind===ts.SyntaxKind.ThisKeyword) return wordy(node.name.text);
-  return ts.isIdentifier(node.expression)||memberRead(node.expression);
+  // A chain on `this` names only properties, so every name must read as source words.
+  const names:string[]=[];
+  let root:ts.Expression=node;
+  while(ts.isPropertyAccessExpression(root)||ts.isNonNullExpression(root)||ts.isParenthesizedExpression(root)) {
+   if(ts.isPropertyAccessExpression(root)) names.push(root.name.text);
+   root=root.expression;
+  }
+  if(root.kind===ts.SyntaxKind.ThisKeyword) return names.every(wordy);
+  return ts.isIdentifier(root);
  }
  function assignment(name:ts.Node,initializer:ts.Expression|undefined):void {
   if(!initializer||!sensitiveName.test(ts.isStringLiteralLike(name)?name.text:name.getText(file))) return;
@@ -175,7 +188,9 @@ export async function loadRepairBase(github:GitHubBroker,repository:string,revis
  if(commit.status!==200) throw new RepairBaseUnavailable('Repair base revision unavailable: HTTP '+commit.status);
  // Paths are validated again in full before any check relies on them.
  const valid=paths.filter(path=>/^[\w./-]+$/.test(path)&&!path.startsWith('/')&&!path.split('/').some(part=>!part||part==='.'||part==='..'));
- const responses=await Promise.all(valid.map(path=>read('/contents/'+path+'?ref='+revision,'application/vnd.github.raw+json')));
+ // At most eight at once, below GitHub's concurrency limits.
+ const responses:Awaited<ReturnType<typeof read>>[]=[];
+ for(let i=0;i<valid.length;i+=8) responses.push(...await Promise.all(valid.slice(i,i+8).map(path=>read('/contents/'+path+'?ref='+revision,'application/vnd.github.raw+json'))));
  const base:Record<string,string|null>={};
  valid.forEach((path,i)=>{
   const response=responses[i];
