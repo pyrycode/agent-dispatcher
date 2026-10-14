@@ -24,7 +24,7 @@ import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { execSync, spawnSync } from "node:child_process";
+import { execFile, execSync, spawnSync } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
 import { FleetStore } from './fleet-store.js';
 import { MachineManager, serveManager } from './machine-manager.js';
@@ -8894,7 +8894,7 @@ describe("runVerifierGates — deterministic gate execution", () => {
     return { deps, calls };
   };
 
-  test("runs every gate in the worktree cwd with the 10-minute cap, in order", async () => {
+  test("runs every gate in the worktree cwd with the 20-minute cap, in order", async () => {
     const { deps, calls } = gateDeps();
     const result = await runVerifierGates({
       gates: ["make check", "make build"],
@@ -8907,13 +8907,93 @@ describe("runVerifierGates — deterministic gate execution", () => {
     assert.deepEqual(calls.gates.map((g) => g.command), ["make check", "make build"]);
     for (const req of calls.gates) {
       assert.equal(req.cwd, "/worktrees/verifier-7", "gates must run in the ticket's worktree");
-      assert.equal(req.timeoutMs, VERIFIER_GATE_TIMEOUT_MS, "each gate gets the 10min cap");
-      assert.equal(req.timeoutMs, 600_000);
+      assert.equal(req.timeoutMs, VERIFIER_GATE_TIMEOUT_MS, "each gate gets the 20min cap");
+      assert.equal(req.timeoutMs, 1_200_000);
     }
     assert.deepEqual(result.summary, [
       "✓ make check (exit 0)",
       "✓ make build (exit 0)",
     ]);
+  });
+
+  test("pyrycode #3341: make check can finish after 615.1 seconds within the default allowance", async () => {
+    // Model the retained full run at the spawner seam, without waiting ten minutes.
+    const { deps, calls } = gateDeps({
+      gateImpl: (req) => req.command === "make check" && req.timeoutMs <= 615_100
+        ? { exitCode: null, timedOut: true, spawnError: null }
+        : { exitCode: 0, timedOut: false, spawnError: null },
+    });
+    const result = await runVerifierGates({
+      gates: ["make check", "make build"], cwd: "/wt", issueNumber: 3341, deps,
+    });
+    assert.equal(result.ok, true, "the full check must be allowed to finish beyond the old 600-second cap");
+    assert.deepEqual(calls.gates.map(g => g.command), ["make check", "make build"]);
+    assert.deepEqual(result.summary, ["✓ make check (exit 0)", "✓ make build (exit 0)"]);
+  });
+
+  test("pyrycode #3289: a 686-second make check also finishes within the default allowance", async () => {
+    const { deps } = gateDeps({
+      gateImpl: (req) => req.command === "make check" && req.timeoutMs <= 686_000
+        ? { exitCode: null, timedOut: true, spawnError: null }
+        : { exitCode: 0, timedOut: false, spawnError: null },
+    });
+    const result = await runVerifierGates({
+      gates: ["make check", "make build"], cwd: "/wt", issueNumber: 3289, deps,
+    });
+    assert.equal(result.ok, true, "the slowest measured full check must fit the default");
+    assert.ok(VERIFIER_GATE_TIMEOUT_MS >= 686_000 * 1.5, "the default keeps headroom over the slowest measured run");
+  });
+
+  const runWithTimeoutOverride = async (timeoutMs: string, code: string) => {
+    // The timeout is selected at module load, so use a fresh process like a dispatcher restart.
+    const dispatchModule = fileURLToPath(new URL("./dispatch.ts", import.meta.url));
+    const output = await new Promise<string>((res, rej) => execFile(process.execPath, [
+      "--import", "tsx", "--input-type=module", "-e",
+      `const m = await import(${JSON.stringify(dispatchModule)});\n${code}`,
+    ], { encoding: "utf8", timeout: 10_000, env: { ...process.env, PYRY_VERIFIER_GATE_TIMEOUT_MS: timeoutMs } },
+    (error, stdout) => error ? rej(error) : res(stdout)));
+    // dotenv can print before the result.
+    return JSON.parse(output.trim().split("\n").at(-1)!);
+  };
+
+  test("explicit shorter and longer timeout overrides reach every gate unchanged", async () => {
+    for (const timeoutMs of [600_000, 1_800_000]) {
+      const requests = await runWithTimeoutOverride(String(timeoutMs), `
+        const requests = [];
+        await m.runVerifierGates({
+          gates: ["make check", "make build"], cwd: "/wt", issueNumber: 3341,
+          deps: { readFileSync: () => "", spawnGate: async req => {
+            requests.push({ command: req.command, timeoutMs: req.timeoutMs });
+            return { exitCode: 0, timedOut: false, spawnError: null };
+          } },
+        });
+        console.log(JSON.stringify(requests));
+      `);
+      assert.deepEqual(requests, [
+        { command: "make check", timeoutMs }, { command: "make build", timeoutMs },
+      ]);
+    }
+  });
+
+  test("an explicit short timeout terminates the real gate and prevents later gates", { timeout: 15_000 }, async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), "verifier-timeout-"));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const { result, requests } = await runWithTimeoutOverride("300", `
+      const { readFileSync } = await import("node:fs");
+      const requests = [];
+      const result = await m.runVerifierGates({
+        gates: ["sleep 30", "echo later"], cwd: ${JSON.stringify(dir)}, logsDir: ${JSON.stringify(dir)}, issueNumber: 3341,
+        deps: { readFileSync, spawnGate: async req => {
+          requests.push({ command: req.command, timeoutMs: req.timeoutMs });
+          return m.spawnGateCommand(req);
+        } },
+      });
+      console.log(JSON.stringify({ result, requests }));
+    `);
+    assert.equal(result.ok, false);
+    assert.equal(result.failedGate, "sleep 30");
+    assert.match(result.summary[0], /timed out after/);
+    assert.deepEqual(requests, [{ command: "sleep 30", timeoutMs: 300 }]);
   });
 
   test("red exit code → stops at the failing gate, names it, later gates never run", async () => {
@@ -8993,14 +9073,22 @@ describe("runVerifierGates — deterministic gate execution", () => {
     assert.equal(result.infra, undefined);
   });
 
-  test("timeout counts as red", async () => {
-    const { deps } = gateDeps({
-      gateImpl: () => ({ exitCode: null, timedOut: true, spawnError: null }),
+  test("exceeding the default allowance stays red and cannot be excused by a baseline", async () => {
+    let assessed = 0;
+    const { deps, calls } = gateDeps({
+      gateImpl: req => req.timeoutMs <= 1_200_001
+        ? { exitCode: 0, timedOut: true, spawnError: null }
+        : { exitCode: 0, timedOut: false, spawnError: null },
     });
-    const result = await runVerifierGates({ gates: ["make slow"], cwd: "/wt", issueNumber: 10, deps });
+    const result = await runVerifierGates({
+      gates: ["make slow", "make build"], cwd: "/wt", issueNumber: 10, deps,
+      assessRed: async () => { assessed++; return null; },
+    });
     assert.equal(result.ok, false);
     assert.equal(result.failedGate, "make slow");
-    assert.match(result.summary[0]!, /timed out after 10min/);
+    assert.match(result.summary[0]!, /timed out after 20min/);
+    assert.deepEqual(calls.gates.map(g => g.command), ["make slow"]);
+    assert.equal(assessed, 0, "an incomplete gate cannot be read against main");
   });
 
   test("a timeout after credited waiting says how much was credited", async () => {
@@ -9009,7 +9097,7 @@ describe("runVerifierGates — deterministic gate execution", () => {
     });
     const result = await runVerifierGates({ gates: ["python3 scripts/android-test-gate.py ui"], cwd: "/wt", issueNumber: 11, deps });
     assert.equal(result.ok, false);
-    assert.match(result.summary[0]!, /timed out after 10min plus 45min credited for waiting/);
+    assert.match(result.summary[0]!, /timed out after 20min plus 45min credited for waiting/);
   });
 
   test("spawn error counts as red", async () => {
@@ -9299,11 +9387,15 @@ describe("pre-verifier gates — dispatchToAgent wiring", () => {
       const { ctx, calls } = makeTestContext({
         agent: builderAgent("verifier"), item: { issueNumber: 916 }, client,
         mockOptions: {
-          execImpls: fullHappyExecImpls("feature/916"),
-          gateImpl: () => ({ exitCode: 1, timedOut: true, spawnError: null }),
+          execImpls: {
+            ...fullHappyExecImpls("feature/916"),
+            "git rev-parse HEAD": () => `${"a".repeat(40)}\n${"b".repeat(40)}\n`,
+          },
+          gateImpl: () => ({ exitCode: 0, timedOut: true, spawnError: null }),
         },
       });
       await maybeRunPreSpawnGates(ctx);
+      assert.ok(!calls.fs.some(f => f.kind === "write" && f.path.endsWith(".pass.json")), "incomplete gates cannot record a reusable PASS");
       assert.deepEqual(await handlePostRun(STREAM_OK(), ctx, false), { ok: false });
       assert.deepEqual(calls.gates.map(g => g.command), ["make ui"]);
       assert.ok(client.addLabelCalls.some(c => c.label === "error:verifier"));
