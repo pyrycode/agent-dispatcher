@@ -116,6 +116,56 @@ function gateCommandWords(command: string): (GateCommandWord | null)[][] | null 
   return commands;
 }
 
+/** Launchers that run their remaining words as a command. `flags` take no
+ * operand, `values` take exactly one (separately, attached, or after `=`),
+ * and `positional` lists required operands before the command, such as
+ * the duration of `timeout`. Anything else stays ambiguous. */
+interface LauncherGrammar { flags: string[]; values: string[]; positional?: RegExp[]; numericFlag?: boolean }
+
+const LAUNCHERS: Record<string, LauncherGrammar> = {
+  timeout: { flags: ["--preserve-status", "--foreground", "-v", "--verbose"], values: ["-s", "--signal", "-k", "--kill-after"],
+    positional: [/^(?:\d+(?:\.\d*)?|\.\d+)[smhd]?$/] },
+  nice: { flags: [], values: ["-n", "--adjustment"], numericFlag: true },
+  nohup: { flags: [], values: [] },
+  setsid: { flags: ["-c", "--ctty", "-f", "--fork", "-w", "--wait"], values: [] },
+  stdbuf: { flags: [], values: ["-i", "--input", "-o", "--output", "-e", "--error"] },
+  "xvfb-run": { flags: ["-a", "--auto-servernum", "-l", "--listen-tcp"],
+    values: ["-e", "--error-file", "-f", "--auth-file", "-n", "--server-num", "-p", "--xauth-protocol", "-s", "--server-args", "-w", "--wait"] },
+};
+
+/** Commands that never execute their arguments, so a runner name among them
+ * (`echo go test`, `mkdir playwright`) is data, not an invocation. */
+const INERT_COMMANDS = new Set(["echo", "printf", "true", "false", ":", "cd", "pwd", "export", "unset", "mkdir", "rm", "rmdir",
+  "cp", "mv", "ln", "touch", "cat", "tee", "ls", "sleep", "test", "[", "chmod", "head", "tail", "wc", "grep", "which"]);
+
+/** Returns the index of the launched command, or null when an option, its
+ * operand or a required positional is unknown or dynamic. */
+function skipLauncher(args: readonly GateCommandWord[], start: number, grammar: LauncherGrammar): number | null {
+  const literal = (i: number) => !!args[i] && !args[i].dynamic;
+  while (args[start]?.value.startsWith("-") && args[start].value !== "-") {
+    if (args[start].dynamic) return null;
+    const option = args[start++].value;
+    if (option === "--") break;
+    if (grammar.flags.includes(option)) continue;
+    if (grammar.numericFlag && /^-\d+$/.test(option)) continue;
+    if (grammar.values.includes(option)) {
+      if (!literal(start)) return null;
+      start++;
+      continue;
+    }
+    const long = option.match(/^(--[^=]+)=.+$/);
+    if (long && grammar.values.includes(long[1])) continue;
+    // Attached short operands, such as `-sKILL`, `-n10` or `-oL`.
+    if (/^-[A-Za-z]./.test(option) && grammar.values.includes(option.slice(0, 2))) continue;
+    return null;
+  }
+  for (const operand of grammar.positional ?? []) {
+    if (!literal(start) || !operand.test(args[start].value)) return null;
+    start++;
+  }
+  return start;
+}
+
 /** Only explicit reporter flags identify old bytes. Missing flags can be
  * supplied by bound metadata for one invocation; a second default reporter
  * cannot borrow another invocation's JSON flag. */
@@ -171,13 +221,29 @@ export function gateCommandProvenance(command: string): GateCommandProvenance {
       } else if (["pnpm", "npm", "yarn"].includes(wrapper) &&
           (args[start + 1]?.dynamic || value(start + 1).startsWith("-"))) {
         return { kind: "ambiguous" };
+      } else if (LAUNCHERS[wrapper]) {
+        const next = skipLauncher(args, start + 1, LAUNCHERS[wrapper]);
+        if (next === null) return { kind: "ambiguous" };
+        start = next;
       } else break;
       if (!args[start]) return { kind: "ambiguous" };
     }
     if (["sh", "bash", "zsh", "eval", "if", "then", "else", "elif", "for", "while", "do", "case", "function", "!", "{"].includes(executable())) return { kind: "ambiguous" };
     if (args[start]?.dynamic) return { kind: "ambiguous" };
     const runner = executable();
-    if (runner !== "go" && runner !== "playwright") continue;
+    // A launcher this reader does not model (sudo, xargs, find -exec, a
+    // retry helper) can still run a test runner named in its arguments.
+    // Its options are unknown, so the runner and its reporter cannot be
+    // resolved: keep the command ambiguous instead of dropping the
+    // invocation, which would let another invocation's JSON stand alone.
+    if (runner !== "go" && runner !== "playwright") {
+      if (!INERT_COMMANDS.has(runner) && args.slice(start + 1).some((arg, i, rest) => {
+        const name = arg.value.split("/").at(-1);
+        return !arg.dynamic && (name === "go" || name === "playwright")
+          || arg.dynamic && rest.slice(i + 1).some(later => !later.dynamic && later.value === "test");
+      })) return { kind: "ambiguous" };
+      continue;
+    }
     let subcommand = start + 1;
     if (runner === "go" && value(subcommand).startsWith("-")) {
       if (value(subcommand) === "-C") {

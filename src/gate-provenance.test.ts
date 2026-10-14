@@ -136,3 +136,64 @@ test("wrapper chains and Go global flags preserve each invocation's reporter", (
     "time pnpm exec env MODE=fixture go test -json ./...",
   ]) assert.equal(gateCommandProvenance(command).kind, "single", command);
 });
+
+test("unsupported launchers cannot hide a test invocation behind another invocation's JSON", () => {
+  const tally = parseGateOutput(go + "\nok fixture 0.001s", "go-json");
+  const verdict = (command: string) => decideGateVerdict({ command, outputFormat: "go-json", tally,
+    runError: null, timedOut: false, exitCode: 0, minExecuted: 10 }).verdict;
+  // The October 13 review reproducer for Desktop #1809, in both orders.
+  for (const command of ["go test -json ./first; timeout 30 go test ./second", "timeout 30 go test ./second; go test -json ./first"]) {
+    assert.deepEqual(gateCommandProvenance(command), { kind: "ambiguous" }, command);
+    assert.equal(verdict(command), "unusable", command);
+  }
+  for (const launcher of [
+    "sudo -E go test ./second", "xargs go test", "find . -name go.mod -execdir go test ./... ;",
+    "retry --times 3 -- go test ./second", "/usr/local/bin/with-lock gate go test ./second",
+    "doas /usr/bin/go test ./second", "sudo npx playwright test", 'sudo "$RUNNER" test ./second',
+    "timeout --unknown 30 go test ./second", 'timeout "$GATE_TIMEOUT" go test ./second', "timeout go test ./second",
+    "nice --unknown go test ./second", "stdbuf -x go test ./second", "xvfb-run --bogus npx playwright test",
+    "nohup", "timeout 30",
+  ]) {
+    for (const command of [`go test -json ./first; ${launcher}`, `${launcher}; go test -json ./first`]) {
+      assert.deepEqual(gateCommandProvenance(command), { kind: "ambiguous" }, command);
+      assert.equal(verdict(command), "unusable", command);
+    }
+  }
+});
+
+test("supported launchers resolve to the invocation they run", () => {
+  for (const [command, format] of [
+    ["timeout 30 go test -json ./...", "go-json"],
+    ["timeout 30m go test -json ./...", "go-json"],
+    ["timeout -s KILL -k 5s 1.5h go test -json ./...", "go-json"],
+    ["timeout --signal=TERM --kill-after=10 --preserve-status 20m go test -json ./...", "go-json"],
+    ["timeout -sKILL -- 30 go test -json ./...", "go-json"],
+    ["nice -n 10 go test -json ./...", "go-json"],
+    ["nice -10 nohup go test -json ./...", "go-json"],
+    ["nice --adjustment=5 env MODE=fixture go test -json ./...", "go-json"],
+    ["stdbuf -oL -eL go test -json ./...", "go-json"],
+    ["stdbuf --output=0 timeout 30 go test -json ./...", "go-json"],
+    ["setsid -w go test -json ./...", "go-json"],
+    ["xvfb-run -a npx playwright test --reporter=json", "playwright-json"],
+    ["xvfb-run --auto-servernum -s '-screen 0 1280x720x24' npx playwright test --reporter=json", "playwright-json"],
+    ["xvfb-run --server-args='-screen 0 1280x720x24' timeout 30m npx playwright test --reporter=json", "playwright-json"],
+  ]) assert.deepEqual(gateCommandProvenance(command), { kind: "single", format }, command);
+  // A launched runner keeps the per-invocation reporter rule.
+  for (const command of [
+    "go test -json ./first; timeout 30 go test -json ./second",
+    "xvfb-run -a npx playwright test --reporter=json && nice -n 5 npx playwright test --reporter=json",
+  ]) assert.equal(gateCommandProvenance(command).kind, "single", command);
+  for (const command of ["timeout 30 go test ./...", "xvfb-run -a npx playwright test"]) {
+    assert.deepEqual(gateCommandProvenance(command), { kind: "missing" }, command);
+  }
+});
+
+test("commands that never run their arguments stay unrelated to the gate", () => {
+  for (const command of [
+    "echo go test ./second; go test -json ./first", "printf '%s\\n' playwright test; go test -json ./first",
+    "mkdir -p go; go test -json ./first", "go test -json ./first | tee go", 'test -n "$CI"; go test -json ./first',
+    "npm install --no-audit --no-fund >&2 && npm run build >&2 && npx playwright test --config playwright.real-claude.config.ts --reporter=json",
+  ]) assert.equal(gateCommandProvenance(command).kind, "single", command);
+  assert.deepEqual(gateCommandProvenance("pnpm live-tests"), { kind: "missing" });
+  assert.deepEqual(gateCommandProvenance("./gradlew connectedDebugAndroidTest"), { kind: "missing" });
+});
