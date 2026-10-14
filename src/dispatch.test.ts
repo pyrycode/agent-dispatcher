@@ -2464,6 +2464,15 @@ describe("selectUnansweredGateFailure", () => {
     assert.equal(selectUnansweredGateFailure([builderDone, verifierPassed, parked], "builder"), null);
   });
 
+  test("the evidence comment names the raw evidence folder only when there is one", () => {
+    assert.doesNotMatch(gateFail, /Raw evidence/);
+    const withFolder = formatGateEvidenceComment({
+      verdict: "pass", reason: "ok", report: { ...report, evidenceDir: "/agents/logs/evidence/996/gate-runs/2026-10-14T08-12-13-141Z" },
+      minExecuted: 8, action: "moved it on.",
+    });
+    assert.ok(withFolder.includes("Raw evidence: `/agents/logs/evidence/996/gate-runs/2026-10-14T08-12-13-141Z` on the dispatcher host"), withFolder);
+  });
+
   test("a gate verdict that parks for a human is not a rework reason", () => {
     assert.equal(selectUnansweredGateFailure([builderDone, gateUnusable], "builder"), null);
   });
@@ -6777,6 +6786,8 @@ function makeGateDeps(over: Partial<GateRunnerDeps> & {
       spawnRequests.push(req);
       return { exitCode: 0, timedOut: false, spawnError: null, ...over.spawnOutcome };
     },
+    // Never the real filesystem: the folder is named, not made.
+    prepareEvidence: (logsDir: string, issueNumber: number, stamp: string) => `${logsDir}/evidence/${issueNumber}/gate-runs/${stamp}`,
     ...over,
   };
 
@@ -7315,6 +7326,34 @@ describe("runRealClaudeGateSuite — same-tree re-run before the base comparison
     assert.deepEqual(report.baselineFailures, ["p.TestFlaky"], "the base comparison still runs over the full set");
   });
 
+  test("each part of the run gets its own evidence folder outside the worktree", async () => {
+    // Mobile #2137 and #1977, 2026-10-14: the raw XML, logcat and per-arm
+    // captures were written inside the detached worktree and removed with it.
+    const { run, spawnRequests } = rerunHarness(contents(rerunRed, rerunGreen));
+    const report = await run();
+    const runDir = report.evidenceDir ?? "";
+    assert.match(runDir, /^\/tmp\/fake-logs\/evidence\/1382\/gate-runs\/\d{4}-\d{2}-\d{2}T[\d-]+Z$/);
+    assert.deepEqual(spawnRequests.map(r => r.env.PYRY_GATE_EVIDENCE_DIR), [`${runDir}/main`, `${runDir}/rerun`, `${runDir}/base`]);
+    for (const r of spawnRequests) assert.ok(!String(r.env.PYRY_GATE_EVIDENCE_DIR).startsWith(r.cwd), "never inside the worktree");
+  });
+
+  test("no evidence folder: the command runs without the variable, even when the parent had one", async () => {
+    const saved = process.env.PYRY_GATE_EVIDENCE_DIR;
+    process.env.PYRY_GATE_EVIDENCE_DIR = "/somewhere/else";
+    try {
+      const harness = makeGateDeps({ gitOut: (cmd) => GATE_SHAS[cmd] ?? "", prepareEvidence: () => null });
+      const report = await runRealClaudeGateSuite({
+        issueNumber: 1382, command: "go test -json ./...", format: "go-json", timeoutMs: 60_000,
+        repoRoot: "/tmp/fake-repo", defaultBranch: "main", logsDir: "/tmp/fake-logs", deps: harness.deps,
+      });
+      assert.equal(report.evidenceDir, null);
+      assert.equal(report.runError, null, "a missing evidence folder never fails the gate");
+      assert.ok(!("PYRY_GATE_EVIDENCE_DIR" in harness.spawnRequests[0].env));
+    } finally {
+      if (saved === undefined) delete process.env.PYRY_GATE_EVIDENCE_DIR; else process.env.PYRY_GATE_EVIDENCE_DIR = saved;
+    }
+  });
+
   test("an unfinished re-run cannot excuse a named failure using its passing fragment", async () => {
     const incomplete = `${rerunGreen}\n${JSON.stringify({ Action: "run", Package: "p", Test: "TestLuna" })}`;
     const report = await rerunHarness(contents(incomplete, rerunRed)).run();
@@ -7405,6 +7444,7 @@ describe("runRealClaudeGateSuite: infrastructure-shaped first pass", () => {
     assert.equal(spawnRequests.length, 2, "the first pass, then only the base check");
     assert.match(spawnRequests[1].cwd, /real-claude-gate-infra-check-2138/);
     assert.equal(spawnRequests[1].timeoutMs, 30_000, "the base check has its own, shorter bound");
+    assert.equal(spawnRequests[1].env.PYRY_GATE_EVIDENCE_DIR, `${report.evidenceDir}/infra-check`, "its captures get their own folder");
     assert.equal(report.infraFailure?.baseCheck?.tests.length, 3);
     assert.equal(report.infraFailure?.baseCheck?.confirmed, true);
     assert.ok(calls.some(c => c.includes(`worktree add --detach`) && c.includes(GATE_BASE_SHA)), "the check runs on the base commit");
@@ -7702,6 +7742,11 @@ describe("buildGateSpawnEnv", () => {
     // the board.
     const env = buildGateSpawnEnv({ GITHUB_TOKEN: "ghp_secret", CLAUDE_CODE_OAUTH_TOKEN: "t" });
     assert.equal(env.GITHUB_TOKEN, undefined);
+  });
+
+  test("drops an inherited evidence folder, which only the dispatcher may name per run", () => {
+    const env = buildGateSpawnEnv({ PYRY_GATE_EVIDENCE_DIR: "/elsewhere", CLAUDE_CODE_OAUTH_TOKEN: "t" });
+    assert.ok(!("PYRY_GATE_EVIDENCE_DIR" in env));
   });
 
   test("the gate command receives that environment", async () => {

@@ -283,6 +283,8 @@ export interface GateRunMeta {
   rerunFailures: string[] | null;
   /** `PYRY_BIN`, the daemon binary a Playwright live suite drives, when set. */
   pyryBin: string | null;
+  /** The run's raw evidence folder, `PYRY_GATE_EVIDENCE_DIR` (gate-artifacts.ts), when one was made. */
+  evidenceDir: string | null;
   finishedAt: string;
 }
 
@@ -308,6 +310,7 @@ export function serializeGateRunMeta(report: GateRunReport, env: NodeJS.ProcessE
     selectedTests: report.selection?.mode === "selected" ? report.selection.tests : null,
     rerunFailures: report.rerunFailures,
     pyryBin: env.PYRY_BIN?.trim() || null,
+    evidenceDir: report.evidenceDir ?? null,
     finishedAt: now.toISOString(),
   };
   return JSON.stringify(meta, null, 2) + "\n";
@@ -351,6 +354,7 @@ export function parseGateRunMeta(raw: string): GateRunMeta | null {
     selectedTests: Array.isArray(m.selectedTests) ? m.selectedTests.filter((t: unknown) => typeof t === "string") : null,
     rerunFailures: Array.isArray(m.rerunFailures) ? m.rerunFailures.filter((t: unknown) => typeof t === "string") : null,
     pyryBin: typeof m.pyryBin === "string" ? m.pyryBin : null,
+    evidenceDir: typeof m.evidenceDir === "string" && m.evidenceDir !== "" ? m.evidenceDir : null,
     finishedAt: typeof m.finishedAt === "string" ? m.finishedAt : "",
   };
 }
@@ -399,6 +403,10 @@ export function liveGateLines(live: LiveGateRun, namingText: string, testEvidenc
       ? `did not finish: ${meta.runError}`
       : meta.timedOut ? `timed out after ${formatDuration(meta.durationMs)}` : `exit ${meta.exitCode ?? "unknown"} in ${formatDuration(meta.durationMs)}`;
     lines.push(`- Tested: \`${meta.branchName}\` at \`${shortSha(meta.headSha)}\` merged with \`${meta.baseRef}\` at \`${shortSha(meta.baseSha)}\`; ${scope}; ${end}.`);
+    lines.push(meta.evidenceDir
+      ? `- Raw evidence: \`${meta.evidenceDir}\`, kept outside the removed gate worktree. The \`main\` folder holds the first pass's ` +
+        "captures; `rerun`, `base` and `infra-check` exist only when those parts ran. Cite files from there by path."
+      : "- Raw evidence: no evidence folder was recorded for this run. It predates the folder or one could not be made, so only the test report and diagnostic log are kept.");
   }
 
   if (live.format === null || live.raw === null) {

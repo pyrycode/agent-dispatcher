@@ -257,6 +257,18 @@ describe("gate report: the latest live gate run, test by test", () => {
     assert.match(text, /- Daemon revision: `0\.37\.0`/);
   });
 
+  test("the run record names the raw evidence folder, so documentation can cite captures from it (Mobile #2137, #1977)", () => {
+    const evidence = "/agents/logs/evidence/42/gate-runs/2026-10-07T02-23-21-880Z";
+    const dir = logsDir({ [liveLog]: DESKTOP_1818, [gateRunMetaPath(liveLog)]: liveMeta({ evidenceDir: evidence }) });
+    const text = gateReportSection({ issueNumber: ISSUE, logsDir: dir, env: env({ PYRY_REAL_CLAUDE_GATE_FORMAT: "playwright-json" }), namingText: "" });
+    assert.ok(text.includes(`- Raw evidence: \`${evidence}\`, kept outside the removed gate worktree.`), text);
+    const older = gateReportSection({
+      issueNumber: ISSUE, logsDir: logsDir({ [liveLog]: DESKTOP_1818, [gateRunMetaPath(liveLog)]: liveMeta() }),
+      env: env({ PYRY_REAL_CLAUDE_GATE_FORMAT: "playwright-json" }), namingText: "",
+    });
+    assert.match(older, /- Raw evidence: no evidence folder was recorded for this run\./);
+  });
+
   test("an unreadable output or an unknown format gives no per-test results", () => {
     const dir = logsDir({ [liveLog]: "not json at all" });
     const text = gateReportSection({ issueNumber: ISSUE, logsDir: dir, env: env({ PYRY_REAL_CLAUDE_GATE_FORMAT: "playwright-json" }), namingText: "" });

@@ -177,6 +177,9 @@ Optional:
 | `PYRY_REAL_CLAUDE_GATE_ALWAYS_TESTS` | unset | Comma-separated qualified test names every live gate run must execute and pass, selection on or off; a selected run also includes them. See "Required named tests" below. |
 | `PYRY_REAL_CLAUDE_GATE_FULL_PATHS` | — | Comma-separated path prefixes. A branch changing any of them runs the whole suite. |
 | `PYRY_REAL_CLAUDE_GATE_FULL_EVERY` | `10` | Merges on the base since the last clean full run that force the whole suite again. State in `logs/real-claude-gate-full-state.json`. |
+| `PYRY_GATE_EVIDENCE_KEEP` | `5` | Raw evidence folders kept per ticket. Every live gate run gets a fresh owner-only folder, `logs/evidence/<issue>/gate-runs/<stamp>/`, with one subfolder per part of the run (`main`, `rerun`, `base`, `infra-check`), and the command for each part receives its subfolder as `PYRY_GATE_EVIDENCE_DIR`. The gate worktree is removed after the run, so a fork's gate script writes captures it wants kept there. The evidence comment and the documentation agent's gate report name the folder. Folders older than `PYRY_GATE_EVIDENCE_DAYS`, beyond this count per ticket, or over `PYRY_GATE_EVIDENCE_MAX_MB` in total (oldest first) are removed when a new run starts. Nothing else under `logs/evidence/` is touched. Garbage keeps the default. |
+| `PYRY_GATE_EVIDENCE_DAYS` | `30` | Age limit for live gate evidence folders, matching the dispatch log retention. |
+| `PYRY_GATE_EVIDENCE_MAX_MB` | `2048` | Total size limit for live gate evidence folders on this dispatcher. |
 | `PYRY_INFRA_BREAKER` | on | `0` turns off the live gate's infrastructure breaker. See "Infrastructure-shaped failures" below. |
 | `PYRY_INFRA_BREAKER_MIN_FAILED` | `5` | Infrastructure breaker: fewer failed tests than this never trip it. |
 | `PYRY_INFRA_BREAKER_MIN_FAILED_SHARE` | `0.5` | Infrastructure breaker: failed tests as a share of executed tests must reach this. |
