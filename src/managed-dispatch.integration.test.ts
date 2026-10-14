@@ -284,3 +284,83 @@ test("a PR comment's ownership check travels through the machine manager to the 
   await assert.rejects(client.addPullRequestComment(3248, 3250, "verdict"), /Unclaimed workflow writes require a run grant/);
   assert.deepEqual(posted, []);
 });
+
+test("a drain releases idle grants, including reconcile's project lock, and leaves the run in flight alone", async t => {
+  const store = new FleetStore(":memory:", { mac: { heavyLimit: 1, combinedLimit: 2 }, linux: { heavyLimit: 1, combinedLimit: 2 } });
+  const claimsServer = await serveFleet(store, { mac: "mac-test", linux: "linux-test" }, "admin-test", 0);
+  const manager = new MachineManager({ machine: "mac", heavyLimit: 1, combinedLimit: 2, projects: ["org/core"] }, new FleetClient(url(claimsServer), "mac-test"));
+  const managerServer = await serveManager(manager, { "org/core": "project-test" }, "operator-test", 0);
+  const managed = new ManagedDispatch("org/core", { PYRY_MANAGER_URL: url(managerServer), PYRY_MANAGER_TOKEN: "project-test" });
+  const other = new FleetClient(url(claimsServer), "linux-test");
+  let release!: () => void;
+  const barrier = new Promise<void>(resolve => { release = resolve; });
+  let started!: () => void;
+  const starting = new Promise<void>(resolve => { started = resolve; });
+  let activeRun: Promise<unknown> | undefined;
+  t.after(async () => { release(); await activeRun; await managed.stop(); await close(managerServer); await close(claimsServer); store.close(); });
+  await managed.start();
+  const reconcileLocked = () => store.snapshot().runs.some(run => run.locks.includes("org/core:reconcile"));
+
+  // A long run is in flight.
+  managed.beginCycle();
+  const active = managed.offer(1, "builder", "medium");
+  await managed.endCycle(); await manager.tick(); await managed.sync();
+  activeRun = managed.run(active, async () => { started(); await barrier; return true; });
+  await starting;
+
+  // The next cycle offers reconcile and the light verifier, which are not granted before the cycle ends.
+  managed.beginCycle();
+  const reconcile = managed.offer("@reconcile", "reconcile", "light", ["org/core:reconcile"], -3);
+  const verifier = managed.offer(2, "verifier", "light");
+  await managed.endCycle();
+  assert.equal(managed.ready(reconcile), false);
+
+  // SIGTERM: the loop's next cycle drains. The 2 s timer keeps syncing meanwhile.
+  managed.beginCycle();
+  await managed.drain();
+  for (let i = 0; i < 3; i++) { await manager.tick(); await managed.sync(); }
+  assert.equal(reconcileLocked(), false, "no idle reconcile grant holds the project lock");
+  assert.deepEqual(store.snapshot().runs.map(run => run.ticket), ["org/core#1"], "only the run in flight keeps a grant");
+  assert.equal(store.snapshot().claims.some(claim => claim.ticket === "org/core#2"), false, "an unused grant leaves no claim");
+  assert.equal(managed.ready(reconcile) || managed.ready(verifier), false);
+
+  // Another computer can reconcile the project while this one drains.
+  const otherRun = await other.start({ id: "linux-reconcile", machine: "linux", session: "linux-session",
+    project: "org/core", ticket: "org/core#@reconcile", role: "reconcile", resource: "light", locks: ["org/core:reconcile"] });
+  assert.equal(otherRun.ok, true, "the project is not locked fleet-wide");
+  await other.finish("linux-session", "linux-reconcile", true);
+
+  // Work offered during the drain, such as a failed run's recovery successor, is not granted here.
+  const late = managed.offer(3, "recovery", "heavy", [], -4);
+  await manager.tick(); await managed.sync();
+  assert.equal(managed.ready(late), false);
+  assert.deepEqual(store.snapshot().runs.map(run => run.ticket), ["org/core#1"]);
+
+  // The run in flight is undisturbed and finishes as completed.
+  assert.equal(managed.ready(active), false);
+  release();
+  assert.equal(await activeRun, true);
+  assert.deepEqual(store.snapshot().runs, []);
+  assert.equal(store.snapshot().claims[0]?.ticket, "org/core#1", "the finished run's ticket stays owned");
+  await managed.stop();
+  assert.deepEqual(store.snapshot().runs, []);
+});
+
+test("a grant reaching a draining dispatcher is released by its next sync", async t => {
+  const store = new FleetStore(":memory:", { mac: { heavyLimit: 1, combinedLimit: 1 } });
+  const claimsServer = await serveFleet(store, { mac: "mac-test" }, "admin-test", 0);
+  const manager = new MachineManager({ machine: "mac", heavyLimit: 1, combinedLimit: 1, projects: ["org/core"] }, new FleetClient(url(claimsServer), "mac-test"));
+  const managerServer = await serveManager(manager, { "org/core": "project-test" }, "operator-test", 0);
+  const managed = new ManagedDispatch("org/core", { PYRY_MANAGER_URL: url(managerServer), PYRY_MANAGER_TOKEN: "project-test" });
+  t.after(async () => { await managed.stop(); await close(managerServer); await close(claimsServer); store.close(); });
+  await managed.start();
+  managed.beginCycle();
+  const reconcile = managed.offer("@reconcile", "reconcile", "light", ["org/core:reconcile"], -3);
+  await managed.endCycle(); await manager.tick(); await managed.sync();
+  assert.equal(managed.ready(reconcile), true);
+  // The manager's drain flag, or a failed drain(), leaves the grant for the timer.
+  managed.draining = true;
+  await managed.sync();
+  assert.deepEqual(store.snapshot().runs, [], "the idle grant is released as unused");
+  assert.equal(managed.ready(reconcile), false);
+});
