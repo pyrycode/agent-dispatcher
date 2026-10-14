@@ -63,7 +63,7 @@ import {
 } from "./merge-handoff.js";
 import { selectDispatches } from "./dispatch-selection.js";
 import { findRepeatedMustFix, newestFailVerdict, parseVerdictArtifacts, staleBaseFindings, type VerdictArtifact } from "./verdict-guard.js";
-import { GATE_PARSER_VERSION, formatGateEvidenceComment, gateCommandProvenance, gateRunFloor, parseGateOutput, validateGateOutputProvenance, type GateOutputFormat, type GateRunReport } from "./gate-output.js";
+import { GATE_PARSER_VERSION, formatGateEvidenceComment, gateCommandProvenance, gateRunFloor, gateRunRequiredTests, parseGateOutput, validateGateOutputProvenance, type GateOutputFormat, type GateRunReport } from "./gate-output.js";
 import { gateRunMetaMatches, gateRunMetaPath, parseGateRunMeta, type GateRunMeta } from "./gate-report.js";
 import type { FlakyRunContext, FlakyTicketResult } from "./flaky-tickets.js";
 import type { InheritedTicketResult } from "./inherited-tickets.js";
@@ -863,6 +863,7 @@ export async function runRealClaudeGateExecution(
           const needsRecovery = report.tally.parserVersion !== GATE_PARSER_VERSION || report.tally.completeParse !== true || report.outputFormat === undefined || report.tally.skippedTests === undefined ||
             (format === "playwright-json" && report.tally.testDetails === undefined);
           report.outputFormat = format;
+          report.requiredTests = [...new Set([...gateRunRequiredTests(report), ...(meta?.requiredTests ?? [])])];
           if (needsRecovery) {
             try {
               report.tally = parseGateOutput(readFileSync(report.outputPath, "utf8"), format);
@@ -880,6 +881,7 @@ export async function runRealClaudeGateExecution(
         exitCode: report.exitCode,
         minExecuted: gateRunFloor(report, minExecuted),
         command: report.command,
+        requiredTests: gateRunRequiredTests(report),
         outputFormat: format,
       });
       // A failure in the shape of a shared environment failure is not judged

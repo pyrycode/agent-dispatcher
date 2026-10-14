@@ -27,9 +27,10 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { parseVerifierGates } from "./agent-runtime.js";
-import { isGateOutputFormat, parseGateOutput, parseGateTestDetails, stripPackageQualifier, type GateOutputFormat, type GateRunReport, type GateTally, type GateTestDetail } from "./gate-output.js";
+import { gateRunRequiredTests, isGateOutputFormat, parseGateOutput, parseGateTestDetails, stripPackageQualifier, type GateOutputFormat, type GateRunReport, type GateTally, type GateTestDetail } from "./gate-output.js";
 import { parseVerifierGateFormats } from "./verifier-gate-baseline.js";
 import { parseVerifierGatePass, verifierGatePassFileName, type VerifierGatePass } from "./verifier-gate-reuse.js";
+import { decideGateVerdict } from "./pipeline-decisions.js";
 
 /** Most named tests listed; the rest are counted. */
 export const MAX_NAMED_TESTS = 25;
@@ -259,6 +260,9 @@ export interface LiveGateRun {
  */
 export interface GateRunMeta {
   outputFormat?: GateOutputFormat;
+  /** Named live acceptance, retained for full runs too. A selected run's
+   *  names are folded in when an older sidecar recorded only those. */
+  requiredTests: string[];
   branchName: string;
   headSha: string;
   baseRef: string;
@@ -286,6 +290,7 @@ export function gateRunMetaPath(outputPath: string): string {
 export function serializeGateRunMeta(report: GateRunReport, env: NodeJS.ProcessEnv, now: Date): string {
   const meta: GateRunMeta = {
     outputFormat: report.outputFormat,
+    requiredTests: gateRunRequiredTests(report),
     branchName: report.branchName,
     headSha: report.headSha,
     baseRef: report.baseRef,
@@ -320,8 +325,15 @@ export function parseGateRunMeta(raw: string): GateRunMeta | null {
   try { m = JSON.parse(raw); } catch { return null; }
   if (!m || typeof m !== "object" || typeof m.headSha !== "string" || typeof m.baseSha !== "string") return null;
   if (m.outputFormat !== undefined && !isGateOutputFormat(m.outputFormat)) return null;
+  const validNames = (value: unknown) => Array.isArray(value) && value.every(t => typeof t === "string" && t.trim() !== "");
+  if (m.requiredTests !== undefined && !validNames(m.requiredTests)) return null;
+  if (m.selection === "selected" && !validNames(m.selectedTests)) return null;
   return {
     ...(isGateOutputFormat(m.outputFormat) ? { outputFormat: m.outputFormat } : {}),
+    requiredTests: [...new Set<string>([
+      ...(Array.isArray(m.requiredTests) ? m.requiredTests : []),
+      ...(m.selection === "selected" && Array.isArray(m.selectedTests) ? m.selectedTests : []),
+    ])],
     branchName: typeof m.branchName === "string" ? m.branchName : "",
     headSha: m.headSha,
     baseRef: typeof m.baseRef === "string" ? m.baseRef : "",
@@ -393,6 +405,21 @@ export function liveGateLines(live: LiveGateRun, namingText: string): string[] {
   if (details === null) {
     lines.push("- The output is unreadable or incomplete, so there are no per-test results.");
     return lines;
+  }
+
+  const requiredTests = meta?.requiredTests ?? [];
+  // Do not present aggregate passes as acceptance when a required named
+  // result is missing: the documentation stage must not record it as proof.
+  if (requiredTests.length > 0) {
+    lines.push(`- Required live tests: ${requiredTests.map(n => `\`${n}\``).join(", ")}.`);
+    const acceptance = decideGateVerdict({
+      runError: meta?.runError ?? null, timedOut: meta?.timedOut ?? false,
+      exitCode: meta?.exitCode ?? null, minExecuted: 1,
+      tally: parseGateOutput(live.raw, live.format), requiredTests, outputFormat: live.format,
+    });
+    if (acceptance.verdict === "unusable" || acceptance.verdict === "zero-executed") {
+      lines.push(`- Live acceptance remains missing: ${acceptance.reason}. \`needs-real-claude\` must remain; this run cannot advance to documentation.`);
+    }
   }
 
   // Daemon revision.
