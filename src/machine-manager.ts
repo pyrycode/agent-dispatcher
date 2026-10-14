@@ -3,11 +3,13 @@ import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { listen, readJson, tokenMatches, type FleetClient } from "./fleet-http.js";
 import { validateStart, validateLimits, type MachineLimits, type FleetRun } from "./fleet-store.js";
-import { scheduleMachine, runnableTickets, acceptsDuringProjectDrain, codexPaused, codexSpaced, type WorkOffer } from "./machine-scheduler.js";
+import { scheduleMachine, runnableTickets, acceptsDuringProjectDrain, codexPaused, codexSpaced, isNewTicket, reviewQueue, effectiveReviewQueueLimit, type WorkOffer } from "./machine-scheduler.js";
 
 /** An operator drain or resume command, kept so a supervisor can tell it from an unexplained policy change. */
 export interface ProjectDrainChange { project: string; draining: boolean; at: number }
-export interface MachineConfig extends MachineLimits { machine: string; projects: string[]; drainingProjects?: string[]; projectDrainChanges?: ProjectDrainChange[]; ticketLimit?: number; controlRevision?: string }
+export interface MachineConfig extends MachineLimits { machine: string; projects: string[]; drainingProjects?: string[]; projectDrainChanges?: ProjectDrainChange[]; ticketLimit?: number;
+  /** New tickets wait while this many owned tickets wait for review. Absent: heavyLimit. 0: no hold. */
+  reviewQueueLimit?: number; controlRevision?: string }
 type ClaimService = Pick<FleetClient, "snapshot" | "start" | "finish"> & Partial<Pick<FleetClient, "authorize" | "github" | "call">>;
 interface Offers { session: string; work: WorkOffer[]; at: number }
 export function offerId(machine: string, session: string, offer: WorkOffer): string {
@@ -26,6 +28,7 @@ export class MachineManager {
     this.startedAt = now();
     validateLimits(config);
     if (config.ticketLimit !== undefined && (!Number.isSafeInteger(config.ticketLimit) || config.ticketLimit < 1)) throw new Error("Invalid ticket limit");
+    if (config.reviewQueueLimit !== undefined && (!Number.isSafeInteger(config.reviewQueueLimit) || config.reviewQueueLimit < 0)) throw new Error("Invalid review queue limit");
     if (!config.machine || new Set(config.projects).size !== config.projects.length) throw new Error("Invalid machine configuration");
     if (config.projectHeavyLimits !== undefined && Object.keys(config.projectHeavyLimits).some(p => !config.projects.includes(p))) throw new Error("projectHeavyLimits names a project this manager does not serve");
     if (config.drainingProjects !== undefined && (!Array.isArray(config.drainingProjects) || config.drainingProjects.some(p => !config.projects.includes(p)))) throw new Error("Invalid project drain configuration");
@@ -72,9 +75,11 @@ export class MachineManager {
     while (!this.draining) {
       const state = await this.claims.snapshot();
       if (this.draining) break;
-      const offers = [...this.offers.values(),...(this.supportOffers?[this.supportOffers]:[])].filter(o => this.now() - o.at < 180_000).flatMap(o => o.work)
-        .filter(o => !this.finished.has(`${o.project}/${o.key}`) && !attempted.has(`${o.project}/${o.key}`));
-      const job = scheduleMachine({ ...this.config, offers, state })[0];
+      const fresh = [...this.offers.values(),...(this.supportOffers?[this.supportOffers]:[])].filter(o => this.now() - o.at < 180_000).flatMap(o => o.work);
+      // Reviews tried this tick still count for the review queue; finished ones do not.
+      const unfinished = fresh.filter(o => !this.finished.has(`${o.project}/${o.key}`));
+      const offers = unfinished.filter(o => !attempted.has(`${o.project}/${o.key}`));
+      const job = scheduleMachine({ ...this.config, offers, reviewOffers: unfinished, state })[0];
       if (!job) break;
       attempted.add(`${job.project}/${job.key}`);
       if (!acceptsDuringProjectDrain(job, this.config.machine, this.config.drainingProjects ?? [], state)) continue;
@@ -120,7 +125,12 @@ export class MachineManager {
     const available = [...this.offers.values(),...(this.supportOffers?[this.supportOffers]:[])].filter(o => this.now() - o.at < 180_000).flatMap(o => o.work);
     const runnableOffers = available.filter(o => !this.finished.has(`${o.project}/${o.key}`));
     const eligible = new Set(scheduleMachine({ ...this.config, offers: runnableOffers, state }).map(o => `${o.project}/${o.key}`));
-    return { ...(this.config.controlRevision?{controlRevision:this.config.controlRevision}:{}), managerStartedAt: this.startedAt, machine: this.config.machine, heavyLimit: this.config.heavyLimit, combinedLimit: this.config.combinedLimit, ...(this.config.projectHeavyLimits ? { projectHeavyLimits: this.config.projectHeavyLimits } : {}), ticketLimit: this.config.ticketLimit ?? null, runnableTicketCount: runnableTickets(this.config.machine, runnableOffers, state).size, draining: this.draining, drainingProjects: this.config.drainingProjects ?? [], projectDrainChanges: this.config.projectDrainChanges ?? [], ...state,
+    const reviewLimit = effectiveReviewQueueLimit(this.config);
+    const waitingReview = reviewQueue(this.config.machine, state, runnableOffers);
+    const reviewFull = reviewLimit > 0 && waitingReview !== undefined && waitingReview.length >= reviewLimit;
+    return { ...(this.config.controlRevision?{controlRevision:this.config.controlRevision}:{}), managerStartedAt: this.startedAt, machine: this.config.machine, heavyLimit: this.config.heavyLimit, combinedLimit: this.config.combinedLimit, ...(this.config.projectHeavyLimits ? { projectHeavyLimits: this.config.projectHeavyLimits } : {}), ticketLimit: this.config.ticketLimit ?? null,
+      // tickets is null when the claim service predates the report; nothing is held then.
+      reviewQueue: { limit: reviewLimit, tickets: waitingReview ?? null, full: reviewFull }, runnableTicketCount: runnableTickets(this.config.machine, runnableOffers, state).size, draining: this.draining, drainingProjects: this.config.drainingProjects ?? [], projectDrainChanges: this.config.projectDrainChanges ?? [], ...state,
       projects: this.config.projects.map(project => ({ project, draining: this.config.drainingProjects?.includes(project) ?? false, lastSeen: this.offers.get(project)?.at ?? null, health: !this.offers.has(project) ? "not-registered" : this.now() - this.offers.get(project)!.at >= 180_000 ? "dispatcher-unreachable" : "reporting" })),
       attention: state.runs.filter(r => r.machine === this.config.machine && this.now() - r.created >= 3 * 3600000)
         .map(r => ({ ticket: r.ticket, runId: r.id, reason: "Reservation older than three hours; verify worker progress before intervening" })),
@@ -132,6 +142,8 @@ export class MachineManager {
           : !acceptsDuringProjectDrain(o, this.config.machine, this.config.drainingProjects ?? [], state) ? "project-draining"
           : codexPaused(o, state) ? "codex-paused"
           : codexSpaced(o, state) ? "codex-spaced"
+          // A verifier selected in the same pass can shorten the queue, so an offer it frees is eligible.
+          : reviewFull && isNewTicket(o.ticket, state) && !eligible.has(`${o.project}/${o.key}`) ? "review-queue-full"
           : eligible.has(`${o.project}/${o.key}`) ? "eligible" : "waiting-for-capacity-or-lock" })),
     };
   }
