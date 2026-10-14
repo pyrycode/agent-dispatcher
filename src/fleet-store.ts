@@ -66,6 +66,26 @@ export function countsForRoleLimit(run: { project: string; role: string; machine
   return run.project === offer.project && run.role === offer.role
     && (offer.roleLimitScope !== "machine" || run.machine === undefined || run.machine === machine);
 }
+/**
+ * Roles whose admitted run does not start ticket ownership. A recovery
+ * assessment only reads and decides. A refiner (po in the classic stage set)
+ * writes the issue body, comments and labels on GitHub, and leaves no branch,
+ * worktree or local evidence a later stage needs. So ownership starts with
+ * the first stage that makes local work: builder, or architect and developer
+ * in the classic set.
+ *
+ * The run still holds its reservation, locks and generation while it runs, so
+ * the ticket cannot run twice. A ticket the computer already owns stays owned
+ * exactly as it was. Decided 2026-10-14: an assessment that decided to wait on
+ * a blocker had made its computer the ticket's permanent owner, and the claim
+ * budget lets existing ownership exceed the cap, so one computer owned six
+ * runnable tickets once the blockers closed.
+ */
+export const NON_OWNING_ROLES: ReadonlySet<string> = new Set(["recovery", "refiner", "po"]);
+export function startsOwnership(role: string): boolean {
+  return !NON_OWNING_ROLES.has(role);
+}
+
 export interface StartRequest {
   workflowVersion?: 1;
   id: string;
@@ -403,14 +423,18 @@ export class FleetStore {
     return this.transaction(() => {
       const claim = this.db.prepare("SELECT * FROM fleet_claims WHERE ticket=?").get(ticket) as unknown as Claim | undefined;
       if (claim && claim.machine !== machine) throw new Error("Ticket belongs to another machine");
-      const active = this.db.prepare("SELECT id,session FROM fleet_runs WHERE ticket=? AND finished IS NULL").get(ticket);
+      const active = this.db.prepare("SELECT id,machine,session FROM fleet_runs WHERE ticket=? AND finished IS NULL").get(ticket);
+      // An unowned ticket's run, such as an assessment, is guarded here rather than by a claim.
+      if (active && active.machine !== machine) throw new Error("Ticket is running on another machine");
       if (active && (active.id !== runId || active.session !== session)) throw new Error("Ticket has an active run");
       if (claim) return claim;
-      const grant = runId ? this.db.prepare("SELECT request,generation FROM fleet_runs WHERE id=? AND machine=? AND session=? AND finished IS NULL").get(runId, machine, session) : undefined;
+      const grant = runId ? this.db.prepare("SELECT ticket,request,generation FROM fleet_runs WHERE id=? AND machine=? AND session=? AND finished IS NULL").get(runId, machine, session) : undefined;
       if (!grant) throw new Error("Unclaimed workflow writes require a run grant");
       const request = JSON.parse(String(grant.request)) as StartRequest;
       if (!ticket.startsWith(`${request.project}#`)) throw new Error("Run project mismatch");
-      const result = { ticket, machine, generation: randomUUID(), created: Date.now() };
+      // A run that starts no ownership writes its own ticket under its own generation.
+      const generation = String(grant.ticket) === ticket ? String(grant.generation) : randomUUID();
+      const result = { ticket, machine, generation, created: Date.now() };
       // Recording follow-ups and housekeeping must not reserve their future
       // work. Only start() creates ownership after scheduling admission.
       return result;
@@ -505,11 +529,13 @@ export class FleetStore {
       }
       // Last, so a start that would be refused anyway is not counted as spaced.
       if (codex && this.codex.spacingWaitMs(this.clock()) > 0) { this.codex.spacingHeld(); return { ok: false, reason: "codex-spaced" }; }
+      // A run that starts no ownership still gets a generation of its own, so
+      // its grant, workflow writes and completion are tied to this run.
       const generation = claim ? String(claim.generation) : randomUUID();
       const now = this.clock();
       const runnerPolicy = this.runnerPolicy();
       const admitted = runnerPolicy ? JSON.stringify({ ...JSON.parse(request), runnerPolicy }) : request;
-      this.db.prepare("INSERT OR IGNORE INTO fleet_claims VALUES (?,?,?,?)").run(req.ticket, req.machine, generation, now);
+      if (!claim && startsOwnership(req.role)) this.db.prepare("INSERT OR IGNORE INTO fleet_claims VALUES (?,?,?,?)").run(req.ticket, req.machine, generation, now);
       this.db.prepare("INSERT INTO fleet_runs VALUES (?,?,?,?,?,?,?,?,NULL,NULL)").run(req.id, req.machine, req.session, req.ticket, generation, req.resource, admitted, now);
       for (const lock of new Set(req.locks)) this.db.prepare("INSERT INTO fleet_locks VALUES (?,?)").run(lock, req.id);
       if (codex) this.codex.started({ machine: req.machine, ticket: req.ticket, role: req.role }, now);
@@ -603,7 +629,10 @@ export class FleetStore {
     if (stopped !== true) throw new Error("Confirm the old worker and its subprocesses have stopped");
     this.transaction(() => {
       const claim = this.db.prepare("SELECT generation FROM fleet_claims WHERE ticket=?").get(ticket);
-      if (!claim || claim.generation !== generation) throw new Error("Ticket ownership changed; inspect it again");
+      // An unowned ticket can still hold a run that starts no ownership, such
+      // as a recovery assessment. The operator ends it by its run generation.
+      const unownedRun = !claim && this.db.prepare("SELECT 1 FROM fleet_runs WHERE ticket=? AND generation=? AND finished IS NULL").get(ticket, generation);
+      if (claim ? claim.generation !== generation : !unownedRun) throw new Error("Ticket ownership changed; inspect it again");
       this.db.prepare("DELETE FROM fleet_locks WHERE run_id IN (SELECT id FROM fleet_runs WHERE ticket=? AND finished IS NULL)").run(ticket);
       this.db.prepare("UPDATE fleet_runs SET finished=? WHERE ticket=? AND finished IS NULL").run(Date.now(), ticket);
       this.db.prepare("DELETE FROM fleet_claims WHERE ticket=? AND generation=?").run(ticket, generation);
