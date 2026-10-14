@@ -60,7 +60,7 @@ test('unknown pauses are inspected but cannot be blindly resumed or lose their h
  const db=new DatabaseSync(':memory:');t.after(()=>db.close());const ledger=new RecoveryLedger(db,()=>1000);
  const paused=upgraded({...error,status:'Halted',labels:[]}),current=item(paused);const [incident]=ledger.report('mac',project,[paused],empty);
  assert.ok(incident);let assessed=0;const mutations:string[]=[];
- await runRecoveryWork(incident,{project,agents,readCurrent:async()=>current,begin:async()=>ledger.begin(incident.id,'read-only'),assess:async()=>{assessed++;return {action:'resume',reason:'Earlier backlog approval exists'};},decide:async d=>ledger.decide(incident.id,'read-only',d),complete:async()=>ledger.complete(incident.id,'read-only'),addLabel:async(_n,l)=>{if(l==='orchestrator:fixing')mutations.push(l);},removeLabel:async(_n,l)=>{if(l.startsWith('error:'))mutations.push(l);},comment:async()=>{},move:async()=>{mutations.push('move');},notify:async()=>{}});
+ await runRecoveryWork(incident,{project,agents,readCurrent:async()=>current,begin:async()=>ledger.begin(incident.id,'read-only'),assess:async()=>{assessed++;return {action:'resume',reason:'Earlier backlog approval exists'};},decide:async d=>ledger.decide(incident.id,'read-only',d),complete:async()=>ledger.complete(incident.id,'read-only'),addLabel:async(_n,l)=>{if(l.startsWith('orchestrator:')&&l!=='orchestrator:investigating')mutations.push(l);},removeLabel:async(_n,l)=>{if(l.startsWith('error:'))mutations.push(l);},comment:async()=>{},move:async()=>{mutations.push('move');},notify:async()=>{}});
  assert.equal(assessed,1);assert.deepEqual(mutations,[]);assert.equal(current.status,'Halted');assert.equal(ledger.incident(incident.id).decision?.category,'human');
 });
 

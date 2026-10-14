@@ -3,7 +3,27 @@ import { scrubCredentials } from './agent-runtime.js';
 
 export const OPERATION_PHASES: readonly string[] = ['current','stopped','drain-requested','draining','start-requested','verifying','complete','attention','preflight-failed','changed-before-drain','waiting-for-native-task'];
 
-const AUTOMATIC_CHANGES = ['health-latch-cleared','operation-retired','native-task-unrecoverable','native-task-skipped','native-task-interrupted','native-task-deferred'];
+const AUTOMATIC_CHANGES = ['health-latch-cleared','operation-retired','native-task-unrecoverable','native-task-skipped','native-task-interrupted','native-task-deferred',
+  'native-task-finalized','watchdog-stalled','watchdog-starvation','watchdog-finalize-refused'];
+
+/** Every kind scripts/fleet-watchdog.py reports. */
+export const WATCHDOG_KINDS: readonly string[] = ['stalled','starvation','finalize-refused','finalized','released','error'];
+const WATCHDOG_TEXT = ['subject','ticket','phase','worker','action','holder'] as const;
+const WATCHDOG_NUMBERS = ['since','lastProgress','limitSeconds'] as const;
+
+/**
+ * The supervisor's no-progress findings, the same items its local report holds.
+ * Malformed items are dropped rather than rejected, like the housekeeping list.
+ */
+function watchdogItems(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  return value.filter((w: any) => w && WATCHDOG_KINDS.includes(w.kind) && typeof w.reason === 'string').slice(0,20).map((w: any) => {
+    const item: Record<string, string | number> = {kind:String(w.kind),reason:scrubCredentials(w.reason.slice(0,1000))};
+    for (const key of WATCHDOG_TEXT) if (typeof w[key] === 'string') item[key] = scrubCredentials(w[key].slice(0,200));
+    for (const key of WATCHDOG_NUMBERS) if (Number.isFinite(w[key])) item[key] = Number(w[key]);
+    return item;
+  });
+}
 
 /**
  * The supervisor's recent automatic clears and retirements. Malformed entries are
@@ -29,7 +49,8 @@ export class OperationReports {
       return {project:o.project,phase:o.phase,...(typeof o.reason === 'string' ? {reason:scrubCredentials(o.reason.slice(0,1000))} : {})};
     });
     const housekeeping = automaticChanges(value.housekeeping);
-    const report = {operations,...(housekeeping.length ? {housekeeping} : {}),...(value.service === 'attention' ? {service:'attention',reason:scrubCredentials(String(value.reason ?? 'Control service unavailable').slice(0,1000))} : {})};
+    const watchdog = watchdogItems(value.watchdog);
+    const report = {operations,...(housekeeping.length ? {housekeeping} : {}),...(watchdog.length ? {watchdog} : {}),...(value.service === 'attention' ? {service:'attention',reason:scrubCredentials(String(value.reason ?? 'Control service unavailable').slice(0,1000))} : {})};
     this.db.prepare('INSERT INTO fleet_operation_reports VALUES (?,?,?) ON CONFLICT(machine) DO UPDATE SET received=excluded.received,report=excluded.report').run(machine,this.now(),JSON.stringify(report));
   }
   list() { return this.db.prepare('SELECT * FROM fleet_operation_reports ORDER BY machine').all().map(r => ({machine:String(r.machine),received:Number(r.received),...JSON.parse(String(r.report))})); }

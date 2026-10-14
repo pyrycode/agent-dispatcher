@@ -1267,6 +1267,14 @@ export interface GateRunReport {
   /** Build and device diagnostics, kept separately from the machine-readable report. */
   stderrPath?: string;
   /**
+   * The run's raw evidence folder outside the worktree, handed to the gate
+   * command as `PYRY_GATE_EVIDENCE_DIR` (gate-artifacts.ts). Each part of the
+   * run has a subfolder: `main`, `rerun`, `base`, `infra-check`. Null or
+   * absent when none was made, and then the command's own captures went
+   * wherever it puts them, usually the removed worktree.
+   */
+  evidenceDir?: string | null;
+  /**
    * Which of the branch's failing tests also fail on the base commit.
    *
    * Null means no baseline was run: the branch had no failures, the fork
@@ -1603,6 +1611,12 @@ export function formatGateEvidenceComment(opts: {
   lines.push("");
   lines.push(`Test report: \`${report.outputPath}\` (${formatBytes(report.outputBytes)}) on the dispatcher host.`);
   if (report.stderrPath) lines.push(`Diagnostic log: \`${report.stderrPath}\` on the dispatcher host.`);
+  if (report.evidenceDir) {
+    lines.push(`Raw evidence: \`${report.evidenceDir}\` on the dispatcher host, one folder per part of the run ` +
+      `(\`main\`, \`rerun\`, \`base\`, \`infra-check\`). It holds whatever the gate command wrote to ` +
+      `\`PYRY_GATE_EVIDENCE_DIR\`, kept outside the removed worktree. It is empty when the command does not use the ` +
+      `variable, and it is pruned later by age, count and size.`);
+  }
 
   return lines.join("\n");
 }

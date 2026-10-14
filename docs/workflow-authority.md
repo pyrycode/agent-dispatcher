@@ -134,6 +134,83 @@ resolve the actual state. Reuse the same command identity only for the exact sam
 request. The controls also support `state`, `labels`, `blockedBy`, `top` and `afterItemId`.
 Changing a status does not bypass dependency, review, ownership or admission checks.
 
+### Filing a ticket
+
+An interactive session files a new ticket in one step:
+
+```sh
+node --import tsx src/fleet-bin.ts workflow OPERATOR_CONFIG file owner/repo request.json
+```
+
+```json
+{
+  "commandId": "a-unique-id-retained-for-retries",
+  "title": "Show the relay state on the phone",
+  "body": "Issue description in Markdown.",
+  "labels": ["enhancement"],
+  "workflow": {
+    "stage": "Backlog",
+    "labels": ["priority:high", "done:refiner"],
+    "blockedBy": [2101, 2102]
+  }
+}
+```
+
+`commandId`, `title` and `body` are required. `labels` are GitHub content labels
+and must not use the workflow prefixes `wip:`, `done:`, `error:`,
+`needs-rework:`, `claim:` or `orchestrator:`. Those go in `workflow.labels`. The
+`workflow` block is optional. Its stage defaults to Inbox. Each blocker is a
+ticket number that the database already holds in the same project. The whole
+request is checked before anything is written to GitHub.
+
+The central service creates the issue with its own GitHub credential, adds it to
+the board and registers it as the bridge does when a worker creates an issue.
+It then applies the stage, workflow labels and blockers in one transaction and
+saves the answer with it. The command prints the ticket, issue number, URL,
+revision and the item as the database now holds it. GitHub's labels and column
+follow through the publisher.
+
+A failed filing is retried with the same request file. The same `commandId` with
+the same request never creates a second issue. A finished filing answers with
+its first result. If the issue was created but registration failed, the retry
+reuses that issue. If GitHub's answer to the creation was lost, the retry finds
+the issue by a hidden `<!-- orchestrator-filing:ID -->` line at the end of its
+body. Reusing a `commandId` with a different request is refused. A retry also
+converges when the content scan registered the issue in Inbox in between. It
+refuses only when the ticket meanwhile has an active reservation.
+
+## Recovery labels
+
+Recovery priority and the repair run have separate labels since 2026-10-14.
+`orchestrator:recovery-priority` gives an assigned repair recovery priority
+through all later stages and waits. `orchestrator:repairing` shows only the
+assigned repair run, from the handback until that run finishes. The
+[machine manager](machine-manager.md) describes when each appears and goes.
+
+The old `orchestrator:fixing` had both meanings. Every reader in this release
+treats it as `orchestrator:recovery-priority`. The rename is rolled out in two
+steps, because dispatchers of both versions run during a rollout and an older
+dispatcher reads only the old name.
+
+1. This release. Handbacks write both names and cleanup removes both. When the
+   central service starts, it adds `orchestrator:recovery-priority` to every
+   saved ticket that carries only `orchestrator:fixing`. Each such change is a
+   workflow command by `migration:recovery-priority` in the ticket's history.
+   A converged store changes nothing, so restarts are safe. A ticket handed back
+   by an older dispatcher keeps only the old name until the next central start.
+   It loses no priority, because every reader accepts either name.
+2. Retirement, once every dispatcher and machine manager runs this release or
+   later. Set `WRITE_LEGACY_RECOVERY_PRIORITY` in `src/recovery-labels.ts` to
+   `false` and deploy. At its next start the central service removes
+   `orchestrator:fixing` from every saved ticket, again once and recorded. When
+   the boards show no `orchestrator:fixing`, delete the GitHub label in each
+   repository, for example
+   `gh label delete orchestrator:fixing -R pyrycode/pyrycode --yes`.
+
+The publisher creates `orchestrator:recovery-priority` and `orchestrator:repairing`
+on GitHub the first time a ticket needs them, both in colour `FF1493` with a short
+description. A label that already exists keeps its colour and description.
+
 ## Recovery and rollback
 
 The database is now required for scheduling. If it is unavailable, workers fail

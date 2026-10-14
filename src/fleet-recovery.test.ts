@@ -12,6 +12,7 @@ import { ManagedDispatch } from "./managed-dispatch.js";
 import { runRecoveryWork, recoveryPlan, parseRecoveryDecision, recoveryHandoff, observationFor, cleanRecoveryLabels } from "./recovery-work.js";
 import type { AgentConfig, ProjectItem } from "./types.js";
 import { recoveryLogContext } from "./recovery-context.js";
+import { RECOVERY_ASSIGNMENT_LABELS, recoveryAssignmentLabels, RECOVERY_LABEL_DEFINITIONS } from "./recovery-labels.js";
 
 const project = "org/core";
 const limits = { mac: { heavyLimit: 1, combinedLimit: 2 }, linux: { heavyLimit: 1, combinedLimit: 2 } };
@@ -397,7 +398,7 @@ test("changed evidence, converging work and failed assessments never trigger a r
       decide: async d => { decided = d; return d; }, complete: async () => {},
       comment: async () => {}, removeLabel: async (_n, label) => { writes.push(label); }, move: async () => { writes.push("move"); }, notify: async () => {},
     });
-    assert.equal(assessed, 1); assert.deepEqual(writes, mode === "failed" ? ["orchestrator:investigating", "orchestrator:fixing"] : ["orchestrator:investigating"]);
+    assert.equal(assessed, 1); assert.deepEqual(writes, mode === "failed" ? ["orchestrator:investigating", ...RECOVERY_ASSIGNMENT_LABELS] : ["orchestrator:investigating"]);
     assert.equal(decided.action, mode === "failed" ? "escalate" : "wait");
   }
 });
@@ -458,7 +459,7 @@ test("sizing review remains informational while real operator holds stay manual"
   assert.equal(recoveryTrigger(observation(1, ["needs-human:sizing"])), null);
   assert.equal(recoveryTrigger(observation(1, ["needs-human:sizing", "needs-human:decision", "error:builder"]))?.manual, true);
   assert.equal(recoveryPlan(current, { action: "rework", reason: "Repair repeated source provenance defect" }, agents).status, "In Development");
-  current.labels = ["needs-human:sizing", "orchestrator:fixing"];
+  current.labels = ["needs-human:sizing", "orchestrator:recovery-priority", "orchestrator:repairing"];
   const removed: string[] = [];
   await cleanRecoveryLabels([current], async (_n, label) => { removed.push(label); });
   assert.deepEqual(removed, [], "informational sizing must not remove repair priority");
@@ -713,7 +714,7 @@ test("diagnosis evidence is bounded and restricted to this ticket's last two log
 });
 
 
-test("investigating is visible during assessment; fixing survives a successful handback only", async () => {
+test("investigating is visible during assessment; priority and repairing survive a successful handback only", async () => {
   for (const mode of ["rework", "retry", "wait", "escalate", "interrupted"] as const) {
     const current = item();
     const incident: RecoveryIncident = {id: "visible", ticket: `${project}#1`, fingerprint: recoveryFingerprint(observationFor(project, current)), reason: "error", state: "queued", created: 1, updated: 1, runId: null, decision: null};
@@ -730,20 +731,55 @@ test("investigating is visible during assessment; fixing survives a successful h
     });
     if (mode === "interrupted") await assert.rejects(run, /outage/); else await run;
     assert.equal(current.labels.includes("orchestrator:investigating"), false);
-    assert.equal(current.labels.includes("orchestrator:fixing"), mode === "rework" || mode === "retry");
+    for (const label of ["orchestrator:recovery-priority", "orchestrator:fixing", "orchestrator:repairing"])
+      assert.equal(current.labels.includes(label), mode === "rework" || mode === "retry", `${mode} ${label}`);
     assert.equal(current.labels.includes("error:builder"), mode !== "rework" && mode !== "retry");
   }
 });
 
 test("idle-ticket reconciliation repairs stale labels after outage or restart", async () => {
-  const activeRepair = item(["orchestrator:fixing"]);
-  const held = {...item(["orchestrator:fixing"]), issueNumber: 2, status: "Halted"};
-  const failed = {...item(["orchestrator:fixing", "error:builder"]), issueNumber: 3};
-  const done = {...item(["orchestrator:fixing", "orchestrator:investigating"]), issueNumber: 4, status: "Done"};
+  const assigned = ["orchestrator:recovery-priority", "orchestrator:fixing", "orchestrator:repairing"];
+  const activeRepair = item([...assigned]);
+  const laterStage = {...item(["orchestrator:recovery-priority", "orchestrator:fixing"]), issueNumber: 6, status: "In Code Review"};
+  const legacyOnly = {...item(["orchestrator:fixing"]), issueNumber: 7, status: "In QA"};
+  const held = {...item([...assigned]), issueNumber: 2, status: "Halted"};
+  const failed = {...item([...assigned, "error:builder"]), issueNumber: 3};
+  const done = {...item([...assigned, "orchestrator:investigating"]), issueNumber: 4, status: "Done"};
   const interrupted = {...item(["orchestrator:investigating"]), issueNumber: 5};
+  const operatorHold = {...item(["orchestrator:recovery-priority", "orchestrator:repairing", "needs-human:decision"]), issueNumber: 8};
+  const orphan = {...item(["orchestrator:repairing"]), issueNumber: 9};
   const removed: string[] = [];
-  await cleanRecoveryLabels([activeRepair, held, failed, done, interrupted], async (n,l) => {removed.push(`${n}:${l}`);});
-  assert.deepEqual(removed, ["2:orchestrator:fixing", "3:orchestrator:fixing", "4:orchestrator:fixing", "4:orchestrator:investigating", "5:orchestrator:investigating"]);
-  assert.deepEqual(activeRepair.labels, ["orchestrator:fixing"]);
-  await cleanRecoveryLabels([held, failed, done, interrupted], async () => {throw new Error("duplicate cleanup");});
+  await cleanRecoveryLabels([activeRepair, laterStage, legacyOnly, held, failed, done, interrupted, operatorHold, orphan], async (n,l) => {removed.push(`${n}:${l}`);});
+  assert.deepEqual(removed, [
+    ...assigned.map(l => `2:${l}`), ...assigned.map(l => `3:${l}`), ...assigned.map(l => `4:${l}`), "4:orchestrator:investigating",
+    "5:orchestrator:investigating", "8:orchestrator:recovery-priority", "8:orchestrator:repairing", "9:orchestrator:repairing"]);
+  assert.deepEqual(activeRepair.labels, assigned, "a repair waiting for or in its run keeps both labels");
+  assert.deepEqual(laterStage.labels, ["orchestrator:recovery-priority", "orchestrator:fixing"], "later stages and waits keep priority");
+  assert.deepEqual(legacyOnly.labels, ["orchestrator:fixing"], "the old name still means priority");
+  await cleanRecoveryLabels([held, failed, done, interrupted, operatorHold, orphan], async () => {throw new Error("duplicate cleanup");});
+});
+
+test("each repair decision writes the labels its handback needs", () => {
+  const priority = ["orchestrator:recovery-priority", "orchestrator:fixing"];
+  for (const action of ["retry", "rework", "resume", "refine"]) assert.deepEqual(recoveryAssignmentLabels(action), [...priority, "orchestrator:repairing"], action);
+  for (const action of ["unblock", "coordinate"]) assert.deepEqual(recoveryAssignmentLabels(action), priority, `${action} assigns no stage run`);
+  for (const action of ["wait", "escalate", "propose-close"]) assert.deepEqual(recoveryAssignmentLabels(action), [], action);
+  for (const definition of Object.values(RECOVERY_LABEL_DEFINITIONS)) {
+    assert.match(definition.color, /^[0-9A-F]{6}$/);
+    assert.ok(definition.description.length <= 100, "GitHub refuses longer label descriptions");
+  }
+});
+
+test("scheduler readers accept the new and the old priority name", () => {
+  for (const label of ["orchestrator:recovery-priority", "orchestrator:fixing"]) {
+    assert.equal(recoveryTrigger(observation(1, ["rework-count:3", label])), null, label);
+    const managed = new ManagedDispatch(project, {PYRY_MANAGER_URL: "http://localhost:1", PYRY_MANAGER_TOKEN: "test"});
+    const ticket = {issueNumber: 1, labels: [label]} as any;
+    managed.setRecoveryTickets([ticket]);
+    assert.equal(managed.offer(1, "real-claude-gate", "heavy").offer.recovery, true, label);
+    assert.equal(managed.agentOffer({name: "verifier"} as any, ticket, 0).offer.recovery, true, label);
+  }
+  const managed = new ManagedDispatch(project, {PYRY_MANAGER_URL: "http://localhost:1", PYRY_MANAGER_TOKEN: "test"});
+  assert.equal(managed.agentOffer({name: "builder"} as any, {issueNumber: 2, labels: ["orchestrator:repairing"]} as any, 0).offer.recovery, false,
+    "priority comes from the priority label, not the run marker");
 });

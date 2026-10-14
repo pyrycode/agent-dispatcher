@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { config } from "dotenv";
 import { githubPauseMs, freshGitHubRead } from "./github-transport.js";
 import { decidePollFailure, newPollOutage, pollRecovered, transientPollFailure } from "./poll-failure.js";
-import { runRecoveryWork, recoveryHandoff, parseRecoveryDecision, RECOVERY_INSTRUCTIONS, RECOVERY_EFFORT, RECOVERY_MAX_TURNS, RECOVERY_TIMEOUT_MS, cleanRecoveryLabels } from "./recovery-work.js";
+import { runRecoveryWork, recoveryHandoff, parseRecoveryDecision, RECOVERY_INSTRUCTIONS, RECOVERY_EFFORT, RECOVERY_MAX_TURNS, RECOVERY_TIMEOUT_MS, cleanRecoveryLabels, RECOVERY_REPAIRING } from "./recovery-work.js";
 import { verifyCoordination } from "./recovery-coordination.js";
 import { recoveryInventory, relatedTickets, relatedEvidence } from "./recovery-evidence.js";
 import { recoveryLogContext } from "./recovery-context.js";
@@ -21,6 +21,7 @@ import { countOpenPrs, shouldFlagMissingPr } from "./pr-guard.js";
 import { PENDING_VERDICT_PREFIX, REREVIEW_PATCH_CAP, decideVerdictRecovery, extractVerdictFindings, reworkFindingsNote, handoffMarker, isVerdictPublishFailure, parseLastVerdict, parsePendingVerdictState, parsePrVerdictView, parseVerdictHandoff, reReviewNote, serializeLastVerdict, serializePendingVerdictState, verdictHandoffNote, type HandoffParse, type PendingVerdictState, type VerdictHandoff, type VerdictPrLookup } from "./verdict-handoff.js";
 import { resolveImportOnlyMerge } from "./merge-resolve.js";
 import { gateReportSection, gateRunMetaPath, serializeGateRunMeta } from "./gate-report.js";
+import { GATE_EVIDENCE_ENV, gateEvidenceEnv, prepareGateRunEvidence } from "./gate-artifacts.js";
 import { FINAL_MERGE_HANDOFF_MARKER, FINAL_MERGE_HANDOFF_MAX, MERGE_HANDOFF_LABEL, checkMergeResolution, decideConflictRoute, decideFinalMergeRoute, findMergeCommit, mergeHandoffNote, mergeResolutionComment, mergeResolutionSection, readPendingMerge, type PendingMerge, type ResolutionNote } from "./merge-handoff.js";
 
 import {
@@ -2285,6 +2286,9 @@ export type DispatchDeps = {
   /** Start a post-merge codegraph reindex in the background and return at
    *  once. See `createCodegraphReindexer`. */
   reindexCodegraph: (repoRoot: string) => void;
+  /** Wait between mergeability reads in `runAutoMerge`. Optional so the
+   *  many hand-built deps keep compiling; a real timer when absent. */
+  sleepMs?: (ms: number) => Promise<void>;
 };
 
 // Default curation runner: spawn the memory-curation shell runner in inline
@@ -6960,6 +6964,9 @@ export type GateSpawner = (req: GateSpawnRequest) => Promise<GateSpawnOutcome>;
 export function buildGateSpawnEnv(parentEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env = scrubSpawnEnv(parentEnv);
   delete env.ANTHROPIC_API_KEY;
+  // Only a gate run the dispatcher made a folder for may name one; an
+  // inherited value would send captures to some other run's folder.
+  delete env[GATE_EVIDENCE_ENV];
   return env;
 }
 
@@ -7150,6 +7157,8 @@ export interface GateRunnerDeps {
   /** The selection backstop's record of the last passing full run. */
   readGateFullState: () => string | null;
   writeGateFullState: (json: string) => void;
+  /** Make the run's raw evidence folder (gate-artifacts.ts). Null runs without one. */
+  prepareEvidence: (logsDir: string, issueNumber: number, stamp: string) => string | null;
 }
 
 const GATE_FULL_STATE_FILE = "real-claude-gate-full-state.json";
@@ -7170,6 +7179,7 @@ export const DEFAULT_GATE_RUNNER_DEPS: GateRunnerDeps = {
     mkdirSync(LOGS_DIR, { recursive: true });
     writeFileSync(resolve(LOGS_DIR, GATE_FULL_STATE_FILE), json);
   },
+  prepareEvidence: (logsDir, issueNumber, stamp) => prepareGateRunEvidence(logsDir, issueNumber, stamp),
 };
 
 /**
@@ -7461,10 +7471,13 @@ export async function runRealClaudeGateSuite(opts: {
   // 5. Run it, then judge what landed on disk.
   try {
     deps.mkdirSync(logsDir, { recursive: true });
+    // Raw captures go outside the worktree, which is removed below
+    // (gate-artifacts.ts). Each part of the run gets its own folder.
+    report.evidenceDir = deps.prepareEvidence(logsDir, opts.issueNumber, stamp);
     const outcome = await deps.spawnGate({
       command,
       cwd: worktreeDir,
-      env: {...buildGateSpawnEnv(process.env),...managedTaskEnv()},
+      env: {...buildGateSpawnEnv(process.env),...managedTaskEnv(),...gateEvidenceEnv(report.evidenceDir, "main", deps.mkdirSync)},
       timeoutMs: opts.timeoutMs,
       stdoutPath,
       stderrPath,
@@ -7575,6 +7588,7 @@ export async function runRealClaudeGateSuite(opts: {
             stamp,
             label: "real-claude-gate-infra-check",
             who: "Real-claude gate infrastructure check",
+            evidence: { runDir: report.evidenceDir ?? null, part: "infra-check" },
             deps,
           });
           failedOnBase = check.failures;
@@ -7711,7 +7725,10 @@ async function runBaselineComparison(opts: {
   deps: GateRunnerDeps;
 }): Promise<void> {
   const { report } = opts;
-  const result = await runFailuresOnBase({ ...opts, label: "real-claude-gate-base", who: "Real-claude gate" });
+  const result = await runFailuresOnBase({
+    ...opts, label: "real-claude-gate-base", who: "Real-claude gate",
+    evidence: { runDir: opts.report.evidenceDir ?? null, part: "base" },
+  });
   if (result.outputPath !== null) report.baselineOutputPath = result.outputPath;
   report.baselineFailures = result.failures;
   report.baselineSkipReason = result.skipReason;
@@ -7741,7 +7758,9 @@ async function runFailuresOnBase(opts: {
   label: string;
   /** Log prefix naming the caller. */
   who: string;
-  deps: Pick<GateRunnerDeps, "execSync" | "spawnGate" | "readFileSync">;
+  /** The live gate run's evidence folder and this part's name in it. Absent for the verifier gates. */
+  evidence?: { runDir: string | null; part: string };
+  deps: Pick<GateRunnerDeps, "execSync" | "spawnGate" | "readFileSync"> & { mkdirSync?: GateRunnerDeps["mkdirSync"] };
 }): Promise<{ failures: string[] | null; skipReason: string | null; outputPath: string | null }> {
   const { deps, targetRepo } = opts;
   const skip = (skipReason: string, outputPath: string | null = null) => ({ failures: null, skipReason, outputPath });
@@ -7778,7 +7797,8 @@ async function runFailuresOnBase(opts: {
     const outcome = await deps.spawnGate({
       command,
       cwd: worktreeDir,
-      env: {...buildGateSpawnEnv(process.env),...managedTaskEnv()},
+      env: {...buildGateSpawnEnv(process.env),...managedTaskEnv(),
+        ...gateEvidenceEnv(opts.evidence?.runDir, opts.evidence?.part ?? "base", deps.mkdirSync ?? mkdirSync)},
       timeoutMs: opts.timeoutMs,
       stdoutPath,
       stderrPath,
@@ -7870,7 +7890,7 @@ async function runBranchRerun(opts: {
     const outcome = await deps.spawnGate({
       command,
       cwd: opts.worktreeDir,
-      env: {...buildGateSpawnEnv(process.env),...managedTaskEnv()},
+      env: {...buildGateSpawnEnv(process.env),...managedTaskEnv(),...gateEvidenceEnv(report.evidenceDir, "rerun", deps.mkdirSync)},
       timeoutMs: opts.timeoutMs,
       stdoutPath,
       stderrPath,
@@ -8586,6 +8606,13 @@ export async function runConcurrentDispatches(
       } catch (error: any) {
         console.error(`Error dispatching ${agent.name} on #${item.issueNumber}: ${error.message}`);
       } finally {
+        // This run was the repair the orchestrator assigned. Recovery priority
+        // stays; only the marker for the repair run itself ends here. The
+        // central store removes a marker this write leaves behind.
+        if (item.labels.includes(RECOVERY_REPAIRING)) {
+          try { await client.removeLabel(item.issueNumber, RECOVERY_REPAIRING); }
+          catch (e) { warnOnceCleanup(item.issueNumber, RECOVERY_REPAIRING, "post-dispatch removeLabel", e); }
+        }
         try {
           await client.removeLabel(item.issueNumber, wipLabel);
         } catch (e) {
@@ -8841,6 +8868,44 @@ async function handleMergeConflict(
   }
 }
 
+/** Polls of an UNKNOWN mergeability, and the wait between them. */
+const MERGEABLE_POLLS = 6;
+const MERGEABLE_POLL_MS = 5_000;
+/** Cycles a PR may stay UNKNOWN after a refused merge before it counts as a conflict. */
+export const MERGE_UNKNOWN_SKIP_MAX = 3;
+/** Consecutive uncounted UNKNOWN skips per PR, for this process. A restart
+ *  starts again from zero, which only delays the count by a few cycles. */
+export const mergeUnknownSkips = new Map<number, number>();
+
+/**
+ * GitHub's mergeability for a PR once it has settled, with the head it
+ * describes: MERGEABLE, CONFLICTING, or UNKNOWN when it is still computing
+ * after about 30 seconds. Null when it could not be read; the head is null
+ * when it was not a full commit id. The read goes to GitHub fresh, also
+ * through the shared connection, which never caches pull request reads.
+ */
+async function settleMergeable(prNumber: number, deps: DispatchDeps): Promise<{ state: string; head: string | null } | null> {
+  const sleep = deps.sleepMs ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const read = (): { state: string; head: string | null } | null => {
+    try {
+      const [state = "", head = ""] = deps.execSync(
+        `gh pr view ${prNumber} --json mergeable,headRefOid --jq '.mergeable + " " + .headRefOid'`,
+        { cwd: repoRoot, encoding: "utf-8", timeout: 15_000 },
+      ).toString().trim().split(/\s+/);
+      if (state !== "MERGEABLE" && state !== "CONFLICTING" && state !== "UNKNOWN") return null;
+      return { state, head: /^[0-9a-f]{40}$/.test(head) ? head : null };
+    } catch {
+      return null;
+    }
+  };
+  let view = read();
+  for (let i = 0; view?.state === "UNKNOWN" && i < MERGEABLE_POLLS; i++) {
+    await sleep(MERGEABLE_POLL_MS);
+    view = read();
+  }
+  return view;
+}
+
 /**
  * Auto-merge any open PR for tickets sitting in the Done column.
  *
@@ -8854,7 +8919,13 @@ async function handleMergeConflict(
  *     merge, which may still be clean (2026-09-23, #823). Transient
  *     failure → logged skip, retry next cycle (same posture as PR-list
  *     transient).
- *   - `gh pr merge <n> --merge --delete-branch`. On success: pull
+ *   - Wait up to about 30s for GitHub to settle the PR's mergeability and
+ *     read its head (`settleMergeable`).
+ *   - `gh pr merge <n> --merge --delete-branch --match-head-commit <head>`.
+ *     A conflict-shaped refusal is checked against GitHub's settled
+ *     mergeability first: still UNKNOWN → retry next cycle, uncounted, up
+ *     to MERGE_UNKNOWN_SKIP_MAX times; MERGEABLE → one immediate retry
+ *     (2026-10-14, mobile #1977). On success: pull
  *     merged changes to local main (non-fatal failure), strip pipeline
  *     labels from the issue, Discord notify. On conflict (detected
  *     via `isMergeConflictError` on stderr): `handleConflictWithRetry`,
@@ -8950,12 +9021,64 @@ export async function runAutoMerge(
       }
 
       // Step 2: Try the actual merge. Conflict path is the special case.
-      try {
-        console.log(`   🔀 Auto-merging PR #${prNumber} for #${item.issueNumber} (moved to Done)`);
+      //
+      // A rebase that moved the head leaves GitHub's mergeability UNKNOWN
+      // for a few seconds, and a merge in that window is refused as "not
+      // mergeable". So read the settled mergeability and the head first,
+      // and merge only that head (`--match-head-commit`): a push landing
+      // after the read is refused by GitHub instead of merged unseen.
+      const before = await settleMergeable(prNumber, deps);
+      const merge = (head: string | null): void => {
         execSync(
-          `gh pr merge ${prNumber} --merge --delete-branch`,
+          `gh pr merge ${prNumber} --merge --delete-branch${head ? ` --match-head-commit ${head}` : ""}`,
           { cwd: repoRoot, encoding: "utf-8", timeout: 30_000 }
         );
+      };
+      try {
+        console.log(`   🔀 Auto-merging PR #${prNumber} for #${item.issueNumber} (moved to Done)`);
+        try {
+          merge(before?.head ?? null);
+        } catch (first: any) {
+          // "Not mergeable" is also what GitHub answers while it is still
+          // computing mergeability. Counting that as a conflict spent a
+          // retry on pyrycode-mobile #1977 (PR #1980) on 2026-10-14: the
+          // rebase force-pushed at 12:19:11 and the merge was refused one
+          // second later, on a PR GitHub then reported clean. So ask
+          // GitHub before counting:
+          //   - CONFLICTING, or no readable answer: the counted conflict
+          //     path, exactly as before.
+          //   - UNKNOWN after the wait: retried next cycle without a
+          //     count, at most MERGE_UNKNOWN_SKIP_MAX times in a row for
+          //     the PR, then counted like a conflict, so a PR GitHub never
+          //     settles still reaches the handoff instead of looping.
+          //   - MERGEABLE: one immediate retry of that head. A second
+          //     refusal goes to the counted path.
+          if (!isMergeConflictError(`${first?.stderr ?? ""}\n${first?.message ?? ""}`)) throw first;
+          const after = before?.state === "UNKNOWN" ? before : await settleMergeable(prNumber, deps);
+          if (after?.state === "UNKNOWN") {
+            const skips = (mergeUnknownSkips.get(prNumber) ?? 0) + 1;
+            if (skips <= MERGE_UNKNOWN_SKIP_MAX) {
+              mergeUnknownSkips.set(prNumber, skips);
+              console.warn(`   ⏳ PR #${prNumber} for #${item.issueNumber}: GitHub has not settled whether it is mergeable; retrying next cycle without counting a conflict (${skips}/${MERGE_UNKNOWN_SKIP_MAX})`);
+              continue;
+            }
+            mergeUnknownSkips.delete(prNumber);
+            console.warn(`   ⏳ PR #${prNumber} for #${item.issueNumber}: mergeability still unsettled after ${MERGE_UNKNOWN_SKIP_MAX} cycles; counting it as a conflict`);
+            throw first;
+          }
+          mergeUnknownSkips.delete(prNumber);
+          if (after?.state !== "MERGEABLE") throw first;
+          // Retry only the head the first attempt was allowed to merge. A
+          // head that moved in between is one nobody read before merging;
+          // the next cycle reads it fresh.
+          if (before?.head && after.head !== before.head) {
+            console.warn(`   ⏳ PR #${prNumber} for #${item.issueNumber}: head moved from ${before.head.slice(0, 12)} to ${after.head?.slice(0, 12) ?? "unknown"} during the merge; retrying next cycle without counting a conflict`);
+            continue;
+          }
+          console.log(`   🔁 PR #${prNumber} for #${item.issueNumber}: refused while GitHub was settling mergeability, now mergeable; merging again`);
+          merge(before?.head ?? after.head);
+        }
+        mergeUnknownSkips.delete(prNumber);
         await client.recordMergedIssue?.(item.issueNumber);
         // Pull merged changes to local main. Failure is non-fatal — the
         // PR already merged on origin, so the next cycle's dispatch will
@@ -9453,13 +9576,34 @@ export async function pollLoop(): Promise<void> {
   if (managed) {await managed.start();rawClient=managed.authorityClient(rawClient);}
   const client = managed ? managed.client(rawClient) : rawClient;
   const maintenanceClient = managed ? managed.client(rawClient, true) : rawClient;
+  // Managed merges are light (see `mergeOfferShape`), so the CPU-heavy
+  // codegraph refresh a merge asks for is not run inside the merge. It is
+  // noted here and run as its own medium job, beside the loop, so it is
+  // charged to this computer's capacity and never holds a merge back.
+  let codegraphWanted = false;
+  let codegraphRun: Promise<void> | null = null;
+  const mergeDeps: DispatchDeps = managed
+    ? { ...DEFAULT_DEPS, reindexCodegraph: () => { codegraphWanted = true; } }
+    : DEFAULT_DEPS;
   const mergeReady = async (): Promise<void> => {
     if (!managed) return runAutoMerge(client);
     for (const item of await client.getItemsByStatus("Done")) {
       if (item.issueNumber <= 0 || item.labels.includes("merged") || item.labels.some(l => l.startsWith("error:"))) continue;
-      const offer = managed.offer(item.issueNumber, "merge", "heavy", [`${managed.project}:merge`], -2);
-      if (managed.ready(offer)) await managed.run(offer, () => runAutoMerge(managed.client(rawClient, false, item.issueNumber)));
+      const offer = managed.mergeOffer(item.issueNumber);
+      if (managed.ready(offer)) await managed.run(offer, () => runAutoMerge(managed.client(rawClient, false, item.issueNumber), mergeDeps));
     }
+    if (!codegraphWanted || codegraphRun !== null) return;
+    const offer = managed.codegraphOffer();
+    if (offer === null || !managed.ready(offer)) return;
+    codegraphWanted = false;
+    const run: Promise<void> = managed.run(offer, async () => {
+      defaultCodegraphReindexer.request(repoRoot);
+      await defaultCodegraphReindexer.whenIdle();
+    }).catch((e: any) => {
+      codegraphWanted = true;
+      console.warn(`   ⚠️  Post-merge codegraph refresh failed to run (retried after the next merge or cycle): ${e?.message ?? e}`);
+    }).finally(() => { if (codegraphRun === run) codegraphRun = null; });
+    codegraphRun = run;
   };
   // GitHub's board listing can lag its issues (2026-09-23 incident); the
   // client then reads columns from the issues and says so here, once.
@@ -9666,6 +9810,10 @@ export async function pollLoop(): Promise<void> {
       if (gateRun !== null) {
         console.log(`🚦 Drain: waiting for the real-claude gate on #${gateRun.issue} to finish`);
         await gateRun.done;
+      }
+      if (codegraphRun !== null) {
+        console.log(`🚦 Drain: waiting for the codegraph refresh to finish`);
+        await codegraphRun;
       }
       if (managed) await managed.stop();
       console.log("✅ Drain complete. Exiting cleanly.");

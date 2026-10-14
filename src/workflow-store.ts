@@ -1,6 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import type { ProjectItem } from "./types.js";
+import { RECOVERY_PRIORITY, RECOVERY_REPAIRING, LEGACY_RECOVERY_PRIORITY, WRITE_LEGACY_RECOVERY_PRIORITY } from "./recovery-labels.js";
 
 export type WorkflowItem = ProjectItem & {
   state: "OPEN" | "CLOSED";
@@ -25,6 +26,13 @@ export interface WorkflowChange {
   top?: boolean;
   afterItemId?: string;
 }
+export interface FiledTicket {
+  ticket: string;
+  issueNumber: number;
+  url: string;
+  revision: number;
+  item: WorkflowItem;
+}
 const projectPattern = /^[\w.-]+\/[\w.-]+$/;
 
 /** Workflow authority. GitHub observations never overwrite an adopted ticket's controls. */
@@ -38,11 +46,96 @@ export class WorkflowStore {
       ) STRICT;
       CREATE TABLE IF NOT EXISTS workflow_commands (id TEXT PRIMARY KEY, ticket TEXT NOT NULL, request TEXT NOT NULL, result TEXT NOT NULL) STRICT;
       CREATE TABLE IF NOT EXISTS workflow_events (id INTEGER PRIMARY KEY, ticket TEXT NOT NULL, actor TEXT NOT NULL, at INTEGER NOT NULL, change TEXT NOT NULL) STRICT;
-      CREATE TABLE IF NOT EXISTS workflow_comments (id TEXT PRIMARY KEY, ticket TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL, published INTEGER NOT NULL DEFAULT 0) STRICT;`);
+      CREATE TABLE IF NOT EXISTS workflow_comments (id TEXT PRIMARY KEY, ticket TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL, published INTEGER NOT NULL DEFAULT 0) STRICT;
+      CREATE TABLE IF NOT EXISTS workflow_filings (id TEXT PRIMARY KEY, project TEXT NOT NULL, request TEXT NOT NULL, started_at INTEGER NOT NULL, issue_id TEXT, result TEXT) STRICT;`);
     db.exec(`CREATE INDEX IF NOT EXISTS workflow_item_id ON workflow_tickets(json_extract(item,'$.id'));
       CREATE INDEX IF NOT EXISTS workflow_issue_id ON workflow_tickets(json_extract(item,'$.issueId'));
       CREATE INDEX IF NOT EXISTS workflow_parent ON workflow_tickets(project,json_extract(item,'$.parentNumber'));
       CREATE INDEX IF NOT EXISTS workflow_order ON workflow_tickets(project,position);`);
+    this.migrateRecoveryPriority();
+  }
+  /**
+   * Renames the saved recovery priority label once. Idempotent: a converged
+   * store changes nothing. Each change is a recorded workflow command.
+   * While old dispatchers may run, the old name stays beside the new one.
+   */
+  migrateRecoveryPriority(retireLegacy = !WRITE_LEGACY_RECOVERY_PRIORITY): number {
+    let changed = 0;
+    const rows = this.db
+      .prepare(
+        "SELECT ticket FROM workflow_tickets WHERE EXISTS (SELECT 1 FROM json_each(item,'$.labels') WHERE value=?) ORDER BY ticket",
+      )
+      .all(LEGACY_RECOVERY_PRIORITY);
+    for (const row of rows) {
+      const ticket = String(row.ticket),
+        item = this.get(ticket);
+      const addLabels = item.labels.includes(RECOVERY_PRIORITY)
+        ? []
+        : [RECOVERY_PRIORITY];
+      const removeLabels = retireLegacy ? [LEGACY_RECOVERY_PRIORITY] : [];
+      if (!addLabels.length && !removeLabels.length) continue;
+      this.change(
+        ticket,
+        { addLabels, removeLabels },
+        "migration:recovery-priority",
+        `migration:recovery-priority:${ticket}:${item.revision}`,
+        item.revision,
+      );
+      changed++;
+    }
+    return changed;
+  }
+  /**
+   * The repair run marker ends when the run the handback assigned has
+   * finished, whatever its outcome. That run is the first stage run to mark
+   * the ticket running after the marker was added. Removing it here, with no
+   * active run on the ticket, covers an interrupted run, a crashed worker
+   * released by an operator and a dispatcher that does not remove it itself.
+   */
+  settleRepairing(project: string): string[] {
+    const settled: string[] = [];
+    for (const item of this.list(project)) {
+      const ticket = `${project}#${item.issueNumber}`;
+      if (
+        !item.labels.includes(RECOVERY_REPAIRING) ||
+        this.db
+          .prepare("SELECT 1 FROM fleet_runs WHERE ticket=? AND finished IS NULL")
+          .get(ticket)
+      )
+        continue;
+      const adds = (change: string, label: (l: string) => boolean) => {
+        try {
+          const c = JSON.parse(change);
+          return [...(c?.addLabels ?? []), ...(c?.labels ?? [])].some(
+            (l: unknown) => typeof l === "string" && label(l),
+          );
+        } catch {
+          return false;
+        }
+      };
+      const events = this.db
+        .prepare("SELECT change FROM workflow_events WHERE ticket=? ORDER BY id")
+        .all(ticket)
+        .map((e) => String(e.change));
+      let assigned = -1;
+      events.forEach((e, i) => {
+        if (adds(e, (l) => l === RECOVERY_REPAIRING)) assigned = i;
+      });
+      if (
+        assigned < 0 ||
+        !events.slice(assigned + 1).some((e) => adds(e, (l) => l.startsWith("wip:")))
+      )
+        continue;
+      this.change(
+        ticket,
+        { removeLabels: [RECOVERY_REPAIRING] },
+        "authority",
+        `repairing:${ticket}:${item.revision}`,
+        item.revision,
+      );
+      settled.push(ticket);
+    }
+    return settled;
   }
   projects(): WorkflowProject[] {
     return this.db
@@ -418,6 +511,78 @@ export class WorkflowStore {
         .prepare("INSERT INTO workflow_commands VALUES (?,?,?,?)")
         .run(commandId, ticket, request, JSON.stringify(updated));
       return updated;
+    });
+  }
+  /**
+   * An operator filing outlives a failed attempt. The row is written before
+   * GitHub is asked to create anything, so a retry knows whether to look for
+   * an issue that may already exist.
+   */
+  beginFiling(
+    id: string,
+    project: string,
+    request: string,
+  ): { fresh: boolean; startedAt: number; issueId?: string; result?: FiledTicket } {
+    return this.transaction(() => {
+      const row = this.db
+        .prepare("SELECT * FROM workflow_filings WHERE id=?")
+        .get(id);
+      if (row) {
+        if (row.project !== project || row.request !== request)
+          throw new Error("Workflow command identity reused");
+        return {
+          fresh: false,
+          startedAt: Number(row.started_at),
+          ...(row.issue_id ? { issueId: String(row.issue_id) } : {}),
+          ...(row.result ? { result: JSON.parse(String(row.result)) } : {}),
+        };
+      }
+      const startedAt = Date.now();
+      this.db
+        .prepare(
+          "INSERT INTO workflow_filings VALUES (?,?,?,?,NULL,NULL)",
+        )
+        .run(id, project, request, startedAt);
+      return { fresh: true, startedAt };
+    });
+  }
+  filingCreated(id: string, issueId: string): void {
+    this.db
+      .prepare(
+        "UPDATE workflow_filings SET issue_id=? WHERE id=? AND issue_id IS NULL",
+      )
+      .run(issueId, id);
+  }
+  /** Applies the intended workflow and saves the answer in one transaction. */
+  completeFiling(
+    id: string,
+    ticket: string,
+    change: WorkflowChange,
+  ): FiledTicket {
+    return this.transaction(() => {
+      const row = this.db
+        .prepare("SELECT result FROM workflow_filings WHERE id=?")
+        .get(id);
+      if (!row) throw new Error("Unknown workflow filing");
+      if (row.result) return JSON.parse(String(row.result));
+      const item = this.change(
+        ticket,
+        change,
+        "operator",
+        "file:" + id,
+        this.get(ticket).revision,
+      );
+      const result: FiledTicket = {
+        ticket,
+        issueNumber: item.issueNumber,
+        url: item.url,
+        revision: item.revision,
+        item,
+      };
+      this.db
+        .prepare("UPDATE workflow_filings SET result=? WHERE id=?")
+        .run(JSON.stringify(result), id);
+      return result;
     });
   }
   finish(ticket: string, role: string, runId: string): void {

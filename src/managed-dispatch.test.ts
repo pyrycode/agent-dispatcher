@@ -53,7 +53,7 @@ test("documentation is light but retains its board-wide serial restriction", () 
 
 test("repair priority follows labels across builder, verification and live-gate offers", () => {
   const managed = new ManagedDispatch("org/core", {PYRY_MANAGER_URL: "http://localhost:1", PYRY_MANAGER_TOKEN: "test"});
-  const ticket = {issueNumber: 1, labels: ["orchestrator:fixing"]} as any;
+  const ticket = {issueNumber: 1, labels: ["orchestrator:recovery-priority"]} as any;
   managed.setRecoveryTickets([ticket]);
   const gate = managed.offer(1, "real-claude-gate", "heavy");
   assert.equal(gate.offer.recovery, true);

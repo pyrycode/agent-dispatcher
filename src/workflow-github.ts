@@ -19,9 +19,19 @@ import type {
   WorkflowItem,
   WorkflowChange,
   WorkflowProject,
+  FiledTicket,
 } from "./workflow-store.js";
 
 type Actor = { machine: string; session: string; runId?: string };
+type FilingRequest = {
+  commandId: string;
+  title: string;
+  body: string;
+  labels: string[];
+  workflow: { stage: string; labels: string[]; blockedBy: number[] };
+};
+// The prefixes discovery strips from a new issue. They are workflow state, not content.
+const WORKFLOW_LABEL = /^(wip:|done:|error:|needs-rework:|claim:|orchestrator:)/;
 const response = (value: unknown): GitHubResponse => ({
   status: 200,
   headers: { "content-type": "application/json" },
@@ -610,6 +620,122 @@ export class WorkflowGitHub {
       }
     }
     return response({ data: output });
+  }
+  /**
+   * Files a ticket for an operator: creates the issue, registers it like the
+   * bridge does and applies the intended workflow. Safe to retry with the same
+   * commandId. The hidden marker in the body finds an issue whose creation
+   * answer was lost, so a retry never creates a second one.
+   */
+  file(project: string, input: unknown): Promise<FiledTicket> {
+    const request = this.filingRequest(project, input);
+    const key = JSON.stringify(request);
+    const running = this.filings.get(request.commandId);
+    if (running) {
+      if (running.key !== key) throw new Error("Workflow command identity reused");
+      return running.work;
+    }
+    const work = this.fileOnce(project, request, key).finally(() =>
+      this.filings.delete(request.commandId),
+    );
+    this.filings.set(request.commandId, { key, work });
+    return work;
+  }
+  private filings = new Map<string, { key: string; work: Promise<FiledTicket> }>();
+  private filingRequest(project: string, input: any): FilingRequest {
+    const config = this.store.workflow.config(project);
+    if (!config) throw new Error("Workflow not enabled for this project");
+    if (!input || typeof input !== "object" || Array.isArray(input))
+      throw new Error("Invalid filing request");
+    const { commandId, title, body, labels = [], workflow = {} } = input;
+    if (Object.keys(input).some((k) => !["project", "commandId", "title", "body", "labels", "workflow"].includes(k)))
+      throw new Error("Unknown filing request field");
+    if (typeof commandId !== "string" || !commandId || commandId.length > 200)
+      throw new Error("Filing requires a commandId of at most 200 characters");
+    if (typeof title !== "string" || !title.trim() || title.length > 256)
+      throw new Error("Filing requires a title of at most 256 characters");
+    if (typeof body !== "string" || body.length > 60_000)
+      throw new Error("Filing requires a body of at most 60000 characters");
+    const names = (value: unknown, what: string) => {
+      if (!Array.isArray(value) || value.some((l) => typeof l !== "string" || !l || l.length > 100))
+        throw new Error(`Invalid ${what}`);
+      return [...new Set(value as string[])];
+    };
+    const content = names(labels, "labels");
+    if (content.some((l) => WORKFLOW_LABEL.test(l)))
+      throw new Error("Workflow labels belong in workflow.labels");
+    if (!workflow || typeof workflow !== "object" || Array.isArray(workflow) ||
+      Object.keys(workflow).some((k) => !["stage", "labels", "blockedBy"].includes(k)))
+      throw new Error("Invalid filing workflow");
+    const stage = workflow.stage ?? "Inbox";
+    if (typeof stage !== "string" || !Object.hasOwn(config.options, stage))
+      throw new Error("Unknown workflow stage");
+    const blockedBy = workflow.blockedBy ?? [];
+    if (!Array.isArray(blockedBy) || blockedBy.some((n) => !Number.isSafeInteger(n) || n < 1) ||
+      new Set(blockedBy).size !== blockedBy.length)
+      throw new Error("Blockers must be distinct ticket numbers");
+    const known = new Set(this.store.workflow.list(project).map((i) => i.issueNumber));
+    const missing = blockedBy.filter((n: number) => !known.has(n));
+    if (missing.length)
+      throw new Error(`Blockers are not tickets in ${project}: ${missing.join(", ")}`);
+    return {
+      commandId, title, body, labels: content,
+      workflow: { stage, labels: names(workflow.labels ?? [], "workflow labels"), blockedBy },
+    };
+  }
+  private async fileOnce(project: string, request: FilingRequest, key: string): Promise<FiledTicket> {
+    const filing = this.store.workflow.beginFiling(request.commandId, project, key);
+    if (filing.result) return filing.result;
+    const marker = `<!-- orchestrator-filing:${request.commandId} -->`;
+    let issueId =
+      filing.issueId ?? (filing.fresh ? undefined : await this.findFiled(project, marker, filing.startedAt));
+    if (!issueId) {
+      const created = await this.checked(project, {
+        method: "POST",
+        path: `/repos/${project}/issues`,
+        body: JSON.stringify({
+          title: request.title,
+          body: `${request.body}\n\n${marker}`,
+          ...(request.labels.length ? { labels: request.labels } : {}),
+        }),
+      });
+      issueId = JSON.parse(created.body).node_id;
+      if (typeof issueId !== "string" || !issueId)
+        throw new Error("GitHub did not return the new issue identity");
+    }
+    this.store.workflow.filingCreated(request.commandId, issueId);
+    await this.adoptIssue(project, issueId);
+    const ticket = this.store.workflow.find(issueId)!.ticket;
+    const items = this.store.workflow.list(project);
+    return this.store.workflowFile(request.commandId, ticket, {
+      status: request.workflow.stage,
+      addLabels: request.workflow.labels,
+      blockedBy: request.workflow.blockedBy.map((n) => {
+        const blocker = items.find((i) => i.issueNumber === n);
+        if (!blocker) throw new Error(`Blocker ${project}#${n} is no longer a ticket`);
+        return { number: n, state: blocker.state, url: blocker.url };
+      }),
+    });
+  }
+  /** Newest issues first, back to shortly before the first attempt started. */
+  private async findFiled(project: string, marker: string, startedAt: number) {
+    for (let page = 1; page <= 10; page++) {
+      const rows = JSON.parse(
+        (
+          await this.checked(project, {
+            method: "GET",
+            path: `/repos/${project}/issues?state=all&sort=created&direction=desc&per_page=100&page=${page}`,
+            fresh: true,
+          })
+        ).body,
+      );
+      if (!Array.isArray(rows)) throw new Error("Invalid issue list");
+      const hit = rows.find((r: any) => !r.pull_request && r.body?.includes(marker));
+      if (hit) return String(hit.node_id);
+      const oldest = Date.parse(rows.at(-1)?.created_at ?? "");
+      if (rows.length < 100 || oldest < startedAt - 600_000) return undefined;
+    }
+    throw new Error("Cannot confirm whether an earlier attempt created the issue");
   }
   async adoptIssue(project: string, id: string): Promise<void> {
     if (!id)

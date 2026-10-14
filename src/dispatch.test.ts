@@ -52,6 +52,8 @@ import {
   maybeResumeExhaustedRun,
   prepareAgentSpawn,
   runAutoMerge,
+  MERGE_UNKNOWN_SKIP_MAX,
+  mergeUnknownSkips,
   runParentClose,
   runClosedSweep,
   runConcurrentDispatches,
@@ -2462,6 +2464,15 @@ describe("selectUnansweredGateFailure", () => {
 
   test("the parked notice alone is not a gate failure", () => {
     assert.equal(selectUnansweredGateFailure([builderDone, verifierPassed, parked], "builder"), null);
+  });
+
+  test("the evidence comment names the raw evidence folder only when there is one", () => {
+    assert.doesNotMatch(gateFail, /Raw evidence/);
+    const withFolder = formatGateEvidenceComment({
+      verdict: "pass", reason: "ok", report: { ...report, evidenceDir: "/agents/logs/evidence/996/gate-runs/2026-10-14T08-12-13-141Z" },
+      minExecuted: 8, action: "moved it on.",
+    });
+    assert.ok(withFolder.includes("Raw evidence: `/agents/logs/evidence/996/gate-runs/2026-10-14T08-12-13-141Z` on the dispatcher host"), withFolder);
   });
 
   test("a gate verdict that parks for a human is not a rework reason", () => {
@@ -5281,6 +5292,39 @@ describe("runConcurrentDispatches", () => {
     // The attempted wip removal was recorded (failed, but attempted).
     assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1104 && c.label === "wip:developer"));
   });
+  test("the assigned repair run ends the repairing marker but keeps recovery priority", async () => {
+    const claudeMd = claudeMdAbsPath("developer/CLAUDE.md");
+    const repair = ["orchestrator:recovery-priority", "orchestrator:fixing", "orchestrator:repairing", "wip:developer"];
+    const client = new MockGitHubClient({
+      status: { 1105: "In Development", 1106: "In Development" },
+      labels: { 1105: [...repair], 1106: ["wip:developer"] },
+    });
+    const { deps } = makeMockDeps({
+      execImpls: {
+        "git rev-parse --verify feature/1105": () => execError({ stderr: "fatal" }),
+        "git rev-parse --verify origin/feature/1105": () => execError({ stderr: "fatal" }),
+        "git rev-parse --verify feature/1106": () => execError({ stderr: "fatal" }),
+        "git rev-parse --verify origin/feature/1106": () => execError({ stderr: "fatal" }),
+        "git status --porcelain": () => "",
+        "git rev-list --count main..": () => "1\n",
+      },
+      fsMap: { [claudeMd]: "developer system prompt" },
+      // The repair run fails. Its outcome does not matter to the marker.
+      streamResult: (opts) => opts?.cwd?.includes("developer-1105")
+        ? streamResult({ isError: true, terminalReason: "api_error", output: "anthropic API failure" })
+        : streamResult({ isError: false, output: "ok" }),
+    });
+    const agent = makeAgentConfig({});
+    await runConcurrentDispatches([
+      { agent, item: makeProjectItem({ issueNumber: 1105, labels: [...repair] }) },
+      { agent, item: makeProjectItem({ issueNumber: 1106, labels: ["wip:developer"] }) },
+    ], client, deps);
+    const removed = (n: number) => client.removeLabelCalls.filter(c => c.issueNumber === n).map(c => c.label);
+    assert.ok(removed(1105).includes("orchestrator:repairing"));
+    assert.ok(!removed(1105).includes("orchestrator:recovery-priority"));
+    assert.ok(!removed(1105).includes("orchestrator:fixing"));
+    assert.ok(!removed(1106).includes("orchestrator:repairing"), "an ordinary run writes nothing extra");
+  });
 });
 
 // =====================================================================
@@ -6777,6 +6821,8 @@ function makeGateDeps(over: Partial<GateRunnerDeps> & {
       spawnRequests.push(req);
       return { exitCode: 0, timedOut: false, spawnError: null, ...over.spawnOutcome };
     },
+    // Never the real filesystem: the folder is named, not made.
+    prepareEvidence: (logsDir: string, issueNumber: number, stamp: string) => `${logsDir}/evidence/${issueNumber}/gate-runs/${stamp}`,
     ...over,
   };
 
@@ -7315,6 +7361,34 @@ describe("runRealClaudeGateSuite — same-tree re-run before the base comparison
     assert.deepEqual(report.baselineFailures, ["p.TestFlaky"], "the base comparison still runs over the full set");
   });
 
+  test("each part of the run gets its own evidence folder outside the worktree", async () => {
+    // Mobile #2137 and #1977, 2026-10-14: the raw XML, logcat and per-arm
+    // captures were written inside the detached worktree and removed with it.
+    const { run, spawnRequests } = rerunHarness(contents(rerunRed, rerunGreen));
+    const report = await run();
+    const runDir = report.evidenceDir ?? "";
+    assert.match(runDir, /^\/tmp\/fake-logs\/evidence\/1382\/gate-runs\/\d{4}-\d{2}-\d{2}T[\d-]+Z$/);
+    assert.deepEqual(spawnRequests.map(r => r.env.PYRY_GATE_EVIDENCE_DIR), [`${runDir}/main`, `${runDir}/rerun`, `${runDir}/base`]);
+    for (const r of spawnRequests) assert.ok(!String(r.env.PYRY_GATE_EVIDENCE_DIR).startsWith(r.cwd), "never inside the worktree");
+  });
+
+  test("no evidence folder: the command runs without the variable, even when the parent had one", async () => {
+    const saved = process.env.PYRY_GATE_EVIDENCE_DIR;
+    process.env.PYRY_GATE_EVIDENCE_DIR = "/somewhere/else";
+    try {
+      const harness = makeGateDeps({ gitOut: (cmd) => GATE_SHAS[cmd] ?? "", prepareEvidence: () => null });
+      const report = await runRealClaudeGateSuite({
+        issueNumber: 1382, command: "go test -json ./...", format: "go-json", timeoutMs: 60_000,
+        repoRoot: "/tmp/fake-repo", defaultBranch: "main", logsDir: "/tmp/fake-logs", deps: harness.deps,
+      });
+      assert.equal(report.evidenceDir, null);
+      assert.equal(report.runError, null, "a missing evidence folder never fails the gate");
+      assert.ok(!("PYRY_GATE_EVIDENCE_DIR" in harness.spawnRequests[0].env));
+    } finally {
+      if (saved === undefined) delete process.env.PYRY_GATE_EVIDENCE_DIR; else process.env.PYRY_GATE_EVIDENCE_DIR = saved;
+    }
+  });
+
   test("an unfinished re-run cannot excuse a named failure using its passing fragment", async () => {
     const incomplete = `${rerunGreen}\n${JSON.stringify({ Action: "run", Package: "p", Test: "TestLuna" })}`;
     const report = await rerunHarness(contents(incomplete, rerunRed)).run();
@@ -7405,6 +7479,7 @@ describe("runRealClaudeGateSuite: infrastructure-shaped first pass", () => {
     assert.equal(spawnRequests.length, 2, "the first pass, then only the base check");
     assert.match(spawnRequests[1].cwd, /real-claude-gate-infra-check-2138/);
     assert.equal(spawnRequests[1].timeoutMs, 30_000, "the base check has its own, shorter bound");
+    assert.equal(spawnRequests[1].env.PYRY_GATE_EVIDENCE_DIR, `${report.evidenceDir}/infra-check`, "its captures get their own folder");
     assert.equal(report.infraFailure?.baseCheck?.tests.length, 3);
     assert.equal(report.infraFailure?.baseCheck?.confirmed, true);
     assert.ok(calls.some(c => c.includes(`worktree add --detach`) && c.includes(GATE_BASE_SHA)), "the check runs on the base commit");
@@ -7702,6 +7777,11 @@ describe("buildGateSpawnEnv", () => {
     // the board.
     const env = buildGateSpawnEnv({ GITHUB_TOKEN: "ghp_secret", CLAUDE_CODE_OAUTH_TOKEN: "t" });
     assert.equal(env.GITHUB_TOKEN, undefined);
+  });
+
+  test("drops an inherited evidence folder, which only the dispatcher may name per run", () => {
+    const env = buildGateSpawnEnv({ PYRY_GATE_EVIDENCE_DIR: "/elsewhere", CLAUDE_CODE_OAUTH_TOKEN: "t" });
+    assert.ok(!("PYRY_GATE_EVIDENCE_DIR" in env));
   });
 
   test("the gate command receives that environment", async () => {
@@ -12614,5 +12694,179 @@ describe("buildPromptForAgent — run-generated follow-up priority", () => {
       assert.match(prompt, /existing ticket.*priority/);
       assert.match(prompt, /split.*parent.*priority/);
     }
+  });
+});
+
+// =====================================================================
+// runAutoMerge: GitHub still settling mergeability (2026-10-14)
+// =====================================================================
+//
+// Modelled on pyrycode-mobile #1977 / PR #1980. The ticket reached Done,
+// the pre-merge rebase force-pushed a new head at 12:19:11, and the merge
+// one second later was refused with "GraphQL: Pull Request is not
+// mergeable (mergePullRequest)". The refusal was counted as a conflict
+// (merge-attempt:1) on a PR GitHub reported CLEAN minutes later.
+
+describe("runAutoMerge: mergeability still settling", () => {
+  const HEAD = "9db3a6091455189f001ed163bc9b9dc86a7637c1";
+  const HEAD2 = "1111111111111111111111111111111111111111";
+  const refusal = () => execError({ stderr: "GraphQL: Pull Request is not mergeable (mergePullRequest)" });
+  type MergeResult = "ok" | "refused" | "transient";
+  const setup = (opts: { views: string[]; merges: MergeResult[]; labels?: string[]; rebase?: "ok" | "conflict"; extraItems?: boolean }) => {
+    mergeUnknownSkips.clear();
+    const items: any[] = [{ id: "PVTI_1977", issueNumber: 1977, status: "Done", labels: opts.labels ?? ["done:documentation", "security-sensitive"], state: "OPEN" }];
+    if (opts.extraItems) items.push({ id: "PVTI_2153", issueNumber: 2153, status: "Done", labels: ["done:documentation"], state: "OPEN" });
+    const client = new MockGitHubClient({ items });
+    let view = 0;
+    let merge = 0;
+    const { deps, calls } = makeMockDeps({
+      execImpls: {
+        "gh pr list --head \"feature/1977\"": () => "1980\n",
+        "gh pr list --head \"feature/2153\"": () => "2155\n",
+        "gh pr update-branch 1980 --rebase": () => opts.rebase === "conflict" ? execError({ stderr: "GraphQL: rebase conflict between base and head (updatePullRequestBranch)" }) : "",
+        "gh pr view 1980 --json mergeable,headRefOid": () => opts.views[Math.min(view++, opts.views.length - 1)]! + "\n",
+        "gh pr view 2155 --json mergeable,headRefOid": () => `MERGEABLE ${HEAD2}\n`,
+        "gh pr merge 1980 --merge --delete-branch": () => {
+          const r = opts.merges[Math.min(merge++, opts.merges.length - 1)];
+          return r === "ok" ? "" : r === "refused" ? refusal() : execError({ stderr: "GraphQL: Head branch was modified. Review and try the merge again. (mergePullRequest)" });
+        },
+        "gh pr merge 2155 --merge --delete-branch": () => "",
+        "git checkout main && git pull": () => "",
+      },
+    });
+    const sleeps: number[] = [];
+    deps.sleepMs = async (ms) => { sleeps.push(ms); };
+    const merges = () => calls.exec.filter(c => c.cmd.startsWith("gh pr merge 1980 ")).map(c => c.cmd);
+    return { client, deps, calls, sleeps, merges };
+  };
+
+  test("waits for GitHub to settle after the rebase, then merges only the head it read", async () => {
+    const { client, deps, calls, sleeps, merges } = setup({ views: ["UNKNOWN", "UNKNOWN", `MERGEABLE ${HEAD}`], merges: ["ok"] });
+
+    await runAutoMerge(client, deps);
+
+    assert.equal(sleeps.length, 2, "polls while UNKNOWN, stops at the first settled answer");
+    const order = calls.exec.map(c => c.cmd);
+    const lastView = order.map((c, i) => c.startsWith("gh pr view 1980") ? i : -1).filter(i => i >= 0).pop()!;
+    const firstMerge = order.findIndex(c => c.startsWith("gh pr merge 1980"));
+    assert.ok(order.indexOf("gh pr update-branch 1980 --rebase") < lastView && lastView < firstMerge, "rebase, settle, then merge");
+    assert.deepEqual(merges(), [`gh pr merge 1980 --merge --delete-branch --match-head-commit ${HEAD}`]);
+    assert.ok(!client.addLabelCalls.some(c => c.label.startsWith("merge-attempt:")));
+    assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1977 && c.label === "done:documentation"));
+  });
+
+  test("#1977 shape: refused as not mergeable, then GitHub says MERGEABLE for the same head → merged at once, no conflict counted", async () => {
+    const { client, deps, calls, merges } = setup({ views: [`MERGEABLE ${HEAD}`], merges: ["refused", "ok"] });
+
+    await runAutoMerge(client, deps);
+
+    assert.deepEqual(merges(), [
+      `gh pr merge 1980 --merge --delete-branch --match-head-commit ${HEAD}`,
+      `gh pr merge 1980 --merge --delete-branch --match-head-commit ${HEAD}`,
+    ], "one immediate retry, of the same head");
+    assert.ok(!client.addLabelCalls.some(c => c.label.startsWith("merge-attempt:") || c.label === "error:merge-conflict"));
+    assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1977 && c.label === "done:documentation"));
+    assert.ok(calls.exec.some(c => c.cmd === "git checkout main && git pull"), "post-merge bookkeeping still runs");
+    assert.equal(client.comments.length, 0);
+    assert.equal(calls.discord.length, 0);
+  });
+
+  test("still UNKNOWN → retried next cycle uncounted, then counted after the cap", async () => {
+    const { client, deps, calls, sleeps, merges } = setup({ views: ["UNKNOWN"], merges: ["refused"] });
+
+    for (let cycle = 1; cycle <= MERGE_UNKNOWN_SKIP_MAX; cycle++) {
+      await runAutoMerge(client, deps);
+      assert.equal(merges().length, cycle);
+      assert.deepEqual(client.addLabelCalls, [], `cycle ${cycle} is not counted`);
+    }
+    assert.equal(sleeps.length, 6 * MERGE_UNKNOWN_SKIP_MAX, "one wait per cycle, not a second one after the refusal");
+    assert.deepEqual(client.removeLabelCalls, [], "nothing is cleaned up on an unmerged ticket");
+    assert.ok(!calls.exec.some(c => c.cmd === "git checkout main && git pull"));
+    assert.equal(client.comments.length, 0);
+
+    await runAutoMerge(client, deps);
+
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1977, label: "merge-attempt:1" }], "a PR GitHub never settles is counted, never loops forever");
+    assert.equal(mergeUnknownSkips.has(1980), false);
+  });
+
+  test("an UNKNOWN skip moves on to the next Done ticket in the same pass", async () => {
+    const { client, deps, calls } = setup({ views: ["UNKNOWN"], merges: ["refused"], extraItems: true });
+
+    await runAutoMerge(client, deps);
+
+    assert.ok(calls.exec.some(c => c.cmd === `gh pr merge 2155 --merge --delete-branch --match-head-commit ${HEAD2}`));
+    assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 2153 && c.label === "done:documentation"));
+    assert.ok(!client.removeLabelCalls.some(c => c.issueNumber === 1977));
+  });
+
+  test("UNKNOWN for the whole wait, then the merge succeeds → merged normally", async () => {
+    const { client, deps, sleeps, merges } = setup({ views: [`UNKNOWN ${HEAD}`], merges: ["ok"] });
+
+    await runAutoMerge(client, deps);
+
+    assert.equal(sleeps.length, 6);
+    assert.deepEqual(merges(), [`gh pr merge 1980 --merge --delete-branch --match-head-commit ${HEAD}`]);
+    assert.ok(client.removeLabelCalls.some(c => c.issueNumber === 1977 && c.label === "done:documentation"));
+    assert.deepEqual(client.addLabelCalls, []);
+  });
+
+  test("head moved between the refusal and the re-read → not merged unseen, retried next cycle uncounted", async () => {
+    const { client, deps, merges } = setup({ views: [`MERGEABLE ${HEAD2}`, `MERGEABLE ${HEAD}`], merges: ["refused", "ok"] });
+
+    await runAutoMerge(client, deps);
+
+    assert.deepEqual(merges(), [`gh pr merge 1980 --merge --delete-branch --match-head-commit ${HEAD2}`], "the new head is never merged in this pass");
+    assert.deepEqual(client.addLabelCalls, []);
+    assert.deepEqual(client.removeLabelCalls, []);
+  });
+
+  test("CONFLICTING → counted as a conflict exactly as before", async () => {
+    const { client, deps, merges } = setup({ views: [`CONFLICTING ${HEAD}`], merges: ["refused"] });
+
+    await runAutoMerge(client, deps);
+
+    assert.equal(merges().length, 1, "no retry against a real conflict");
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1977, label: "merge-attempt:1" }]);
+  });
+
+  test("rebase refused over a conflict → no wait when GitHub has already settled, conflict counted", async () => {
+    const { client, deps, sleeps, merges } = setup({ views: [`CONFLICTING ${HEAD}`], merges: ["refused"], rebase: "conflict" });
+
+    await runAutoMerge(client, deps);
+
+    assert.deepEqual(sleeps, []);
+    assert.equal(merges().length, 1, "the plain merge is still tried");
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1977, label: "merge-attempt:1" }]);
+  });
+
+  test("MERGEABLE but refused twice → the second refusal is counted", async () => {
+    const { client, deps, merges } = setup({ views: [`MERGEABLE ${HEAD}`], merges: ["refused", "refused"], labels: ["merge-attempt:1"] });
+
+    await runAutoMerge(client, deps);
+
+    assert.equal(merges().length, 2, "only one immediate retry, never a loop");
+    assert.ok(client.addLabelCalls.some(c => c.label === "merge-attempt:2"));
+    assert.ok(client.removeLabelCalls.some(c => c.label === "merge-attempt:1"));
+  });
+
+  test("the retry refused for a moved head → transient, retried next cycle, nothing counted or cleaned", async () => {
+    const { client, deps, merges } = setup({ views: [`MERGEABLE ${HEAD}`], merges: ["refused", "transient"] });
+
+    await runAutoMerge(client, deps);
+
+    assert.equal(merges().length, 2);
+    assert.deepEqual(client.addLabelCalls, []);
+    assert.deepEqual(client.removeLabelCalls, []);
+    assert.equal(client.comments.length, 0);
+  });
+
+  test("an unreadable mergeability keeps the old conflict path and merges without a head match", async () => {
+    const { client, deps, merges } = setup({ views: [""], merges: ["refused"] });
+
+    await runAutoMerge(client, deps);
+
+    assert.deepEqual(merges(), ["gh pr merge 1980 --merge --delete-branch"]);
+    assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1977, label: "merge-attempt:1" }]);
   });
 });

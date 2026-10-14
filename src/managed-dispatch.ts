@@ -11,6 +11,7 @@ import type { Claim, FleetRun, FleetSnapshot, ResourceClass } from "./fleet-stor
 import type { WorkOffer } from "./machine-scheduler.js";
 import type { AgentConfig, ProjectItem } from "./types.js";
 import { observationFor } from "./recovery-work.js";
+import { hasRecoveryPriority } from "./recovery-labels.js";
 import type { PauseRecord, EvidenceRecord, CoordinationRecord } from "./recovery-facts.js";
 import type { RecoveryObservation, RecoveryIncident, RecoveryDecision } from "./fleet-recovery.js";
 import type { AgentRunner } from './agent-runner.js';
@@ -46,6 +47,42 @@ export function resourceClasses(raw: string | undefined): Record<string, Resourc
   const parsed = JSON.parse(raw);
   if (!parsed || Array.isArray(parsed) || typeof parsed !== "object" || Object.values(parsed).some(v => v !== "heavy" && v !== "medium" && v !== "light")) throw new Error("PYRY_RESOURCE_CLASSES must map role names to heavy, medium or light");
   return parsed;
+}
+
+/**
+ * The managed offer for one Done ticket's merge.
+ *
+ * Light, so it never waits for heavy or combined capacity. A merge is a few
+ * GitHub calls and a pull of main. The codegraph refresh that follows a
+ * merge is CPU work, so it is not part of the merge: it runs as its own
+ * medium job (`codegraphOfferShape`). While the merge was
+ * heavy, a ticket that reached Done waited for the claiming computer's one
+ * heavy place: pyrycode-mobile #1977 reached Done at 12:05:56 on 2026-10-14
+ * and its merge was granted at 12:19:04, the second a core repair task
+ * released that computer's heavy place.
+ *
+ * Capacity was never what kept merges single. One actor still owns each
+ * merge: only the ticket's claiming computer is granted it, the authority
+ * admits one unfinished run per ticket, and the project lock admits one
+ * merge per board across all computers.
+ */
+/**
+ * The managed offer for the post-merge codegraph refresh on one computer.
+ * Medium, so it is charged against the computer's combined capacity like a
+ * build. Named per computer and, through the offer's project prefix, per
+ * project: each computer refreshes its own checkout, and the authority
+ * admits one unfinished run per name, so refreshes of one checkout never
+ * overlap. It carries no ticket claim, so on a busy computer it waits
+ * behind claimed ticket work for a combined place; agents fall back to
+ * grep on a stale index meanwhile. Null for a name a ticket cannot carry.
+ */
+export function codegraphOfferShape(machine: string): { ticket: string; role: "codegraph"; resource: ResourceClass; locks: string[]; order: number } | null {
+  if (!/^[\w.-]+$/.test(machine)) return null;
+  return { ticket: `@codegraph-${machine}`, role: "codegraph", resource: "medium", locks: [], order: -1 };
+}
+
+export function mergeOfferShape(project: string): { role: "merge"; resource: ResourceClass; locks: string[]; order: number } {
+  return { role: "merge", resource: "light", locks: [`${project}:merge`], order: -2 };
 }
 
 interface Pending { offer: WorkOffer; run?: FleetRun; retired?: boolean }
@@ -110,7 +147,7 @@ export class ManagedDispatch {
   }
   beginCycle(): void { this.seen.clear(); }
   setRecoveryTickets(items: readonly ProjectItem[]): void {
-    this.recoveryTickets = new Set(items.filter(i => i.labels.includes("orchestrator:fixing"))
+    this.recoveryTickets = new Set(items.filter(i => hasRecoveryPriority(i.labels))
       .map(i => `${this.project}#${i.issueNumber}`));
     for (const p of this.pending.values()) if (!p.run && p.offer.role !== 'recovery') {
       p.offer.recovery = this.recoveryTickets.has(p.offer.ticket);
@@ -144,12 +181,24 @@ export class ManagedDispatch {
     }
     return pending;
   }
+  /** Null until the first sync has named this computer. */
+  codegraphOffer(): Pending | null {
+    const machine = (this.state as FleetSnapshot & { machine?: string }).machine;
+    if (!machine) return null;
+    const shape = codegraphOfferShape(machine);
+    if (shape === null) return null;
+    return this.offer(shape.ticket, shape.role, shape.resource, shape.locks, shape.order);
+  }
+  mergeOffer(issue: number): Pending {
+    const shape = mergeOfferShape(this.project);
+    return this.offer(issue, shape.role, shape.resource, shape.locks, shape.order);
+  }
   agentOffer(agent: AgentConfig, item: ProjectItem, order: number): Pending {
     const pending = this.offer(item.issueNumber, agent.name, this.classes[agent.name] ?? DEFAULT_RESOURCE_CLASSES[agent.name] ?? "heavy",
       agent.serial ? [`${this.project}:role:${agent.name}`] : [], order);
     pending.offer.roleLimit = agent.serial ? 1 : agent.maxInFlight;
     if (!pending.run) {
-      pending.offer.recovery = item.labels.includes("orchestrator:fixing");
+      pending.offer.recovery = hasRecoveryPriority(item.labels);
       pending.offer.recoveryError = pending.offer.recovery;
     }
     return pending;

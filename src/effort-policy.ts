@@ -1,5 +1,6 @@
 import type { AgentRunner } from "./agent-runner.js";
 import type { AgentConfig, ProjectItem } from "./types.js";
+import { hasRecoveryPriority } from "./recovery-labels.js";
 
 export function validateEffortPolicy(value: string | undefined, stageSet: string): void {
   if (!value || value === "off") return;
@@ -66,7 +67,7 @@ export function resolveEffort(opts: {
   const { agent, item, runner, env, stageSet } = opts;
   validateEffortPolicy(env.PYRY_EFFORT_POLICY, stageSet);
   const policy = env.PYRY_EFFORT_POLICY === "role-risk-v1" ? "role-risk-v1" : "off";
-  if ((agent.name === "builder" || agent.name === "developer") && item.labels.includes("orchestrator:fixing")) {
+  if ((agent.name === "builder" || agent.name === "developer") && hasRecoveryPriority(item.labels)) {
     return { effort: "xhigh", policy, reason: "orchestrator recovery repair" };
   }
   if (agent.name === "builder") {
