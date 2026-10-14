@@ -35,7 +35,9 @@ export const GATE_OUTPUT_FORMATS: readonly GateOutputFormat[] = ["go-json", "pla
 
 /** Bump when completeness validation changes. A saved completeParse flag
  * certifies only its reader's rules, so older tallies must be reparsed. */
-export const GATE_PARSER_VERSION = 4;
+// 5: Go runs record a non-deadline panic or data race (`abnormalExit`), which
+// a saved version 4 tally lacks, so those are re-parsed from the raw output.
+export const GATE_PARSER_VERSION = 5;
 
 /**
  * Type guard for the env-configured format string. An unrecognised value
@@ -382,6 +384,12 @@ export interface GateTally {
   /** Packages/suites that reported failure, in encounter order. */
   packageFailures: string[];
   /**
+   * Go only: the run printed a panic other than the test binary's own
+   * deadline, or a data race. Either stops or taints a whole package, so the
+   * named failures alone cannot say what else broke.
+   */
+  abnormalExit?: boolean;
+  /**
    * How many lines/documents parsed into recognisable events. Zero means
    * the artifact is unusable — there is nothing to judge, which is a very
    * different thing from "nothing failed".
@@ -642,6 +650,9 @@ function parseGoJson(raw: string): GateTally {
     if (event.Action === "output") {
       const text = event.Output ?? "";
       const panic = text.match(GO_TIMEOUT_PANIC);
+      if (!panic && (/^\s*panic: /.test(text) || /WARNING: DATA RACE|race detected during execution of test/.test(text))) {
+        tally.abnormalExit = true;
+      }
       if (panic) {
         inTimeoutList = true;
         tally.timedOutBudget = panic[1];
@@ -1394,6 +1405,8 @@ export function formatGateEvidenceComment(opts: {
   preExisting?: readonly string[];
   /** Failures that passed when re-run on the same merged tree. */
   flaky?: readonly string[];
+  /** Inherited failures the gate accepted, each with its tracking ticket. */
+  acceptedInherited?: readonly { name: string; issue: number }[];
 }): string {
   const { report } = opts;
   const heading: Record<string, string> = {
@@ -1403,6 +1416,7 @@ export function formatGateEvidenceComment(opts: {
     "zero-executed": "🚨 Real-claude gate — NOTHING EXECUTED",
     unusable: "🚨 Real-claude gate — NO USABLE RESULT",
     "inherited-failure": "⚠️ Real-claude gate — FAILURES THIS BRANCH DID NOT CAUSE",
+    "inherited-pass": "⚠️ Real-claude gate: PASS WITH ACCEPTED INHERITED FAILURES",
     "infra-failure": "🚨 Real-claude gate: INFRASTRUCTURE FAILURE, NOT JUDGED",
   };
 
@@ -1535,9 +1549,15 @@ export function formatGateEvidenceComment(opts: {
       const compared = report.baselineFailures !== null;
 
       if (compared && preExisting.length > 0) {
-        lines.push(`**Already failing on \`${report.baseRef}\` (${preExisting.length})** — not caused by this branch:`);
+        const trackers = new Map((opts.acceptedInherited ?? []).map(t => [t.name, t.issue] as const));
+        lines.push(trackers.size > 0
+          ? `**Already failing on \`${report.baseRef}\` (${preExisting.length})**, not caused by this branch, failed again on the same-tree re-run, and accepted because each is tracked on an open ticket:`
+          : `**Already failing on \`${report.baseRef}\` (${preExisting.length})** — not caused by this branch:`);
         lines.push("");
-        for (const name of preExisting.slice(0, 25)) lines.push(`- \`${name}\``);
+        for (const name of preExisting.slice(0, 25)) {
+          const issue = trackers.get(name);
+          lines.push(issue === undefined ? `- \`${name}\`` : `- \`${name}\`, tracked on #${issue}`);
+        }
         lines.push("");
       }
 
@@ -1616,6 +1636,10 @@ export function formatGateEvidenceComment(opts: {
       `(\`main\`, \`rerun\`, \`base\`, \`infra-check\`). It holds whatever the gate command wrote to ` +
       `\`PYRY_GATE_EVIDENCE_DIR\`, kept outside the removed worktree. It is empty when the command does not use the ` +
       `variable, and it is pruned later by age, count and size.`);
+  }
+  // Machine-readable record of the accepted inherited failures, one per test.
+  for (const t of opts.acceptedInherited ?? []) {
+    lines.push(`<!-- real-claude-gate-accepted-inherited: #${t.issue} ${t.name.replace(/--/g, "- -")} -->`);
   }
 
   return lines.join("\n");

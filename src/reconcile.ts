@@ -38,6 +38,7 @@ import {
   REWORK_LOOP_THRESHOLD,
   decideAutoAdvance,
   decideBaselineAdjustedVerdict,
+  decideInheritedAdvance,
   INFRA_FAILURE_LABEL,
   type BaselineAdjustedVerdict,
   decideGateOutcome,
@@ -64,10 +65,10 @@ import {
 import { selectDispatches } from "./dispatch-selection.js";
 import { findRepeatedMustFix, newestFailVerdict, parseVerdictArtifacts, staleBaseFindings, type VerdictArtifact } from "./verdict-guard.js";
 import { GATE_PARSER_VERSION, formatGateEvidenceComment, gateCommandProvenance, gateRunFloor, gateRunRequiredTests, parseGateOutput, validateGateOutputProvenance, type GateOutputFormat, type GateRunReport } from "./gate-output.js";
-import { gateRunMetaMatches, gateRunMetaPath, parseGateRunMeta, type GateRunMeta } from "./gate-report.js";
+import { gateRunMetaMatches, gateRunMetaPath, parseGateRunMeta, recordAcceptedInherited, type GateRunMeta } from "./gate-report.js";
 import type { TestEvidenceRule } from "./gate-test-evidence.js";
 import type { FlakyRunContext, FlakyTicketResult } from "./flaky-tickets.js";
-import type { InheritedTicketResult } from "./inherited-tickets.js";
+import type { InheritedTicketOptions, InheritedTicketResult } from "./inherited-tickets.js";
 
 /**
  * Subset of `GitHubProjectClient` that reconciliation actually uses.
@@ -702,10 +703,12 @@ export async function runRealClaudeGateExecution(
   inFlight = 0,
   recordFlaky: (flaky: readonly string[], ctx: FlakyRunContext) => Promise<FlakyTicketResult> = noFlakyTickets,
   background?: RealClaudeGateBackground,
-  recordInherited: (failures: readonly string[], ctx: FlakyRunContext) => Promise<InheritedTicketResult> = noInheritedTickets,
+  recordInherited: (failures: readonly string[], ctx: FlakyRunContext, options?: InheritedTicketOptions) => Promise<InheritedTicketResult> = noInheritedTickets,
   /** The fork's configured gate format, used only for a saved report that
-   *  predates recorded formats and whose command names no reporter. */
-  options: { legacyFormat?: GateOutputFormat; testEvidence?: readonly TestEvidenceRule[] } = {},
+   *  predates recorded formats and whose command names no reporter.
+   *  `inheritedAdvance` lets a tracked inherited failure advance the ticket
+   *  (`PYRY_REAL_CLAUDE_GATE_INHERITED_ADVANCE`); absent means it parks. */
+  options: { legacyFormat?: GateOutputFormat; testEvidence?: readonly TestEvidenceRule[]; inheritedAdvance?: boolean } = {},
 ): Promise<boolean> {
   // Off switch. No command configured means this step never touches the
   // board, so the whole feature can land on a live dispatcher before any
@@ -932,28 +935,60 @@ export async function runRealClaudeGateExecution(
         reason = `${raw.missingLiveAcceptance}; a failure-only re-run cannot supply missing live acceptance`;
       }
       if (conflictParkNote !== "") reason = `${reason} ${conflictParkNote.replace(/\.$/, "")}`;
+      // An inherited failure may advance instead of parking, when every
+      // condition in decideInheritedAdvance holds and every inherited test
+      // has an open tracker naming it (checked by recordInherited).
+      const advance = verdict === "inherited-failure" && conflictParkNote === ""
+        ? decideInheritedAdvance({
+          enabled: options.inheritedAdvance === true,
+          adjusted: { verdict, introduced, preExisting, flaky },
+          raw,
+          tally: report.tally,
+          format,
+          rerunFailures: report.rerunFailures,
+          baselineFailures: report.baselineFailures,
+          requiredTests: gateRunRequiredTests(report),
+          testEvidence: options.testEvidence,
+        })
+        : null;
       let inheritedTickets: InheritedTicketResult = { blockers: [], untracked: [] };
       if (preExisting.length > 0) {
         try {
           inheritedTickets = await recordInherited(preExisting, {
             gatedIssue: candidate.issueNumber, report, at: new Date().toISOString(),
-          });
+            gatedBody: parked.find(i => i.issueNumber === candidate.issueNumber)?.body,
+          }, advance?.eligible ? { advance: true } : undefined);
         } catch (error) {
           console.warn(`   ⚠️ Shared live failure filing failed: ${error}`);
-          inheritedTickets.untracked = [...preExisting];
+          inheritedTickets = { blockers: [], untracked: [...preExisting] };
         }
       }
       if ((inheritedTickets.owned?.length ?? 0) > 0) {
         verdict = "fail";
         reason += `; this ticket already owns the fix for ${inheritedTickets.owned!.join(", ")}, so its builder must repair them`;
       }
+      const accepted = advance?.eligible && verdict === "inherited-failure" && inheritedTickets.tracked !== undefined
+        && inheritedTickets.untracked.length === 0 && inheritedTickets.blockers.length === 0
+        && (inheritedTickets.owned?.length ?? 0) === 0
+        && preExisting.every(name => inheritedTickets.tracked!.some(t => t.name === name))
+        ? inheritedTickets.tracked : null;
+      if (accepted) {
+        verdict = "inherited-pass";
+        reason = `${preExisting.length} test(s) failed on this branch, failed again on the same-tree re-run and fail on ` +
+          `the base commit, and each is tracked on an open ticket. This ticket's own required live tests passed, so ` +
+          `it advances as an accepted inherited-failure pass` + (flaky.length > 0 ? `; ${flaky.length} other(s) passed on re-run and are set aside as flaky` : "");
+      }
+      const advanceNote = verdict === "inherited-failure" && advance !== null && options.inheritedAdvance === true
+        ? ` It did not advance past the inherited failure: ${advance.eligible ? inheritedTickets.fallbackReason ?? "a tracking ticket could not be confirmed" : advance.reason}.`
+        : "";
       const inheritedWait = verdict === "inherited-failure" && inheritedTickets.untracked.length === 0
         && preExisting.every(name => inheritedTickets.blockers.some(b => b.name === name));
       const blockerNote = inheritedTickets.blockers.length > 0
         ? ` Shared failures tracked on ${[...new Set(inheritedTickets.blockers.map(b => `#${b.issue}`))].join(", ")}.`
         : "";
       const artifactsPending = freshLabels.includes("needs-live-artifacts")
-        && (verdict === "pass" || verdict === "flaky-pass");
+        && (verdict === "pass" || verdict === "flaky-pass" || verdict === "inherited-pass");
+      const acceptedList = (accepted ?? []).map(t => `\`${t.name}\` (tracked on #${t.issue})`).join(", ");
       const outcome = artifactsPending
         ? { toColumn: "In Development", addLabels: [realClaudeGate.failReworkLabel], removeLabels: [], notify: verdict === "flaky-pass" }
         : decideGateOutcome(verdict === "inherited-failure" && !inheritedWait ? "unusable" : verdict, realClaudeGate.failReworkLabel);
@@ -968,9 +1003,9 @@ export async function runRealClaudeGateExecution(
         : verdict === "inherited-failure"
         ? inheritedWait
           ? `left it in **${REAL_CLAUDE_GATE_RUN_FROM_COLUMN}** waiting on the separate fix-ticket blockers.${blockerNote} ` +
-            `No rework requested and no retry consumed. The live gate runs again against current main after the blockers close.`
+            `No rework requested and no retry consumed. The live gate runs again against current main after the blockers close.${advanceNote}`
           : `could not confirm every shared-failure blocker. Left it in **${REAL_CLAUDE_GATE_RUN_FROM_COLUMN}** ` +
-            `with \`error:real-claude-gate\` for recovery.${blockerNote} No rework requested.`
+            `with \`error:real-claude-gate\` for recovery.${blockerNote} No rework requested.${advanceNote}`
         : verdict === "infra-failure"
         ? `left it in **${REAL_CLAUDE_GATE_RUN_FROM_COLUMN}** and added \`${INFRA_FAILURE_LABEL}\`. No rework is requested ` +
           `or counted, and no same-tree re-run or base comparison ran. ${infraPauseNote}` +
@@ -988,6 +1023,11 @@ export async function runRealClaudeGateExecution(
             : verdict === "flaky-pass"
               ? `. The suite is green on re-run and the ticket did nothing wrong. The flaky test(s) named above ` +
                 `are the suite's problem, not this branch's, and a human has been pinged about them.`
+            : verdict === "inherited-pass"
+              ? `. Accepted inherited failures: ${acceptedList}. Each failed on this branch, failed again on the ` +
+                `same-tree re-run and fails on the base commit. No blocker was added, so this ticket does not wait ` +
+                `for the fixes, and documentation and the merge should treat this run as an accepted inherited-failure pass. ` +
+                `Any other failing test would have parked it.`
               : ".");
 
       // Comment first, mutate second. If a label write fails, the evidence
@@ -1003,7 +1043,8 @@ export async function runRealClaudeGateExecution(
       try {
         await client.addComment(
           candidate.issueNumber,
-          formatGateEvidenceComment({ verdict, reason, report, minExecuted, action: action + (verdict === "fail" ? blockerNote : ""), introduced, preExisting, flaky }),
+          formatGateEvidenceComment({ verdict, reason, report, minExecuted, action: action + (verdict === "fail" ? blockerNote : ""), introduced, preExisting, flaky,
+            ...(accepted ? { acceptedInherited: accepted } : {}) }),
         );
       } catch (e) {
         console.warn(`   ⚠️  Failed to post real-claude gate evidence on #${candidate.issueNumber}: ${e}`);
@@ -1037,7 +1078,11 @@ export async function runRealClaudeGateExecution(
         }
       }
 
-      const icon = verdict === "pass" ? "✅" : verdict === "flaky-pass" || verdict === "inherited-failure" ? "⚠️" : verdict === "fail" ? "❌" : "🚨";
+      // Beside the run's output, so the documentation stage's gate report
+      // shows the accepted failures instead of a bare red test.
+      if (accepted) recordAcceptedInherited(report.outputPath, accepted);
+
+      const icon = verdict === "pass" ? "✅" : verdict === "flaky-pass" || verdict === "inherited-failure" || verdict === "inherited-pass" ? "⚠️" : verdict === "fail" ? "❌" : "🚨";
       console.log(`   ${icon} Real-claude gate #${candidate.issueNumber}: ${verdict} — ${reason}`);
 
       // After the gated ticket's own writes, so a slow or failing board write
@@ -1067,6 +1112,9 @@ export async function runRealClaudeGateExecution(
             : verdict === "inherited-failure"
               ? `⚠️ **Real-claude gate found failures on main for #${candidate.issueNumber}.** ${reason}. ` +
                 action
+            : verdict === "inherited-pass"
+              ? `⚠️ **Real-claude gate advanced #${candidate.issueNumber} past failures on main.** ${acceptedList} ` +
+                `failed on the branch, on re-run and on the base. The ticket moved on; the fixes are tracked separately.`
             : verdict === "infra-failure"
               ? `🧯 **Live gate infrastructure failure on #${candidate.issueNumber}.** ${reason}.\n` +
                 `Halted in ${REAL_CLAUDE_GATE_RUN_FROM_COLUMN} with \`${INFRA_FAILURE_LABEL}\`. No rework counted, and the ` +

@@ -24,7 +24,7 @@
 //
 // `buildGateReportSection` is pure; `gateReportSection` reads the logs.
 
-import { readdirSync, readFileSync } from "node:fs";
+import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { parseVerifierGates } from "./agent-runtime.js";
 import { gateRunRequiredTests, isGateOutputFormat, parseGateOutput, parseGateTestDetails, stripPackageQualifier, type GateOutputFormat, type GateRunReport, type GateTally, type GateTestDetail } from "./gate-output.js";
@@ -286,6 +286,33 @@ export interface GateRunMeta {
   /** The run's raw evidence folder, `PYRY_GATE_EVIDENCE_DIR` (gate-artifacts.ts), when one was made. */
   evidenceDir: string | null;
   finishedAt: string;
+  /**
+   * Inherited failures the gate accepted when it advanced the ticket, each
+   * with its tracking ticket. Written after the verdict; absent otherwise.
+   */
+  acceptedInherited?: { name: string; issue: number }[];
+}
+
+/**
+ * Add the accepted inherited failures to a run's record, after the verdict.
+ * Never throws: the evidence comment on the issue carries the same list.
+ */
+export function recordAcceptedInherited(
+  outputPath: string,
+  accepted: readonly { name: string; issue: number }[],
+  deps: { readFileSync: (path: string, enc: "utf8") => string; writeFileSync: (path: string, data: string) => void } =
+    { readFileSync: (path, enc) => readFileSync(path, enc), writeFileSync: (path, data) => writeFileSync(path, data) },
+): void {
+  if (!outputPath.endsWith(".log")) return;
+  const path = gateRunMetaPath(outputPath);
+  try {
+    const meta = JSON.parse(deps.readFileSync(path, "utf8"));
+    if (!meta || typeof meta !== "object") throw new Error("not a run record");
+    meta.acceptedInherited = accepted.map(({ name, issue }) => ({ name, issue }));
+    deps.writeFileSync(path, JSON.stringify(meta, null, 2) + "\n");
+  } catch (e: any) {
+    console.warn(`   ⚠️  Could not record the accepted inherited failures beside ${outputPath}: ${e?.message ?? e}`);
+  }
 }
 
 /** The run record's path for a live gate output path or file name. */
@@ -356,6 +383,11 @@ export function parseGateRunMeta(raw: string): GateRunMeta | null {
     pyryBin: typeof m.pyryBin === "string" ? m.pyryBin : null,
     evidenceDir: typeof m.evidenceDir === "string" && m.evidenceDir !== "" ? m.evidenceDir : null,
     finishedAt: typeof m.finishedAt === "string" ? m.finishedAt : "",
+    ...(Array.isArray(m.acceptedInherited) ? {
+      acceptedInherited: m.acceptedInherited.filter((t: any) =>
+        t && typeof t.name === "string" && t.name !== "" && Number.isInteger(t.issue) && t.issue > 0)
+        .map((t: any) => ({ name: t.name, issue: t.issue })),
+    } : {}),
   };
 }
 
@@ -452,6 +484,16 @@ export function liveGateLines(live: LiveGateRun, namingText: string, testEvidenc
   const passed = count("passed"), flaky = count("flaky"), failed = count("failed"), skipped = count("skipped");
   lines.push(`- Counts: ${passed + flaky + failed} executed, ${passed + flaky} passed (${flaky} of them flaky), ${failed} failed, ${skipped} skipped.`);
 
+  // Inherited failures the gate accepted: red here, on the re-run and on
+  // the base, each tracked elsewhere. The ticket advanced past them.
+  const acceptedInherited = new Map((meta?.acceptedInherited ?? []).map(t => [t.name, t.issue] as const));
+  if (acceptedInherited.size > 0) {
+    lines.push(`- Accepted inherited failures: the live gate advanced this ticket past ${acceptedInherited.size} failing test(s) that ` +
+      `failed again on the same-tree re-run and fail on the base commit, each tracked on an open ticket: ` +
+      `${[...acceptedInherited].map(([n, i]) => `\`${displayName(n, live.format!)}\` on #${i}`).join(", ")}. ` +
+      "They are not this ticket's to fix, and they are not passes. Every other failing test would have parked it.");
+  }
+
   // Failures the dispatcher re-ran on the same tree, and what became of them.
   const rerun = meta?.rerunFailures ?? null;
   const rerunPassed = (name: string) => rerun !== null && !rerun.includes(name);
@@ -478,7 +520,11 @@ export function liveGateLines(live: LiveGateRun, namingText: string, testEvidenc
     : "- Results:");
   for (const d of shown) {
     const parts: string[] = [];
-    if (d.status === "failed") parts.push(rerunPassed(d.name) ? "failed, then passed on the dispatcher's same-tree re-run" : "failed");
+    if (d.status === "failed") {
+      const tracker = acceptedInherited.get(d.name);
+      parts.push(tracker !== undefined ? `failed, inherited from the base and accepted by the gate, tracked on #${tracker}`
+        : rerunPassed(d.name) ? "failed, then passed on the dispatcher's same-tree re-run" : "failed");
+    }
     else if (d.status === "flaky") parts.push(`flaky, passed on attempt ${d.attempts ?? "?"} of ${d.attempts ?? "?"}`);
     else if (d.status === "skipped") parts.push(`skipped: ${d.skipReason ?? "no reason recorded"}`);
     else parts.push("passed");
