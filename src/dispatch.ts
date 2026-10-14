@@ -9767,7 +9767,7 @@ export async function pollLoop(): Promise<void> {
           : verifier.maxInFlight !== undefined
             ? `up to ${verifier.maxInFlight} at a time (PYRY_VERIFIER_MAX)`
             : "concurrent (PYRY_VERIFIER_SERIAL=0)"
-      }`);
+      }${managed && verifier.roleLimitScope === "machine" && (verifier.serial || verifier.maxInFlight !== undefined) ? " on each computer" : ""}`);
     }
   }
   console.log("   Family dispatch counts: history only; no family limit");

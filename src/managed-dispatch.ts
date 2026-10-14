@@ -219,9 +219,15 @@ export class ManagedDispatch {
     return this.offer(issue, shape.role, shape.resource, shape.locks, shape.order);
   }
   agentOffer(agent: AgentConfig, item: ProjectItem, order: number): Pending {
+    // A machine-scoped limit takes no role lock: locks are fleet-wide, and the
+    // role limit alone enforces one per computer. An older authority ignores
+    // the scope and keeps counting the role limit across the fleet.
+    const machineScoped = agent.roleLimitScope === "machine";
     const pending = this.offer(item.issueNumber, agent.name, this.classes[agent.name] ?? DEFAULT_RESOURCE_CLASSES[agent.name] ?? "heavy",
-      agent.serial ? [`${this.project}:role:${agent.name}`] : [], order);
+      agent.serial && !machineScoped ? [`${this.project}:role:${agent.name}`] : [], order);
     pending.offer.roleLimit = agent.serial ? 1 : agent.maxInFlight;
+    if (machineScoped && pending.offer.roleLimit !== undefined) pending.offer.roleLimitScope = "machine";
+    else delete pending.offer.roleLimitScope;
     if (!pending.run) {
       pending.offer.recovery = hasRecoveryPriority(item.labels);
       pending.offer.recoveryError = pending.offer.recovery;

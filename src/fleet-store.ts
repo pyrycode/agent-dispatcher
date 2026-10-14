@@ -19,12 +19,52 @@ import { CodexThrottle, startsCodex, DEFAULT_CODEX_THROTTLE, type CodexThrottleC
 export interface RunnerPolicy { runner: AgentRunner | null; revision: number }
 
 export type ResourceClass = "heavy" | "medium" | "light";
-export interface MachineLimits { heavyLimit: number; combinedLimit: number }
+export interface MachineLimits {
+  heavyLimit: number;
+  combinedLimit: number;
+  /**
+   * Optional. At most this many heavy runs of one project at a time on this
+   * computer, inside heavyLimit. A project absent from the map has no extra
+   * limit. Added 2026-10-14 for build-hp-1: one Mobile verifier reached 17 to
+   * 22 GB of its 31 GB, so two would swap, while a Mobile and a Core heavy
+   * job fit together.
+   */
+  projectHeavyLimits?: Record<string, number>;
+}
 export function validateLimits(limits: MachineLimits): void {
   if (!limits || !Number.isSafeInteger(limits.heavyLimit) || limits.heavyLimit < 1 ||
       !Number.isSafeInteger(limits.combinedLimit) || limits.combinedLimit < limits.heavyLimit) {
     throw new Error("Limits require positive integers with combinedLimit >= heavyLimit");
   }
+  const perProject = limits.projectHeavyLimits;
+  if (perProject === undefined) return;
+  if (!perProject || typeof perProject !== "object" || Array.isArray(perProject)
+    || Object.entries(perProject).some(([project, limit]) => !/^[\w.-]+\/[\w.-]+$/.test(project) || !Number.isSafeInteger(limit) || limit < 1)) {
+    throw new Error("projectHeavyLimits must map owner/repo names to positive integers");
+  }
+}
+
+/**
+ * The project a heavy run is charged to for a per-project heavy limit. A
+ * support task can be admitted under another project's name, so it is
+ * charged to the project of the ticket it serves.
+ */
+export function heavyProject(run: { project: string; parentTicket?: string }): string {
+  return run.parentTicket?.split("#")[0] || run.project;
+}
+
+/**
+ * Where a role limit counts runs. "fleet" counts every computer and is the
+ * default, so offers from older workers keep their meaning. "machine" counts
+ * only the computer being admitted to: a limit that protects host resources,
+ * such as the verifier's emulator and local relay, not shared repository
+ * files such as documentation's index.
+ */
+export type RoleLimitScope = "machine" | "fleet";
+/** Whether an active run counts against a role limit for an offer bound for `machine`. */
+export function countsForRoleLimit(run: { project: string; role: string; machine?: string }, offer: { project: string; role: string; roleLimitScope?: RoleLimitScope }, machine: string): boolean {
+  return run.project === offer.project && run.role === offer.role
+    && (offer.roleLimitScope !== "machine" || run.machine === undefined || run.machine === machine);
 }
 export interface StartRequest {
   workflowVersion?: 1;
@@ -37,6 +77,8 @@ export interface StartRequest {
   resource: ResourceClass;
   locks: string[];
   roleLimit?: number;
+  /** Absent means "fleet". See RoleLimitScope. */
+  roleLimitScope?: RoleLimitScope;
   requiresRecovery?: boolean;
   readyRepairs?: string[];
   supportTaskId?: string; parentTicket?: string;
@@ -62,6 +104,7 @@ export function validateStart(req: StartRequest): void {
   }
   if (req.resource !== "heavy" && req.resource !== "medium" && req.resource !== "light") throw new Error("Invalid resource class");
   if (req.roleLimit !== undefined && (!Number.isSafeInteger(req.roleLimit) || req.roleLimit < 1)) throw new Error("Invalid role limit");
+  if (req.roleLimitScope !== undefined && ((req.roleLimitScope !== "machine" && req.roleLimitScope !== "fleet") || req.roleLimit === undefined)) throw new Error("Invalid role limit scope");
   if (req.runner !== undefined && req.runner !== 'claude' && req.runner !== 'codex') throw new Error('Invalid runner');
   if (req.requiresRecovery !== undefined && (typeof req.requiresRecovery !== 'boolean' || req.role !== 'recovery')) throw new Error('Invalid recovery requirement');
   if(req.readyRepairs!==undefined && (!Array.isArray(req.readyRepairs)||req.readyRepairs.length>10||req.readyRepairs.some(s=>! /^[a-f0-9]{40}$/.test(s)))) throw new Error("Invalid repair readiness");
@@ -441,10 +484,15 @@ export class FleetStore {
         const limit = this.limits[req.machine];
         if (Number(row.combined) >= limit.combinedLimit ||
             (req.resource === "heavy" && Number(row.heavy) >= limit.heavyLimit)) return { ok: false, reason: "capacity" };
+        const projectLimit = req.resource === "heavy" ? limit.projectHeavyLimits?.[heavyProject(req)] : undefined;
+        if (projectLimit !== undefined) {
+          const heavy = this.db.prepare("SELECT request FROM fleet_runs WHERE machine=? AND finished IS NULL AND resource='heavy'").all(req.machine);
+          if (heavy.filter(r => heavyProject(JSON.parse(String(r.request))) === heavyProject(req)).length >= projectLimit) return { ok: false, reason: "capacity" };
+        }
       }
       if (req.roleLimit !== undefined) {
-        const active = this.db.prepare("SELECT request FROM fleet_runs WHERE finished IS NULL").all();
-        if (active.filter(r => { const job = JSON.parse(String(r.request)); return job.project === req.project && job.role === req.role; }).length >= req.roleLimit) return { ok: false, reason: "locked" };
+        const active = this.db.prepare("SELECT machine,request FROM fleet_runs WHERE finished IS NULL").all();
+        if (active.filter(r => countsForRoleLimit({ ...JSON.parse(String(r.request)), machine: String(r.machine) }, req, req.machine)).length >= req.roleLimit) return { ok: false, reason: "locked" };
       }
       for (const lock of req.locks) {
         if (this.db.prepare("SELECT 1 FROM fleet_locks WHERE name=?").get(lock)) return { ok: false, reason: "locked" };
