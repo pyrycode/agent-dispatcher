@@ -1534,7 +1534,12 @@ const CREDENTIAL_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
   // (also `:` and quoted forms, e.g. CLAUDE_CODE_OAUTH_TOKEN=..., "api_key": "...").
   // Streaming diagnostics can contain several nested JSON string envelopes.
   // Recognise escaped quotes/whitespace while redacting the same assignment value.
-  [/(\b[A-Za-z0-9_-]*(?:token|key|secret|password)(?:\\*["'])?(?:\s|\\+[nrt])*[=:](?:\s|\\+[nrt])*(?:\\*["'])?)[A-Za-z0-9+/_.=-]{16,}/gi, `$1${REDACTED}`],
+  // No name prefix before the keyword: `\b[A-Za-z0-9_-]*` before it matched
+  // the same assignments but backtracked quadratically on long hyphenated
+  // runs (64 KiB of `a-a-...` took 16 seconds), and evidence bundles scrub
+  // megabytes on the claim service's event loop. The name stays in the text
+  // either way, because only the value is replaced.
+  [/((?:token|key|secret|password)(?:\\*["'])?(?:\s|\\+[nrt])*[=:](?:\s|\\+[nrt])*(?:\\*["'])?)[A-Za-z0-9+/_.=-]{16,}/gi, `$1${REDACTED}`],
 ];
 
 /**

@@ -221,7 +221,8 @@ export async function serveManager(manager: MachineManager, projectTokens: Recor
         if (!manager.claims.call || !run || run.project !== project || run.machine !== manager.config.machine || run.session !== body.session) return send(403, { error: "Run owner mismatch" });
         return send(200, await manager.claims.call(req.url, body));
       }
-      if (["/codex/report", "/tasks/request", "/tasks/read", "/tasks/artifact", "/recovery/facts", "/recovery/evidence", "/recovery/pause", "/recovery/coordination", "/recovery/report", "/recovery/begin", "/recovery/decide", "/recovery/complete"].includes(req.url ?? "")) {
+      if (["/codex/report", "/tasks/request", "/tasks/read", "/tasks/artifact", "/recovery/facts", "/recovery/evidence", "/recovery/pause", "/recovery/coordination", "/recovery/report", "/recovery/begin", "/recovery/decide", "/recovery/complete",
+        "/evidence/begin", "/evidence/put", "/evidence/commit", "/evidence/list", "/evidence/chunk", "/evidence/usage"].includes(req.url ?? "")) {
         if (!manager.claims.call) throw new Error("Recovery service unavailable");
         return send(200, await manager.claims.call(req.url!, { ...body, project,
           ...(req.url === "/recovery/evidence" ? { records: body.records?.map((r: any) => ({ ...r, machine: manager.config.machine })) } : {}) }));

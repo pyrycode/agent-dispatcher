@@ -29,7 +29,8 @@ import { execFile, execSync, spawnSync } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
 import { FleetStore } from './fleet-store.js';
 import { MachineManager, serveManager } from './machine-manager.js';
-import { ManagedDispatch } from './managed-dispatch.js';
+import { ManagedDispatch, withManagedTaskRun } from './managed-dispatch.js';
+import type { RunEvidenceInput } from './run-evidence.js';
 import { completeGo, completePlaywright, loggedArtifacts, loggedFailures, mixedGoCommands, singleWrappedGoCommands, repeatedGo } from "./fixtures/gate-completeness.js";
 
 import { basename, dirname, join, resolve } from "node:path";
@@ -4416,6 +4417,36 @@ describe("dispatchToAgent — orchestrator integration", () => {
     // Success ping dropped 2026-06-07 — happy path completes without a
     // Discord notify.
     assert.equal(calls.discord.length, 0);
+  });
+
+  // Shared run evidence (run-evidence.ts): a managed run records its bundle
+  // when it ends, pass or fail, and outside a managed run nothing is recorded.
+  for (const [name, impls, outcome] of [
+    ["a passed run", {}, "completed"],
+    ["a failed run", { "git rev-list --count main..": () => "0\n" }, "failed"],
+  ] as const) test(`${name} inside an admitted managed run records its evidence as ${outcome}`, async () => {
+    const claudeMd = claudeMdAbsPath("developer/CLAUDE.md");
+    const issue = name === "a passed run" ? 702 : 703;
+    const client = new MockGitHubClient({ status: { [issue]: "In Development" }, labels: { [issue]: [] } });
+    const recorded: RunEvidenceInput[] = [];
+    const { deps } = makeMockDeps({
+      execImpls: { ...fullHappyExecImpls(`feature/${issue}`), ...impls },
+      fsMap: { [claudeMd]: "developer system prompt" },
+    });
+    const run = { id: "admitted-run", machine: "box", session: "s", project: "org/core", ticket: `org/core#${issue}`, role: "developer", generation: "g", resource: "medium", created: 1 } as any;
+    await withManagedTaskRun(run, () => dispatchToAgent(makeAgentConfig({}), makeProjectItem({ issueNumber: issue }), client,
+      { ...deps, recordEvidence: async input => { recorded.push(input); } }));
+    assert.equal(recorded.length, 1);
+    assert.equal(recorded[0].runId, "admitted-run");
+    assert.equal(recorded[0].issueNumber, issue);
+    assert.equal(recorded[0].role, "developer");
+    assert.equal(recorded[0].kind, "agent");
+    assert.equal(recorded[0].outcome, outcome);
+    assert.match(recorded[0].logFile ?? "", new RegExp(`_developer_#${issue}\\.log$`));
+    // Outside a managed run there is no run id, so nothing is recorded.
+    const unmanaged: RunEvidenceInput[] = [];
+    await dispatchToAgent(makeAgentConfig({}), makeProjectItem({ issueNumber: issue }), client, { ...deps, recordEvidence: async input => { unmanaged.push(input); } });
+    assert.equal(unmanaged.length, 0);
   });
 
   test("setup-fails (push-equivalent: empty-branch from handlePostRun) → cleanup-skipped invariant", async () => {

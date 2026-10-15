@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Native evidence for the current admitted builder. No fleet secret reaches this client."""
+"""Native evidence for the current admitted builder, and shared run evidence for any agent. No fleet secret reaches this client."""
 import argparse
 import base64
 import hashlib
@@ -66,6 +66,12 @@ def retrieve(task,destination):
     manifest,digest=inventory(task['artifacts'])
     if not re.fullmatch(r'[a-f0-9]{64}',task['id']):raise RuntimeError('Invalid artifact task identity')
     root=Path(destination).resolve();root.mkdir(parents=True,exist_ok=True,mode=0o700)
+    fetch=lambda entry,part:request('artifact',{'id':task['id'],'digest':digest,'path':entry['path'],'part':part})
+    download(manifest,digest,root,task['id'],fetch)
+    # Retain complete inventory and authority provenance alongside the evidence.
+    private_write(contained(root,'.fleet-task-manifest.json'),json.dumps({'task':task,'digest':digest},separators=(',',':')).encode(),replace=False)
+
+def download(manifest,digest,root,cache_key,fetch):
     for ordinal,entry in enumerate(manifest['files']):
         target=contained(root,entry['path'])
         if target.exists():
@@ -76,10 +82,10 @@ def retrieve(task,destination):
         parts=[]
         for part,expected in enumerate(entry['chunks']):
             size=min(CHUNK_BYTES,entry['bytes']-part*CHUNK_BYTES)
-            cached=contained(root,f'.fleet-task-cache/{task["id"]}/{digest}/{ordinal}/{part}')
+            cached=contained(root,f'.fleet-task-cache/{cache_key}/{digest}/{ordinal}/{part}')
             data=cached.read_bytes() if cached.is_file() else None
             if data is None or len(data)!=size or sha(data)!=expected:
-                reply=request('artifact',{'id':task['id'],'digest':digest,'path':entry['path'],'part':part})
+                reply=fetch(entry,part)
                 if reply.get('digest')!=digest or reply.get('path')!=entry['path'] or reply.get('part')!=part or reply.get('sha256')!=expected or reply.get('bytes')!=size:
                     raise RuntimeError('Artifact chunk identity or hash mismatch')
                 data=base64.b64decode(reply['data'],validate=True)
@@ -90,8 +96,39 @@ def retrieve(task,destination):
         if len(data)!=entry['bytes'] or sha(data)!=entry['sha256']:raise RuntimeError('Artifact byte/hash mismatch')
         data.decode('utf-8') # The contract carries exact UTF-8 text, including CRLF.
         private_write(target,data,replace=False)
-    # Retain complete inventory and authority provenance alongside the evidence.
-    private_write(contained(root,'.fleet-task-manifest.json'),json.dumps({'task':task,'digest':digest},separators=(',',':')).encode(),replace=False)
+
+def safe_name(value):
+    if not isinstance(value,str) or value in {'.','..'} or not re.fullmatch(r'[\w.:@-]{1,128}',value,flags=re.ASCII):raise RuntimeError('Invalid evidence run identity')
+    return re.sub(r'[^\w.-]','_',value,flags=re.ASCII)
+
+def evidence(ticket,destination,run=None,limit=5):
+    """Shared run evidence for a ticket, uploaded by whichever computer ran each run."""
+    body={'ticket':ticket,'limit':limit}
+    if run:body['runId']=run
+    listing=request('evidence-list',body)
+    bundles=listing.get('bundles')
+    if not isinstance(bundles,list):raise RuntimeError('Invalid evidence listing')
+    summary=[]
+    for bundle in bundles:
+        entry={'runId':bundle.get('runId'),'machine':bundle.get('machine'),'role':bundle.get('role'),'meta':bundle.get('meta'),'created':bundle.get('created')}
+        try:
+            fetch_bundle(listing,bundle,destination,entry)
+        except Exception as error: # One unreadable bundle never hides the others.
+            entry['error']=str(error)[:300]
+        summary.append(entry)
+    return {'ticket':listing.get('ticket'),'bundles':summary}
+
+def fetch_bundle(listing,bundle,destination,entry):
+    manifest,digest=inventory(bundle.get('manifest'))
+    if bundle.get('digest')!=digest:raise RuntimeError('Evidence bundle digest mismatch')
+    entry['files']=[{'path':f['path'],'bytes':f['bytes']} for f in manifest['files']]
+    if destination:
+        root=Path(destination).resolve().joinpath(safe_name(bundle.get('runId')))
+        root.mkdir(parents=True,exist_ok=True,mode=0o700)
+        fetch=lambda f,part,b=bundle,d=digest:request('evidence-chunk',{'ticket':listing['ticket'],'runId':b['runId'],'digest':d,'path':f['path'],'part':part})
+        download(manifest,digest,root,'evidence-'+digest,fetch)
+        private_write(contained(root,'.fleet-task-manifest.json'),json.dumps({'evidence':{k:v for k,v in bundle.items() if k!='manifest'},'digest':digest},separators=(',',':')).encode(),replace=False)
+        entry['directory']=str(root)
 
 class Connection(http.client.HTTPConnection):
     def connect(self):
@@ -109,9 +146,12 @@ def request(action,body):
     return data
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('action',choices=['request','read','await'])
+    p=argparse.ArgumentParser();p.add_argument('action',choices=['request','read','await','evidence'])
     p.add_argument('value');p.add_argument('--out');p.add_argument('--timeout',type=int,default=3600)
+    p.add_argument('--run');p.add_argument('--limit',type=int,default=5)
     a=p.parse_args()
+    if a.action=='evidence':
+        print(json.dumps(evidence(a.value,a.out,a.run,a.limit)));return
     if a.action=='request':
         t=request('request',{'request':json.loads(Path(a.value).read_text())})
     else:
