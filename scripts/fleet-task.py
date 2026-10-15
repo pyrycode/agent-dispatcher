@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Native evidence for the current admitted builder, and shared run evidence for any agent. No fleet secret reaches this client."""
+"""Native checks: builders and developers request them; every agent of the ticket reads and awaits them. Shared run evidence for any agent. No fleet secret reaches this client."""
 import argparse
 import base64
 import hashlib

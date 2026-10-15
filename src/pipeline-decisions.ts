@@ -11,6 +11,7 @@ import { hasRunningWip, isRepairWip } from "./recovery-labels.js";
 import { hasOpenBlockers } from "./blockers.js";
 import { byTicketPriority } from "./ticket-priority.js";
 import { MERGE_HANDOFF_LABEL } from "./merge-handoff.js";
+import { NATIVE_TASK_HOLD_LABEL, NATIVE_TASK_WAITED_LABEL } from "./native-task-hold.js";
 import { GATE_PARSER_VERSION, parseGateOutput, validateGateOutputProvenance, type GateOutputFormat, type GateTestDetail } from "./gate-output.js";
 import { missingTestEvidence, reportedRequiredTests, rulesFor, type TestEvidenceRule } from "./gate-test-evidence.js";
 
@@ -216,6 +217,9 @@ export function decideAutoAdvance(
     item.issueNumber > 0 &&
     item.labels.includes(rule.readyLabel) &&
     !item.labels.some(l => l.startsWith("needs-rework:") || l.startsWith("error:")) &&
+    // A handover held for native tasks waits for them, even if a done label
+    // landed beside the hold in a write race (native-task-hold.ts).
+    !item.labels.includes(NATIVE_TASK_HOLD_LABEL) &&
     // Real-claude gate (belt to runRealClaudeGate). A ticket needing a
     // live-claude run must not auto-advance past code review until the gate
     // has actually RUN and its result has been READ. The 2026-07-22 failure
@@ -422,7 +426,9 @@ export function decideReworkRoutes(
           label,
           ...item.labels.filter(l =>
             l !== label &&
-            (l.startsWith("done:") || l.startsWith("wip:") || l.startsWith("error:") || l === MERGE_HANDOFF_LABEL),
+            (l.startsWith("done:") || l.startsWith("wip:") || l.startsWith("error:") || l === MERGE_HANDOFF_LABEL
+              // A rework starts a new handover, which may wait for native tasks again.
+              || l === NATIVE_TASK_WAITED_LABEL),
           ),
         ];
 
@@ -1317,6 +1323,9 @@ export interface DoneCleanup {
  *     tally lives in the root's marker comments, so the board copy can
  *     go; a family whose root reaches Done and later re-opens should not
  *     wear a stale badge)
+ *   - the `native-task:waited` marker, which only means something before
+ *     the stage's next handover, and a `held:native-task` left on a ticket
+ *     moved to Done by hand: no stage runs there (native-task-hold.ts)
  *
  * Does NOT touch:
  *   - `size:`, `priority:`, `merged`, or any free-form tag
@@ -1350,7 +1359,9 @@ export function decideDoneCleanup(
           || l.startsWith("rework-count:")
           || l.startsWith(REWORK_OTHER_PREFIX)
           || l.startsWith(ERROR_RETRY_COUNT_PREFIX)
-          || l.startsWith(FAMILY_DISPATCH_COUNT_PREFIX)),
+          || l.startsWith(FAMILY_DISPATCH_COUNT_PREFIX)
+          || l === NATIVE_TASK_WAITED_LABEL
+          || l === NATIVE_TASK_HOLD_LABEL),
     );
 
     if (labelsToStrip.length === 0) continue;
@@ -1988,6 +1999,11 @@ export const GLOBAL_BLOCK_LABELS: ReadonlySet<string> = new Set([
   // not have. Every stage waits for a person, or the verifier would run
   // into the same host problem every cycle (infra-failure.ts).
   INFRA_FAILURE_LABEL,
+  // A builder or developer handover waiting for the native checks its run
+  // requested. No stage runs until the owning computer's reconcile pass
+  // lifts it, which it does once no task is open within the hold's bound
+  // (native-task-hold.ts).
+  NATIVE_TASK_HOLD_LABEL,
 ]);
 
 /**
