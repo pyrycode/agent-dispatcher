@@ -21,7 +21,7 @@ test('runtime-only dirt is never an automatic commit, even when already tracked'
     'explicitly staged untracking remains committable');
 });
 
-import { execFileSync, execSync } from 'node:child_process';
+import { execFileSync, execSync, spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync, symlinkSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -276,7 +276,7 @@ test('managed verifier FAIL hands its entire retained tree to builder safely', a
 async function legacyWorktreeCases(t: import('node:test').TestContext, root: string, repo: string, store: FleetStore) {
   const gitAt = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: 'pipe' }).trim();
   const git = (...args: string[]) => gitAt(repo, ...args);
-  const { DEFAULT_DEPS, setupBranchAndWorktree, makeDispatchContext, worktreePath, managedWorktreeRecordPath } = await import('./dispatch.js');
+  const { DEFAULT_DEPS, setupBranchAndWorktree, makeDispatchContext, worktreePath, managedWorktreeRecordPath, processesUsingPath } = await import('./dispatch.js');
   let ticket = 2050;
   const fixture = async (opts: { push?: boolean; commit?: boolean; role?: string } = {}) => {
     for (const run of store.snapshot().runs) store.finish(run.machine, run.session, run.id, false);
@@ -455,6 +455,40 @@ async function legacyWorktreeCases(t: import('node:test').TestContext, root: str
     assert.doesNotMatch(f.comments[0]!, /left in place/);
     assert.deepEqual(f.labels, ['error:builder']);
   });
+  for (const condition of ['active process', 'launch failure', 'timeout', 'nonzero exit', 'incomplete output', 'late inspection failure']) {
+    await t.test(`macOS inspection refuses a retained tree on ${condition}`, async () => {
+      const f = await fixture();
+      const ctx = f.builder();
+      const head = git('rev-parse', `feature/${f.number}`);
+      const status = gitAt(f.path, 'status', '--porcelain', '--untracked-files=all');
+      const claims = store.snapshot().claims;
+      // Ignored evidence does not itself block removal: process inspection must.
+      writeFileSync(join(f.path, 'ignored-evidence'), 'retained inspection evidence\n');
+      writeFileSync(join(repo, '.git', 'info', 'exclude'), 'ignored-evidence\n');
+      let inspections = 0;
+      ctx.deps.processesUsingPath = path => processesUsingPath(path, { platform: 'darwin', spawnSync: (() => {
+        inspections++;
+        const stdout = condition === 'active process' ? `p4242\nn${path}/source.ts\n` : 'p4242\nn/elsewhere\n';
+        if (condition === 'late inspection failure' && inspections === 1) return lsofResult({ stdout });
+        if (condition === 'launch failure') return lsofResult({ error: Object.assign(new Error('ENOENT'), { code: 'ENOENT' }), status: null, stdout: '' });
+        if (condition === 'timeout' || condition === 'late inspection failure') return lsofResult({ error: Object.assign(new Error('ETIMEDOUT'), { code: 'ETIMEDOUT' }), status: null, stdout });
+        return lsofResult({ stdout: condition === 'incomplete output' ? 'p4242\nn/elsewhere' : stdout, status: condition === 'nonzero exit' ? 1 : 0 });
+      }) as unknown as typeof spawnSync });
+      f.commands.length = 0;
+      assert.deepEqual(await setupBranchAndWorktree(ctx), { ok: false });
+      assert.equal(inspections, condition === 'late inspection failure' ? 2 : 1);
+      assert.match(f.comments[0]!, condition === 'active process' ? /process\(es\) 4242 still use it/ : /processes using it could not be checked.*lsof failed/);
+      assert.deepEqual(f.labels, ['error:builder']);
+      assert.deepEqual(store.snapshot().claims, claims);
+      assert.deepEqual(ctx.item.labels, ['needs-rework:builder', 'rework-count:1']);
+      assert.equal(git('rev-parse', `feature/${f.number}`), head);
+      assert.equal(gitAt(f.path, 'status', '--porcelain', '--untracked-files=all'), status);
+      assert.equal(readFileSync(join(f.path, 'ignored-evidence'), 'utf8'), 'retained inspection evidence\n');
+      assert.equal(existsSync(managedWorktreeRecordPath(f.path)), false, 'no custody is invented for a refused tree');
+      assert.equal(existsSync(ctx.worktreeDir), false);
+      assert.ok(!f.commands.some(cmd => /worktree (add|remove|move|prune)|git add|git push|branch -f/.test(cmd)), f.commands.join('\n'));
+    });
+  }
   await t.test('a dangling custody symlink is evidence, not absence', async () => {
     const f = await fixture();
     const record = managedWorktreeRecordPath(f.path);
@@ -487,6 +521,58 @@ async function legacyWorktreeCases(t: import('node:test').TestContext, root: str
     assert.equal(existsSync(f.path), true);
   });
 }
+
+function lsofResult(overrides: Partial<SpawnSyncReturns<string>> = {}): SpawnSyncReturns<string> {
+  return { pid: 42, status: 0, signal: null, stdout: 'p4242\nn/elsewhere\n', stderr: '', output: [], ...overrides };
+}
+
+test('macOS processesUsingPath discovers system lsof with /usr/sbin absent from PATH', async t => {
+  const { processesUsingPath } = await import('./dispatch.js');
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'macos-processes-')));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const tree = join(root, 'tree');
+  const linked = join(root, 'link');
+  const restrictedPath = join(root, 'empty-bin');
+  mkdirSync(tree); mkdirSync(restrictedPath); symlinkSync(tree, linked);
+  const stdout = `p0\nfcwd\nn/elsewhere\np1000001\nfcwd\nn${tree}\nf3\nn${tree}/nested/file\np1000002\nfcwd\nn${tree}-sibling/file\np1000003\nf4\nn${linked}/file\np1000004\nf5\nn${tree}/removed (deleted)\n`;
+  const installedLsof = join(root, 'installed-lsof');
+  writeFileSync(installedLsof, `#!${process.execPath}\nprocess.stdout.write(${JSON.stringify(stdout)});\n`, { mode: 0o700 });
+  const commands: string[] = [];
+  // Only the installed system location is mapped to the fixture on Linux.
+  // A bare lsof must still go through real executable discovery and fail.
+  const run = ((file: string, args: string[], options: any) => {
+    commands.push(file);
+    assert.deepEqual(args, ['-b', '-w', '-n', '-P', '-Fpn']);
+    return spawnSync(file === '/usr/sbin/lsof' ? installedLsof : file, args, options);
+  }) as typeof spawnSync;
+  const oldPath = process.env.PATH;
+  try {
+    process.env.PATH = restrictedPath;
+    assert.deepEqual(processesUsingPath(tree, { platform: 'darwin', spawnSync: run }), [1000001, 1000004]);
+    assert.deepEqual(processesUsingPath(linked, { platform: 'darwin', spawnSync: run }), [1000001, 1000003, 1000004]);
+    assert.deepEqual(commands, ['/usr/sbin/lsof', '/usr/sbin/lsof']);
+  } finally {
+    if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
+  }
+});
+
+test('macOS processesUsingPath refuses failed or incomplete lsof inspection', async () => {
+  const { processesUsingPath } = await import('./dispatch.js');
+  for (const [name, result] of [
+    ['launch failure', lsofResult({ status: null, stdout: '', error: Object.assign(new Error('ENOENT'), { code: 'ENOENT' }) })],
+    ['timeout with partial output', lsofResult({ status: null, signal: 'SIGTERM', error: Object.assign(new Error('ETIMEDOUT'), { code: 'ETIMEDOUT' }) })],
+    ['buffer overflow', lsofResult({ status: null, error: Object.assign(new Error('ENOBUFS'), { code: 'ENOBUFS' }) })],
+    ['nonzero exit with output', lsofResult({ status: 1 })],
+    ['signal with output', lsofResult({ status: null, signal: 'SIGTERM' })],
+    ['empty output', lsofResult({ stdout: '' })],
+    ['truncated output', lsofResult({ stdout: 'p4242\nn/elsewhere' })],
+    ['missing file records', lsofResult({ stdout: 'p4242\n' })],
+    ['missing process record', lsofResult({ stdout: 'n/elsewhere\n' })],
+    ['invalid process record', lsofResult({ stdout: 'pNaN\nn/elsewhere\n' })],
+  ] as const) {
+    assert.throws(() => processesUsingPath('/retained-tree', { platform: 'darwin', spawnSync: (() => result) as unknown as typeof spawnSync }), /lsof failed/, name);
+  }
+});
 
 test('processesUsingPath finds a process working inside a tree, also through a linked path', async t => {
   const { processesUsingPath } = await import('./dispatch.js');
