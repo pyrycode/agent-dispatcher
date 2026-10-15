@@ -484,11 +484,51 @@ One central publisher checks on startup and every minute. It creates missing lab
 
 The `claim:` prefix is reserved for this display. GitHub labels never grant or transfer ownership; manual changes are corrected from the claim database. The publisher only adds or removes individual claim labels, leaving other issue labels intact. GitHub outages retry on later passes without affecting claims, capacity or dispatch. Label visibility is eventually consistent and can lag changes by one minute plus API time. Only the claim service needs this configuration; project dispatchers need no label-specific change or restart.
 
+### Central desired state
+
+Since 2026-10-15 drains and stops are kept centrally, in the claims database, per computer and per board (project). On 2026-10-15 a whole-fleet drain lived only in each manager's memory, a controller rollout restarted the managers and lifted it, and pyrybox could not drain the Mac at all, because the Mac only connects out. Now:
+
+```sh
+operator.sh drain  --machine MACHINE [--project PROJECT] [--tickets] [--reason TEXT]
+operator.sh resume --machine MACHINE [--project PROJECT]
+operator.sh stop   --machine MACHINE --project PROJECT
+operator.sh start  --machine MACHINE --project PROJECT
+operator.sh desired-state
+```
+
+`--all-machines` replaces `--machine` in each; with `--project` it skips computers that do not serve the project. Only the central operator credential can change anything (`POST /desired/set`), only to these fixed values, only for configured computers and for projects the computer's own manager reported serving. Nothing is executed on a remote computer: managers and supervisors read the state and apply it themselves.
+
+What each state means:
+
+- **Work.** `taking`; `tickets-drained` (`drain --tickets`): no new tickets, while tickets this computer owns continue through every stage, board housekeeping runs and support tasks run, which is what `drain-project` always did; `drained`: no new grants at all, running work finishes and its later stages wait. A board gets the stricter of the computer-wide state and its own, so `resume --project` cannot lift a computer-wide drain. A drain does not stop dispatchers: they stay up and idle.
+- **Run**, per board: `stopped` stops the dispatcher unit with one graceful signal once its running jobs finish, and holds it stopped, also drained, so a unit a reboot starts gets no work before its supervisor stops it again. `running` starts a stopped unit on the desired versions. A board with no run state keeps the older behaviour: a stopped unit stays stopped, a running one is updated.
+
+How it is delivered:
+
+1. Every manager fetches its own document every 15 seconds over its existing outbound claim service connection (`POST /machines/desired`, machine credential). The fetch carries the revision it applied, which is the acknowledgement; after applying a change it fetches once more at once.
+2. The manager saves the document in its private configuration (`desiredState`), mirrors the boards it holds back into `drainingProjects`, records each change it applies in `projectDrainChanges` with `source: "central"`, and only then applies it. It waits for any start already sent to the claim service before acknowledging. A document it cannot save is not applied and is acknowledged as failed.
+3. At start a manager grants nothing until it knows its state. It applies the saved copy immediately, so a restart or a controller rollout never lifts a drain, even with the claim service unreachable. With no saved copy it waits for the claim service, which it needs to grant anything anyway, so a first install cannot deadlock. A claim service from before this change answers that it has no such route; the manager then keeps the older local drains.
+4. The claim service enforces work states at admission too: a start for a drained or stopped board, or a new ticket on a ticket-drained one, is refused with the reason `drained`, whatever the manager's version. A retry of a lost grant reply still recovers its grant.
+5. The supervisor reads the run state from its local manager's status (`desiredState`). While that is unknown it starts nothing and drains nothing for an update. A drain for an update on a board that should now be stopped installs the new versions and leaves it stopped; a stopped board gets the desired versions installed and loads them when it next starts. A deliberately stopped board is reported `stopped`, not a health failure, and a health latch or older uncertain record on it is retired once it has stopped. A recorded central drain change no longer stops an update for inspection; an unexplained one still does.
+
+Visibility: `operator.sh status` carries the local manager's `desiredState` (mode `central`, `cached`, `unknown` or `unsupported`, revision, applied revision and each board's desired and effective state) and `fleetDesiredState` from the claim service: every computer and board, desired against observed, with an acknowledgement per change, `applied`, `pending` or `failed` with its reason. The work state is acknowledged by the manager; the run state by the supervisor's operation report. `operator.sh attention` carries `desiredState`: changes pending longer than two minutes, and failures. If the claim service cannot answer, it is `null` with `desiredStateError`.
+
+Signals: a stop signal that was certainly not sent (the dispatcher changed or could not be observed, or the signal was refused) is reported as phase `signal-failed`, and the next pass tries again. One whose delivery is unknown, as after a timeout or a supervisor crash between saving its record and the acknowledgement, is waited out: the operation stays `draining`, says the delivery is unconfirmed, finishes normally when the dispatcher exits, and is never signalled again. The six-hour limit still applies. This replaces "Drain acknowledgement uncertain"; such records left from before become this wait, with the six hours counted from the conversion.
+
+Migration: a manager's saved `drainingProjects` from before this change are sent with its first fetch and imported as `tickets-drained` (actor `import`). An import never loosens a central state that is already stricter. The older `drain-project` and `resume-project` commands now set the same central state for the local computer. The bare `drain` command keeps its older meaning, an in-memory drain of the local manager that makes its dispatchers exit and that any manager restart lifts; it prints a warning. In-memory drains cannot be imported: a controller rollout that loads this change lifts them, exactly as before. To keep one through that rollout, seed the central rows before setting the control target, in the same guarded way as the target itself. `DESIRED_STATE_SCHEMA` in `src/desired-state.ts` is the table definition, and for each computer:
+
+```sql
+INSERT INTO fleet_desired_state VALUES ('MACHINE','*','drained',NULL,1,strftime('%s','now')*1000,'operator','kept through the rollout');
+INSERT INTO fleet_desired_revisions VALUES ('MACHINE',1);
+```
+
+Upgrade order is the usual one: claim service, then managers and supervisors, through the controller rollout. Until a computer's manager is updated, the claim service still refuses its grants for drained boards, and its stops wait. Restoring an older claims database restores its older desired state too.
+
 ### Operator commands
 
 ```sh
 pnpm fleet status /absolute/private/path/operator.json
-pnpm fleet drain /absolute/private/path/operator.json
+pnpm fleet drain /absolute/private/path/operator.json --machine pyrybox
 pnpm fleet drain-project /absolute/private/path/operator.json pyrycode/pyrycode-mobile
 pnpm fleet resume-project /absolute/private/path/operator.json pyrycode/pyrycode-mobile
 pnpm fleet free /absolute/private/path/operator.json \
@@ -497,11 +537,11 @@ pnpm fleet free /absolute/private/path/operator.json \
 
 Status includes durable owners, active reservations, both capacity limits, project order, project drain policies, last reports and the eligible queue. A claim with no offer can be blocked, errored, completed or waiting for its dispatcher. GitHub remains the source for the detailed workflow reason. A reservation records permission to run, not proof that its process is still alive.
 
-`drain` stops all new grants on the computer. Existing grants can finish, but subsequent stages of those tickets cannot start. The drain flag is local process state; a manager restart resumes admission. Never configure an external watchdog to restart a deliberately drained manager.
+`drain --machine` is the saved central drain described above. A bare `drain` stops all new grants on the computer from the local manager's memory only. Existing grants can finish, but subsequent stages of those tickets cannot start, and the dispatchers exit once idle. A manager restart resumes admission. Never configure an external watchdog to restart a deliberately drained manager.
 
-`drain-project` stops new ticket claims for one project on this computer. Tickets already owned by it can continue through build, verification, documentation, final checks and merge. Blocked or errored tickets retain their claims and continue when runnable. Other projects remain eligible under the shared limits. Reconciliation remains allowed so board updates can finish; background main sweeps are held back. This command waits for any start already sent to the claim service before acknowledging the change. It does not stop running agents or release tickets to another computer.
+`drain-project` stops new ticket claims for one project on this computer. With central desired state it sets `tickets-drained` for this computer centrally. Tickets already owned by it can continue through build, verification, documentation, final checks and merge. Blocked or errored tickets retain their claims and continue when runnable. Other projects remain eligible under the shared limits. Reconciliation remains allowed so board updates can finish; background main sweeps are held back. This command waits for any start already sent to the claim service before acknowledging the change. It does not stop running agents or release tickets to another computer.
 
-The project policy is saved atomically in the manager's private configuration as `drainingProjects`, an optional list of configured repository names. It survives service and computer restarts until `resume-project` removes it. Keep the project dispatcher running while draining; removing its configuration or stopping its service would prevent later stages from finishing. Once the owned tickets are done, it remains idle for new tickets. Previously owned tickets keep their owner when reopened, just as they do outside drain mode. Free their claims manually to transfer them.
+Before central desired state, the project policy was saved atomically in the manager's private configuration as `drainingProjects`, an optional list of configured repository names. It survives service and computer restarts until `resume-project` removes it. A manager with central desired state imports that list once and from then on writes it as a mirror of the central state. Keep the project dispatcher running while draining; removing its configuration or stopping its service would prevent later stages from finishing. Once the owned tickets are done, it remains idle for new tickets. Previously owned tickets keep their owner when reopened, just as they do outside drain mode. Free their claims manually to transfer them.
 
 The operator client can use a separate `managerUrl` configuration, or the manager configuration's `socketPath` when run from the manager's working directory. Only the operator credential can change a project policy. The manager must be able to write its own configuration directory. If saving fails, the command reports an error and leaves admission unchanged.
 

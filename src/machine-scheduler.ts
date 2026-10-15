@@ -125,6 +125,12 @@ export function effectiveReviewQueueLimit(limits: { heavyLimit: number; reviewQu
 /** Offers are already eligible: blockers, errors and backoff belong to the dispatcher. */
 export function scheduleMachine(opts: {
   machine: string; projects: readonly string[]; drainingProjects?: readonly string[]; ticketLimit?: number;
+  /**
+   * Boards that take no new grants at all: a central drain or stop (see
+   * desired-state.ts). A support task is held when the board of the ticket
+   * it serves is listed too.
+   */
+  drainedProjects?: readonly string[];
   /** What this computer advertises to tickets with a `requires:` label. See ticket-requirements.ts. */
   capabilities?: readonly string[];
   /**
@@ -159,7 +165,8 @@ export function scheduleMachine(opts: {
   const rank = new Map(opts.projects.map((p, i) => [p, i]));
   const priorityHigh = new Set(opts.state.priorityHighTickets ?? []);
   const ready = opts.offers.filter(o => rank.has(o.project) && (!claims.has(o.ticket) || claims.get(o.ticket)!.machine === opts.machine)
-    && acceptsDuringProjectDrain(o, opts.machine, opts.drainingProjects ?? [], opts.state));
+    && acceptsDuringProjectDrain(o, opts.machine, opts.drainingProjects ?? [], opts.state)
+    && !(opts.drainedProjects ?? []).some(p => o.project === p || o.parentTicket?.split("#")[0] === p));
   ready.sort((a, b) => {
     const parentClaim=(o:WorkOffer)=>o.supportTaskId&&o.parentTicket?claims.get(o.parentTicket):undefined;
     const ac=claims.get(a.ticket)??parentClaim(a),bc=claims.get(b.ticket)??parentClaim(b);

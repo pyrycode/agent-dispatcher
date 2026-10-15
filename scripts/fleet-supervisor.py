@@ -24,6 +24,12 @@ def redact_paths(text):
     return HOST_PATH.sub('<path>', text)
 HEALTH_LATCH_REASON = 'Health failed again after a verified restart. No repeat restart within twenty-four hours.'
 SIX_HOUR_REASON = 'Operation exceeded six hours. No forced stop or second signal sent.'
+# Records written before an undelivered or unconfirmed stop signal had its own
+# handling. They are now waited out like any drain: no second signal is sent.
+UNCERTAIN_SIGNAL_REASONS = ('Drain acknowledgement uncertain. No second signal sent.',
+                            'Drain delivery uncertain after supervisor restart. Inspect before retrying.')
+UNCONFIRMED_NOTE = ('Stop signal delivery is unconfirmed. Waiting for the dispatcher to exit; '
+                    'no second signal is sent, and the six-hour limit still applies.')
 # Configurable through the supervisor configuration file.
 DEFAULTS = {
     # A health failure must persist this long before it latches or restarts.
@@ -147,8 +153,55 @@ class Supervisor:
         since = self.unhealthy_since.setdefault(project, now)
         return now - since >= self.settings['healthFailureConfirmSeconds']
 
+    def desired_run(self, project):
+        """The board's central run state, read from the local manager.
+
+        'running' or 'stopped' as the operator set it, 'unknown' while the
+        manager has no desired state yet, or None for a board, manager or claim
+        service without one, which keeps the older behaviour: a stopped
+        dispatcher stays stopped and a running one is updated."""
+        try:
+            state = self.adapter.status()
+        except Exception:
+            return 'unknown'
+        desired = state.get('desiredState') if isinstance(state, dict) else None
+        if not isinstance(desired, dict):
+            return None
+        if desired.get('known') is not True:
+            return 'unknown'
+        entry = (desired.get('projects') or {}).get(project)
+        run = entry.get('run') if isinstance(entry, dict) else None
+        return run if run in ('running', 'stopped') else None
+
+    def retire_receipt(self, project, receipt, state, reason):
+        folder = self.housekeeping.archive('retired', project.replace('/', '_'),
+                                           {'reason': reason, 'project': project, 'phase': state.get('phase')}, move=[receipt])
+        self.housekeeping.record('operation-retired', project, reason, folder)
+        self.notices[project].append(reason)
+
     def recheck_attention(self, project, desired, receipt, state):
-        """Only a health latch or a six-hour record can resolve without a person."""
+        """Only a health latch, a six-hour record or an unconfirmed signal can resolve without a person."""
+        quiet = health_latched(state) or state.get('reason') in (SIX_HOUR_REASON, *UNCERTAIN_SIGNAL_REASONS)
+        if quiet and self.desired_run(project) == 'stopped':
+            # The operator wants this board stopped. Once it is, nothing will
+            # be signalled or restarted, so the record has nothing left to guard.
+            try:
+                observed = self.adapter.observe(project)
+            except Exception:
+                observed = {}
+            if observed.get('stopped') and observed.get('childrenStopped'):
+                self.retire_receipt(project, receipt, state, 'Retired ' + ('a health latch' if health_latched(state) else 'an attention record')
+                                    + ': the board is stopped as desired, so nothing is restarted.')
+                return None
+        if state.get('reason') in UNCERTAIN_SIGNAL_REASONS and state.get('identity'):
+            # Waiting for the signalled process to exit replaces inspection. It
+            # sends nothing: if the signal never arrived, the six-hour limit
+            # reports it, counted from now.
+            converted = {k: v for k, v in state.items() if k not in {'reason', 'attentionFrom'}}
+            converted.update(phase='draining', signalUncertain=True, timerFrom=self.clock())
+            atomic(receipt, converted)
+            self.housekeeping.record('operation-retired', project, 'Unconfirmed stop signal record now waits for the dispatcher to exit. No second signal is sent.')
+            return converted
         if health_latched(state):
             return self.watch_latch(project, desired, receipt, state)
         if state.get('reason') == SIX_HOUR_REASON and state.get('desired') != desired:
@@ -301,6 +354,113 @@ class Supervisor:
         self.notices[project].append(reason)
         return 'retired'
 
+    def begin_drain(self, project, desired, observed, receipt, intent):
+        """One graceful stop signal, for an update or for a desired stop.
+
+        The record is written before the signal, so a crash never causes a
+        second one."""
+        if not observed.get('identity'):
+            # A unit that is neither running nor stopped, such as a failed one, has no process to signal.
+            return {'phase': 'attention', 'project': project, 'reason': 'Dispatcher service is neither running nor stopped. Nothing was signalled.'}
+        helpers_active = getattr(self.adapter, 'helpers_active', lambda project: False)
+        if helpers_active(project):
+            state = {'phase': 'waiting-for-native-task', 'project': project, 'desired': desired, 'created': self.clock()}
+            atomic(receipt, state)
+            return state
+        before = self.adapter.status()
+        current = self.adapter.observe(project)
+        if current.get('identity') != observed.get('identity'):
+            return {'phase': 'changed-before-drain', 'project': project}
+        # Stop new native task admissions into this container first, then
+        # look again. A task admitted before the withdrawal is visible now,
+        # and the drain waits for it instead of stopping its container.
+        if self.withhold:
+            self.withhold(project)
+            if helpers_active(project):
+                state = {'phase': 'waiting-for-native-task', 'project': project, 'desired': desired, 'created': self.clock()}
+                atomic(receipt, state)
+                return state
+        state = {'phase': 'drain-requested', 'project': project, 'desired': desired, 'intent': intent,
+                 'identity': observed['identity'], 'childGroups': observed.get('childGroups', []), 'created': self.clock(),
+                 'claims': real_claims(before), 'policy': policy(before)}
+        # Write BEFORE signalling. If the host dies here, the next pass waits
+        # for the process to exit instead of signalling again.
+        atomic(receipt, state)
+        self.unhealthy_since.pop(project, None)
+        try:
+            self.adapter.drain(project, observed['identity'])
+        except Exception as error:
+            return self.signal_failed(project, receipt, state, error)
+        state['phase'] = 'draining'
+        atomic(receipt, state)
+        if intent == 'stop':
+            self.notices[project].append('Stopping as desired once its running jobs finish.')
+        return state
+
+    def signal_failed(self, project, receipt, state, error):
+        """Tell a signal that was never sent from one whose delivery is unknown."""
+        try:
+            after = self.adapter.observe(project)
+        except Exception:
+            after = None
+        if after is not None and after.get('stopped'):
+            # Gone either way: the wait for its children continues as a drain.
+            state['phase'] = 'draining'
+            atomic(receipt, state)
+            return state
+        if getattr(error, 'signal_not_sent', False):
+            # Nothing was signalled, so the next pass may try again.
+            receipt.unlink(missing_ok=True)
+            return {'phase': 'signal-failed', 'project': project,
+                    'reason': 'Stop signal not sent: ' + redact_paths(str(error))[:200] + '. Nothing was signalled; the next pass tries again.'}
+        state['phase'] = 'draining'
+        state['signalUncertain'] = True
+        atomic(receipt, state)
+        self.notices[project].append(UNCONFIRMED_NOTE)
+        return state
+
+    def install_stopped(self, project, desired, observed):
+        """A board stopped as desired gets the desired versions installed, not started."""
+        result = {'phase': 'stopped', 'project': project, 'reason': 'Stopped as desired.'}
+        installed = getattr(self.adapter, 'installed', None)
+        if not installed or not observed.get('childrenStopped') or not isinstance(desired, dict):
+            return result
+        try:
+            if installed(project) == {'consumer': desired.get('consumer'), 'dispatcher': desired.get('dispatcher')}:
+                return result
+            if not self.adapter.preflight(project, desired):
+                result['reason'] += ' The new version waits: its update preflight does not pass.'
+                return result
+            self.adapter.update(project, desired)
+            result['reason'] += ' Installed the desired versions; they load when it next starts.'
+        except Exception as error:
+            result['reason'] += ' The new version waits: ' + type(error).__name__ + '.'
+        return result
+
+    def start_stopped(self, project, desired, observed, receipt):
+        """Start a stopped board the operator wants running, on the desired versions."""
+        if not observed.get('childrenStopped'):
+            return {'phase': 'stopped', 'project': project, 'reason': 'Waiting for the previous dispatcher\'s processes to exit before starting.'}
+        if not self.adapter.preflight(project, desired):
+            return {'phase': 'preflight-failed', 'project': project}
+        before = self.adapter.status()
+        self.adapter.update(project, desired)
+        state = {'phase': 'start-requested', 'project': project, 'desired': desired, 'intent': 'start', 'created': self.clock(),
+                 'claims': real_claims(before), 'policy': policy(before)}
+        # A crash after this write must not issue another start.
+        atomic(receipt, state)
+        try:
+            self.adapter.start(project)
+        except Exception:
+            state['attentionFrom'] = 'start-requested'
+            state['phase'] = 'attention'
+            state['reason'] = 'Start delivery uncertain. Inspect before another start.'
+            atomic(receipt, state)
+            return state
+        state['phase'] = 'verifying'
+        atomic(receipt, state)
+        return state
+
     def step(self, project, desired):
         receipt = self.directory / (project.replace('/', '_') + '.json')
         state = json.loads(receipt.read_text()) if receipt.exists() else None
@@ -318,6 +478,7 @@ class Supervisor:
         # Any healthy sample ends a failure confirmation, whatever version it runs.
         if observed.get('healthy') is True:
             self.unhealthy_since.pop(project, None)
+        run = self.desired_run(project)
         # Checked before the six-hour limit: a superseded record raises no alert.
         outcome = self.superseded(project, desired, state, observed) if state else None
         if outcome == 'attention':
@@ -327,6 +488,13 @@ class Supervisor:
         if state and state['phase']=='waiting-for-native-task':
             if helpers_active(project): return state
             state=None
+        if state and state['phase'] == 'complete' and run == 'stopped':
+            # A deliberately stopped board is not a health failure. Its verified
+            # record is archived once it is stopped; while it still runs, the
+            # stop below replaces it.
+            if observed.get('stopped'):
+                self.retire_receipt(project, receipt, state, 'Retired the verified record: the board is stopped as desired.')
+            state = None
         if state and state['phase'] == 'complete':
             if observed.get('generation') == desired and observed.get('healthy'):
                 self.unhealthy_since.pop(project, None)
@@ -345,10 +513,16 @@ class Supervisor:
                 return state
             state = None
         if not state:
-            # A service intentionally left stopped stays stopped.
             if observed.get('stopped'):
                 self.unhealthy_since.pop(project, None)
+                if run == 'running':
+                    return self.start_stopped(project, desired, observed, receipt)
+                if run == 'stopped':
+                    return self.install_stopped(project, desired, observed)
+                # Without a central run state, a service left stopped stays stopped.
                 return {'phase': 'stopped', 'project': project}
+            if run == 'stopped':
+                return self.begin_drain(project, desired, observed, receipt, 'stop')
             if observed.get('generation') == desired and observed.get('healthy'):
                 self.unhealthy_since.pop(project, None)
                 return {'phase': 'current', 'project': project}
@@ -358,44 +532,25 @@ class Supervisor:
                     return {'phase': 'current', 'project': project, 'reason': 'Waiting for dispatcher reporting after a manager restart.'}
                 if not self.unhealthy_confirmed(project):
                     return {'phase': 'current', 'project': project, 'reason': 'Health check failing. Confirming before any restart.'}
+            if run == 'unknown':
+                # Desired state may say stopped. Nothing is drained for an update until it is known.
+                return {'phase': 'current', 'project': project, 'reason': 'Waiting for this computer\'s desired state before updating.'}
             if helpers_active(project):
                 state={'phase':'waiting-for-native-task','project':project,'desired':desired,'created':self.clock()}
                 atomic(receipt,state)
                 return state
             if not self.adapter.preflight(project, desired):
                 return {'phase': 'preflight-failed', 'project': project}
-            before = self.adapter.status()
-            current = self.adapter.observe(project)
-            if current.get('identity') != observed.get('identity'):
-                return {'phase': 'changed-before-drain', 'project': project}
-            # Stop new native task admissions into this container first, then
-            # look again. A task admitted before the withdrawal is visible now,
-            # and the drain waits for it instead of stopping its container.
-            if self.withhold:
-                self.withhold(project)
-                if helpers_active(project):
-                    state = {'phase': 'waiting-for-native-task', 'project': project, 'desired': desired, 'created': self.clock()}
-                    atomic(receipt, state)
-                    return state
-            state = {'phase': 'drain-requested', 'project': project, 'desired': desired,
-                     'identity': observed['identity'], 'childGroups': observed.get('childGroups', []), 'created': self.clock(),
-                     'claims': real_claims(before), 'policy': policy(before)}
-            # Write BEFORE signalling. If the host dies here, inspection replaces a second signal.
-            atomic(receipt, state)
-            self.unhealthy_since.pop(project, None)
-            try:
-                self.adapter.drain(project, observed['identity'])
-                state['phase'] = 'draining'
-                atomic(receipt, state)
-            except Exception:
-                state['phase'] = 'attention'
-                state['reason'] = 'Drain acknowledgement uncertain. No second signal sent.'
-                atomic(receipt, state)
-            return state
+            return self.begin_drain(project, desired, observed, receipt, 'update')
         try:
             if state['phase'] == 'drain-requested':
-                raise RuntimeError('Drain delivery uncertain after supervisor restart. Inspect before retrying.')
-            if self.clock() - state['created'] > 6 * 3600:
+                # The supervisor stopped between saving the record and the signal
+                # acknowledgement. Wait for the process to exit; never signal twice.
+                state['phase'] = 'draining'
+                state['signalUncertain'] = True
+                state['timerFrom'] = self.clock()
+                atomic(receipt, state)
+            if self.clock() - state.get('timerFrom', state['created']) > 6 * 3600:
                 raise RuntimeError(SIX_HOUR_REASON)
             if state['desired'] != desired:
                 if state['phase'] == 'draining':
@@ -413,6 +568,10 @@ class Supervisor:
                     # operation; new revisions wait for its verified completion.
                     desired = state['desired']
             if state['phase'] == 'draining':
+                if state.get('signalUncertain'):
+                    self.notices[project].append(UNCONFIRMED_NOTE)
+                if state.get('intent') == 'stop' or run == 'stopped':
+                    self.notices[project].append('Stopping as desired once its running jobs finish.')
                 if helpers_active(project): return state
                 if not observed.get('stopped'):
                     groups = sorted(set(state.get('childGroups', []) + observed.get('childGroups', [])))
@@ -421,10 +580,19 @@ class Supervisor:
                     return state
                 if not observed.get('childrenStopped'):
                     return state
+                if run == 'unknown':
+                    self.notices[project].append('Stopped. Waiting for this computer\'s desired state before starting it again.')
+                    return state
+                if run == 'stopped' or (state.get('intent') == 'stop' and run != 'running'):
+                    # Leave it stopped. A drain for an update still installs the
+                    # new version, which loads when the board next starts.
+                    result = self.install_stopped(project, desired, observed)
+                    receipt.unlink(missing_ok=True)
+                    return result
                 before = self.adapter.status()
                 if any(r['project'] == project and r['machine'] == before['machine'] and not r.get('supportTaskId') for r in before['runs']):
                     raise RuntimeError('Worker reservation remains. Ownership was preserved.')
-                if policy(before) != state['policy']:
+                if policy(before) != state['policy'] and not self.recorded_policy_change(state, before):
                     raise RuntimeError('Operator drain policy changed during operation.')
                 self.adapter.update(project, desired)
                 # A crash after this write must not issue another start.
@@ -451,7 +619,7 @@ class Supervisor:
                 releases = {(c['ticket'], c['machine'], c['generation']) for c in after.get('releasedAssessmentClaims', [])}
                 if any(current.get(ticket) != owner and (ticket, *owner) not in releases for ticket, owner in state['claims'].items()):
                     raise RuntimeError('Existing ticket ownership changed. Inspect the retained comparison.')
-                if policy(after) != state['policy']:
+                if policy(after) != state['policy'] and not self.recorded_policy_change(state, after):
                     raise RuntimeError('Operator drain policy changed during verification.')
                 state['phase'] = 'complete'
                 state['verified'] = self.clock()
