@@ -1,15 +1,16 @@
 import {createHash} from 'node:crypto';
+import {parseGateOutput} from './gate-output.js';
 import type {DatabaseSync} from 'node:sqlite';
 import {scrubCredentials} from './agent-runtime.js';
 import {validateRepairPublication} from './recovery-source-publication.js';
 import {ARTIFACT_LIMITS,artifactManifest,manifestHash,sha256,validateArtifactPath,validateManifest,type ArtifactManifest} from './recovery-artifacts.js';
 
-export const CAPABILITIES = ['linux-amd64','macos-arm64','android-emulator','dispatcher-repair'] as const;
+export const CAPABILITIES = ['linux-amd64','macos-arm64','android-emulator','dispatcher-repair','desktop-fake-suite'] as const;
 export type Capability = typeof CAPABILITIES[number];
 /** A capability report older than this is stale: its machine may be offline. */
 export const CAPABILITY_FRESH_MS = 180_000;
 export interface RecoveryTaskRequest {
- recipe: 'platform-probe'|'memory-runtime-smoke'|'android-tool-then-text'|'dispatcher-repair';
+ recipe: 'platform-probe'|'memory-runtime-smoke'|'android-tool-then-text'|'dispatcher-repair'|'desktop-fake-suite';
  capability: Capability; revision?: string; reason: string;
 }
 export interface RecoveryTaskResult {outcome:'completed'|'failed';summary:string;files:Record<string,string>;dispatcherRevision?:string;candidateRevision?:string}
@@ -65,12 +66,14 @@ export function assessmentTasks(tasks:RecoveryTask[],includeDiagnostics:boolean,
 
 export function validateTaskRequest(value:unknown): RecoveryTaskRequest {
  const r=value as RecoveryTaskRequest;
- if (!r || !['platform-probe','memory-runtime-smoke','android-tool-then-text','dispatcher-repair'].includes(r.recipe)
+ if (!r || !['platform-probe','memory-runtime-smoke','android-tool-then-text','dispatcher-repair','desktop-fake-suite'].includes(r.recipe)
   || !CAPABILITIES.includes(r.capability) || typeof r.reason!=='string' || !r.reason.trim() || r.reason.length>6000
   || Object.keys(r).some(k=>!['recipe','capability','revision','reason'].includes(k))) throw new Error('Invalid recovery task');
  if (r.recipe!=='platform-probe' && !/^[a-f0-9]{40}$/.test(r.revision??'')) throw new Error('An executed task requires an exact revision');
  if (r.recipe==='android-tool-then-text' && r.capability!=='android-emulator'
   || r.recipe==='memory-runtime-smoke' && !['linux-amd64','macos-arm64'].includes(r.capability)
+  || r.recipe==='desktop-fake-suite' && r.capability!=='desktop-fake-suite'
+  || r.capability==='desktop-fake-suite' && r.recipe!=='desktop-fake-suite'
   || r.recipe==='dispatcher-repair' && r.capability!=='dispatcher-repair') throw new Error('Recipe does not match the required platform');
  return {recipe:r.recipe,capability:r.capability,...(r.revision?{revision:r.revision}:{}),reason:scrubCredentials(r.reason)};
 }
@@ -88,6 +91,32 @@ export function validateTaskResult(value:RecoveryTaskResult): RecoveryTaskResult
   if (scrubCredentials(data)!==data) throw new Error('Artifact contains credential-shaped text; retain it privately and return a sanitised diagnostic');
  }
  return {...value,summary:scrubCredentials(value.summary)};
+}
+
+/** A reported pass must carry executed evidence, also on the chunked path. */
+function validateDesktopEvidence(task:RecoveryTask,result:RecoveryTaskResult,files:Record<string,string>):void {
+ if(task.request.recipe!=='desktop-fake-suite' || result.outcome!=='completed') return;
+ try {
+  for(const path of ['desktop/capture.json','desktop/playwright.json','desktop/playwright.list.log','desktop/playwright.config.ts','desktop/fake-daemon-setup.json']) {
+   if(!Object.hasOwn(files,path) || !files[path].trim()) throw new Error();
+  }
+  const capture=JSON.parse(files['desktop/capture.json']),report=JSON.parse(files['desktop/playwright.json']);
+  if(result.candidateRevision!==task.request.revision || capture.revision!==task.request.revision
+   || capture.repository!=='pyrycode/pyrycode-desktop' || !report.config || !capture.configuration
+   || !Array.isArray(capture.errors) || capture.errors.length
+   || !Array.isArray(JSON.parse(files['desktop/fake-daemon-setup.json']))) throw new Error();
+  const tally=parseGateOutput(files['desktop/playwright.json'],'playwright-json');
+  if(!tally.completeParse || tally.packageFailed || !tally.executed || tally.failed) throw new Error();
+  let retries=0;
+  const visit=(suite:any):void=>{
+   for(const spec of suite.specs??[]) for(const test of spec.tests??[]) retries+=Math.max(0,test.results.length-1);
+   for(const child of suite.suites??[]) visit(child);
+  };
+  for(const suite of report.suites) visit(suite);
+  const counts=capture.counts;
+  if(counts.executed!==tally.executed || counts.passed!==tally.passed || counts.failed!==tally.failed
+   || counts.skipped!==tally.skipped || counts.retries!==retries) throw new Error();
+ }catch {throw new Error('Desktop capture requires complete nonzero passing evidence for its exact revision');}
 }
 
 /** Requests and outcomes share the authority database. A lost acknowledgement never executes twice. */
@@ -112,6 +141,7 @@ export class RecoveryTasks {
  }
  request(ticket:string,value:RecoveryTaskRequest,context=""):RecoveryTask {
   const request=validateTaskRequest(value);
+  if(request.recipe==='desktop-fake-suite' && ticket.split('#')[0]!=='pyrycode/pyrycode-desktop') throw new Error('Desktop capture requires a Desktop source ticket');
   const id=createHash('sha256').update(JSON.stringify([ticket,request.recipe,request.capability,request.revision??null,context])).digest('hex');
   this.db.prepare("INSERT OR IGNORE INTO fleet_recovery_tasks VALUES (?,?,?,'queued',?,?,NULL,NULL,NULL,NULL)").run(id,ticket,JSON.stringify(request),this.now(),this.now());
   return this.get(id);
@@ -147,13 +177,17 @@ export class RecoveryTasks {
   const task=this.get(id);
   if (task.machine!==machine || task.session!==session) throw new Error('Task actor mismatch');
   const result=validateTaskResult(value);
+  validateDesktopEvidence(task,result,result.files);
+  return this.recordComplete(task,result);
+ }
+ private recordComplete(task:RecoveryTask,result:RecoveryTaskResult):RecoveryTask {
   if (['complete','failed'].includes(task.state)) {
    if (JSON.stringify(task.result)!==JSON.stringify(result)) throw new Error('Completed task result changed');
    return task;
   }
   if (!['running','attention','publishing'].includes(task.state)) throw new Error('Task is not running');
-  this.db.prepare('UPDATE fleet_recovery_tasks SET state=?,result=?,updated=? WHERE id=?').run(result.outcome==='completed'?'complete':'failed',JSON.stringify(result),this.now(),id);
-  return this.get(id);
+  this.db.prepare('UPDATE fleet_recovery_tasks SET state=?,result=?,updated=? WHERE id=?').run(result.outcome==='completed'?'complete':'failed',JSON.stringify(result),this.now(),task.id);
+  return this.get(task.id);
  }
  prepareRepair(id:string,machine:string,session:string,publication:unknown,base?:Record<string,string|null>):RecoveryTask {
   const task=this.get(id);
@@ -217,6 +251,7 @@ export class RecoveryTasks {
   if(terminal && (task.result?.outcome!==result.outcome || task.result?.summary!==result.summary
    || task.result?.dispatcherRevision!==result.dispatcherRevision || task.result?.candidateRevision!==result.candidateRevision)) throw new Error('Completed task result changed');
   const manifest:ArtifactManifest=JSON.parse(String(transfer.manifest));
+  const desktopFiles:Record<string,string>={};
   for(const file of manifest.files) {
    const parts=file.chunks.map((hash,i)=>{
     const row=this.db.prepare('SELECT data FROM fleet_task_chunks WHERE task=? AND path=? AND part=?').get(id,file.path,i);
@@ -230,9 +265,11 @@ export class RecoveryTasks {
    // Check complete reconstructed content: secrets may span any chunk boundary.
    if(scrubCredentials(text)!==text) throw new Error('Artifact contains credential-shaped text; retain it privately and return a sanitised diagnostic');
    if(terminal && task.result && Object.hasOwn(task.result.files,file.path) && task.result.files[file.path]!==text) throw new Error('Retained artifact changed');
+   if(task.request.recipe==='desktop-fake-suite') desktopFiles[file.path]=text;
   }
   if(terminal && task.result && Object.keys(task.result.files).some(path=>!manifest.files.some(f=>f.path===path))) throw new Error('Retained artifact inventory incomplete');
-  if(!terminal) this.complete(id,machine,session,result);
+  validateDesktopEvidence(task,result,desktopFiles);
+  if(!terminal) this.recordComplete(task,result);
   this.db.prepare('UPDATE fleet_task_artifacts SET committed=1 WHERE task=?').run(id);
   return this.get(id);
  }
