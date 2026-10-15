@@ -11,6 +11,7 @@ import { hasRunningWip, isRepairWip } from "./recovery-labels.js";
 import { hasOpenBlockers } from "./blockers.js";
 import { byTicketPriority } from "./ticket-priority.js";
 import { MERGE_HANDOFF_LABEL } from "./merge-handoff.js";
+import { NATIVE_TASK_HOLD_LABEL } from "./native-task-hold.js";
 import { GATE_PARSER_VERSION, parseGateOutput, validateGateOutputProvenance, type GateOutputFormat, type GateTestDetail } from "./gate-output.js";
 import { missingTestEvidence, reportedRequiredTests, rulesFor, type TestEvidenceRule } from "./gate-test-evidence.js";
 
@@ -1988,6 +1989,10 @@ export const GLOBAL_BLOCK_LABELS: ReadonlySet<string> = new Set([
   // not have. Every stage waits for a person, or the verifier would run
   // into the same host problem every cycle (infra-failure.ts).
   INFRA_FAILURE_LABEL,
+  // A builder or developer handover waiting for the native checks its run
+  // requested. No stage runs until the reconcile pass lifts it, which it
+  // always does within the hold's bound (native-task-hold.ts).
+  NATIVE_TASK_HOLD_LABEL,
 ]);
 
 /**

@@ -15,7 +15,8 @@ import { hasRecoveryPriority } from "./recovery-labels.js";
 import type { PauseRecord, EvidenceRecord, CoordinationRecord } from "./recovery-facts.js";
 import type { RecoveryObservation, RecoveryIncident, RecoveryDecision } from "./fleet-recovery.js";
 import type { AgentRunner } from './agent-runner.js';
-import {taskBridge, type BridgeActions} from "./recovery-task-bridge.js";
+import {taskBridge, TASK_REQUEST_ROLES, type BridgeActions} from "./recovery-task-bridge.js";
+import type { NativeTaskView } from "./native-task-hold.js";
 import { offerId } from "./machine-manager.js";
 import { NON_AGENT_ROLES, startsCodex, codexStartHoldMs, rearmCodexStartJitter, type CodexPauseState } from "./codex-throttle.js";
 
@@ -24,7 +25,8 @@ const DEFAULT_RESOURCE_CLASSES: Readonly<Record<string, ResourceClass>> = {
 };
 export type CodexReportEvent = "rate-limited" | "clean";
 type CodexReporter = (event: CodexReportEvent) => Promise<CodexPauseState | null>;
-const currentRun = new AsyncLocalStorage<{ run: FleetRun; groups: Set<number>; taskSocket?: string; taskActions?: BridgeActions; githubEnv?:NodeJS.ProcessEnv; reportCodex?: CodexReporter }>();
+const currentRun = new AsyncLocalStorage<{ run: FleetRun; groups: Set<number>; taskSocket?: string; taskActions?: BridgeActions; githubEnv?:NodeJS.ProcessEnv; reportCodex?: CodexReporter;
+  requestedTasks?: () => string[]; ticketTasks?: () => Promise<NativeTaskView[]> }>();
 /**
  * Reports the current admitted run's Codex events to the fleet's Codex
  * throttle, or null outside a managed dispatcher run. The reporter resolves
@@ -39,8 +41,19 @@ export function managedTaskEnv(): NodeJS.ProcessEnv {
   const socket=currentRun.getStore()?.taskSocket;
   return {...currentRun.getStore()?.githubEnv,...(socket?{PYRY_TASK_SOCKET:socket}:{})};
 }
-/** What the current run's task socket accepts: native check requests, shared evidence reads, or neither. */
-export function managedBridgeActions(): BridgeActions { return currentRun.getStore()?.taskActions ?? { tasks: false, evidence: false }; }
+/** What the current run's task socket accepts: native check requests, native task reads, shared evidence reads, or none. */
+export function managedBridgeActions(): BridgeActions { return currentRun.getStore()?.taskActions ?? { request: false, read: false, evidence: false }; }
+/** The native tasks the current run asked for through its socket, by id. Empty outside a managed run. */
+export function managedRequestedTasks(): string[] { return currentRun.getStore()?.requestedTasks?.() ?? []; }
+/**
+ * The current run's ticket's native tasks, newest first, as the claim service
+ * reports them to any fleet credential. Null outside a managed run or for a
+ * run that cannot read native tasks. Throws when the service does not answer.
+ */
+export async function managedTicketTasks(): Promise<NativeTaskView[] | null> {
+  const read = currentRun.getStore()?.ticketTasks;
+  return read ? read() : null;
+}
 /** The admitted run this code runs inside, or undefined outside a managed run. */
 export function managedRun(): FleetRun | undefined { return currentRun.getStore()?.run; }
 /** Native repair recipes use the same tracked-child completion rule as project workers. */
@@ -345,11 +358,17 @@ export class ManagedDispatch {
           ghBridge=await startGitHubBridge(ghEnv,{session:this.session,runId:run.id});
           if(ghBridge)currentRun.getStore()!.githubEnv={GH_CONFIG_DIR:ghEnv.GH_CONFIG_DIR};
         }
-        // Builders request native checks. Every numbered ticket's agent can read
-        // the shared evidence of earlier runs, from any computer.
-        const actions:BridgeActions={tasks:this.tasksEnabled && ['builder','developer'].includes(run.role),evidence:this.evidenceEnabled};
-        bridge=/#[1-9]\d*$/.test(run.ticket) && (actions.tasks || actions.evidence) ? await taskBridge(this.connection,run,actions) : undefined;
-        if(bridge){currentRun.getStore()!.taskSocket=bridge.socket;currentRun.getStore()!.taskActions=actions;}
+        // Builders and developers request native checks. Every agent of a
+        // numbered ticket reads and awaits that ticket's native tasks, and
+        // reads the shared evidence of earlier runs, from any computer.
+        const actions:BridgeActions={request:this.tasksEnabled && TASK_REQUEST_ROLES.has(run.role),
+          read:this.tasksEnabled && !NON_AGENT_ROLES.has(run.role),evidence:this.evidenceEnabled};
+        bridge=/#[1-9]\d*$/.test(run.ticket) && (actions.request || actions.read || actions.evidence) ? await taskBridge(this.connection,run,actions) : undefined;
+        if(bridge){
+          const store=currentRun.getStore()!;
+          store.taskSocket=bridge.socket;store.taskActions=actions;store.requestedTasks=bridge.requested;
+          if(actions.read) store.ticketTasks=()=>this.ticketTasks(run.ticket);
+        }
         // Fresh authority check before starting, including after a manual release.
         const state = await this.connection.call<FleetSnapshot>("/state");
         if (!state.runs.some(r => r.id === run.id && r.session === this.session && r.generation === run.generation)) throw new Error("Run grant no longer active");
@@ -458,6 +477,17 @@ export class ManagedDispatch {
   async hydrateRecovery(item: ProjectItem): Promise<ProjectItem> {
     const [facts] = await this.recoveryFacts([`${this.project}#${item.issueNumber}`]);
     return { ...item, recoveryPause: facts.pause, artifactRevision: facts.artifactRevision };
+  }
+  /**
+   * A ticket's native tasks, newest first, read through the recovery facts
+   * any fleet credential may read: state, recipe, platform, revision and the
+   * scrubbed summary, never artifact bytes. No run identity is sent, so this
+   * never asks for an assessment's diagnostics.
+   */
+  async ticketTasks(ticket: string): Promise<NativeTaskView[]> {
+    const facts = await this.connection.call<Array<{ ticket: string; tasks?: NativeTaskView[] }>>("/recovery/facts", { tickets: [ticket] });
+    const own = Array.isArray(facts) ? facts.find(f => f?.ticket === ticket) : undefined;
+    return Array.isArray(own?.tasks) ? own!.tasks : [];
   }
   recordEvidence(records: EvidenceRecord[]) { return this.connection.call("/recovery/evidence", { records }); }
   async recoveryReport(items: ProjectItem[]): Promise<RecoveryIncident[]> {

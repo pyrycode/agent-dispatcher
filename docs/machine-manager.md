@@ -652,6 +652,40 @@ can request the same native checks through `scripts/fleet-task.py`. Each run get
 a private socket. The parent supplies the ticket and run identity. The child
 receives no fleet credential and cannot read another ticket's artifacts.
 
+**Who may request and who may read.** Requesting a check (`fleet-task.py request`)
+stays with builder and developer runs: a check spends heavy time on the Mac or the
+Android host, and the later stages judge evidence rather than make it. Reading a
+task and its artifacts (`read`) and waiting for one (`await`) is open to every
+agent role of a numbered ticket, verifier and documentation included, for that
+ticket's tasks only: the claim service answers a read only for a task of the
+run's own ticket while the run is active. Every such run's prompt lists the
+ticket's tasks, newest first, with their state and summary. Until 2026-10-15 one
+switch covered both, so a verifier or documentation run could not read the result
+its builder asked for (Desktop #1998). Recovery assessments already receive each
+task's state and summary, and a failed task's bounded diagnostics, in their facts.
+
+**The builder handover waits for its checks.** A builder or developer run that
+ends while a task it requested is still queued, running, publishing or in
+attention does not hand over. Instead of `done:<agent>` the ticket gets
+`held:native-task` and a comment naming the tasks. The label blocks every stage,
+so nothing is offered for the ticket and it holds no build place: the requesting
+run has ended, and the task's own run is the only one using capacity. Each
+reconcile pass reads the ticket's tasks and removes the label once none is worth
+waiting for, with a comment giving their outcome. The ticket keeps its column, so
+the builder runs again, reads the result, commits the evidence or fixes what it
+shows, and hands over as usual.
+
+A task stops holding when it completes or fails. The claim service has no
+cancelled state: a withdrawn repair or an interrupted worker is recorded as
+failed. A task open for longer than the bound stops holding too:
+`PYRY_NATIVE_TASK_HOLD_MINUTES`, default 240, with 0 turning the hold off. If the
+task states cannot be read, the reconcile pass lifts the hold once it has seen
+the label for the bound. A ticket with more than five native tasks hands over
+without a hold, so a builder that keeps asking for checks reaches a verifier.
+Independently of the hold, the claim service admits no stage but a recovery on a
+ticket while one of its tasks is open, so a task stuck past the bound still
+keeps the ticket waiting until it finishes or a person settles it, as before.
+
 The existing local supervisor advertises its configured capabilities after
 checking the required executables. Records expire after three minutes for new
 admission. An expired record never releases an existing worker or ownership.

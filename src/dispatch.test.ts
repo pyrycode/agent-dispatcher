@@ -125,6 +125,7 @@ import { FINAL_MERGE_HANDOFF_MARKER, MERGE_RESOLUTION_NOTE_MARKER, mergeResoluti
 import { runReworkRouting } from "./reconcile.js";
 import { hashGateList, type VerifierGatePass } from "./verifier-gate-reuse.js";
 import { resetActiveStageSetForTests, resolveStageSet } from "./stage-sets.js";
+import { NATIVE_TASK_HOLD_LABEL } from "./native-task-hold.js";
 import type { AgentConfig, BlockerInfo, ProjectItem } from "./types.js";
 import {
   decideReworkRoutes,
@@ -136,6 +137,7 @@ import {
   STRANDED_WIP_SWEPT_MARKER,
   tallyFamilyComments,
   shouldSkipDispatch,
+  PENDING_DONE_PREFIX,
 } from "./pipeline-decisions.js";
 import { AGENTS } from "./types.js";
 import { AgentRunFailedError, AgentRunStoppedError, buildResumePrompt, idleStallMessage, noResultErrorMessage, ResourceExhaustedError, timeoutFor } from "./agent-runtime.js";
@@ -3269,6 +3271,105 @@ describe("handlePostRun — failure modes", () => {
     assert.deepEqual(result, { ok: true });
     assert.ok(client.addLabelCalls.some(c => c.label === "done:builder"));
     assert.ok(!client.addLabelCalls.some(c => c.label === "error:builder"));
+  });
+
+  // Desktop #1998 (2026-10-15): the builder handed over "native acceptance
+  // pending" at 12:51 and its Mac check finished green at 13:00, after the
+  // ticket had moved on. A builder whose requested task is still open now
+  // keeps the ticket with held:native-task (native-task-hold.ts).
+  describe("native task handover hold", () => {
+    const OPEN = {
+      id: "0234f9aa".padEnd(64, "0"), state: "queued", created: Date.now() - 6 * 60_000,
+      request: { recipe: "desktop-fake-suite", capability: "desktop-fake-suite", revision: "c".repeat(40) },
+    };
+    const builderCtx = (issue: number, hold: DispatchDeps["nativeTaskHold"], client: MockGitHubClient, agent: Partial<AgentConfig> = BUILDER) => {
+      const mock = makeMockDeps({ execImpls: {
+        "git status --porcelain": () => "",
+        "git rev-list --count main..": () => "2\n",
+        "gh pr list --head": () => JSON.stringify([{ number: 2000 }]),
+        "gh pr view": () => JSON.stringify({ reviews: [{ submittedAt: new Date(Date.now() + 60_000).toISOString(), body: "PASS" }], comments: [] }),
+      } });
+      mock.deps.nativeTaskHold = hold;
+      return makeTestContext({ agent, item: { issueNumber: issue }, client, deps: mock.deps, calls: mock.calls }).ctx;
+    };
+
+    test("an open requested task holds the handover: held:native-task, no done:builder, the hold explained after the completion comment", async () => {
+      const client = new MockGitHubClient({ status: { 1998: "In Development" }, labels: { 1998: ["done:refiner", "error-retry-count:1"] } });
+      const ctx = builderCtx(1998, async () => ({ held: [{ id: OPEN.id, task: OPEN }], passed: [] }), client);
+
+      const result = await handlePostRun(STREAM_OK(), ctx, false);
+
+      assert.deepEqual(result, { ok: true });
+      assert.ok(client.addLabelCalls.some(c => c.label === NATIVE_TASK_HOLD_LABEL));
+      assert.ok(!client.addLabelCalls.some(c => c.label === "done:builder"), "the ticket does not move on");
+      assert.ok(!client.addLabelCalls.some(c => c.label.startsWith(PENDING_DONE_PREFIX)));
+      assert.ok(client.removeLabelCalls.some(c => c.label === "error-retry-count:1"), "the run succeeded, so its retry state ends");
+      assert.equal(client.comments.length, 2);
+      assert.match(client.comments[0]!.body, /builder agent has completed work/);
+      assert.match(client.comments[1]!.body, /Handover held: native task still running/);
+      assert.match(client.comments[1]!.body, new RegExp(OPEN.id));
+    });
+
+    test("an open task that does not hold hands over and says why", async () => {
+      const client = new MockGitHubClient({ status: { 1999: "In Development" }, labels: { 1999: [] } });
+      const ctx = builderCtx(1999, async () => ({ held: [], passed: [{ task: OPEN, reason: "limit" as const }] }), client);
+
+      await handlePostRun(STREAM_OK(), ctx, false);
+
+      assert.ok(client.addLabelCalls.some(c => c.label === "done:builder"));
+      assert.ok(!client.addLabelCalls.some(c => c.label === NATIVE_TASK_HOLD_LABEL));
+      assert.match(client.comments.at(-1)!.body, /handover not held/);
+    });
+
+    test("no requested task, a check that throws, or a hold label GitHub refuses: done:builder as before", async () => {
+      for (const [issue, hold, refuse] of [
+        [2001, async () => null, false],
+        [2002, async () => { throw new Error("socket closed"); }, false],
+        [2003, async () => ({ held: [{ id: OPEN.id, task: OPEN }], passed: [] }), true],
+      ] as const) {
+        const client = new MockGitHubClient({ status: { [issue]: "In Development" }, labels: { [issue]: [] } });
+        if (refuse) client.failures.addLabel = (_n, label) => label === NATIVE_TASK_HOLD_LABEL ? new Error("GitHub 502") : null;
+        const ctx = builderCtx(issue, hold, client);
+        await handlePostRun(STREAM_OK(), ctx, false);
+        assert.ok(client.addLabelCalls.some(c => c.label === "done:builder"), String(issue));
+        assert.equal(client.comments.length, 1, `${issue}: only the completion comment`);
+      }
+    });
+
+    test("an unknown column with an open task holds instead of deferring done:builder", async () => {
+      const client = new MockGitHubClient({ status: { 2004: "In Development" }, labels: { 2004: [] } });
+      client.failures.getItemStatus = new Error("GraphQL rate limit");
+      const ctx = builderCtx(2004, async () => ({ held: [{ id: OPEN.id }], passed: [] }), client);
+
+      await handlePostRun(STREAM_OK(), ctx, false);
+
+      assert.ok(client.addLabelCalls.some(c => c.label === NATIVE_TASK_HOLD_LABEL));
+      assert.ok(!client.addLabelCalls.some(c => c.label === `${PENDING_DONE_PREFIX}builder`), "pending-done would hand over on the next board read");
+      assert.ok(!client.addLabelCalls.some(c => c.label === "done:builder"));
+    });
+
+    test("a verifier never holds: only builders and developers request native checks", async () => {
+      let asked = false;
+      const client = new MockGitHubClient({ status: { 2005: "In Code Review" }, labels: { 2005: [] } });
+      const ctx = builderCtx(2005, async () => { asked = true; return { held: [{ id: OPEN.id }], passed: [] }; }, client,
+        { name: "verifier", column: "In Code Review", claudeMdPath: "verifier/CLAUDE.md", usesWorktree: true, producesCommits: false, requiresVerdict: true });
+
+      await handlePostRun(STREAM_OK(), ctx, false);
+
+      assert.equal(asked, false);
+      assert.ok(!client.addLabelCalls.some(c => c.label === NATIVE_TASK_HOLD_LABEL));
+    });
+
+    test("a developer holds like a builder", async () => {
+      const client = new MockGitHubClient({ status: { 2006: "In Development" }, labels: { 2006: [] } });
+      const ctx = builderCtx(2006, async () => ({ held: [{ id: OPEN.id, task: OPEN }], passed: [] }), client,
+        { name: "developer", column: "In Development", claudeMdPath: "developer/CLAUDE.md", usesWorktree: true, producesCommits: true });
+
+      await handlePostRun(STREAM_OK(), ctx, false);
+
+      assert.ok(client.addLabelCalls.some(c => c.label === NATIVE_TASK_HOLD_LABEL));
+      assert.ok(!client.addLabelCalls.some(c => c.label === "done:developer"));
+    });
   });
 
   test("empty branch + architect added needs-human:sizing → error:architect (a stop is now a deviation)", async () => {
