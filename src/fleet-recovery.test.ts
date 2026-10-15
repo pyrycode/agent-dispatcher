@@ -255,7 +255,8 @@ test("recovery respects capacity, drains and fleet-wide assessment exclusion", a
   manager.draining = true; await manager.tick(); assert.equal(store.snapshot().runs.length, 0);
   manager.draining = false; await manager.tick(); assert.equal(store.snapshot().runs[0].role, "recovery");
   assert.deepEqual(store.start(request(2, { machine: "linux" })), { ok: false, reason: "locked" });
-  assert.throws(() => store.start(request(3, { resource: "light" })), /heavy/);
+  assert.deepEqual(store.start(request(3, { resource: "light" })), {ok:false,reason:"locked"});
+  assert.throws(() => store.start(request(3, { resource: "medium" })), /read-only/);
   const run = store.snapshot().runs[0]; store.finish("mac", "session", run.id);
   store.start(request(4, { role: "verifier" }));
   assert.deepEqual(store.start(request(2)), { ok: false, reason: "capacity" });

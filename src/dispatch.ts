@@ -1,3 +1,5 @@
+import {fixedFailureDecision} from "./fixed-failure-handling.js";
+import {ServiceError} from "./fleet-http.js";
 import { coordinationReceipts } from "./recovery-receipts.js";
 import { writeRuntimeReceipt } from "./runtime-receipt.js";
 import { type ChildProcess, execSync, spawn, spawnSync } from "node:child_process";
@@ -3377,6 +3379,10 @@ export async function handleDispatchError(
     console.log(`   ⏸️  #${item.issueNumber} Codex rate limit: waits for the fleet Codex pause, no retry counted`);
     return;
   }
+  const definiteRefusal = error instanceof ServiceError && [401,403,422].includes(error.status);
+  if (item.issueNumber > 0 && definiteRefusal) {
+    await client.addLabel(item.issueNumber, error.status === 422 ? 'error:publication-refused' : 'error:authentication');
+  }
   if (item.issueNumber > 0) {
     const classifyText = isResourceExhausted
       ? `${error.message} ${(error as ResourceExhaustedError).errno}`
@@ -3393,7 +3399,7 @@ export async function handleDispatchError(
     // does a block after the approval reviewer failed to decide (#121); a
     // rejected action and every other block still park at once.
     const terminalReason = streamResult?.terminalReason ?? "";
-    const { transient, signature } = terminalReason === "codex_blocked"
+    const { transient, signature } = definiteRefusal ? {transient:false,signature:""} : terminalReason === "codex_blocked"
       ? classifyBlockedRun(classifyText, {
         approvalRejected: streamResult?.hadPermissionDenial === true,
         approvalReviewFailed: streamResult?.approvalReviewFailed === true,
@@ -11195,7 +11201,7 @@ export async function pollLoop(): Promise<void> {
         const issue = Number(incident.ticket.split("#")[1]);
         const key = `recovery#${issue}`;
         if (pool.has(key)) continue;
-        const offer = managed.offer(issue, "recovery", "heavy", [], -4);
+        const offer = managed.offer(issue, "recovery", "light", [], -4);
         offer.offer.roleLimit = 1;
         offer.offer.requiresRecovery = true;
         offer.offer.recoveryError = incident.reason.startsWith('error:');
@@ -11220,6 +11226,15 @@ export async function pollLoop(): Promise<void> {
               begin: () => managed.recoveryStep<RecoveryIncident>("begin", incident.id),
               decide: decision => managed.recoveryStep<RecoveryDecision>("decide", incident.id, decision),
               complete: () => managed.recoveryStep("complete", incident.id),
+              knownDecision: async item => {
+                const direct = fixedFailureDecision(item, true);
+                if (direct) return direct;
+                if (item.blockedBy.some(b => b.state === 'OPEN')) {
+                  const [facts] = await managed.recoveryFacts([incident.ticket]);
+                  return fixedFailureDecision(item, !!facts?.coordination?.length);
+                }
+                return null;
+              },
               assess: async item => {
                 const runner = selectRunner("recovery");
                 if (runner === "codex" && !process.env.PYRY_CODEX_BIN) process.env.PYRY_CODEX_BIN = resolveCodexExecutable(process.env);
