@@ -64,6 +64,10 @@ export function assessmentTasks(tasks:RecoveryTask[],includeDiagnostics:boolean,
  return views;
 }
 
+/** A task's identity: one per ticket, recipe, platform, revision and requesting incident or run. */
+export function recoveryTaskId(ticket:string,request:RecoveryTaskRequest,context=""):string {
+ return createHash('sha256').update(JSON.stringify([ticket,request.recipe,request.capability,request.revision??null,context])).digest('hex');
+}
 export function validateTaskRequest(value:unknown): RecoveryTaskRequest {
  const r=value as RecoveryTaskRequest;
  if (!r || !['platform-probe','memory-runtime-smoke','android-tool-then-text','dispatcher-repair','desktop-fake-suite'].includes(r.recipe)
@@ -142,7 +146,7 @@ export class RecoveryTasks {
  request(ticket:string,value:RecoveryTaskRequest,context=""):RecoveryTask {
   const request=validateTaskRequest(value);
   if(request.recipe==='desktop-fake-suite' && ticket.split('#')[0]!=='pyrycode/pyrycode-desktop') throw new Error('Desktop capture requires a Desktop source ticket');
-  const id=createHash('sha256').update(JSON.stringify([ticket,request.recipe,request.capability,request.revision??null,context])).digest('hex');
+  const id=recoveryTaskId(ticket,request,context);
   this.db.prepare("INSERT OR IGNORE INTO fleet_recovery_tasks VALUES (?,?,?,'queued',?,?,NULL,NULL,NULL,NULL)").run(id,ticket,JSON.stringify(request),this.now(),this.now());
   return this.get(id);
  }

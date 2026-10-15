@@ -4,6 +4,7 @@ import type { FleetSnapshot } from "./fleet-store.js";
 import {validateTaskRequest, CAPABILITY_FRESH_MS, type RecoveryTaskRequest} from "./recovery-tasks.js";
 import type { PauseRecord } from "./recovery-facts.js";
 import { hasRecoveryPriority, hasRepairMarker, hasRunningWip } from "./recovery-labels.js";
+import { dispatcherRepairCap } from "./recovery-repair-cap.js";
 
 export interface RecoveryObservation {
   ticket: string; status: string; labels: string[]; blocked: boolean;
@@ -491,6 +492,11 @@ export class RecoveryLedger {
     if (incident.decision) return incident.decision;
     if (incident.state !== "assessing") throw new Error("Recovery is not being assessed");
     let decision = validateRecoveryDecision(value);
+    // Two failed dispatcher repairs end automatic repair for the ticket (recovery-repair-cap.ts).
+    if (decision.action === "coordinate" && decision.task?.recipe === "dispatcher-repair") {
+      const cap = dispatcherRepairCap(this.db, incident.ticket, incident.fingerprint, this.now(), decision.task);
+      if (cap.capped) decision = { action: "escalate", category: "human", reason: cap.reason };
+    }
     if (["retry", "rework", "resume", "refine", "unblock"].includes(decision.action)) {
       const repairs = this.db.prepare("SELECT count(*) AS n FROM fleet_recovery WHERE ticket=? AND decision IS NOT NULL AND updated>? AND json_extract(decision,'$.action') IN ('retry','rework','resume','refine','unblock')").get(incident.ticket, this.now() - 86400000)!;
       if (Number(repairs.n) >= RECOVERY_REPAIRS_PER_TICKET) {

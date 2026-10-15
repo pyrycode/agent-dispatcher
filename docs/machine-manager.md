@@ -714,6 +714,20 @@ intentionally stopped services and project drains remain intact.
 A `human` escalation remains held for an actual decision, denied permission or
 uncertain worker. An `operational` escalation rechecks after a bounded delay.
 Repair-budget exhaustion records its next available time and rechecks then.
+
+**Dispatcher repair cap.** After two failed dispatcher repairs for one ticket,
+an assessment's next `coordinate` with recipe `dispatcher-repair` becomes a
+`human` escalation and no task is created. A repair worker's direct request for
+a new one is refused the same way. Two failures count when they ended within
+24 hours, or when incidents with the current fingerprint ordered both. Failed
+checks, failed or incomplete independent review, refused publication and an
+implementation that did not finish count. A worker interrupted before it wrote a
+result does not. A completed repair, merged or overtaken by main, starts the
+count again. The escalation reason lists each attempt, its revision and how it
+failed, and `attention` shows it as `decision-needed` with `repairCap: true`.
+Other recovery actions are not capped. Measured overnight 2026-10-14: 21
+repair tasks for six Core tickets and 22 for Desktop and Mobile, each failing
+review, checks or publication. See `src/recovery-repair-cap.ts`.
 This uses the existing recovery cycle and supervisor. No new reporter or cron is
 created.
 

@@ -9,7 +9,8 @@ import { RecoveryFacts, type PauseRecord, type EvidenceRecord, type Coordination
 import { RecoveryLedger, validateObservations, IDLE_RECOVERY_REASONS, RECOVERY_UNKNOWN_PAUSE_REASON, type RecoveryObservation, type RecoveryDecision, type RecoveryIncident, type RecoveryLedgerOptions } from "./fleet-recovery.js";
 import { OperationReports } from './operation-reports.js';
 import { OrphanedTaskWatch } from './orphaned-tasks.js';
-import {RecoveryTasks, assessmentTasks, type RecoveryTaskRequest, type RecoveryTaskResult} from './recovery-tasks.js';
+import {RecoveryTasks, assessmentTasks, recoveryTaskId, validateTaskRequest, type RecoveryTaskRequest, type RecoveryTaskResult} from './recovery-tasks.js';
+import { dispatcherRepairCap } from './recovery-repair-cap.js';
 import {createHash} from 'node:crypto';
 import {manifestHash} from './recovery-artifacts.js';
 import type { AgentRunner } from './agent-runner.js';
@@ -289,7 +290,17 @@ export class FleetStore {
     const run = this.snapshot().runs.find(r => r.id === runId && r.machine === machine && r.session === session && r.project === project);
     if (!run || !['builder','developer','recovery'].includes(run.role) || !/#[1-9]\d*$/.test(run.ticket)) throw new Error('Task needs an admitted source worker');
     this.authorize(machine, session, run.ticket, runId);
-    return this.transaction(() => this.tasks.request(run.ticket, request,run.id));
+    return this.transaction(() => {
+      // The same cap as an assessment's order. Repeating an existing request still returns it.
+      let known = false;
+      try { this.tasks.get(recoveryTaskId(run.ticket, validateTaskRequest(request), run.id)); known = true; } catch { /* new, or invalid and refused below */ }
+      if (!known && request?.recipe === 'dispatcher-repair') {
+        const incident = this.db.prepare('SELECT fingerprint FROM fleet_recovery WHERE ticket=? AND present=1').get(run.ticket);
+        const cap = dispatcherRepairCap(this.db, run.ticket, incident ? String(incident.fingerprint) : null, this.clock(), request);
+        if (cap.capped) throw new Error(cap.reason);
+      }
+      return this.tasks.request(run.ticket, request,run.id);
+    });
   }
   taskStart(machine: string, id: string, session: string): StartResult & {runnerPolicy?: RunnerPolicy;run?:FleetRun} {
     if(!Object.hasOwn(this.limits,machine)) throw new Error('Unknown machine');
