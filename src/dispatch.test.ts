@@ -219,6 +219,7 @@ export type ExecHandler = (cmd: string) => string | Error;
 export type SpawnHandler = (cmd: string, args: string[]) => number | { status: number; stderr?: string; stdout?: string };
 
 export type MockDepsOptions = {
+  salvageGates?: readonly string[];
   /**
    * Pattern → handler for execSync. First matching pattern wins.
    * Unknown commands return empty string (success). To make a command
@@ -386,6 +387,7 @@ export function makeMockDeps(opts: MockDepsOptions = {}): { deps: DispatchDeps; 
   }) as DispatchDeps["spawnGate"];
 
   const deps: DispatchDeps = {
+    salvageGates: opts.salvageGates ?? ["go vet ./...", "go build ./..."],
     execSync: mockExecSync,
     spawnSync: mockSpawnSync,
     existsSync: mockExistsSync,
@@ -2573,8 +2575,43 @@ describe("handleAgentResultErrors", () => {
     await assert.rejects(handleAgentResultErrors(
       streamResult({ isError: true, terminalReason: "", timedOut: true }), ctx,
     ), /Agent error/);
+    assert.ok(calls.exec.some(c => c.cmd === "go build ./..."), "the failing build must actually execute");
     assert.ok(!calls.spawn.some(c => c.args[0] === "push" || c.cmd === "gh"));
   });
+
+  for (const permissionDenied of [false, true]) {
+    const failure = permissionDenied
+      ? { isError: true, terminalReason: "permission_denied", hadPermissionDenial: true }
+      : { isError: true, terminalReason: "", timedOut: true };
+    const path = permissionDenied ? "permission denial" : "timeout";
+    for (const gates of [["fixture build"], []]) {
+      test(`${path} salvage honors injected ${gates.length ? "failing" : "empty"} gates`, async () => {
+        const { ctx, calls, client } = makeTestContext({
+          mockOptions: {
+            salvageGates: gates,
+            execImpls: {
+              "git status --porcelain": () => "M file.go\n",
+              "fixture build": () => execError({ stderr: "fixture failed" }),
+              "go build": () => execError({ stderr: "must not execute default gates" }),
+            },
+          },
+        });
+        const result = handleAgentResultErrors(streamResult(failure), ctx);
+        if (gates.length && !permissionDenied) await assert.rejects(result, /Agent error/);
+        else assert.equal(await result, true);
+        assert.deepEqual(calls.exec.filter(c => c.opts?.timeout === 120_000).map(c => c.cmd), gates);
+        assert.equal(calls.spawn.some(c => c.cmd === "git" && c.args[0] === "push"), gates.length === 0);
+        const pr = calls.spawn.find(c => c.cmd === "gh" && c.args.includes("create"));
+        assert.equal(!!pr, gates.length === 0);
+        if (pr) {
+          assert.ok(pr.args.includes("--draft"));
+          assert.match(String(pr.opts?.input), /no gates configured/);
+        }
+        if (permissionDenied) assert.ok(client.addLabelCalls.some(c => c.label === "error:developer:permission_denied"));
+        if (gates.length && !permissionDenied) assert.match(calls.logs.at(-1)!.content, /"fixture build"=1/);
+      });
+    }
+  }
 
   test("isError=false → returns false (no salvage, success path runs)", async () => {
     const { ctx, client, calls } = makeTestContext({ item: { issueNumber: 300 } });

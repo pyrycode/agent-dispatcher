@@ -1836,7 +1836,7 @@ async function attemptSaferSalvage(opts: {
   logFile: string;
   deps: DispatchDeps;
 }): Promise<boolean> {
-  const { execSync, spawnSync, notifyDiscord } = opts.deps;
+  const { execSync, spawnSync, notifyDiscord, salvageGates } = opts.deps;
   try {
     const dirty = execSync(`git status --porcelain`, {
       cwd: opts.agentCwd, encoding: "utf-8", timeout: 15_000,
@@ -2048,7 +2048,7 @@ async function attemptPermissionDenialSalvage(opts: {
   logFile: string;
   deps: DispatchDeps;
 }): Promise<boolean> {
-  const { execSync, spawnSync, notifyDiscord } = opts.deps;
+  const { execSync, spawnSync, notifyDiscord, salvageGates } = opts.deps;
   const label = `error:${opts.agent.name}:permission_denied`;
   try {
     const dirty = execSync(`git status --porcelain`, {
@@ -2307,6 +2307,8 @@ export interface DispatchClient {
 // `attemptSaferSalvage` accepts deps as part of its opts (called from
 // `handleAgentResultErrors`).
 export type DispatchDeps = {
+  /** Configured production gates; fixtures explicitly supply their own commands. */
+  salvageGates: readonly string[];
   // child_process
   execSync: typeof execSync;
   spawnSync: typeof spawnSync;
@@ -2511,6 +2513,7 @@ export function createCodegraphReindexer(
 const defaultCodegraphReindexer = createCodegraphReindexer(runCommandAsync);
 
 export const DEFAULT_DEPS: DispatchDeps = {
+  salvageGates,
   execSync: ((command:any,options:any={})=>execSync(command,{...options,env:{...(options.env??process.env),...managedTaskEnv()}})) as typeof execSync,
   spawnSync: ((command:any,args:any,options:any={})=>{
     if(!Array.isArray(args)) {options=args??{};args=[];}
