@@ -157,6 +157,7 @@ export type BaselineSource = "main-sweep" | "base-commit";
 export interface BaselineEntry {
   name: string;
   source: BaselineSource;
+  outputPath?:string|null;
   /** The main commit it failed on: the sweep's, or the base the re-run used. */
   sha: string;
 }

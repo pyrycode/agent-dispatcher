@@ -1,3 +1,4 @@
+import {checkInheritedException,type GateExceptionInput} from "./gate-exceptions.js";
 import { coordinationReceipts } from "./recovery-receipts.js";
 import { writeRuntimeReceipt } from "./runtime-receipt.js";
 import { type ChildProcess, execSync, spawn, spawnSync } from "node:child_process";
@@ -2375,6 +2376,7 @@ export interface DispatchClient {
 export type DispatchDeps = {
   /** Test fixtures can pin gates independently of the launching consumer. */
   salvageGates?: readonly string[];
+  inheritedException?: (input:GateExceptionInput)=>string|null;
   // child_process
   execSync: typeof execSync;
   spawnSync: typeof spawnSync;
@@ -6538,7 +6540,7 @@ async function assessVerifierGateRed(
       const split = decideBaselineAdjustedVerdict({
         verdict: "fail", branchFailures: remaining, baselineFailures: run.failures, reason: `\`${gate}\` failed`,
       });
-      baseline.push(...split.preExisting.map((name): BaselineEntry => ({ name, source: "base-commit", sha: baseSha! })));
+      baseline.push(...split.preExisting.map((name): BaselineEntry => ({ name, source: "base-commit", sha: baseSha!, outputPath:run.outputPath })));
       remaining = split.introduced;
       baseSkipReason = run.skipReason;
     }
@@ -6637,8 +6639,32 @@ async function acceptInheritedBaseline(
   if (tracked === undefined || !names.every((name) => tracked.some((t) => t.name === name))) {
     return hold(result.fallbackReason ?? `no tracking ticket could be confirmed for ${result.untracked.join(", ") || names.join(", ")}`);
   }
+  for (const entry of assessment.baseline) {
+    const refusal=(ctx.deps.inheritedException??checkInheritedException)({policyFile:process.env.PYRY_GATE_EXCEPTIONS_FILE??resolve(agentsRepoRoot,'gate-exceptions.json'),
+      project:(process.env.GITHUB_OWNER??'')+'/'+(process.env.GITHUB_REPO??''),gate:assessment.gate,test:entry.name,tracker:tracked.find(t=>t.name===entry.name)!.issue,
+      securitySensitive:ctx.item.labels.includes("security-sensitive"),format,branchPath:stdoutPath,basePath:entry.outputPath,cwd:ctx.agentCwd,base:entry.sha,head:mergedWorktreeHead(ctx)?.commit??''});
+    if(refusal) return hold(refusal);
+  }
   assessment.inherited = tracked;
   for (const { name, issue } of tracked) console.log(`   🧾 \`${assessment.gate}\`: inherited \`${name}\` is tracked on #${issue}`);
+}
+
+async function recordScopedInheritedTests(client:Parameters<typeof recordInheritedTests>[0],failures:readonly string[],context:Parameters<typeof recordInheritedTests>[2],options:Parameters<typeof recordInheritedTests>[3]) {
+  const result=await recordInheritedTests(client,failures,context,{...options,addBlockers:false});
+  if(!result.tracked) return result;
+  const report=context.report;
+  const labelClient=client as typeof client & {getIssueLabels?:(issue:number)=>Promise<string[]>};
+  let securitySensitive=true;
+  try {
+    if(labelClient.getIssueLabels) securitySensitive=(await labelClient.getIssueLabels(context.gatedIssue)).includes('security-sensitive');
+  } catch { /* An unreadable security classification cannot authorize an exception. */ }
+  for(const entry of result.tracked) {
+    const refusal=checkInheritedException({policyFile:process.env.PYRY_GATE_EXCEPTIONS_FILE??resolve(agentsRepoRoot,'gate-exceptions.json'),
+      project:(process.env.GITHUB_OWNER??'')+'/'+(process.env.GITHUB_REPO??''),gate:report.command,test:entry.name,tracker:entry.issue,
+      securitySensitive,format:report.outputFormat??REAL_CLAUDE_GATE_FORMAT??'go-json',branchPath:report.outputPath,basePath:report.baselineOutputPath,cwd:repoRoot,base:report.baseSha,head:report.headSha});
+    if(refusal) return {blockers:[],untracked:[...failures],owned:result.owned,fallbackReason:refusal};
+  }
+  return result;
 }
 
 /** The log lines for one flaky filing, from either gate. */
@@ -11026,7 +11052,7 @@ export async function pollLoop(): Promise<void> {
                   managed.client(rawClient, false, candidate.issueNumber), reporting,
                   REAL_CLAUDE_GATE_MIN_EXECUTED, notifyDiscord, 0,
                   (flaky, ctx, run) => recordFlakyTests(client, flaky, ctx, { ...run, store: flakySightingStore }), undefined,
-                  (failures, ctx, opts) => recordInheritedTests(client, failures, ctx, opts),
+                  (failures, ctx, opts) => recordScopedInheritedTests(client, failures, ctx, opts),
                   { legacyFormat: REAL_CLAUDE_GATE_FORMAT ?? undefined, testEvidence: REAL_CLAUDE_GATE_TEST_EVIDENCE ?? [], inheritedAdvance: REAL_CLAUDE_GATE_INHERITED_ADVANCE,
           recordFlakySightings: (flaky, ctx, shape) => recordFlakySightings(flakySightingStore, flaky, ctx, shape) },
                 );
@@ -11052,7 +11078,7 @@ export async function pollLoop(): Promise<void> {
         pool.size + (sweepRun !== null ? 1 : 0),
         (flaky, ctx, run) => recordFlakyTests(client, flaky, ctx, { ...run, store: flakySightingStore }),
         undefined,
-        (failures, ctx, opts) => recordInheritedTests(client, failures, ctx, opts),
+        (failures, ctx, opts) => recordScopedInheritedTests(client, failures, ctx, opts),
         { legacyFormat: REAL_CLAUDE_GATE_FORMAT ?? undefined, testEvidence: REAL_CLAUDE_GATE_TEST_EVIDENCE ?? [], inheritedAdvance: REAL_CLAUDE_GATE_INHERITED_ADVANCE,
           recordFlakySightings: (flaky, ctx, shape) => recordFlakySightings(flakySightingStore, flaky, ctx, shape) },
       );
@@ -11071,7 +11097,7 @@ export async function pollLoop(): Promise<void> {
           const done: Promise<void> = work().finally(() => { if (gateRun?.done === done) gateRun = null; });
           gateRun = { issue, done };
         },
-        (failures, ctx, opts) => recordInheritedTests(client, failures, ctx, opts),
+        (failures, ctx, opts) => recordScopedInheritedTests(client, failures, ctx, opts),
         { legacyFormat: REAL_CLAUDE_GATE_FORMAT ?? undefined, testEvidence: REAL_CLAUDE_GATE_TEST_EVIDENCE ?? [], inheritedAdvance: REAL_CLAUDE_GATE_INHERITED_ADVANCE,
           recordFlakySightings: (flaky, ctx, shape) => recordFlakySightings(flakySightingStore, flaky, ctx, shape) },
       );
