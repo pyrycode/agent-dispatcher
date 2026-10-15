@@ -339,14 +339,14 @@ async function legacyWorktreeCases(t: import('node:test').TestContext, root: str
     assert.match(f.comments[0]!, /git status showed it clean/);
     assert.match(f.comments[0]!, /Ignored files went with it.*`ignored-scratch`/);
   });
-  await t.test('macOS unnamed non-filesystem descriptors permit both retained-tree inspections', async () => {
+  await t.test('macOS mixed native descriptor types permit both retained-tree inspections', async () => {
     const f = await fixture();
     const ctx = f.builder();
     const claims = store.snapshot().claims;
     let inspections = 0;
     ctx.deps.processesUsingPath = path => processesUsingPath(path, { platform: 'darwin', spawnSync: (() => {
       inspections++;
-      return lsofResult({ stdout: MACOS_UNNAMED_LSOF });
+      return lsofResult({ stdout: MACOS_MIXED_LSOF });
     }) as unknown as typeof spawnSync });
     await accepted(f, false, ctx);
     assert.equal(inspections, 2);
@@ -467,8 +467,8 @@ async function legacyWorktreeCases(t: import('node:test').TestContext, root: str
     assert.doesNotMatch(f.comments[0]!, /left in place/);
     assert.deepEqual(f.labels, ['error:builder']);
   });
-  for (const condition of ['active process', 'late active process', 'unnamed filesystem descriptor', 'launch failure', 'timeout', 'nonzero exit', 'incomplete output', 'late inspection failure']) {
-    await t.test(`macOS inspection refuses a retained tree on ${condition}`, async () => {
+  for (const condition of ['active process', 'unnamed filesystem descriptor', 'unresolved vnode', 'unsupported valid type', 'launch failure', 'timeout', 'buffer overflow', 'signal', 'nonzero exit', 'incomplete output']) {
+    for (const failingInspection of [1, 2]) await t.test(`macOS inspection ${failingInspection} refuses a retained tree on ${condition}`, async () => {
       const f = await fixture();
       const ctx = f.builder();
       const head = git('rev-parse', `feature/${f.number}`);
@@ -480,19 +480,23 @@ async function legacyWorktreeCases(t: import('node:test').TestContext, root: str
       let inspections = 0;
       ctx.deps.processesUsingPath = path => processesUsingPath(path, { platform: 'darwin', spawnSync: (() => {
         inspections++;
-        const active = condition === 'active process' || (condition === 'late active process' && inspections === 2);
-        let stdout = MACOS_UNNAMED_LSOF + (active ? `f7\ntREG\nn${path}/source.ts\n` : '');
-        if (condition === 'late inspection failure' && inspections === 1) return lsofResult({ stdout });
+        if (inspections !== failingInspection) return lsofResult();
+        let stdout = MACOS_MIXED_LSOF + (condition === 'active process' ? `f33\ntREG\nn${path}/source.ts\n` : '');
         if (condition === 'launch failure') return lsofResult({ error: Object.assign(new Error('ENOENT'), { code: 'ENOENT' }), status: null, stdout: '' });
-        if (condition === 'timeout' || condition === 'late inspection failure') return lsofResult({ error: Object.assign(new Error('ETIMEDOUT'), { code: 'ETIMEDOUT' }), status: null, stdout });
+        if (condition === 'timeout' || condition === 'buffer overflow') return lsofResult({ error: Object.assign(new Error(condition), { code: condition === 'timeout' ? 'ETIMEDOUT' : 'ENOBUFS' }), status: null, stdout });
+        if (condition === 'signal') return lsofResult({ signal: 'SIGTERM', status: null, stdout });
         if (condition === 'incomplete output') stdout = stdout.slice(0, -1);
-        if (condition === 'unnamed filesystem descriptor') stdout += 'f7\ntREG\nn\n';
+        if (condition === 'unnamed filesystem descriptor') stdout += 'f33\ntREG\nn\n';
+        if (condition === 'unresolved vnode') stdout += MACOS_UNRESOLVED_VNODE;
+        if (condition === 'unsupported valid type') stdout += 'f31\ntFSEVENTS\nn\n';
         return lsofResult({ stdout, status: condition === 'nonzero exit' ? 1 : 0 });
       }) as unknown as typeof spawnSync });
       f.commands.length = 0;
       assert.deepEqual(await setupBranchAndWorktree(ctx), { ok: false });
-      assert.equal(inspections, condition.startsWith('late ') ? 2 : 1);
-      assert.match(f.comments[0]!, condition.endsWith('active process') ? /process\(es\) 4242 still use it/ : /processes using it could not be checked.*lsof failed/);
+      assert.equal(inspections, failingInspection);
+      assert.match(f.comments[0]!, condition === 'active process' ? /process\(es\) 4242 still use it/ : /processes using it could not be checked.*lsof failed/);
+      if (condition === 'unresolved vnode') assert.match(f.comments[0]!, /unresolved filesystem\/vnode inspection.*fd="32" type=<absent> name=unavailable/);
+      if (condition === 'unsupported valid type') assert.match(f.comments[0]!, /unsupported unnamed type.*type="FSEVENTS"/);
       assert.deepEqual(f.labels, ['error:builder']);
       assert.deepEqual(store.snapshot().claims, claims);
       assert.deepEqual(ctx.item.labels, ['needs-rework:builder', 'rework-count:1']);
@@ -537,26 +541,103 @@ async function legacyWorktreeCases(t: import('node:test').TestContext, root: str
   });
 }
 
-// Portable, path-redacted /usr/sbin/lsof -b -w -n -P -Fpfnt fixture:
-// keep process/file boundaries, types and the legitimately empty NPOLICY name.
-const MACOS_UNNAMED_LSOF = 'p4242\nfcwd\ntDIR\nn/elsewhere\nf6\ntNPOLICY\nn\n';
+// Representative mixed -Fpfnt stream, not a claim of a complete native capture.
+// #3404 supplied f6/NPOLICY, f7/NEXUS, f8/rte with present, empty names, and
+// f32 with absent type and "no more information"; the recovery brief reports
+// that native enumeration identified it as VNODE. No path probe is replayed.
+// Keep those boundaries and field-presence distinctions. Other records combine
+// the existing supported dialect with redacted paths and synthetic PID 4242.
+const MACOS_MIXED_LSOF = `p4242
+fcwd
+tDIR
+n/elsewhere
+ftxt
+tREG
+n/elsewhere/program
+f0
+tCHR
+n/dev/null
+f6
+tNPOLICY
+n
+f7
+tNEXUS
+n
+f8
+trte
+n
+f9
+tKQUEUE
+n
+f10
+tPIPE
+n
+f11
+tIPv4
+n127.0.0.1:1234
+f12
+tIPv6
+n
+f13
+tsystm
+n
+f14
+tunix
+n/elsewhere/socket
+`;
+const MACOS_UNRESOLVED_VNODE = 'f32\nnno more information\n';
 
 function lsofResult(overrides: Partial<SpawnSyncReturns<string>> = {}): SpawnSyncReturns<string> {
-  return { pid: 42, status: 0, signal: null, stdout: MACOS_UNNAMED_LSOF, stderr: '', output: [], ...overrides };
+  return { pid: 42, status: 0, signal: null, stdout: MACOS_MIXED_LSOF, stderr: '', output: [], ...overrides };
 }
 
 test('macOS processesUsingPath accepts unnamed non-filesystem records and checks later paths', async () => {
   const { processesUsingPath } = await import('./dispatch.js');
   for (const [stdout, pids] of [
-    [MACOS_UNNAMED_LSOF, []],
-    [MACOS_UNNAMED_LSOF + 'f7\ntREG\nn/retained-tree/source.ts\n', [4242]],
-    [MACOS_UNNAMED_LSOF + 'p4243\nf7\ntREG\nn/retained-tree/source.ts\n', [4243]],
+    [MACOS_MIXED_LSOF, []],
+    [MACOS_MIXED_LSOF + 'f33\ntREG\nn/retained-tree/source.ts\n', [4242]],
+    [MACOS_MIXED_LSOF + 'p4243\nf33\ntREG\nn/retained-tree/source.ts\n', [4243]],
     ['p4242\nf6\ntNPOLICY\nn\n', []],
     ['p4242\nf6\nn\ntNPOLICY\n', []],
-    ...['KQUEUE', 'PIPE', 'IPv4', 'IPv6', 'systm'].map(type => [`p4242\nf6\nt${type}\nn\n`, []] as const),
+    ...['KQUEUE', 'PIPE', 'IPv4', 'IPv6', 'systm', 'NEXUS', 'rte'].map(type => [`p4242\nf6\nt${type}\nn\n`, []] as const),
   ] as const) {
     assert.deepEqual(processesUsingPath('/retained-tree', { platform: 'darwin', spawnSync: (() => lsofResult({ stdout })) as unknown as typeof spawnSync }), pids);
   }
+});
+
+test('macOS processesUsingPath inventories the whole dialect while refusing unresolved vnode evidence', async () => {
+  const { processesUsingPath } = await import('./dispatch.js');
+  // An unsupported but valid lsof type must not hide a later unresolved vnode,
+  // another process, or the later matching file. No name/path is logged.
+  const stdout = MACOS_MIXED_LSOF + 'f31\ntFSEVENTS\nn\n' + MACOS_UNRESOLVED_VNODE + 'f34\ntREG\nf35\nn\n' +
+    'p4243\nf33\ntREG\nn/retained-tree/private-source.ts\n';
+  assert.throws(() => processesUsingPath('/retained-tree', { platform: 'darwin', spawnSync: (() => lsofResult({ stdout })) as unknown as typeof spawnSync }), (error: Error) => {
+    assert.match(error.message, /unsupported unnamed type.*pid=4242 fd="31" type="FSEVENTS" name=empty/);
+    assert.match(error.message, /unresolved filesystem\/vnode inspection.*pid=4242 fd="32" type=<absent> name=unavailable/);
+    assert.match(error.message, /inventory: processes=2 files=17/);
+    for (const entry of ['"NEXUS"/empty=1', '"rte"/empty=1', '<absent>/unavailable=1', '"REG"/present=2', '"REG"/absent=1', '<absent>/empty=1']) {
+      assert.ok(error.message.includes(entry), error.message);
+    }
+    assert.doesNotMatch(error.message, /elsewhere|private-source|\/retained-tree/);
+    return true;
+  });
+});
+
+test('macOS inspection diagnostics bound samples and inventory without hiding later vnode uncertainty', async () => {
+  const { processesUsingPath } = await import('./dispatch.js');
+  const padding = '\t'.repeat(10_000);
+  const stdout = 'p4242\n' + Array.from({ length: 100 }, (_, index) =>
+    `f${index}${padding}\ntFUTURE_${index}${padding}\nn\n`).join('') + MACOS_UNRESOLVED_VNODE;
+  assert.throws(() => processesUsingPath('/retained-tree', { platform: 'darwin', spawnSync: (() => lsofResult({ stdout })) as unknown as typeof spawnSync }), (error: Error) => {
+    assert.match(error.message, /unsupported unnamed type: 100 record\(s\)/);
+    assert.match(error.message, /further records omitted/);
+    assert.match(error.message, /unresolved filesystem\/vnode inspection: 1 record\(s\).*fd="32"/);
+    assert.match(error.message, /inventory: processes=1 files=101/);
+    assert.match(error.message, /85 other record\(s\)/);
+    assert.ok(error.message.length < 8192, `diagnostic length ${error.message.length}`);
+    assert.doesNotMatch(error.message, /[\t\n\r]/);
+    return true;
+  });
 });
 
 test('macOS processesUsingPath discovers system lsof with /usr/sbin absent from PATH', async t => {
@@ -567,7 +648,7 @@ test('macOS processesUsingPath discovers system lsof with /usr/sbin absent from 
   const linked = join(root, 'link');
   const restrictedPath = join(root, 'empty-bin');
   mkdirSync(tree); mkdirSync(restrictedPath); symlinkSync(tree, linked);
-  const stdout = MACOS_UNNAMED_LSOF + `p0\nfcwd\ntDIR\nn/elsewhere\np1000001\nfcwd\ntDIR\nn${tree}\nf3\ntREG\nn${tree}/nested/file\np1000002\nfcwd\ntDIR\nn${tree}-sibling/file\np1000003\nf4\ntREG\nn${linked}/file\np1000004\nf5\ntREG\nn${tree}/removed (deleted)\n`;
+  const stdout = MACOS_MIXED_LSOF + `p0\nfcwd\ntDIR\nn/elsewhere\np1000001\nfcwd\ntDIR\nn${tree}\nf3\ntREG\nn${tree}/nested/file\np1000002\nfcwd\ntDIR\nn${tree}-sibling/file\np1000003\nf4\ntREG\nn${linked}/file\np1000004\nf5\ntREG\nn${tree}/removed (deleted)\n`;
   const installedLsof = join(root, 'installed-lsof');
   writeFileSync(installedLsof, `#!${process.execPath}\nprocess.stdout.write(${JSON.stringify(stdout)});\n`, { mode: 0o700 });
   const commands: string[] = [];
@@ -603,23 +684,33 @@ test('macOS processesUsingPath refuses failed or incomplete lsof inspection', as
     ['missing process record', lsofResult({ stdout: 'n/elsewhere\n' })],
     ['invalid process record', lsofResult({ stdout: 'pNaN\nn/elsewhere\n' })],
     ...[
-      ['unnamed regular file', MACOS_UNNAMED_LSOF + 'f7\ntREG\nn\n'],
-      ['unnamed directory', MACOS_UNNAMED_LSOF + 'f7\ntDIR\nn\n'],
-      ['unnamed FIFO', MACOS_UNNAMED_LSOF + 'f7\ntFIFO\nn\n'],
-      ['unnamed unknown type', MACOS_UNNAMED_LSOF + 'f7\ntUNKNOWN\nn\n'],
-      ['unnamed unix socket', MACOS_UNNAMED_LSOF + 'f7\ntunix\nn\n'],
-      ['unnamed missing type', MACOS_UNNAMED_LSOF + 'f7\nn\n'],
-      ['named file missing type', MACOS_UNNAMED_LSOF + 'f7\nn/elsewhere\n'],
+      ['unnamed regular file', MACOS_MIXED_LSOF + 'f33\ntREG\nn\n'],
+      ['unnamed directory', MACOS_MIXED_LSOF + 'f33\ntDIR\nn\n'],
+      ['unnamed FIFO', MACOS_MIXED_LSOF + 'f33\ntFIFO\nn\n'],
+      ['unnamed unknown type', MACOS_MIXED_LSOF + 'f33\ntUNKNOWN\nn\n'],
+      ['unnamed unix socket', MACOS_MIXED_LSOF + 'f33\ntunix\nn\n'],
+      ['unnamed missing type', MACOS_MIXED_LSOF + 'f33\nn\n'],
+      ['named file missing type', MACOS_MIXED_LSOF + 'f33\nn/elsewhere\n'],
+      ['unresolved native vnode', MACOS_MIXED_LSOF + MACOS_UNRESOLVED_VNODE],
+      ['unresolved vnode after matching path', MACOS_MIXED_LSOF + 'f33\ntREG\nn/retained-tree/source.ts\n' + MACOS_UNRESOLVED_VNODE],
+      ['unresolved vnode before matching path', MACOS_MIXED_LSOF + MACOS_UNRESOLVED_VNODE + 'f33\ntREG\nn/retained-tree/source.ts\n'],
+      ['typed unresolved vnode', MACOS_MIXED_LSOF + 'f32\ntREG\nnno more information\n'],
+      ['unavailable kernel object name', MACOS_MIXED_LSOF + 'f32\ntNEXUS\nnno more information\n'],
       ['type from preceding descriptor', 'p4242\nf6\ntNPOLICY\nn\nf7\nn\n'],
-      ['incomplete trailing file', MACOS_UNNAMED_LSOF + 'f7\n'],
-      ['incomplete file before process', MACOS_UNNAMED_LSOF + 'f7\ntREG\np4243\nfcwd\ntDIR\nn/elsewhere\n'],
+      ['NEXUS type from preceding descriptor', 'p4242\nf7\ntNEXUS\nn\nf32\nnno more information\n'],
+      ['rte type from preceding descriptor', 'p4242\nf8\ntrte\nn\nf32\nn\n'],
+      ['name from preceding descriptor', MACOS_MIXED_LSOF + 'f33\ntNEXUS\n'],
+      ['incomplete trailing file', MACOS_MIXED_LSOF + 'f33\n'],
+      ['incomplete file before process', MACOS_MIXED_LSOF + 'f33\ntREG\np4243\nfcwd\ntDIR\nn/elsewhere\n'],
       ['missing name on non-filesystem object', 'p4242\nf6\ntNPOLICY\n'],
+      ['missing name on NEXUS', 'p4242\nf7\ntNEXUS\n'],
+      ['missing name on rte', 'p4242\nf8\ntrte\n'],
       ['missing descriptor', 'p4242\ntNPOLICY\nn\n'],
       ['empty descriptor', 'p4242\nf\ntNPOLICY\nn\n'],
       ['duplicate type', 'p4242\nf6\ntNPOLICY\ntREG\nn\n'],
-      ['duplicate name', MACOS_UNNAMED_LSOF + 'n/elsewhere\n'],
-      ['unexpected field', MACOS_UNNAMED_LSOF + 'xunexpected\n'],
-      ['empty internal line', MACOS_UNNAMED_LSOF + '\n'],
+      ['duplicate name', MACOS_MIXED_LSOF + 'n/elsewhere\n'],
+      ['unexpected field', MACOS_MIXED_LSOF + 'xunexpected\n'],
+      ['empty internal line', MACOS_MIXED_LSOF + '\n'],
       ['incomplete process after a match', 'p4242\nf7\ntREG\nn/retained-tree/source.ts\np4243\n'],
     ].map(([name, stdout]) => [name, lsofResult({ stdout })] as const),
   ] as const) {
