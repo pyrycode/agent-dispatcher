@@ -109,7 +109,7 @@ async function main(): Promise<void> {
     const reassessMinutes = config.recovery?.reassessBaseMinutes, reassessHours = config.recovery?.reassessCeilingHours;
     if (reassessMinutes !== undefined && (typeof reassessMinutes !== "number" || !Number.isFinite(reassessMinutes))) throw new Error("recovery.reassessBaseMinutes must be a number");
     if (reassessHours !== undefined && (typeof reassessHours !== "number" || !Number.isFinite(reassessHours))) throw new Error("recovery.reassessCeilingHours must be a number");
-    const store = new FleetStore(database, limits, { ...(safetyHours === undefined ? {} : { safetyRecheckMs: Math.round(safetyHours * 3600_000) }),
+    const store = new FleetStore(database, limits, { infrastructureRetries: config.recovery?.infrastructureRetries, ...(safetyHours === undefined ? {} : { safetyRecheckMs: Math.round(safetyHours * 3600_000) }),
       ...(orphanMinutes === undefined ? {} : { orphanedTaskMs: Math.round(orphanMinutes * 60_000) }),
       ...(reassessMinutes === undefined ? {} : { reassessBaseMs: Math.round(reassessMinutes * 60_000) }),
       ...(reassessHours === undefined ? {} : { reassessCeilingMs: Math.round(reassessHours * 3600_000) }),

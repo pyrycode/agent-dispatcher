@@ -301,7 +301,7 @@ export class FleetStore {
   recoveryStep(machine: string, session: string, project: string, id: string, runId: string, step: "begin" | "decide" | "complete", decision?: RecoveryDecision) {
     const incident = this.recovery.incident(id);
     const run = this.snapshot().runs.find(r => r.id === runId);
-    if (!run || run.project !== project || run.ticket !== incident.ticket || run.role !== "recovery" || run.resource !== "heavy") throw new Error("Recovery requires its admitted heavy run");
+    if (!run || run.project !== project || run.ticket !== incident.ticket || run.role !== "recovery" || !["light","heavy"].includes(run.resource)) throw new Error("Recovery requires its admitted read-only run");
     this.authorize(machine, session, incident.ticket, runId);
     return this.transaction(() => {
       if (step === "begin") return this.recovery.begin(id, runId);
@@ -680,7 +680,7 @@ export class FleetStore {
       if (req.ticket.includes("#@main-sweep-") && this.db.prepare("SELECT 1 FROM fleet_runs WHERE ticket=? AND finished IS NOT NULL AND outcome='completed'").get(req.ticket)) return { ok: false, reason: "finished" };
       if (req.role === "reconcile" && (req.ticket !== `${req.project}#@reconcile` || !req.locks.includes(`${req.project}:reconcile`))) throw new Error("Housekeeping requires the project lock");
       if (req.role === "recovery") {
-        if (req.resource !== "heavy" || !/#[1-9]\d*$/.test(req.ticket)) throw new Error("Recovery requires a heavy ticket reservation");
+        if (!["light","heavy"].includes(req.resource) || !/#[1-9]\d*$/.test(req.ticket)) throw new Error("Recovery requires a read-only ticket reservation");
         if (req.requiresRecovery && !this.db.prepare("SELECT 1 FROM fleet_recovery WHERE ticket=? AND present=1 AND state='queued'").get(req.ticket)) return { ok: false, reason: 'locked' };
         if (this.db.prepare("SELECT 1 FROM fleet_runs WHERE finished IS NULL AND json_extract(request,'$.role')='recovery'").get()) return { ok: false, reason: "locked" };
       }

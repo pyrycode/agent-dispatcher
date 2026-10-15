@@ -65,7 +65,7 @@ export const RECOVERY_SAFETY_RECHECK_MS = 24 * 3600_000;
  */
 export const RECOVERY_REASSESS_BASE_MS = RECOVERY_RECHECK_MS;
 export const RECOVERY_REASSESS_CEILING_MS = 4 * 3600_000;
-export interface RecoveryLedgerOptions { safetyRecheckMs?: number; reassessBaseMs?: number; reassessCeilingMs?: number }
+export interface RecoveryLedgerOptions { infrastructureRetries?: number; safetyRecheckMs?: number; reassessBaseMs?: number; reassessCeilingMs?: number }
 export function validateSafetyRecheck(ms: number): number {
   if (!Number.isSafeInteger(ms) || ms < 60 * 60_000 || ms > 30 * 86400_000) throw new Error("Recovery safety recheck must be between one hour and thirty days");
   return ms;
@@ -185,9 +185,12 @@ export function validateRecoveryDecision(value: unknown): RecoveryDecision {
 
 /** Uses the claim authority's database. No independent watcher can race this ledger. */
 export class RecoveryLedger {
+  private readonly infrastructureRetries: number;
   private readonly safetyRecheckMs: number;
   private readonly reassess: { baseMs: number; ceilingMs: number };
   constructor(private db: DatabaseSync, private now = Date.now, options: RecoveryLedgerOptions = {}) {
+    this.infrastructureRetries = options.infrastructureRetries ?? 2;
+    if (!Number.isInteger(this.infrastructureRetries) || this.infrastructureRetries < 0 || this.infrastructureRetries > 10) throw new Error('Infrastructure retries must be an integer from 0 to 10');
     this.safetyRecheckMs = validateSafetyRecheck(options.safetyRecheckMs ?? RECOVERY_SAFETY_RECHECK_MS);
     this.reassess = validateReassessSpacing(options.reassessBaseMs ?? RECOVERY_REASSESS_BASE_MS, options.reassessCeilingMs ?? RECOVERY_REASSESS_CEILING_MS);
     db.exec(`CREATE TABLE IF NOT EXISTS fleet_recovery (
@@ -205,6 +208,7 @@ export class RecoveryLedger {
       incident_id TEXT PRIMARY KEY, ticket TEXT NOT NULL, basis TEXT NOT NULL, digest TEXT NOT NULL,
       created INTEGER NOT NULL, recheck_at INTEGER NOT NULL, reopened TEXT, reopened_at INTEGER
     ) STRICT;
+    CREATE TABLE IF NOT EXISTS fleet_recovery_retries (ticket TEXT NOT NULL,stage TEXT NOT NULL,attempts INTEGER NOT NULL,PRIMARY KEY(ticket,stage)) STRICT;
     CREATE TABLE IF NOT EXISTS fleet_recovery_status (ticket TEXT PRIMARY KEY, status TEXT NOT NULL, present INTEGER NOT NULL) STRICT;
     CREATE TABLE IF NOT EXISTS fleet_recovery_cadence (ticket TEXT PRIMARY KEY, streak INTEGER NOT NULL, updated INTEGER NOT NULL, pause TEXT) STRICT;`);
   }
@@ -487,6 +491,12 @@ export class RecoveryLedger {
     return this.incident(id);
   }
   decide(id: string, runId: string, value: RecoveryDecision): RecoveryDecision {
+    if (this.db.isTransaction) return this.decideRecord(id,runId,value);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {const result=this.decideRecord(id,runId,value);this.db.exec('COMMIT');return result;}
+    catch (error) {this.db.exec('ROLLBACK');throw error;}
+  }
+  private decideRecord(id: string, runId: string, value: RecoveryDecision): RecoveryDecision {
     const incident = this.incident(id);
     if (incident.runId !== runId) throw new Error("Recovery run mismatch");
     if (incident.decision) return incident.decision;
@@ -503,6 +513,12 @@ export class RecoveryLedger {
         const first=this.db.prepare("SELECT min(updated) AS at FROM fleet_recovery WHERE ticket=? AND decision IS NOT NULL AND updated>? AND json_extract(decision,'$.action') IN ('retry','rework','resume','refine','unblock')").get(incident.ticket,this.now()-86400000)!;
         decision={action:'escalate',category:'operational',reason:'Automatic repair budget exhausted: three repairs per ticket per rolling day',recheckAt:Number(first.at)+86400001};
       }
+    }
+    if (decision.action === 'retry') {
+      const stage = String(this.db.prepare('SELECT status FROM fleet_recovery_status WHERE ticket=?').get(incident.ticket)?.status ?? 'unknown');
+      const used = Number(this.db.prepare('SELECT attempts FROM fleet_recovery_retries WHERE ticket=? AND stage=?').get(incident.ticket,stage)?.attempts ?? 0);
+      if (used >= this.infrastructureRetries) decision = {action:'escalate',category:'human',reason:'Infrastructure retry allowance exhausted for this stage. Review the retained failure before extending its configured allowance.'};
+      else this.db.prepare('INSERT INTO fleet_recovery_retries VALUES (?,?,1) ON CONFLICT(ticket,stage) DO UPDATE SET attempts=attempts+1').run(incident.ticket,stage);
     }
     if (decision.cooldown) {
       const { cooldown: _, ...rest } = decision;

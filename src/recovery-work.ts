@@ -130,6 +130,7 @@ export interface RecoveryWorkDeps {
   readCurrent(): Promise<ProjectItem | undefined>;
   begin(): Promise<RecoveryIncident>;
   assess(item: ProjectItem): Promise<RecoveryDecision>;
+  knownDecision?(item: ProjectItem): Promise<RecoveryDecision | null>;
   decide(decision: RecoveryDecision): Promise<RecoveryDecision>;
   complete(): Promise<unknown>;
   comment(issue: number, body: string): Promise<void>;
@@ -160,7 +161,7 @@ export async function runRecoveryWork(incident: RecoveryIncident, deps: Recovery
     }
     await deps.addLabel(issue, RECOVERY_INVESTIGATING);
     try {
-      decision = validateRecoveryDecision(await deps.assess(item));
+      decision = validateRecoveryDecision(await deps.knownDecision?.(item) ?? await deps.assess(item));
       delete decision.cooldown; // Only code may request the short transport cooldown.
       if (decision.action === "escalate" && !decision.category) decision.category = "human";
     }
