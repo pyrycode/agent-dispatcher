@@ -407,6 +407,8 @@ export function makeMockDeps(opts: MockDepsOptions = {}): { deps: DispatchDeps; 
 
   const deps: DispatchDeps = {
     salvageGates: ["go vet ./...", "go build ./..."],
+    // Tracker mechanism tests assume a separately approved exception policy.
+    inheritedException: () => null,
     execSync: mockExecSync,
     spawnSync: mockSpawnSync,
     existsSync: mockExistsSync,
@@ -11841,12 +11843,14 @@ describe("pre-verifier gates — failures already on main (#123)", () => {
     itemBody?: string;
     /** The flaky sighting record. Unset: one that has seen every test before. */
     sightings?: FlakySightingStore | null;
+    inheritedException?: DispatchDeps["inheritedException"];
   }) {
     return withStageSet("builder", () => withVerifierGates(opts.gates ?? `make check;${UI}`, () => withFormats("formats" in opts ? opts.formats : FORMATS, async () => {
       const fsMap: Record<string, string> = { [gateLog(n, 2)]: opts.uiOutput };
       if (opts.state !== null) fsMap[stateFile] = opts.state ?? sweepState();
       const { deps, calls } = makeMockDeps({ execImpls: opts.exec ?? execs(), fsMap, gateImpl: opts.gateImpl ?? uiRed });
       deps.flakySightings = opts.sightings === undefined ? seenBefore() : opts.sightings;
+      if (opts.inheritedException) deps.inheritedException = opts.inheritedException;
       const read = deps.readFileSync;
       deps.readFileSync = ((path: any, ...rest: any[]) =>
         /verifier-gate-base_#\d+\.log$/.test(String(path)) && opts.baseOutput !== undefined
@@ -12257,6 +12261,18 @@ describe("pre-verifier gates — failures already on main (#123)", () => {
       assert.equal(client.moveItemToTopCalls.length, 1, "a tracker off the board goes to the top of Backlog");
       assert.match(loggedText(calls), /all 1 failing test\(s\) also fail on main and is tracked on #3418, so it counts as green/);
       assert.ok(!client.addLabelCalls.some((c) => c.label.startsWith("needs-rework:")));
+    });
+
+    test("an expired exception keeps the gate red without creating a dependency", async () => {
+      const { client, blockers } = board([tracker(Z)]);
+      const { result, ctx } = await runGates(3382, {
+        gates: `make check;${UI};make lint`, uiOutput: junit([Z], [X]),
+        state: emptySweep(), rerunOutput: junit([Z]), baseOutput: junit([Z]), client,
+        inheritedException: () => "The approved exception expired",
+      });
+      assert.match(result.promptNote, /TRIAGE MODE/);
+      assert.ok(ctx.failedPreSpawnGate);
+      assert.deepEqual(blockers, []);
     });
 
     test("an untracked baseline failure gets a tracker filed and counts as inherited once it is tracked", async () => {
