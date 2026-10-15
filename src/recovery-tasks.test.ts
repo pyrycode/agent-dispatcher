@@ -1,6 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {FleetStore} from './fleet-store.js';
+import {parseGateOutput} from './gate-output.js';
 import {assessmentTasks, validateTaskResult, type RecoveryTask} from './recovery-tasks.js';
 
 import {ARTIFACT_LIMITS,artifactManifest,manifestHash,sha256,validateManifest} from './recovery-artifacts.js';
@@ -13,6 +14,117 @@ import {join} from 'node:path';
 const SHA='9950e6fbd28aac7ec3f6772e2deeebbcf83b52a2';
 const req={id:'builder',machine:'box',session:'s',project:'org/core',ticket:'org/core#3154',role:'builder',resource:'medium' as const,locks:[]};
 const limits={box:{heavyLimit:1,combinedLimit:2},mac:{heavyLimit:1,combinedLimit:2},hp:{heavyLimit:1,combinedLimit:2}};
+
+test('Desktop capture needs its own recipe readiness, exact pushed revision and ordinary heavy capacity',()=>{
+ const s=new FleetStore(':memory:',limits);try {
+  const project='pyrycode/pyrycode-desktop',source={...req,project,ticket:project+'#1983'};
+  const request={recipe:'desktop-fake-suite' as const,capability:'desktop-fake-suite' as const,
+   revision:'e8281ae46204e6286702bff791188b2b437b79f5',reason:'Capture the complete configured fake suite'};
+  s.start(source);
+  assert.throws(()=>s.requestTask('box','s',project,'builder',{...request,revision:undefined}),/exact revision/);
+  assert.throws(()=>s.requestTask('box','s',project,'builder',{...request,capability:'macos-arm64'}),/platform/);
+  assert.throws(()=>s.requestTask('box','s',project,'builder',{...request,recipe:'platform-probe'}),/platform/);
+  assert.throws(()=>s.requestTask('box','s',project,'builder',{...request,command:'test'} as any),/Invalid/);
+  assert.throws(()=>s.tasks.request('pyrycode/pyrycode#1983',request),/Desktop source ticket/);
+  const task=s.requestTask('box','s',project,'builder',request);
+  assert.equal(s.requestTask('box','s',project,'builder',request).id,task.id);
+  s.tasks.report('mac',{capabilities:['macos-arm64'],ready:true});
+  assert.equal(s.taskStart('mac',task.id,'capture').ok,false,'a generic native probe cannot advertise this route');
+  s.tasks.report('mac',{capabilities:['desktop-fake-suite'],ready:true});
+  s.start({...req,machine:'mac',id:'busy',ticket:'org/core#9',resource:'heavy'});
+  assert.equal(s.taskStart('mac',task.id,'capture').ok,false);
+  s.finish('mac','s','busy');
+  assert.equal(s.taskStart('mac',task.id,'capture').ok,true);
+  assert.equal(s.snapshot().runs.find(r=>r.supportTaskId===task.id)?.resource,'heavy');
+  assert.equal(s.snapshot().claims.find(c=>c.ticket===source.ticket)?.machine,'box');
+  assert.throws(()=>s.taskComplete('hp',task.id,'capture',{outcome:'failed',summary:'Wrong worker',files:{}}),/actor/);
+  s.taskComplete('mac',task.id,'capture',{outcome:'failed',candidateRevision:request.revision,summary:'Launcher rejected execution',files:{'desktop/execution.log':'Desktop test launch refused'}});
+  assert.equal(s.readTask('box','s',project,'builder',task.id).state,'failed');
+  assert.equal(s.snapshot().runs.some(r=>r.supportTaskId===task.id),false);
+  s.start({...req,id:'foreign',machine:'hp',ticket:'org/core#99'});
+  assert.throws(()=>s.readTask('hp','s','org/core','foreign',task.id),/admitted source ticket/);
+ }finally{s.close();}
+});
+
+for(const chunked of [false,true]) test('Desktop passes require complete, nonzero evidence ('+(chunked?'chunks':'legacy')+')',()=>{
+ const s=new FleetStore(':memory:',limits);try {
+  const project='pyrycode/pyrycode-desktop',source={...req,project,ticket:project+'#1983'};
+  s.start(source);s.tasks.report('mac',{capabilities:['desktop-fake-suite'],ready:true});
+  const task=s.requestTask('box','s',project,'builder',{recipe:'desktop-fake-suite',capability:'desktop-fake-suite',revision:SHA,reason:'full capture'});
+  s.taskStart('mac',task.id,'capture');
+  const report={config:{workers:4,projects:[{name:'clipboard',workers:1},{name:'parallel'}]},errors:[],
+   suites:[{title:'file.spec.ts',specs:[{title:'passes',tests:[{projectName:'parallel',status:'expected',results:[{status:'passed'}]}]}],
+    suites:[{title:'nested',specs:[{title:'project outcomes',tests:[
+     {projectName:'clipboard',status:'expected',expectedStatus:'failed',results:[{status:'failed'}]},
+     {projectName:'parallel',status:'flaky',results:[{status:'failed'},{status:'passed'}]},
+     {projectName:'clipboard',status:'skipped',annotations:[{type:'skip',description:'unsupported platform'}],results:[]},
+     {projectName:'parallel',status:'skipped',annotations:[{type:'skip',description:'configured skip'}],results:[{status:'skipped'}]},
+    ]}]}]}]};
+  const capture={revision:SHA,repository:project,configuration:report.config,errors:[],counts:{executed:3,passed:3,failed:0,skipped:2,retries:1}};
+  const files={'desktop/capture.json':JSON.stringify(capture),'desktop/playwright.json':JSON.stringify(report),
+   'desktop/playwright.list.log':'1 passed','desktop/playwright.config.ts':'export default {}','desktop/fake-daemon-setup.json':'[]'};
+  const metadata={outcome:'completed' as const,candidateRevision:SHA,summary:'full capture',files:{}};
+  if(chunked) {
+   const empty=artifactManifest({}),{digest}=s.tasks.beginArtifacts(task.id,'mac','capture',empty);
+   assert.throws(()=>s.commitTaskArtifacts('mac',task.id,'capture',digest,metadata),/nonzero passing evidence/);
+   // An immutable upload cannot change its manifest; test a fresh task below.
+  } else {
+   assert.throws(()=>s.taskComplete('mac',task.id,'capture',metadata),/nonzero passing evidence/);
+   assert.throws(()=>s.taskComplete('mac',task.id,'capture',{...metadata,files:{...files,'desktop/playwright.json':JSON.stringify({...report,suites:[]})}}),/nonzero passing evidence/);
+   assert.throws(()=>s.taskComplete('mac',task.id,'capture',{...metadata,candidateRevision:'b'.repeat(40),files}),/nonzero passing evidence/);
+   s.taskComplete('mac',task.id,'capture',{...metadata,files});
+   assert.equal(s.tasks.get(task.id).state,'complete');
+   return;
+  }
+  assert.equal(s.tasks.get(task.id).state,'running');
+  assert.ok(s.snapshot().runs.some(r=>r.supportTaskId===task.id));
+  s.taskComplete('mac',task.id,'capture',{outcome:'failed',summary:'Missing evidence rejected',files:{}});
+  const next=s.tasks.request(source.ticket,task.request,'next capture');
+  s.taskStart('mac',next.id,'capture2');
+  const manifest=artifactManifest(files),{digest,missing}=s.tasks.beginArtifacts(next.id,'mac','capture2',manifest);
+  for(const file of manifest.files) for(const part of missing[file.path]) s.tasks.putArtifact(next.id,'mac','capture2',digest,file.path,part,Buffer.from(files[file.path as keyof typeof files]).toString('base64'));
+  s.commitTaskArtifacts('mac',next.id,'capture2',digest,metadata);
+  assert.equal(s.tasks.get(next.id).state,'complete');
+ }finally{s.close();}
+});
+
+for(const chunked of [false,true]) test('Desktop evidence rejects incomplete attempts and aggregate contradictions ('+(chunked?'chunks':'legacy')+')',()=>{
+ const s=new FleetStore(':memory:',limits);try {
+  const project='pyrycode/pyrycode-desktop';
+  s.start({...req,project,ticket:project+'#1983'});s.tasks.report('mac',{capabilities:['desktop-fake-suite'],ready:true});
+  const malformed:any[]=[
+   {status:'expected',results:[]}, {status:'expected',results:[null,{status:'passed'}]},
+   {status:'expected',results:[{status:'running'},{status:'passed'}]},
+   {status:'expected',results:[{status:'failed'}]}, {status:'unexpected',results:[{status:'passed'}]},
+   {status:'flaky',results:[{status:'failed'}]}, {status:'skipped',results:[{status:'passed'}]},
+   {status:'expected',expectedStatus:'unknown',results:[{status:'passed'}]},
+  ];
+  const reports:any[]=malformed.map(test=>({suites:[{title:'file.spec.ts',specs:[{title:'malformed',tests:[test]}]}]}));
+  const passing={title:'file.spec.ts',specs:[{title:'passes',tests:[{status:'expected',results:[{status:'passed'}]}]}]};
+  reports.push({suites:[passing],errors:[{message:'worker crash'}]}, {suites:[passing],errors:{}},
+   {suites:[passing,null]}, {suites:[passing,{specs:[{title:'missing tests',tests:[]}]}]},
+   {suites:[]}, {suites:[{specs:[{title:'skipped',tests:[{status:'skipped',results:[]}]}]}]});
+  for(const [index,fragment] of reports.entries()) {
+   const report={config:{workers:4,projects:[{name:'clipboard'},{name:'parallel'}]},errors:[],...fragment};
+   const raw=JSON.stringify(report),tally=parseGateOutput(raw,'playwright-json');
+   assert.ok(!tally.completeParse || tally.packageFailed || tally.executed===0);
+   const task=s.tasks.request(project+'#1983',{recipe:'desktop-fake-suite',capability:'desktop-fake-suite',revision:SHA,reason:'contract regression'},String(index));
+   s.taskStart('mac',task.id,'capture');
+   // A fabricated green summary cannot make malformed raw evidence acceptable.
+   const capture={revision:SHA,repository:project,configuration:report.config,errors:[],counts:{executed:1,passed:1,failed:0,skipped:0,retries:0}};
+   const files={'desktop/capture.json':JSON.stringify(capture),'desktop/playwright.json':raw,
+    'desktop/playwright.list.log':'fresh list','desktop/playwright.config.ts':'export default {}','desktop/fake-daemon-setup.json':'[]'};
+   const metadata={outcome:'completed' as const,candidateRevision:SHA,summary:'fabricated pass',files:{}};
+   if(chunked) {
+    const manifest=artifactManifest(files),{digest,missing}=s.tasks.beginArtifacts(task.id,'mac','capture',manifest);
+    for(const file of manifest.files) for(const part of missing[file.path]) s.tasks.putArtifact(task.id,'mac','capture',digest,file.path,part,Buffer.from(files[file.path as keyof typeof files]).toString('base64'));
+    assert.throws(()=>s.commitTaskArtifacts('mac',task.id,'capture',digest,metadata),/nonzero passing evidence/);
+   } else assert.throws(()=>s.taskComplete('mac',task.id,'capture',{...metadata,files}),/nonzero passing evidence/);
+   assert.equal(s.tasks.get(task.id).state,'running');
+   s.taskComplete('mac',task.id,'capture',{outcome:'failed',summary:'Rejected incomplete report',files:{}});
+  }
+ }finally{s.close();}
+});
 
 for(const chunked of [false,true]) test('only the owning admitted recovery assessment receives bounded failed-task diagnostics ('+(chunked?'chunks':'legacy')+')',()=>{
  const s=new FleetStore(':memory:',limits);try {
