@@ -15,7 +15,7 @@ import { hasRecoveryPriority } from "./recovery-labels.js";
 import type { PauseRecord, EvidenceRecord, CoordinationRecord } from "./recovery-facts.js";
 import type { RecoveryObservation, RecoveryIncident, RecoveryDecision } from "./fleet-recovery.js";
 import type { AgentRunner } from './agent-runner.js';
-import {taskBridge} from "./recovery-task-bridge.js";
+import {taskBridge, type BridgeActions} from "./recovery-task-bridge.js";
 import { offerId } from "./machine-manager.js";
 import { NON_AGENT_ROLES, startsCodex, codexStartHoldMs, rearmCodexStartJitter, type CodexPauseState } from "./codex-throttle.js";
 
@@ -24,7 +24,7 @@ const DEFAULT_RESOURCE_CLASSES: Readonly<Record<string, ResourceClass>> = {
 };
 export type CodexReportEvent = "rate-limited" | "clean";
 type CodexReporter = (event: CodexReportEvent) => Promise<CodexPauseState | null>;
-const currentRun = new AsyncLocalStorage<{ run: FleetRun; groups: Set<number>; taskSocket?: string; githubEnv?:NodeJS.ProcessEnv; reportCodex?: CodexReporter }>();
+const currentRun = new AsyncLocalStorage<{ run: FleetRun; groups: Set<number>; taskSocket?: string; taskActions?: BridgeActions; githubEnv?:NodeJS.ProcessEnv; reportCodex?: CodexReporter }>();
 /**
  * Reports the current admitted run's Codex events to the fleet's Codex
  * throttle, or null outside a managed dispatcher run. The reporter resolves
@@ -39,6 +39,10 @@ export function managedTaskEnv(): NodeJS.ProcessEnv {
   const socket=currentRun.getStore()?.taskSocket;
   return {...currentRun.getStore()?.githubEnv,...(socket?{PYRY_TASK_SOCKET:socket}:{})};
 }
+/** What the current run's task socket accepts: native check requests, shared evidence reads, or neither. */
+export function managedBridgeActions(): BridgeActions { return currentRun.getStore()?.taskActions ?? { tasks: false, evidence: false }; }
+/** The admitted run this code runs inside, or undefined outside a managed run. */
+export function managedRun(): FleetRun | undefined { return currentRun.getStore()?.run; }
 /** Native repair recipes use the same tracked-child completion rule as project workers. */
 export async function withManagedTaskRun<T>(run: FleetRun, work: () => Promise<T>): Promise<T> {
   return currentRun.run({run,groups:new Set()},async()=>{
@@ -112,13 +116,15 @@ export class ManagedDispatch {
   private errorAt = 0;
   private readonly cooldown = new Map<string, number>();
   private readonly dispatcherRoot=fileURLToPath(new URL("..",import.meta.url));
-  private readonly loadedRevision=execFileSync("git",["rev-parse","HEAD"],{cwd:this.dispatcherRoot,encoding:"utf8"}).trim();
+  readonly loadedRevision=execFileSync("git",["rev-parse","HEAD"],{cwd:this.dispatcherRoot,encoding:"utf8"}).trim();
   private readonly repairProofs=new Map<string,boolean>();
   private recoveryTickets = new Set<string>();
   draining = false;
   /** This dispatcher's runner for a role, without the central choice. Stated on agent offers. */
   localRunner: ((role: string) => AgentRunner) | undefined;
   tasksEnabled: boolean;
+  /** The claim service holds the shared evidence store (evidence-store.ts). */
+  evidenceEnabled = false;
   private readonly tasksDisabled: boolean;
 
   constructor(readonly project: string, private readonly env: NodeJS.ProcessEnv) {
@@ -295,6 +301,7 @@ export class ManagedDispatch {
       const runs = await this.connection.call<FleetRun[]>("/offers", { session: this.session, offers: this.offers() });
       this.state = state;
       this.tasksEnabled = !this.tasksDisabled && state.features?.recoveryTasks === true;
+      this.evidenceEnabled = state.features?.evidence === true;
       this.draining = state.draining || this.draining;
       let fresh = false;
       for (const p of this.pending.values()) {
@@ -336,8 +343,11 @@ export class ManagedDispatch {
           ghBridge=await startGitHubBridge(ghEnv,{session:this.session,runId:run.id});
           if(ghBridge)currentRun.getStore()!.githubEnv={GH_CONFIG_DIR:ghEnv.GH_CONFIG_DIR};
         }
-        bridge=this.tasksEnabled && /#[1-9]\d*$/.test(run.ticket) && ['builder','developer'].includes(run.role) ? await taskBridge(this.connection,run) : undefined;
-        if(bridge)currentRun.getStore()!.taskSocket=bridge.socket;
+        // Builders request native checks. Every numbered ticket's agent can read
+        // the shared evidence of earlier runs, from any computer.
+        const actions:BridgeActions={tasks:this.tasksEnabled && ['builder','developer'].includes(run.role),evidence:this.evidenceEnabled};
+        bridge=/#[1-9]\d*$/.test(run.ticket) && (actions.tasks || actions.evidence) ? await taskBridge(this.connection,run,actions) : undefined;
+        if(bridge){currentRun.getStore()!.taskSocket=bridge.socket;currentRun.getStore()!.taskActions=actions;}
         // Fresh authority check before starting, including after a manual release.
         const state = await this.connection.call<FleetSnapshot>("/state");
         if (!state.runs.some(r => r.id === run.id && r.session === this.session && r.generation === run.generation)) throw new Error("Run grant no longer active");

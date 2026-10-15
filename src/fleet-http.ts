@@ -6,6 +6,7 @@ import type { GitHubBroker, GitHubRequest, GitHubResponse } from "./github-broke
 import {publishRepair} from "./recovery-repair-publication.js";
 import {loadRepairBase,RepairBaseUnavailable,RepairRefusal} from "./recovery-source-publication.js";
 import type { Claim, FleetStore, FleetSnapshot, StartRequest, StartResult } from "./fleet-store.js";
+import type { EvidenceStore } from "./evidence-store.js";
 
 export async function readJson(req: IncomingMessage, maxBytes = 1024 * 1024): Promise<any> {
   let size = 0;
@@ -31,7 +32,7 @@ export async function listen(server: Server, port: number | string, host = "127.
   if (typeof port === "string") chmodSync(port, 0o600);
   return server;
 }
-export async function serveFleet(store: FleetStore, machines: Record<string, string>, admin: string, port: number, host = "127.0.0.1", github?: GitHubBroker, desired?: () => unknown, repairRepository?: string, repairConsumers?: Record<string,string>, controlRevision?: string): Promise<Server> {
+export async function serveFleet(store: FleetStore, machines: Record<string, string>, admin: string, port: number, host = "127.0.0.1", github?: GitHubBroker, desired?: () => unknown, repairRepository?: string, repairConsumers?: Record<string,string>, controlRevision?: string, evidence?: EvidenceStore): Promise<Server> {
   const secrets = [...Object.values(machines), admin];
   if (secrets.some(s => !s) || new Set(secrets).size !== secrets.length) throw new Error("Fleet credentials must be non-empty and distinct");
   const workflowGitHub=github?new WorkflowGitHub(store,github):undefined;
@@ -49,13 +50,28 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
       if (req.method === "GET" && req.url === "/operations/control") return send(200,{desired:store.controlTarget(),centralLoaded:controlRevision});
       if (req.method === "GET" && req.url === "/operations/reports") return send(200, store.operations.list());
       if (req.method === "GET" && req.url === "/tasks/orphaned") return send(200, store.orphans.list());
-      if (req.method === "GET" && req.url === "/state") return send(200, {...store.snapshot(), features:{recoveryTasks:true},requiredRepairs:store.requiredRepairs()});
+      if (req.method === "GET" && req.url === "/state") return send(200, {...store.snapshot(), features:{recoveryTasks:true,...(evidence?{evidence:true}:{})},requiredRepairs:store.requiredRepairs(),...(evidence?{evidenceStore:evidence.cachedUsage()}:{})});
       if (req.method === "GET" && req.url === "/runner") return send(200, store.runnerPolicy() ?? null);
       if (req.method === "GET" && req.url === "/codex") return send(200, { pause: store.codex.state(), spacing: store.codex.spacingState(), config: store.codex.config, events: store.codex.events(), recentStarts: store.codex.starts() });
       if (req.method === "GET" && req.url === "/recovery/state") return send(200, store.recovery.list());
       if (req.method === "GET" && req.url === "/github/status" && isAdmin) return send(200, github?.status() ?? { enabled: false });
       if (req.method !== "POST") return send(404, { error: "Unknown operation" });
       const body = await readJson(req, req.url?.startsWith("/workflow/") ? 32*1024*1024 : req.url?.startsWith("/tasks/") ? 8*1024*1024 : 1024*1024);
+      // Shared run evidence (evidence-store.ts). Any fleet credential reads;
+      // only the computer that ran a run uploads its bundle. A service without
+      // the store answers like one that predates it.
+      if(req.url?.startsWith('/evidence/')) {
+        if(!evidence) return send(404,{error:'Unknown operation'});
+        if(req.url==='/evidence/usage') return send(200,evidence.usage());
+        if(req.url==='/evidence/list') return send(200,{bundles:evidence.list(body.ticket,body.runId)});
+        if(req.url==='/evidence/chunk') return send(200,evidence.read(body.ticket,body.runId,body.digest,body.path,body.part));
+        if(!machine) return send(403,{error:'Machine credential required'});
+        const project=typeof body.project==='string'?body.project:undefined;
+        if(req.url==='/evidence/begin') return send(200,evidence.begin(machine,project,body.ticket,body.runId,body.meta,body.manifest));
+        if(req.url==='/evidence/put') {evidence.put(machine,project,body.ticket,body.runId,body.digest,body.path,body.part,body.data);return send(200,{ok:true});}
+        if(req.url==='/evidence/commit') return send(200,evidence.commit(machine,project,body.ticket,body.runId,body.digest));
+        return send(404,{error:'Unknown operation'});
+      }
       if(req.url==='/operations/control-ready') {
         const actor=isAdmin?body.machine:machine;
         if(!actor) return send(403,{error:'Control worker required'});
@@ -290,7 +306,7 @@ export class JsonClient {
         headers: { Authorization: `Bearer ${this.token}`, "Content-Type": "application/json" },
         signal: AbortSignal.timeout(timeoutMs), agent: false,
       }, response => {
-        void readJson(response, path.startsWith("/workflow/") ? 32*1024*1024 : path === "/github" ? 16 * 1024 * 1024 : path.startsWith("/tasks/") ? 8*1024*1024 : 1024 * 1024).then(value => {
+        void readJson(response, path.startsWith("/workflow/") ? 32*1024*1024 : path === "/github" ? 16 * 1024 * 1024 : path.startsWith("/tasks/") || path.startsWith("/evidence/") ? 8*1024*1024 : 1024 * 1024).then(value => {
           if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
             reject(new Error(`Service ${response.statusCode}: ${JSON.stringify(value).slice(0, 500)}`));
           } else resolve(value as T);

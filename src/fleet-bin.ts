@@ -20,6 +20,7 @@ import { recoveryReport } from "./recovery-report.js";
 import { persistProjectDrains } from "./fleet-config.js";
 import { ServiceShutdown, SHUTDOWN_DEADLINE_MS } from "./service-shutdown.js";
 import { readCodexThrottleConfig, codexPauseAttention, type CodexPauseState } from "./codex-throttle.js";
+import { EvidenceStore, readEvidenceLimits, type EvidenceUsage } from "./evidence-store.js";
 
 function secret(name: string): string {
   if (typeof name !== "string" || !name || !process.env[name]) throw new Error(`Missing credential environment variable: ${name}`);
@@ -119,7 +120,14 @@ async function main(): Promise<void> {
     const refresh = () => { void updates?.refresh().catch(() => console.warn("Consumer update lookup paused; running workers preserved")); };
     if (updates) { try { await updates.refresh(); } catch { /* retry without offering any update */ } }
     const updateTimer = updates ? setInterval(refresh, 300_000) : undefined;
-    const server = await serveFleet(store, machines, secret(config.operatorTokenEnv), config.port ?? 7430, config.host ?? "127.0.0.1", github, () => updates?.snapshot() ?? {}, config.updates?.dispatcherRepository,config.updates?.consumers,execFileSync("git",["rev-parse","HEAD"],{cwd:resolve(fileURLToPath(new URL("..",import.meta.url))),encoding:"utf8"}).trim());
+    // Shared run evidence, in its own database beside the authority so the
+    // authority's backups stay small. `evidence.enabled: false` turns it off.
+    const evidence = config.evidence?.enabled === false ? undefined
+      : new EvidenceStore(resolve(config.evidence?.database ?? resolve(dirname(database), "evidence.sqlite")), readEvidenceLimits(config.evidence), id => store.runOwner(id));
+    const evidenceSweep = () => { try { const { deleted } = evidence!.sweep(ticket => store.ticketDone(ticket)); if (deleted) console.log(`Evidence retention removed ${deleted} bundle(s)`); } catch (e) { console.warn("Evidence retention failed:", (e as Error).message); } };
+    if (evidence) evidenceSweep();
+    const evidenceTimer = evidence ? setInterval(evidenceSweep, 3600_000) : undefined;
+    const server = await serveFleet(store, machines, secret(config.operatorTokenEnv), config.port ?? 7430, config.host ?? "127.0.0.1", github, () => updates?.snapshot() ?? {}, config.updates?.dispatcherRepository,config.updates?.consumers,execFileSync("git",["rev-parse","HEAD"],{cwd:resolve(fileURLToPath(new URL("..",import.meta.url))),encoding:"utf8"}).trim(), evidence);
     let cli: Awaited<ReturnType<typeof serveGitHubBridge>> | undefined;
     if (github && config.github.socketPath) {
       const socket = resolve(config.github.socketPath);
@@ -146,8 +154,8 @@ async function main(): Promise<void> {
     const stopLabels = startClaimLabelSync(config.githubLabels, () => store.snapshot().claims, process.env, labelFetch, () => store.recovery.escalatedTickets(), project=>store.workflow.enabled(project));
     // A display pass writes the database after its GitHub calls, so it may finish.
     const shutdown = new ServiceShutdown({ servers: cli ? [server, cli] : [server],
-      stop: [() => clearInterval(updateTimer), () => clearInterval(workflowTimer), () => clearInterval(codexTimer), stopLabels],
-      pending: () => publishing, close: () => store.close(), deadlineMs: stopDeadline });
+      stop: [() => clearInterval(updateTimer), () => clearInterval(workflowTimer), () => clearInterval(codexTimer), () => clearInterval(evidenceTimer), stopLabels],
+      pending: () => publishing, close: () => { store.close(); evidence?.close(); }, deadlineMs: stopDeadline });
     process.on("SIGTERM", () => void shutdown.stop("SIGTERM")); process.on("SIGINT", () => void shutdown.stop("SIGINT"));
     console.log("Claim service listening", server.address());
     return;
@@ -202,7 +210,10 @@ async function main(): Promise<void> {
       claims.call<any[]>('/tasks/orphaned').catch((error: Error) => { orphanedError = String(error.message).slice(0, 200); return null; })]);
     // A pause at the ceiling means the limit outlasted the whole backoff: someone should look at OpenAI usage.
     const codexPause = codexPauseAttention(state.codexPause as CodexPauseState | undefined);
-    console.log(JSON.stringify({...recoveryReport(incidents, state),operationReports:operations,orphanedTasks:orphaned,...(orphanedError ? {orphanedTasksError:orphanedError} : {}),...(codexPause ? {codexPause} : {})}, null, 2)); return;
+    // Near the cap, the store is evicting evidence other computers may still need.
+    const evidence = (state.evidenceStore ?? null) as EvidenceUsage | null;
+    const evidenceStore = evidence?.nearCap ? { ...evidence, attention: `Shared evidence store at ${Math.round(evidence.usedRatio * 100)}% of its ${Math.round(evidence.limits.totalBytes / 1024 / 1024)} MiB cap; the oldest bundles are being evicted early` } : undefined;
+    console.log(JSON.stringify({...recoveryReport(incidents, state),operationReports:operations,orphanedTasks:orphaned,...(orphanedError ? {orphanedTasksError:orphanedError} : {}),...(codexPause ? {codexPause} : {}),...(evidenceStore ? {evidenceStore} : {})}, null, 2)); return;
   }
   if (command === "drain") { await client.call("/drain", {}); console.log("Draining: no new grants. Existing grants remain reserved."); }
   else if (command === "drain-project" || command === "resume-project") {
@@ -211,6 +222,7 @@ async function main(): Promise<void> {
     await client.call("/project-drain", { project: args[0], draining });
     console.log(draining ? `Draining ${args[0]}: existing owned tickets continue; no new tickets or main sweeps. Saved across manager restarts.` : `Resumed ${args[0]}: new tickets are eligible again.`);
   }
+  // status carries the shared evidence store's usage as evidenceStore, from the claim service's snapshot.
   else console.log(JSON.stringify(await client.call(command === "recovery" ? "/recovery/state" : "/state"), null, 2));
 }
 main().catch(error => { console.error(error.message); process.exitCode = 1; });

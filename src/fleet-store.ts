@@ -107,7 +107,7 @@ export interface StartRequest {
 }
 export interface Claim { ticket: string; machine: string; generation: string; created: number }
 export interface FleetRun extends StartRequest { generation: string; created: number; runnerPolicy?: RunnerPolicy }
-export interface FleetSnapshot { workflowProjects?: string[]; claims: Claim[]; runs: FleetRun[]; runnerPolicy?: RunnerPolicy; idleRecoveryTickets?: string[]; priorityHighTickets?: string[]; releasedAssessmentClaims?: Claim[]; features?: {recoveryTasks:boolean}; requiredRepairs?: Record<string,string[]>; codexPause?: CodexPauseState;
+export interface FleetSnapshot { workflowProjects?: string[]; claims: Claim[]; runs: FleetRun[]; runnerPolicy?: RunnerPolicy; idleRecoveryTickets?: string[]; priorityHighTickets?: string[]; releasedAssessmentClaims?: Claim[]; features?: {recoveryTasks:boolean; evidence?: boolean}; evidenceStore?: import("./evidence-store.js").EvidenceUsage; requiredRepairs?: Record<string,string[]>; codexPause?: CodexPauseState;
   /**
    * Open tickets of adopted projects waiting for review with nothing holding
    * them (see awaitsReview), whoever owns them. Present, possibly empty,
@@ -204,6 +204,20 @@ export class FleetStore {
     this.codex = new CodexThrottle(this.db, clock, options.codexThrottle ?? DEFAULT_CODEX_THROTTLE, options.log);
   }
   close(): void { this.db.close(); }
+  /** The authority's record of one run, finished or not. Evidence uploads are accepted only from its own computer. */
+  runOwner(id: string): { machine: string; ticket: string; role: string } | undefined {
+    const run = this.db.prepare("SELECT machine,ticket,request FROM fleet_runs WHERE id=?").get(id);
+    if (!run) return undefined;
+    let role = "unknown";
+    try { role = String(JSON.parse(String(run.request)).role ?? "unknown"); } catch { /* an unreadable request still names its computer */ }
+    return { machine: String(run.machine), ticket: String(run.ticket), role };
+  }
+  /** True for a Done or closed workflow ticket, false for an open one, undefined for one the workflow store does not hold. */
+  ticketDone(ticket: string): boolean | undefined {
+    let item;
+    try { item = this.workflow.get(ticket); } catch { return undefined; }
+    return item.status === "Done" || item.state === "CLOSED";
+  }
 
   runnerPolicy(): RunnerPolicy | undefined {
     const row = this.db.prepare('SELECT runner,revision FROM fleet_runner_policy WHERE singleton=1').get();
