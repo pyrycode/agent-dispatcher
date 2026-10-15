@@ -4024,27 +4024,48 @@ export function processesUsingPath(path: string, options: { platform?: NodeJS.Pl
     return [...found];
   }
   // launchd/manager environments need not include /usr/sbin in PATH.
-  const listing = (options.spawnSync ?? spawnSync)(platform === "darwin" ? "/usr/sbin/lsof" : "lsof", ["-b", "-w", "-n", "-P", "-Fpn"], { encoding: "utf-8", maxBuffer: 256 * 1024 * 1024, timeout: 60_000 });
+  const listing = (options.spawnSync ?? spawnSync)(platform === "darwin" ? "/usr/sbin/lsof" : "lsof", ["-b", "-w", "-n", "-P", "-Fpfnt"], { encoding: "utf-8", maxBuffer: 256 * 1024 * 1024, timeout: 60_000 });
   if (listing.error || listing.status !== 0 || listing.signal) throw new Error(`lsof failed: ${listing.error ?? `exit ${listing.status}, signal ${listing.signal}: ${listing.stderr}`}`);
   if (typeof listing.stdout !== "string" || !listing.stdout.endsWith("\n")) throw new Error("lsof failed: incomplete output");
   let pid: number | undefined;
-  let hasName = false;
-  for (const line of listing.stdout.split("\n")) {
+  let hasFile = false;
+  let file: { type?: string; name?: string } | undefined;
+  // These types identify kernel objects without filesystem paths. An empty
+  // name on a filesystem object, a Unix socket or an unknown type remains
+  // ambiguous and must block removal. Never carry type/name evidence
+  // across descriptor boundaries, even within the same process.
+  const unnamedTypes = new Set(["NPOLICY", "KQUEUE", "PIPE", "IPv4", "IPv6", "systm"]);
+  const finishFile = () => {
+    if (!file) return;
+    if (pid === undefined || !file.type || file.name === undefined ||
+        (file.name === "" && !unnamedTypes.has(file.type))) throw new Error("lsof failed: incomplete file record");
+    if (file.name && inside(file.name)) found.add(pid);
+    hasFile = true;
+    file = undefined;
+  };
+  for (const line of listing.stdout.slice(0, -1).split("\n")) {
     if (line.startsWith("p")) {
-      if (pid !== undefined && !hasName) throw new Error("lsof failed: incomplete process record");
+      finishFile();
+      if (pid !== undefined && !hasFile) throw new Error("lsof failed: incomplete process record");
       pid = Number(line.slice(1));
       if (!/^\d+$/.test(line.slice(1)) || !Number.isSafeInteger(pid)) throw new Error("lsof failed: invalid process record");
-      hasName = false;
-    } else if (line.startsWith("n")) {
+      hasFile = false;
+    } else if (line.startsWith("f")) {
       if (pid === undefined || line.length === 1) throw new Error("lsof failed: incomplete file record");
-      hasName = true;
-      if (inside(line.slice(1))) found.add(pid);
-    } else if (line) {
-      // Older lsof versions also emit descriptor fields even without -Ff.
-      if (!(pid !== undefined && /^f.+$/.test(line))) throw new Error("lsof failed: unexpected output");
+      finishFile();
+      file = {};
+    } else if (line.startsWith("t")) {
+      if (!file || file.type !== undefined || line.length === 1) throw new Error("lsof failed: invalid file type");
+      file.type = line.slice(1);
+    } else if (line.startsWith("n")) {
+      if (!file || file.name !== undefined) throw new Error("lsof failed: invalid file name");
+      file.name = line.slice(1);
+    } else {
+      throw new Error("lsof failed: unexpected output");
     }
   }
-  if (pid === undefined || !hasName) throw new Error("lsof failed: incomplete process record");
+  finishFile();
+  if (pid === undefined || !hasFile) throw new Error("lsof failed: incomplete process record");
   return [...found];
 }
 
