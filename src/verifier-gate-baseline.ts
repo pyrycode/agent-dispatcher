@@ -174,6 +174,12 @@ export interface GateBaselineAssessment {
   /** Why the same-tree re-run told nothing, when it did not run or could not be read; for the log. */
   rerunSkipReason: string | null;
   /**
+   * What became of each flaky name's sighting, by name: filed, reopened,
+   * recorded on an open ticket, or a first sighting with no ticket yet
+   * (`flakyTrackingNotes`). For the verifier's note and the log.
+   */
+  flakyNotes?: Record<string, string>;
+  /**
    * `PYRY_VERIFIER_GATE_INHERITED_ADVANCE` on: the baseline failures, each
    * with the open ticket that tracks it. Set only when every baseline name
    * was accepted, so the gate may count as green.

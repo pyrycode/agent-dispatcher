@@ -23,7 +23,7 @@ def report():
 
 
 class DesktopCaptureTests(unittest.TestCase):
-    def capture(self, directory, payload, exit_code=0, setup_code=0):
+    def capture(self, directory, payload, exit_code=0, setup_code=0, rebuild_code=0):
         calls = []
         paths = {'desktop': '/configured/desktop', 'desktopLauncher': '/configured/desktop-test'}
         config = "export default { workers: 4, projects: [{name: 'clipboard', workers: 1}, {name: 'parallel'}] }\n"
@@ -33,6 +33,9 @@ class DesktopCaptureTests(unittest.TestCase):
             if 'worktree' in argv:
                 worktree = directory / 'desktop'; worktree.mkdir()
                 (worktree / 'playwright.config.ts').write_text(config)
+            if argv == ['npm', 'run', 'rebuild:electron']:
+                with log.open('a') as output: output.write('rebuild stdout diagnostic\nrebuild stderr diagnostic\n')
+                return rebuild_code
             if argv[0] == paths['desktopLauncher']:
                 if payload is not None:
                     (directory / 'playwright.json').write_text(json.dumps(payload))
@@ -52,7 +55,9 @@ class DesktopCaptureTests(unittest.TestCase):
             self.assertEqual(result['outcome'], 'completed')
             self.assertEqual(calls[0][0], ['git', '-C', '/configured/desktop', 'fetch', '--refetch', 'origin', SHA])
             self.assertEqual(calls[1][0], ['git', '-C', '/configured/desktop', 'worktree', 'add', '--detach', str(directory/'desktop'), SHA])
-            self.assertEqual([c[0] for c in calls[2:]], [['npm', 'ci'], ['npm', 'run', 'build'], ['/configured/desktop-test', str(directory/'desktop')]])
+            self.assertEqual([c[0] for c in calls[2:]], [['npm', 'ci'], ['npm', 'run', 'build'],
+                ['npm', 'run', 'rebuild:electron'], ['/configured/desktop-test', str(directory/'desktop')]])
+            self.assertTrue(all(c[1] == directory/'desktop' for c in calls[2:]))
             self.assertEqual(result['files']['desktop/playwright.config.ts'], config)
             evidence = json.loads(result['files']['desktop/capture.json'])
             self.assertEqual(evidence['revision'], SHA)
@@ -248,6 +253,25 @@ class DesktopCaptureTests(unittest.TestCase):
                 self.assertIn('desktop/execution.log', result['files'])
                 if setup_code:
                     self.assertNotIn('/configured/desktop-test', [c[0][0] for c in calls])
+
+    def test_electron_rebuild_failure_prevents_launch_and_retains_diagnostics(self):
+        with tempfile.TemporaryDirectory() as d:
+            directory = Path(d)
+            result, calls, config = self.capture(directory, report(), rebuild_code=7)
+            self.assertEqual(result['outcome'], 'failed')
+            self.assertEqual([c[0] for c in calls[2:]], [
+                ['npm', 'ci'], ['npm', 'run', 'build'], ['npm', 'run', 'rebuild:electron']])
+            self.assertEqual(result['candidateRevision'], SHA)
+            self.assertEqual(result['files']['desktop/playwright.config.ts'], config)
+            self.assertIn('rebuild stdout diagnostic', result['files']['desktop/execution.log'])
+            self.assertIn('rebuild stderr diagnostic', result['files']['desktop/execution.log'])
+            evidence = json.loads(result['files']['desktop/capture.json'])
+            self.assertEqual(evidence['revision'], SHA)
+            self.assertEqual(evidence['counts'], {'executed': 0, 'passed': 0, 'failed': 0, 'skipped': 0, 'retries': 0})
+            self.assertIn('Desktop Electron rebuild failed; inspect execution.log', evidence['errors'])
+            self.assertEqual(json.loads(result['files']['desktop/fake-daemon-setup.json']), [])
+            self.assertNotIn('desktop/playwright.json', result['files'])
+            self.assertNotIn('desktop/playwright.list.log', result['files'])
 
     def test_desktop_readiness_requires_the_specific_mac_route(self):
         with tempfile.TemporaryDirectory() as d:

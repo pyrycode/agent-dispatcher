@@ -2,7 +2,17 @@
 // leaving the original at its live gate, so even an exhausted rework budget waits.
 // Failures new in one run share one ticket: tests that break together on one base
 // commit usually share a cause, and one ticket per test fixed it twice (#107).
-import { shortTestName, failureTicketLabels, dropStaleOsRequirement, type FlakyRunContext, type FlakyTicketClient } from "./flaky-tickets.js";
+// A failure whose fix ticket closed in the last 30 days reopens that ticket at
+// the top of Backlog instead of filing a new one (2026-10-15): the fix did not
+// hold, and its history is where the next attempt should start.
+//
+// Unlike a flaky test, a shared failure files on its first sighting. It failed
+// on the branch, again on the re-run and on the base commit, so it is not in
+// doubt, and the gated ticket waits on its tracker.
+import {
+  shortTestName, failureTicketLabels, dropStaleOsRequirement, reopenTracker, trackerKey, FLAKY_REOPEN_WINDOW_DAYS, FLAKY_REOPEN_WINDOW_MS,
+  type ClosedTracker, type FlakyRunContext, type FlakyTicketClient,
+} from "./flaky-tickets.js";
 import { osName } from "./ticket-requirements.js";
 
 export interface InheritedTicketClient extends InheritedTrackingClient {
@@ -156,14 +166,26 @@ function fixTicket(names: readonly string[], ctx: InheritedRunContext, platform:
   return { title: `fix shared ${kind} failures: ${names.length} tests fail on main`, body };
 }
 
+function reopenComment(names: readonly string[], ctx: FlakyRunContext, platform: string, closedAt: string): string {
+  return [
+    "## Shared failure back after this ticket closed",
+    "",
+    `This ticket closed at ${closedAt}, within ${FLAKY_REOPEN_WINDOW_DAYS} days, and its failure is back, so the ` +
+      "dispatcher reopened it at the top of Backlog instead of filing a new one.",
+    "",
+    evidence(names, ctx, platform),
+  ].join("\n");
+}
+
 /** Search first. A failed board/link write remains untracked and is retried on
  * the same open issue on the next attempt. Never report an unconfirmed blocker. */
 export function recordInheritedTests(
   client: InheritedTicketClient, failures: readonly string[], ctx: FlakyRunContext,
   options: InheritedTicketOptions = {},
   platform: string = process.platform,
+  now: () => number = Date.now,
 ): Promise<InheritedTicketResult> {
-  return recordInherited(client, failures, ctx, options, platform);
+  return recordInherited(client, failures, ctx, options, platform, now);
 }
 
 /**
@@ -174,8 +196,9 @@ export function recordInheritedTests(
 export function trackInheritedTests(
   client: InheritedTrackingClient, failures: readonly string[], ctx: VerifierGateInheritedContext,
   platform: string = process.platform,
+  now: () => number = Date.now,
 ): Promise<InheritedTicketResult> {
-  return recordInherited(client, failures, ctx, { advance: true, addBlockers: false, recordSighting: false }, platform);
+  return recordInherited(client, failures, ctx, { advance: true, addBlockers: false, recordSighting: false }, platform, now);
 }
 
 async function recordInherited(
@@ -183,6 +206,7 @@ async function recordInherited(
   failures: readonly string[], ctx: InheritedRunContext,
   options: InheritedTicketOptions,
   platform: string,
+  now: () => number,
 ): Promise<InheritedTicketResult> {
   const result: InheritedTicketResult = { blockers: [], untracked: [], owned: [] };
   const names = [...new Set(failures)];
@@ -196,8 +220,8 @@ async function recordInherited(
   }
   const owner = open.find(i => i.number === ctx.gatedIssue);
   const candidates = open.filter(i => i.number !== ctx.gatedIssue).sort((a, b) => a.number - b.number);
-  const groups = new Map<number, { issue: OpenIssue; names: string[]; created: boolean }>();
-  const untrackedNow: string[] = [];
+  const groups = new Map<number, { issue: OpenIssue; names: string[]; created: boolean; reopened?: boolean }>();
+  let untrackedNow: string[] = [];
   // Names whose tracker matched only by the method name in its title.
   const looselyTracked = new Set<string>();
   for (const name of names) {
@@ -233,6 +257,41 @@ async function recordInherited(
       return result;
     }
   }
+  // Reopening is the live gate's (PR 271). The pre-verifier gate's tracker
+  // path files as before (PR 272), and its client offers no closed-ticket search.
+  if (!("verifierGate" in ctx) && untrackedNow.length > 0 && client.listRecentlyClosedIssuesWithLabel) {
+    let closed: ClosedTracker[] = [];
+    try {
+      closed = await client.listRecentlyClosedIssuesWithLabel("bug", new Date(now() - FLAKY_REOPEN_WINDOW_MS));
+    } catch (error) {
+      // The gated ticket waits on a tracker, so a new one is filed as before.
+      console.warn(`   ⚠️ Could not search recently closed shared-failure tickets, so a new one is filed: ${error}`);
+    }
+    const byPrior = new Map<number, { prior: ClosedTracker; names: string[] }>();
+    for (const name of untrackedNow) {
+      // A person's not-planned or duplicate close is not reopened; a new ticket is filed as before.
+      const prior = closed.filter(c => c.number !== ctx.gatedIssue && hasMarker(c, name) && c.stateReason !== "not_planned" && c.stateReason !== "duplicate")
+        .sort((a, b) => Date.parse(b.closedAt) - Date.parse(a.closedAt))[0];
+      if (!prior) continue;
+      const group = byPrior.get(prior.number) ?? { prior, names: [] };
+      group.names.push(name);
+      byPrior.set(prior.number, group);
+    }
+    for (const { prior, names: group } of byPrior.values()) {
+      try {
+        await reopenTracker(client, prior, reopenComment(group, ctx, platform, prior.closedAt),
+          { kind: "inherited", tests: group, top: true, key: trackerKey(ctx, prior.number, "inherited-reopen") });
+        groups.set(prior.number, {
+          issue: { number: prior.number, nodeId: prior.nodeId ?? "", title: prior.title, body: prior.body, labels: prior.labels },
+          names: group, created: true, reopened: true,
+        });
+        untrackedNow = untrackedNow.filter(n => !group.includes(n));
+        console.log(`   ♻️  Reopened shared-failure ticket #${prior.number} for ${group.join(", ")}`);
+      } catch (error) {
+        console.warn(`   ⚠️ Could not reopen #${prior.number} for ${group.join(", ")}, so a new ticket is filed: ${error}`);
+      }
+    }
+  }
   if (untrackedNow.length > 0) {
     try {
       const { title, body } = fixTicket(untrackedNow, ctx, platform);
@@ -246,7 +305,12 @@ async function recordInherited(
   // Record the sighting and keep each tracker on the board first. A ticket
   // whose tracker could not be confirmed here never advances.
   const placed: { issue: OpenIssue; names: string[] }[] = [];
-  for (const { issue, names: groupNames, created } of groups.values()) {
+  for (const { issue, names: groupNames, created, reopened } of groups.values()) {
+    // A reopen already put the tracker at the top of Backlog.
+    if (reopened) {
+      placed.push({ issue, names: groupNames });
+      continue;
+    }
     try {
       if (!created) {
         if (options.recordSighting !== false) {

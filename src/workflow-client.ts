@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { JsonClient } from "./fleet-http.js";
+import { unknownOperation, type JsonClient } from "./fleet-http.js";
 import type { WorkflowItem, WorkflowChange } from "./workflow-store.js";
 import {
   tallyFamilyComments,
@@ -29,6 +29,20 @@ export function workflowClient<T extends object>(
       ticket: `${project}#${number}`,
       change: value,
       commandId: randomUUID(),
+      ...actor(),
+    });
+  type TrackerRef = { kind: string; tests: string[]; top?: boolean; key?: string };
+  const tracker = async (number: number, comment: string, ref: TrackerRef, reopen: boolean) =>
+    connection.call("/flaky/track", {
+      project,
+      ticket: `${project}#${number}`,
+      kind: ref.kind,
+      tests: ref.tests,
+      comment,
+      reopen,
+      ...(ref.top ? { top: true } : {}),
+      // The same gate run's write carries the same key, so judging it twice writes once.
+      commandId: ref.key ?? randomUUID(),
       ...actor(),
     });
   const comments = async (number: number) =>
@@ -99,6 +113,25 @@ export function workflowClient<T extends object>(
     closeIssue: async (n: number) => {
       await change(n, { state: "CLOSED" });
     },
+    reopenIssue: async (n: number) => {
+      await change(n, { state: "OPEN" });
+    },
+    // Failure trackers (flaky-tickets.ts). Usually another computer's ticket,
+    // so the claim service checks the ticket names these tests instead of
+    // asking for its claim, and reopens into Backlog in one write.
+    reopenTracker: async (issue: { number: number }, comment: string, ref: TrackerRef) => {
+      await tracker(issue.number, comment, ref, true);
+    },
+    commentOnTracker: async (n: number, comment: string, ref: TrackerRef) => {
+      try {
+        await tracker(n, comment, ref, false);
+      } catch (error) {
+        // A service from before the route: the ordinary comment, which works
+        // wherever this run may write the ticket.
+        if (!unknownOperation(error)) throw error;
+        await methods.addComment(n, comment);
+      }
+    },
     recordMergedIssue: async (n: number) => {
       const item = (await read()).find((i) => i.issueNumber === n);
       if (!item) throw new Error("Unknown workflow ticket");
@@ -148,6 +181,25 @@ export function workflowClient<T extends object>(
             : match[1] !== project || x.number !== Number(match[2]),
         ),
       });
+    },
+    // GitHub knows when a ticket closed and why; the store knows whether it
+    // is closed. A ticket the store holds open is not closed, and one it has
+    // closed that GitHub still shows open closed just now, before publication.
+    listRecentlyClosedIssuesWithLabel: async (label: string, since: Date) => {
+      const [closed, items] = await Promise.all([(base as any).listRecentlyClosedIssuesWithLabel(label, since), read()]);
+      const byNumber = new Map(items.map((i) => [i.issueNumber, i]));
+      // One the store does not hold cannot be reopened through it, so it is left out, and a new ticket filed instead.
+      const out = (closed as Array<{ number: number }>).filter((c) => byNumber.get(c.number)?.state === "CLOSED");
+      const unpublished = items.filter((i) => i.state === "CLOSED" && i.labels.includes(label) && !out.some((c) => c.number === i.issueNumber));
+      if (unpublished.length > 0) {
+        const openOnGitHub = new Set(((await (base as any).listOpenIssuesWithLabel(label)) as Array<{ number: number }>).map((i) => i.number));
+        for (const i of unpublished) {
+          if (openOnGitHub.has(i.issueNumber)) {
+            out.push({ number: i.issueNumber, nodeId: i.issueId, title: i.title, body: i.body, labels: [...i.labels], closedAt: new Date().toISOString(), stateReason: null } as any);
+          }
+        }
+      }
+      return out;
     },
     listOpenIssuesWithLabel: async (label: string) =>
       (await read())

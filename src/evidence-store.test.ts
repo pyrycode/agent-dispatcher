@@ -288,7 +288,7 @@ test('any agent reads shared evidence through its run socket and the Python help
  // A builder on the other computer, holding only its own run socket.
  assert.equal(f.store.start({id:'mac-builder',machine:'hp',session:'s-hp',project:'org/core',ticket:'org/core#12',role:'builder',resource:'medium',locks:[]}).ok,true);
  const run=f.store.snapshot().runs.find(r=>r.id==='mac-builder')!;
- const bridge=await taskBridge(f.project('hp'),run,{tasks:false,evidence:true});
+ const bridge=await taskBridge(f.project('hp'),run,{request:false,read:false,evidence:true});
  t.after(()=>bridge.close());
  const helper=fileURLToPath(new URL('../scripts/fleet-task.py',import.meta.url));
  const env={PATH:process.env.PATH,PYRY_TASK_SOCKET:bridge.socket};
@@ -303,7 +303,7 @@ test('any agent reads shared evidence through its run socket and the Python help
  // Listing without --out, and a full ticket name.
  const listed=JSON.parse((await execute('python3',[helper,'evidence','org/core#12'],{env})).stdout);
  assert.ok(listed.bundles[0].files.some((f:any)=>f.path==='run.json'));
- // Native check requests stay with builders that have the tasks action.
+ // A socket without the read action refuses native task reads.
  await assert.rejects(execute('python3',[helper,'read','a'.repeat(64)],{env}),/Unknown task action/);
 });
 

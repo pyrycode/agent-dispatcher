@@ -29,7 +29,7 @@ import { execFile, execSync, spawnSync } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
 import { FleetStore } from './fleet-store.js';
 import { MachineManager, serveManager } from './machine-manager.js';
-import { ManagedDispatch, withManagedTaskRun } from './managed-dispatch.js';
+import { ManagedDispatch, managedTaskEnv, withManagedTaskRun } from './managed-dispatch.js';
 import type { RunEvidenceInput } from './run-evidence.js';
 import { completeGo, completePlaywright, loggedArtifacts, loggedFailures, mixedGoCommands, singleWrappedGoCommands, repeatedGo } from "./fixtures/gate-completeness.js";
 
@@ -123,10 +123,13 @@ import { decideGateVerdict } from "./pipeline-decisions.js";
 import { flakyMarker } from "./flaky-tickets.js";
 import { inheritedMarker } from "./inherited-tickets.js";
 import { verifierInheritedAdvanceEnabled } from "./verifier-gate-baseline.js";
+import type { FlakySightingStore } from "./flaky-sightings.js";
 import { FINAL_MERGE_HANDOFF_MARKER, MERGE_RESOLUTION_NOTE_MARKER, mergeResolutionComment } from "./merge-handoff.js";
 import { runReworkRouting } from "./reconcile.js";
 import { hashGateList, type VerifierGatePass } from "./verifier-gate-reuse.js";
 import { resetActiveStageSetForTests, resolveStageSet } from "./stage-sets.js";
+import { NATIVE_TASK_HOLD_LABEL, NATIVE_TASK_WAITED_LABEL, decideHandoverHold } from "./native-task-hold.js";
+import { FleetClient, serveFleet } from "./fleet-http.js";
 import type { AgentConfig, BlockerInfo, ProjectItem } from "./types.js";
 import {
   decideReworkRoutes,
@@ -138,6 +141,7 @@ import {
   STRANDED_WIP_SWEPT_MARKER,
   tallyFamilyComments,
   shouldSkipDispatch,
+  PENDING_DONE_PREFIX,
 } from "./pipeline-decisions.js";
 import { AGENTS } from "./types.js";
 import { AgentRunFailedError, AgentRunStoppedError, buildResumePrompt, idleStallMessage, noResultErrorMessage, ResourceExhaustedError, timeoutFor } from "./agent-runtime.js";
@@ -3277,6 +3281,160 @@ describe("handlePostRun — failure modes", () => {
     assert.deepEqual(result, { ok: true });
     assert.ok(client.addLabelCalls.some(c => c.label === "done:builder"));
     assert.ok(!client.addLabelCalls.some(c => c.label === "error:builder"));
+  });
+
+  // Desktop #1998 (2026-10-15): the builder handed over "native acceptance
+  // pending" at 12:51 and its Mac check finished green at 13:00, after the
+  // ticket had moved on. A builder whose requested task is still open now
+  // keeps the ticket with held:native-task (native-task-hold.ts).
+  describe("native task handover hold", () => {
+    const OPEN = {
+      id: "0234f9aa".padEnd(64, "0"), state: "queued", created: Date.now() - 6 * 60_000,
+      request: { recipe: "desktop-fake-suite", capability: "desktop-fake-suite", revision: "c".repeat(40) },
+    };
+    const builderCtx = (issue: number, hold: DispatchDeps["nativeTaskHold"], client: MockGitHubClient, agent: Partial<AgentConfig> = BUILDER) => {
+      const mock = makeMockDeps({ execImpls: {
+        "git status --porcelain": () => "",
+        "git rev-list --count main..": () => "2\n",
+        "gh pr list --head": () => JSON.stringify([{ number: 2000 }]),
+        "gh pr view": () => JSON.stringify({ reviews: [{ submittedAt: new Date(Date.now() + 60_000).toISOString(), body: "PASS" }], comments: [] }),
+      } });
+      mock.deps.nativeTaskHold = hold;
+      return makeTestContext({ agent, item: { issueNumber: issue }, client, deps: mock.deps, calls: mock.calls }).ctx;
+    };
+
+    test("an open requested task holds the handover: held:native-task, no done:builder, the hold explained after the completion comment", async () => {
+      const client = new MockGitHubClient({ status: { 1998: "In Development" }, labels: { 1998: ["done:refiner", "error-retry-count:1"] } });
+      const ctx = builderCtx(1998, async () => ({ held: [{ id: OPEN.id, task: OPEN }], passed: [] }), client);
+
+      const result = await handlePostRun(STREAM_OK(), ctx, false);
+
+      assert.deepEqual(result, { ok: true });
+      assert.ok(client.addLabelCalls.some(c => c.label === NATIVE_TASK_HOLD_LABEL));
+      assert.ok(!client.addLabelCalls.some(c => c.label === "done:builder"), "the ticket does not move on");
+      assert.ok(!client.addLabelCalls.some(c => c.label.startsWith(PENDING_DONE_PREFIX)));
+      assert.ok(client.removeLabelCalls.some(c => c.label === "error-retry-count:1"), "the run succeeded, so its retry state ends");
+      assert.equal(client.comments.length, 2);
+      assert.match(client.comments[0]!.body, /builder agent has completed work/);
+      assert.match(client.comments[0]!.body, /Handover held\*\* until its native checks finish/);
+      assert.doesNotMatch(client.comments[0]!.body, /Ready for human review/);
+      assert.match(client.comments[1]!.body, /Handover held: native task still running/);
+      assert.match(client.comments[1]!.body, new RegExp(OPEN.id));
+    });
+
+    test("a handover after a hold does not wait again, and ends the wait", async () => {
+      const client = new MockGitHubClient({ status: { 2007: "In Development" }, labels: { 2007: [NATIVE_TASK_WAITED_LABEL] } });
+      const seen: boolean[] = [];
+      const ctx = builderCtx(2007, async (waited) => { seen.push(waited); return decideHandoverHold([OPEN.id], [OPEN], Date.now(), 4 * 3_600_000, waited); }, client);
+
+      await handlePostRun(STREAM_OK(), ctx, false);
+
+      assert.deepEqual(seen, [true], "the check is told this handover already waited");
+      assert.ok(client.addLabelCalls.some(c => c.label === "done:builder"));
+      assert.ok(!client.addLabelCalls.some(c => c.label === NATIVE_TASK_HOLD_LABEL));
+      assert.ok(client.removeLabelCalls.some(c => c.label === NATIVE_TASK_WAITED_LABEL), "the next handover may hold again");
+      assert.match(client.comments.at(-1)!.body, /already waited for native tasks once/);
+    });
+
+    test("a hold label whose write failed but landed counts as held, so no done label goes beside it", async () => {
+      const client = new MockGitHubClient({ status: { 2008: "In Development" }, labels: { 2008: [] } });
+      client.failures.addLabel = (n, label) => {
+        if (label !== NATIVE_TASK_HOLD_LABEL) return null;
+        client.labelsByIssue.get(n)!.push(label);
+        return new Error("The operation was aborted due to timeout");
+      };
+      const ctx = builderCtx(2008, async () => ({ held: [{ id: OPEN.id, task: OPEN }], passed: [] }), client);
+
+      await handlePostRun(STREAM_OK(), ctx, false);
+
+      assert.ok(!client.addLabelCalls.some(c => c.label === "done:builder"));
+      assert.match(client.comments.at(-1)!.body, /Handover held/);
+    });
+
+    test("an open task that does not hold hands over and says why", async () => {
+      const client = new MockGitHubClient({ status: { 1999: "In Development" }, labels: { 1999: [] } });
+      const ctx = builderCtx(1999, async () => ({ held: [], passed: [{ task: OPEN, reason: "bound" as const }] }), client);
+
+      await handlePostRun(STREAM_OK(), ctx, false);
+
+      assert.ok(client.addLabelCalls.some(c => c.label === "done:builder"));
+      assert.ok(!client.addLabelCalls.some(c => c.label === NATIVE_TASK_HOLD_LABEL));
+      assert.match(client.comments.at(-1)!.body, /handover not held/);
+    });
+
+    test("no requested task, a check that throws, or a hold label GitHub refuses: done:builder as before", async () => {
+      for (const [issue, hold, refuse] of [
+        [2001, async () => null, false],
+        [2002, async () => { throw new Error("socket closed"); }, false],
+        [2003, async () => ({ held: [{ id: OPEN.id, task: OPEN }], passed: [] }), true],
+      ] as const) {
+        const client = new MockGitHubClient({ status: { [issue]: "In Development" }, labels: { [issue]: [] } });
+        if (refuse) client.failures.addLabel = (_n, label) => label === NATIVE_TASK_HOLD_LABEL ? new Error("GitHub 502") : null;
+        const ctx = builderCtx(issue, hold, client);
+        await handlePostRun(STREAM_OK(), ctx, false);
+        assert.ok(client.addLabelCalls.some(c => c.label === "done:builder"), String(issue));
+        assert.equal(client.comments.length, 1, `${issue}: only the completion comment`);
+      }
+    });
+
+    test("an unknown column with an open task holds instead of deferring done:builder", async () => {
+      const client = new MockGitHubClient({ status: { 2004: "In Development" }, labels: { 2004: [] } });
+      client.failures.getItemStatus = new Error("GraphQL rate limit");
+      const ctx = builderCtx(2004, async () => ({ held: [{ id: OPEN.id }], passed: [] }), client);
+
+      await handlePostRun(STREAM_OK(), ctx, false);
+
+      assert.ok(client.addLabelCalls.some(c => c.label === NATIVE_TASK_HOLD_LABEL));
+      assert.ok(!client.addLabelCalls.some(c => c.label === `${PENDING_DONE_PREFIX}builder`), "pending-done would hand over on the next board read");
+      assert.ok(!client.addLabelCalls.some(c => c.label === "done:builder"));
+    });
+
+    test("labels that cannot be read hand over without a hold, and still end any wait", async () => {
+      const client = new MockGitHubClient({ status: { 2010: "In Development" }, labels: { 2010: [NATIVE_TASK_WAITED_LABEL] } });
+      client.failures.getIssueLabels = new Error("GitHub 502");
+      let asked = false;
+      const ctx = builderCtx(2010, async () => { asked = true; return { held: [{ id: OPEN.id, task: OPEN }], passed: [] }; }, client);
+
+      await handlePostRun(STREAM_OK(), ctx, false);
+
+      assert.equal(asked, false, "an unknown marker must not hold a second time");
+      assert.ok(client.addLabelCalls.some(c => c.label === "done:builder"));
+      assert.ok(client.removeLabelCalls.some(c => c.label === NATIVE_TASK_WAITED_LABEL), "removed without knowing it was there");
+    });
+
+    test("an unknown column after a hold hands over through pending-done and ends the wait", async () => {
+      const client = new MockGitHubClient({ status: { 2009: "In Development" }, labels: { 2009: [NATIVE_TASK_WAITED_LABEL] } });
+      client.failures.getItemStatus = new Error("GraphQL rate limit");
+      const ctx = builderCtx(2009, async (waited) => decideHandoverHold([OPEN.id], [OPEN], Date.now(), 4 * 3_600_000, waited), client);
+
+      await handlePostRun(STREAM_OK(), ctx, false);
+
+      assert.ok(client.addLabelCalls.some(c => c.label === `${PENDING_DONE_PREFIX}builder`));
+      assert.ok(client.removeLabelCalls.some(c => c.label === NATIVE_TASK_WAITED_LABEL));
+    });
+
+    test("a verifier never holds: only builders and developers request native checks", async () => {
+      let asked = false;
+      const client = new MockGitHubClient({ status: { 2005: "In Code Review" }, labels: { 2005: [] } });
+      const ctx = builderCtx(2005, async () => { asked = true; return { held: [{ id: OPEN.id }], passed: [] }; }, client,
+        { name: "verifier", column: "In Code Review", claudeMdPath: "verifier/CLAUDE.md", usesWorktree: true, producesCommits: false, requiresVerdict: true });
+
+      await handlePostRun(STREAM_OK(), ctx, false);
+
+      assert.equal(asked, false);
+      assert.ok(!client.addLabelCalls.some(c => c.label === NATIVE_TASK_HOLD_LABEL));
+    });
+
+    test("a developer holds like a builder", async () => {
+      const client = new MockGitHubClient({ status: { 2006: "In Development" }, labels: { 2006: [] } });
+      const ctx = builderCtx(2006, async () => ({ held: [{ id: OPEN.id, task: OPEN }], passed: [] }), client,
+        { name: "developer", column: "In Development", claudeMdPath: "developer/CLAUDE.md", usesWorktree: true, producesCommits: true });
+
+      await handlePostRun(STREAM_OK(), ctx, false);
+
+      assert.ok(client.addLabelCalls.some(c => c.label === NATIVE_TASK_HOLD_LABEL));
+      assert.ok(!client.addLabelCalls.some(c => c.label === "done:developer"));
+    });
   });
 
   test("empty branch + architect added needs-human:sizing → error:architect (a stop is now a deviation)", async () => {
@@ -7558,6 +7716,38 @@ describe("runRealClaudeGateSuite — same-tree re-run before the base comparison
     assert.match(report.baselineSkipReason ?? "", /passed on the same-tree re-run/);
   });
 
+  test("a Playwright live re-run and its base comparison ask for the gate's worker count, with no load tests", async () => {
+    // 2026-10-15: one or two failing tests re-run alone used one worker
+    // against the gate's three or four. Live load tests would each be a real
+    // claude session, so the live gate passes the worker count only.
+    const pw = (files: Record<string, Record<string, string>>) => JSON.stringify({
+      config: { workers: 2, metadata: { actualWorkers: 2 } },
+      suites: Object.entries(files).map(([file, tests]) => ({ title: file, specs: Object.entries(tests).map(([title, st]) => ({
+        title, tests: [{ status: st === "passed" ? "expected" : "unexpected", results: [{ status: st, duration: 500 }] }],
+      })) })),
+    });
+    const branch = pw({ "real-claude-effort.spec.ts": { applied: "failed" }, "real-claude-mcp.spec.ts": { sheet: "passed" } });
+    const rerun = pw({ "real-claude-effort.spec.ts": { applied: "failed" } });
+    const base = pw({ "real-claude-effort.spec.ts": { applied: "passed" } });
+    const harness = makeGateDeps({
+      gitOut: (cmd) => GATE_SHAS[cmd] ?? "",
+      spawnOutcome: { exitCode: 1 },
+      readFileSync: ((path: string) => path.includes("-rerun_") ? rerun : path.includes("-base_") ? base : branch) as any,
+    });
+    const report = await runRealClaudeGateSuite({
+      issueNumber: 1382,
+      command: "npx playwright test --config playwright.real-claude.config.ts --reporter=json",
+      baselineCommand: "npx playwright test --config playwright.real-claude.config.ts --reporter=json -g {{TESTS}}",
+      format: "playwright-json", timeoutMs: 60_000, repoRoot: "/tmp/fake-repo", defaultBranch: "main", logsDir: "/tmp/fake-logs",
+      deps: harness.deps,
+    });
+    const loaded = "-g '(real-claude-effort\\.spec\\.ts.*applied)' --workers=2";
+    assert.ok(harness.spawnRequests[1].command.endsWith(loaded), harness.spawnRequests[1].command);
+    assert.deepEqual(report.rerunFailures, ["real-claude-effort.spec.ts › applied"]);
+    assert.ok(harness.spawnRequests[2].command.endsWith(loaded), "the base asks for the same workers");
+    assert.deepEqual(report.baselineFailures, []);
+  });
+
   test("a failure that fails again is compared against the base as before", async () => {
     const { run, spawnRequests } = rerunHarness(contents(rerunRed, rerunGreen));
     const report = await run();
@@ -11601,6 +11791,23 @@ describe("pre-verifier gates — failures already on main (#123)", () => {
   });
   const gateLog = (n: number, i: number) => resolve(logsDir, `verifier-gate_#${n}_${i}.log`);
   const stateFile = resolve(logsDir, "main-sweep-state.json");
+  /** A sighting record that counts each test's sightings, starting from `prior`. */
+  const seenBefore = (prior = 1): FlakySightingStore & { recorded: { test: string; counts: boolean }[] } => {
+    const seen = new Map<string, number>();
+    const recorded: { test: string; counts: boolean }[] = [];
+    return {
+      recorded,
+      record: async (sightings) => ({
+        source: "central" as const,
+        counts: new Map(sightings.map((x) => {
+          recorded.push({ test: x.test, counts: x.counts });
+          const count = (seen.get(x.test) ?? prior) + (x.counts ? 1 : 0);
+          seen.set(x.test, count);
+          return [x.id, { id: x.id, test: x.test, count, earlier: [] }];
+        })),
+      }),
+    };
+  };
   /** A red UI gate: exit 1 for the gate itself; the base re-run's own exit is irrelevant. */
   const uiRed = (req: GateSpawnRequest): GateSpawnOutcome =>
     req.command === UI ? { exitCode: 1, timedOut: false, spawnError: null } : { exitCode: 0, timedOut: false, spawnError: null };
@@ -11632,11 +11839,14 @@ describe("pre-verifier gates — failures already on main (#123)", () => {
     client?: MockGitHubClient;
     /** The gated ticket's body. */
     itemBody?: string;
+    /** The flaky sighting record. Unset: one that has seen every test before. */
+    sightings?: FlakySightingStore | null;
   }) {
     return withStageSet("builder", () => withVerifierGates(opts.gates ?? `make check;${UI}`, () => withFormats("formats" in opts ? opts.formats : FORMATS, async () => {
       const fsMap: Record<string, string> = { [gateLog(n, 2)]: opts.uiOutput };
       if (opts.state !== null) fsMap[stateFile] = opts.state ?? sweepState();
       const { deps, calls } = makeMockDeps({ execImpls: opts.exec ?? execs(), fsMap, gateImpl: opts.gateImpl ?? uiRed });
+      deps.flakySightings = opts.sightings === undefined ? seenBefore() : opts.sightings;
       const read = deps.readFileSync;
       deps.readFileSync = ((path: any, ...rest: any[]) =>
         /verifier-gate-base_#\d+\.log$/.test(String(path)) && opts.baseOutput !== undefined
@@ -11862,18 +12072,112 @@ describe("pre-verifier gates — failures already on main (#123)", () => {
       assert.equal(client.createdIssues.length, 0, "no flaky ticket");
     });
 
-    test("a flaky name and a baseline name together count as green, and the note lists both", async () => {
+    test("a flaky name and a baseline name together count as green, the note lists both, and the run files one ticket", async () => {
+      const sightings = seenBefore();
       const { result, client } = await runGates(1762, {
         uiOutput: junit([X, Z]),
         rerunOutput: junit([X], [Z]),
+        sightings,
       });
 
       const note = result.promptNote;
       assert.ok(!note.includes("TRIAGE MODE"));
       assert.match(note, /count as green for your verdict/);
       assert.ok(note.includes(`\`${X}\` (failed in the main sweep`));
-      assert.match(note, /### Flaky failures, not this ticket's[^]*- `de\.pyryco\.mobile\.ui\.NewTest#broken`/);
-      assert.deepEqual(client.createdIssues.map((i) => i.body.includes(flakyMarker(Z))), [true], "only Z is flaky");
+      assert.match(note, /### Flaky failures, not this ticket's[^]*- `de\.pyryco\.mobile\.ui\.NewTest#broken`, gate `[^`]+`: filed #/);
+      assert.deepEqual(client.createdIssues.map((i) => i.body.includes(flakyMarker(Z))), [true], "X failed again and is main's, so the run's one ticket is Z's");
+      assert.ok(!client.createdIssues[0]!.body.includes(flakyMarker(X)));
+      assert.deepEqual(sightings.recorded, [{ test: Z, counts: true }], "X is main's, so Z's sighting still counts");
+    });
+
+    test("a flake beside a failure that is the branch's own is recorded but not counted", async () => {
+      const sightings = seenBefore();
+      const { result, client } = await runGates(1764, {
+        uiOutput: junit([W, Z]),
+        state: noSweep(),
+        rerunOutput: junit([W], [Z]),
+        baseOutput: junit([], [W]),
+        sightings,
+      });
+      assert.match(result.promptNote, /TRIAGE MODE/);
+      assert.match(result.promptNote, /: recorded and not counted: this branch's own failure/);
+      assert.equal(client.createdIssues.length, 0);
+      assert.deepEqual(sightings.recorded, [{ test: Z, counts: false }]);
+    });
+
+    test("a first sighting files nothing and the verifier's note says so", async () => {
+      const { result, client, calls } = await runGates(1765, {
+        uiOutput: junit([Z]),
+        state: noSweep(),
+        rerunOutput: junit([], [Z]),
+        sightings: seenBefore(0),
+      });
+      assert.match(result.promptNote, /count as green for your verdict/);
+      assert.ok(result.promptNote.includes(`- \`${Z}\`, gate \`${UI}\`: first sighting in 14 days, recorded; a ticket is filed if it flakes again`));
+      assert.equal(client.createdIssues.length, 0, "no ticket on the first sighting");
+      assert.match(loggedText(calls), /passed on the same-tree re-run, flaky; first sighting in 14 days/);
+    });
+
+    describe("under the gate's own worker count", () => {
+      // 2026-10-15: Desktop's re-runs of one or two failing tests used one
+      // worker against the gate's four, so a contention failure nearly always
+      // passed and was filed as a flaky test.
+      const PW = "npx playwright test --reporter=json";
+      const PW_FORMATS = JSON.stringify({ [PW]: { format: "playwright-json", baseline: `${PW} -g {{TESTS}}` } });
+      /** file -> test -> statuses */
+      const pw = (workers: number, files: Record<string, Record<string, string[]>>) => JSON.stringify({
+        config: { workers, metadata: { actualWorkers: workers } },
+        suites: Object.entries(files).map(([file, tests]) => ({ title: file, specs: Object.entries(tests).map(([title, statuses]) => ({
+          title, tests: statuses.map((st) => ({ status: st === "passed" ? "expected" : "unexpected", results: [{ status: st, duration: 1000 }] })),
+        })) })),
+      });
+      const gateRun = (workers: number) => pw(workers, { "flow.spec.ts": { a: ["failed"], b: ["passed"] }, "other.spec.ts": { o: ["passed"] }, "more.spec.ts": { m: ["passed"] } });
+      const pwRed = (req: GateSpawnRequest): GateSpawnOutcome =>
+        req.command === PW ? { exitCode: 1, timedOut: false, spawnError: null } : { exitCode: 0, timedOut: false, spawnError: null };
+      const pwReruns = (calls: CallLog) => calls.gates.filter((g) => g.command.includes(" -g ") && !/verifier-gate-base-/.test(g.cwd));
+      const pwBase = (calls: CallLog) => calls.gates.filter((g) => g.command.includes(" -g ") && /verifier-gate-base-/.test(g.cwd));
+      const LOADED = `${PW} -g '(flow\\.spec\\.ts.*a|(?:^|[ /])other\\.spec\\.ts(?: |$).*o|(?:^|[ /])more\\.spec\\.ts(?: |$).*m)' --workers=3`;
+
+      test("the re-run asks for the gate's workers and fills the idle ones with passing tests from other files", async () => {
+        const { result, calls } = await runGates(1767, {
+          gates: `make check;${PW}`, formats: PW_FORMATS, gateImpl: pwRed, state: noSweep(),
+          uiOutput: gateRun(3),
+          rerunOutput: pw(3, { "flow.spec.ts": { a: ["passed"] }, "other.spec.ts": { o: ["passed"] }, "more.spec.ts": { m: ["passed"] } }),
+        });
+        assert.equal(pwReruns(calls)[0]!.command, LOADED, "each failing test still runs once");
+        assert.match(result.promptNote, /count as green for your verdict/);
+      });
+
+      test("a load test's result decides nothing, and the base runs under the same load", async () => {
+        const { result, calls, client } = await runGates(1768, {
+          gates: `make check;${PW}`, formats: PW_FORMATS, gateImpl: pwRed, state: noSweep(),
+          uiOutput: gateRun(3),
+          rerunOutput: pw(3, { "flow.spec.ts": { a: ["failed"] }, "other.spec.ts": { o: ["failed"] }, "more.spec.ts": { m: ["passed"] } }),
+          baseOutput: pw(3, { "flow.spec.ts": { a: ["passed"] }, "other.spec.ts": { o: ["failed"] }, "more.spec.ts": { m: ["passed"] } }),
+        });
+        assert.equal(pwBase(calls)[0]!.command, LOADED);
+        assert.match(result.promptNote, /TRIAGE MODE/, "a failed again and passes on the base, so it is the ticket's");
+        assert.match(result.promptNote, /Judge only these remaining failures[^]*- `flow\.spec\.ts › a`/);
+        const judged = result.promptNote.split("Judge only these remaining failures")[1]!.split("\n\n")[1]!;
+        assert.equal(judged, "- `flow.spec.ts › a`", "the load test that failed is not a finding");
+        assert.ok(!result.promptNote.includes("`other.spec.ts › o` (failed"), "nor a failure on main");
+        assert.equal(client.createdIssues.length, 0);
+      });
+
+      test("a gate that ran one worker re-runs as before", async () => {
+        const { calls } = await runGates(1769, {
+          gates: `make check;${PW}`, formats: PW_FORMATS, gateImpl: pwRed, state: noSweep(),
+          uiOutput: gateRun(1),
+          rerunOutput: pw(1, { "flow.spec.ts": { a: ["passed"] } }),
+        });
+        assert.equal(pwReruns(calls)[0]!.command, `${PW} -g '(flow\\.spec\\.ts.*a)'`);
+      });
+    });
+
+    test("without a sighting record nothing is filed", async () => {
+      const { result, client } = await runGates(1766, { uiOutput: junit([Z]), state: noSweep(), rerunOutput: junit([], [Z]), sightings: null });
+      assert.match(result.promptNote, /: not recorded, because no sighting record is configured/);
+      assert.equal(client.createdIssues.length, 0);
     });
 
     const unknown: [string, Partial<Parameters<typeof runGates>[1]>][] = [
@@ -13448,4 +13752,66 @@ describe("runAutoMerge: mergeability still settling", () => {
     assert.deepEqual(merges(), ["gh pr merge 1980 --merge --delete-branch"]);
     assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1977, label: "merge-attempt:1" }]);
   });
+});
+
+// The handover hold end to end inside an admitted run: the socket records the
+// builder's request, the default check reads the ticket's tasks from the claim
+// service, and handlePostRun keeps the ticket (native-task-hold.ts).
+test("a managed builder whose requested native task is open is held by handlePostRun's own check", async t => {
+  const store = new FleetStore(":memory:", { box: { heavyLimit: 1, combinedLimit: 3 }, mac: { heavyLimit: 1, combinedLimit: 2 } });
+  const claims = await serveFleet(store, { box: "box-token", mac: "mac-token" }, "admin-token", 0);
+  const claimsAddress = claims.address(); assert.ok(claimsAddress && typeof claimsAddress !== "string");
+  const manager = new MachineManager({ machine: "box", heavyLimit: 1, combinedLimit: 3, projects: ["org/core"] }, new FleetClient(`http://127.0.0.1:${claimsAddress.port}`, "box-token"));
+  const server = await serveManager(manager, { "org/core": "project-token" }, "operator-token", 0);
+  const address = server.address(); assert.ok(address && typeof address !== "string");
+  const managed = new ManagedDispatch("org/core", { GITHUB_OWNER: "org", GITHUB_REPO: "core", PYRY_MANAGER_URL: `http://127.0.0.1:${address.port}`, PYRY_MANAGER_TOKEN: "project-token" });
+  const directory = mkdtempSync(join(tmpdir(), "managed-hold-"));
+  t.after(async () => {
+    await managed.stop(); await new Promise<void>(r => server.close(() => r())); await new Promise<void>(r => claims.close(() => r()));
+    store.close(); rmSync(directory, { recursive: true, force: true });
+  });
+  await managed.start();
+  const helper = fileURLToPath(new URL("../scripts/fleet-task.py", import.meta.url));
+  const requestFile = join(directory, "request.json");
+  writeFileSync(requestFile, JSON.stringify({ recipe: "platform-probe", capability: "macos-arm64", reason: "Native acceptance on the Mac" }));
+  // Asynchronous: the run's socket is served by this same process.
+  const requestTask = () => new Promise<any>((resolve, reject) => execFile("python3", [helper, "request", requestFile],
+    { env: { PATH: process.env.PATH, PYRY_TASK_SOCKET: managedTaskEnv().PYRY_TASK_SOCKET } },
+    (error, stdout) => error ? reject(error) : resolve(JSON.parse(stdout))));
+  const builder = { name: "builder", column: "In Development", claudeMdPath: "builder/CLAUDE.md", usesWorktree: true, producesCommits: true, opensPr: true };
+  const handOver = async (issue: number, client: MockGitHubClient) => {
+    const { ctx } = makeTestContext({ agent: builder, item: { issueNumber: issue }, client, mockOptions: { execImpls: {
+      "git status --porcelain": () => "", "git rev-list --count main..": () => "2\n", "gh pr list --head": () => JSON.stringify([{ number: 2000 }]),
+    } } });
+    return handlePostRun(STREAM_OK(), ctx, false);
+  };
+  const admit = async (issue: number) => {
+    managed.beginCycle(); const pending = managed.offer(issue, "builder", "medium");
+    await managed.endCycle();
+    // The dispatcher's own 2 s sync can be in flight and make ours a no-op.
+    for (let i = 0; i < 40 && !managed.ready(pending); i++) { await manager.tick(); await managed.sync(); if (!managed.ready(pending)) await new Promise(r => setTimeout(r, 50)); }
+    assert.equal(managed.ready(pending), true); return pending;
+  };
+
+  const held = new MockGitHubClient({ status: { 80: "In Development" }, labels: { 80: [] } });
+  let taskId = "";
+  await managed.run(await admit(80), async () => {
+    taskId = (await requestTask()).id;
+    assert.deepEqual(await handOver(80, held), { ok: true });
+  });
+  assert.ok(held.addLabelCalls.some(c => c.label === NATIVE_TASK_HOLD_LABEL), "held through the default check");
+  assert.ok(!held.addLabelCalls.some(c => c.label === "done:builder"));
+  assert.match(held.comments.at(-1)!.body, new RegExp(taskId));
+
+  // A request whose task has already finished hands over as before.
+  store.tasks.report("mac", { capabilities: ["macos-arm64"], ready: true });
+  const settled = new MockGitHubClient({ status: { 81: "In Development" }, labels: { 81: [] } });
+  await managed.run(await admit(81), async () => {
+    const id = (await requestTask()).id;
+    assert.equal(store.taskStart("mac", id, "native").ok, true);
+    store.taskComplete("mac", id, "native", { outcome: "completed", summary: "Route available", files: {} });
+    await handOver(81, settled);
+  });
+  assert.ok(settled.addLabelCalls.some(c => c.label === "done:builder"));
+  assert.ok(!settled.addLabelCalls.some(c => c.label === NATIVE_TASK_HOLD_LABEL));
 });

@@ -29,6 +29,18 @@ export function ownershipRefusal(error: unknown): OwnershipRefusalBody | undefin
     ? { error: body.error, refused: "ownership" } : undefined;
 }
 
+/**
+ * The service, or the machine manager in front of it, does not know this
+ * operation: it predates it. A manager relays a newer route to an older
+ * claim service as a 409 that carries the service's 404.
+ */
+export function unknownOperation(error: unknown): boolean {
+  if (!(error instanceof ServiceError)) return false;
+  if (error.status === 404) return true;
+  const text = typeof (error.body as any)?.error === "string" ? (error.body as any).error : "";
+  return error.status === 409 && /Unknown operation|Service 404/.test(text);
+}
+
 export async function readJson(req: IncomingMessage, maxBytes = 1024 * 1024): Promise<any> {
   let size = 0;
   const chunks: Buffer[] = [];
@@ -244,6 +256,17 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
         if (!machine) return send(403, { error: "Machine credential required" });
         return send(200, store.recoveryStep(machine, body.session, body.project, body.id, body.runId,
           req.url!.split("/")[2] as "begin" | "decide" | "complete", body.decision));
+      }
+      // Flaky-test sightings and tracker writes (flaky-sightings.ts). An older
+      // service answers "Unknown operation", and the dispatcher then keeps the
+      // sighting on its own disk and files nothing on a first sighting.
+      if (req.url === "/flaky/sightings") {
+        if (!machine) return send(403, { error: "Machine credential required" });
+        return send(200, store.flakySightings(machine, body.project, body.sightings));
+      }
+      if (req.url === "/flaky/track") {
+        if (!machine) return send(403, { error: "Machine credential required" });
+        return send(200, store.flakyTrack(machine, body.session, body.project, body));
       }
       if (req.url?.startsWith('/workflow/')) {
         const project=body.project;
