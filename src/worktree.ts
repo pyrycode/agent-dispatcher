@@ -7,6 +7,7 @@
 // in OPEN-QUESTIONS.
 
 import { resolve } from "node:path";
+import type { FleetRun, FleetSnapshot } from "./fleet-store.js";
 
 // --------- Auto-commit safety net ---------
 
@@ -21,7 +22,41 @@ import { resolve } from "node:path";
  * trailing newlines or shell padding.
  */
 export function shouldAutoCommit(gitStatusOutput: string): boolean {
-  return gitStatusOutput.trim().length > 0;
+  return statusEntries(gitStatusOutput).some(({ status, path, from }) =>
+    status[0] === "D" || !isRuntimeFile(path) || (from !== undefined && !isRuntimeFile(from)));
+}
+
+/** One policy for every dispatcher automatic staging/commit path. */
+export const RUNTIME_FILE_GLOBS = ["**/.codegraph", "**/.codegraph/**", "**/*-wal", "**/*-shm", "**/*-journal", "**/*.pid"] as const;
+export const AUTO_STAGE_COMMAND = "git add -A -- . " + RUNTIME_FILE_GLOBS
+  .map(pattern => `':(glob,exclude)${pattern}'`).join(" ");
+
+export function isRuntimeFile(path: string): boolean {
+  return /(^|\/)\.codegraph(\/|$)/.test(path) || /(?:-wal|-shm|-journal|\.pid)$/.test(path);
+}
+
+/** Supports ordinary porcelain and NUL porcelain (including rename sources).
+ * Automatic staging uses -z so Git quoting cannot disguise a runtime path. */
+export function statusEntries(output: string): Array<{ status: string; path: string; from?: string }> {
+  const nul = output.includes("\0");
+  const fields = output.split(nul ? "\0" : "\n");
+  const entries: Array<{ status: string; path: string; from?: string }> = [];
+  for (let i = 0; i < fields.length; i++) {
+    const field = fields[i]!;
+    if (field.trim().length === 0) continue;
+    const status = field.slice(0, 2);
+    let path = field.slice(3);
+    let from: string | undefined;
+    if (nul && /[RC]/.test(status)) from = fields[++i];
+    if (!nul) {
+      if (/[RC]/.test(status) && path.includes(" -> ")) [from, path] = path.split(" -> ") as [string, string];
+      // core.quotePath normally only quotes unusual names; these are
+      // conservatively substantive when they cannot be decoded here.
+      try { if (path.startsWith('"')) path = JSON.parse(path); } catch {}
+    }
+    entries.push({ status, path, ...(from !== undefined ? { from } : {}) });
+  }
+  return entries;
 }
 
 // --------- Codegraph worktree integration ---------
@@ -287,13 +322,41 @@ export function isWorktreeLocked(porcelainOutput: string, path: string): boolean
   return false;
 }
 
-/** The git state files that mean a merge, rebase, cherry-pick or revert is
- *  unfinished. Read with `git rev-parse --git-path <name>` in the worktree. */
-export const IN_PROGRESS_GIT_PATHS = ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"] as const;
+/** Git operations and locks that forbid continuation. Resolve each with
+ *  `git rev-parse --git-path <name>` in the worktree. */
+export const IN_PROGRESS_GIT_PATHS = ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply", "sequencer", "BISECT_START", "index.lock", "HEAD.lock", "packed-refs.lock"] as const;
 
 export type OwnWorktreeReuse =
   | { reuse: true; commitLeftovers: boolean }
   | { reuse: false; reason: string };
+
+/** Persisted outside the worker's tree, before its run starts. */
+export interface ManagedWorktreeRecord {
+  repository: string;
+  commonGitDir: string;
+  path: string;
+  branch: string;
+  run: FleetRun;
+}
+
+/** Require the authority's exact normal-completion record and an active
+ * successor reservation in the SAME ownership generation. ManagedDispatch
+ * waits for tracked children before that release. Absence
+ * alone, a PID probe, a FAIL verdict or a new ownership generation proves
+ * nothing: operator release changes the generation, and is refused here. */
+export function managedPredecessorFinished(prior: FleetRun, current: FleetRun, state: FleetSnapshot, finishedPrior: FleetRun | null): boolean {
+  if (!finishedPrior || (["id", "session", "generation", "machine", "project", "ticket", "role", "created"] as const)
+    .some(key => prior[key] !== finishedPrior[key])) return false;
+  if (![prior.id, prior.session, prior.generation].every(value => typeof value === "string" && value.length > 0)) return false;
+  if (prior.id === current.id || prior.machine !== current.machine || prior.project !== current.project ||
+      prior.ticket !== current.ticket || prior.generation !== current.generation || !Number.isFinite(prior.created) ||
+      !Number.isFinite(current.created) || prior.created > current.created) return false;
+  const runs = state.runs.filter(run => run.ticket === current.ticket);
+  return runs.length === 1 && runs[0]!.id === current.id && runs[0]!.session === current.session &&
+    runs[0]!.generation === current.generation && runs[0]!.machine === current.machine && runs[0]!.project === current.project &&
+    runs[0]!.role === current.role && runs[0]!.created === current.created && state.claims.some(claim => claim.ticket === current.ticket &&
+      claim.machine === current.machine && claim.generation === current.generation);
+}
 
 /**
  * Decide whether the next run on a ticket may continue in the worktree its
@@ -308,14 +371,15 @@ export type OwnWorktreeReuse =
  * the same agent and ticket, on the same branch.
  *
  * Reuse only when all hold:
- * - after the normal cleanup, the one worktree still holding the branch is
- *   this agent's own path. Another role's worktree or a person's checkout
- *   keeps today's refusal.
+ * - the one worktree still holding the branch is this agent's own path,
+ *   or its recorded managed predecessor has been authoritatively confirmed
+ *   finished (including its tracked children) in this ownership generation.
  * - it is not locked, its status could be read, and no merge, rebase,
  *   cherry-pick or revert is unfinished in it.
- * - there is something to continue from: uncommitted changes, or local
+ * - there is something to continue from: retained local files, or local
  *   commits origin lacks (`abort-local-strictly-ahead`). A diverged branch
- *   or one origin moved ahead of keeps today's handling.
+ *   or one origin moved ahead of keeps today's handling. A confirmed managed
+ *   predecessor may also hand off a clean tree without removing it.
  *
  * `gitStatusOutput` is `git status --porcelain` in the worktree, or null
  * when it could not be read. Pure; the caller does the I/O.
@@ -328,8 +392,12 @@ export function decideOwnWorktreeReuse(opts: {
   locked: boolean;
   operationInProgress: boolean;
   gitStatusOutput: string | null;
+  /** Set only after checking the recorded managed worker against fresh
+   * authority, repository identity, path and branch. Never inferred from a
+   * role-shaped directory or an apparently dead PID. */
+  managedHandoff?: boolean;
 }): OwnWorktreeReuse {
-  if (opts.held.length !== 1 || opts.held[0]!.path !== opts.ownPath) {
+  if (opts.held.length !== 1 || (!opts.managedHandoff && opts.held[0]!.path !== opts.ownPath)) {
     return { reuse: false, reason: "the branch is not held by this agent's own worktree alone" };
   }
   if (opts.locked) return { reuse: false, reason: "the worktree is locked" };
@@ -338,7 +406,8 @@ export function decideOwnWorktreeReuse(opts: {
   const dirty = shouldAutoCommit(opts.gitStatusOutput);
   if (opts.branchAction === "abort-local-strictly-ahead") return { reuse: true, commitLeftovers: dirty };
   if (opts.branchAction === "reuse-local-no-remote" || opts.branchAction === "reuse-local-already-synced") {
-    return dirty ? { reuse: true, commitLeftovers: true } : { reuse: false, reason: "nothing to continue from" };
+    return dirty || opts.managedHandoff || opts.gitStatusOutput.trim().length > 0
+      ? { reuse: true, commitLeftovers: dirty } : { reuse: false, reason: "nothing to continue from" };
   }
   return { reuse: false, reason: `branch setup action ${opts.branchAction}` };
 }

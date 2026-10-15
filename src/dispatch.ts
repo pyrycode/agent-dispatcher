@@ -1,7 +1,9 @@
 import { coordinationReceipts } from "./recovery-receipts.js";
 import { writeRuntimeReceipt } from "./runtime-receipt.js";
 import { type ChildProcess, execSync, spawn, spawnSync } from "node:child_process";
-import { readFileSync, existsSync, writeFileSync, mkdirSync, mkdtempSync, rmdirSync, appendFileSync, readdirSync, createWriteStream, statSync, symlinkSync, unlinkSync, openSync, closeSync } from "node:fs";
+import { createHash } from "node:crypto";
+import type { FleetRun, FleetSnapshot } from "./fleet-store.js";
+import { readFileSync, realpathSync, existsSync, writeFileSync, mkdirSync, mkdtempSync, rmdirSync, appendFileSync, readdirSync, createWriteStream, statSync, symlinkSync, unlinkSync, openSync, closeSync } from "node:fs";
 import { homedir, hostname, tmpdir } from "node:os";
 import { resolve, dirname, basename } from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -192,6 +194,11 @@ import {
 } from "./pipeline-decisions.js";
 import {
   type BranchSetupAction,
+  AUTO_STAGE_COMMAND,
+  isRuntimeFile,
+  statusEntries,
+  managedPredecessorFinished,
+  type ManagedWorktreeRecord,
   decideBranchSetup,
   decideCodegraphIndexCopy,
   decideOwnWorktreeReuse,
@@ -1837,11 +1844,12 @@ async function attemptSaferSalvage(opts: {
   deps: DispatchDeps;
 }): Promise<boolean> {
   const { execSync, spawnSync, notifyDiscord } = opts.deps;
+  const gates = opts.deps.salvageGates ?? salvageGates;
   try {
-    const dirty = execSync(`git status --porcelain`, {
+    const dirty = execSync(`git status --porcelain -z --untracked-files=all`, {
       cwd: opts.agentCwd, encoding: "utf-8", timeout: 15_000,
     }).toString();
-    const hasUncommittedChanges = dirty.trim().length > 0;
+    const hasUncommittedChanges = shouldAutoCommit(dirty);
     let hasCommittedChanges = false;
     if (!hasUncommittedChanges) {
       // A clean worktree can still hold the entire implementation, as
@@ -1860,7 +1868,7 @@ async function attemptSaferSalvage(opts: {
     // generous enough for typed-language compilation but not so long
     // that a hung gate blocks the salvage path indefinitely.
     const gateExitCodes: number[] = [];
-    for (const gate of salvageGates) {
+    for (const gate of gates) {
       let exitCode = 0;
       try {
         execSync(gate, { cwd: opts.agentCwd, stdio: "pipe", timeout: 120_000 });
@@ -1874,20 +1882,20 @@ async function attemptSaferSalvage(opts: {
       terminalReason: opts.streamResult.terminalReason || "",
       timedOut: opts.streamResult.timedOut === true,
       prAlreadyExists: false,
-      gitStatusOutput: dirty,
+      gitStatusOutput: hasUncommittedChanges ? dirty : "",
       hasCommittedChanges,
       gateExitCodes,
     })) {
-      const gateSummary = salvageGates.length === 0
+      const gateSummary = gates.length === 0
         ? "gates: none"
-        : `gates: ${salvageGates.map((g, i) => `"${g}"=${gateExitCodes[i]}`).join(" ")}`;
+        : `gates: ${gates.map((g, i) => `"${g}"=${gateExitCodes[i]}`).join(" ")}`;
       opts.deps.writeLog(opts.logFile, "SAFER_SALVAGE_SKIPPED",
         `${gateSummary} dirty=${hasUncommittedChanges} committedChanges=${hasCommittedChanges}`);
       return false;
     }
 
     if (hasUncommittedChanges) {
-      execSync(`git add -A`, { cwd: opts.agentCwd, stdio: "pipe", timeout: 15_000 });
+      stageAutomaticChanges(opts.agentCwd, opts.deps);
       // spawnSync with argv (no shell) so commit messages and branch
       // names containing shell metacharacters can't break the call.
       // The same pattern is used for `gh pr create` below where the
@@ -1938,7 +1946,7 @@ async function attemptSaferSalvage(opts: {
       ``,
       `The **${opts.agent.name}** agent ${budget.detail} (${opts.streamResult.numTurns} turns, ${formatRunCost(opts.streamResult)}) on #${opts.item.issueNumber} while work was in progress. The dispatcher ${preservation} and opened this **draft** PR for human triage.`,
       ``,
-      `**Build status at salvage:** clean (${salvageGates.length === 0 ? "no gates configured" : salvageGates.map((g) => `\`${g}\``).join(" + ") + " all passed"}). Tests were not run as a salvage gate — failing tests are often the signal the agent was chasing.`,
+      `**Build status at salvage:** clean (${gates.length === 0 ? "no gates configured" : gates.map((g) => `\`${g}\``).join(" + ") + " all passed"}). Tests were not run as a salvage gate — failing tests are often the signal the agent was chasing.`,
       ``,
       `**Last messages from the agent (may include unresolved findings):**`,
       ``,
@@ -2049,9 +2057,10 @@ async function attemptPermissionDenialSalvage(opts: {
   deps: DispatchDeps;
 }): Promise<boolean> {
   const { execSync, spawnSync, notifyDiscord } = opts.deps;
+  const gates = opts.deps.salvageGates ?? salvageGates;
   const label = `error:${opts.agent.name}:permission_denied`;
   try {
-    const dirty = execSync(`git status --porcelain`, {
+    const dirty = execSync(`git status --porcelain -z --untracked-files=all`, {
       cwd: opts.agentCwd, encoding: "utf-8", timeout: 15_000,
     }).toString();
 
@@ -2059,7 +2068,7 @@ async function attemptPermissionDenialSalvage(opts: {
     // Permission denial without clean code → don't ship a broken draft;
     // post the label + comment and exit so the operator is alerted.
     const gateExitCodes: number[] = [];
-    for (const gate of salvageGates) {
+    for (const gate of gates) {
       let exitCode = 0;
       try {
         execSync(gate, { cwd: opts.agentCwd, stdio: "pipe", timeout: 120_000 });
@@ -2069,7 +2078,7 @@ async function attemptPermissionDenialSalvage(opts: {
       gateExitCodes.push(exitCode);
     }
     const gatesPass = gateExitCodes.every((c) => c === 0);
-    const hasDirty = dirty.trim().length > 0;
+    const hasDirty = shouldAutoCommit(dirty);
 
     // Apply label even when there's nothing to commit — the operator
     // still needs the signal that a permission denial happened. Order:
@@ -2090,9 +2099,9 @@ async function attemptPermissionDenialSalvage(opts: {
     if (!hasDirty || !gatesPass) {
       // No code to ship as a draft PR. Still post the diagnostic comment
       // — the label is set; the operator unblocks redispatch after review.
-      const gateSummary = salvageGates.length === 0
+      const gateSummary = gates.length === 0
         ? "no gates configured"
-        : salvageGates.map((g, i) => `\`${g}\`=${gateExitCodes[i]}`).join(" + ");
+        : gates.map((g, i) => `\`${g}\`=${gateExitCodes[i]}`).join(" + ");
       try {
         await opts.client.addComment(
           opts.item.issueNumber,
@@ -2125,7 +2134,7 @@ async function attemptPermissionDenialSalvage(opts: {
     }
 
     // Clean WIP exists and gates pass → commit + push + draft PR.
-    execSync(`git add -A`, { cwd: opts.agentCwd, stdio: "pipe", timeout: 15_000 });
+    stageAutomaticChanges(opts.agentCwd, opts.deps);
     const commitResult = spawnSync(
       "git",
       [
@@ -2161,7 +2170,7 @@ async function attemptPermissionDenialSalvage(opts: {
       intent,
       "```",
       ``,
-      `**Build status at salvage:** clean (${salvageGates.length === 0 ? "no gates configured" : salvageGates.map((g) => `\`${g}\``).join(" + ") + " all passed"}).`,
+      `**Build status at salvage:** clean (${gates.length === 0 ? "no gates configured" : gates.map((g) => `\`${g}\``).join(" + ") + " all passed"}).`,
       ``,
       `**To investigate:**`,
       `- Branch: \`${opts.branchName}\``,
@@ -2307,6 +2316,8 @@ export interface DispatchClient {
 // `attemptSaferSalvage` accepts deps as part of its opts (called from
 // `handleAgentResultErrors`).
 export type DispatchDeps = {
+  /** Test fixtures can pin gates independently of the launching consumer. */
+  salvageGates?: readonly string[];
   // child_process
   execSync: typeof execSync;
   spawnSync: typeof spawnSync;
@@ -2318,6 +2329,9 @@ export type DispatchDeps = {
   /** Copy the canonical `.codegraph/` into a worktree. See `copyCodegraphIndex`. */
   copyCodegraphIndex: typeof copyCodegraphIndex;
   isSymlinkPath: typeof isSymlinkPath;
+  realpathSync?: typeof realpathSync;
+  /** Only supplied inside an admitted ManagedDispatch.run. */
+  managedWorktree?: { run: FleetRun; snapshot: () => Promise<FleetSnapshot>; predecessor: (id: string) => Promise<FleetRun | null> };
   // dispatch-internal
   runClaudeStreaming: typeof runClaudeStreaming;
   notifyDiscord: (msg: string) => Promise<void>;
@@ -2346,6 +2360,33 @@ export type DispatchDeps = {
    *  many hand-built deps keep compiling; a real timer when absent. */
   sleepMs?: (ms: number) => Promise<void>;
 };
+
+/** Stage source edits without introducing or refreshing runtime files. A
+ * runtime deletion already in the index is intentional cleanup: leave it.
+ * Unstaging other runtime entries changes only the index, never local files. */
+export function stageAutomaticChanges(cwd: string, deps: Pick<DispatchDeps, "execSync" | "spawnSync">): void {
+  unstageRuntimeChanges(cwd, deps);
+  deps.execSync(AUTO_STAGE_COMMAND, { cwd, stdio: "pipe", timeout: 15_000 });
+}
+
+function unstageRuntimeChanges(cwd: string, deps: Pick<DispatchDeps, "execSync" | "spawnSync">): void {
+  const status = String(deps.execSync("git status --porcelain -z --untracked-files=all", {
+    cwd, encoding: "utf-8", stdio: "pipe", timeout: 15_000,
+  }));
+  const unstage = new Set<string>();
+  for (const entry of statusEntries(status)) {
+    // A blank index column can still carry an intent-to-add entry. Restore
+    // it too; otherwise the later merge refuses an unstaged runtime addition.
+    if (isRuntimeFile(entry.path) && !["?", "D"].includes(entry.status[0]!)) {
+      unstage.add(entry.path);
+      if (entry.from !== undefined) unstage.add(entry.from);
+    }
+  }
+  if (unstage.size) {
+    const result = deps.spawnSync("git", ["restore", "--staged", "--", ...[...unstage].map(path => `:(literal)${path}`)], { cwd, stdio: "pipe", timeout: 15_000 });
+    if (result.status !== 0) throw new Error(`Could not unstage runtime files: ${result.stderr?.toString() || "git restore failed"}`);
+  }
+}
 
 // Default curation runner: spawn the memory-curation shell runner in inline
 // mode (--now implies --live) for this fork and await its exit. It runs the
@@ -3323,7 +3364,8 @@ export async function handleDispatchError(
 export async function setupBranchAndWorktree(
   ctx: DispatchContext,
 ): Promise<{ ok: true } | { ok: false }> {
-  const { agent, item, client, branchName, worktreeDir, useWorktree } = ctx;
+  const { agent, item, client, branchName, useWorktree } = ctx;
+  let { worktreeDir } = ctx;
   const { execSync, mkdirSync, existsSync, copyCodegraphIndex, isSymlinkPath } = ctx.deps;
 
   // PO and issue-0 (manual dispatch) run on the default branch — just pull latest
@@ -3429,8 +3471,36 @@ export async function setupBranchAndWorktree(
   // as usual, and the reuse decision below picks it up (#119).
   const aborting = branchAction === "abort-local-strictly-ahead" || branchAction === "abort-local-diverged";
   const keepOwn = branchAction === "abort-local-strictly-ahead" && ownWorktreeHoldsBranch(ctx);
-  const heldWorktrees = aborting && !keepOwn ? [] : removeBlockingWorktrees(ctx, { keepOwn });
-  const ownReuse = decideOwnReuse(ctx, heldWorktrees, branchAction);
+  let heldWorktrees: HeldWorktree[];
+  let ownReuse: OwnWorktreeReuse;
+  if (ctx.deps.managedWorktree) {
+    // Managed trees are never removed merely because their path looks like
+    // a role's directory. Check custody before touching any retained tree.
+    try {
+      const porcelain = String(execSync("git worktree list --porcelain", { cwd: repoRoot, encoding: "utf-8", stdio: "pipe", timeout: 15_000 }));
+      const paths = findWorktreesForBranch(porcelain, branchName);
+      heldWorktrees = paths.map(path => ({ path, error: "preserved pending managed worker confirmation" }));
+      if (paths.length > 0) {
+        if (paths.length !== 1) throw new Error("Multiple worktrees hold the ticket branch");
+        const path = paths[0]!;
+        await confirmManagedWorktree(ctx, path);
+        ownReuse = decideOwnReuse(ctx, heldWorktrees, branchAction, true);
+        if (!ownReuse.reuse) throw new Error(ownReuse.reason);
+        ctx.worktreeDir = ctx.agentCwd = worktreeDir = path;
+      } else {
+        if (existsSync(worktreeDir)) throw new Error("The requested managed path already exists without the ticket branch");
+        heldWorktrees = [];
+        ownReuse = { reuse: false, reason: "no retained worktree" };
+      }
+    } catch (e) {
+      await client.addComment(item.issueNumber, `## ⚠️ Dispatch Error: ${agent.name}\n\nManaged worktree handoff refused: ${e}. All retained work and evidence were left in place.`);
+      try { await client.addLabel(item.issueNumber, `error:${agent.name}`); } catch {}
+      return { ok: false };
+    }
+  } else {
+    heldWorktrees = aborting && !keepOwn ? [] : removeBlockingWorktrees(ctx, { keepOwn });
+    ownReuse = decideOwnReuse(ctx, heldWorktrees, branchAction);
+  }
 
   try {
     switch (branchAction) {
@@ -3553,7 +3623,12 @@ export async function setupBranchAndWorktree(
     // `decideCodegraphIndexCopy` in worktree.ts for the decision rules.
     const codegraphSrc = resolve(repoRoot, ".codegraph");
     const codegraphDst = resolve(worktreeDir, ".codegraph");
-    const cgDecision = decideCodegraphIndexCopy({
+    // A retained managed tree is evidence, including incomplete index-copy
+    // files. Only fresh trees get bootstrapped; unsafe shared symlinks were
+    // refused by confirmManagedWorktree before continuation.
+    const cgDecision = ownReuse.reuse && ctx.deps.managedWorktree
+      ? { action: "skip", reason: "already-present" } as const
+      : decideCodegraphIndexCopy({
       sourceExists: existsSync(resolve(codegraphSrc, "codegraph.db")),
       destExists: existsSync(resolve(codegraphDst, "codegraph.db")),
       destIsSymlink: isSymlinkPath(codegraphDst),
@@ -3585,6 +3660,14 @@ export async function setupBranchAndWorktree(
   // HEAD is read before the merge so a committed merge can be pushed right
   // away (see pushPreRunMerge).
   const headBefore = readWorktreeHead(execSync, worktreeDir);
+  if (ctx.deps.managedWorktree) {
+    try { recordManagedWorktree(ctx); }
+    catch (e) {
+      await client.addComment(item.issueNumber, `## ⚠️ Dispatch Error: ${agent.name}\n\nCould not record managed worktree custody: ${e}. The worktree is retained at \`${worktreeDir}\`.`);
+      try { await client.addLabel(item.issueNumber, `error:${agent.name}`); } catch {}
+      return { ok: false };
+    }
+  }
   try {
     execSync(`git -c merge.conflictStyle=diff3 merge ${defaultBranch} --no-edit`, { cwd: worktreeDir, stdio: "pipe" });
     console.log(`   🔀 Merged ${defaultBranch} into ${branchName} (in worktree)`);
@@ -3736,10 +3819,54 @@ function ownWorktreeHoldsBranch(ctx: DispatchContext): boolean {
   return findWorktreesForBranch(readWorktreeList(ctx), ctx.branchName).includes(ctx.worktreeDir);
 }
 
+export function managedWorktreeRecordPath(path: string): string {
+  return resolve(LOGS_DIR, `managed-worktree-${createHash("sha256").update(path).digest("hex")}.json`);
+}
+
+function worktreeIdentity(ctx: DispatchContext, path: string): { repository: string; commonGitDir: string } {
+  const canonical = ctx.deps.realpathSync ?? realpathSync;
+  if (path !== resolve(path) || String(canonical(path)) !== path) throw new Error("Ambiguous or aliased managed worktree path");
+  const git = (args: string, cwd: string) => String(ctx.deps.execSync(`git ${args}`, { cwd, encoding: "utf-8", stdio: "pipe", timeout: 15_000 })).trim();
+  if (git("rev-parse --show-toplevel", path) !== path) throw new Error("Managed path is not the worktree root");
+  const repository = String(canonical(repoRoot));
+  const commonGitDir = String(canonical(git("rev-parse --path-format=absolute --git-common-dir", repository)));
+  if (String(canonical(git("rev-parse --path-format=absolute --git-common-dir", path))) !== commonGitDir) throw new Error("Retained worktree belongs to a different repository");
+  if (git("symbolic-ref --quiet HEAD", path) !== `refs/heads/${ctx.branchName}` ||
+      git("rev-parse HEAD", path) !== git(`rev-parse refs/heads/${ctx.branchName}`, repository)) throw new Error("Retained worktree does not hold the recorded ticket branch");
+  return { repository, commonGitDir };
+}
+
+async function confirmManagedWorktree(ctx: DispatchContext, path: string): Promise<void> {
+  const managed = ctx.deps.managedWorktree!;
+  if (managed.run.ticket !== `${managed.run.project}#${ctx.item.issueNumber}` || managed.run.role !== ctx.agent.name) throw new Error("Current managed grant does not match this ticket and role");
+  const record = JSON.parse(String(ctx.deps.readFileSync(managedWorktreeRecordPath(path), "utf-8"))) as ManagedWorktreeRecord;
+  const roles = activeStageSet().agents.map(agent => agent.name);
+  if (!record?.run || record.path !== path || record.branch !== ctx.branchName ||
+      !roles.includes(record.run.role) || !roles.some(role => path === worktreePath(repoRoot, `${role}-${ctx.item.issueNumber}`))) throw new Error("No matching recorded managed path and worker for this ticket");
+  if (ctx.deps.isSymlinkPath(resolve(path, ".codegraph"))) throw new Error("Retained worktree has a shared CodeGraph symlink; preserve it for triage");
+  const identity = worktreeIdentity(ctx, path);
+  if (record.repository !== identity.repository || record.commonGitDir !== identity.commonGitDir) throw new Error("Recorded repository identity changed");
+  const state = await managed.snapshot();
+  const finishedPrior = await managed.predecessor(record.run.id);
+  if (!managedPredecessorFinished(record.run, managed.run, state, finishedPrior)) throw new Error("Authority has not confirmed the prior worker and tracked children finished in this ownership generation");
+}
+
+function recordManagedWorktree(ctx: DispatchContext): void {
+  const record: ManagedWorktreeRecord = {
+    ...worktreeIdentity(ctx, ctx.worktreeDir), path: ctx.worktreeDir, branch: ctx.branchName, run: ctx.deps.managedWorktree!.run,
+  };
+  const file = managedWorktreeRecordPath(ctx.worktreeDir);
+  // Retain each run's custody record as evidence when the current pointer
+  // advances to the successor. Both files stay outside the worker's tree.
+  const runKey = createHash("sha256").update(record.run.id).digest("hex");
+  ctx.deps.writeFileSync(`${file}.${runKey}`, JSON.stringify(record), { mode: 0o600 });
+  ctx.deps.writeFileSync(file, JSON.stringify(record), { mode: 0o600 });
+}
+
 // Gather what decideOwnWorktreeReuse needs about the worktrees still holding
 // the branch after the cleanup. Only reads; a failed read refuses the reuse.
-function decideOwnReuse(ctx: DispatchContext, held: HeldWorktree[], branchAction: BranchSetupAction): OwnWorktreeReuse {
-  const { worktreeDir } = ctx;
+function decideOwnReuse(ctx: DispatchContext, held: HeldWorktree[], branchAction: BranchSetupAction, managedHandoff = false): OwnWorktreeReuse {
+  const worktreeDir = managedHandoff ? held[0]!.path : ctx.worktreeDir;
   const { execSync, existsSync } = ctx.deps;
   if (held.length !== 1 || held[0]!.path !== worktreeDir) {
     return decideOwnWorktreeReuse({ ownPath: worktreeDir, held, branchAction, locked: false, operationInProgress: false, gitStatusOutput: null });
@@ -3747,22 +3874,31 @@ function decideOwnReuse(ctx: DispatchContext, held: HeldWorktree[], branchAction
   let gitStatusOutput: string | null = null;
   let operationInProgress = true;
   try {
-    gitStatusOutput = String(execSync(`git status --porcelain`, { cwd: worktreeDir, encoding: "utf-8", stdio: "pipe", timeout: 15_000 }));
+    gitStatusOutput = String(execSync(`git status --porcelain -z --untracked-files=all`, { cwd: worktreeDir, encoding: "utf-8", stdio: "pipe", timeout: 15_000 }));
     const paths = String(execSync(
       `git rev-parse ${IN_PROGRESS_GIT_PATHS.map(p => `--git-path ${p}`).join(" ")}`,
       { cwd: worktreeDir, encoding: "utf-8", stdio: "pipe", timeout: 15_000 },
     )).split("\n").map(l => l.trim()).filter(Boolean);
-    operationInProgress = paths.some(p => existsSync(resolve(worktreeDir, p)));
+    operationInProgress = (managedHandoff && paths.length !== IN_PROGRESS_GIT_PATHS.length) || paths.some(p => existsSync(resolve(worktreeDir, p))) ||
+      statusEntries(gitStatusOutput).some(({ status }) => /U/.test(status) || status === "AA" || status === "DD");
+    if (managedHandoff) {
+      const refLock = String(execSync(`git rev-parse --git-path refs/heads/${ctx.branchName}.lock`, { cwd: worktreeDir, encoding: "utf-8", stdio: "pipe", timeout: 15_000 })).trim();
+      operationInProgress ||= !refLock || existsSync(resolve(worktreeDir, refLock));
+    }
   } catch (e) {
+    operationInProgress = true;
     console.warn(`   ⚠️  Could not inspect the held worktree ${worktreeDir}: ${e}`);
   }
+  const listing = readWorktreeList(ctx);
+  const holders = findWorktreesForBranch(listing, ctx.branchName);
   const decision = decideOwnWorktreeReuse({
     ownPath: worktreeDir,
     held,
     branchAction,
-    locked: isWorktreeLocked(readWorktreeList(ctx), worktreeDir),
+    locked: (managedHandoff && (holders.length !== 1 || holders[0] !== worktreeDir)) || isWorktreeLocked(listing, worktreeDir),
     operationInProgress,
     gitStatusOutput,
+    managedHandoff,
   });
   if (!decision.reuse) console.log(`   ⏸️  Not reusing ${worktreeDir}: ${decision.reason}`);
   return decision;
@@ -3779,9 +3915,9 @@ async function reuseOwnWorktree(ctx: DispatchContext, commitLeftovers: boolean):
   const { agent, item, client, branchName, worktreeDir } = ctx;
   const { execSync, spawnSync } = ctx.deps;
   let sha = "";
-  if (commitLeftovers) {
-    try {
-      execSync(`git add -A`, { cwd: worktreeDir, stdio: "pipe", timeout: 15_000 });
+  try {
+    if (commitLeftovers) {
+      stageAutomaticChanges(worktreeDir, ctx.deps);
       const commit = spawnSync(
         "git",
         [
@@ -3794,32 +3930,36 @@ async function reuseOwnWorktree(ctx: DispatchContext, commitLeftovers: boolean):
       if (commit.status !== 0) {
         throw new Error(`git commit failed: ${commit.stderr?.toString() || commit.stdout?.toString() || "unknown"}`);
       }
-    } catch (e) {
-      console.error(`   ❌ Failed to commit the previous run's leftovers in ${worktreeDir}: ${e}`);
-      await client.addComment(
-        item.issueNumber,
-        `## ⚠️ Dispatch Error: ${agent.name}\n\n` +
-        `The previous ${agent.name} run left uncommitted changes in its worktree \`${worktreeDir}\`. ` +
-        `The dispatcher tried to commit them so this run could continue from them, and the commit failed. ` +
-        `Nothing was discarded. Commit or save the changes there, then retry.\n\n\`\`\`\n${e}\n\`\`\``,
-      );
-      try { await client.addLabel(item.issueNumber, `error:${agent.name}`); } catch {}
-      return false;
+    } else {
+      // A runtime-only index must not leak into the normal pre-run merge.
+      unstageRuntimeChanges(worktreeDir, ctx.deps);
     }
+  } catch (e) {
+    console.error(`   ❌ Failed to prepare the previous run's leftovers in ${worktreeDir}: ${e}`);
+    await client.addComment(
+      item.issueNumber,
+      `## ⚠️ Dispatch Error: ${agent.name}\n\n` +
+      `The dispatcher could not prepare the previous run's retained work in \`${worktreeDir}\` for continuation. ` +
+      `Nothing was discarded. Save the changes there and resolve the preparation error, then retry.\n\n\`\`\`\n${e}\n\`\`\``,
+    );
+    try { await client.addLabel(item.issueNumber, `error:${agent.name}`); } catch {}
+    return false;
+  }
+  if (commitLeftovers) {
     try {
       sha = String(execSync(`git rev-parse --short HEAD`, { cwd: worktreeDir, encoding: "utf-8", timeout: 15_000 })).trim();
     } catch { /* cosmetic */ }
   }
-  console.log(`   ♻️  Reusing ${agent.name}'s own worktree at ${worktreeDir}${commitLeftovers ? `; leftovers committed${sha ? ` as ${sha}` : ""}` : ""}`);
+  console.log(`   ♻️  Continuing ${agent.name} in the retained worktree at ${worktreeDir}${commitLeftovers ? `; leftovers committed${sha ? ` as ${sha}` : ""}` : ""}`);
   const what = commitLeftovers
     ? `left uncommitted changes in its worktree. The dispatcher committed them${sha ? ` as \`${sha}\`` : ""}`
-    : `left commits on \`${branchName}\` that origin does not have yet`;
+    : `left a preserved worktree on \`${branchName}\`, including its local runtime files and evidence`;
   try {
     await client.addComment(
       item.issueNumber,
       `## ♻️ Continuing from the previous run's work\n\n` +
-      `The previous ${agent.name} run on this ticket ${what}, and this run continues from them in the same worktree. ` +
-      `They reach origin with this run's pushes.`,
+      `The previous run on this ticket ${what}, and this ${agent.name} run continues from that work in the same worktree at \`${worktreeDir}\`. ` +
+      `Source commits reach origin with this run's pushes; runtime files stay local.`,
     );
   } catch (e) { console.warn(`   ⚠️  Failed to post the worktree-reuse comment: ${e}`); }
   return true;
@@ -4609,7 +4749,7 @@ export async function salvagePartialWork(
       : "ended in an error";
   try {
     const prNumbers = openPrNumbersFor(ctx) ?? [];
-    const gitStatusOutput = String(execSync(`git status --porcelain`, { cwd: agentCwd, encoding: "utf-8", timeout: 15_000 }));
+    const gitStatusOutput = String(execSync(`git status --porcelain -z --untracked-files=all`, { cwd: agentCwd, encoding: "utf-8", timeout: 15_000 }));
     // `-q --verify` prints MERGE_HEAD's sha when a merge is in progress
     // and exits 1 with no output when none is.
     let mergeInProgress = false;
@@ -4631,7 +4771,7 @@ export async function salvagePartialWork(
       : [];
 
     const decision = decidePartialWorkSalvage({
-      gitStatusOutput, commitsAheadOfOrigin, mergeInProgress, mergeCheckProblems,
+      gitStatusOutput: shouldAutoCommit(gitStatusOutput) ? gitStatusOutput : "", commitsAheadOfOrigin, mergeInProgress, mergeCheckProblems,
     });
     if (!decision.salvage) {
       ctx.deps.writeLog(logFile, "PARTIAL_SALVAGE_SKIPPED", `${stopKind}: ${decision.reason}`);
@@ -4639,9 +4779,9 @@ export async function salvagePartialWork(
       return { keepWorktree: false };
     }
 
-    const dirty = gitStatusOutput.trim().length > 0;
+    const dirty = shouldAutoCommit(gitStatusOutput);
     if (dirty) {
-      execSync(`git add -A`, { cwd: agentCwd, stdio: "pipe", timeout: 15_000 });
+      stageAutomaticChanges(agentCwd, ctx.deps);
       const runShape = stopKind === "timeout" ? "a timed-out run"
         : stopKind === "idle_stall" ? "a stalled run" : "a run that ended in an error";
       const commit = spawnSync(
@@ -5114,9 +5254,9 @@ export async function handlePostRun(
   // worktree so we don't have to know which agents write files.
   if (item.issueNumber > 0 && useWorktree) {
     try {
-      const dirty = execSync(`git status --porcelain`, { cwd: agentCwd, stdio: "pipe" }).toString();
+      const dirty = execSync(`git status --porcelain -z --untracked-files=all`, { cwd: agentCwd, stdio: "pipe" }).toString();
       if (shouldAutoCommit(dirty)) {
-        execSync(`git add -A`, { cwd: agentCwd, stdio: "pipe" });
+        stageAutomaticChanges(agentCwd, ctx.deps);
         // argv-based commit so agent.name (currently from a hardcoded
         // enum, but configurability is a routine refactor away) can't
         // ever break out of `-m`'s quoting. Same discipline used in
@@ -10372,6 +10512,7 @@ export async function pollLoop(): Promise<void> {
         if (drainMode) break;
         const offer = managed.agentOffer(c.agent, c.item, 0);
         if (!managed.ready(offer)) continue;
+        const admittedRun = offer.run!;
         pool.launch(`${c.agent.name}#${c.item.issueNumber}`, () => managed.run(offer, async () => {
           if (drainMode) return;
           const [labels, blockers, status] = await Promise.all([
@@ -10388,7 +10529,11 @@ export async function pollLoop(): Promise<void> {
           const claim = await claimForDispatch(c.agent, c.item, client);
           if (drainMode) { await releaseDispatchClaim(c.agent, c.item, client, claim); return; }
           await countFamilyDispatch(c.agent, c.item, rawClient, { tallies: familyTallies, rootLabelsByIssue });
-          await runConcurrentDispatches([c], client, DEFAULT_DEPS, managed.machine ?? hostname());
+          await runConcurrentDispatches([c], client, {
+            ...DEFAULT_DEPS,
+            managedWorktree: { run: admittedRun, snapshot: () => managed.connection.call<FleetSnapshot>("/state"),
+              predecessor: priorId => managed.connection.call<FleetRun | null>("/worktree/predecessor", { session: admittedRun.session, runId: admittedRun.id, priorId }) },
+          }, managed.machine ?? hostname());
         }, recoveryEnabled ? {
           observe: async () => {
             const [labels, blockers, status] = await Promise.all([

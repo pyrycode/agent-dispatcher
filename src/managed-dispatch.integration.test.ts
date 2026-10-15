@@ -101,7 +101,7 @@ test("a cancelled stale stage offer cannot outrank a higher-priority ticket", as
   assert.deepEqual(store.snapshot(), { claims: [], runs: [] });
 });
 
-test("real manager grants cover workflow writes and remain occupied until the child group exits", async t => {
+test("real manager grants cover workflow writes and handoff waits until the child group exits", async t => {
   const store = new FleetStore(":memory:", { mac: { heavyLimit: 1, combinedLimit: 1 }, linux: { heavyLimit: 1, combinedLimit: 1 } });
   const claimsServer = await serveFleet(store, { mac: "mac-test", linux: "linux-test" }, "admin-test", 0);
   const manager = new MachineManager({ machine: "mac", heavyLimit: 1, combinedLimit: 1, projects: ["org/core"] }, new FleetClient(url(claimsServer), "mac-test"));
@@ -110,11 +110,12 @@ test("real manager grants cover workflow writes and remain occupied until the ch
   t.after(async () => { await managed.stop(); await close(managerServer); await close(claimsServer); store.close(); });
   await managed.start();
   managed.beginCycle();
-  const pending = managed.offer(1, "builder", "heavy");
+  const pending = managed.offer(1, "verifier", "heavy");
   await managed.endCycle();
   await manager.tick();
   await managed.sync();
   assert.equal(managed.ready(pending), true);
+  const prior = pending.run!;
   let writes = 0;
   const items = [1, 2].map(n => ({ id: `item-${n}`, issueNumber: n }) as ProjectItem);
   const base = { getAllProjectItems: async () => items, addLabel: async (_n: number, _l: string) => { writes++; } };
@@ -137,9 +138,26 @@ test("real manager grants cover workflow writes and remain occupied until the ch
   assert.equal(writes, 1);
   assert.equal(finished, false);
   assert.equal(store.snapshot().runs.filter(r => r.machine === "mac").length, 1);
+  managed.beginCycle();
+  const successor = managed.offer(1, "builder", "medium");
+  await managed.endCycle(); await manager.tick(); await managed.sync();
+  assert.equal(managed.ready(successor), false, "a tracked grandchild still holds the predecessor reservation");
+  assert.equal(await managed.connection.call("/worktree/predecessor", {session: prior.session, runId: prior.id, priorId: prior.id}), null);
   await run;
   assert.equal(store.snapshot().runs.filter(r => r.machine === "mac").length, 0);
   assert.equal(store.snapshot().claims.find(c => c.ticket === "org/core#1")?.machine, "mac");
+  const claims = store.snapshot().claims;
+  await manager.tick(); await managed.sync();
+  assert.equal(managed.ready(successor), true);
+  await managed.run(successor, async () => {
+    assert.deepEqual(await managed.connection.call("/worktree/predecessor", {
+      session: successor.run!.session, runId: successor.run!.id, priorId: prior.id,
+    }), prior, "the authority confirms the exact finished verifier through the manager");
+    await assert.rejects(managed.connection.call("/worktree/predecessor", {
+      session: "unknown", runId: successor.run!.id, priorId: prior.id,
+    }), /403/);
+  });
+  assert.deepEqual(store.snapshot().claims, claims, "handoff never resets ownership");
 });
 
 test("a builder admission committed after its Backlog handback is cancelled before refinement starts", async t => {

@@ -3,6 +3,35 @@ import assert from "node:assert/strict";
 import { FleetStore } from "./fleet-store.js";
 import { serveFleet, FleetClient } from "./fleet-http.js";
 
+test('worktree predecessor proof requires an active owner and exact normal completion history', async t => {
+  const store = new FleetStore(':memory:', { mac: { heavyLimit: 1, combinedLimit: 1 }, linux: { heavyLimit: 1, combinedLimit: 1 } });
+  const server = await serveFleet(store, { mac: 'mac-test', linux: 'linux-test' }, 'operator-test', 0);
+  t.after(async () => { await new Promise<void>(r => server.close(() => r())); store.close(); });
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  const endpoint = `http://127.0.0.1:${address.port}`;
+  const mac = new FleetClient(endpoint, 'mac-test'), linux = new FleetClient(endpoint, 'linux-test');
+  const admin = new FleetClient(endpoint, 'operator-test');
+  const request = { machine: 'mac', session: 'verifier-session', project: 'org/desktop', ticket: 'org/desktop#1936', role: 'verifier', resource: 'medium' as const, locks: [] };
+  assert.equal((await mac.start({ ...request, id: 'prior' })).ok, true);
+  const prior = store.snapshot().runs[0];
+  assert.equal(await mac.call('/worktree/predecessor', { session: request.session, runId: 'prior', priorId: 'prior' }), null);
+  await mac.finish(request.session, 'prior', false);
+  await mac.start({ ...request, id: 'unused', session: 'unused-session' });
+  await mac.finish('unused-session', 'unused', false, true);
+  await mac.start({ ...request, id: 'current', session: 'builder-session', role: 'builder' });
+  const body = { session: 'builder-session', runId: 'current', priorId: 'prior' };
+  const before = store.snapshot();
+  assert.deepEqual(await mac.call('/worktree/predecessor', body), prior);
+  for (const priorId of ['never-admitted', 'unused', 'current']) assert.equal(await mac.call('/worktree/predecessor', { ...body, priorId }), null);
+  await assert.rejects(linux.call('/worktree/predecessor', body), /409/);
+  await assert.rejects(admin.call('/worktree/predecessor', body), /403/);
+  await assert.rejects(mac.call('/worktree/predecessor', { ...body, session: 'unknown' }), /409/);
+  assert.deepEqual(store.snapshot(), before, 'proof is read-only');
+  await admin.free(request.ticket, prior.generation, true);
+  await mac.start({ ...request, id: 'new-generation', session: 'fresh-session', role: 'builder' });
+  assert.equal(await mac.call('/worktree/predecessor', { session: 'fresh-session', runId: 'new-generation', priorId: 'prior' }), null);
+});
+
 test('only the central operator can change the fleet runner', async t => {
   const store = new FleetStore(':memory:', { mac: { heavyLimit: 1, combinedLimit: 1 } });
   const server = await serveFleet(store, { mac: 'machine-test' }, 'operator-test', 0);

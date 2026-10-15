@@ -194,6 +194,11 @@ export async function serveManager(manager: MachineManager, projectTokens: Recor
         return send(200, { ok: true, drainingProjects: manager.config.drainingProjects });
       }
       if (!project) return send(403, { error: "Project credential required" });
+      if (req.url === "/worktree/predecessor") {
+        const run = (await manager.claims.snapshot()).runs.find(run => run.id === body.runId);
+        if (!manager.claims.call || !run || run.project !== project || run.machine !== manager.config.machine || run.session !== body.session) return send(403, { error: "Run owner mismatch" });
+        return send(200, await manager.claims.call(req.url, body));
+      }
       if (["/codex/report", "/tasks/request", "/tasks/read", "/tasks/artifact", "/recovery/facts", "/recovery/evidence", "/recovery/pause", "/recovery/coordination", "/recovery/report", "/recovery/begin", "/recovery/decide", "/recovery/complete"].includes(req.url ?? "")) {
         if (!manager.claims.call) throw new Error("Recovery service unavailable");
         return send(200, await manager.claims.call(req.url!, { ...body, project,
