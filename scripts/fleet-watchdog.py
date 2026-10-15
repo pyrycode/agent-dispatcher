@@ -38,6 +38,8 @@ DEFAULTS = {
         'memory-runtime-smoke': 8400,
         # One capture command of up to an hour, plus two checkouts.
         'android-tool-then-text': 6000,
+        # Fetch/worktree, install/build and the complete configured fake suite.
+        'desktop-fake-suite': 5400,
         # The repair program's own limit.
         'dispatcher-repair': 5400,
     },

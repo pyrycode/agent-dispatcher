@@ -19,6 +19,7 @@ import { FleetUpdates } from "./fleet-updates.js";
 import { recoveryReport } from "./recovery-report.js";
 import { persistProjectDrains } from "./fleet-config.js";
 import { ServiceShutdown, SHUTDOWN_DEADLINE_MS } from "./service-shutdown.js";
+import { machineCapabilities, capabilityAttention, CAPABILITY_REPORT_INTERVAL_MS } from "./ticket-requirements.js";
 import { readCodexThrottleConfig, codexPauseAttention, type CodexPauseState } from "./codex-throttle.js";
 import { EvidenceStore, readEvidenceLimits, type EvidenceUsage } from "./evidence-store.js";
 
@@ -114,6 +115,13 @@ async function main(): Promise<void> {
       codexThrottle: readCodexThrottleConfig(config.codexThrottle) });
     // Logs a Codex pause's end once, when it runs out, rather than at the next report.
     const codexTimer = setInterval(() => { try { store.codexTick(); } catch (e) { console.warn("Codex throttle tick failed:", (e as Error).message); } }, 5_000);
+    // A claim held by a computer that cannot run its ticket's requirement is released, so a capable one can take the next stage.
+    const releaseIncapable = () => {
+      try { for (const c of store.releaseIncapableClaims()) console.log(`Released ${c.ticket} from ${c.machine}: it lacks a capability the ticket requires`); }
+      catch (e) { console.warn("Capability claim release failed:", (e as Error).message); }
+    };
+    releaseIncapable();
+    const capabilityTimer = setInterval(releaseIncapable, 15_000);
     const github = config.github ? new GitHubBroker({ ...config.github,
       projects: [...new Set([...config.github.projects, ...Object.values(config.updates?.consumers ?? {}), ...(config.updates?.dispatcherRepository ? [config.updates.dispatcherRepository] : [])])], token: secret(config.github.tokenEnv) }) : undefined;
     const updates = config.updates && github ? new FleetUpdates(github, config.updates.consumers, config.updates.dispatcherRepository) : undefined;
@@ -156,7 +164,7 @@ async function main(): Promise<void> {
     const stopLabels = startClaimLabelSync(config.githubLabels, () => store.snapshot().claims, process.env, labelFetch, () => store.recovery.escalatedTickets(), project=>store.workflow.enabled(project));
     // A display pass writes the database after its GitHub calls, so it may finish.
     const shutdown = new ServiceShutdown({ servers: cli ? [server, cli] : [server],
-      stop: [() => clearInterval(updateTimer), () => clearInterval(workflowTimer), () => clearInterval(codexTimer), () => clearInterval(evidenceTimer), () => clearInterval(vacuumTimer), stopLabels],
+      stop: [() => clearInterval(updateTimer), () => clearInterval(workflowTimer), () => clearInterval(codexTimer), () => clearInterval(capabilityTimer), () => clearInterval(evidenceTimer), () => clearInterval(vacuumTimer), stopLabels],
       pending: () => publishing, close: () => { store.close(); evidence?.close(); }, deadlineMs: stopDeadline });
     process.on("SIGTERM", () => void shutdown.stop("SIGTERM")); process.on("SIGINT", () => void shutdown.stop("SIGINT"));
     console.log("Claim service listening", server.address());
@@ -164,12 +172,24 @@ async function main(): Promise<void> {
   }
   if (command === "manager") {
     const claims = new FleetClient(config.claimsUrl, secret(config.claimsTokenEnv));
-    const manager = new MachineManager({ machine: config.machine, heavyLimit: config.heavyLimit, combinedLimit: config.combinedLimit, ...(config.projectHeavyLimits !== undefined ? { projectHeavyLimits: config.projectHeavyLimits } : {}), ticketLimit: config.ticketLimit ?? 2, ...(config.reviewQueueLimit != null ? { reviewQueueLimit: config.reviewQueueLimit } : {}), controlRevision: execFileSync("git",["rev-parse","HEAD"],{cwd:resolve(fileURLToPath(new URL("..",import.meta.url))),encoding:"utf8"}).trim(), projects: config.projects.map((p: any) => p.repo), drainingProjects: config.drainingProjects, projectDrainChanges: config.projectDrainChanges }, claims);
+    const manager = new MachineManager({ machine: config.machine, heavyLimit: config.heavyLimit, combinedLimit: config.combinedLimit, ...(config.projectHeavyLimits !== undefined ? { projectHeavyLimits: config.projectHeavyLimits } : {}), ticketLimit: config.ticketLimit ?? 2, ...(config.reviewQueueLimit != null ? { reviewQueueLimit: config.reviewQueueLimit } : {}), controlRevision: execFileSync("git",["rev-parse","HEAD"],{cwd:resolve(fileURLToPath(new URL("..",import.meta.url))),encoding:"utf8"}).trim(), capabilities: machineCapabilities(config.capabilities), projects: config.projects.map((p: any) => p.repo), drainingProjects: config.drainingProjects, projectDrainChanges: config.projectDrainChanges }, claims);
     const tokens = Object.fromEntries(config.projects.map((p: any) => [p.repo, secret(p.tokenEnv)]));
     const endpoint = config.socketPath ? resolve(config.socketPath) : config.port ?? 7431;
     const server = await serveManager(manager, tokens, secret(config.operatorTokenEnv), endpoint, config.host ?? "127.0.0.1", (projects, changes) => persistProjectDrains(configPath, projects, changes));
     const timer = setInterval(() => { void manager.tick().catch(e => console.error("Scheduling paused:", e.message)); }, 1000);
-    const close = () => { manager.draining = true; clearInterval(timer); server.close(() => process.exit(0)); };
+    // Logged once per change between failing and working, not every minute.
+    let reportFailed = false;
+    const report = () => void manager.reportCapabilities().then(() => {
+      if (reportFailed) console.log("Capability report accepted again");
+      reportFailed = false;
+    }, (e: Error) => {
+      if (!reportFailed) console.warn("Capability report failed; tickets with a requirement cannot start here:", e.message);
+      reportFailed = true;
+    });
+    report();
+    const capabilityTimer = setInterval(report, CAPABILITY_REPORT_INTERVAL_MS);
+    console.log("Machine capabilities", (manager.config.capabilities ?? []).join(", ") || "none");
+    const close = () => { manager.draining = true; clearInterval(timer); clearInterval(capabilityTimer); server.close(() => process.exit(0)); };
     process.on("SIGTERM", close); process.on("SIGINT", close);
     console.log("Machine manager listening", server.address());
     return;
@@ -212,10 +232,12 @@ async function main(): Promise<void> {
       claims.call<any[]>('/tasks/orphaned').catch((error: Error) => { orphanedError = String(error.message).slice(0, 200); return null; })]);
     // A pause at the ceiling means the limit outlasted the whole backoff: someone should look at OpenAI usage.
     const codexPause = codexPauseAttention(state.codexPause as CodexPauseState | undefined);
+    // A ticket whose requirement no reporting computer can satisfy would otherwise wait silently.
+    const capabilityGaps = capabilityAttention(state);
     // Near the cap, the store is evicting evidence other computers may still need.
     const evidence = (state.evidenceStore ?? null) as EvidenceUsage | null;
     const evidenceStore = evidence?.nearCap ? { ...evidence, attention: `Shared evidence store at ${Math.round(evidence.usedRatio * 100)}% of its ${Math.round(evidence.limits.totalBytes / 1024 / 1024)} MiB cap; the oldest bundles are being evicted early` } : undefined;
-    console.log(JSON.stringify({...recoveryReport(incidents, state),operationReports:operations,orphanedTasks:orphaned,...(orphanedError ? {orphanedTasksError:orphanedError} : {}),...(codexPause ? {codexPause} : {}),...(evidenceStore ? {evidenceStore} : {})}, null, 2)); return;
+    console.log(JSON.stringify({...recoveryReport(incidents, state),operationReports:operations,orphanedTasks:orphaned,...(orphanedError ? {orphanedTasksError:orphanedError} : {}),...(codexPause ? {codexPause} : {}),...(capabilityGaps.length ? {capabilityGaps} : {}),...(evidenceStore ? {evidenceStore} : {})}, null, 2)); return;
   }
   if (command === "drain") { await client.call("/drain", {}); console.log("Draining: no new grants. Existing grants remain reserved."); }
   else if (command === "drain-project" || command === "resume-project") {

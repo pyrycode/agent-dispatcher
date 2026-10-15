@@ -13,6 +13,7 @@
 // lives beside the real-claude gate runner in dispatch.ts.
 
 import { isGateOutputFormat, type GateOutputFormat } from "./gate-output.js";
+import { osName, seenOnLabel } from "./ticket-requirements.js";
 
 export interface MainSweepConfig {
   /** Shell command run from a detached worktree of main. Empty disables the sweep. */
@@ -157,6 +158,18 @@ export interface MainSweepOutcome {
 
 const MAX_LISTED_FAILURES = 30;
 
+/**
+ * The labels a main sweep failure ticket is filed with. A suite that ran and
+ * failed was seen failing on this system only, so the fix ticket requires
+ * it. A sweep that could not start says nothing about where tests fail.
+ * The ticket keeps the requirement: later update comments come from the
+ * same computer's sweep state, so from the same system.
+ */
+export function mainSweepIssueLabels(outcome: Pick<MainSweepOutcome, "runError">, platform: string = process.platform): string[] {
+  const seenOn = outcome.runError === null ? seenOnLabel(platform) : undefined;
+  return ["bug", "priority:low", ...(seenOn ? [seenOn] : [])];
+}
+
 /** The Backlog ticket for a failed sweep. Written for the refiner that picks it up. */
 export function buildMainSweepIssue(input: {
   repo: string;
@@ -165,6 +178,8 @@ export function buildMainSweepIssue(input: {
   mergeSubjects: readonly string[];
   command: string;
   outcome: MainSweepOutcome;
+  /** The system the sweep ran on. Default this process's. */
+  platform?: string;
 }): { title: string; body: string } {
   const { outcome } = input;
   const short = input.head.slice(0, 7);
@@ -184,6 +199,7 @@ export function buildMainSweepIssue(input: {
   lines.push("## Result");
   lines.push("");
   lines.push(`- Command: \`${input.command}\``);
+  lines.push(`- Seen on ${osName(input.platform ?? process.platform)}`);
   if (outcome.runError !== null) lines.push(`- Run error: ${outcome.runError}`);
   if (outcome.timedOut) lines.push("- The dispatcher's wall clock killed the command.");
   if (outcome.exitCode !== null) lines.push(`- Exit code: ${outcome.exitCode}`);

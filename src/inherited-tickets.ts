@@ -2,10 +2,11 @@
 // leaving the original at its live gate, so even an exhausted rework budget waits.
 // Failures new in one run share one ticket: tests that break together on one base
 // commit usually share a cause, and one ticket per test fixed it twice (#107).
-import { shortTestName, type FlakyRunContext, type FlakyTicketClient } from "./flaky-tickets.js";
+import { shortTestName, failureTicketLabels, dropStaleOsRequirement, type FlakyRunContext, type FlakyTicketClient } from "./flaky-tickets.js";
+import { osName } from "./ticket-requirements.js";
 
 export interface InheritedTicketClient extends FlakyTicketClient {
-  listOpenIssuesWithLabel(label: string): Promise<{ number: number; nodeId: string; title?: string; body: string }[]>;
+  listOpenIssuesWithLabel(label: string): Promise<{ number: number; nodeId: string; title?: string; body: string; labels?: string[] }[]>;
   getItemStatus(issueNumber: number): Promise<string | null>;
   moveItemToTop(itemId: string): Promise<void>;
   /** Links two issues and reads the relationship back before resolving. */
@@ -33,7 +34,7 @@ export interface InheritedTicketOptions {
    */
   advance?: boolean;
 }
-type OpenIssue = { number: number; nodeId: string; title?: string; body: string };
+type OpenIssue = { number: number; nodeId: string; title?: string; body: string; labels?: string[] };
 
 export function inheritedMarker(name: string): string {
   return `<!-- inherited-live-test: ${name} -->`;
@@ -57,7 +58,7 @@ function matchesTrackingTicket(issue: { title?: string; body: string }, name: st
   return /pre-existing|unmasked|drift|flaky|tracking|regression|bug|failure|broken|intermittent/i.test(title)
     && words.includes(shortTestName(name).toLowerCase());
 }
-function evidence(names: readonly string[], ctx: FlakyRunContext): string {
+function evidence(names: readonly string[], ctx: FlakyRunContext, platform: string): string {
   const r = ctx.report;
   const subject = names.length === 1
     ? `\`${names[0]}\` failed on both the gated branch and the base commit.`
@@ -65,18 +66,19 @@ function evidence(names: readonly string[], ctx: FlakyRunContext): string {
   return [
     subject,
     `- Found while testing #${ctx.gatedIssue} at ${ctx.at}`,
+    `- Seen on ${osName(platform)}`,
     `- Branch \`${r.branchName}\` at \`${r.headSha}\``,
     `- Base \`${r.baseRef}\` at \`${r.baseSha}\``,
     `- Branch report: \`${r.outputPath}\``,
     `- Base report: \`${r.baselineOutputPath ?? "unavailable"}\``,
   ].join("\n");
 }
-function fixTicket(names: readonly string[], ctx: FlakyRunContext): { title: string; body: string } {
+function fixTicket(names: readonly string[], ctx: FlakyRunContext, platform: string): { title: string; body: string } {
   if (names.length === 1) {
     const [name] = names;
     const body = ["## User Story", "",
       `As a maintainer, I want \`${name}\` to pass on main so unrelated tickets can complete their live checks.`,
-      "", "## Context", "", evidence(names, ctx), "", "## Acceptance Criteria", "",
+      "", "## Context", "", evidence(names, ctx, platform), "", "## Acceptance Criteria", "",
       "- [ ] Diagnose the shared failure from the branch and base reports.",
       "- [ ] Repair the test or product without weakening the assertion or skipping the test.",
       "- [ ] The named live test passes on the repaired main branch.", "", inheritedMarker(name)].join("\n");
@@ -85,7 +87,7 @@ function fixTicket(names: readonly string[], ctx: FlakyRunContext): { title: str
   // One marker per test, so a later run that sees any of them again finds this ticket.
   const body = ["## User Story", "",
     `As a maintainer, I want these ${names.length} tests to pass on main so unrelated tickets can complete their live checks.`,
-    "", "## Context", "", evidence(names, ctx), "",
+    "", "## Context", "", evidence(names, ctx, platform), "",
     "They started failing together on one base commit, so they most likely share one cause.",
     "", "## Acceptance Criteria", "",
     "- [ ] Diagnose what the failures share from the branch and base reports before repairing any of them. Split a test off only when its cause turns out to be independent.",
@@ -99,6 +101,7 @@ function fixTicket(names: readonly string[], ctx: FlakyRunContext): { title: str
 export async function recordInheritedTests(
   client: InheritedTicketClient, failures: readonly string[], ctx: FlakyRunContext,
   options: InheritedTicketOptions = {},
+  platform: string = process.platform,
 ): Promise<InheritedTicketResult> {
   const result: InheritedTicketResult = { blockers: [], untracked: [], owned: [] };
   const names = [...new Set(failures)];
@@ -136,9 +139,10 @@ export async function recordInheritedTests(
   }
   if (untrackedNow.length > 0) {
     try {
-      const { title, body } = fixTicket(untrackedNow, ctx);
-      const created = await client.createIssue(title, body, ["bug", "priority:low"]);
-      groups.set(created.number, { issue: { ...created, title, body }, names: untrackedNow, created: true });
+      const { title, body } = fixTicket(untrackedNow, ctx, platform);
+      const labels = failureTicketLabels(["bug", "priority:low"], platform);
+      const created = await client.createIssue(title, body, labels);
+      groups.set(created.number, { issue: { ...created, title, body, labels }, names: untrackedNow, created: true });
     } catch (error) {
       console.warn(`   ⚠️ Could not file a fix ticket for ${untrackedNow.join(", ")}: ${error}`);
     }
@@ -148,7 +152,12 @@ export async function recordInheritedTests(
   const placed: { issue: OpenIssue; names: string[] }[] = [];
   for (const { issue, names: groupNames, created } of groups.values()) {
     try {
-      if (!created) await client.addComment(issue.number, `## Shared failure seen again\n\n${evidence(groupNames, ctx)}`);
+      if (!created) {
+        await client.addComment(issue.number, `## Shared failure seen again\n\n${evidence(groupNames, ctx, platform)}`);
+        // Only a ticket the pipeline filed for these tests: a person's own
+        // bug ticket matched by name keeps the requirement they chose.
+        if (groupNames.some(name => hasMarker(issue, name))) await dropStaleOsRequirement(client, issue, platform);
+      }
       const status = await client.getItemStatus(issue.number);
       const itemId = await client.addItemToProject(issue.nodeId);
       const entersBacklog = status === null || status === "Inbox" || status === "Done";

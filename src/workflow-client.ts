@@ -157,6 +157,7 @@ export function workflowClient<T extends object>(
           nodeId: i.issueId,
           title: i.title,
           body: i.body,
+          labels: [...i.labels],
         })),
     addComment: async (n: number, body: string) => {
       await connection.call("/workflow/comment", {

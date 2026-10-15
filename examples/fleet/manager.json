@@ -21,5 +21,8 @@
     }
   ],
   "combinedLimit": 1,
-  "ticketLimit": 2
+  "ticketLimit": 2,
+  "capabilities": [
+    "android-device"
+  ]
 }
