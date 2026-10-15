@@ -3,7 +3,7 @@ import {mkdirSync,mkdtempSync,writeFileSync,readdirSync,lstatSync,readFileSync} 
 import {resolve,isAbsolute} from 'node:path';
 import {FleetClient} from './fleet-http.js';
 import {withManagedTaskRun} from './managed-dispatch.js';
-import {buildGateSpawnEnv,spawnGateCommand,type GateSpawner} from './dispatch.js';
+import type {GateSpawner} from './dispatch.js';
 import type {StartRequest} from './fleet-store.js';
 
 interface InteractiveConfig {
@@ -19,7 +19,7 @@ function cacheBytes(path:string):number {
 const quote=(value:string)=>"'"+value.replace(/'/g,"'\"'\"'")+"'";
 
 /** Local interactive suites use the same authority and process proof as fleet gates. */
-export async function runAdmittedTests(config:InteractiveConfig,project:string,args:string[],spawner:GateSpawner=spawnGateCommand):Promise<number> {
+export async function runAdmittedTests(config:InteractiveConfig,project:string,args:string[],spawner?:GateSpawner):Promise<number> {
  const minutes=config.timeoutMinutes??30;
  if(!config.machine || !Array.isArray(config.projects) || !config.projects.includes(project) || !isAbsolute(config.receiptDirectory)
   || !Number.isInteger(minutes) || minutes<1 || minutes>240 || !args.length || args.some(a=>typeof a!=='string'||a.includes('\0'))
@@ -43,14 +43,16 @@ export async function runAdmittedTests(config:InteractiveConfig,project:string,a
  try {
   record('admitted',{generation:granted.generation});
   const result=await withManagedTaskRun({...request,generation:granted.generation,created:Date.now()},async()=>{
+   const {buildGateSpawnEnv,spawnGateCommand}=await import('./dispatch.js');
+   const run=spawner??spawnGateCommand;
    const env=buildGateSpawnEnv(process.env);
    if(cache && cacheBytes(cache.directory)>cache.maxBytes) {
     if(lstatSync(cache.directory).isSymbolicLink() || !readFileSync(resolve(cache.directory,'README'),'utf8').startsWith('This directory holds cached build artifacts from the Go build system.')) throw new Error('The configured directory is not an identified Go build cache');
-    const cleaned=await spawner({command:'go clean -cache',cwd:process.cwd(),env:{...env,GOCACHE:cache.directory},timeoutMs:600_000,
+    const cleaned=await run({command:'go clean -cache',cwd:process.cwd(),env:{...env,GOCACHE:cache.directory},timeoutMs:600_000,
      stdoutPath:resolve(directory,'cache.stdout.log'),stderrPath:resolve(directory,'cache.stderr.log')});
     if(cleaned.exitCode!==0 || cleaned.timedOut || cleaned.spawnError) return cleaned;
    }
-   return spawner({command:args.map(quote).join(' '),cwd:process.cwd(),env,timeoutMs:minutes*60_000,
+   return run({command:args.map(quote).join(' '),cwd:process.cwd(),env,timeoutMs:minutes*60_000,
     stdoutPath:resolve(directory,'tests.stdout.log'),stderrPath:resolve(directory,'tests.stderr.log')});
   });
   code=result.exitCode===0 && !result.timedOut && !result.spawnError?0:1;

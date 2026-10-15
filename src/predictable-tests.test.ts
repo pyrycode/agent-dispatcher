@@ -1,3 +1,5 @@
+import {execFile} from 'node:child_process';
+import {promisify} from 'node:util';
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {mkdtempSync,mkdirSync,writeFileSync,rmSync,readFileSync,readdirSync,existsSync} from 'node:fs';
@@ -48,3 +50,15 @@ test('interactive suites and cache cleanup wait for an idle host and retain norm
  const receipts=readdirSync(config.receiptDirectory).map(name=>JSON.parse(readFileSync(join(config.receiptDirectory,name,'receipt.json'),'utf8')));
  assert.ok(receipts.some(r=>r.state==='finished'));assert.ok(receipts.some(r=>r.state==='refused'));
 });
+
+ test('unrelated fleet commands keep machine-readable JSON and never load dispatcher settings',async t=>{
+  const root=mkdtempSync(join(tmpdir(),'fleet-cli-json-'));
+  const store=new FleetStore(':memory:',{box:{heavyLimit:1,combinedLimit:1}});
+  store.setRunner('codex');
+  const server=await serveFleet(store,{box:'machine-test'},'operator-test',0);
+  t.after(async()=>{await new Promise<void>(resolve=>server.close(()=>resolve()));store.close();rmSync(root,{recursive:true,force:true});});
+  const address=server.address() as {port:number},config=join(root,'config.json');
+  writeFileSync(config,JSON.stringify({claimsUrl:'http://127.0.0.1:'+address.port,claimsOperatorTokenEnv:'TEST_CLAIMS_TOKEN'}),{mode:0o600});
+  const reply=await promisify(execFile)(process.execPath,['--import','tsx','src/fleet-bin.ts','runner',config],{env:{PATH:process.env.PATH,HOME:root,TEST_CLAIMS_TOKEN:'operator-test'},timeout:10_000});
+  assert.equal(JSON.parse(reply.stdout).runner,'codex');
+ });
