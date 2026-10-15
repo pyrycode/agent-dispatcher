@@ -8,6 +8,7 @@ import {
   buildMainSweepIssue,
   buildMainSweepUpdateComment,
   decideMainSweep,
+  mainSweepIssueLabels,
   holdVerifiersDuringSweep,
   parseMainSweepState,
   resolveMainSweepConfig,
@@ -341,7 +342,9 @@ describe("runMainSweepCycle", () => {
     const h = harness({ state: { lastSha: A, lastGoodSha: A, openIssue: null }, result: outcome({ failedNames: ["p.C#a"] }) });
     await h.cycle(true);
     assert.deepEqual(h.board, ["create In-depth test run failed on main at ccccccc", "add", "status Backlog"]);
-    assert.deepEqual(h.createdLabels, [["bug", "priority:low"]]);
+    // A suite that ran and failed was seen failing on this system, so the fix ticket requires it.
+    assert.deepEqual(h.createdLabels, [mainSweepIssueLabels({ runError: null })]);
+    assert.ok(h.createdLabels[0].includes(`requires:${process.platform === "darwin" ? "macos" : "linux"}`));
     assert.deepEqual(h.lastState(), {
       lastSha: C, lastGoodSha: A, openIssue: 950, failures: { sha: C, names: ["p.C#a"] }, reportedNames: ["p.C#a"],
     });

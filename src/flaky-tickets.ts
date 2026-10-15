@@ -17,6 +17,7 @@
 // no GateRunReport, so it brings its own run lines.
 
 import type { GateRunReport } from "./gate-output.js";
+import { osName, osRequirementToDrop, seenOnLabel } from "./ticket-requirements.js";
 
 export const FLAKY_TEST_LABEL = "flaky-test";
 export const FLAKY_TEST_COLUMN = "Backlog";
@@ -31,11 +32,14 @@ export const MAX_NEW_FLAKY_TICKETS_PER_RUN = 5;
 
 /** Narrow client for the filing; `GitHubProjectClient` satisfies it. */
 export interface FlakyTicketClient {
-  listOpenIssuesWithLabel(label: string): Promise<{ number: number; body: string }[]>;
+  /** `labels` lets a later sighting on another system drop an operating-system requirement. */
+  listOpenIssuesWithLabel(label: string): Promise<{ number: number; body: string; labels?: string[] }[]>;
   createIssue(title: string, body: string, labels?: string[]): Promise<{ number: number; nodeId: string; url: string }>;
   addItemToProject(issueNodeId: string): Promise<string>;
   updateItemStatus(itemId: string, newStatus: string): Promise<void>;
   addComment(issueNumber: number, body: string): Promise<void>;
+  /** Drops a `requires:` label once a failure is seen on a second system. */
+  removeLabel?(issueNumber: number, label: string): Promise<void>;
 }
 
 export interface FlakyRunContext {
@@ -105,12 +109,13 @@ export function shortTestName(name: string): string {
   return go?.index === undefined ? name : name.slice(go.index + 1);
 }
 
-function runLines(ctx: FlakyTicketContext): string[] {
+function runLines(ctx: FlakyTicketContext, platform: string): string[] {
   if ("verifierGate" in ctx) {
     const g = ctx.verifierGate;
     const at = g.commit === null ? "in its merged worktree" : `on merged commit \`${g.commit.slice(0, 10)}\``;
     return [
       `- Verifier gate run for #${ctx.gatedIssue} at ${ctx.at}`,
+      `- Seen on ${osName(platform)}`,
       `- Gate \`${g.gate}\` ${at}`,
       `- Full output: \`${g.outputPath}\`, re-run output: \`${g.rerunOutputPath}\``,
     ];
@@ -118,12 +123,13 @@ function runLines(ctx: FlakyTicketContext): string[] {
   const r = ctx.report;
   return [
     `- Gate run for #${ctx.gatedIssue} at ${ctx.at}`,
+    `- Seen on ${osName(platform)}`,
     `- Branch \`${r.branchName}\` at \`${r.headSha.slice(0, 10)}\`, merged with \`${r.baseRef}\` at \`${r.baseSha.slice(0, 10)}\``,
     `- Full output: \`${r.outputPath}\`` + (r.rerunOutputPath ? `, re-run output: \`${r.rerunOutputPath}\`` : ""),
   ];
 }
 
-export function buildFlakyTestIssue(name: string, ctx: FlakyTicketContext): { title: string; body: string } {
+export function buildFlakyTestIssue(name: string, ctx: FlakyTicketContext, platform: string = process.platform): { title: string; body: string } {
   const verifier = "verifierGate" in ctx;
   const body = [
     "## User Story",
@@ -143,7 +149,7 @@ export function buildFlakyTestIssue(name: string, ctx: FlakyTicketContext): { ti
     "",
     "First seen:",
     "",
-    ...runLines(ctx),
+    ...runLines(ctx, platform),
     "",
     "## Acceptance Criteria",
     "",
@@ -156,14 +162,48 @@ export function buildFlakyTestIssue(name: string, ctx: FlakyTicketContext): { ti
   return { title: `flaky ${verifier ? "" : "live "}test: ${shortTestName(name)}`, body };
 }
 
-export function buildFlakyRecurrenceComment(name: string, ctx: FlakyTicketContext): string {
+export function buildFlakyRecurrenceComment(name: string, ctx: FlakyTicketContext, platform: string = process.platform): string {
   return [
     `## Flaked again`,
     "",
     `\`${name}\` failed once and passed on the same-tree re-run.`,
     "",
-    ...runLines(ctx),
+    ...runLines(ctx, platform),
   ].join("\n");
+}
+
+/**
+ * The labels a new failure ticket starts with: its own, plus the
+ * `requires:` label for the system the failure was seen on, so its fix runs
+ * where the failure can be reproduced. Seen on one system only, by
+ * definition, since one run filed it.
+ */
+export function failureTicketLabels(labels: readonly string[], platform: string = process.platform): string[] {
+  const seenOn = seenOnLabel(platform);
+  return seenOn ? [...labels, seenOn] : [...labels];
+}
+
+/**
+ * A failure tracked on `issue` was seen again on `platform`. When the
+ * ticket requires another operating system, the failure is no longer
+ * specific to it, so the requirement goes. Never throws.
+ */
+export async function dropStaleOsRequirement(
+  client: { removeLabel?(issueNumber: number, label: string): Promise<void> },
+  issue: { number: number; labels?: string[] },
+  platform: string = process.platform,
+): Promise<string | undefined> {
+  const drop = osRequirementToDrop(issue.labels ?? [], platform);
+  if (!drop || !client.removeLabel) return undefined;
+  try {
+    await client.removeLabel(issue.number, drop);
+    issue.labels = (issue.labels ?? []).filter(l => l !== drop);
+    console.log(`   🌐 #${issue.number} failed on ${osName(platform)} too, so it no longer needs ${drop}`);
+    return drop;
+  } catch (e: any) {
+    console.warn(`   ⚠️  Could not remove ${drop} from #${issue.number}: ${e?.message ?? e}`);
+    return undefined;
+  }
 }
 
 /**
@@ -175,12 +215,13 @@ export async function recordFlakyTests(
   client: FlakyTicketClient,
   flaky: readonly string[],
   ctx: FlakyTicketContext,
+  platform: string = process.platform,
 ): Promise<FlakyTicketResult> {
   const result: FlakyTicketResult = { filed: [], commented: [], untracked: [] };
   const names = [...new Set(flaky)];
   if (names.length === 0) return result;
 
-  let open: { number: number; body: string }[];
+  let open: { number: number; body: string; labels?: string[] }[];
   try {
     open = await client.listOpenIssuesWithLabel(FLAKY_TEST_LABEL);
   } catch (e: any) {
@@ -194,8 +235,9 @@ export async function recordFlakyTests(
     const existing = findFlakyTicket(open, name);
     if (existing !== null) {
       try {
-        await client.addComment(existing, buildFlakyRecurrenceComment(name, ctx));
+        await client.addComment(existing, buildFlakyRecurrenceComment(name, ctx, platform));
         result.commented.push({ name, issue: existing });
+        await dropStaleOsRequirement(client, open.find(i => i.number === existing)!, platform);
       } catch (e: any) {
         console.warn(`   ⚠️  Flaky tickets: could not comment on #${existing}: ${e?.message ?? e}`);
         result.untracked.push(name);
@@ -207,12 +249,13 @@ export async function recordFlakyTests(
       continue;
     }
     try {
-      const { title, body } = buildFlakyTestIssue(name, ctx);
-      const issue = await client.createIssue(title, body, ["bug", FLAKY_TEST_LABEL, "priority:low"]);
+      const { title, body } = buildFlakyTestIssue(name, ctx, platform);
+      const labels = failureTicketLabels(["bug", FLAKY_TEST_LABEL, "priority:low"], platform);
+      const issue = await client.createIssue(title, body, labels);
       result.filed.push({ name, issue: issue.number });
       // Recorded before the board writes: the ticket exists either way, and
       // listing it as untracked would invite a second one.
-      open.push({ number: issue.number, body });
+      open.push({ number: issue.number, body, labels });
       const itemId = await client.addItemToProject(issue.nodeId);
       await client.updateItemStatus(itemId, FLAKY_TEST_COLUMN);
     } catch (e: any) {

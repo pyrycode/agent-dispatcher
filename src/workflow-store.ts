@@ -2,6 +2,7 @@ import type { EvidenceSeen } from "./evidence-revision.js";
 import type { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import type { ProjectItem } from "./types.js";
+import { ticketRequirements } from "./ticket-requirements.js";
 import { RECOVERY_PRIORITY, RECOVERY_REPAIRING, LEGACY_RECOVERY_REPAIRING, LEGACY_RECOVERY_PRIORITY, WRITE_LEGACY_RECOVERY_PRIORITY, isRepairWip, hasRunningWip } from "./recovery-labels.js";
 
 export type WorkflowItem = ProjectItem & {
@@ -71,6 +72,7 @@ export function awaitsReview(item: Pick<WorkflowItem, "state" | "status" | "labe
 export class WorkflowStore {
   private readonly labelTickets = new Map<string, { version: number; tickets: string[] }>();
   private reviewTickets: { version: number; tickets: string[] } | undefined;
+  private requirementTickets: { version: number; tickets: Record<string, string[]> } | undefined;
   constructor(private readonly db: DatabaseSync) {
     db.exec(`CREATE TABLE IF NOT EXISTS workflow_projects (project TEXT PRIMARY KEY, config TEXT NOT NULL) STRICT;
       CREATE TABLE IF NOT EXISTS workflow_migrations (project TEXT PRIMARY KEY) STRICT;
@@ -244,6 +246,32 @@ export class WorkflowStore {
     return [...tickets];
   }
   /**
+   * Open tickets of adopted projects with a `requires:` label, mapped to the
+   * capabilities they require (see ticket-requirements.ts). Kept like
+   * openTicketsWithLabel, since every scheduler snapshot asks.
+   */
+  openTicketRequirements(): Record<string, string[]> {
+    const inTransaction = (this.db as { isTransaction?: boolean }).isTransaction !== false;
+    const version = Number(this.db.prepare("PRAGMA data_version").get()?.data_version);
+    const kept = inTransaction ? undefined : this.requirementTickets;
+    if (kept && kept.version === version) return structuredClone(kept.tickets);
+    const tickets: Record<string, string[]> = {};
+    for (const row of this.db
+      .prepare(
+        `SELECT ticket,item FROM workflow_tickets
+         WHERE project IN (SELECT project FROM workflow_projects)
+           AND json_extract(item,'$.state') IS NOT 'CLOSED'
+           AND EXISTS (SELECT 1 FROM json_each(item,'$.labels') WHERE value LIKE 'requires:%')
+         ORDER BY ticket`,
+      )
+      .all()) {
+      const required = ticketRequirements(JSON.parse(String(row.item)).labels ?? []);
+      if (required.length) tickets[String(row.ticket)] = required;
+    }
+    if (!inTransaction) this.requirementTickets = { version, tickets };
+    return structuredClone(tickets);
+  }
+  /**
    * Open tickets of adopted projects that wait for review, see awaitsReview,
    * in ticket order, whoever owns them. A project still preparing is left
    * out, since the authority starts nothing there. Kept like openTicketsWithLabel, since
@@ -284,6 +312,7 @@ export class WorkflowStore {
   }
   prepare(project: string): void {
     this.reviewTickets = undefined;
+    this.requirementTickets = undefined;
     if (!projectPattern.test(project))
       throw new Error("Invalid workflow project");
     this.db
@@ -292,6 +321,7 @@ export class WorkflowStore {
   }
   activate(project: string): void {
     this.reviewTickets = undefined;
+    this.requirementTickets = undefined;
     if (!this.enabled(project))
       throw new Error("Import the workflow before activation");
     this.db
@@ -300,6 +330,7 @@ export class WorkflowStore {
   }
   cancelPreparation(project: string): void {
     this.reviewTickets = undefined;
+    this.requirementTickets = undefined;
     if (this.enabled(project))
       throw new Error("Imported workflow cannot revert to GitHub authority");
     this.db
@@ -309,6 +340,7 @@ export class WorkflowStore {
   transaction<T>(work: () => T): T {
     this.labelTickets.clear();
     this.reviewTickets = undefined;
+    this.requirementTickets = undefined;
     this.db.exec("SAVEPOINT workflow");
     try {
       const value = work();

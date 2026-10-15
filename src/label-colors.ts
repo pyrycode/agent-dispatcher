@@ -55,6 +55,8 @@ export function labelColor(name: string): string {
   if (name.startsWith("pending-") || name.startsWith("ready:")) return "BFD9F8";
   if (name.startsWith("trial:")) return "DDF4FF";
   if (name.startsWith("held:")) return "F2CC60";
+  // Where a ticket may run, such as requires:macos: a placement rule, not a state.
+  if (name.startsWith("requires:")) return "5C3D1E";
   if (name.startsWith("orchestrator:")) return "0B6E65";
   if (name.startsWith("claim:")) return own(CLAIM, name.slice(6)) ?? "C4CBD3";
   if (name.startsWith("priority:")) return own(PRIORITY, name.slice(9)) ?? DEFAULT_LABEL_COLOR;
