@@ -1,3 +1,8 @@
+import {mkdtempSync,writeFileSync,rmSync} from 'node:fs';
+import {join} from 'node:path';
+import {tmpdir} from 'node:os';
+import {execFile} from 'node:child_process';
+import {promisify} from 'node:util';
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {checkHandover,shadowHandoverChoice,type HandoverProof,type HandoverFacts} from './handover-check.js';
@@ -44,5 +49,12 @@ test('shadow choice is disabled by default, Linux only, bounded and deterministi
    assert.equal(result.ready,false);assert.equal(result.ownershipChanged,false);
    assert.ok(result.reasons.every(reason=>reason.includes('Workflow')));
    assert.equal(store.snapshot().claims[0].generation,generation);
+   const root=mkdtempSync(join(tmpdir(),'handover-cli-'));
+   try {
+    writeFileSync(join(root,'config.json'),JSON.stringify({claimsUrl:'http://127.0.0.1:'+address.port,operatorTokenEnv:'TEST_LOCAL_TOKEN',claimsOperatorTokenEnv:'TEST_CLAIMS_TOKEN'}),{mode:0o600});
+    writeFileSync(join(root,'proof.json'),JSON.stringify({...proof,generation}),{mode:0o600});
+    const reply=await promisify(execFile)(process.execPath,['--import','tsx','src/fleet-bin.ts','handover',join(root,'config.json'),join(root,'proof.json')],{env:{PATH:process.env.PATH,HOME:root,TEST_LOCAL_TOKEN:'local-test',TEST_CLAIMS_TOKEN:'admin-test'},timeout:10_000});
+    assert.equal(JSON.parse(reply.stdout).ownershipChanged,false,'the real CLI uses the central operator credential');
+   } finally {rmSync(root,{recursive:true,force:true});}
   } finally {await new Promise<void>(resolve=>server.close(()=>resolve()));store.close();}
  });

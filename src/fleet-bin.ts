@@ -42,7 +42,7 @@ async function main(): Promise<void> {
   const config = JSON.parse(readFileSync(configPath, "utf8"));
   if(command==='handover') {
     if(args.length!==1) throw new Error('handover CONFIG PROOF_FILE');
-    const client=new JsonClient(config.claimsUrl,secret(config.operatorTokenEnv));
+    const client=new JsonClient(config.claimsUrl,secret(config.claimsOperatorTokenEnv??config.claimsTokenEnv));
     console.log(JSON.stringify(await client.call('/handover/check',JSON.parse(readFileSync(args[0],'utf8')))));
     return;
   }
