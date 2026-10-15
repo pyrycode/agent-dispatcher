@@ -480,3 +480,22 @@ test("a drain command never loosens a stricter drain without --loosen", async t 
   store.setDesired({ machines: ["hp"], change: { work: "drained" } });
   assert.match(store.setDesired({ machines: ["hp"], change: { work: "taking" } }).notes.join(" "), /still holds back org\/mobile/);
 });
+
+test("a board removed from a manager's configuration never breaks its fetches", async t => {
+  const store = new FleetStore(":memory:", limits); t.after(() => store.close());
+  const file = configFile(); t.after(file.cleanup);
+  await managerFrom(file.path, client(store, "hp")).refreshDesired();
+  store.setDesired({ machines: ["hp"], project: mobile, change: { run: "stopped" } });
+  await managerFrom(file.path, client(store, "hp")).refreshDesired();
+  // Mobile leaves hp's configuration; its saved and central entries stay behind.
+  const saved = file.read();
+  const manager = new MachineManager({ machine: "hp", projects: [core], heavyLimit: 1, combinedLimit: 2, drainingProjects: [], projectDrainChanges: saved.projectDrainChanges }, client(store, "hp"), Date.now,
+    { cached: saved.desiredState, persist: u => persistDesiredState(file.path, u) });
+  store.setDesired({ machines: ["hp"], project: core, change: { run: "stopped" } });
+  await manager.refreshDesired();
+  assert.equal(manager.desiredStatus()?.mode, "central");
+  assert.equal(manager.desiredStatus()?.projects[core].run, "stopped");
+  // The claims database restore path skips it too.
+  assert.doesNotThrow(() => store.desired.poll("hp", { projects: [core], appliedRevision: 99, savedEntries: [{ project: mobile, run: "stopped" }, { project: core, run: "stopped" }] }));
+  assert.equal(store.desired.document("hp").revision, 100);
+});

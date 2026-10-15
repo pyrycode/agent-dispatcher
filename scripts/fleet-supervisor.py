@@ -442,8 +442,10 @@ class Supervisor:
         if not_sent:
             # Nothing was signalled, so a later pass may try again, a bounded number of times.
             receipt.unlink(missing_ok=True)
-            failures = self.signal_failures.get(project, 0) + 1
-            self.signal_failures[project] = failures
+            # Consecutive means within the hour: an unrelated failure days later starts again at one.
+            count, last = self.signal_failures.get(project, (0, None))
+            failures = (count if last is not None and self.clock() - last < 3600 else 0) + 1
+            self.signal_failures[project] = (failures, self.clock())
             reason = 'Stop signal not sent: ' + redact_paths(str(error))[:200] + '. Nothing was signalled'
             if failures >= SIGNAL_RETRIES:
                 self.signal_failures.pop(project, None)

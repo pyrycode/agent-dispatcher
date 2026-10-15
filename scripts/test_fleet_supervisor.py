@@ -926,6 +926,13 @@ class ReviewTwoTests(unittest.TestCase):
         self.assertIn('3 passes in a row',self.worker.tick(PROJECT,NEW)['reason'])
         self.assertEqual(self.adapter.calls,['drain','drain','drain'])
 
+    def test_unsent_signals_far_apart_do_not_add_up(self):
+        def refuse(p,i):
+            error=RuntimeError('Dispatcher changed before signalling');error.signal_not_sent=True;raise error
+        self.adapter.drain=refuse
+        for _ in range(4):
+            self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'signal-failed');self.now[0]+=7200
+
     def test_a_dispatcher_that_stopped_before_the_signal_is_not_updated_and_started(self):
         # The Mac race: gone between the observation and the kill, perhaps by hand.
         def gone(p,i):

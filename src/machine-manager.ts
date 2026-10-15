@@ -161,7 +161,7 @@ export class MachineManager {
   private poll(): DesiredPoll {
     return { projects: this.config.projects, appliedRevision: this.appliedRevision, ...(this.applyError ? { applyError: this.applyError } : {}),
       ...(this.pendingImports.size ? { localDrains: [...this.pendingImports] } : {}),
-      ...(this.desiredDoc ? { savedEntries: this.desiredDoc.entries.map(e => ({ project: e.project, ...(e.work ? { work: e.work } : {}), ...(e.run ? { run: e.run } : {}) })) } : {}) };
+      ...(this.desiredDoc ? { savedEntries: this.desiredDoc.entries.filter(e => e.project === MACHINE_SCOPE || this.config.projects.includes(e.project)).map(e => ({ project: e.project, ...(e.work ? { work: e.work } : {}), ...(e.run ? { run: e.run } : {}) })) } : {}) };
   }
   private async refreshOnce(): Promise<void> {
     let doc: DesiredDocument;

@@ -257,9 +257,11 @@ export class DesiredStateStore {
     if (!Array.isArray(targets) || !targets.length || targets.length > 50) throw new Error("Name a machine or all machines");
     for (const m of targets) this.known(m);
     const changed: Array<DesiredEntry & { machine: string }> = [], unchanged: string[] = [], skipped: string[] = [], notes: string[] = [];
+    const behindNote = (m: string) => `${m}: its manager applied a newer desired state than this database holds, as after a restore. Its next fetch, within 15 seconds, merges that state back in; retry then.`;
     const behind = targets.filter(m => this.appliedRevision(m) > this.storedRevision(m));
-    if (behind.length) throw new Error(`${behind.join(", ")}: its manager applied a newer desired state than this database holds, as after a restore. Its next fetch, within 15 seconds, merges that state back in; retry then.`);
+    if (behind.length && !all) throw new Error(behind.map(behindNote).join(" "));
     for (const machine of targets) {
+      if (behind.includes(machine)) { skipped.push(machine); notes.push(behindNote(machine)); continue; }
       if (project !== undefined) {
         const served = this.served(machine);
         if (!served?.includes(project)) {
@@ -284,7 +286,7 @@ export class DesiredStateStore {
       if (project !== undefined && change.work === "taking" && desiredRun(this.entries(machine), project) === "stopped") notes.push(`${machine} ${project} is still stopped, which holds new work; start lifts that`);
       if (!this.db.prepare("SELECT 1 FROM fleet_desired_polls WHERE machine=?").get(machine)) notes.push(`${machine}'s manager has not fetched desired state yet; the claim service enforces the work state meanwhile, and a stop or start waits for its manager and supervisor to be updated`);
     }
-    if (all && project !== undefined && !changed.length && !unchanged.length) throw new Error(`No computer reported serving ${project}`);
+    if (all && project !== undefined && !changed.length && !unchanged.length && !behind.length) throw new Error(`No computer reported serving ${project}`);
     return { changed, unchanged, skipped, notes };
   }
   /**
@@ -304,7 +306,7 @@ export class DesiredStateStore {
     if (local !== undefined && (!Array.isArray(local) || local.some(p => !projects.includes(p)))) throw new Error("Saved drains must name served projects");
     const saved = poll.savedEntries;
     if (saved !== undefined && (!Array.isArray(saved) || saved.length > 100 || saved.some(e => !e || typeof e.project !== "string"
-      || (e.project !== MACHINE_SCOPE && !projects.includes(e.project)) || (e.work !== undefined && !WORK_STATES.includes(e.work))
+      || (e.project !== MACHINE_SCOPE && !PROJECT.test(e.project)) || (e.work !== undefined && !WORK_STATES.includes(e.work))
       || (e.run !== undefined && (!RUN_STATES.includes(e.run) || e.project === MACHINE_SCOPE))))) throw new Error("Invalid saved entries");
     const served = [...new Set(projects)].sort();
     this.db.prepare(`INSERT INTO fleet_desired_polls VALUES (?,?,?,?,?) ON CONFLICT(machine) DO UPDATE SET
@@ -315,7 +317,8 @@ export class DesiredStateStore {
       // Without the manager's copy nothing may move past its revision, so the
       // older document stays refused and nothing is imported yet.
       if (!saved) return this.document(machine);
-      for (const e of saved) {
+      // A board the computer no longer serves is skipped, never a reason to refuse the fetch.
+      for (const e of saved.filter(e => e.project === MACHINE_SCOPE || projects.includes(e.project))) {
         const current = this.entries(machine).find(c => c.project === e.project);
         const work = stricter(e.work, current?.work);
         const run = e.run === "stopped" || current?.run === "stopped" ? "stopped" : current?.run;
