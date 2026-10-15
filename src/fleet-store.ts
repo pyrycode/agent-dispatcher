@@ -1,3 +1,5 @@
+import {snapshotFleet} from './fleet-backups.js';
+import type {EvidenceStore} from './evidence-store.js';
 import { isRepairWip } from "./recovery-labels.js";
 import { PRIORITY_HIGH } from "./ticket-priority.js";
 import { WorkflowStore, type WorkflowChange } from "./workflow-store.js";
@@ -179,6 +181,7 @@ export function validateStart(req: StartRequest): void {
 }
 
 export interface FleetStoreOptions extends RecoveryLedgerOptions {
+  backupDirectory?:string;
   /** How long a running or attention task may have no holder before it is reported. Default one hour. */
   orphanedTaskMs?: number;
   now?: () => number;
@@ -214,8 +217,10 @@ export class FleetStore {
   readonly desired: DesiredStateStore;
   /** Every flaky-test sighting from every computer. See flaky-sightings.ts. */
   readonly flaky: FlakySightingLedger;
+  readonly backupDirectory:string|undefined;
   private readonly clock: () => number;
   constructor(path: string, private readonly limits: Readonly<Record<string, MachineLimits>>, options: FleetStoreOptions = {}) {
+    this.backupDirectory=options.backupDirectory;
     for (const value of Object.values(limits)) validateLimits(value);
     this.db = new DatabaseSync(path);
     this.db.exec(`
@@ -953,6 +958,9 @@ export class FleetStore {
     // before /finish. Operator /free leaves no normal outcome and changes ownership.
     return prior;
   }
+
+  /** Both stores have this controller as sole writer. The call does not yield. */
+  backup(directory:string,evidence:EvidenceStore) {return snapshotFleet(directory,this.db,path=>evidence.snapshot(path),this.clock());}
 
   snapshot(): FleetSnapshot {
     const runnerPolicy = this.runnerPolicy();

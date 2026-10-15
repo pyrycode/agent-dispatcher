@@ -95,6 +95,11 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
       // Shared run evidence (evidence-store.ts). Any fleet credential reads;
       // only the computer that ran a run uploads its bundle. A service without
       // the store answers like one that predates it.
+      if(req.url==='/operations/backup') {
+        if(!isAdmin) return send(403,{error:'Operator credential required'});
+        if(!evidence || !store.backupDirectory) return send(409,{error:'Coherent backups are not configured'});
+        return send(200,store.backup(store.backupDirectory,evidence));
+      }
       if(req.url?.startsWith('/evidence/')) {
         if(!evidence) return send(404,{error:'Unknown operation'});
         if(req.url==='/evidence/usage') return send(200,evidence.usage());

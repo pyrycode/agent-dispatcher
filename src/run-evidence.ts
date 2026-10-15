@@ -1,3 +1,4 @@
+import {readRuntimeProvenance,type RuntimeProvenance} from './runtime-provenance.js';
 // The dispatcher's half of the shared evidence store (evidence-store.ts).
 //
 // When an agent run, a live gate run or a recovery assessment ends, pass or
@@ -249,7 +250,7 @@ function priority(path: string): number {
  */
 export async function collectRunEvidence(opts: RunEvidenceInput & {
   project: string; machine: string; logsDir: string; dispatcherRevision?: string;
-  limits?: RunEvidenceLimits; now?: () => number;
+  limits?: RunEvidenceLimits; now?: () => number; runtime?:RuntimeProvenance;
 }): Promise<EvidenceBundle> {
   const limits = opts.limits ?? DEFAULT_RUN_EVIDENCE_LIMITS;
   const since = opts.startedAt - 5_000;
@@ -328,7 +329,8 @@ export async function collectRunEvidence(opts: RunEvidenceInput & {
     if (!whole) await point(source, size, modified, `longer than ${Math.round(limits.tailBytes / KIB)} KiB; the bundle holds the tail`);
   }
   const ticket = `${opts.project}#${opts.issueNumber}`;
-  const meta: EvidenceMeta = { kind: opts.kind, role: opts.role, outcome: opts.outcome, startedAt: Math.round(opts.startedAt), endedAt: Math.round(opts.endedAt),
+  const runtime=opts.runtime;
+  const meta: EvidenceMeta = { ...(runtime?{runtime}:{}), kind: opts.kind, role: opts.role, outcome: opts.outcome, startedAt: Math.round(opts.startedAt), endedAt: Math.round(opts.endedAt),
     ...(opts.dispatcherRevision && /^[a-f0-9]{40}$/.test(opts.dispatcherRevision) ? { dispatcherRevision: opts.dispatcherRevision } : {}) };
   files["run.json"] = redact(JSON.stringify({ ticket, runId: opts.runId, machine: opts.machine, ...meta,
     files: index.map(i => ({ path: i.path, source: i.source, bytes: i.bytes, included: i.included })), ...(omitted ? { omittedFiles: omitted } : {}) }));
@@ -373,6 +375,7 @@ export const DEFAULT_OUTBOX_LIMITS: OutboxLimits = { files: 500, bytes: 128 * MI
  * background. Every method logs and returns; none throws.
  */
 export class RunEvidence {
+  private readonly runtime:RuntimeProvenance|undefined;
   private flushing: Promise<void> | undefined;
   private lastFlush = 0;
   private quietUntil = 0;
@@ -385,6 +388,7 @@ export class RunEvidence {
     /** The claim service's per-bundle cap, from its snapshot. A bundle is sized under it. */
     storeBundleBytes?: () => number | undefined;
   }) {
+    this.runtime=readRuntimeProvenance(process.env.PYRY_RUNTIME_RECORD_FILE,process.cwd());
     this.outbox = opts.outbox ?? resolve(opts.logsDir, "evidence-outbox");
   }
   private now(): number { return (this.opts.now ?? Date.now)(); }
@@ -397,7 +401,7 @@ export class RunEvidence {
       const cap = this.opts.storeBundleBytes?.();
       if (typeof cap === "number" && Number.isFinite(cap) && cap > 0) limits.bundleBytes = Math.min(limits.bundleBytes, cap - 64 * KIB);
       const bundle = await collectRunEvidence({ ...input, project: this.opts.project, machine: this.opts.machine() ?? "unknown", logsDir: this.opts.logsDir,
-        dispatcherRevision: this.opts.dispatcherRevision, limits });
+        dispatcherRevision: this.opts.dispatcherRevision, runtime:this.runtime, limits });
       mkdirSync(this.outbox, { recursive: true, mode: 0o700 });
       chmodSync(this.outbox, 0o700);
       const name = `${String(input.endedAt).padStart(14, "0")}-${input.issueNumber}-${createHash("sha256").update(input.runId).digest("hex").slice(0, 16)}.json`;

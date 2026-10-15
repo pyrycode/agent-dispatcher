@@ -6,7 +6,7 @@ import {writeFileSync} from "node:fs";
 // Explicit executable only. Importable libraries never start services or touch GitHub.
 import {execFileSync} from "node:child_process";
 import {fileURLToPath} from "node:url";
-import { readFileSync, mkdirSync } from "node:fs";
+import { readFileSync, mkdirSync, existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { FleetStore } from "./fleet-store.js";
 import { FleetClient, JsonClient, serveFleet } from "./fleet-http.js";
@@ -36,10 +36,16 @@ function shutdownDeadline(seconds: unknown): number {
 }
 async function main(): Promise<void> {
   const [command, configPath, ...args] = process.argv.slice(2);
-  if (!configPath || !["workflow", "control", "recovery-task", "claims", "manager", "status", "runner", "codex", "desired", "attention", "report-attention", "pause", "coordination", "recovery", "drain", "resume", "stop", "start", "desired-state", "drain-project", "resume-project", "free"].includes(command)) {
+  if (!configPath || !["backup", "workflow", "control", "recovery-task", "claims", "manager", "status", "runner", "codex", "desired", "attention", "report-attention", "pause", "coordination", "recovery", "drain", "resume", "stop", "start", "desired-state", "drain-project", "resume-project", "free"].includes(command)) {
     throw new Error("Usage: fleet-bin.ts claims|manager|status|runner|codex|recovery|drain|resume|stop|start|desired-state|drain-project|resume-project|free CONFIG [claude|codex|local | PROJECT | --machine MACHINE|--all-machines [--project PROJECT] | TICKET GENERATION --confirmed-stopped]");
   }
   const config = JSON.parse(readFileSync(configPath, "utf8"));
+  if(command==='backup') {
+    if(args.length) throw new Error('backup CONFIG');
+    const client=new JsonClient(config.claimsUrl,secret(config.claimsOperatorTokenEnv??config.claimsTokenEnv));
+    console.log(JSON.stringify(await client.call('/operations/backup',{})));
+    return;
+  }
   if(command==='workflow') {
     const [action,project,file,boardNumber]=args;
     if(!['read','export','import','change','file','prepare','activate','cancel-preparation'].includes(action)||!project)throw new Error('workflow read|export|import|change|file|prepare|activate|cancel-preparation PROJECT [JSON_FILE]');
@@ -95,6 +101,7 @@ async function main(): Promise<void> {
   if (command === "claims") {
     const stopDeadline = shutdownDeadline(config.shutdownDeadlineSeconds);
     const database = resolve(config.database);
+    if(existsSync(resolve(dirname(database),'RESTORE_HOLD.json'))) throw new Error('Restored authority remains held. Reconcile every worker before approving a separate restore procedure.');
     mkdirSync(dirname(database), { recursive: true, mode: 0o700 });
     const machines = Object.fromEntries(Object.entries(config.machines).map(([id, value]) => [id, secret((value as any).tokenEnv)]));
     const limits = Object.fromEntries(Object.entries(config.machines).map(([id, value]) => [id, { heavyLimit: (value as any).heavyLimit, combinedLimit: (value as any).combinedLimit, ...((value as any).projectHeavyLimits !== undefined ? { projectHeavyLimits: (value as any).projectHeavyLimits } : {}) }]));
@@ -109,7 +116,7 @@ async function main(): Promise<void> {
     const reassessMinutes = config.recovery?.reassessBaseMinutes, reassessHours = config.recovery?.reassessCeilingHours;
     if (reassessMinutes !== undefined && (typeof reassessMinutes !== "number" || !Number.isFinite(reassessMinutes))) throw new Error("recovery.reassessBaseMinutes must be a number");
     if (reassessHours !== undefined && (typeof reassessHours !== "number" || !Number.isFinite(reassessHours))) throw new Error("recovery.reassessCeilingHours must be a number");
-    const store = new FleetStore(database, limits, { ...(safetyHours === undefined ? {} : { safetyRecheckMs: Math.round(safetyHours * 3600_000) }),
+    const store = new FleetStore(database, limits, { backupDirectory:config.backup?.directory, ...(safetyHours === undefined ? {} : { safetyRecheckMs: Math.round(safetyHours * 3600_000) }),
       ...(orphanMinutes === undefined ? {} : { orphanedTaskMs: Math.round(orphanMinutes * 60_000) }),
       ...(reassessMinutes === undefined ? {} : { reassessBaseMs: Math.round(reassessMinutes * 60_000) }),
       ...(reassessHours === undefined ? {} : { reassessCeilingMs: Math.round(reassessHours * 3600_000) }),

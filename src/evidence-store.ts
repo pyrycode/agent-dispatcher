@@ -1,3 +1,4 @@
+import {validateRuntimeProvenance,type RuntimeProvenance} from './runtime-provenance.js';
 // Shared run evidence. Every agent run and live gate run uploads a bounded,
 // redacted bundle to the claims service, keyed by ticket and run id, so a
 // later stage or a recovery check on another computer can read it.
@@ -70,6 +71,7 @@ export interface EvidenceMeta {
   startedAt: number;
   endedAt: number;
   dispatcherRevision?: string;
+  runtime?: RuntimeProvenance;
 }
 export interface EvidenceBundleView {
   ticket: string;
@@ -117,8 +119,8 @@ function validateMeta(value: unknown): EvidenceMeta {
     || !["agent", "gate", "recovery"].includes(m.kind) || !word(m.role, 64) || !word(m.outcome, 32)
     || !Number.isSafeInteger(m.startedAt) || !Number.isSafeInteger(m.endedAt) || m.startedAt < 0 || m.endedAt < 0
     || (m.dispatcherRevision !== undefined && !/^[a-f0-9]{40}$/.test(String(m.dispatcherRevision)))
-    || Object.keys(m).some(k => !["kind", "role", "outcome", "startedAt", "endedAt", "dispatcherRevision"].includes(k))) throw new Error("Invalid evidence metadata");
-  return { kind: m.kind, role: m.role, outcome: m.outcome, startedAt: m.startedAt, endedAt: m.endedAt,
+    || Object.keys(m).some(k => !["kind", "role", "outcome", "startedAt", "endedAt", "dispatcherRevision", "runtime"].includes(k))) throw new Error("Invalid evidence metadata");
+  return { ...(m.runtime!==undefined?{runtime:validateRuntimeProvenance(m.runtime)}:{}), kind: m.kind, role: m.role, outcome: m.outcome, startedAt: m.startedAt, endedAt: m.endedAt,
     ...(m.dispatcherRevision !== undefined ? { dispatcherRevision: m.dispatcherRevision } : {}) };
 }
 
@@ -182,6 +184,8 @@ export class EvidenceStore {
       CREATE INDEX IF NOT EXISTS evidence_age ON evidence_bundles(committed, created);
     `);
   }
+  /** The controller calls this synchronously beside its authority snapshot. */
+  snapshot(path:string):void {this.db.exec("VACUUM INTO '"+path.replaceAll("'","''")+"'");}
   close(): void { this.db.close(); }
 
   private transaction<T>(work: () => T): T {
