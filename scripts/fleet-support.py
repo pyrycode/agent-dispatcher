@@ -389,6 +389,9 @@ def desktop_capture(task,paths,directory):
         config.write_text("import config from './playwright.fleet-original.config'\nexport default { ...config, reporter: [['list'], ['json', { outputFile: "+json.dumps(str(report))+" }]] }\n")
         for argv,timeout in ((['npm','ci'],600),(['npm','run','build'],600)):
             if run(argv,worktree,timeout=timeout)!=0:raise RuntimeError('Desktop install/build failed; inspect execution.log')
+        # Prepare the Electron ABI only after host-Node install/build preparation.
+        if run(['npm','run','rebuild:electron'],worktree,timeout=600)!=0:
+            raise RuntimeError('Desktop Electron rebuild failed; inspect execution.log')
         # Use the same custody journal for every subprocess. The list reporter
         # writes into execution.log; retain its exact segment separately below.
         offset=log.stat().st_size if log.exists() else 0
