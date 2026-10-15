@@ -4,13 +4,43 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {readJson,listen, type JsonClient} from './fleet-http.js';
 import type {FleetRun} from './fleet-store.js';
+import {recoveryTaskId,validateTaskRequest} from './recovery-tasks.js';
+import {NON_AGENT_ROLES} from './codex-throttle.js';
 
 /**
- * What one run's socket accepts. `tasks`: request and read native checks,
- * builders and developers only. `evidence`: read the shared evidence of any
- * ticket's earlier runs (evidence-store.ts), every agent.
+ * What one run's socket accepts.
+ *
+ * `request`: schedule a native check. Builders and developers only: a check
+ * spends heavy time on the Mac or the Android host, and the stages after the
+ * builder judge evidence rather than make it.
+ *
+ * `read`: read a native task, its artifacts, and wait for it (the helper's
+ * `read` and `await`). Every agent role of a numbered ticket but a recovery
+ * assessment (readsNativeTasks). The claim
+ * service answers only for a task of the run's own ticket, while the run is
+ * active (FleetStore.readTask), so a run never reads another ticket's tasks.
+ * Until agent-dispatcher PR 206's single `tasks` switch was split, reads went
+ * with requests, so a verifier or documentation run could not read the
+ * native result its builder asked for (Desktop #1998, 2026-10-15).
+ *
+ * `evidence`: read the shared evidence of any ticket's earlier runs
+ * (evidence-store.ts), every agent.
  */
-export interface BridgeActions {tasks:boolean;evidence:boolean}
+export interface BridgeActions {request:boolean;read:boolean;evidence:boolean}
+
+/** Roles whose runs may request a native check. */
+export const TASK_REQUEST_ROLES: ReadonlySet<string> = new Set(['builder','developer']);
+
+/**
+ * Roles whose runs read their ticket's native tasks: every agent role, with
+ * two exceptions. Recovery assessments get each task's state, summary and a
+ * failed task's bounded, scrubbed diagnostics in their facts, by design
+ * (recovery-tasks.ts `assessmentTasks`), and full artifacts would widen that.
+ * Dispatcher jobs such as merge, reconcile and codegraph start no agent.
+ */
+export function readsNativeTasks(role:string):boolean {
+ return !NON_AGENT_ROLES.has(role) && role!=='recovery';
+}
 
 /** Newest bundles one evidence list returns through the socket: the helper reads at most 2 MiB a reply. */
 export const BRIDGE_EVIDENCE_BUNDLES=5;
@@ -24,9 +54,16 @@ export function evidenceTicket(value:unknown,project:string):string {
  throw new Error('Invalid evidence ticket');
 }
 
-/** A private, per-run socket carries fixed requests. Children receive no fleet credential. */
-export async function taskBridge(connection:JsonClient,run:FleetRun,actions:BridgeActions={tasks:true,evidence:false}) {
+/**
+ * A private, per-run socket carries fixed requests. Children receive no fleet credential.
+ * `requested()` names the tasks this run asked for, so its handover can wait
+ * for them (native-task-hold.ts). An id is recorded before the request is
+ * sent, from the same identity the claim service gives the task, so a reply
+ * lost on the way back still counts.
+ */
+export async function taskBridge(connection:JsonClient,run:FleetRun,actions:BridgeActions={request:true,read:true,evidence:false}) {
  const socket=join(mkdtempSync(join(tmpdir(),'pyry-task-')),'api.sock');
+ const requested=new Set<string>();
  const server=createServer(async(req,res)=>{
   const send=(status:number,value:unknown)=>{res.writeHead(status,{'Content-Type':'application/json'});res.end(JSON.stringify(value));};
   try {
@@ -41,11 +78,21 @@ export async function taskBridge(connection:JsonClient,run:FleetRun,actions:Brid
     }
     return send(200,await connection.call('/evidence/chunk',{ticket,runId:body.runId,digest:body.digest,path:body.path,part:body.part}));
    }
-   if(req.method!=='POST' || !actions.tasks || !['/request','/read','/artifact'].includes(url)) return send(404,{error:'Unknown task action'});
+   const allowed=req.method==='POST' && (url==='/request'?actions.request:['/read','/artifact'].includes(url) && actions.read);
+   if(!allowed) {
+    // Say why a reader cannot request, rather than that the action is unknown.
+    if(req.method==='POST' && url==='/request' && actions.read) return send(403,{error:'Native check requests are for builder and developer runs; this run can read and await this ticket\'s tasks'});
+    return send(404,{error:'Unknown task action'});
+   }
    const body=await readJson(req);
-   send(200,await connection.call('/tasks'+url,{...body,project:run.project,session:run.session,runId:run.id}));
+   if(url==='/request') {
+    try {requested.add(recoveryTaskId(run.ticket,validateTaskRequest(body.request),run.id));}catch {/* invalid: the service refuses it too */}
+   }
+   const reply=await connection.call<{id?:unknown}>('/tasks'+url,{...body,project:run.project,session:run.session,runId:run.id});
+   if(url==='/request' && typeof reply?.id==='string') requested.add(reply.id);
+   send(200,reply);
   }catch {send(409,{error:'Task request unavailable or outside this admitted ticket'});}
  });
  server.requestTimeout=15000;await listen(server,socket);
- return {socket,close:()=>new Promise<void>(resolve=>server.close(()=>resolve()))};
+ return {socket,requested:()=>[...requested],close:()=>new Promise<void>(resolve=>server.close(()=>resolve()))};
 }
