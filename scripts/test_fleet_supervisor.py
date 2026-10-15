@@ -128,9 +128,19 @@ class Tests(unittest.TestCase):
         self.assertEqual(self.adapter.calls,['drain','update','start'])
         self.worker.tick(PROJECT,'new');self.assertEqual(self.adapter.calls,['drain','update','start'])
     def test_uncertain_signal_is_never_repeated(self):
+        # A crash between the saved record and the acknowledgement: the next
+        # pass waits for the process to exit and never signals again.
         self.worker.tick(PROJECT,'new')
         state=json.loads(self.receipt().read_text());state['phase']='drain-requested';module.atomic(self.receipt(),state)
-        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'attention')
+        result=self.worker.tick(PROJECT,'new')
+        self.assertEqual(result['phase'],'draining')
+        self.assertIn('no second signal',result['reason'])
+        self.assertTrue(json.loads(self.receipt().read_text())['signalUncertain'])
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'draining')
+        self.assertEqual(self.adapter.calls,['drain'])
+        # Once it exits it is not started without an explicit run state: it may have been stopped by hand.
+        self.adapter.current.update(stopped=True,childrenStopped=True)
+        self.assertEqual(self.worker.tick(PROJECT,'new')['reason'],module.EXITED_UNCONFIRMED_REASON)
         self.assertEqual(self.adapter.calls,['drain'])
     def test_uncertain_start_is_never_repeated(self):
         self.worker.tick(PROJECT,'new')
@@ -357,10 +367,12 @@ class StaleStateTests(unittest.TestCase):
         self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'draining')
         self.assertTrue(self.receipt().exists());self.assertEqual(self.archives('retired'),[])
 
-    def test_uncertain_drain_signal_is_never_retired(self):
+    def test_uncertain_drain_signal_is_not_retired_on_the_conversion_pass(self):
+        # It becomes an ordinary wait, without a second signal, and is not retired on that pass.
         self.open_record('drain-requested')
         self.adapter.current={'identity':{'pid':30,'start':'later'},'generation':'new','healthy':True,'stopped':False,'childrenStopped':False}
-        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'attention')
+        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'draining')
+        self.assertNotIn('drain',self.adapter.calls)
         self.assertEqual(self.archives('retired'),[])
 
     def test_own_start_of_the_current_target_completes_with_its_checks(self):
@@ -674,5 +686,262 @@ SupportSupervisor.rpc = rpc
     def local_task_ids(self): '''+body+'\n')
             self.assertNotIn('localTasks',published)
             self.assertNotIn('service',published)
+
+NEW={'consumer':'c2','dispatcher':'d2','credential':'cred'}
+
+class DesiredRunAdapter(Adapter):
+    """The local manager reports central desired state; the checkout reports what is installed."""
+    def __init__(self):
+        super().__init__()
+        self.installed_versions={'consumer':'c1','dispatcher':'d1'}
+        self.set_run(None)
+    def set_run(self,run,known=True):
+        self.state['desiredState']={'mode':'central','known':known,'projects':{PROJECT:{'run':run}}}
+    def installed(self,p):return dict(self.installed_versions)
+    def update(self,p,d):
+        self.calls.append('update')
+        if isinstance(d,dict):self.installed_versions={'consumer':d['consumer'],'dispatcher':d['dispatcher']}
+    def start(self,p,generation=None):
+        self.calls.append('start');self.current={'identity':{'pid':21},'generation':NEW,'healthy':True,'stopped':False,'childrenStopped':False}
+    def verify(self,p,d):return self.current['generation']==d and self.current['healthy']
+
+class DesiredRunTests(unittest.TestCase):
+    def setUp(self):
+        self.directory=Path(tempfile.mkdtemp());self.adapter=DesiredRunAdapter();self.now=[1000]
+        clock=lambda:self.now[0]
+        self.worker=module.Supervisor(self.directory,self.adapter,clock,housekeeping=quiet(self.directory,clock),monotonic=clock)
+    def receipt(self):return self.directory/'org_core.json'
+    def stop_board(self):self.adapter.current.update(stopped=True,childrenStopped=True,healthy=None,generation=None)
+
+    def test_rollout_installs_on_a_stopped_board_but_never_starts_it(self):
+        self.adapter.set_run('stopped');self.stop_board()
+        result=self.worker.tick(PROJECT,NEW)
+        self.assertEqual(result['phase'],'stopped')
+        self.assertIn('Installed the desired versions',result['reason'])
+        self.assertEqual(self.adapter.calls,['update'])
+        # Installed once: later passes neither update again nor start.
+        for _ in range(3):self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'stopped')
+        self.assertEqual(self.adapter.calls,['update'])
+        self.assertFalse(self.receipt().exists())
+
+    def test_a_stopped_board_picks_up_the_new_version_when_it_next_starts(self):
+        self.adapter.set_run('stopped');self.stop_board()
+        self.worker.tick(PROJECT,{'consumer':'c1','dispatcher':'d1','credential':'cred'})
+        self.assertEqual(self.adapter.calls,[])
+        self.adapter.set_run('running')
+        self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'verifying')
+        self.assertEqual(self.adapter.calls,['update','start'])
+        self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'complete')
+
+    def test_desired_stop_drains_once_and_stays_stopped_after_jobs_finish(self):
+        self.adapter.current['generation']=NEW
+        self.adapter.installed_versions={'consumer':'c2','dispatcher':'d2'}
+        self.adapter.set_run('stopped')
+        result=self.worker.tick(PROJECT,NEW)
+        self.assertEqual(result['phase'],'draining')
+        self.assertIn('Stopping as desired',result['reason'])
+        self.assertEqual(json.loads(self.receipt().read_text())['intent'],'stop')
+        self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'draining')
+        self.stop_board()
+        result=self.worker.tick(PROJECT,NEW)
+        self.assertEqual(result['phase'],'stopped')
+        self.assertFalse(self.receipt().exists())
+        for _ in range(3):self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'stopped')
+        self.assertEqual(self.adapter.calls,['drain'])
+
+    def test_a_stop_set_during_an_update_drain_installs_but_does_not_start(self):
+        self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'draining')
+        self.adapter.set_run('stopped')
+        self.stop_board()
+        self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'stopped')
+        self.assertEqual(self.adapter.calls,['drain','update'])
+
+    def test_unknown_desired_state_holds_updates_and_starts(self):
+        self.adapter.set_run(None,known=False)
+        result=self.worker.tick(PROJECT,NEW)
+        self.assertEqual(result['phase'],'current')
+        self.assertIn('desired state',result['reason'])
+        self.assertEqual(self.adapter.calls,[])
+        # An update drain already under way waits after the stop instead of starting.
+        self.adapter.set_run(None)
+        self.worker.tick(PROJECT,NEW)
+        self.adapter.set_run(None,known=False);self.stop_board()
+        self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'draining')
+        self.assertEqual(self.adapter.calls,['drain'])
+        self.adapter.set_run(None)
+        self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'complete')
+        self.assertEqual(self.adapter.calls,['drain','update','start'])
+
+    def test_without_a_run_state_a_stopped_board_stays_stopped(self):
+        self.stop_board()
+        self.assertEqual(self.worker.tick(PROJECT,NEW),{'phase':'stopped','project':PROJECT})
+        self.assertEqual(self.adapter.calls,[])
+
+    def test_a_deliberately_stopped_board_is_not_a_health_failure(self):
+        self.adapter.current['generation']=NEW
+        self.adapter.set_run(None)
+        module.atomic(self.receipt(),{'phase':'complete','project':PROJECT,'desired':NEW,'verified':1000,'created':900,'claims':{},'policy':['mac',False,[]]})
+        self.adapter.set_run('stopped')
+        self.stop_board()
+        for _ in range(3):
+            self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'stopped');self.now[0]+=CONFIRM
+        self.assertFalse(self.receipt().exists())
+
+    def test_a_health_latch_on_a_board_stopped_as_desired_is_retired(self):
+        module.atomic(self.receipt(),{'phase':'attention','latch':'health','reason':module.HEALTH_LATCH_REASON,'project':PROJECT,'desired':NEW,'verified':1000,'created':900})
+        self.stop_board()
+        self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'attention')
+        self.adapter.set_run('stopped')
+        self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'stopped')
+        self.assertFalse(self.receipt().exists())
+        self.assertEqual(len(list(self.directory.glob('auto-retired-*'))),1)
+
+    def test_an_unsent_signal_is_retried_and_never_reported_uncertain(self):
+        def refuse(p,i):
+            self.adapter.calls.append('drain')
+            error=RuntimeError('Dispatcher changed before signalling');error.signal_not_sent=True;raise error
+        self.adapter.drain=refuse
+        result=self.worker.tick(PROJECT,NEW)
+        self.assertEqual(result['phase'],'signal-failed')
+        self.assertIn('Nothing was signalled',result['reason'])
+        self.assertFalse(self.receipt().exists())
+        self.adapter.drain=lambda p,i:self.adapter.calls.append('drain')
+        self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'draining')
+        self.assertEqual(self.adapter.calls,['drain','drain'])
+
+    def test_an_unconfirmed_signal_waits_for_exit_without_a_second_signal(self):
+        def timeout(p,i):
+            self.adapter.calls.append('drain');raise subprocess.TimeoutExpired('podman',90)
+        self.adapter.drain=timeout
+        result=self.worker.tick(PROJECT,NEW)
+        self.assertEqual(result['phase'],'draining')
+        self.assertIn('unconfirmed',result['reason'])
+        self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'draining')
+        self.stop_board()
+        # It may have been stopped by hand, so without a run state it is not started.
+        self.assertEqual(self.worker.tick(PROJECT,NEW)['reason'],module.EXITED_UNCONFIRMED_REASON)
+        self.assertEqual(self.adapter.calls,['drain'])
+
+    def test_older_uncertain_drain_records_become_a_wait(self):
+        module.atomic(self.receipt(),{'phase':'attention','reason':'Drain acknowledgement uncertain. No second signal sent.','project':PROJECT,'desired':NEW,
+            'identity':{'pid':20,'start':'birth'},'childGroups':[],'created':1000-8*3600,'claims':{},'policy':['mac',False,['other/repo']]})
+        result=self.worker.tick(PROJECT,NEW)
+        self.assertEqual(result['phase'],'draining')
+        self.assertNotIn('drain',self.adapter.calls)
+        # The six-hour limit counts from the conversion, not from the old record.
+        self.now[0]+=3600
+        self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'draining')
+        self.now[0]+=6*3600
+        self.assertEqual(self.worker.tick(PROJECT,NEW)['reason'],module.SIX_HOUR_REASON)
+        self.assertNotIn('drain',self.adapter.calls)
+
+    def test_an_older_uncertain_record_on_a_board_stopped_as_desired_is_retired(self):
+        module.atomic(self.receipt(),{'phase':'attention','reason':'Drain acknowledgement uncertain. No second signal sent.','project':PROJECT,'desired':NEW,
+            'identity':{'pid':20,'start':'birth'},'created':1000})
+        self.adapter.set_run('stopped');self.stop_board()
+        self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'stopped')
+        self.assertFalse(self.receipt().exists())
+        self.assertEqual(self.adapter.calls,['update'])
+
+    def test_a_recorded_central_drain_during_an_update_does_not_stop_the_update(self):
+        self.worker.tick(PROJECT,NEW)
+        self.adapter.state['drainingProjects']=['other/repo',PROJECT]
+        self.adapter.state['projectDrainChanges']=[{'project':PROJECT,'draining':True,'at':2000*1000,'source':'central'}]
+        self.stop_board()
+        self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'complete')
+        # An unexplained change still stops it for inspection.
+        self.setUp()
+        self.worker.tick(PROJECT,NEW)
+        self.adapter.state['drainingProjects']=['other/repo',PROJECT]
+        self.stop_board()
+        self.assertEqual(self.worker.tick(PROJECT,NEW)['reason'],'Operator drain policy changed during operation.')
+
+class ReviewOneTests(unittest.TestCase):
+    setUp=DesiredRunTests.setUp;receipt=DesiredRunTests.receipt;stop_board=DesiredRunTests.stop_board
+    def uncertain_record(self):
+        module.atomic(self.receipt(),{'phase':'attention','reason':'Drain acknowledgement uncertain. No second signal sent.','project':PROJECT,'desired':NEW,
+            'identity':{'pid':20,'start':'birth'},'childGroups':[],'created':1000,'claims':{},'policy':['mac',False,['other/repo']]})
+
+    def test_an_older_uncertain_record_never_starts_a_dispatcher_that_is_already_stopped(self):
+        # Reviewer: a dispatcher stopped by hand during the inspection must not be restarted by a rollout.
+        self.uncertain_record();self.stop_board()
+        for _ in range(3):
+            result=self.worker.tick(PROJECT,NEW)
+            self.assertEqual(result['phase'],'attention')
+            self.assertEqual(result['reason'],module.EXITED_UNCONFIRMED_REASON)
+        self.assertEqual(self.adapter.calls,[])
+        # The operator's start answers it.
+        self.adapter.set_run('running')
+        self.worker.tick(PROJECT,NEW)
+        self.assertEqual(self.adapter.calls,['update','start'])
+
+    def test_an_unconfirmed_signal_with_an_explicit_stop_keeps_it_stopped(self):
+        self.uncertain_record();self.adapter.set_run('stopped');self.stop_board()
+        self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'stopped')
+        self.assertNotIn('start',self.adapter.calls)
+
+    def test_no_start_while_a_bare_in_memory_drain_holds_the_manager(self):
+        self.adapter.state['draining']=True
+        self.adapter.set_run('running');self.stop_board()
+        result=self.worker.tick(PROJECT,NEW)
+        self.assertEqual(result['phase'],'stopped')
+        self.assertIn('in-memory drain',result['reason'])
+        self.assertEqual(self.adapter.calls,[])
+
+    def test_no_start_over_a_reservation_of_an_earlier_session(self):
+        self.adapter.state['runs']=[{'project':PROJECT,'machine':'mac','id':'old'}]
+        self.adapter.set_run('running');self.stop_board()
+        self.assertIn('reservation',self.worker.tick(PROJECT,NEW)['reason'])
+        self.assertEqual(self.adapter.calls,[])
+
+class ReviewTwoTests(unittest.TestCase):
+    setUp=DesiredRunTests.setUp;receipt=DesiredRunTests.receipt;stop_board=DesiredRunTests.stop_board
+
+    def test_a_stop_waiting_for_a_native_task_is_not_retired_each_pass(self):
+        self.adapter.current['generation']=NEW
+        self.adapter.set_run('stopped')
+        self.adapter.helpers_active=lambda project:True
+        for _ in range(4):self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'waiting-for-native-task')
+        self.assertEqual(list(self.directory.glob('auto-retired-*')),[])
+        self.adapter.helpers_active=lambda project:False
+        self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'draining')
+        self.assertEqual(self.adapter.calls,['drain'])
+
+    def test_a_stop_reaches_a_latched_dispatcher_that_still_runs(self):
+        module.atomic(self.receipt(),{'phase':'attention','latch':'health','reason':module.HEALTH_LATCH_REASON,'project':PROJECT,'desired':NEW,'verified':1000,'created':900})
+        self.adapter.set_run('stopped')
+        self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'draining')
+        self.assertEqual(self.adapter.calls,['drain'])
+        # Without a desired stop, the latch still holds and nothing is signalled.
+        self.setUp()
+        module.atomic(self.receipt(),{'phase':'attention','latch':'health','reason':module.HEALTH_LATCH_REASON,'project':PROJECT,'desired':NEW,'verified':1000,'created':900})
+        self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'attention')
+        self.assertEqual(self.adapter.calls,[])
+
+    def test_a_signal_that_keeps_failing_goes_to_attention_after_three_passes(self):
+        def refuse(p,i):
+            self.adapter.calls.append('drain');error=RuntimeError('Configured workload command failed with exit 1');error.signal_not_sent=True;raise error
+        self.adapter.drain=refuse
+        self.assertEqual([self.worker.tick(PROJECT,NEW)['phase'] for _ in range(3)],['signal-failed','signal-failed','attention'])
+        self.assertIn('3 passes in a row',self.worker.tick(PROJECT,NEW)['reason'])
+        self.assertEqual(self.adapter.calls,['drain','drain','drain'])
+
+    def test_unsent_signals_far_apart_do_not_add_up(self):
+        def refuse(p,i):
+            error=RuntimeError('Dispatcher changed before signalling');error.signal_not_sent=True;raise error
+        self.adapter.drain=refuse
+        for _ in range(4):
+            self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'signal-failed');self.now[0]+=7200
+
+    def test_a_dispatcher_that_stopped_before_the_signal_is_not_updated_and_started(self):
+        # The Mac race: gone between the observation and the kill, perhaps by hand.
+        def gone(p,i):
+            self.adapter.calls.append('drain');self.stop_board()
+            error=RuntimeError('Signal refused: ProcessLookupError');error.signal_not_sent=True;raise error
+        self.adapter.drain=gone
+        self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'stopped')
+        self.assertFalse(self.receipt().exists())
+        for _ in range(2):self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'stopped')
+        self.assertEqual(self.adapter.calls,['drain'])
 
 if __name__=='__main__':unittest.main()

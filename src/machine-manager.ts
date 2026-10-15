@@ -1,13 +1,37 @@
 import type {RecoveryTask} from "./recovery-tasks.js";
 import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
-import { listen, readJson, tokenMatches, ownershipRefusal, type FleetClient } from "./fleet-http.js";
+import { listen, readJson, tokenMatches, ownershipRefusal, ServiceError, type FleetClient } from "./fleet-http.js";
+import { effectiveWork, desiredRun, stricter, validateDocument, workRefusal, MACHINE_SCOPE, type DesiredDocument, type DesiredPoll, type WorkState } from "./desired-state.js";
 import { validateStart, validateLimits, type MachineLimits, type FleetRun } from "./fleet-store.js";
-import { scheduleMachine, runnableTickets, acceptsDuringProjectDrain, codexPaused, codexSpaced, isNewTicket, reviewQueue, effectiveReviewQueueLimit, lackingCapabilities, type WorkOffer } from "./machine-scheduler.js";
+import { scheduleMachine, runnableTickets, codexPaused, codexSpaced, isNewTicket, reviewQueue, effectiveReviewQueueLimit, lackingCapabilities, type WorkOffer } from "./machine-scheduler.js";
 import { validateCapabilityReport } from "./ticket-requirements.js";
 
-/** An operator drain or resume command, kept so a supervisor can tell it from an unexplained policy change. */
-export interface ProjectDrainChange { project: string; draining: boolean; at: number }
+/**
+ * An operator drain or resume, kept so a supervisor can tell it from an
+ * unexplained policy change. `source: "central"` marks one the manager
+ * applied from the claim service's desired state.
+ */
+export interface ProjectDrainChange { project: string; draining: boolean; at: number; source?: "central" }
+/** The last desired state document a manager applied, saved in its configuration. */
+export interface CachedDesiredState { document: DesiredDocument; fetchedAt: number }
+/**
+ * Central desired state for a production manager. Without it the manager
+ * keeps its older local behaviour, which library users and tests rely on.
+ */
+export interface DesiredStateOptions {
+  /** From the manager's configuration. Absent until the first document was applied. */
+  cached?: CachedDesiredState;
+  /** Saves the document with the drain policy it implies, atomically. Throws on failure. */
+  persist: (update: { desiredState: CachedDesiredState; drainingProjects: string[]; projectDrainChanges: ProjectDrainChange[] }) => void;
+}
+/**
+ * - central: applied a document fetched from the claim service.
+ * - cached: applying the saved document; the claim service has not answered since start.
+ * - unknown: no saved document and no answer yet. Nothing is granted.
+ * - unsupported: the claim service predates desired state; the older local drains apply.
+ */
+export type DesiredMode = "central" | "cached" | "unknown" | "unsupported";
 export interface MachineConfig extends MachineLimits { machine: string; projects: string[]; drainingProjects?: string[]; projectDrainChanges?: ProjectDrainChange[]; ticketLimit?: number;
   /** New tickets wait while this many owned tickets wait for review. Absent: heavyLimit. 0: no hold. */
   reviewQueueLimit?: number; controlRevision?: string;
@@ -32,8 +56,35 @@ export class MachineManager {
   draining = false;
   /** A fresh manager has heard from no dispatcher yet. Supervisors read this as a reporting gap, not a health failure. */
   readonly startedAt: number;
-  constructor(readonly config: MachineConfig, readonly claims: ClaimService, private readonly now = Date.now) {
+  private desiredMode: DesiredMode | undefined;
+  private desiredDoc: DesiredDocument | undefined;
+  private desiredFetchedAt: number | undefined;
+  private desiredError: string | undefined;
+  private appliedRevision: number | null = null;
+  private applyError: { revision: number; reason: string } | undefined;
+  /**
+   * Saved project drains the central document does not hold yet: all of them
+   * on a manager's first start with desired state, or ones an older manager
+   * wrote after a rollback. Sent until the claim service has answered once.
+   */
+  private pendingImports: Set<string>;
+  /** The same drains, still applied here until a document that holds them is saved. */
+  private localFloor: Set<string>;
+  private refreshing: Promise<void> | undefined;
+  constructor(readonly config: MachineConfig, readonly claims: ClaimService, private readonly now = Date.now, private readonly desired?: DesiredStateOptions) {
     this.startedAt = now();
+    if (desired) {
+      if (!claims.call) throw new Error("Desired state requires the claim service");
+      if (desired.cached) {
+        this.desiredDoc = validateDocument(desired.cached.document, config.machine);
+        this.desiredFetchedAt = desired.cached.fetchedAt;
+        this.appliedRevision = this.desiredDoc.revision;
+        this.desiredMode = "cached";
+      } else this.desiredMode = "unknown";
+    }
+    const saved = (config.drainingProjects ?? []).filter(p => config.projects.includes(p));
+    this.pendingImports = new Set(desired ? saved.filter(p => !this.desiredDoc || effectiveWork(this.desiredDoc.entries, p) === "taking") : []);
+    this.localFloor = new Set(this.pendingImports);
     validateLimits(config);
     if (config.ticketLimit !== undefined && (!Number.isSafeInteger(config.ticketLimit) || config.ticketLimit < 1)) throw new Error("Invalid ticket limit");
     if (config.reviewQueueLimit !== undefined && (!Number.isSafeInteger(config.reviewQueueLimit) || config.reviewQueueLimit < 0)) throw new Error("Invalid review queue limit");
@@ -53,9 +104,125 @@ export class MachineManager {
     persist(next, changes);
     this.config.drainingProjects = next;
     this.config.projectDrainChanges = changes;
+    // Made while the claim service predates desired state: imported once it supports it.
+    if (this.desired) {
+      if (draining) { this.pendingImports.add(project); this.localFloor.add(project); }
+      else { this.pendingImports.delete(project); this.localFloor.delete(project); }
+    }
     // A start already sent to the authority can still commit. Wait for it
     // before acknowledging the drain; subsequent jobs check the new policy.
     try { await this.tickPromise; } catch { /* a lost reply remains reserved */ }
+  }
+  /**
+   * The work state this manager applies to one board. Without central
+   * desired state, or while the claim service predates it, the saved local
+   * project drains apply. With no saved document and no answer yet, nothing
+   * is granted.
+   */
+  work(project: string): WorkState {
+    const local: WorkState = this.config.drainingProjects?.includes(project) ? "tickets-drained" : "taking";
+    if (!this.desired || this.desiredMode === "unsupported") return local;
+    if (this.desiredMode === "unknown" || !this.desiredDoc) return "drained";
+    return stricter(effectiveWork(this.desiredDoc.entries, project), this.localFloor.has(project) ? "tickets-drained" : undefined);
+  }
+  /** Local project drain commands apply only without central desired state. */
+  localDrainsAllowed(): boolean { return !this.desired || this.desiredMode === "unsupported"; }
+  /**
+   * Boards reported as draining, for the supervisor's policy comparison.
+   * Before the first document is known nothing is granted, but the saved
+   * list is reported, so a brief start-up gap is not a policy change.
+   */
+  reportedDraining(): string[] {
+    if (this.desired && this.desiredMode === "unknown") return (this.config.drainingProjects ?? []).filter(p => this.config.projects.includes(p));
+    return this.config.projects.filter(p => this.work(p) !== "taking");
+  }
+  /** Whether the manager may grant at all. False only before the first desired state is known. */
+  desiredKnown(): boolean { return this.desiredMode !== "unknown"; }
+  /** The queue state an offer is held in by drains and stops, or undefined. */
+  private held(offer: WorkOffer, state: { claims: Array<{ ticket: string; machine: string }> }): "desired-state-unknown" | "drained" | "project-draining" | undefined {
+    if (!this.desiredKnown()) return "desired-state-unknown";
+    const refusal = workRefusal(project => this.config.projects.includes(project) ? this.work(project) : "taking", offer,
+      state.claims.some(c => c.ticket === offer.ticket && c.machine === this.config.machine));
+    return refusal === "drained" ? "drained" : refusal === "tickets-drained" ? "project-draining" : undefined;
+  }
+  /**
+   * Fetch this computer's desired state through the outbound claim service
+   * connection, save it, then apply it. The fetch carries what was applied
+   * last, which is the acknowledgement. A failed fetch keeps what applies
+   * now: the saved document, or nothing granted when there is none.
+   */
+  refreshDesired(): Promise<void> {
+    if (!this.desired) return Promise.resolve();
+    if (this.refreshing) return this.refreshing;
+    const work = this.refreshOnce().finally(() => { this.refreshing = undefined; });
+    this.refreshing = work;
+    return work;
+  }
+  private poll(): DesiredPoll {
+    return { projects: this.config.projects, appliedRevision: this.appliedRevision, ...(this.applyError ? { applyError: this.applyError } : {}),
+      ...(this.pendingImports.size ? { localDrains: [...this.pendingImports] } : {}),
+      ...(this.desiredDoc ? { savedEntries: this.desiredDoc.entries.filter(e => e.project === MACHINE_SCOPE || this.config.projects.includes(e.project)).map(e => ({ project: e.project, ...(e.work ? { work: e.work } : {}), ...(e.run ? { run: e.run } : {}) })) } : {}) };
+  }
+  private async refreshOnce(): Promise<void> {
+    let doc: DesiredDocument;
+    try { doc = validateDocument(await this.claims.call!<DesiredDocument>("/machines/desired", this.poll()), this.config.machine); }
+    catch (error) {
+      // A claim service from before this change answers that it has no such
+      // route. It enforces nothing, so the older local drains apply. Any other
+      // failure keeps what applies now.
+      if (error instanceof ServiceError && error.status === 404 && this.desiredMode === "unknown") this.desiredMode = "unsupported";
+      this.desiredError = String((error as Error).message).slice(0, 300);
+      return;
+    }
+    this.desiredError = undefined;
+    // The claim service has imported them now; sending them again would undo
+    // an operator's later resume. They stay applied until a document is saved.
+    this.pendingImports.clear();
+    if (this.appliedRevision !== null && doc.revision < this.appliedRevision) {
+      // A restored or replaced claims database. Its older document could lift
+      // drains this computer holds, so the saved one stays until the operator
+      // changes anything for this computer, which moves the revision past it.
+      this.applyError = { revision: this.appliedRevision, reason: `Central desired state is at revision ${doc.revision}, behind the applied ${this.appliedRevision}, as after a claims database restore. Keeping the saved state until an operator change for this computer.` };
+      return;
+    }
+    const changed = this.desiredMode !== "central" || doc.revision !== this.appliedRevision || this.applyError !== undefined || this.localFloor.size > 0;
+    if (!changed) { this.desiredFetchedAt = this.now(); return; }
+    const before = this.reportedDraining();
+    const draining = this.config.projects.filter(p => effectiveWork(doc.entries, p) !== "taking");
+    const at = this.now();
+    // A supervisor accepts a drain policy difference that a recorded change explains.
+    const flips = this.config.projects.filter(p => before.includes(p) !== draining.includes(p))
+      .map(project => ({ project, draining: draining.includes(project), at, source: "central" as const }));
+    const changes = [...(this.config.projectDrainChanges ?? []), ...flips].slice(-50);
+    try { this.desired!.persist({ desiredState: { document: doc, fetchedAt: at }, drainingProjects: draining, projectDrainChanges: changes }); }
+    catch (error) {
+      // Not saved, so not applied: a restart would not keep it. The claim
+      // service still refuses new grants to drained boards meanwhile.
+      this.applyError = { revision: doc.revision, reason: `Could not save desired state: ${String((error as Error).message).slice(0, 200)}` };
+      return;
+    }
+    this.desiredDoc = doc;
+    this.desiredMode = "central";
+    this.desiredFetchedAt = at;
+    this.config.drainingProjects = draining;
+    this.config.projectDrainChanges = changes;
+    this.localFloor.clear();
+    // A start already sent to the claim service can still commit. Wait for
+    // it before acknowledging; later admissions use the new state.
+    try { await this.tickPromise; } catch { /* a lost reply remains reserved */ }
+    this.appliedRevision = doc.revision;
+    this.applyError = undefined;
+    // Acknowledge now rather than at the next fetch. The next fetch repeats it.
+    try { await this.claims.call!("/machines/desired", this.poll()); } catch { /* sent again with the next fetch */ }
+  }
+  /** What the supervisor and operator see of desired state. */
+  desiredStatus() {
+    if (!this.desired) return undefined;
+    const entries = this.desiredDoc?.entries ?? [];
+    return { mode: this.desiredMode, known: this.desiredKnown(), revision: this.desiredDoc?.revision ?? null, appliedRevision: this.appliedRevision,
+      fetchedAt: this.desiredFetchedAt ?? null, ...(this.desiredError ? { lastError: this.desiredError } : {}), ...(this.applyError ? { applyError: this.applyError } : {}),
+      machine: { work: entries.find(e => e.project === MACHINE_SCOPE)?.work ?? "taking" },
+      projects: Object.fromEntries(this.config.projects.map(p => [p, { work: entries.find(e => e.project === p)?.work ?? null, run: desiredRun(entries, p) ?? null, effectiveWork: this.work(p) }])) };
   }
   offer(project: string, session: string, work: WorkOffer[]): void {
     if (!this.config.projects.includes(project) || !session || session.length > 200 || !Array.isArray(work) || work.length > 5000) throw new Error("Invalid offers");
@@ -84,24 +251,24 @@ export class MachineManager {
   }
   tick(): Promise<void> {
     if (this.tickPromise) return this.tickPromise;
-    if (this.draining) return Promise.resolve();
+    if (this.draining || !this.desiredKnown()) return Promise.resolve();
     const promise = this.tickOnce().finally(() => { this.tickPromise = undefined; });
     this.tickPromise = promise;
     return promise;
   }
   private async tickOnce(): Promise<void> {
     const attempted = new Set<string>();
-    while (!this.draining) {
+    while (!this.draining && this.desiredKnown()) {
       const state = await this.claims.snapshot();
       if (this.draining) break;
       const fresh = [...this.offers.values(),...(this.supportOffers?[this.supportOffers]:[])].filter(o => this.now() - o.at < 180_000).flatMap(o => o.work);
       // Reviews tried this tick still count for the review queue; finished ones do not.
       const unfinished = fresh.filter(o => !this.finished.has(`${o.project}/${o.key}`));
       const offers = unfinished.filter(o => !attempted.has(`${o.project}/${o.key}`));
-      const job = scheduleMachine({ ...this.config, offers, reviewOffers: unfinished, state })[0];
+      const job = scheduleMachine({ ...this.config, ...this.schedulingDrains(), offers, reviewOffers: unfinished, state })[0];
       if (!job) break;
       attempted.add(`${job.project}/${job.key}`);
-      if (!acceptsDuringProjectDrain(job, this.config.machine, this.config.drainingProjects ?? [], state)) continue;
+      if (this.held(job, state)) continue;
       const current=job.supportTaskId?this.supportOffers:this.offers.get(job.project);
       if (!current || !current.work.some(w => w.key === job.key) || this.now() - current.at >= 180_000) continue;
       // A lost reply leaves a durable reservation. grants() recovers that exact
@@ -110,6 +277,11 @@ export class MachineManager {
       const result = await this.claims.start({ ...request, id: offerId(this.config.machine, current.session, job), machine: this.config.machine, session: current.session });
       if (!result.ok && result.reason === "finished") this.finished.add(`${job.project}/${job.key}`);
     }
+  }
+  /** The drain lists the scheduler filters by, from the work state of each board. */
+  private schedulingDrains(): { drainingProjects: string[]; drainedProjects: string[] } {
+    const works = this.config.projects.map(p => [p, this.work(p)] as const);
+    return { drainingProjects: works.filter(([, w]) => w !== "taking").map(([p]) => p), drainedProjects: works.filter(([, w]) => w === "drained").map(([p]) => p) };
   }
   async support(session:string):Promise<Array<{task:RecoveryTask;run:FleetRun}>> {
     if(!this.claims.call||!session||session.length>200) throw new Error('Support scheduling requires a configured operator');
@@ -143,14 +315,17 @@ export class MachineManager {
     const state = await this.claims.snapshot();
     const available = [...this.offers.values(),...(this.supportOffers?[this.supportOffers]:[])].filter(o => this.now() - o.at < 180_000).flatMap(o => o.work);
     const runnableOffers = available.filter(o => !this.finished.has(`${o.project}/${o.key}`));
-    const eligible = new Set(scheduleMachine({ ...this.config, offers: runnableOffers, state }).map(o => `${o.project}/${o.key}`));
+    const eligible = new Set((this.desiredKnown() ? scheduleMachine({ ...this.config, ...this.schedulingDrains(), offers: runnableOffers, state }) : []).map(o => `${o.project}/${o.key}`));
+    const desired = this.desiredStatus();
     const reviewLimit = effectiveReviewQueueLimit(this.config);
     const waitingReview = reviewQueue(this.config.machine, state, runnableOffers);
     const reviewFull = reviewLimit > 0 && waitingReview !== undefined && waitingReview.length >= reviewLimit;
     return { ...(this.config.controlRevision?{controlRevision:this.config.controlRevision}:{}), managerStartedAt: this.startedAt, machine: this.config.machine, heavyLimit: this.config.heavyLimit, combinedLimit: this.config.combinedLimit, ...(this.config.projectHeavyLimits ? { projectHeavyLimits: this.config.projectHeavyLimits } : {}), ticketLimit: this.config.ticketLimit ?? null,
       // tickets is null when the claim service predates the report; nothing is held then.
-      reviewQueue: { limit: reviewLimit, tickets: waitingReview ?? null, full: reviewFull }, capabilities: this.config.capabilities ?? [], runnableTicketCount: runnableTickets(this.config.machine, runnableOffers, state).size, draining: this.draining, drainingProjects: this.config.drainingProjects ?? [], projectDrainChanges: this.config.projectDrainChanges ?? [], ...state,
-      projects: this.config.projects.map(project => ({ project, draining: this.config.drainingProjects?.includes(project) ?? false, lastSeen: this.offers.get(project)?.at ?? null, health: !this.offers.has(project) ? "not-registered" : this.now() - this.offers.get(project)!.at >= 180_000 ? "dispatcher-unreachable" : "reporting" })),
+      reviewQueue: { limit: reviewLimit, tickets: waitingReview ?? null, full: reviewFull }, capabilities: this.config.capabilities ?? [], runnableTicketCount: runnableTickets(this.config.machine, runnableOffers, state).size, draining: this.draining,
+      // Every board that is not taking work, so a supervisor sees a central drain as a policy change it can explain.
+      drainingProjects: this.reportedDraining(), projectDrainChanges: this.config.projectDrainChanges ?? [], ...(desired ? { desiredState: desired } : {}), ...state,
+      projects: this.config.projects.map(project => ({ project, draining: this.work(project) !== "taking", work: this.work(project), ...(desired ? { desiredRun: desired.projects[project].run } : {}), lastSeen: this.offers.get(project)?.at ?? null, health: !this.offers.has(project) ? "not-registered" : this.now() - this.offers.get(project)!.at >= 180_000 ? "dispatcher-unreachable" : "reporting" })),
       attention: state.runs.filter(r => r.machine === this.config.machine && this.now() - r.created >= 3 * 3600000)
         .map(r => ({ ticket: r.ticket, runId: r.id, reason: "Reservation older than three hours; verify worker progress before intervening" })),
       queue: available.map(o => ({ ticket: o.ticket, role: o.role, resource: o.resource, ...(o.parentTicket ? { parentTicket: o.parentTicket } : {}),
@@ -158,7 +333,8 @@ export class MachineManager {
           : state.runs.some(r => r.ticket === o.ticket) ? "reserved-or-running"
           : this.draining ? "draining"
           : state.claims.some(c => c.ticket === o.ticket && c.machine !== this.config.machine) ? "owned-elsewhere"
-          : !acceptsDuringProjectDrain(o, this.config.machine, this.config.drainingProjects ?? [], state) ? "project-draining"
+          // A central drain or stop, a saved project drain, or no desired state yet.
+          : this.held(o, state) ? this.held(o, state)!
           // No computer that reported recently can run it, or only another one can.
           : lackingCapabilities(o, state, this.config.capabilities).length
             ? (state.noCapableMachine?.some(g => g.ticket === o.ticket) ? "no-capable-machine" : "missing-capability")
@@ -212,6 +388,8 @@ export async function serveManager(manager: MachineManager, projectTokens: Recor
       if (req.url === "/project-drain") {
         if (!admin) return send(403, { error: "Operator credential required" });
         if (!persistDrains) throw new Error("Persistent project drains are not configured");
+        // A local drain here would be overwritten by the next central document.
+        if (!manager.localDrainsAllowed()) return send(409, { error: "Project drains are central now: use drain --machine MACHINE --project PROJECT --tickets, or resume" });
         await manager.setProjectDraining(body.project, body.draining, persistDrains);
         return send(200, { ok: true, drainingProjects: manager.config.drainingProjects });
       }

@@ -70,6 +70,8 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
       if (req.method === "GET" && req.url === "/operations/desired") return send(200, desired?.() ?? {});
       if (req.method === "GET" && req.url === "/operations/control") return send(200,{desired:store.controlTarget(),centralLoaded:controlRevision});
       if (req.method === "GET" && req.url === "/operations/reports") return send(200, store.operations.list());
+      // Desired against observed for every computer and board, with acknowledgements.
+      if (req.method === "GET" && req.url === "/desired") return send(200, { machines: store.desired.report(store.operations.list()), attention: store.desired.attention(store.operations.list()) });
       if (req.method === "GET" && req.url === "/tasks/orphaned") return send(200, store.orphans.list());
       if (req.method === "GET" && req.url === "/state") return send(200, {...store.snapshot(), features:{recoveryTasks:true,...(evidence?{evidence:true}:{})},requiredRepairs:store.requiredRepairs(),...(evidence?{evidenceStore:evidence.cachedUsage()}:{})});
       if (req.method === "GET" && req.url === "/runner") return send(200, store.runnerPolicy() ?? null);
@@ -116,6 +118,17 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
         // Starts the orphan clock between operator reads. A failure here must never refuse the report.
         try { store.orphans.observe(); } catch { /* observed again on the next report */ }
         return send(200, {ok:true});
+      }
+      // A manager's fetch of its own desired state, carrying what it has applied.
+      // The machine credential names the computer, so it reads only its own.
+      if (req.url === '/machines/desired') {
+        if (!machine) return send(403, { error: 'Machine credential required' });
+        return send(200, store.desiredPoll(machine, body));
+      }
+      // The operator's drain, resume, stop and start. Nothing else can be set.
+      if (req.url === '/desired/set') {
+        if (!isAdmin) return send(403, { error: 'Operator credential required' });
+        return send(200, store.setDesired(body));
       }
       if (req.url === '/machines/capabilities') {
         const actor = isAdmin ? body.machine : machine;

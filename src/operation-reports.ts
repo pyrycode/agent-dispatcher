@@ -1,7 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { scrubCredentials } from './agent-runtime.js';
 
-export const OPERATION_PHASES: readonly string[] = ['current','stopped','drain-requested','draining','start-requested','verifying','complete','attention','preflight-failed','changed-before-drain','waiting-for-native-task'];
+export const OPERATION_PHASES: readonly string[] = ['current','stopped','drain-requested','draining','start-requested','verifying','complete','attention','preflight-failed','changed-before-drain','waiting-for-native-task','signal-failed'];
 
 const AUTOMATIC_CHANGES = ['health-latch-cleared','operation-retired','native-task-unrecoverable','native-task-skipped','native-task-interrupted','native-task-deferred',
   'native-task-finalized','watchdog-stalled','watchdog-starvation','watchdog-finalize-refused'];

@@ -17,7 +17,8 @@ import { githubResponse } from "./github-transport.js";
 import { configureGitHubCLI, serveGitHubBridge } from "./github-bridge.js";
 import { FleetUpdates } from "./fleet-updates.js";
 import { recoveryReport } from "./recovery-report.js";
-import { persistProjectDrains } from "./fleet-config.js";
+import { persistProjectDrains, persistDesiredState } from "./fleet-config.js";
+import { parseDesiredCommand } from "./desired-state.js";
 import { ServiceShutdown, SHUTDOWN_DEADLINE_MS } from "./service-shutdown.js";
 import { machineCapabilities, capabilityAttention, CAPABILITY_REPORT_INTERVAL_MS } from "./ticket-requirements.js";
 import { readCodexThrottleConfig, codexPauseAttention, type CodexPauseState } from "./codex-throttle.js";
@@ -35,8 +36,8 @@ function shutdownDeadline(seconds: unknown): number {
 }
 async function main(): Promise<void> {
   const [command, configPath, ...args] = process.argv.slice(2);
-  if (!configPath || !["workflow", "control", "recovery-task", "claims", "manager", "status", "runner", "codex", "desired", "attention", "report-attention", "pause", "coordination", "recovery", "drain", "drain-project", "resume-project", "free"].includes(command)) {
-    throw new Error("Usage: fleet-bin.ts claims|manager|status|runner|codex|recovery|drain|drain-project|resume-project|free CONFIG [claude|codex|local | PROJECT | TICKET GENERATION --confirmed-stopped]");
+  if (!configPath || !["workflow", "control", "recovery-task", "claims", "manager", "status", "runner", "codex", "desired", "attention", "report-attention", "pause", "coordination", "recovery", "drain", "resume", "stop", "start", "desired-state", "drain-project", "resume-project", "free"].includes(command)) {
+    throw new Error("Usage: fleet-bin.ts claims|manager|status|runner|codex|recovery|drain|resume|stop|start|desired-state|drain-project|resume-project|free CONFIG [claude|codex|local | PROJECT | --machine MACHINE|--all-machines [--project PROJECT] | TICKET GENERATION --confirmed-stopped]");
   }
   const config = JSON.parse(readFileSync(configPath, "utf8"));
   if(command==='workflow') {
@@ -172,10 +173,25 @@ async function main(): Promise<void> {
   }
   if (command === "manager") {
     const claims = new FleetClient(config.claimsUrl, secret(config.claimsTokenEnv));
-    const manager = new MachineManager({ machine: config.machine, heavyLimit: config.heavyLimit, combinedLimit: config.combinedLimit, ...(config.projectHeavyLimits !== undefined ? { projectHeavyLimits: config.projectHeavyLimits } : {}), ticketLimit: config.ticketLimit ?? 2, ...(config.reviewQueueLimit != null ? { reviewQueueLimit: config.reviewQueueLimit } : {}), controlRevision: execFileSync("git",["rev-parse","HEAD"],{cwd:resolve(fileURLToPath(new URL("..",import.meta.url))),encoding:"utf8"}).trim(), capabilities: machineCapabilities(config.capabilities), projects: config.projects.map((p: any) => p.repo), drainingProjects: config.drainingProjects, projectDrainChanges: config.projectDrainChanges }, claims);
+    const manager = new MachineManager({ machine: config.machine, heavyLimit: config.heavyLimit, combinedLimit: config.combinedLimit, ...(config.projectHeavyLimits !== undefined ? { projectHeavyLimits: config.projectHeavyLimits } : {}), ticketLimit: config.ticketLimit ?? 2, ...(config.reviewQueueLimit != null ? { reviewQueueLimit: config.reviewQueueLimit } : {}), controlRevision: execFileSync("git",["rev-parse","HEAD"],{cwd:resolve(fileURLToPath(new URL("..",import.meta.url))),encoding:"utf8"}).trim(), capabilities: machineCapabilities(config.capabilities), projects: config.projects.map((p: any) => p.repo), drainingProjects: config.drainingProjects, projectDrainChanges: config.projectDrainChanges }, claims, Date.now,
+      // Central desired state: the saved copy applies from the start, and with
+      // none nothing is granted until the claim service has answered.
+      { ...(config.desiredState ? { cached: config.desiredState } : {}), persist: update => persistDesiredState(configPath, update) });
     const tokens = Object.fromEntries(config.projects.map((p: any) => [p.repo, secret(p.tokenEnv)]));
     const endpoint = config.socketPath ? resolve(config.socketPath) : config.port ?? 7431;
     const server = await serveManager(manager, tokens, secret(config.operatorTokenEnv), endpoint, config.host ?? "127.0.0.1", (projects, changes) => persistProjectDrains(configPath, projects, changes));
+    // Desired state comes over this manager's own outbound connection, so a
+    // computer the claim service cannot reach, such as the Mac, still gets it.
+    let desiredFailed = false;
+    const fetchDesired = () => void manager.refreshDesired().then(() => {
+      const status = manager.desiredStatus();
+      if (status?.lastError && !desiredFailed) console.warn(`Desired state fetch failed (${status.mode}):`, status.lastError);
+      else if (!status?.lastError && desiredFailed) console.log(`Desired state fetched again (${status?.mode}, revision ${status?.revision})`);
+      desiredFailed = !!status?.lastError;
+    });
+    fetchDesired();
+    const desiredTimer = setInterval(fetchDesired, 15_000);
+    console.log("Desired state at start:", manager.desiredStatus()?.mode, manager.desiredKnown() ? "" : "(nothing is granted until the claim service answers)");
     const timer = setInterval(() => { void manager.tick().catch(e => console.error("Scheduling paused:", e.message)); }, 1000);
     // Logged once per change between failing and working, not every minute.
     let reportFailed = false;
@@ -189,7 +205,7 @@ async function main(): Promise<void> {
     report();
     const capabilityTimer = setInterval(report, CAPABILITY_REPORT_INTERVAL_MS);
     console.log("Machine capabilities", (manager.config.capabilities ?? []).join(", ") || "none");
-    const close = () => { manager.draining = true; clearInterval(timer); clearInterval(capabilityTimer); server.close(() => process.exit(0)); };
+    const close = () => { manager.draining = true; clearInterval(timer); clearInterval(capabilityTimer); clearInterval(desiredTimer); server.close(() => process.exit(0)); };
     process.on("SIGTERM", close); process.on("SIGINT", close);
     console.log("Machine manager listening", server.address());
     return;
@@ -206,6 +222,13 @@ async function main(): Promise<void> {
     const record = JSON.parse(readFileSync(args[0], "utf8"));
     const claims = new JsonClient(config.claimsUrl, secret(config.claimsOperatorTokenEnv ?? config.claimsTokenEnv));
     console.log(JSON.stringify(await claims.call(`/recovery/operator-${command}`, { record })));
+    return;
+  }
+  if (command === "desired-state" || ["resume", "stop", "start"].includes(command) || (command === "drain" && args.length)) {
+    const claims = new JsonClient(config.claimsUrl, secret(config.claimsOperatorTokenEnv ?? config.claimsTokenEnv));
+    if (command === "desired-state") { if (args.length) throw new Error("desired-state takes no arguments"); console.log(JSON.stringify(await claims.call("/desired"), null, 2)); return; }
+    const request = parseDesiredCommand(command, args)!;
+    console.log(JSON.stringify(await claims.call("/desired/set", request), null, 2));
     return;
   }
   const managerUrl = config.managerUrl ?? (config.socketPath ? `unix://${resolve(config.socketPath)}` : undefined);
@@ -237,16 +260,44 @@ async function main(): Promise<void> {
     // Near the cap, the store is evicting evidence other computers may still need.
     const evidence = (state.evidenceStore ?? null) as EvidenceUsage | null;
     const evidenceStore = evidence?.nearCap ? { ...evidence, attention: `Shared evidence store at ${Math.round(evidence.usedRatio * 100)}% of its ${Math.round(evidence.limits.totalBytes / 1024 / 1024)} MiB cap; the oldest bundles are being evicted early` } : undefined;
-    console.log(JSON.stringify({...recoveryReport(incidents, state),operationReports:operations,orphanedTasks:orphaned,...(orphanedError ? {orphanedTasksError:orphanedError} : {}),...(codexPause ? {codexPause} : {}),...(capabilityGaps.length ? {capabilityGaps} : {}),...(evidenceStore ? {evidenceStore} : {})}, null, 2)); return;
+    const desired = await fleetDesired(config);
+    console.log(JSON.stringify({...recoveryReport(incidents, state),operationReports:operations,
+      // Central drains and stops not yet applied, or failed.
+      ...("fleetDesiredState" in desired ? { desiredState: desired.fleetDesiredState.attention } : { desiredState: null, desiredStateError: desired.fleetDesiredStateError }),orphanedTasks:orphaned,...(orphanedError ? {orphanedTasksError:orphanedError} : {}),...(codexPause ? {codexPause} : {}),...(capabilityGaps.length ? {capabilityGaps} : {}),...(evidenceStore ? {evidenceStore} : {})}, null, 2)); return;
   }
-  if (command === "drain") { await client.call("/drain", {}); console.log("Draining: no new grants. Existing grants remain reserved."); }
+  if (command === "drain") {
+    await client.call("/drain", {});
+    console.log("Draining: no new grants. Existing grants remain reserved.");
+    console.warn("This drain is in this manager's memory only: a manager restart, as on a controller rollout, lifts it, and its dispatchers exit. Use drain --machine MACHINE for a saved central drain.");
+  }
   else if (command === "drain-project" || command === "resume-project") {
     if (args.length !== 1) throw new Error(`${command} requires PROJECT`);
     const draining = command === "drain-project";
-    await client.call("/project-drain", { project: args[0], draining });
+    const state = await client.call<any>("/state");
+    // A manager with central desired state takes the same change from the claim service.
+    if (state.desiredState && state.desiredState.mode !== "unsupported") {
+      const claims = new JsonClient(config.claimsUrl, secret(config.claimsOperatorTokenEnv ?? config.claimsTokenEnv));
+      console.log(JSON.stringify(await claims.call("/desired/set", { machines: [state.machine], project: args[0], change: { work: draining ? "tickets-drained" : "taking" } }), null, 2));
+    } else await client.call("/project-drain", { project: args[0], draining });
     console.log(draining ? `Draining ${args[0]}: existing owned tickets continue; no new tickets or main sweeps. Saved across manager restarts.` : `Resumed ${args[0]}: new tickets are eligible again.`);
   }
   // status carries the shared evidence store's usage as evidenceStore, from the claim service's snapshot.
-  else console.log(JSON.stringify(await client.call(command === "recovery" ? "/recovery/state" : "/state"), null, 2));
+  else if (command === "recovery") console.log(JSON.stringify(await client.call("/recovery/state"), null, 2));
+  else {
+    // Desired against observed for every computer comes from the claim
+    // service. Its failure never hides the local state, and is not "none".
+    // `status --local`, which the supervisor reads many times a pass, skips it.
+    if (args.length > 1 || (args.length === 1 && args[0] !== "--local")) throw new Error("status takes only --local");
+    const [state, fleet] = await Promise.all([client.call<any>("/state"), args[0] === "--local" ? {} : fleetDesired(config)]);
+    console.log(JSON.stringify({ ...state, ...fleet }, null, 2));
+  }
+}
+/** The claim service's desired state report, or the reason it is unavailable. */
+async function fleetDesired(config: any): Promise<{ fleetDesiredState: { machines: unknown[]; attention: unknown[] } } | { fleetDesiredStateError: string }> {
+  try {
+    if (!config.claimsUrl) return { fleetDesiredStateError: "No claimsUrl in this operator configuration" };
+    const claims = new JsonClient(config.claimsUrl, secret(config.claimsOperatorTokenEnv ?? config.claimsTokenEnv));
+    return { fleetDesiredState: await claims.call("/desired") };
+  } catch (error) { return { fleetDesiredStateError: String((error as Error).message).slice(0, 300) }; }
 }
 main().catch(error => { console.error(error.message); process.exitCode = 1; });
