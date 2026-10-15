@@ -3998,9 +3998,11 @@ class LegacyRemovalIncomplete extends Error {}
 /** Processes whose working directory or an open file is inside `path`. Linux
  * reads /proc; elsewhere `lsof` lists every open file. Only processes this
  * dispatcher may inspect are seen: its own user's, in its own container or
- * PID namespace. Throws when neither source can be read, which the caller
- * treats as a blocker. */
-export function processesUsingPath(path: string): number[] {
+ * PID namespace. Throws when inspection fails or lsof output is incomplete,
+ * which the caller treats as a blocker. Options let tests exercise macOS on
+ * a Linux repair host. */
+export function processesUsingPath(path: string, options: { platform?: NodeJS.Platform; spawnSync?: typeof spawnSync } = {}): number[] {
+  const platform = options.platform ?? process.platform;
   let root = path;
   try { root = realpathSync(path); } catch { /* compare the path as given */ }
   const inside = (target: string) => {
@@ -4008,7 +4010,7 @@ export function processesUsingPath(path: string): number[] {
     return [root, path].some(base => name === base || name.startsWith(`${base}/`));
   };
   const found = new Set<number>();
-  if (existsSync("/proc/self/cwd")) {
+  if (platform === "linux" && existsSync("/proc/self/cwd")) {
     for (const entry of readdirSync("/proc")) {
       if (!/^\d+$/.test(entry)) continue;
       const pid = Number(entry);
@@ -4021,13 +4023,28 @@ export function processesUsingPath(path: string): number[] {
     }
     return [...found];
   }
-  const listing = spawnSync("lsof", ["-b", "-w", "-n", "-P", "-Fpn"], { encoding: "utf-8", maxBuffer: 256 * 1024 * 1024, timeout: 60_000 });
-  if (listing.error || typeof listing.stdout !== "string" || listing.stdout.length === 0) throw new Error(`lsof failed: ${listing.error ?? listing.stderr}`);
-  let pid = 0;
+  // launchd/manager environments need not include /usr/sbin in PATH.
+  const listing = (options.spawnSync ?? spawnSync)(platform === "darwin" ? "/usr/sbin/lsof" : "lsof", ["-b", "-w", "-n", "-P", "-Fpn"], { encoding: "utf-8", maxBuffer: 256 * 1024 * 1024, timeout: 60_000 });
+  if (listing.error || listing.status !== 0 || listing.signal) throw new Error(`lsof failed: ${listing.error ?? `exit ${listing.status}, signal ${listing.signal}: ${listing.stderr}`}`);
+  if (typeof listing.stdout !== "string" || !listing.stdout.endsWith("\n")) throw new Error("lsof failed: incomplete output");
+  let pid: number | undefined;
+  let hasName = false;
   for (const line of listing.stdout.split("\n")) {
-    if (line.startsWith("p")) pid = Number(line.slice(1));
-    else if (line.startsWith("n") && inside(line.slice(1))) found.add(pid);
+    if (line.startsWith("p")) {
+      if (pid !== undefined && !hasName) throw new Error("lsof failed: incomplete process record");
+      pid = Number(line.slice(1));
+      if (!/^\d+$/.test(line.slice(1)) || !Number.isSafeInteger(pid)) throw new Error("lsof failed: invalid process record");
+      hasName = false;
+    } else if (line.startsWith("n")) {
+      if (pid === undefined || line.length === 1) throw new Error("lsof failed: incomplete file record");
+      hasName = true;
+      if (inside(line.slice(1))) found.add(pid);
+    } else if (line) {
+      // Older lsof versions also emit descriptor fields even without -Ff.
+      if (!(pid !== undefined && /^f.+$/.test(line))) throw new Error("lsof failed: unexpected output");
+    }
   }
+  if (pid === undefined || !hasName) throw new Error("lsof failed: incomplete process record");
   return [...found];
 }
 
