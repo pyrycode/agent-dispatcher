@@ -676,8 +676,9 @@ removes the label once none is worth waiting for, with a comment giving their
 outcome, and leaves `native-task:waited` in its place. The ticket keeps its
 column, so the builder runs again, reads the result, commits the evidence or
 fixes what it shows, and hands over. That handover does not wait again, whatever
-it requested, and removes the marker; a rework that sends the ticket back may
-hold once more.
+it requested, and removes the marker; a rework route also removes it, so a ticket
+sent back may hold once more. Done cleanup removes both labels from a ticket
+moved to Done by hand.
 
 A task stops holding when it completes or fails. The claim service has no
 cancelled state: a repair withdrawn at the repair cap, and a worker the

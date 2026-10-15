@@ -426,7 +426,9 @@ export function decideReworkRoutes(
           label,
           ...item.labels.filter(l =>
             l !== label &&
-            (l.startsWith("done:") || l.startsWith("wip:") || l.startsWith("error:") || l === MERGE_HANDOFF_LABEL),
+            (l.startsWith("done:") || l.startsWith("wip:") || l.startsWith("error:") || l === MERGE_HANDOFF_LABEL
+              // A rework starts a new handover, which may wait for native tasks again.
+              || l === NATIVE_TASK_WAITED_LABEL),
           ),
         ];
 
@@ -1322,7 +1324,8 @@ export interface DoneCleanup {
  *     go; a family whose root reaches Done and later re-opens should not
  *     wear a stale badge)
  *   - the `native-task:waited` marker, which only means something before
- *     the stage's next handover (native-task-hold.ts)
+ *     the stage's next handover, and a `held:native-task` left on a ticket
+ *     moved to Done by hand: no stage runs there (native-task-hold.ts)
  *
  * Does NOT touch:
  *   - `size:`, `priority:`, `merged`, or any free-form tag
@@ -1357,7 +1360,8 @@ export function decideDoneCleanup(
           || l.startsWith(REWORK_OTHER_PREFIX)
           || l.startsWith(ERROR_RETRY_COUNT_PREFIX)
           || l.startsWith(FAMILY_DISPATCH_COUNT_PREFIX)
-          || l === NATIVE_TASK_WAITED_LABEL),
+          || l === NATIVE_TASK_WAITED_LABEL
+          || l === NATIVE_TASK_HOLD_LABEL),
     );
 
     if (labelsToStrip.length === 0) continue;

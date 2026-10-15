@@ -38,7 +38,9 @@ test("every role reads and awaits its own ticket's native task, only builders re
   const asRole = async <T>(issue: number, role: string, resource: "light" | "medium" | "heavy", work: () => Promise<T>): Promise<T> => {
     managed.beginCycle();
     const offer = managed.offer(issue, role, resource);
-    await managed.endCycle(); await manager.tick(); await managed.sync();
+    await managed.endCycle();
+    // The dispatcher's own 2 s sync can be in flight and make ours a no-op.
+    for (let i = 0; i < 40 && !managed.ready(offer); i++) { await manager.tick(); await managed.sync(); if (!managed.ready(offer)) await new Promise(r => setTimeout(r, 50)); }
     assert.equal(managed.ready(offer), true, role);
     return managed.run(offer, work);
   };
@@ -89,11 +91,8 @@ test("every role reads and awaits its own ticket's native task, only builders re
   // While the task is open the claim service admits no stage on the ticket
   // (FleetStore.startAdmitted), which is what started #1998's verifier only
   // at 13:00. Unchanged by the hold.
-  managed.beginCycle();
-  const early = managed.offer(40, "verifier", "light");
-  await managed.endCycle(); await manager.tick(); await managed.sync();
-  assert.equal(managed.ready(early), false, "no verifier while the builder's task is open");
-  managed.beginCycle(); await managed.endCycle();
+  assert.deepEqual(store.start({ id: "early-verifier", machine: "box", session: "other", project: "org/core", ticket: "org/core#40", role: "verifier", resource: "light", locks: [] }),
+    { ok: false, reason: "locked" }, "no verifier while the builder's task is open");
 
   // The Mac runs the check; its worker's state is uncertain for a while.
   store.tasks.report("mac", { capabilities: ["macos-arm64"], ready: true });
@@ -161,7 +160,12 @@ test("a reading role's await waits for a running task of its ticket and returns 
   // released past its bound while the task kept running.
   assert.equal(store.start({ id: "doc-40", machine: "box", session: "s", project: "org/core", ticket: "org/core#40", role: "documentation", resource: "light", locks: [] }).ok, true);
   const run = store.snapshot().runs.find(r => r.id === "doc-40")!;
-  const bridge = await taskBridge(new JsonClient(url(local), "project-token"), run, { request: false, read: true, evidence: false });
+  // Count the reads the service has answered, to complete the task only once
+  // the helper has seen it running.
+  const connection = new JsonClient(url(local), "project-token");
+  let reads = 0;
+  const counting = { call: async (path: string, body?: unknown) => { const reply = await connection.call(path, body); if (path === "/tasks/read") reads++; return reply; } } as unknown as JsonClient;
+  const bridge = await taskBridge(counting, run, { request: false, read: true, evidence: false });
   const directory = mkdtempSync(join(tmpdir(), "native-task-await-"));
   t.after(async () => { await bridge.close(); await close(local); await close(claims); store.close(); rmSync(directory, { recursive: true, force: true }); });
   const task = store.tasks.request("org/core#40", { recipe: "platform-probe", capability: "macos-arm64", reason: "builder's check" }, "builder-run");
@@ -169,9 +173,12 @@ test("a reading role's await waits for a running task of its ticket and returns 
   assert.equal(store.taskStart("mac", task.id, "native").ok, true);
   const out = join(directory, "result");
   const waiting = execute("python3", [helper, "await", task.id, "--out", out, "--timeout", "60"], { env: { PATH: process.env.PATH, PYRY_TASK_SOCKET: bridge.socket } });
-  await new Promise(resolve => setTimeout(resolve, 1500));
+  const until = Date.now() + 30_000;
+  while (reads === 0 && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 50));
+  assert.ok(reads > 0, "the helper read the running task before it finished");
   store.taskComplete("mac", task.id, "native", { outcome: "failed", summary: "Route probe failed on the Mac", files: { "probe.txt": "no route\n" } });
   const finished = JSON.parse((await waiting).stdout);
+  assert.ok(reads >= 2, "it read again after waiting");
   assert.equal(finished.state, "failed");
   assert.equal(readFileSync(join(out, "probe.txt"), "utf8"), "no route\n");
   assert.deepEqual(bridge.requested(), []);
@@ -195,7 +202,8 @@ test("which roles read and which request: every agent reads but a recovery asses
   for (const [role, want] of Object.entries(expected)) {
     managed.beginCycle();
     const offer = managed.offer(issue++, role, "light");
-    await managed.endCycle(); await manager.tick(); await managed.sync();
+    await managed.endCycle();
+    for (let i = 0; i < 40 && !managed.ready(offer); i++) { await manager.tick(); await managed.sync(); if (!managed.ready(offer)) await new Promise(r => setTimeout(r, 50)); }
     assert.equal(managed.ready(offer), true, role);
     await managed.run(offer, async () => {
       const actions = managedBridgeActions();

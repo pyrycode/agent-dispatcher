@@ -3380,6 +3380,19 @@ describe("handlePostRun — failure modes", () => {
       assert.ok(!client.addLabelCalls.some(c => c.label === "done:builder"));
     });
 
+    test("labels that cannot be read hand over without a hold, and still end any wait", async () => {
+      const client = new MockGitHubClient({ status: { 2010: "In Development" }, labels: { 2010: [NATIVE_TASK_WAITED_LABEL] } });
+      client.failures.getIssueLabels = new Error("GitHub 502");
+      let asked = false;
+      const ctx = builderCtx(2010, async () => { asked = true; return { held: [{ id: OPEN.id, task: OPEN }], passed: [] }; }, client);
+
+      await handlePostRun(STREAM_OK(), ctx, false);
+
+      assert.equal(asked, false, "an unknown marker must not hold a second time");
+      assert.ok(client.addLabelCalls.some(c => c.label === "done:builder"));
+      assert.ok(client.removeLabelCalls.some(c => c.label === NATIVE_TASK_WAITED_LABEL), "removed without knowing it was there");
+    });
+
     test("an unknown column after a hold hands over through pending-done and ends the wait", async () => {
       const client = new MockGitHubClient({ status: { 2009: "In Development" }, labels: { 2009: [NATIVE_TASK_WAITED_LABEL] } });
       client.failures.getItemStatus = new Error("GraphQL rate limit");
@@ -13332,7 +13345,9 @@ test("a managed builder whose requested native task is open is held by handlePos
   };
   const admit = async (issue: number) => {
     managed.beginCycle(); const pending = managed.offer(issue, "builder", "medium");
-    await managed.endCycle(); await manager.tick(); await managed.sync();
+    await managed.endCycle();
+    // The dispatcher's own 2 s sync can be in flight and make ours a no-op.
+    for (let i = 0; i < 40 && !managed.ready(pending); i++) { await manager.tick(); await managed.sync(); if (!managed.ready(pending)) await new Promise(r => setTimeout(r, 50)); }
     assert.equal(managed.ready(pending), true); return pending;
   };
 

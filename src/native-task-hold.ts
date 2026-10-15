@@ -168,11 +168,15 @@ function plain(text: string, max: number): string {
   return flat.length > max ? flat.slice(0, max - 3) + "..." : flat;
 }
 
-/** One task as a list line: full id (the helper needs it), recipe, platform, revision, state and summary. */
+/**
+ * One task as a list line: full id (the helper needs it), recipe, platform,
+ * revision, state and summary. The summary sits in a code span, so links and
+ * HTML in it render as text.
+ */
 export function taskLine(task: NativeTaskView, summaryChars = 300): string {
   const revision = task.request?.revision ? `, revision ${plain(task.request.revision.slice(0, 12), 12)}` : "";
   const pending = task.artifactsPending ? " (artifacts still transferring)" : "";
-  const summary = task.result?.summary ? `: ${plain(task.result.summary, summaryChars)}` : "";
+  const summary = task.result?.summary ? `: \`${plain(task.result.summary, summaryChars)}\`` : "";
   return `\`${plain(task.id, 64)}\`, ${plain(task.request?.recipe ?? "unknown recipe", 40)} on ${plain(task.request?.capability ?? "an unknown platform", 40)}${revision}, ${plain(task.state, 20)}${pending}${summary}`;
 }
 
@@ -204,7 +208,7 @@ export function passedComment(agent: string, passed: HandoverHoldDecision["passe
     `\n\n${OPEN_TASK_ADMISSION} The next stages can read a result once it finishes. ` + READ_HINT;
 }
 
-export function releaseComment(release: HoldRelease, tasks: readonly NativeTaskView[], boundMs: number, unreadable = false): string {
+export function releaseComment(release: HoldRelease, tasks: readonly NativeTaskView[], boundMs: number, unreadable = false, handedOver = false): string {
   const bound = formatHoldBound(boundMs);
   const why = boundMs <= 0
     ? `The native task hold is off (\`PYRY_NATIVE_TASK_HOLD_MINUTES=0\`), so the hold is lifted.` +
@@ -220,10 +224,12 @@ export function releaseComment(release: HoldRelease, tasks: readonly NativeTaskV
   const recent = tasks.filter(t => !release.stale.includes(t)).slice(0, 5);
   return `## ▶️ Native task hold released\n\n${why}\n\n` +
     (recent.length > 0 ? `Newest tasks of this ticket:\n\n${recent.map(t => `- ${taskLine(t)}`).join("\n")}\n\n` : "") +
-    (release.stale.length > 0 && !unreadable
-      ? `The ticket keeps its column, so its stage agent runs again once that task is settled. `
-      : `The ticket keeps its column, so its stage agent runs again to read the results and hand over. `) +
-    `Its next handover does not wait again. ` + READ_HINT;
+    (handedOver
+      ? `The ticket already carries its done label, so it moves on to the next stage, which can read the results. `
+      : (release.stale.length > 0 && !unreadable
+        ? `The ticket keeps its column, so its stage agent runs again once that task is settled. `
+        : `The ticket keeps its column, so its stage agent runs again to read the results and hand over. `) +
+        `Its next handover does not wait again. `) + READ_HINT;
 }
 
 /**
@@ -255,8 +261,11 @@ export function nativeTaskReadNote(opts: { helper: string; canRequest: boolean; 
 export interface NativeTaskHoldState { seen: Map<number, number> }
 export function newNativeTaskHoldState(): NativeTaskHoldState { return { seen: new Map() }; }
 
+/** A held ticket that already carries its done label moved on through a write race; nothing reruns it. */
+const HANDOVER_LABELS: readonly string[] = ["done:builder", "done:developer"];
+
 export interface NativeTaskHoldClient {
-  getAllProjectItems(): Promise<Array<{ issueNumber: number; labels: string[] }>>;
+  getAllProjectItems(): Promise<Array<{ issueNumber: number; labels: string[]; status?: string }>>;
   addLabel(issueNumber: number, label: string): Promise<void>;
   removeLabel(issueNumber: number, label: string): Promise<void>;
   addComment(issueNumber: number, body: string): Promise<void>;
@@ -280,10 +289,11 @@ export async function runNativeTaskHolds(opts: {
   now?: () => number;
 }): Promise<void> {
   const now = opts.now ?? Date.now;
-  let items: Array<{ issueNumber: number; labels: string[] }>;
+  let items: Array<{ issueNumber: number; labels: string[]; status?: string }>;
   try { items = await opts.client.getAllProjectItems(); }
   catch (e: any) { console.warn(`   ⚠️  Native task holds: board read failed (${e?.message ?? e}); holds re-checked next cycle`); return; }
-  const held = items.filter(i => i.issueNumber > 0 && i.labels.includes(NATIVE_TASK_HOLD_LABEL));
+  // Done cleanup takes the label off a ticket moved to Done; no stage runs there.
+  const held = items.filter(i => i.issueNumber > 0 && i.status !== "Done" && i.labels.includes(NATIVE_TASK_HOLD_LABEL));
   const heldNumbers = new Set(held.map(i => i.issueNumber));
   for (const issue of [...opts.state.seen.keys()]) if (!heldNumbers.has(issue)) opts.state.seen.delete(issue);
   let mutated = false;
@@ -308,7 +318,8 @@ export async function runNativeTaskHolds(opts: {
       console.log(`   ⏸️  #${issue} handover held for native task(s): ${release.waiting.map(t => `${t.id.slice(0, 12)} ${t.state}`).join(", ")}`);
       continue;
     }
-    if (!item.labels.includes(NATIVE_TASK_WAITED_LABEL)) {
+    const handedOver = item.labels.some(l => HANDOVER_LABELS.includes(l));
+    if (!handedOver && !item.labels.includes(NATIVE_TASK_WAITED_LABEL)) {
       try { await opts.client.addLabel(issue, NATIVE_TASK_WAITED_LABEL); }
       catch (e: any) { console.warn(`   ⚠️  Native task hold on #${issue}: could not add ${NATIVE_TASK_WAITED_LABEL} (${e?.message ?? e}); the next handover may wait once more`); }
     }
@@ -319,7 +330,7 @@ export async function runNativeTaskHolds(opts: {
     console.log(`   ▶️  #${issue} native task hold released${unreadable ? " (task states unreadable past the bound)" : release.stale.length ? ` (${release.stale.length} task(s) past the bound)` : ""}`);
     try {
       await opts.client.addComment(issue, opts.readTasks
-        ? releaseComment(release, tasks, opts.boundMs, unreadable)
+        ? releaseComment(release, tasks, opts.boundMs, unreadable, handedOver)
         : `## ▶️ Native task hold released\n\nThis dispatcher has no claim service, so no native task can be followed. The ticket keeps its column, so its stage agent runs again.`);
     } catch (e: any) { console.warn(`   ⚠️  Native task hold on #${issue}: released, but the comment failed: ${e?.message ?? e}`); }
   }

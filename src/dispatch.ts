@@ -5465,13 +5465,19 @@ async function managedNativeTaskHold(waited: boolean): Promise<HandoverHoldDecis
  * true when the ticket now carries `held:native-task` and must not get its
  * done label. `note` is the comment that explains it, posted after the run's
  * own completion comment. A handover that already waited once
- * (`native-task:waited` in `labels`) is not held again. A hold label that
- * cannot be written, and is not on the ticket when read back, hands over as
- * before: a ticket with neither label would only run this stage again.
+ * (`native-task:waited` in `labels`) is not held again; `labels` is null when
+ * the post-run read failed, and is read once more here, since an unknown
+ * marker must not hold a second time. A hold label that cannot be written,
+ * and is not on the ticket when read back, hands over as before: a ticket
+ * with neither label would only run this stage again.
  */
-async function holdForNativeTasks(ctx: DispatchContext, labels: readonly string[]): Promise<{ held: boolean; note?: string }> {
+async function holdForNativeTasks(ctx: DispatchContext, labels: readonly string[] | null): Promise<{ held: boolean; note?: string }> {
   const { agent, item, client } = ctx;
   if (!TASK_REQUEST_ROLES.has(agent.name) || item.issueNumber <= 0) return { held: false };
+  if (labels === null) {
+    try { labels = await client.getIssueLabels(item.issueNumber); }
+    catch (e) { console.warn(`   ⚠️  Labels of #${item.issueNumber} not readable, so whether it already waited for native tasks is unknown (${e}); handing over without a hold`); return { held: false }; }
+  }
   let decision: HandoverHoldDecision | null;
   try { decision = await (ctx.deps.nativeTaskHold ?? managedNativeTaskHold)(labels.includes(NATIVE_TASK_WAITED_LABEL)); }
   catch (e: any) { console.warn(`   ⚠️  Native task hold check failed for #${item.issueNumber} (${e?.message ?? e}); handing over as before`); return { held: false }; }
@@ -5704,9 +5710,11 @@ export async function handlePostRun(
   // block (`decidePostRunLabels`). Hoisted up here so both blocks
   // share one fetch instead of two.
   let postLabels: string[] = [];
+  let postLabelsRead = false;
   if (item.issueNumber > 0 && !saferSalvaged) {
     try {
       postLabels = await client.getIssueLabels(item.issueNumber);
+      postLabelsRead = true;
     } catch (e) {
       console.warn(`   ⚠️  Failed to check post-run labels: ${e}`);
     }
@@ -5944,13 +5952,13 @@ export async function handlePostRun(
     // does not hand over yet: `held:native-task` instead of a done or
     // pending-done label (native-task-hold.ts, Desktop #1998).
     const native: { held: boolean; note?: string } = decision.addReadyLabel || decision.logKind === "status-unknown"
-      ? await holdForNativeTasks(ctx, postLabels)
+      ? await holdForNativeTasks(ctx, postLabelsRead ? postLabels : null)
       : { held: false };
     const nativeHold = native.held;
     // A handover ends the once-per-handover wait; a hold keeps it for the
     // run that follows (native-task-hold.ts).
     const endWaited = async (): Promise<void> => {
-      if (!postLabels.includes(NATIVE_TASK_WAITED_LABEL)) return;
+      if (postLabelsRead && !postLabels.includes(NATIVE_TASK_WAITED_LABEL)) return;
       try { await client.removeLabel(item.issueNumber, NATIVE_TASK_WAITED_LABEL); }
       catch (e) { console.warn(`   ⚠️  Failed to remove ${NATIVE_TASK_WAITED_LABEL} from #${item.issueNumber}: ${e}`); }
     };
