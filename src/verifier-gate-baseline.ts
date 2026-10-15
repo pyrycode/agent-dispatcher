@@ -26,10 +26,15 @@
 // The format is opt-in per gate (`PYRY_VERIFIER_GATE_FORMATS`). A gate
 // without one behaves exactly as before.
 //
+// With `PYRY_VERIFIER_GATE_INHERITED_ADVANCE` on, the default, a baseline
+// name counts only when it is inherited and tracked, the live gate's rule:
+// the run shows every failure (`inheritedIneligibility`) and an open ticket
+// names the test. Then no blocker is linked. Otherwise the gate stays red.
+//
 // Pure helpers here; the runs, git calls and ticket writes stay in
 // dispatch.ts.
 
-import { isGateOutputFormat, type GateOutputFormat, type GateTally } from "./gate-output.js";
+import { gateCommandProvenance, isGateOutputFormat, type GateOutputFormat, type GateTally } from "./gate-output.js";
 
 /** How to read one verifier gate's stdout, and how to re-run its failures. */
 export interface VerifierGateFormat {
@@ -168,6 +173,66 @@ export interface GateBaselineAssessment {
   baseSkipReason: string | null;
   /** Why the same-tree re-run told nothing, when it did not run or could not be read; for the log. */
   rerunSkipReason: string | null;
+  /**
+   * `PYRY_VERIFIER_GATE_INHERITED_ADVANCE` on: the baseline failures, each
+   * with the open ticket that tracks it. Set only when every baseline name
+   * was accepted, so the gate may count as green.
+   */
+  inherited?: { name: string; issue: number }[];
+  /**
+   * `PYRY_VERIFIER_GATE_INHERITED_ADVANCE` on: why the baseline failures
+   * were not accepted as inherited. The gate then stays red, as it would
+   * without any baseline reading.
+   */
+  held?: string;
+}
+
+/**
+ * `PYRY_VERIFIER_GATE_INHERITED_ADVANCE`: on unless `0`, `false`, `off` or
+ * `no`, the same switch style as `PYRY_REAL_CLAUDE_GATE_INHERITED_ADVANCE`.
+ * Read at dispatch time, like the gate formats.
+ */
+export function verifierInheritedAdvanceEnabled(env: NodeJS.ProcessEnv): boolean {
+  return !/^(0|false|off|no)$/i.test((env.PYRY_VERIFIER_GATE_INHERITED_ADVANCE ?? "").trim());
+}
+
+/**
+ * Whether a red gate's baseline failures may be accepted as inherited at
+ * all, before any tracker is looked for. Null when they may; otherwise the
+ * reason, for the log and the verifier's note. The same conditions as the
+ * live gate's `decideInheritedAdvance` that a verifier gate can check:
+ *
+ * - The gate's output parsed completely, and no test was killed by the test
+ *   binary's own deadline.
+ * - No Go panic or data race: a panic stops its package, so the tests after
+ *   it never ran on either tree and a regression there would be invisible.
+ * - Every failed Go package has a failing test of exactly its own, so
+ *   `example.com/foo.v2` does not explain a failing `example.com/foo`.
+ * - A `go-json` or `playwright-json` gate is one direct test run. A compound
+ *   command, such as `make check` or `go test -json ./... && make e2e`,
+ *   stops at its first red step, so the steps after it never ran, and an
+ *   accepted red would skip them. List each step as its own gate instead:
+ *   the gates after an accepted red still run. A `junit-xml` gate is always
+ *   a wrapper script the dispatcher cannot read, so it is trusted to be one
+ *   test run, as the gate formats already require.
+ */
+export function inheritedIneligibility(gate: string, format: GateOutputFormat, tally: GateTally): string | null {
+  if (tally.completeParse !== true) return "its output is incomplete test evidence";
+  if ((tally.timedOutTests?.length ?? 0) > 0) return "a test was killed by the test binary's own deadline";
+  if (tally.abnormalExit) return "the run printed a panic or a data race, which can hide failures in tests that never ran";
+  if (tally.packageFailures.length > 0) {
+    if (format !== "go-json") return "the run has a suite-level failure the named failures do not explain";
+    const unexplained = tally.packageFailures.filter((pkg) => !tally.failedNames.some((name) =>
+      name.startsWith(`${pkg}.`) && /^(Test|Benchmark|Example|Fuzz)/.test(name.slice(pkg.length + 1))));
+    if (unexplained.length > 0) return `package ${unexplained.join(", ")} failed with no failing test of its own`;
+  }
+  if (format !== "junit-xml") {
+    const provenance = gateCommandProvenance(gate);
+    if (provenance.kind !== "single" || provenance.format !== format) {
+      return "the gate is not one direct test run, so the steps after its red step may never have run; list each step as its own gate";
+    }
+  }
+  return null;
 }
 
 /** A one-line description of an entry, for the note, the log and the ticket. */

@@ -20,7 +20,7 @@
 // Coverage scope follows the plan in this session's PR — Tier B
 // (known production failure modes + happy paths + decision branches).
 
-import { describe, test } from "node:test";
+import { afterEach, beforeEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
@@ -121,6 +121,8 @@ import { serializeLastVerdict } from "./verdict-handoff.js";
 import { formatGateEvidenceComment, gateRunFloor, gateRunRequiredTests } from "./gate-output.js";
 import { decideGateVerdict } from "./pipeline-decisions.js";
 import { flakyMarker } from "./flaky-tickets.js";
+import { inheritedMarker } from "./inherited-tickets.js";
+import { verifierInheritedAdvanceEnabled } from "./verifier-gate-baseline.js";
 import { FINAL_MERGE_HANDOFF_MARKER, MERGE_RESOLUTION_NOTE_MARKER, mergeResolutionComment } from "./merge-handoff.js";
 import { runReworkRouting } from "./reconcile.js";
 import { hashGateList, type VerifierGatePass } from "./verifier-gate-reuse.js";
@@ -772,6 +774,12 @@ export class MockGitHubClient implements DispatchClient {
 
   async addItemToProject(issueNodeId: string): Promise<string> {
     return `item-${issueNodeId}`;
+  }
+
+  /** Board items moved to the top, for inherited failure trackers. */
+  moveItemToTopCalls: string[] = [];
+  async moveItemToTop(itemId: string): Promise<void> {
+    this.moveItemToTopCalls.push(itemId);
   }
 }
 
@@ -11546,6 +11554,19 @@ describe("pre-verifier gates — failures already on main (#123)", () => {
   // re-run on main cannot reproduce. A red gate with an
   // output format now has its failures read against main before the verifier
   // spawns; a gate without one behaves exactly as before.
+  //
+  // These tests pin the earlier set-aside, which needs no tracker, so they
+  // run with PYRY_VERIFIER_GATE_INHERITED_ADVANCE off. The tracked rule has
+  // its own block at the end.
+  let priorInherited: string | undefined;
+  beforeEach(() => {
+    priorInherited = process.env.PYRY_VERIFIER_GATE_INHERITED_ADVANCE;
+    process.env.PYRY_VERIFIER_GATE_INHERITED_ADVANCE = "0";
+  });
+  afterEach(() => {
+    if (priorInherited === undefined) delete process.env.PYRY_VERIFIER_GATE_INHERITED_ADVANCE;
+    else process.env.PYRY_VERIFIER_GATE_INHERITED_ADVANCE = priorInherited;
+  });
   const logsDir = resolve(TEST_AGENTS_REPO_ROOT, "logs");
   const UI = "python3 scripts/android-test-gate.py ui";
   const SWEEP_SHA = "a".repeat(40);
@@ -11607,6 +11628,10 @@ describe("pre-verifier gates — failures already on main (#123)", () => {
     /** The same-tree re-run's stdout (#133). Unset reads as a missing file. */
     rerunOutput?: string;
     gateImpl?: (req: GateSpawnRequest) => GateSpawnOutcome;
+    /** The board's client, when a test seeds open tickets on it. */
+    client?: MockGitHubClient;
+    /** The gated ticket's body. */
+    itemBody?: string;
   }) {
     return withStageSet("builder", () => withVerifierGates(opts.gates ?? `make check;${UI}`, () => withFormats("formats" in opts ? opts.formats : FORMATS, async () => {
       const fsMap: Record<string, string> = { [gateLog(n, 2)]: opts.uiOutput };
@@ -11619,7 +11644,10 @@ describe("pre-verifier gates — failures already on main (#123)", () => {
           : /verifier-gate-rerun_#\d+\.log$/.test(String(path)) && opts.rerunOutput !== undefined
             ? opts.rerunOutput
             : (read as any)(path, ...rest)) as typeof deps.readFileSync;
-      const { ctx, client } = makeTestContext({ agent: builderAgent("verifier"), item: { issueNumber: n }, deps, calls });
+      const { ctx, client } = makeTestContext({
+        agent: builderAgent("verifier"), item: { issueNumber: n, ...(opts.itemBody !== undefined ? { body: opts.itemBody } : {}) },
+        deps, calls, ...(opts.client ? { client: opts.client } : {}),
+      });
       const result = await maybeRunPreSpawnGates(ctx);
       return { result, calls, client, ctx };
     })));
@@ -11877,6 +11905,199 @@ describe("pre-verifier gates — failures already on main (#123)", () => {
         assert.equal(client.createdIssues.length, 0);
       });
     }
+  });
+
+  // 2026-10-15, pyrycode #3382: four macOS gate repairs that also failed on
+  // unchanged main were each added as its blocker in turn. With
+  // PYRY_VERIFIER_GATE_INHERITED_ADVANCE on, a baseline failure counts only
+  // when an open ticket tracks it, and then no blocker is added.
+  describe("tracked inherited failures (PYRY_VERIFIER_GATE_INHERITED_ADVANCE, pyrycode #3382)", () => {
+    beforeEach(() => { delete process.env.PYRY_VERIFIER_GATE_INHERITED_ADVANCE; });
+    const emptySweep = () => sweepState({ failures: { sha: SWEEP_SHA, names: [] } });
+    /** A board client with open `bug` tickets, and a spy on blocker links. */
+    const board = (open: { number: number; title: string; body: string }[] = []) => {
+      const client = new MockGitHubClient();
+      client.openIssuesByLabel.set("bug", open.map((i) => ({ ...i, nodeId: `node-${i.number}` })) as any);
+      const blockers: [number, number][] = [];
+      (client as any).addBlocker = async (issue: number, blocker: number) => { blockers.push([issue, blocker]); };
+      return { client, blockers };
+    };
+    const tracker = (name: string, number = 3418) => ({ number, title: `fix shared failure on main`, body: `Fails on main.\n\n${inheritedMarker(name)}` });
+    const allGates = (calls: CallLog) => calls.gates.filter((g) => !g.command.includes("--tests")).map((g) => g.command);
+
+    test("a gate red only with a tracked inherited failure counts as green with the list, the later gates run and no blocker is added", async () => {
+      const { client, blockers } = board([tracker(Z)]);
+      const { result, calls, ctx } = await runGates(3382, {
+        gates: `make check;${UI};make lint`,
+        uiOutput: junit([Z], [X]),
+        state: emptySweep(),
+        rerunOutput: junit([Z]),
+        baseOutput: junit([Z]),
+        client,
+      });
+
+      assert.deepEqual(allGates(calls), ["make check", UI, "make lint"], "the gate after the inherited red still runs");
+      assert.equal(baseRuns(calls).length, 1, "Z was compared on the base commit");
+      const note = result.promptNote;
+      assert.ok(!note.includes("TRIAGE MODE"), "the gate counts as green");
+      assert.match(note, /### Inherited failures, tracked and accepted/);
+      assert.match(note, /The gates are green except these inherited failures, tracked in #3418/);
+      assert.ok(note.includes(`\`${Z}\` (failed when re-run alone on the base commit \`${BASE_SHA.slice(0, 12)}\`), gate \`${UI}\`, tracked on #3418`));
+      assert.match(note, /List each of them with its tracking ticket in your verdict and in your pull request comment/);
+      assert.match(note, /Do not add a blocker for them/);
+      assert.ok(!note.includes("Failures already on main, not this ticket's"), "accepted names are not listed twice");
+      assert.equal(ctx.failedPreSpawnGate, undefined);
+      assert.deepEqual(blockers, [], "no blocker is linked");
+      assert.equal(client.createdIssues.length, 0, "the open tracker is used, not a new ticket");
+      assert.ok(client.comments.some((c) => c.issueNumber === 3418 && c.body.startsWith("## Shared failure seen again")
+        && c.body.includes(`Found while verifying #3382`)), "the sighting is recorded on the tracker");
+      assert.equal(client.moveItemToTopCalls.length, 1, "the tracker goes to the top of Backlog");
+      assert.match(loggedText(calls), /all 1 failing test\(s\) also fail on main and is tracked on #3418, so it counts as green/);
+      assert.ok(!client.addLabelCalls.some((c) => c.label.startsWith("needs-rework:")));
+    });
+
+    test("an untracked baseline failure gets a tracker filed and counts as inherited once it is tracked", async () => {
+      const { client, blockers } = board();
+      const { result } = await runGates(3383, {
+        uiOutput: junit([Z]),
+        state: emptySweep(),
+        rerunOutput: junit([Z]),
+        baseOutput: junit([Z]),
+        client,
+      });
+
+      assert.equal(client.createdIssues.length, 1, "one tracker filed through the live gate's filing path");
+      const filed = client.createdIssues[0]!;
+      assert.ok(filed.labels.includes("bug"));
+      assert.ok(filed.body.includes(inheritedMarker(Z)), "the tracker carries the test's marker");
+      assert.ok(filed.body.includes(`Gate \`${UI}\``), "and names the gate");
+      assert.ok(!result.promptNote.includes("TRIAGE MODE"));
+      assert.match(result.promptNote, /tracked on #5000/);
+      assert.deepEqual(blockers, []);
+    });
+
+    test("a baseline failure whose tracker cannot be filed keeps the gate red, with the reason, and links no blocker", async () => {
+      const { client, blockers } = board();
+      client.createIssue = async () => { throw new Error("HTTP 502"); };
+      const { result, ctx } = await runGates(3384, {
+        uiOutput: junit([Z]),
+        state: emptySweep(),
+        rerunOutput: junit([Z]),
+        baseOutput: junit([Z]),
+        client,
+      });
+
+      assert.match(result.promptNote, /TRIAGE MODE/, "untracked, so the gate fails as before");
+      assert.match(result.promptNote, /### Failures on main not accepted as inherited/);
+      assert.ok(result.promptNote.includes(`${Z} has no confirmed tracking ticket`));
+      assert.ok(!result.promptNote.includes("Inherited failures, tracked and accepted"));
+      assert.equal(ctx.failedPreSpawnGate, UI);
+      assert.deepEqual(blockers, []);
+    });
+
+    test("a new failure beside a tracked inherited one still fails the gate", async () => {
+      const { client, blockers } = board([tracker(Z)]);
+      const { result, ctx } = await runGates(3385, {
+        uiOutput: junit([Z, W]),
+        state: emptySweep(),
+        rerunOutput: junit([Z, W]),
+        baseOutput: junit([Z], [W]),
+        client,
+      });
+
+      const note = result.promptNote;
+      assert.match(note, /TRIAGE MODE/);
+      assert.match(note, new RegExp(`Judge only these remaining failures[^]*- \`${W}\``), "W is the ticket's");
+      assert.match(note, /### Inherited failures, tracked and accepted[^]*tracked on #3418/, "Z is still listed with its tracker");
+      assert.equal(ctx.failedPreSpawnGate, UI);
+      assert.deepEqual(blockers, []);
+    });
+
+    test("an incomplete base re-run falls back to today's red and files nothing", async () => {
+      const { client, blockers } = board();
+      const { result } = await runGates(3386, {
+        uiOutput: junit([Z]),
+        state: emptySweep(),
+        rerunOutput: junit([Z]),
+        baseOutput: "BUILD FAILED",
+        client,
+      });
+
+      assert.match(result.promptNote, /TRIAGE MODE/);
+      assert.ok(!result.promptNote.includes("Inherited failures"));
+      assert.ok(!result.promptNote.includes("not accepted as inherited"), "nothing failed on main, so nothing was held");
+      assert.equal(client.createdIssues.length, 0);
+      assert.equal(client.comments.filter((c) => c.issueNumber !== 3386).length, 0);
+      assert.deepEqual(blockers, []);
+    });
+
+    test("a gated ticket whose own body names the inherited test is not let through, since it may be the fix", async () => {
+      const { client, blockers } = board([tracker(Z)]);
+      const { result } = await runGates(3387, {
+        uiOutput: junit([Z]),
+        state: emptySweep(),
+        rerunOutput: junit([Z]),
+        baseOutput: junit([Z]),
+        client,
+        itemBody: `Repair \`${Z}\` on main.`,
+      });
+
+      assert.match(result.promptNote, /TRIAGE MODE/);
+      assert.match(result.promptNote, /names de\.pyryco\.mobile\.ui\.NewTest#broken itself, so it may be the fix/);
+      assert.deepEqual(blockers, []);
+    });
+
+    test("a tracker matched only by its method name is not accepted and nothing is filed again", async () => {
+      const { client, blockers } = board([{ number: 3418, title: "broken test: broken", body: "Flaky on CI." }]);
+      const { result } = await runGates(3388, {
+        uiOutput: junit([Z]),
+        state: emptySweep(),
+        rerunOutput: junit([Z]),
+        baseOutput: junit([Z]),
+        client,
+      });
+
+      assert.match(result.promptNote, /TRIAGE MODE/);
+      assert.match(result.promptNote, /tracked on #3418 only by its method name/);
+      assert.equal(client.createdIssues.length, 0);
+      assert.deepEqual(blockers, []);
+    });
+
+    test("a compound go-json gate is not let through, since the steps after its red step never ran", async () => {
+      const GATE = "go test -race -json ./... && make e2e";
+      const TEST = "example.com/p.TestPublish";
+      const goRed = [
+        { Action: "start", Package: "example.com/p" },
+        { Action: "run", Package: "example.com/p", Test: "TestPublish" },
+        { Action: "fail", Package: "example.com/p", Test: "TestPublish", Elapsed: 0.1 },
+        { Action: "fail", Package: "example.com/p", Elapsed: 0.2 },
+      ].map((e) => JSON.stringify(e)).join("\n");
+      const { client, blockers } = board([tracker(TEST)]);
+      const { result, calls } = await runGates(3389, {
+        gates: `make check;${GATE}`,
+        formats: JSON.stringify({ [GATE]: { format: "go-json", baseline: "go test -race -json -run {{TESTS}} ./..." } }),
+        uiOutput: goRed,
+        state: emptySweep(),
+        rerunOutput: goRed,
+        baseOutput: goRed,
+        gateImpl: (req) => ({ exitCode: req.command === GATE ? 1 : 0, timedOut: false, spawnError: null }),
+        client,
+      });
+
+      assert.ok(calls.gates.some((g) => g.command.includes("-run '^(TestPublish)$'")), "the failure was compared on main");
+      assert.match(result.promptNote, /TRIAGE MODE/);
+      assert.match(result.promptNote, /not one direct test run/);
+      assert.equal(client.comments.filter((c) => c.issueNumber === 3418).length, 0, "no tracker is touched");
+      assert.deepEqual(blockers, []);
+    });
+
+    test("the switch is on by default and off with 0, false, off or no", () => {
+      assert.equal(verifierInheritedAdvanceEnabled({}), true);
+      assert.equal(verifierInheritedAdvanceEnabled({ PYRY_VERIFIER_GATE_INHERITED_ADVANCE: "1" }), true);
+      for (const off of ["0", "false", "OFF", " no "]) {
+        assert.equal(verifierInheritedAdvanceEnabled({ PYRY_VERIFIER_GATE_INHERITED_ADVANCE: off }), false, off);
+      }
+    });
   });
 });
 

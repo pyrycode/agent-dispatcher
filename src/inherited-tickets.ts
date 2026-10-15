@@ -5,13 +5,37 @@
 import { shortTestName, failureTicketLabels, dropStaleOsRequirement, type FlakyRunContext, type FlakyTicketClient } from "./flaky-tickets.js";
 import { osName } from "./ticket-requirements.js";
 
-export interface InheritedTicketClient extends FlakyTicketClient {
-  listOpenIssuesWithLabel(label: string): Promise<{ number: number; nodeId: string; title?: string; body: string; labels?: string[] }[]>;
-  getItemStatus(issueNumber: number): Promise<string | null>;
-  moveItemToTop(itemId: string): Promise<void>;
+export interface InheritedTicketClient extends InheritedTrackingClient {
   /** Links two issues and reads the relationship back before resolving. */
   addBlocker(issueNumber: number, blockerNumber: number): Promise<void>;
 }
+/** Enough to find, file and place trackers, for a caller that never links a blocker. */
+export interface InheritedTrackingClient extends FlakyTicketClient {
+  listOpenIssuesWithLabel(label: string): Promise<{ number: number; nodeId: string; title?: string; body: string; labels?: string[] }[]>;
+  getItemStatus(issueNumber: number): Promise<string | null>;
+  moveItemToTop(itemId: string): Promise<void>;
+}
+/**
+ * A pre-verifier gate's baseline failures. Each name failed in the gate and
+ * also failed on main: in the latest main sweep on an ancestor commit, or
+ * when re-run alone on the base commit.
+ */
+export interface VerifierGateInheritedContext {
+  gatedIssue: number;
+  at: string;
+  gatedBody?: string;
+  verifierGate: {
+    /** The gate command, as configured. */
+    gate: string;
+    /** The gated worktree's merged HEAD, or null when it could not be read. */
+    commit: string | null;
+    /** The gate's own stdout log. */
+    outputPath: string;
+    /** Where each name failed on main, one line per name. */
+    onMain: ReadonlyMap<string, string>;
+  };
+}
+export type InheritedRunContext = FlakyRunContext | VerifierGateInheritedContext;
 export interface InheritedTicketResult {
   blockers: { name: string; issue: number }[];
   untracked: string[];
@@ -33,6 +57,13 @@ export interface InheritedTicketOptions {
    * falls back to the blockers of the default mode.
    */
   advance?: boolean;
+  /**
+   * Advance mode only. False links no blocker when the advance does not
+   * hold: every name without an accepted tracker comes back as untracked,
+   * with the reason in `fallbackReason`. The pre-verifier gate uses this,
+   * since its fallback is a red gate, never a wait.
+   */
+  addBlockers?: boolean;
 }
 type OpenIssue = { number: number; nodeId: string; title?: string; body: string; labels?: string[] };
 
@@ -58,7 +89,22 @@ function matchesTrackingTicket(issue: { title?: string; body: string }, name: st
   return /pre-existing|unmasked|drift|flaky|tracking|regression|bug|failure|broken|intermittent/i.test(title)
     && words.includes(shortTestName(name).toLowerCase());
 }
-function evidence(names: readonly string[], ctx: FlakyRunContext, platform: string): string {
+function evidence(names: readonly string[], ctx: InheritedRunContext, platform: string): string {
+  if ("verifierGate" in ctx) {
+    const g = ctx.verifierGate;
+    const subject = names.length === 1
+      ? `\`${names[0]}\` failed in a pre-verifier gate and also fails on main.`
+      : [`These ${names.length} tests failed in a pre-verifier gate and also fail on main:`, ...names.map(n => `- \`${n}\``)].join("\n");
+    return [
+      subject,
+      `- Found while verifying #${ctx.gatedIssue} at ${ctx.at}`,
+      `- Seen on ${osName(platform)}`,
+      `- Gate \`${g.gate}\``,
+      `- Gated worktree at \`${g.commit ?? "unknown"}\``,
+      `- Gate output: \`${g.outputPath}\``,
+      ...names.map(n => `- On main: ${g.onMain.get(n) ?? `\`${n}\` failed on main`}`),
+    ].join("\n");
+  }
   const r = ctx.report;
   const subject = names.length === 1
     ? `\`${names[0]}\` failed on both the gated branch and the base commit.`
@@ -73,7 +119,7 @@ function evidence(names: readonly string[], ctx: FlakyRunContext, platform: stri
     `- Base report: \`${r.baselineOutputPath ?? "unavailable"}\``,
   ].join("\n");
 }
-function fixTicket(names: readonly string[], ctx: FlakyRunContext, platform: string): { title: string; body: string } {
+function fixTicket(names: readonly string[], ctx: InheritedRunContext, platform: string): { title: string; body: string } {
   if (names.length === 1) {
     const [name] = names;
     const body = ["## User Story", "",
@@ -98,10 +144,31 @@ function fixTicket(names: readonly string[], ctx: FlakyRunContext, platform: str
 
 /** Search first. A failed board/link write remains untracked and is retried on
  * the same open issue on the next attempt. Never report an unconfirmed blocker. */
-export async function recordInheritedTests(
+export function recordInheritedTests(
   client: InheritedTicketClient, failures: readonly string[], ctx: FlakyRunContext,
   options: InheritedTicketOptions = {},
   platform: string = process.platform,
+): Promise<InheritedTicketResult> {
+  return recordInherited(client, failures, ctx, options, platform);
+}
+
+/**
+ * Find or file a tracker for every name, as the live gate's advance mode
+ * does, and never link a blocker. `tracked` is set only when every name has
+ * an open tracker naming it exactly; otherwise `fallbackReason` says why.
+ */
+export function trackInheritedTests(
+  client: InheritedTrackingClient, failures: readonly string[], ctx: VerifierGateInheritedContext,
+  platform: string = process.platform,
+): Promise<InheritedTicketResult> {
+  return recordInherited(client, failures, ctx, { advance: true, addBlockers: false }, platform);
+}
+
+async function recordInherited(
+  client: InheritedTrackingClient & { addBlocker?: InheritedTicketClient["addBlocker"] },
+  failures: readonly string[], ctx: InheritedRunContext,
+  options: InheritedTicketOptions,
+  platform: string,
 ): Promise<InheritedTicketResult> {
   const result: InheritedTicketResult = { blockers: [], untracked: [], owned: [] };
   const names = [...new Set(failures)];
@@ -179,6 +246,10 @@ export async function recordInheritedTests(
       return { blockers: [], untracked: [], owned: [], tracked: names.map(name => ({ name, issue: placedNames.get(name)! })) };
     }
     result.fallbackReason = gap;
+  }
+  if (options.addBlockers === false || !client.addBlocker) {
+    result.untracked = names.filter(n => !result.owned!.includes(n));
+    return result;
   }
   const confirmed = new Map<string, number>();
   for (const { issue, names: groupNames } of placed) {
