@@ -80,7 +80,7 @@ export class MachineManager {
    */
   async reportCapabilities(): Promise<void> {
     if (!this.claims.call) throw new Error("Capability reports require the claim service");
-    await this.claims.call("/machines/capabilities", { capabilities: this.config.capabilities ?? [] });
+    await this.claims.call("/machines/capabilities", { capabilities: this.config.capabilities ?? [], projects: this.config.projects });
   }
   tick(): Promise<void> {
     if (this.tickPromise) return this.tickPromise;

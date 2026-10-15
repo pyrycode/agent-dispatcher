@@ -116,14 +116,15 @@ export function osRequirementToDrop(labels: readonly string[], platform: string 
  */
 export function capabilityAttention(state: {
   noCapableMachine?: Array<{ ticket: string; requires: string[]; missing: string[] }>;
-  machineCapabilities?: Record<string, { capabilities: string[]; updated: number }>;
+  machineCapabilities?: Record<string, { capabilities: string[]; projects?: string[]; updated: number }>;
 }): Array<{ ticket: string; requires: string[]; missing: string[]; reason: string }> {
   const reports = Object.entries(state.machineCapabilities ?? {});
   return (state.noCapableMachine ?? []).map(gap => {
-    const known = reports.filter(([, r]) => !missingCapabilities(gap.requires, r.capabilities).length).map(([m]) => m);
+    const project = gap.ticket.split("#")[0];
+    const known = reports.filter(([, r]) => (!r.projects || r.projects.includes(project)) && !missingCapabilities(gap.requires, r.capabilities).length).map(([m]) => m);
     const reason = known.length
       ? `No computer that reported in the last ${CAPABILITY_REPORT_FRESH_MS / 60_000} minutes offers ${gap.requires.join(" and ")}. ${known.join(", ")} did earlier; check that its manager is running.`
-      : `No computer offers ${gap.requires.join(" and ")}. Configure one, or remove the requires: label.`;
+      : `No computer serving ${project} offers ${gap.requires.join(" and ")}. Configure one, or remove the requires: label.`;
     return { ...gap, reason };
   });
 }

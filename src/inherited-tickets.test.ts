@@ -26,6 +26,8 @@ class Client implements InheritedTicketClient {
   }
   async createIssue(title: string, body: string, labels: string[] = []) {
     assert.deepEqual(labels, failureTicketLabels(["bug", "priority:low"]));
+    assert.deepEqual(labels.slice(0, 2), ["bug", "priority:low"]);
+    assert.match(labels[2], /^requires:(linux|macos)$/, "the system it was seen on");
     if (this.fail === "create") throw Error("create failed");
     const issue = { number: 1500 + this.created.length, nodeId: `node-${1500 + this.created.length}`, title, body };
     this.created.push(issue); this.open.push(issue);

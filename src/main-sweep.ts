@@ -158,17 +158,19 @@ export interface MainSweepOutcome {
 
 const MAX_LISTED_FAILURES = 30;
 
-/** The Backlog ticket for a failed sweep. Written for the refiner that picks it up. */
 /**
  * The labels a main sweep failure ticket is filed with. A suite that ran and
  * failed was seen failing on this system only, so the fix ticket requires
  * it. A sweep that could not start says nothing about where tests fail.
+ * The ticket keeps the requirement: later update comments come from the
+ * same computer's sweep state, so from the same system.
  */
 export function mainSweepIssueLabels(outcome: Pick<MainSweepOutcome, "runError">, platform: string = process.platform): string[] {
   const seenOn = outcome.runError === null ? seenOnLabel(platform) : undefined;
   return ["bug", "priority:low", ...(seenOn ? [seenOn] : [])];
 }
 
+/** The Backlog ticket for a failed sweep. Written for the refiner that picks it up. */
 export function buildMainSweepIssue(input: {
   repo: string;
   head: string;

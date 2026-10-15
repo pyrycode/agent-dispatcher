@@ -83,17 +83,22 @@ function fleet(items: WorkflowItem[]) {
 
 test("every stage of a ticket with a requirement is admitted only where it can run", () => {
   const { store } = fleet([item(1, "Backlog", ["requires:macos"]), item(2, "In Development", ["requires:macos"]),
-    item(3, "In Code Review", ["requires:macos"]), item(4, "In Development"), item(5, "In Development", ["requires:macos", "requires:android-device"])]);
+    item(3, "In Code Review", ["requires:macos"]), item(4, "In Development"), item(5, "In Development", ["requires:macos", "requires:android-device"]),
+    item(6, "In Documentation", ["requires:macos"]), item(7, "Done", ["requires:macos"])]);
   try {
     store.reportMachineCapabilities("mac", ["macos"]);
     store.reportMachineCapabilities("hp", ["linux"]);
-    for (const [id, n, role, resource] of [["r1", 1, "refiner", "light"], ["b2", 2, "builder", "medium"], ["v3", 3, "verifier", "heavy"], ["a1", 1, "recovery", "heavy"]] as const) {
-      assert.deepEqual(store.start(request(`hp-${id}`, "hp", n, role, resource)), { ok: false, reason: "incapable" }, `${role} on Linux`);
+    for (const [id, n, role, resource] of [["r1", 1, "refiner", "light"], ["b2", 2, "builder", "medium"], ["v3", 3, "verifier", "heavy"],
+      ["a1", 1, "recovery", "heavy"], ["d6", 6, "documentation", "light"], ["m7", 7, "merge", "light"]] as const) {
+      const locks = role === "merge" ? [`${DESKTOP}:merge`] : [];
+      assert.deepEqual(store.start({ ...request(`hp-${id}`, "hp", n, role, resource), locks }), { ok: false, reason: "incapable" }, `${role} on Linux`);
     }
     assert.equal(store.snapshot().runs.length, 0, "a refusal reserves nothing");
     assert.equal(store.start(request("hp-b4", "hp", 4)).ok, true, "no requirement: any computer, as before");
     assert.equal(store.start(request("mac-b2", "mac", 2)).ok, true);
     assert.equal(store.start(request("mac-v3", "mac", 3, "verifier", "heavy")).ok, true);
+    assert.equal(store.start(request("mac-d6", "mac", 6, "documentation", "light")).ok, true);
+    assert.equal(store.start({ ...request("mac-m7", "mac", 7, "merge", "light"), locks: [`${DESKTOP}:merge`] }).ok, true);
     assert.deepEqual(store.start(request("mac-b5", "mac", 5)), { ok: false, reason: "incapable" }, "the Mac lacks the configured phone");
     store.reportMachineCapabilities("mac", ["macos", "android-device"]);
     assert.equal(store.start(request("mac-b5b", "mac", 5)).ok, true);
@@ -161,6 +166,53 @@ test("a released ticket refined on the Mac starts no claim, and a closed ticket 
   } finally { store.close(); }
 });
 
+test("a claim is kept while only its owner can finish something, and an owner that never reported keeps its claims", () => {
+  const { store, label } = fleet([item(1, "In Development"), item(2, "In Development"), item(3, "In Development"), item(4, "In Development"), item(5, "In Development")]);
+  try {
+    store.reportMachineCapabilities("hp", ["linux"]);
+    for (const n of [1, 2, 3, 4]) { assert.equal(store.start(request(`b${n}`, "hp", n)).ok, true); store.finish("hp", "s-hp", `b${n}`); }
+    // Fractal builds #5 before its manager has ever reported (an older manager during a rollout).
+    assert.equal(store.start(request("b5", "fractal", 5)).ok, true);
+    store.finish("fractal", "s-fractal", "b5");
+    label(1, { addLabels: ["requires:macos", "pending-verdict:verifier"] });
+    label(2, { addLabels: ["requires:macos", "pending-done:verifier"] });
+    label(3, { addLabels: ["requires:macos", "wip:builder"] });
+    label(4, { addLabels: ["requires:macos"] });
+    label(5, { addLabels: ["requires:linux"] });
+    const db = (store as unknown as { db: import("node:sqlite").DatabaseSync }).db;
+    db.prepare("INSERT INTO fleet_recovery_tasks (id,ticket,request,state,created,updated) VALUES (?,?,?,?,1,1)").run("t4", `${DESKTOP}#4`, "{}", "running");
+    assert.deepEqual(store.releaseIncapableClaims(), [], "saved verdicts, a stranded wip label, a running support task and an unknown owner all keep the claim");
+    // Once the support task ends, #4 goes.
+    db.prepare("UPDATE fleet_recovery_tasks SET state='complete' WHERE id='t4'").run();
+    assert.deepEqual(store.releaseIncapableClaims().map(c => c.ticket), [`${DESKTOP}#4`]);
+    // Once its verdict has published, #1 goes too.
+    label(1, { removeLabels: ["pending-verdict:verifier"] });
+    assert.deepEqual(store.releaseIncapableClaims().map(c => c.ticket), [`${DESKTOP}#1`]);
+    // Fractal reports Linux: it can run #5, so it keeps it.
+    store.reportMachineCapabilities("fractal", ["linux"]);
+    assert.deepEqual(store.releaseIncapableClaims(), []);
+    assert.deepEqual(store.snapshot().claims.map(c => c.ticket), [`${DESKTOP}#2`, `${DESKTOP}#3`, `${DESKTOP}#5`]);
+  } finally { store.close(); }
+});
+
+test("only computers serving the ticket's project count as able to run it", () => {
+  const { store } = fleet([item(1, "Backlog", ["requires:macos"])]);
+  try {
+    store.reportMachineCapabilities("mac", ["macos"], ["org/core"]);
+    store.reportMachineCapabilities("hp", ["linux"], [DESKTOP]);
+    const state = store.snapshot();
+    assert.deepEqual(state.noCapableMachine, [{ ticket: `${DESKTOP}#1`, requires: ["macos"], missing: ["macos"] }]);
+    assert.deepEqual(state.machineCapabilities?.mac, { capabilities: ["macos"], projects: ["org/core"], updated: 1_000_000 });
+    assert.match(capabilityAttention(state)[0].reason, /No computer serving org\/desktop offers macos/);
+    store.reportMachineCapabilities("mac", ["macos"], ["org/core", DESKTOP]);
+    assert.equal(store.snapshot().noCapableMachine, undefined);
+    // A report that names no projects counts for all of them.
+    store.reportMachineCapabilities("mac", ["macos"]);
+    assert.equal(store.snapshot().noCapableMachine, undefined);
+    assert.throws(() => store.reportMachineCapabilities("mac", ["macos"], ["not a repo"]), /Invalid machine projects/);
+  } finally { store.close(); }
+});
+
 test("the snapshot lists requirements, reports and the requirements nobody fresh can satisfy", () => {
   const { store, advance, label } = fleet([item(1, "Backlog", ["requires:macos"]), item(2, "Backlog", ["requires:android-device"]),
     item(3, "Backlog"), item(4, "Backlog", ["requires:gpu"])]);
@@ -180,7 +232,7 @@ test("the snapshot lists requirements, reports and the requirements nobody fresh
     assert.deepEqual(state.noCapableMachine?.map(g => g.ticket), [`${DESKTOP}#1`, `${DESKTOP}#2`, `${DESKTOP}#4`]);
     const attention = capabilityAttention(state);
     assert.match(attention[0].reason, /mac did earlier; check that its manager is running/);
-    assert.match(attention[2].reason, /No computer offers gpu\. Configure one, or remove the requires: label/);
+    assert.match(attention[2].reason, /No computer serving org\/desktop offers gpu\. Configure one, or remove the requires: label/);
     // A stale report still admits: capabilities do not change while a computer is away.
     assert.equal(store.start(request("mac-r1", "mac", 1, "refiner", "light")).ok, true);
     // Removing the label ends the requirement.
@@ -238,7 +290,8 @@ test("the manager reports its capabilities, shows why a ticket waits and starts 
     const client = { snapshot: async () => store.snapshot(), start: async (r: StartRequest) => store.start(r), finish: async () => {},
       call: async <T>(path: string, body?: any): Promise<T> => {
         assert.equal(path, "/machines/capabilities");
-        return store.reportMachineCapabilities("hp", body.capabilities) as T;
+        assert.deepEqual(body.projects, [DESKTOP]);
+        return store.reportMachineCapabilities("hp", body.capabilities, body.projects) as T;
       } };
     const manager = new MachineManager({ machine: "hp", heavyLimit: 1, combinedLimit: 2, ticketLimit: 5, projects: [DESKTOP], capabilities: ["linux", "linux"] }, client);
     assert.deepEqual(manager.config.capabilities, ["linux"]);
@@ -303,12 +356,15 @@ test("a flaky test ticket requires the system it flaked on, until it flakes on a
   assert.deepEqual(failureTicketLabels(["bug"], "win32"), ["bug"], "an unknown system adds no requirement");
 });
 
-test("a failed requirement removal is logged and the sighting still counts", async () => {
+test("a failed requirement removal is logged and the sighting still counts", async t => {
   const board = new Board();
   board.open.push({ number: 5, nodeId: "n5", body: flakyMarker(NAME), labels: ["requires:linux"] });
   board.removeLabel = async () => { throw new Error("owned elsewhere"); };
+  const warn = t.mock.method(console, "warn", () => {});
   const result = await recordFlakyTests(board, [NAME], run, "darwin");
-  assert.deepEqual(result.commented, [{ name: NAME, issue: 5 }]);
+  assert.deepEqual(result, { filed: [], commented: [{ name: NAME, issue: 5 }], untracked: [] });
+  assert.ok(warn.mock.calls.some(c => /Could not remove requires:linux from #5: owned elsewhere/.test(String(c.arguments[0]))));
+  assert.deepEqual(board.open[0].labels, ["requires:linux"], "the label stays");
 });
 
 test("a shared live failure ticket requires its system, and drops it only on its own ticket", async () => {

@@ -131,7 +131,8 @@ export interface FleetSnapshot { workflowProjects?: string[]; claims: Claim[]; r
 export type StartResult = { ok: true; generation: string } | {
   ok: false; reason: "foreign-claim" | "running" | "capacity" | "locked" | "finished" | "codex-paused" | "codex-spaced" | "incapable";
 };
-export interface MachineCapabilityReport { capabilities: string[]; updated: number }
+/** projects: the projects the computer's manager serves; absent from a report that did not say, which counts for every project. */
+export interface MachineCapabilityReport { capabilities: string[]; projects?: string[]; updated: number }
 /** A ticket whose requirement no computer that reported recently advertises. */
 export interface CapabilityGap { ticket: string; requires: string[]; missing: string[] }
 
@@ -210,7 +211,7 @@ export class FleetStore {
     this.facts = new RecoveryFacts(this.db);
     this.tasks = new RecoveryTasks(this.db);
     this.db.exec("CREATE TABLE IF NOT EXISTS fleet_assessment_releases (ticket TEXT NOT NULL, machine TEXT NOT NULL, generation TEXT NOT NULL, created INTEGER NOT NULL, PRIMARY KEY(ticket,generation)) STRICT");
-    this.db.exec("CREATE TABLE IF NOT EXISTS fleet_machine_capabilities (machine TEXT PRIMARY KEY, capabilities TEXT NOT NULL, updated INTEGER NOT NULL) STRICT");
+    this.db.exec("CREATE TABLE IF NOT EXISTS fleet_machine_capabilities (machine TEXT PRIMARY KEY, capabilities TEXT NOT NULL, projects TEXT, updated INTEGER NOT NULL) STRICT");
     this.db.exec("CREATE TABLE IF NOT EXISTS fleet_control_target (singleton INTEGER PRIMARY KEY,revision TEXT NOT NULL) STRICT; CREATE TABLE IF NOT EXISTS fleet_control_ready (machine TEXT PRIMARY KEY,revision TEXT NOT NULL) STRICT;");
     const clock = options.now ?? Date.now;
     this.operations = new OperationReports(this.db, Object.keys(limits), clock);
@@ -652,28 +653,31 @@ export class FleetStore {
    * A manager's report of what its computer offers tickets: its operating
    * system and configured hardware (see ticket-requirements.ts).
    */
-  reportMachineCapabilities(machine: string, capabilities: unknown): MachineCapabilityReport {
+  reportMachineCapabilities(machine: string, capabilities: unknown, projects?: unknown): MachineCapabilityReport {
     if (!Object.hasOwn(this.limits, machine)) throw new Error("Unknown machine");
     const list = validateCapabilityReport(capabilities);
+    if (projects !== undefined && (!Array.isArray(projects) || projects.length > 50 || projects.some(p => typeof p !== "string" || !/^[\w.-]+\/[\w.-]+$/.test(p)))) throw new Error("Invalid machine projects");
+    const served = projects === undefined ? undefined : [...new Set(projects as string[])].sort();
     const updated = this.clock();
-    this.db.prepare("INSERT INTO fleet_machine_capabilities VALUES (?,?,?) ON CONFLICT(machine) DO UPDATE SET capabilities=excluded.capabilities,updated=excluded.updated")
-      .run(machine, JSON.stringify(list), updated);
-    return { capabilities: list, updated };
+    this.db.prepare("INSERT INTO fleet_machine_capabilities VALUES (?,?,?,?) ON CONFLICT(machine) DO UPDATE SET capabilities=excluded.capabilities,projects=excluded.projects,updated=excluded.updated")
+      .run(machine, JSON.stringify(list), served === undefined ? null : JSON.stringify(served), updated);
+    return { capabilities: list, ...(served ? { projects: served } : {}), updated };
   }
   /** Last reports of configured computers. A computer that never reported is absent. */
   machineCapabilities(): Record<string, MachineCapabilityReport> {
     return Object.fromEntries(this.db.prepare("SELECT * FROM fleet_machine_capabilities ORDER BY machine").all()
       .filter(r => Object.hasOwn(this.limits, String(r.machine)))
-      .map(r => [String(r.machine), { capabilities: JSON.parse(String(r.capabilities)) as string[], updated: Number(r.updated) }]));
+      .map(r => [String(r.machine), { capabilities: JSON.parse(String(r.capabilities)) as string[],
+        ...(r.projects === null ? {} : { projects: JSON.parse(String(r.projects)) as string[] }), updated: Number(r.updated) }]));
   }
   /**
    * What a computer advertised in its last report, whatever its age: a
    * computer's capabilities do not change while it is away. A computer that
    * never reported, such as one on an older manager, advertises nothing.
    */
-  private reportedCapabilities(machine: string): string[] {
+  private reportedCapabilities(machine: string): string[] | undefined {
     const row = this.db.prepare("SELECT capabilities FROM fleet_machine_capabilities WHERE machine=?").get(machine);
-    return row ? JSON.parse(String(row.capabilities)) as string[] : [];
+    return row ? JSON.parse(String(row.capabilities)) as string[] : undefined;
   }
   /** The capabilities a numbered ticket of an adopted project requires. Shared jobs require nothing. */
   private requirementsOf(ticket: string): string[] {
@@ -684,9 +688,14 @@ export class FleetStore {
   }
   /**
    * Release every claim whose owner lacks a capability its open ticket now
-   * requires, when no run holds the ticket. The owner can never run another
-   * stage of it, so the claim would only trap the ticket. Its next stage is
-   * then taken like any unowned ticket by a computer that can run it. The
+   * requires, when nothing the owner alone holds is pending: no run, no open
+   * support task, no running or stranded wip: label, and no saved verdict
+   * waiting to publish (pending-verdict:, pending-done:), which only the
+   * owner's disk has. The owner can never run another stage of the ticket,
+   * so the claim would only trap it. Its next stage is then taken like any
+   * unowned ticket by a computer that can run it. An owner that never
+   * reported, such as one on an older manager during a rollout, is unknown
+   * rather than incapable, and keeps its claims. The
    * release is recorded with the assessment releases, so a supervised update
    * reads the disappearing claim as a release, not an ownership change.
    * Branches, working copies and GitHub state are untouched, as with free().
@@ -698,8 +707,13 @@ export class FleetStore {
       const released: Claim[] = [];
       for (const claim of this.db.prepare("SELECT * FROM fleet_claims ORDER BY created,ticket").all() as unknown as Claim[]) {
         const required = requirements[claim.ticket];
-        if (!required || !missingCapabilities(required, this.reportedCapabilities(claim.machine)).length) continue;
+        const owner = required && this.reportedCapabilities(claim.machine);
+        if (!required || !owner || !missingCapabilities(required, owner).length) continue;
         if (this.db.prepare("SELECT 1 FROM fleet_runs WHERE ticket=? AND finished IS NULL").get(claim.ticket)) continue;
+        if (this.db.prepare("SELECT 1 FROM fleet_recovery_tasks WHERE ticket=? AND state IN ('queued','running','publishing','attention')").get(claim.ticket)) continue;
+        let labels: string[];
+        try { labels = this.workflow.get(claim.ticket).labels; } catch { continue; }
+        if (labels.some(l => /^(wip:|pending-verdict:|pending-done:)/.test(l))) continue;
         this.db.prepare("DELETE FROM fleet_claims WHERE ticket=? AND generation=?").run(claim.ticket, claim.generation);
         this.db.prepare("INSERT OR IGNORE INTO fleet_assessment_releases VALUES (?,?,?,?)").run(claim.ticket, claim.machine, claim.generation, this.clock());
         released.push(claim);
@@ -707,13 +721,16 @@ export class FleetStore {
       return released;
     });
   }
-  /** Requirements no configured computer with a fresh report can satisfy. */
+  /** Requirements no configured computer that serves the ticket's project and reported recently can satisfy. */
   private capabilityGaps(requirements: Record<string, string[]>, reports: Record<string, MachineCapabilityReport>): CapabilityGap[] {
     const now = this.clock();
-    const fresh = Object.values(reports).filter(r => now - r.updated < CAPABILITY_REPORT_FRESH_MS).map(r => r.capabilities);
-    return Object.entries(requirements)
-      .filter(([, required]) => !fresh.some(caps => !missingCapabilities(required, caps).length))
-      .map(([ticket, required]) => ({ ticket, requires: required, missing: required.filter(c => !fresh.some(caps => caps.includes(c))) }));
+    const fresh = Object.values(reports).filter(r => now - r.updated < CAPABILITY_REPORT_FRESH_MS);
+    return Object.entries(requirements).flatMap(([ticket, required]) => {
+      const project = ticket.split("#")[0];
+      const serving = fresh.filter(r => !r.projects || r.projects.includes(project)).map(r => r.capabilities);
+      if (serving.some(caps => !missingCapabilities(required, caps).length)) return [];
+      return [{ ticket, requires: required, missing: required.filter(c => !serving.some(caps => caps.includes(c))) }];
+    });
   }
 
   // Operator recovery only. The caller must disable/stop the old worker first.
