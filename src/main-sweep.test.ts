@@ -8,6 +8,7 @@ import {
   buildMainSweepIssue,
   buildMainSweepUpdateComment,
   decideMainSweep,
+  mainSweepIssueLabels,
   holdVerifiersDuringSweep,
   parseMainSweepState,
   resolveMainSweepConfig,
@@ -221,6 +222,20 @@ describe("runMainSweep", () => {
     assert.ok(h.calls.at(-2)?.startsWith("git worktree remove "));
   });
 
+  test("runs without the Codex test login (pyrycode #3389)", async () => {
+    const saved = [process.env.PYRY_CODEX_CAPTURE_BIN, process.env.PYRY_CODEX_CAPTURE_HOME];
+    process.env.PYRY_CODEX_CAPTURE_BIN = "/opt/codex"; process.env.PYRY_CODEX_CAPTURE_HOME = "/home/x/.codex-test";
+    try {
+      const h = runnerDeps();
+      await sweep(h);
+      assert.ok(!("PYRY_CODEX_CAPTURE_BIN" in h.requests[0].env) && !("PYRY_CODEX_CAPTURE_HOME" in h.requests[0].env));
+    } finally {
+      for (const [name, value] of [["PYRY_CODEX_CAPTURE_BIN", saved[0]], ["PYRY_CODEX_CAPTURE_HOME", saved[1]]] as const) {
+        if (value === undefined) delete process.env[name]; else process.env[name] = value;
+      }
+    }
+  });
+
   test("a non-zero exit, a timeout or a spawn error is a failure", async () => {
     assert.equal((await sweep(runnerDeps({ spawn: { exitCode: 1 } }))).passed, false);
     assert.equal((await sweep(runnerDeps({ spawn: { exitCode: null, timedOut: true } }))).passed, false);
@@ -341,7 +356,9 @@ describe("runMainSweepCycle", () => {
     const h = harness({ state: { lastSha: A, lastGoodSha: A, openIssue: null }, result: outcome({ failedNames: ["p.C#a"] }) });
     await h.cycle(true);
     assert.deepEqual(h.board, ["create In-depth test run failed on main at ccccccc", "add", "status Backlog"]);
-    assert.deepEqual(h.createdLabels, [["bug", "priority:low"]]);
+    // A suite that ran and failed was seen failing on this system, so the fix ticket requires it.
+    assert.deepEqual(h.createdLabels, [mainSweepIssueLabels({ runError: null })]);
+    assert.ok(h.createdLabels[0].includes(`requires:${process.platform === "darwin" ? "macos" : "linux"}`));
     assert.deepEqual(h.lastState(), {
       lastSha: C, lastGoodSha: A, openIssue: 950, failures: { sha: C, names: ["p.C#a"] }, reportedNames: ["p.C#a"],
     });

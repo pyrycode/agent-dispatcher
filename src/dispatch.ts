@@ -92,6 +92,7 @@ import {
   retrySpawnOnTransientError,
   scrubSpawnEnv,
   agentSpawnEnv,
+  CODEX_CAPTURE_ENV,
   shouldAttemptSafeSalvage,
   shouldUseWorktree,
   findReadyPrNumber,
@@ -105,6 +106,7 @@ import {
 import { selectDispatches } from "./dispatch-selection.js";
 import {
   buildMainSweepIssue,
+  mainSweepIssueLabels,
   buildMainSweepUpdateComment,
   decideMainSweep,
   holdVerifiersDuringSweep,
@@ -192,6 +194,7 @@ import {
   FAMILY_DISPATCH_COUNT_PREFIX,
   decideBaselineAdjustedVerdict,
 } from "./pipeline-decisions.js";
+import { snapshotTestdata, changedTestdata, restoreGateTestdata, gateTestdataComment, type TestdataSnapshot } from "./gate-fixtures.js";
 import {
   type BranchSetupAction,
   AUTO_STAGE_COMMAND,
@@ -2364,9 +2367,26 @@ export type DispatchDeps = {
 /** Stage source edits without introducing or refreshing runtime files. A
  * runtime deletion already in the index is intentional cleanup: leave it.
  * Unstaging other runtime entries changes only the index, never local files. */
-export function stageAutomaticChanges(cwd: string, deps: Pick<DispatchDeps, "execSync" | "spawnSync">): void {
+export function stageAutomaticChanges(cwd: string, deps: Pick<DispatchDeps, "execSync" | "spawnSync">, exclude: ReadonlySet<string> = new Set()): void {
   unstageRuntimeChanges(cwd, deps);
   deps.execSync(AUTO_STAGE_COMMAND, { cwd, stdio: "pipe", timeout: 15_000 });
+  if (exclude.size) unstagePaths(cwd, deps, exclude);
+}
+
+/** Take paths back out of the index after automatic staging. Changes only the index. */
+function unstagePaths(cwd: string, deps: Pick<DispatchDeps, "execSync" | "spawnSync">, paths: ReadonlySet<string>): void {
+  const status = String(deps.execSync("git status --porcelain -z --untracked-files=all", {
+    cwd, encoding: "utf-8", stdio: "pipe", timeout: 15_000,
+  }));
+  // Only staged entries: an untouched pathspec would make git restore fail.
+  // A rename pairs a deleted and an added path. Only its excluded side is
+  // taken out; the other stays staged as a plain deletion or addition.
+  const staged = [...new Set(statusEntries(status)
+    .filter(e => ![" ", "?"].includes(e.status[0]!))
+    .flatMap(e => [e.path, e.from].filter((p): p is string => p !== undefined && paths.has(p))))];
+  if (!staged.length) return;
+  const result = deps.spawnSync("git", ["restore", "--staged", "--", ...staged.map(path => `:(literal)${path}`)], { cwd, stdio: "pipe", timeout: 15_000 });
+  if (result.status !== 0) throw new Error(`Could not keep gate-written fixtures out of the commit: ${result.stderr?.toString() || "git restore failed"}`);
 }
 
 function unstageRuntimeChanges(cwd: string, deps: Pick<DispatchDeps, "execSync" | "spawnSync">): void {
@@ -2653,6 +2673,9 @@ export type DispatchContext = {
   /** Set when a pre-spawn gate failed on the host, not the change (a
    *  toolchain mismatch). The dispatch halts with `error:infra`. */
   infraGateFailure?: { gate: string; reason: string; samples: string[] };
+  /** `testdata/` paths the pre-spawn gates changed. No automatic commit of
+   *  this run includes them, see gate-fixtures.ts. */
+  gateTestdata?: ReadonlySet<string>;
 };
 
 /**
@@ -4770,8 +4793,9 @@ export async function salvagePartialWork(
       ? checkMergeResolution(agentCwd, ctx.pendingMerge, ctx.deps).problems
       : [];
 
+    const gateTestdata = ctx.gateTestdata ?? new Set<string>();
     const decision = decidePartialWorkSalvage({
-      gitStatusOutput: shouldAutoCommit(gitStatusOutput) ? gitStatusOutput : "", commitsAheadOfOrigin, mergeInProgress, mergeCheckProblems,
+      gitStatusOutput: shouldAutoCommit(gitStatusOutput, gateTestdata) ? gitStatusOutput : "", commitsAheadOfOrigin, mergeInProgress, mergeCheckProblems,
     });
     if (!decision.salvage) {
       ctx.deps.writeLog(logFile, "PARTIAL_SALVAGE_SKIPPED", `${stopKind}: ${decision.reason}`);
@@ -4779,9 +4803,9 @@ export async function salvagePartialWork(
       return { keepWorktree: false };
     }
 
-    const dirty = shouldAutoCommit(gitStatusOutput);
+    const dirty = shouldAutoCommit(gitStatusOutput, gateTestdata);
     if (dirty) {
-      stageAutomaticChanges(agentCwd, ctx.deps);
+      stageAutomaticChanges(agentCwd, ctx.deps, gateTestdata);
       const runShape = stopKind === "timeout" ? "a timed-out run"
         : stopKind === "idle_stall" ? "a stalled run" : "a run that ended in an error";
       const commit = spawnSync(
@@ -5255,8 +5279,14 @@ export async function handlePostRun(
   if (item.issueNumber > 0 && useWorktree) {
     try {
       const dirty = execSync(`git status --porcelain -z --untracked-files=all`, { cwd: agentCwd, stdio: "pipe" }).toString();
-      if (shouldAutoCommit(dirty)) {
-        stageAutomaticChanges(agentCwd, ctx.deps);
+      const gateTestdata = ctx.gateTestdata ?? new Set<string>();
+      const leftOut = statusEntries(dirty).filter(e => gateTestdata.has(e.path)).map(e => e.path);
+      if (leftOut.length) {
+        console.warn(`   ⚠️  Not committing ${leftOut.length} test fixture(s) the gates wrote: ${leftOut.join(", ")}`);
+        ctx.deps.writeLog(logFile, "GATE FIXTURES NOT COMMITTED", leftOut.join("\n"));
+      }
+      if (shouldAutoCommit(dirty, gateTestdata)) {
+        stageAutomaticChanges(agentCwd, ctx.deps, gateTestdata);
         // argv-based commit so agent.name (currently from a hardcoded
         // enum, but configurability is a routine refactor away) can't
         // ever break out of `-m`'s quoting. Same discipline used in
@@ -6291,7 +6321,8 @@ function readDocsOnlyGateReuse(
  *   (capped at `VERIFIER_GATE_TAIL_CAP`). The verifier owns the baseline
  *   partition and the bounce-vs-advance call, exactly as QA does today —
  *   a deterministic bounce would loop forever on a failure that
- *   pre-exists on the merge base. Nothing is labelled or commented here;
+ *   pre-exists on the merge base. Nothing is labelled here, and the only
+ *   comment is the note on fixtures a gate rewrote (gate-fixtures.ts);
  *   routing is the model's verdict, not the gate's.
  * - **Already green on these files** → a full pass recorded on the same
  *   merged tree with the same gate list in the last 24 hours is reused:
@@ -6413,6 +6444,29 @@ export async function maybeRunPreSpawnGates(
   };
 }
 
+/**
+ * After the pre-spawn gates: put back the `testdata/` files they changed and
+ * keep every changed path out of this run's automatic commits. Reported in the
+ * log and on the ticket. Never fails the dispatch.
+ */
+async function guardGateTestdata(ctx: DispatchContext, before: TestdataSnapshot): Promise<void> {
+  let changed: string[];
+  try { changed = changedTestdata(before, snapshotTestdata(ctx.agentCwd, ctx.deps.spawnSync, false)); }
+  catch (e: any) {
+    console.warn(`   ⚠️  Could not read testdata/ after the gates: ${e?.message ?? e}`);
+    return;
+  }
+  if (!changed.length) return;
+  ctx.gateTestdata = new Set([...(ctx.gateTestdata ?? []), ...changed]);
+  const outcome = restoreGateTestdata(ctx.agentCwd, before, changed, ctx.deps.spawnSync);
+  console.warn(`   ⚠️  Pre-${ctx.agent.name} gates changed ${changed.length} file(s) under testdata/: ${outcome.restored.length} put back, ${outcome.kept.length} kept out of commits`);
+  ctx.deps.writeLog(ctx.logFile, "GATE FIXTURES", [
+    ...outcome.restored.map(p => `restored ${p}`), ...outcome.kept.map(p => `kept out of commits ${p}`),
+  ].join("\n"));
+  try { await ctx.client.addComment(ctx.item.issueNumber, gateTestdataComment(ctx.agent.name, outcome)); }
+  catch (e: any) { console.warn(`   ⚠️  Failed to post the gate fixture note on #${ctx.item.issueNumber}: ${e?.message ?? e}`); }
+}
+
 async function runConfiguredPreSpawnGates(
   ctx: DispatchContext,
 ): Promise<{ promptNote: string }> {
@@ -6519,6 +6573,11 @@ async function runConfiguredPreSpawnGates(
     console.log(`   ♻️  Pre-${agent.name} code gates already passed at ${docsOnly.pass.passedAt} on ${docsOnly.pass.commit.slice(0, 12)}; only documentation changed since (${docsOnly.files.length} file(s)), reusing that result`);
   }
   console.log(`   🧪 Pre-${agent.name} gates (${toRun.length}): ${toRun.map((g) => `\`${g}\``).join(", ")}`);
+  // What testdata/ looked like before the gates, so fixtures they rewrite are
+  // put back and never committed (gate-fixtures.ts). Unreadable: nothing known.
+  let testdataBefore: TestdataSnapshot | null = null;
+  try { testdataBefore = snapshotTestdata(agentCwd, ctx.deps.spawnSync); }
+  catch (e: any) { console.warn(`   ⚠️  Could not read testdata/ before the gates: ${e?.message ?? e}`); }
   const result = await runVerifierGates({
     gates: toRun,
     cwd: agentCwd,
@@ -6529,6 +6588,7 @@ async function runConfiguredPreSpawnGates(
     logNumbers: docsOnly !== null ? toRun.map((g) => gates.indexOf(g) + 1) : undefined,
     deps: ctx.deps,
   });
+  if (testdataBefore !== null) await guardGateTestdata(ctx, testdataBefore);
   const baselineLog = result.baseline.flatMap((a) => [
     ...a.flaky.map((name) => `  ${a.gate}: \`${name}\` (passed on the same-tree re-run, flaky)`),
     ...(a.rerunSkipReason ? [`  ${a.gate}: no same-tree re-run, ${a.rerunSkipReason}`] : []),
@@ -7168,13 +7228,34 @@ export type GateSpawner = (req: GateSpawnRequest) => Promise<GateSpawnOutcome>;
  * **Strips the dispatcher's own secrets** via the shared `scrubSpawnEnv`, so
  * a test process cannot reach the GitHub token that drives the board.
  */
-export function buildGateSpawnEnv(parentEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+export function buildGateSpawnEnv(parentEnv: NodeJS.ProcessEnv, opts: { codexCapture?: boolean } = {}): NodeJS.ProcessEnv {
   const env = scrubSpawnEnv(parentEnv);
   delete env.ANTHROPIC_API_KEY;
   // Only a gate run the dispatcher made a folder for may name one; an
   // inherited value would send captures to some other run's folder.
   delete env[GATE_EVIDENCE_ENV];
+  if (!opts.codexCapture) for (const name of CODEX_CAPTURE_ENV) delete env[name];
   return env;
+}
+
+export { CODEX_CAPTURE_ENV };
+
+/** The environment without the Codex test login (CODEX_CAPTURE_ENV). */
+function withoutCodexCapture(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const out = { ...env };
+  for (const name of CODEX_CAPTURE_ENV) delete out[name];
+  return out;
+}
+
+/**
+ * The live gate's environment: `buildGateSpawnEnv` plus the Codex test login,
+ * because the live suites (Core's `e2e_realclaude` Codex conversation test,
+ * Desktop's real Luna channel spec) are where a live Codex capture is meant
+ * to run. Used for the live gate's own run, its same-tree rerun, its
+ * base-commit checks and its health checks, and nowhere else.
+ */
+export function buildLiveGateSpawnEnv(parentEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return buildGateSpawnEnv(parentEnv, { codexCapture: true });
 }
 
 /**
@@ -7684,7 +7765,7 @@ export async function runRealClaudeGateSuite(opts: {
     const outcome = await deps.spawnGate({
       command,
       cwd: worktreeDir,
-      env: {...buildGateSpawnEnv(process.env),...managedTaskEnv(),...gateEvidenceEnv(report.evidenceDir, "main", deps.mkdirSync)},
+      env: {...buildLiveGateSpawnEnv(process.env),...managedTaskEnv(),...gateEvidenceEnv(report.evidenceDir, "main", deps.mkdirSync)},
       timeoutMs: opts.timeoutMs,
       stdoutPath,
       stderrPath,
@@ -7796,6 +7877,7 @@ export async function runRealClaudeGateSuite(opts: {
             label: "real-claude-gate-infra-check",
             who: "Real-claude gate infrastructure check",
             evidence: { runDir: report.evidenceDir ?? null, part: "infra-check" },
+            live: true,
             deps,
           });
           failedOnBase = check.failures;
@@ -7935,6 +8017,7 @@ async function runBaselineComparison(opts: {
   const result = await runFailuresOnBase({
     ...opts, label: "real-claude-gate-base", who: "Real-claude gate",
     evidence: { runDir: opts.report.evidenceDir ?? null, part: "base" },
+    live: true,
   });
   if (result.outputPath !== null) report.baselineOutputPath = result.outputPath;
   report.baselineFailures = result.failures;
@@ -7967,6 +8050,8 @@ async function runFailuresOnBase(opts: {
   who: string;
   /** The live gate run's evidence folder and this part's name in it. Absent for the verifier gates. */
   evidence?: { runDir: string | null; part: string };
+  /** A check for the live gate: it keeps the Codex test login (buildLiveGateSpawnEnv). */
+  live?: boolean;
   deps: Pick<GateRunnerDeps, "execSync" | "spawnGate" | "readFileSync"> & { mkdirSync?: GateRunnerDeps["mkdirSync"] };
 }): Promise<{ failures: string[] | null; skipReason: string | null; outputPath: string | null }> {
   const { deps, targetRepo } = opts;
@@ -8004,7 +8089,7 @@ async function runFailuresOnBase(opts: {
     const outcome = await deps.spawnGate({
       command,
       cwd: worktreeDir,
-      env: {...buildGateSpawnEnv(process.env),...managedTaskEnv(),
+      env: {...(opts.live ? buildLiveGateSpawnEnv(process.env) : buildGateSpawnEnv(process.env)),...managedTaskEnv(),
         ...gateEvidenceEnv(opts.evidence?.runDir, opts.evidence?.part ?? "base", deps.mkdirSync ?? mkdirSync)},
       timeoutMs: opts.timeoutMs,
       stdoutPath,
@@ -8097,7 +8182,7 @@ async function runBranchRerun(opts: {
     const outcome = await deps.spawnGate({
       command,
       cwd: opts.worktreeDir,
-      env: {...buildGateSpawnEnv(process.env),...managedTaskEnv(),...gateEvidenceEnv(report.evidenceDir, "rerun", deps.mkdirSync)},
+      env: {...buildLiveGateSpawnEnv(process.env),...managedTaskEnv(),...gateEvidenceEnv(report.evidenceDir, "rerun", deps.mkdirSync)},
       timeoutMs: opts.timeoutMs,
       stdoutPath,
       stderrPath,
@@ -8525,7 +8610,7 @@ async function recordMainSweep(r: {
       repo: opts.repo, head, lastGoodSha: state.lastGoodSha, mergeSubjects, command: config.command, outcome,
     });
     try {
-      const issue = await opts.client.createIssue(title, body, ["bug", "priority:low"]);
+      const issue = await opts.client.createIssue(title, body, mainSweepIssueLabels(outcome));
       const itemId = await opts.client.addItemToProject(issue.nodeId);
       await opts.client.updateItemStatus(itemId, "Backlog");
       next.openIssue = issue.number;
@@ -9979,7 +10064,7 @@ export async function pollLoop(): Promise<void> {
     checker: healthChecker,
     roles: pollOrder.map((a) => a.name),
     envFor: (role, check) => healthEnvForAgent(process.env, role, managed?.runner() ?? selectRunner(role), check.scope),
-    liveGateEnv: realClaudeGateRunner === null ? null : buildGateSpawnEnv(process.env),
+    liveGateEnv: realClaudeGateRunner === null ? null : buildLiveGateSpawnEnv(process.env),
     notify: notifyDiscord,
     state: healthNotices,
   });
@@ -10221,7 +10306,7 @@ export async function pollLoop(): Promise<void> {
     if (realClaudeGateRunner !== null) announceInfraPause(infraPause);
     const infraPaused = infraPause !== null;
     const gateHealthFailures = drainMode || envHeld || infraPaused || realClaudeGateRunner === null ? [] : await liveGateHealthFailures({
-      checks: HEALTH_CHECKS, checker: healthChecker, env: {...buildGateSpawnEnv(process.env),...managedTaskEnv()}, notify: notifyDiscord, state: healthNotices,
+      checks: HEALTH_CHECKS, checker: healthChecker, env: {...buildLiveGateSpawnEnv(process.env),...managedTaskEnv()}, notify: notifyDiscord, state: healthNotices,
     });
     // Read after the checks, so a stop signal that landed during them counts.
     const gateRunner = liveGateRunnerFor({
@@ -10443,7 +10528,7 @@ export async function pollLoop(): Promise<void> {
                   model: runner === "codex" ? process.env.PYRY_CODEX_MODEL ?? "gpt-6.1-sol" : "sonnet",
                   effort: RECOVERY_EFFORT, maxTurns: RECOVERY_MAX_TURNS, timeoutMs: RECOVERY_TIMEOUT_MS,
                   allowedTools: "Read,Glob,Grep", disallowedTools: "Bash,Write,Edit,Agent",
-                  env: { ...scrubSpawnEnv(process.env),...managedTaskEnv(), CLAUDE_CODE_ENTRYPOINT: "recovery" } });
+                  env: { ...withoutCodexCapture(scrubSpawnEnv(process.env)),...managedTaskEnv(), CLAUDE_CODE_ENTRYPOINT: "recovery" } });
                 if (result.codexRateLimited) throw new CodexRateLimitError("Codex rate limit (429) before the assessment could run");
                 if (result.isError || result.timedOut || result.hadPermissionDenial) throw new Error("Recovery assessment failed");
                 return parseRecoveryDecision(result.output);

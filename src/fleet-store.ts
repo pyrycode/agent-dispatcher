@@ -9,10 +9,12 @@ import { RecoveryFacts, type PauseRecord, type EvidenceRecord, type Coordination
 import { RecoveryLedger, validateObservations, IDLE_RECOVERY_REASONS, RECOVERY_UNKNOWN_PAUSE_REASON, type RecoveryObservation, type RecoveryDecision, type RecoveryIncident, type RecoveryLedgerOptions } from "./fleet-recovery.js";
 import { OperationReports } from './operation-reports.js';
 import { OrphanedTaskWatch } from './orphaned-tasks.js';
-import {RecoveryTasks, assessmentTasks, type RecoveryTaskRequest, type RecoveryTaskResult} from './recovery-tasks.js';
+import {RecoveryTasks, assessmentTasks, recoveryTaskId, validateTaskRequest, type RecoveryTaskRequest, type RecoveryTaskResult} from './recovery-tasks.js';
+import { currentWorkflow, recordRepairWorkflow, dispatcherRepairCap } from './recovery-repair-cap.js';
 import {createHash} from 'node:crypto';
 import {manifestHash} from './recovery-artifacts.js';
 import type { AgentRunner } from './agent-runner.js';
+import { CAPABILITY_REPORT_FRESH_MS, missingCapabilities, ticketRequirements, validateCapabilityReport } from "./ticket-requirements.js";
 import { CodexThrottle, startsCodex, DEFAULT_CODEX_THROTTLE, type CodexThrottleConfig, type CodexPauseState, type CodexSpacingState } from './codex-throttle.js';
 
 /** An operator choice, frozen into each new grant. Null restores local settings. */
@@ -115,11 +117,32 @@ export interface FleetSnapshot { workflowProjects?: string[]; claims: Claim[]; r
    * and a manager then applies no review queue limit.
    */
   reviewReadyTickets?: string[];
+  /**
+   * Open tickets with a `requires:` label and the capabilities they need
+   * (see ticket-requirements.ts). Absent when there are none, or from an
+   * older claim service, which enforces no requirement.
+   */
+  ticketRequirements?: Record<string, string[]>;
+  /** Each computer's last capability report. Absent before any report. */
+  machineCapabilities?: Record<string, MachineCapabilityReport>;
+  /** Requirements no computer with a fresh report can satisfy. Absent when there are none. */
+  noCapableMachine?: CapabilityGap[];
+  /**
+   * Claims on tickets with a requirement held by a computer that has never
+   * reported its capabilities, such as one still on an older manager. The
+   * claim is kept, since the owner may be able to run the ticket, but the
+   * owner's starts are refused until it reports. Absent when there are none.
+   */
+  unreportedOwners?: Array<{ ticket: string; machine: string; requires: string[] }>;
   /** Present only while a new Codex start would be refused for spacing. */
   codexSpacing?: CodexSpacingState }
 export type StartResult = { ok: true; generation: string } | {
-  ok: false; reason: "foreign-claim" | "running" | "capacity" | "locked" | "finished" | "codex-paused" | "codex-spaced";
+  ok: false; reason: "foreign-claim" | "running" | "capacity" | "locked" | "finished" | "codex-paused" | "codex-spaced" | "incapable";
 };
+/** projects: the projects the computer's manager serves; absent from a report that did not say, which counts for every project. */
+export interface MachineCapabilityReport { capabilities: string[]; projects?: string[]; updated: number }
+/** A ticket whose requirement no computer that reported recently advertises. */
+export interface CapabilityGap { ticket: string; requires: string[]; missing: string[] }
 
 export function validateStart(req: StartRequest): void {
   if (Object.hasOwn(req, 'runnerPolicy')) throw new Error('Runner choice belongs to the central operator');
@@ -213,6 +236,7 @@ export class FleetStore {
     // active the ticket is not admitted (see startAdmitted), so a refiner that
     // splits a ticket keeps write access to its children until it finishes.
     this.db.exec("CREATE TABLE IF NOT EXISTS fleet_ticket_creators (issue_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, created INTEGER NOT NULL) STRICT");
+    this.db.exec("CREATE TABLE IF NOT EXISTS fleet_machine_capabilities (machine TEXT PRIMARY KEY, capabilities TEXT NOT NULL, projects TEXT, updated INTEGER NOT NULL) STRICT");
     this.db.exec("CREATE TABLE IF NOT EXISTS fleet_control_target (singleton INTEGER PRIMARY KEY,revision TEXT NOT NULL) STRICT; CREATE TABLE IF NOT EXISTS fleet_control_ready (machine TEXT PRIMARY KEY,revision TEXT NOT NULL) STRICT;");
     const clock = options.now ?? Date.now;
     this.operations = new OperationReports(this.db, Object.keys(limits), clock);
@@ -252,7 +276,10 @@ export class FleetStore {
       if (step === "begin") return this.recovery.begin(id, runId);
       if (step === "decide") {
         const selected = this.recovery.decide(id, runId, decision!);
-        if (selected.action === 'coordinate') this.tasks.request(incident.ticket, selected.task!,incident.id);
+        if (selected.action === 'coordinate') {
+          const task = this.tasks.request(incident.ticket, selected.task!,incident.id);
+          if (task.request.recipe === 'dispatcher-repair') recordRepairWorkflow(this.db, task.id, task.ticket, currentWorkflow(this.db, task.ticket));
+        }
         return selected;
       }
       if (step === "complete") { this.recovery.complete(id, runId); return { ok: true }; }
@@ -283,7 +310,19 @@ export class FleetStore {
     const run = this.snapshot().runs.find(r => r.id === runId && r.machine === machine && r.session === session && r.project === project);
     if (!run || !['builder','developer','recovery'].includes(run.role) || !/#[1-9]\d*$/.test(run.ticket)) throw new Error('Task needs an admitted source worker');
     this.authorize(machine, session, run.ticket, runId);
-    return this.transaction(() => this.tasks.request(run.ticket, request,run.id));
+    return this.transaction(() => {
+      // The same cap as an assessment's order. Repeating an existing request still returns it.
+      let known = false;
+      try { this.tasks.get(recoveryTaskId(run.ticket, validateTaskRequest(request), run.id)); known = true; } catch { /* new, or invalid and refused below */ }
+      const workflow = currentWorkflow(this.db, run.ticket);
+      if (!known && request?.recipe === 'dispatcher-repair') {
+        const cap = dispatcherRepairCap(this.db, run.ticket, workflow, this.clock(), request);
+        if (cap.capped) throw new Error(cap.reason);
+      }
+      const task = this.tasks.request(run.ticket, request,run.id);
+      if (task.request.recipe === 'dispatcher-repair') recordRepairWorkflow(this.db, task.id, task.ticket, workflow);
+      return task;
+    });
   }
   taskStart(machine: string, id: string, session: string): StartResult & {runnerPolicy?: RunnerPolicy;run?:FleetRun} {
     if(!Object.hasOwn(this.limits,machine)) throw new Error('Unknown machine');
@@ -528,6 +567,9 @@ export class FleetStore {
       // children past the point where its reservation is reported as stale.
       if(this.db.prepare('SELECT 1 FROM fleet_ticket_creators AS c JOIN fleet_runs AS r ON r.id=c.run_id WHERE c.issue_id=? AND r.finished IS NULL AND c.created>?').get(item.issueId,this.clock()-CREATOR_HOLD_MS)) return {ok:false,reason:'locked'};
     }
+    // Every stage of a ticket with a requirement runs only where it can.
+    const needs = this.requirementsOf(req.ticket);
+    if (needs.length && missingCapabilities(needs, this.reportedCapabilities(req.machine)).length) return { ok: false, reason: "incapable" };
     if(/#[1-9]\d*$/.test(req.ticket) && req.role!=='recovery') {
       const required=this.requiredRepairs()[req.ticket]??[];
       if(required.some(sha=>!req.readyRepairs?.includes(sha))) return {ok:false,reason:'locked'};
@@ -669,6 +711,90 @@ export class FleetStore {
   /** Log a Codex pause that has run out. Called on a timer by the claim service. */
   codexTick(): void { this.transaction(() => this.codex.tick()); }
 
+  /**
+   * A manager's report of what its computer offers tickets: its operating
+   * system and configured hardware (see ticket-requirements.ts).
+   */
+  reportMachineCapabilities(machine: string, capabilities: unknown, projects?: unknown): MachineCapabilityReport {
+    if (!Object.hasOwn(this.limits, machine)) throw new Error("Unknown machine");
+    const list = validateCapabilityReport(capabilities);
+    if (projects !== undefined && (!Array.isArray(projects) || projects.length > 50 || projects.some(p => typeof p !== "string" || !/^[\w.-]+\/[\w.-]+$/.test(p)))) throw new Error("Invalid machine projects");
+    const served = projects === undefined ? undefined : [...new Set(projects as string[])].sort();
+    const updated = this.clock();
+    this.db.prepare("INSERT INTO fleet_machine_capabilities VALUES (?,?,?,?) ON CONFLICT(machine) DO UPDATE SET capabilities=excluded.capabilities,projects=excluded.projects,updated=excluded.updated")
+      .run(machine, JSON.stringify(list), served === undefined ? null : JSON.stringify(served), updated);
+    return { capabilities: list, ...(served ? { projects: served } : {}), updated };
+  }
+  /** Last reports of configured computers. A computer that never reported is absent. */
+  machineCapabilities(): Record<string, MachineCapabilityReport> {
+    return Object.fromEntries(this.db.prepare("SELECT * FROM fleet_machine_capabilities ORDER BY machine").all()
+      .filter(r => Object.hasOwn(this.limits, String(r.machine)))
+      .map(r => [String(r.machine), { capabilities: JSON.parse(String(r.capabilities)) as string[],
+        ...(r.projects === null ? {} : { projects: JSON.parse(String(r.projects)) as string[] }), updated: Number(r.updated) }]));
+  }
+  /**
+   * What a computer advertised in its last report, whatever its age: a
+   * computer's capabilities do not change while it is away. A computer that
+   * never reported, such as one on an older manager, advertises nothing.
+   */
+  private reportedCapabilities(machine: string): string[] | undefined {
+    const row = this.db.prepare("SELECT capabilities FROM fleet_machine_capabilities WHERE machine=?").get(machine);
+    return row ? JSON.parse(String(row.capabilities)) as string[] : undefined;
+  }
+  /** The capabilities a numbered ticket of an adopted project requires. Shared jobs require nothing. */
+  private requirementsOf(ticket: string): string[] {
+    if (!/#[1-9]\d*$/.test(ticket) || !this.workflow.enabled(ticket.split("#")[0])) return [];
+    let labels: string[];
+    try { labels = this.workflow.get(ticket).labels; } catch { return []; }
+    return ticketRequirements(labels);
+  }
+  /**
+   * Release every claim whose owner lacks a capability its open ticket now
+   * requires, when nothing the owner alone holds is pending: no run, no open
+   * support task, no running or stranded wip: label, and no saved verdict
+   * waiting to publish (pending-verdict:, pending-done:), which only the
+   * owner's disk has. The owner can never run another stage of the ticket,
+   * so the claim would only trap it. Its next stage is then taken like any
+   * unowned ticket by a computer that can run it. An owner that never
+   * reported, such as one on an older manager during a rollout, is unknown
+   * rather than incapable, and keeps its claims. The
+   * release is recorded with the assessment releases, so a supervised update
+   * reads the disappearing claim as a release, not an ownership change.
+   * Branches, working copies and GitHub state are untouched, as with free().
+   * The claim service runs this on a timer.
+   */
+  releaseIncapableClaims(): Claim[] {
+    return this.transaction(() => {
+      const requirements = this.workflow.openTicketRequirements();
+      const released: Claim[] = [];
+      for (const claim of this.db.prepare("SELECT * FROM fleet_claims ORDER BY created,ticket").all() as unknown as Claim[]) {
+        const required = requirements[claim.ticket];
+        const owner = required && this.reportedCapabilities(claim.machine);
+        if (!required || !owner || !missingCapabilities(required, owner).length) continue;
+        if (this.db.prepare("SELECT 1 FROM fleet_runs WHERE ticket=? AND finished IS NULL").get(claim.ticket)) continue;
+        if (this.db.prepare("SELECT 1 FROM fleet_recovery_tasks WHERE ticket=? AND state IN ('queued','running','publishing','attention')").get(claim.ticket)) continue;
+        let labels: string[];
+        try { labels = this.workflow.get(claim.ticket).labels; } catch { continue; }
+        if (labels.some(l => /^(wip:|pending-verdict:|pending-done:)/.test(l))) continue;
+        this.db.prepare("DELETE FROM fleet_claims WHERE ticket=? AND generation=?").run(claim.ticket, claim.generation);
+        this.db.prepare("INSERT OR IGNORE INTO fleet_assessment_releases VALUES (?,?,?,?)").run(claim.ticket, claim.machine, claim.generation, this.clock());
+        released.push(claim);
+      }
+      return released;
+    });
+  }
+  /** Requirements no configured computer that serves the ticket's project and reported recently can satisfy. */
+  private capabilityGaps(requirements: Record<string, string[]>, reports: Record<string, MachineCapabilityReport>): CapabilityGap[] {
+    const now = this.clock();
+    const fresh = Object.values(reports).filter(r => now - r.updated < CAPABILITY_REPORT_FRESH_MS);
+    return Object.entries(requirements).flatMap(([ticket, required]) => {
+      const project = ticket.split("#")[0];
+      const serving = fresh.filter(r => !r.projects || r.projects.includes(project)).map(r => r.capabilities);
+      if (serving.some(caps => !missingCapabilities(required, caps).length)) return [];
+      return [{ ticket, requires: required, missing: required.filter(c => !serving.some(caps => caps.includes(c))) }];
+    });
+  }
+
   // Operator recovery only. The caller must disable/stop the old worker first.
   // Matching the generation prevents an old confirmation from releasing a new owner.
   free(ticket: string, generation: string, stopped: boolean): void {
@@ -728,6 +854,12 @@ export class FleetStore {
     const priorityHighTickets = this.workflow.openTicketsWithLabel(PRIORITY_HIGH);
     const workflowProjects = this.workflow.projects().map(p => p.project);
     const reviewReadyTickets = workflowProjects.length ? this.reviewReadyTickets() : undefined;
+    const ticketRequirements = workflowProjects.length ? this.workflow.openTicketRequirements() : {};
+    const machineCapabilities = this.machineCapabilities();
+    const noCapableMachine = this.capabilityGaps(ticketRequirements, machineCapabilities);
+    const claims = this.db.prepare("SELECT * FROM fleet_claims ORDER BY created,ticket").all() as unknown as Claim[];
+    const unreportedOwners = claims.filter(c => ticketRequirements[c.ticket] && !Object.hasOwn(machineCapabilities, c.machine))
+      .map(c => ({ ticket: c.ticket, machine: c.machine, requires: ticketRequirements[c.ticket] }));
     return {
       ...(codexPause ? { codexPause } : {}),
       ...(codexSpacing ? { codexSpacing } : {}),
@@ -736,8 +868,12 @@ export class FleetStore {
       ...(idleRecoveryTickets.length ? { idleRecoveryTickets } : {}),
       ...(priorityHighTickets.length ? { priorityHighTickets } : {}),
       ...(reviewReadyTickets ? { reviewReadyTickets } : {}),
+      ...(Object.keys(ticketRequirements).length ? { ticketRequirements } : {}),
+      ...(Object.keys(machineCapabilities).length ? { machineCapabilities } : {}),
+      ...(noCapableMachine.length ? { noCapableMachine } : {}),
+      ...(unreportedOwners.length ? { unreportedOwners } : {}),
       ...(releasedAssessmentClaims.length ? { releasedAssessmentClaims } : {}),
-      claims: this.db.prepare("SELECT * FROM fleet_claims ORDER BY created,ticket").all() as unknown as Claim[],
+      claims,
       runs: this.db.prepare("SELECT request,generation,created FROM fleet_runs WHERE finished IS NULL ORDER BY created,id").all()
         .map(row => ({ ...JSON.parse(String(row.request)), generation: String(row.generation), created: Number(row.created) })),
     };

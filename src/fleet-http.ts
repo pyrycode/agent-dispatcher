@@ -101,6 +101,11 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
         try { store.orphans.observe(); } catch { /* observed again on the next report */ }
         return send(200, {ok:true});
       }
+      if (req.url === '/machines/capabilities') {
+        const actor = isAdmin ? body.machine : machine;
+        if (!actor || !Object.hasOwn(machines, actor)) return send(403,{error:'Unknown capability owner'});
+        return send(200, store.reportMachineCapabilities(actor, body.capabilities, body.projects));
+      }
       if (req.url === '/tasks/capabilities') {
         const actor = isAdmin ? body.machine : machine;
         if (!actor || !Object.hasOwn(machines, actor)) return send(403,{error:'Unknown capability owner'});

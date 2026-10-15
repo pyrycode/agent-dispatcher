@@ -3,13 +3,21 @@ import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { listen, readJson, tokenMatches, ownershipRefusal, type FleetClient } from "./fleet-http.js";
 import { validateStart, validateLimits, type MachineLimits, type FleetRun } from "./fleet-store.js";
-import { scheduleMachine, runnableTickets, acceptsDuringProjectDrain, codexPaused, codexSpaced, isNewTicket, reviewQueue, effectiveReviewQueueLimit, type WorkOffer } from "./machine-scheduler.js";
+import { scheduleMachine, runnableTickets, acceptsDuringProjectDrain, codexPaused, codexSpaced, isNewTicket, reviewQueue, effectiveReviewQueueLimit, lackingCapabilities, type WorkOffer } from "./machine-scheduler.js";
+import { validateCapabilityReport } from "./ticket-requirements.js";
 
 /** An operator drain or resume command, kept so a supervisor can tell it from an unexplained policy change. */
 export interface ProjectDrainChange { project: string; draining: boolean; at: number }
 export interface MachineConfig extends MachineLimits { machine: string; projects: string[]; drainingProjects?: string[]; projectDrainChanges?: ProjectDrainChange[]; ticketLimit?: number;
   /** New tickets wait while this many owned tickets wait for review. Absent: heavyLimit. 0: no hold. */
-  reviewQueueLimit?: number; controlRevision?: string }
+  reviewQueueLimit?: number; controlRevision?: string;
+  /**
+   * Everything this computer advertises to tickets with a `requires:` label:
+   * its operating system and configured hardware (machineCapabilities in
+   * ticket-requirements.ts). Reported to the claim service, which enforces
+   * it. Absent: nothing, so only tickets without a requirement run here.
+   */
+  capabilities?: string[] }
 type ClaimService = Pick<FleetClient, "snapshot" | "start" | "finish"> & Partial<Pick<FleetClient, "authorize" | "github" | "call">>;
 interface Offers { session: string; work: WorkOffer[]; at: number }
 export function offerId(machine: string, session: string, offer: WorkOffer): string {
@@ -31,6 +39,7 @@ export class MachineManager {
     if (config.reviewQueueLimit !== undefined && (!Number.isSafeInteger(config.reviewQueueLimit) || config.reviewQueueLimit < 0)) throw new Error("Invalid review queue limit");
     if (!config.machine || new Set(config.projects).size !== config.projects.length) throw new Error("Invalid machine configuration");
     if (config.projectHeavyLimits !== undefined && Object.keys(config.projectHeavyLimits).some(p => !config.projects.includes(p))) throw new Error("projectHeavyLimits names a project this manager does not serve");
+    if (config.capabilities !== undefined) config.capabilities = validateCapabilityReport(config.capabilities);
     if (config.drainingProjects !== undefined && (!Array.isArray(config.drainingProjects) || config.drainingProjects.some(p => !config.projects.includes(p)))) throw new Error("Invalid project drain configuration");
   }
   async setProjectDraining(project: string, draining: boolean, persist: (projects: string[], changes: ProjectDrainChange[]) => void): Promise<void> {
@@ -62,6 +71,16 @@ export class MachineManager {
     const old = this.offers.get(project);
     if (old && old.session !== session && this.now() - old.at < 180_000) throw new Error("Another dispatcher session is registered; drain it first");
     this.offers.set(project, { session, work: structuredClone(work), at: this.now() });
+  }
+  /**
+   * Tell the claim service what this computer offers tickets. The service
+   * admits a ticket with a requirement only on a computer whose report
+   * covers it, and lists requirements no fresh report covers. An older
+   * service without the route refuses; the caller logs and retries.
+   */
+  async reportCapabilities(): Promise<void> {
+    if (!this.claims.call) throw new Error("Capability reports require the claim service");
+    await this.claims.call("/machines/capabilities", { capabilities: this.config.capabilities ?? [], projects: this.config.projects });
   }
   tick(): Promise<void> {
     if (this.tickPromise) return this.tickPromise;
@@ -130,7 +149,7 @@ export class MachineManager {
     const reviewFull = reviewLimit > 0 && waitingReview !== undefined && waitingReview.length >= reviewLimit;
     return { ...(this.config.controlRevision?{controlRevision:this.config.controlRevision}:{}), managerStartedAt: this.startedAt, machine: this.config.machine, heavyLimit: this.config.heavyLimit, combinedLimit: this.config.combinedLimit, ...(this.config.projectHeavyLimits ? { projectHeavyLimits: this.config.projectHeavyLimits } : {}), ticketLimit: this.config.ticketLimit ?? null,
       // tickets is null when the claim service predates the report; nothing is held then.
-      reviewQueue: { limit: reviewLimit, tickets: waitingReview ?? null, full: reviewFull }, runnableTicketCount: runnableTickets(this.config.machine, runnableOffers, state).size, draining: this.draining, drainingProjects: this.config.drainingProjects ?? [], projectDrainChanges: this.config.projectDrainChanges ?? [], ...state,
+      reviewQueue: { limit: reviewLimit, tickets: waitingReview ?? null, full: reviewFull }, capabilities: this.config.capabilities ?? [], runnableTicketCount: runnableTickets(this.config.machine, runnableOffers, state).size, draining: this.draining, drainingProjects: this.config.drainingProjects ?? [], projectDrainChanges: this.config.projectDrainChanges ?? [], ...state,
       projects: this.config.projects.map(project => ({ project, draining: this.config.drainingProjects?.includes(project) ?? false, lastSeen: this.offers.get(project)?.at ?? null, health: !this.offers.has(project) ? "not-registered" : this.now() - this.offers.get(project)!.at >= 180_000 ? "dispatcher-unreachable" : "reporting" })),
       attention: state.runs.filter(r => r.machine === this.config.machine && this.now() - r.created >= 3 * 3600000)
         .map(r => ({ ticket: r.ticket, runId: r.id, reason: "Reservation older than three hours; verify worker progress before intervening" })),
@@ -140,6 +159,9 @@ export class MachineManager {
           : this.draining ? "draining"
           : state.claims.some(c => c.ticket === o.ticket && c.machine !== this.config.machine) ? "owned-elsewhere"
           : !acceptsDuringProjectDrain(o, this.config.machine, this.config.drainingProjects ?? [], state) ? "project-draining"
+          // No computer that reported recently can run it, or only another one can.
+          : lackingCapabilities(o, state, this.config.capabilities).length
+            ? (state.noCapableMachine?.some(g => g.ticket === o.ticket) ? "no-capable-machine" : "missing-capability")
           : codexPaused(o, state) ? "codex-paused"
           : codexSpaced(o, state) ? "codex-spaced"
           // A verifier selected in the same pass can shorten the queue, so an offer it frees is eligible.

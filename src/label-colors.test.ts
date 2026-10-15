@@ -21,7 +21,7 @@ test("every colour reads in black or white text", () => {
   const names = ["error:x", "needs-human:x", "needs-rework:x", "wip:x", "pending-done:x", "held:x", "orchestrator:fixing",
     "orchestrator:escalated", "claim:pyrybox", "claim:build-fractal-2", "priority:high", "priority:normal", "priority:low",
     "size:xs", "size:s", "size:m", "size:l", "done:po", "done:architect", "done:developer", "done:qa", "done:verifier",
-    "done:documentation", "merged", "security-sensitive", "rework-count:1"];
+    "done:documentation", "merged", "security-sensitive", "rework-count:1", "requires:macos"];
   for (const n of names) {
     const l = luminance(labelColor(n));
     const best = Math.max(1.05 / (l + 0.05), (l + 0.05) / 0.05);
@@ -62,6 +62,31 @@ test("addLabel reads the label list once and creates only labels that are missin
     assert.equal(lists.length, 1);
     assert.deepEqual(creates.map((c) => c.body), [{ name: "error:builder", color: "B60205" }, { name: "done:qa", color: "3CA862" }]);
     assert.equal(adds.length, 6);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("createIssue creates a missing label in its colour before filing", async () => {
+  const { GitHubProjectClient } = await import("./github.js");
+  const realFetch = globalThis.fetch;
+  const calls: Array<{ method: string; url: string; body?: any }> = [];
+  globalThis.fetch = (async (input: any, init?: any) => {
+    const url = String(input?.url ?? input);
+    const method = init?.method ?? "GET";
+    calls.push({ method, url, body: init?.body ? JSON.parse(init.body) : undefined });
+    if (method === "GET") return new Response(JSON.stringify([{ name: "bug", color: "d73a4a" }]), { status: 200 });
+    if (url.endsWith("/issues")) return new Response(JSON.stringify({ number: 7, node_id: "n7", html_url: "u" }), { status: 201 });
+    return new Response("{}", { status: 201 });
+  }) as typeof fetch;
+  try {
+    const client = new GitHubProjectClient({ owner: "o", repo: "r", projectNumber: 1, ownerType: "organization", token: "t" } as any);
+    assert.deepEqual(await client.createIssue("t", "b", ["bug", "requires:linux"]), { number: 7, nodeId: "n7", url: "u" });
+    const creates = calls.filter((c) => c.method === "POST" && c.url.endsWith("/repos/o/r/labels"));
+    assert.deepEqual(creates.map((c) => c.body), [{ name: "requires:linux", color: "5C3D1E" }]);
+    const issue = calls.findIndex((c) => c.url.endsWith("/repos/o/r/issues"));
+    assert.ok(issue > calls.indexOf(creates[0]), "the label exists before the issue names it");
+    assert.deepEqual(calls[issue].body.labels, ["bug", "requires:linux"]);
   } finally {
     globalThis.fetch = realFetch;
   }
