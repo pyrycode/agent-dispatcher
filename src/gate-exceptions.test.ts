@@ -29,7 +29,7 @@ test('the same test name cannot excuse a different assertion or missing diagnost
  assert.ok(exceptionRefusal(record,{...input,base:null},now));
  assert.equal(failureSignature('{malformed','go-json','pkg.TestOld'),null);
  assert.equal(failureSignature(raw('expected 1, got 2'),'go-json','pkg.TestOther'),null);
- assert.ok(checkInheritedException({policyFile:'/absent/policy',project:record.project,gate:record.gate,test:record.test,tracker:42,format:'go-json',branchPath:'/absent/branch',basePath:null,cwd:'/tmp',base:'a'.repeat(40),head:'b'.repeat(40)},now));
+ assert.ok(checkInheritedException({issueNumber:42,policyFile:'/absent/policy',project:record.project,gate:record.gate,test:record.test,tracker:42,format:'go-json',branchPath:'/absent/branch',basePath:null,cwd:'/tmp',base:'a'.repeat(40),head:'b'.repeat(40)},now));
 });
 
 test('JUnit assertion messages remain distinct even with the same test identity',()=>{
@@ -41,13 +41,18 @@ test('JUnit assertion messages remain distinct even with the same test identity'
 
  test('security classification refuses even when the failed name looks unrelated',()=>{
   assert.match(exceptionRefusal({...record,test:'pkg.TestAuthentication'},{...input,test:'pkg.TestAuthentication'},now)!,/Security/);
-  assert.match(checkInheritedException({policyFile:'/absent/policy',project:record.project,gate:record.gate,test:record.test,tracker:42,format:'go-json',branchPath:'/absent/branch',basePath:null,cwd:'/tmp',base:'a'.repeat(40),head:'b'.repeat(40),securitySensitive:true},now)!,/Security/);
+  assert.match(checkInheritedException({issueNumber:42,policyFile:'/absent/policy',project:record.project,gate:record.gate,test:record.test,tracker:42,format:'go-json',branchPath:'/absent/branch',basePath:null,cwd:'/tmp',base:'a'.repeat(40),head:'b'.repeat(40),securitySensitive:true},now)!,/Security/);
  });
 
  test('a two-dot filename is still inside the ticket checkout',()=>{
   const root=mkdtempSync(join(tmpdir(),'gate-policy-'));
   try {
    const policy=join(root,'..policy.json');writeFileSync(policy,JSON.stringify({version:1,exceptions:[]}));
-   assert.match(checkInheritedException({policyFile:policy,project:record.project,gate:record.gate,test:record.test,tracker:42,format:'go-json',branchPath:'/unused',basePath:'/unused',cwd:root,base:'a'.repeat(40),head:'b'.repeat(40)},now)!,/outside the ticket checkout/);
+   assert.match(checkInheritedException({issueNumber:42,policyFile:policy,project:record.project,gate:record.gate,test:record.test,tracker:42,format:'go-json',branchPath:'/unused',basePath:'/unused',cwd:root,base:'a'.repeat(40),head:'b'.repeat(40)},now)!,/outside the ticket checkout/);
   } finally {rmSync(root,{recursive:true,force:true});}
+ });
+
+ test('Desktop 1908 protocol coverage cannot be waived through an inherited exception',()=>{
+  const refusal=checkInheritedException({issueNumber:1908,project:'pyrycode/pyrycode-desktop',policyFile:'/absent/policy',gate:record.gate,test:record.test,tracker:42,format:'go-json',branchPath:'/absent/branch',basePath:'/absent/base',cwd:'/tmp',base:'a'.repeat(40),head:'b'.repeat(40)},now);
+  assert.match(refusal!,/1908 protocol migration cannot use inherited exceptions/);
  });

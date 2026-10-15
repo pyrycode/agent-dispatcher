@@ -45,7 +45,8 @@ for the protected operator's preparation. They emit hashes rather than diagnosti
 text. Preserve both raw reports and the exact baseline revision with the approval.
 Review paths by behaviour as well as file overlap. A protocol or fixture migration
 is part of that change's acceptance. The 262 failures from Desktop 1908 cannot be
-waived as inherited noise.
+waived as inherited noise. That ticket is refused explicitly even if a policy
+record would otherwise match.
 
 Roll out this policy together with approved narrow records for any currently
 accepted failures. Missing policy fails closed. Confirm the same known failure

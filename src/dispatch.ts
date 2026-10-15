@@ -6640,7 +6640,7 @@ async function acceptInheritedBaseline(
     return hold(result.fallbackReason ?? `no tracking ticket could be confirmed for ${result.untracked.join(", ") || names.join(", ")}`);
   }
   for (const entry of assessment.baseline) {
-    const refusal=(ctx.deps.inheritedException??checkInheritedException)({policyFile:process.env.PYRY_GATE_EXCEPTIONS_FILE??resolve(agentsRepoRoot,'gate-exceptions.json'),
+    const refusal=(ctx.deps.inheritedException??checkInheritedException)({issueNumber:ctx.item.issueNumber,policyFile:process.env.PYRY_GATE_EXCEPTIONS_FILE??resolve(agentsRepoRoot,'gate-exceptions.json'),
       project:(process.env.GITHUB_OWNER??'')+'/'+(process.env.GITHUB_REPO??''),gate:assessment.gate,test:entry.name,tracker:tracked.find(t=>t.name===entry.name)!.issue,
       securitySensitive:ctx.item.labels.includes("security-sensitive"),format,branchPath:stdoutPath,basePath:entry.outputPath,cwd:ctx.agentCwd,base:entry.sha,head:mergedWorktreeHead(ctx)?.commit??''});
     if(refusal) return hold(refusal);
@@ -6659,7 +6659,7 @@ async function recordScopedInheritedTests(client:Parameters<typeof recordInherit
     if(labelClient.getIssueLabels) securitySensitive=(await labelClient.getIssueLabels(context.gatedIssue)).includes('security-sensitive');
   } catch { /* An unreadable security classification cannot authorize an exception. */ }
   for(const entry of result.tracked) {
-    const refusal=checkInheritedException({policyFile:process.env.PYRY_GATE_EXCEPTIONS_FILE??resolve(agentsRepoRoot,'gate-exceptions.json'),
+    const refusal=checkInheritedException({issueNumber:context.gatedIssue,policyFile:process.env.PYRY_GATE_EXCEPTIONS_FILE??resolve(agentsRepoRoot,'gate-exceptions.json'),
       project:(process.env.GITHUB_OWNER??'')+'/'+(process.env.GITHUB_REPO??''),gate:report.command,test:entry.name,tracker:entry.issue,
       securitySensitive,format:report.outputFormat??REAL_CLAUDE_GATE_FORMAT??'go-json',branchPath:report.outputPath,basePath:report.baselineOutputPath,cwd:repoRoot,base:report.baseSha,head:report.headSha});
     if(refusal) return {blockers:[],untracked:[...failures],owned:result.owned,fallbackReason:refusal};

@@ -7,7 +7,7 @@ import {XMLParser} from 'fast-xml-parser';
 import {parseGateOutput,type GateOutputFormat} from './gate-output.js';
 
 export interface GateExceptionInput {
- policyFile:string;project:string;gate:string;test:string;tracker:number;format:GateOutputFormat;
+ issueNumber:number;policyFile:string;project:string;gate:string;test:string;tracker:number;format:GateOutputFormat;
  branchPath:string;basePath?:string|null;cwd:string;base:string;head:string;securitySensitive?:boolean;
 }
 export interface GateException {
@@ -73,6 +73,7 @@ export function exceptionRefusal(record:GateException,input:{project:string;gate
 /** Protected configuration and retained branch/base reports decide acceptance. */
 export function checkInheritedException(input:GateExceptionInput,now=Date.now()):string|null {
  try {
+  if(input.project.toLowerCase()==='pyrycode/pyrycode-desktop' && input.issueNumber===1908) return 'The Desktop 1908 protocol migration cannot use inherited exceptions';
   if(input.securitySensitive) return 'Security-sensitive tickets cannot use automatic exceptions';
   if(!input.basePath || !/^[a-f0-9]{40}$/.test(input.base) || !/^[a-f0-9]{40}$/.test(input.head)) return 'Readable exact branch and baseline evidence is required';
   if(lstatSync(input.policyFile).isSymbolicLink()) return 'The exception policy cannot be a symbolic link';
