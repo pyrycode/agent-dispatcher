@@ -234,7 +234,9 @@ import {
   buildBaselineCommand,
   buildBaselineFilter,
   namesPassedEveryTime,
+  rerunLoad,
   rerunLoadArguments,
+  type RerunLoad,
   gateRunRequiredTests,
   judgeableRequiredTests,
   isGateOutputFormat,
@@ -6184,6 +6186,31 @@ function readMainSweepState(ctx: DispatchContext): MainSweepState {
 }
 
 /**
+ * The filter and command for a re-run of `failedNames` under `load`. A load
+ * test the filter cannot carry drops the load tests, never the re-run, and a
+ * template where the worker count cannot be appended still runs the load.
+ */
+function loadedRerunCommand(
+  template: string,
+  failedNames: readonly string[],
+  format: GateOutputFormat,
+  load: RerunLoad | null | undefined,
+): { filter: string | null; command: string | null; load: RerunLoad | null } {
+  const plain = buildBaselineFilter(failedNames, format);
+  if (plain === null) return { filter: null, command: null, load: null };
+  const loaded = load && load.tests.length > 0 ? buildBaselineFilter([...failedNames, ...load.tests], format) : plain;
+  const used: RerunLoad | null = !load ? null : loaded === null ? { ...load, tests: [] } : load;
+  const filter = loaded ?? plain;
+  return { filter, command: buildBaselineCommand(template, filter, rerunLoadArguments(used)), load: used };
+}
+
+/** The log's words for a re-run's load. */
+function describeRerunLoad(load: RerunLoad | null): string {
+  if (!load) return "";
+  return ` at the gate's ${load.workers} workers` + (load.tests.length > 0 ? `, beside ${load.tests.length} passing test(s) from other files as load` : "");
+}
+
+/**
  * Re-run a red verifier gate's failing names once in the SAME worktree,
  * before any check against main (#133). Mirrors `runBranchRerun`: the same
  * filter and template as the base re-run, only the tree differs. Returns
@@ -6196,20 +6223,18 @@ async function rerunVerifierGateFailures(
   failedNames: readonly string[],
   commandTemplate: string,
   format: GateOutputFormat,
-  /** The gate's own worker count, so the re-run carries the same load (`rerunLoadArguments`). */
-  workers?: number,
+  /** The gate's own load (`rerunLoad`), so a contention failure meets the same contention again. */
+  load?: RerunLoad | null,
 ): Promise<{ passed: string[] | null; skipReason: string | null; outputPath: string }> {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const outputPath = resolve(LOGS_DIR, `${stamp}_verifier-gate-rerun_#${ctx.item.issueNumber}.log`);
   const skip = (skipReason: string) => ({ passed: null, skipReason, outputPath });
-  const filter = buildBaselineFilter(failedNames, format);
-  if (filter === null) return skip("could not build a safe test filter from the failing names");
-  const load = rerunLoadArguments(format, failedNames, workers);
-  const command = buildBaselineCommand(commandTemplate, filter, load);
+  const rerun = loadedRerunCommand(commandTemplate, failedNames, format, load);
+  if (rerun.filter === null) return skip("could not build a safe test filter from the failing names");
+  const command = rerun.command;
   if (command === null) return skip(`the baseline command has no ${BASELINE_TESTS_PLACEHOLDER} placeholder`);
   try {
-    console.log(`   🔁 Verifier gate: re-running ${failedNames.length} failing test(s) in the same worktree` +
-      (command.includes(load) && load !== "" ? ` at the gate's ${workers} workers…` : "…"));
+    console.log(`   🔁 Verifier gate: re-running ${failedNames.length} failing test(s) in the same worktree${describeRerunLoad(rerun.load)}…`);
     const outcome = await ctx.deps.spawnGate({
       command,
       cwd: ctx.agentCwd,
@@ -6285,7 +6310,7 @@ async function assessVerifierGateRed(
   let rerunSkipReason: string | null = "the gate has no baseline template";
   let rerunOutputPath: string | null = null;
   if (spec.baselineCommand !== null) {
-    const rerun = await rerunVerifierGateFailures(ctx, failed, spec.baselineCommand, spec.format, tally.workers);
+    const rerun = await rerunVerifierGateFailures(ctx, failed, spec.baselineCommand, spec.format, rerunLoad(spec.format, tally, failed));
     ({ flaky, remaining: toJudge } = splitByRerun(failed, rerun.passed));
     rerunSkipReason = rerun.skipReason;
     rerunOutputPath = rerun.outputPath;
@@ -6330,7 +6355,7 @@ async function assessVerifierGateRed(
         stamp: new Date().toISOString().replace(/[:.]/g, "-"),
         label: "verifier-gate-base",
         who: "Verifier gate",
-        workers: tally.workers,
+        load: rerunLoad(spec.format, tally, remaining),
         deps: ctx.deps,
       });
       // Same partition as the real-claude gate: null base failures excuse nothing.
@@ -6353,6 +6378,8 @@ async function assessVerifierGateRed(
     const tickets = await recordFlakyTests(ctx.client, flaky, {
       gatedIssue: ctx.item.issueNumber,
       at: new Date().toISOString(),
+      // The log path is reused by every dispatch of the ticket; its bytes are this run's own.
+      runKey: createHash("sha256").update(raw).digest("hex"),
       verifierGate: {
         gate,
         commit: mergedWorktreeHead(ctx)?.commit ?? null,
@@ -8255,7 +8282,7 @@ export async function runRealClaudeGateSuite(opts: {
         issueNumber: opts.issueNumber,
         logsDir,
         stamp,
-        workers: report.tally?.workers,
+        load: rerunLoad(opts.format, report.tally, rerunCandidates),
         deps,
       });
     } else if (rerunCandidates.length === 0 && report.rerunSkipReason === null) {
@@ -8296,7 +8323,7 @@ export async function runRealClaudeGateSuite(opts: {
         targetRepo,
         logsDir,
         stamp,
-        workers: report.tally?.workers,
+        load: rerunLoad(opts.format, report.tally, persistent),
         deps,
       });
     } else if (persistent.length === 0 && report.baselineSkipReason === null) {
@@ -8336,8 +8363,8 @@ async function runBaselineComparison(opts: {
   targetRepo: string;
   logsDir: string;
   stamp: string;
-  /** The gate's own worker count (`rerunLoadArguments`). */
-  workers?: number;
+  /** The gate's own load (`rerunLoad`). */
+  load?: RerunLoad | null;
   deps: GateRunnerDeps;
 }): Promise<void> {
   const { report } = opts;
@@ -8379,18 +8406,18 @@ async function runFailuresOnBase(opts: {
   evidence?: { runDir: string | null; part: string };
   /** A check for the live gate: it keeps the Codex test login (buildLiveGateSpawnEnv). */
   live?: boolean;
-  /** The gate's own worker count, so the base runs under the same load as the branch's re-run. */
-  workers?: number;
+  /** The gate's own load (`rerunLoad`), so the base meets what the branch's re-run met. */
+  load?: RerunLoad | null;
   deps: Pick<GateRunnerDeps, "execSync" | "spawnGate" | "readFileSync"> & { mkdirSync?: GateRunnerDeps["mkdirSync"] };
 }): Promise<{ failures: string[] | null; skipReason: string | null; outputPath: string | null }> {
   const { deps, targetRepo } = opts;
   const skip = (skipReason: string, outputPath: string | null = null) => ({ failures: null, skipReason, outputPath });
 
-  const filter = buildBaselineFilter(opts.failedNames, opts.format);
-  if (filter === null) {
+  const rerun = loadedRerunCommand(opts.baselineCommand, opts.failedNames, opts.format, opts.load);
+  if (rerun.filter === null) {
     return skip("could not build a safe test filter from the failing names, so no comparison was attempted");
   }
-  const command = buildBaselineCommand(opts.baselineCommand, filter, rerunLoadArguments(opts.format, opts.failedNames, opts.workers));
+  const command = rerun.command;
   if (command === null) {
     return skip(`the baseline command has no ${BASELINE_TESTS_PLACEHOLDER} placeholder, so it would have re-run the whole suite`);
   }
@@ -8414,7 +8441,7 @@ async function runFailuresOnBase(opts: {
   }
 
   try {
-    console.log(`   🔎 ${opts.who}: re-running ${opts.failedNames.length} failing test(s) against the base commit…`);
+    console.log(`   🔎 ${opts.who}: re-running ${opts.failedNames.length} failing test(s) against the base commit${describeRerunLoad(rerun.load)}…`);
     const outcome = await deps.spawnGate({
       command,
       cwd: worktreeDir,
@@ -8453,7 +8480,9 @@ async function runFailuresOnBase(opts: {
       );
     }
 
-    return { failures: baseTally.failedNames, skipReason: null, outputPath: stdoutPath };
+    // A load test that failed on the base is not a finding about main.
+    const loadTests = new Set(rerun.load?.tests ?? []);
+    return { failures: baseTally.failedNames.filter((n) => !loadTests.has(n)), skipReason: null, outputPath: stdoutPath };
   } catch (e: any) {
     return skip(`the base re-run failed unexpectedly: ${e?.message ?? e}`);
   } finally {
@@ -8487,19 +8516,19 @@ async function runBranchRerun(opts: {
   issueNumber: number;
   logsDir: string;
   stamp: string;
-  /** The gate's own worker count, so a contention failure meets the same load again (`rerunLoadArguments`). */
-  workers?: number;
+  /** The gate's own load (`rerunLoad`), so a contention failure meets the same contention again. */
+  load?: RerunLoad | null;
   deps: GateRunnerDeps;
 }): Promise<void> {
   const { report, deps } = opts;
 
-  const filter = buildBaselineFilter(opts.failedNames, opts.format);
-  if (filter === null) {
+  const rerun = loadedRerunCommand(opts.commandTemplate, opts.failedNames, opts.format, opts.load);
+  if (rerun.filter === null) {
     report.rerunSkipReason =
       "could not build a safe test filter from the failing names, so no re-run was attempted";
     return;
   }
-  const command = buildBaselineCommand(opts.commandTemplate, filter, rerunLoadArguments(opts.format, opts.failedNames, opts.workers));
+  const command = rerun.command;
   if (command === null) {
     report.rerunSkipReason =
       `the baseline command has no ${BASELINE_TESTS_PLACEHOLDER} placeholder, so a re-run would repeat the whole suite`;
@@ -8509,7 +8538,7 @@ async function runBranchRerun(opts: {
   const stderrPath = resolve(opts.logsDir, `${opts.stamp}_real-claude-gate-rerun_#${opts.issueNumber}.stderr.log`);
 
   try {
-    console.log(`   🔁 Real-claude gate: re-running ${opts.failedNames.length} failing test(s) on the same merged tree…`);
+    console.log(`   🔁 Real-claude gate: re-running ${opts.failedNames.length} failing test(s) on the same merged tree${describeRerunLoad(rerun.load)}…`);
     const outcome = await deps.spawnGate({
       command,
       cwd: opts.worktreeDir,
@@ -8552,7 +8581,7 @@ async function runBranchRerun(opts: {
     // Per name, and only a test seen PASSING is excused. A name the re-run
     // never reported on (skipped, not matched by the filter, or lost in a
     // crash) stays failing. Absence of a failure is not a pass. Under the
-    // gate's load a name runs more than once, and must pass every time.
+    // A name that also failed, in another project running the same spec, failed again.
     const passed = new Set(namesPassedEveryTime(tally));
     report.rerunFailures = opts.failedNames.filter(name => !passed.has(name));
     report.rerunSkipReason = null;

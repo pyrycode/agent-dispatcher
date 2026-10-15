@@ -182,8 +182,40 @@ describe("flaky-test tickets", () => {
     const client = new AdoptedClient();
     client.open.push({ number: 1036, body: flakyMarker(NAME) });
     await recordFlakyTests(client, [NAME], ctx(), { store: on("pyrybox") });
-    assert.deepEqual(client.tracked.map((t) => [t.issue, t.reopen, t.ref]), [[1036, false, { kind: "flaky", tests: [NAME] }]]);
+    assert.deepEqual(client.tracked.map((t) => [t.issue, t.reopen, t.ref.kind, t.ref.tests]), [[1036, false, "flaky", [NAME]]]);
+    assert.match(client.tracked[0].ref.key!, /^[0-9a-f]{48}$/, "a key, so the same run judged twice comments once");
     assert.equal(client.comments.length, 0);
+  });
+
+  test("a run judged twice is one sighting", async () => {
+    const { ledger, on } = shared();
+    const store = on("pyrybox");
+    const client = new FakeClient();
+    const run = { ...ctx(), runKey: "/logs/2026-10-15T10-00-00-000Z_real-claude-gate_#1016.log" };
+    await recordFlakyTests(client, [NAME], run, { store });
+    const again = await recordFlakyTests(client, [NAME], { ...run, at: new Date(T0 + 60_000).toISOString() }, { store });
+    assert.deepEqual(again.firstSightings, [NAME]);
+    assert.equal(ledger.history("org/mobile", NAME).length, 1);
+  });
+
+  test("a due test whose filing another run holds is left to that run", async () => {
+    const client = new FakeClient();
+    const busy: FlakySightingStore = { record: async (s) => ({ source: "central", counts: new Map(s.map((x) => [x.id, { id: x.id, test: x.test, count: 3, earlier: [], file: false }])) }) };
+    const result = await recordFlakyTests(client, [NAME], ctx(), { store: busy });
+    assert.deepEqual(result.deferred, [NAME]);
+    assert.equal(client.created.length, 0);
+    assert.equal(flakyTrackingNotes(result).get(NAME), "seen again; another gate run is filing or reopening its ticket");
+  });
+
+  test("a ticket a person closed as not planned is neither reopened nor filed again inside the window", async () => {
+    const { on } = shared(() => T0);
+    const store = on("pyrybox");
+    const client = new AdoptedClient();
+    client.closed.push({ number: 1918, nodeId: "node-1918", body: flakyMarker(NAME), labels: ["bug", FLAKY_TEST_LABEL], closedAt: new Date(T0 - DAY).toISOString(), stateReason: "not_planned" });
+    await recordFlakyTests(client, [NAME], ctx(), { store, now: () => T0 });
+    const result = await recordFlakyTests(client, [NAME], ctx(), { store, now: () => T0 });
+    assert.deepEqual(result.declined, [{ name: NAME, issue: 1918 }]);
+    assert.equal(client.created.length + client.tracked.length, 0);
   });
 
   test("matches the whole marker line, so one test cannot claim another's ticket", () => {
@@ -228,20 +260,50 @@ describe("flaky-test tickets", () => {
   });
 
   describe("a run where another failure persisted on the re-run", () => {
-    test("files no flaky ticket even on a second sighting, and records the sighting", async () => {
+    const onMain = (flakes: string[]) => ({ failed: [...flakes, "p.C#broken"], persistent: ["p.C#broken"], branchOwnsPersistent: false });
+
+    test("files at most one ticket for its flakes when the persistent failure is main's", async () => {
       const { ledger, on } = shared();
       const store = on("pyrybox");
       const client = new FakeClient();
+      const flakes = ["p.C#one", "p.C#two"];
+      await recordFlakyTests(client, ["p.C#one"], ctx(), { store });
+
+      const result = await recordFlakyTests(client, flakes, ctx(), { store, shape: onMain(flakes) });
+
+      assert.equal(client.created.length, 1, "one ticket for the run");
+      assert.deepEqual(result.filed, flakes.map((name) => ({ name, issue: 3000 })));
+      assert.match(client.created[0].body, /1 other test\(s\) failed again on the re-run and fail on main too[^]*`p\.C#broken`/);
+      assert.ok(!client.created[0].body.includes(flakyMarker("p.C#broken")), "main's failure is named, not tracked here");
+      assert.equal(ledger.history("org/mobile", "p.C#one").filter((h) => h.counts).length, 2, "a main failure beside it leaves the flake counted");
+    });
+
+    test("a single flake beside main's failure gets its own ticket, as the run's one", async () => {
+      const { on } = shared();
+      const store = on("pyrybox");
+      const client = new FakeClient();
       await recordFlakyTests(client, [NAME], ctx(), { store });
-      const shape = { failed: [NAME, "p.C#broken"], persistent: ["p.C#broken"], branchOwnsPersistent: false };
+      const result = await recordFlakyTests(client, [NAME], ctx(), { store, shape: onMain([NAME]) });
+      assert.deepEqual(result.filed, [{ name: NAME, issue: 3000 }]);
+      assert.match(client.created[0].title, /^flaky live test: /);
+    });
 
-      const result = await recordFlakyTests(client, [NAME], ctx(), { store, shape });
+    test("files none when the live gate already filed the run's shared live failure ticket", async () => {
+      const { on } = shared();
+      const store = on("pyrybox");
+      const client = new FakeClient();
+      client.open.push({ number: 1036, body: flakyMarker(NAME) });
+      await recordFlakyTests(client, [NAME], ctx(), { store });
+      const result = await recordFlakyTests(client, [NAME], ctx(), { store, shape: { ...onMain([NAME]), persistentTracked: true } });
+      assert.deepEqual(result.commented, [{ name: NAME, issue: 1036 }], "its open ticket still counts the occurrence");
+      assert.equal(client.comments.length, 2);
 
-      assert.deepEqual(result.held, [NAME]);
-      assert.equal(client.created.length, 0);
-      assert.equal(client.comments.length, 0);
-      assert.equal(ledger.history("org/mobile", NAME).filter((h) => h.counts).length, 2, "a main failure beside it leaves the flake counted");
-      assert.match(flakyTrackingNotes(result).get(NAME)!, /^recorded only: another failure in this run failed again/);
+      const other = "p.C#other";
+      await recordFlakyTests(client, [other], ctx(), { store });
+      const held = await recordFlakyTests(client, [other], ctx(), { store, shape: { ...onMain([other]), persistentTracked: true } });
+      assert.deepEqual(held.held, [other]);
+      assert.equal(client.created.length, 0, "no flaky ticket beside the shared live failure ticket");
+      assert.match(flakyTrackingNotes(held).get(other)!, /^recorded; no flaky ticket, because the run's failures that failed again already have its one ticket/);
     });
 
     test("does not count the flake when the persistent failure is the branch's own", async () => {
@@ -275,7 +337,7 @@ describe("flaky-test tickets", () => {
       assert.equal(client.created.length, 0, "no duplicate");
       assert.deepEqual(result.reopened, [{ name: NAME, issue: 1978 }], "the most recently closed one");
       assert.equal(client.tracked.length, 1);
-      assert.deepEqual(client.tracked[0].ref, { kind: "flaky", tests: [NAME] });
+      assert.deepEqual([client.tracked[0].ref.kind, client.tracked[0].ref.tests], ["flaky", [NAME]]);
       assert.equal(client.tracked[0].reopen, true);
       assert.match(client.tracked[0].comment, /## Flaked again after this ticket closed/);
       assert.match(client.tracked[0].comment, /reopened it into Backlog instead of filing a new one/);
@@ -436,8 +498,9 @@ describe("flaky-test tickets", () => {
       { id: "b", test: "p.C#new", ticket: 1, gate: "live", counts: true, at: T0 + runs },
     ]);
     const text = describeFlakySightings(["p.C#old", "p.C#new"], outcome);
-    assert.match(text, /- `p\.C#old`: seen 2 times in 14 days, so it is tracked on a flaky-test ticket/);
-    assert.match(text, /- `p\.C#new`: first sighting in 14 days, recorded; a ticket is filed if it flakes again/);
+    assert.match(text, /- `p\.C#old`: seen 2 times in 14 days, so it is due for a flaky-test ticket/);
+    assert.match(text, /- `p\.C#new`: first sighting in 14 days, recorded$/m);
+    assert.match(text, /^Flaky-test tracking: a test with an open flaky-test ticket gets a comment on it; otherwise a ticket is filed/);
     assert.match(describeFlakySightings(["x"], outcome, { failed: ["x", "y"], persistent: ["y"], branchOwnsPersistent: true }), /do not count toward a ticket/);
     assert.match(describeFlakySightings(["x"], undefined), /could not be recorded/);
   });

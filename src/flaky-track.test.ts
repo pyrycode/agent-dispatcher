@@ -46,19 +46,19 @@ const body = (over: Record<string, unknown> = {}) => ({
   commandId: "cmd-1", runId: "verify", ...over,
 });
 
-test("reopens another computer's closed flaky ticket into Backlog, drops its stale labels and keeps its claim", () => {
+test("reopens another computer's closed flaky ticket into Backlog, drops its stale labels and releases its claim", () => {
   const store = fixture();
   try {
     const result = store.flakyTrack("build-fractal-2", "s-build-fractal-2", PROJECT, body());
     assert.deepEqual({ state: result.state, status: result.status }, { state: "OPEN", status: "Backlog" });
     const item = store.workflow.get(`${PROJECT}#1978`);
-    assert.deepEqual(item.labels.sort(), ["bug", "claim:build-hp-1", "flaky-test", "priority:low"]);
-    assert.equal(store.snapshot().claims.find((c) => c.ticket === `${PROJECT}#1978`)?.machine, "build-hp-1", "the claim is untouched");
+    assert.deepEqual(item.labels.sort(), ["bug", "claim:build-hp-1", "flaky-test", "priority:low"], "the claim label is display, which the publisher then drops");
+    assert.equal(store.snapshot().claims.find((c) => c.ticket === `${PROJECT}#1978`), undefined, "new work: the next free computer takes it");
     assert.deepEqual(store.workflow.unpublishedComments(`${PROJECT}#1978`).map((c: any) => c.body), ["## Flaked again after this ticket closed"]);
     assert.deepEqual(store.flakyTrack("build-fractal-2", "s-build-fractal-2", PROJECT, body()), result, "a retry answers as before");
     assert.equal(store.workflow.unpublishedComments(`${PROJECT}#1978`).length, 1, "and adds no second comment");
-    assert.throws(() => store.workflowChange("build-fractal-2", "s-build-fractal-2", "verify", `${PROJECT}#1978`, { addLabels: ["x"] }, "other"),
-      /belongs to another machine/, "ordinary writes still need the claim");
+    assert.throws(() => store.workflowChange("build-hp-1", "s-build-hp-1", undefined, `${PROJECT}#2001`, { addLabels: ["x"] }, "other"),
+      /belongs to another machine/, "ordinary writes still need ownership");
   } finally { store.close(); }
 });
 
@@ -99,6 +99,31 @@ test("refuses anything but a pipeline tracker for these tests, written by an act
   } finally { store.close(); }
 });
 
+test("the tracker's own run may comment on it, and a reopen drops a needs-human hold", () => {
+  const store = fixture();
+  try {
+    store.flakyTrack("build-fractal-2", "s-build-fractal-2", PROJECT, body());
+    store.workflow.change(`${PROJECT}#1978`, { status: "In Development" }, "test", "develop");
+    assert.equal(store.start(run("own", "build-fractal-2", 1978)).ok, true);
+    store.flakyTrack("build-fractal-2", "s-build-fractal-2", PROJECT, body({ reopen: false, runId: "own", commandId: "own-comment" }));
+    assert.throws(() => store.flakyTrack("build-fractal-2", "s-build-fractal-2", PROJECT, body({ reopen: false, commandId: "other-run" })), /Ticket has an active run/,
+      "another run is still refused");
+
+    store.workflow.change(`${PROJECT}#1947`, { addLabels: ["needs-human:triage", "done:builder"] }, "test", "hold-1947");
+    store.flakyTrack("build-fractal-2", "s-build-fractal-2", PROJECT, body({ ticket: `${PROJECT}#1947`, kind: "inherited", commandId: "c-1947" }));
+    assert.deepEqual(store.workflow.get(`${PROJECT}#1947`).labels.sort(), ["bug", "priority:low"]);
+
+  } finally { store.close(); }
+});
+
+test("a reopen outside the window is refused when the close is recorded", () => {
+  const store = fixture();
+  try {
+    (store as any).db.prepare("UPDATE workflow_events SET at=? WHERE ticket=?").run(Date.now() - 31 * 24 * 60 * 60 * 1000, `${PROJECT}#1978`);
+    assert.throws(() => store.flakyTrack("build-fractal-2", "s-build-fractal-2", PROJECT, body()), /outside the reopen window/);
+  } finally { store.close(); }
+});
+
 async function served(t: TestContext) {
   const store = fixture();
   const server = await serveFleet(store, { "build-hp-1": "hp-token", "build-fractal-2": "fractal-token" }, "admin-token", 0);
@@ -121,6 +146,23 @@ test("over HTTP, a refused ownership keeps its marker, and the dispatcher's clie
   assert.equal(store.workflow.get(`${PROJECT}#1978`).state, "OPEN");
   await (client as any).commentOnTracker(1978, "## Flaked again", { kind: "flaky", tests: [NAME] });
   assert.equal(store.workflow.unpublishedComments(`${PROJECT}#1978`).length, 2);
+});
+
+test("on an adopted board the closed list trusts the store's state over GitHub's display", async () => {
+  const items = [
+    { ...ticket(1861, { body: flakyMarker(NAME), labels: ["flaky-test"] }), state: "OPEN" as const },
+    { ...ticket(1978, { body: flakyMarker(NAME), labels: ["flaky-test"] }), state: "CLOSED" as const },
+    { ...ticket(1700, { body: flakyMarker(NAME), labels: ["flaky-test"] }), state: "CLOSED" as const },
+  ];
+  const connection = { call: async (path: string) => { assert.equal(path, "/workflow/read"); return { items }; } };
+  const base = {
+    // GitHub still shows 1861 closed (reopened in the store) and 1978 open (closed in the store, not yet published).
+    listRecentlyClosedIssuesWithLabel: async () => [{ number: 1861, body: "", closedAt: "2026-10-09T09:33:44Z" }],
+    listOpenIssuesWithLabel: async () => [{ number: 1978, body: "" }],
+  };
+  const client = workflowClient(base as any, connection as unknown as JsonClient, PROJECT, () => true, () => ({ session: "s" }));
+  const closed = await (client as any).listRecentlyClosedIssuesWithLabel("flaky-test", new Date(0));
+  assert.deepEqual(closed.map((c: any) => c.number), [1978], "1861 is open in the store; 1700 closed long ago, GitHub agrees");
 });
 
 test("a claim service from before the route: the occurrence comment falls back, a reopen does not", async () => {

@@ -1019,8 +1019,8 @@ export class GitHubProjectClient {
    * always is, so the closing time is checked here too. Pull requests share
    * the endpoint and are dropped.
    */
-  async listRecentlyClosedIssuesWithLabel(label: string, since: Date): Promise<{ number: number; nodeId: string; title: string; body: string; labels: string[]; closedAt: string }[]> {
-    const found: { number: number; nodeId: string; title: string; body: string; labels: string[]; closedAt: string }[] = [];
+  async listRecentlyClosedIssuesWithLabel(label: string, since: Date): Promise<{ number: number; nodeId: string; title: string; body: string; labels: string[]; closedAt: string; stateReason: string | null }[]> {
+    const found: { number: number; nodeId: string; title: string; body: string; labels: string[]; closedAt: string; stateReason: string | null }[] = [];
     for (let page = 1; ; page++) {
       const response = await fetchWithRetry(
         `https://api.github.com/repos/${this.config.owner}/${this.config.repo}/issues` +
@@ -1044,6 +1044,7 @@ export class GitHubProjectClient {
         if (issue.pull_request || typeof issue.closed_at !== "string") continue;
         if (Date.parse(issue.closed_at) < since.getTime()) continue;
         found.push({ number: issue.number, nodeId: issue.node_id, title: issue.title, body: issue.body ?? "", closedAt: issue.closed_at,
+          stateReason: typeof issue.state_reason === "string" ? issue.state_reason : null,
           labels: (issue.labels ?? []).map((l: any) => typeof l === "string" ? l : String(l?.name ?? "")).filter(Boolean) });
       }
       if (batch.length < 100) return found.sort((a, b) => Date.parse(b.closedAt) - Date.parse(a.closedAt));

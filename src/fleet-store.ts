@@ -18,7 +18,7 @@ import { CAPABILITY_REPORT_FRESH_MS, missingCapabilities, ticketRequirements, va
 import { DesiredStateStore, workRefusal, type DesiredCommand, type DesiredDocument, type DesiredPoll } from './desired-state.js';
 import { CodexThrottle, startsCodex, DEFAULT_CODEX_THROTTLE, type CodexThrottleConfig, type CodexPauseState, type CodexSpacingState } from './codex-throttle.js';
 import { FlakySightingLedger } from './flaky-sightings.js';
-import { FLAKY_TEST_COLUMN, FLAKY_TEST_LABEL, hasFlakyMarker, staleLabelsOnReopen } from './flaky-tickets.js';
+import { FLAKY_REOPEN_WINDOW_MS, FLAKY_TEST_COLUMN, FLAKY_TEST_LABEL, hasFlakyMarker, staleLabelsOnReopen } from './flaky-tickets.js';
 import { inheritedMarker } from './inherited-tickets.js';
 
 /** An operator choice, frozen into each new grant. Null restores local settings. */
@@ -463,8 +463,13 @@ export class FleetStore {
    * fixed it, and a closed ticket keeps its claim, so the ordinary ownership
    * check would refuse every computer but that one. This write is narrower
    * instead: the caller must hold an active run, the ticket must carry the
-   * kind's label and name one of the tests on its own marker line, and no run
-   * may be active on the ticket itself. The claim stays as it was.
+   * kind's label and name one of the tests on its own marker line, and no
+   * other run may be active on the ticket. A reopen also needs the ticket to
+   * have closed inside the reopen window, when its closing is recorded here.
+   *
+   * A reopen is new work, so it releases the closed ticket's claim, when no
+   * support task is open on it, and the next free capable computer takes it.
+   * Kept, the claim would hold it for a computer that may be drained or gone.
    */
   flakyTrack(machine: string, session: unknown, project: unknown, input: any): { ticket: string; state: string; status: string; revision: number } {
     if (!Object.hasOwn(this.limits, machine)) throw new Error("Unknown machine");
@@ -490,12 +495,18 @@ export class FleetStore {
       const named = (tests as string[]).some(t => kind === "flaky" ? hasFlakyMarker(item.body, t)
         : item.body.split("\n").some(line => line.trim() === inheritedMarker(t)));
       if (!item.labels.includes(label) || !named) throw new Error("Not a tracker the pipeline filed for these tests");
-      if (this.db.prepare("SELECT 1 FROM fleet_runs WHERE ticket=? AND finished IS NULL").get(ticket)) throw new OwnershipRefusal("Ticket has an active run");
+      // The caller's own run on the tracker, such as the tracker's own verifier, may write it.
+      const active = this.db.prepare("SELECT id,machine,session FROM fleet_runs WHERE ticket=? AND finished IS NULL").get(ticket);
+      if (active && (active.id !== runId || active.machine !== machine || active.session !== session)) throw new OwnershipRefusal("Ticket has an active run");
       if (reopen) {
         if (item.state !== "CLOSED") throw new Error("Tracker is already open");
+        const closed = this.db.prepare("SELECT at FROM workflow_events WHERE ticket=? AND json_extract(change,'$.state')='CLOSED' ORDER BY id DESC LIMIT 1").get(ticket);
+        if (closed && Number(closed.at) < this.clock() - FLAKY_REOPEN_WINDOW_MS) throw new Error("Tracker closed outside the reopen window");
         const stale = staleLabelsOnReopen(item.labels);
         this.workflow.change(ticket, { state: "OPEN", status: FLAKY_TEST_COLUMN, ...(stale.length ? { removeLabels: stale } : {}), ...(top ? { top: true } : {}) },
           `flaky:${machine}:${session}`, commandId);
+        if (!active && !this.db.prepare("SELECT 1 FROM fleet_recovery_tasks WHERE ticket=? AND state IN ('queued','running','publishing','attention')").get(ticket))
+          this.db.prepare("DELETE FROM fleet_claims WHERE ticket=?").run(ticket);
       } else if (item.state !== "OPEN") throw new Error("Tracker is closed");
       this.workflow.comment(ticket, comment, `flaky-${commandId}`);
       return summary();

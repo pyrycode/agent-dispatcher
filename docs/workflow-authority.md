@@ -53,10 +53,11 @@ computer that filed or fixed them, and a closed ticket keeps its claim, so an
 occurrence comment or a reopen from another computer would be refused.
 `/flaky/track` takes them instead. It needs an active run of the caller, a
 ticket carrying `flaky-test` (or `bug` for a shared live failure) that names
-one of the tests on its marker line, and no run active on the ticket. A reopen
-sets the ticket open, moves it to Backlog and drops `merged` and the stage
-markers, with the comment, in one transaction, and leaves the claim alone. See
-[flaky-tests.md](flaky-tests.md).
+one of the tests on its marker line, and no other run active on the ticket. A
+reopen sets the ticket open, moves it to Backlog and drops `merged` and the
+stage markers, with the comment, in one transaction. It is new work, so it
+also releases the closed ticket's claim unless a support task is open on it.
+See [flaky-tests.md](flaky-tests.md).
 
 A pull request is not a workflow ticket. Comments on a PR go straight to GitHub,
 both from agents through the bridge and from the dispatcher's

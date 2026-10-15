@@ -38,40 +38,58 @@ things made it worse:
    first sighting is not silently dropped. It is named in the verifier's note
    and the gate log ("first sighting in 14 days, recorded; a ticket is filed
    if it flakes again"), and on the live gate's evidence comment on the gated
+   ticket. A gate run judged twice is still one sighting: its id comes from
+   the run itself, the live gate's output path or a hash of the verifier
+   gate's output.
+2. **A noisy run gets at most one ticket.** A run is noisy when it has more
+   than three failing tests, or when any failure failed again on the re-run.
+   Its flaky tests share at most one ticket, naming them all with a marker
+   line for each, filed once one of them is on its second sighting. When only
+   one of them is left to track, its ticket is the ordinary per-test one.
+3. **Except when the run already explains itself.** A noisy run files no
+   flaky ticket when a failure that failed again is the branch's own, which
+   the verifier or rework handles; those flakes are recorded as not counting,
+   because the branch may have caused them too. Nor when the live gate filed
+   the run's shared live failure ticket for failures that also fail on main:
+   that ticket is the run's one ticket, and the flakes are recorded and
+   counted. In the verifier gate, failures that also fail on main are only
+   noted on the main sweep's ticket, so the run may still file its one flaky
    ticket.
-2. **More than three failures in one run get at most one ticket.** When a run
-   has more than three failing tests and all of them passed on the re-run,
-   the run files at most one ticket, naming every test, with a marker line for
-   each. That many at once usually share one cause. The ticket is filed only
-   once one of the tests is on its second sighting.
-3. **A run where any failure persisted files no flaky ticket.** If any
-   failure failed again on the re-run, the flakes in that run are recorded
-   but no flaky ticket is filed, per test or for the run. The persistent
-   failures are the branch's, which the verifier or rework handles, or
-   main's, which have their own ticket. When one of them is the branch's own,
-   its flakes are recorded as not counting, because the branch may have
-   caused them too.
 4. **A recently closed ticket is reopened instead of filed again.** When a
    test reaches its second sighting and a `flaky-test` ticket naming it on its
    marker line closed in the last 30 days, that ticket is reopened into
    Backlog with a comment, and nothing new is filed. The newest one wins when
-   there are several. On a board the claim service owns, the reopen is one
-   central write (see below). Elsewhere it is GitHub's own steps: reopen,
-   comment, drop the stale labels, move to Backlog.
+   there are several. A ticket a person closed as not planned or as a
+   duplicate is left alone: nothing is reopened or filed for that test until
+   the 30 days have passed. On a board the claim service owns, the reopen is
+   one central write (see below). Elsewhere it is GitHub's own steps: reopen,
+   comment, drop the stale labels, move to Backlog. A reopen that fails files
+   nothing beside the closed ticket; the next sighting tries again.
 5. **The re-run carries the gate's own load.** For Playwright, the gate's
-   report says how many workers it ran with. The same-tree re-run, and the
-   base-commit re-run after it, ask for that worker count and repeat the
-   failing spec files enough times to keep every worker busy, so a contention
-   failure meets the same contention again. Each failing test still gets one
-   re-run round. A test passes the re-run only if every copy passes. A gate
-   that ran one worker re-runs exactly as before. The arguments are added only
-   where the `{{TESTS}}` placeholder is the value of `-g` or `--grep`, so they
-   always land on the runner's own command line. Go JSON and JUnit XML report
-   no worker count, so their re-runs are unchanged.
+   report says how many workers it ran with. With `fullyParallel: false` a
+   spec file runs in one worker, so a re-run of one failing file used one.
+   Now the same-tree re-run, and the base-commit re-run after it, ask for the
+   gate's worker count, and when the failing tests sit in fewer spec files
+   than that, they also run tests that passed in the gate from other spec
+   files, one file per idle worker, until those last at least as long as the
+   slowest failing test did. Those tests are load only: their results never
+   decide anything, and one that fails on the base is not a failure of main.
+   Each failing test still runs exactly once, so the retry budget is
+   unchanged. Copies of the failing test are not used: two copies of one test
+   can collide on a resource the gate never shared. A gate that ran one worker
+   re-runs exactly as before; Desktop's live gate does. `--workers` is added
+   only where the `{{TESTS}}` placeholder is the value of `-g` or `--grep`, so
+   it always lands on the runner's own command line. Go JSON and JUnit XML
+   report no worker count, so their re-runs are unchanged. A name that failed
+   in any Playwright project of the re-run did not pass it.
 
 An open ticket for a test still gets an occurrence comment each time the test
-flakes in a run that is not rule 3's, whatever its count, so its comments are
-the occurrence count. A run's tests that share one open ticket get one comment.
+flakes, whatever its count, except in a run where the branch owns a failure
+that failed again, so its comments are the occurrence count. A run's tests that share one open ticket get one
+comment. A test whose ticket another run is filing or reopening right now is
+left to that run: the claim service hands out the filing for ten minutes to
+the first due sighting, so two verifiers that flake the same test at once on
+one busy computer file once.
 
 ## Where sightings live
 
@@ -79,9 +97,10 @@ Sightings are rows in the claim service's database, table
 `fleet_flaky_sightings`, so every computer counts the same record. The
 dispatcher sends them through its machine manager, as it does run evidence:
 `POST /flaky/sightings`. The answer gives each sighting's count inside the
-window and the earlier ones, which the new ticket's body lists. A sighting
-has a deterministic id, so a retry is recorded once. The service keeps 90 days
-of sightings as history and prunes older ones.
+window, the earlier ones, which a new ticket's body lists, and, for a due
+sighting, whether it holds the filing (`fleet_flaky_filing_leases`). A
+sighting has a deterministic id, so a retry is recorded once. The service
+keeps 90 days of sightings as history and prunes older ones.
 
 The dispatcher also keeps its own copy in `logs/flaky-sightings.json`. When
 the claim service or the manager predates the route, or cannot be reached,
@@ -90,8 +109,8 @@ that is sent, with its original time. Meanwhile the dispatcher counts only
 what this computer saw itself. That can only undercount: a first sighting
 never files a ticket because the shared record was unavailable, and two
 sightings on this computer still file one. An undelivered sighting is kept for
-30 days. An unmanaged dispatcher has no claim service, and its file is the
-whole record.
+30 days. An unreadable file is kept beside it and a new one started. An
+unmanaged dispatcher has no claim service, and its file is the whole record.
 
 ## Tracker writes on a board the claim service owns
 
@@ -103,18 +122,29 @@ reopen. So these go through `POST /flaky/track`, which is narrower instead:
 - the caller must hold an active run;
 - the ticket must carry `flaky-test`, or `bug` for a shared live failure
   ticket, and name one of the tests on its own marker line;
-- no run may be active on the ticket itself;
-- a reopen needs the ticket closed, and a comment needs it open.
+- no other run may be active on the ticket; the tracker's own run, such as
+  its own verifier, may write it;
+- a reopen needs the ticket closed, and inside the 30 days when its closing
+  is recorded in the database; a comment needs it open.
 
-A reopen sets the ticket open and in Backlog and drops `merged` and the stage
-markers a merge strips (`done:`, `wip:`, `needs-rework:`, `error:`,
-`pending-done:`, `pending-verdict:`, `merge-attempt:`), in the same
-transaction as the comment. The claim is left as it was, so the computer that
-owned the ticket runs it again. A retry with the same command id answers as
-before. A claim service from before the route answers "Unknown operation":
-the occurrence comment then falls back to the ordinary workflow comment, and a
+A reopen sets the ticket open and in Backlog and drops `merged`, a
+`needs-human:` hold and the stage markers a merge strips (`done:`, `wip:`,
+`needs-rework:`, `error:`, `pending-done:`, `pending-verdict:`,
+`merge-attempt:`), in the same transaction as the comment. It is new work, so
+it also releases the closed ticket's claim, unless a support task is open on
+it, and the next free computer that can run it takes it. Kept, the claim would
+hold it for a computer that may be drained or gone. Each write carries a key
+from the gate run, so the same run judged twice writes once.
+
+On an owned board the closed tickets come from GitHub, which knows when and
+why each closed, checked against the database, which knows whether it is
+closed: one the database holds open is not reopened, and one the database has
+closed that GitHub still shows open, because publication has not caught up,
+counts as closed just now.
+
+A claim service from before the route answers "Unknown operation": the
+occurrence comment then falls back to the ordinary workflow comment, and a
 reopen is not attempted, so nothing is filed beside the closed ticket either.
-The next sighting tries again.
 
 ## Shared live failures
 
@@ -123,9 +153,18 @@ failed on the branch, again on the re-run and on the base commit. It is not in
 doubt, and the gated ticket waits on its tracker, so it is still filed on its
 first sighting, one ticket for all the run's new failures. Rule 4 applies to
 it: a fix ticket naming the test on its marker line that closed in the last
-30 days is reopened at the top of Backlog and becomes the blocker. If the
-reopen fails, a new ticket is filed as before, because the gated ticket needs
-a tracker to wait on.
+30 days, and not as not planned or a duplicate, is reopened at the top of
+Backlog and becomes the blocker. If the reopen fails, including on a claim
+service from before the route, a new ticket is filed as before, because the
+gated ticket needs a tracker to wait on.
+
+## Known limits
+
+- A burst that reopens one test's closed ticket names the run's other tests
+  in the comment only. The ticket body keeps its own markers, so another of
+  those tests that flakes later gets its own ticket.
+- Two noisy runs that are due at the same moment for different tests can each
+  file their one ticket.
 
 ## Rollout
 

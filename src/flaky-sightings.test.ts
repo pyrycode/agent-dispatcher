@@ -86,6 +86,19 @@ describe("the shared sighting record", () => {
     assert.equal(ledger.history("org/desktop", TEST)[1].counts, false);
   });
 
+  test("one due sighting at a time holds the filing, for ten minutes", () => {
+    let now = T0;
+    const ledger = new FlakySightingLedger(new DatabaseSync(":memory:"), () => now);
+    assert.equal(ledger.record("hp", "org/desktop", [sighting()]).results[0].file, undefined, "a first sighting is not due");
+    const second = sighting({ at: T0 + 1, ticket: 2010 });
+    const third = sighting({ at: T0 + 2, ticket: 2011 });
+    assert.equal(ledger.record("hp", "org/desktop", [second]).results[0].file, true);
+    assert.equal(ledger.record("fractal", "org/desktop", [third]).results[0].file, false, "two runs at once file once");
+    assert.equal(ledger.record("hp", "org/desktop", [second]).results[0].file, true, "the holder asking again keeps it");
+    now = T0 + 11 * 60 * 1000;
+    assert.equal(ledger.record("fractal", "org/desktop", [sighting({ at: now, ticket: 2012 })]).results[0].file, true, "a filing that failed is retried after the lease");
+  });
+
   test("refuses malformed input whole", () => {
     const ledger = new FlakySightingLedger(new DatabaseSync(":memory:"), () => T0);
     assert.throws(() => ledger.record("m", "not a project", [sighting()]), /project/);

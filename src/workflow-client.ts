@@ -31,7 +31,8 @@ export function workflowClient<T extends object>(
       commandId: randomUUID(),
       ...actor(),
     });
-  const tracker = async (number: number, comment: string, ref: { kind: string; tests: string[]; top?: boolean }, reopen: boolean) =>
+  type TrackerRef = { kind: string; tests: string[]; top?: boolean; key?: string };
+  const tracker = async (number: number, comment: string, ref: TrackerRef, reopen: boolean) =>
     connection.call("/flaky/track", {
       project,
       ticket: `${project}#${number}`,
@@ -40,7 +41,8 @@ export function workflowClient<T extends object>(
       comment,
       reopen,
       ...(ref.top ? { top: true } : {}),
-      commandId: randomUUID(),
+      // The same gate run's write carries the same key, so judging it twice writes once.
+      commandId: ref.key ?? randomUUID(),
       ...actor(),
     });
   const comments = async (number: number) =>
@@ -117,10 +119,10 @@ export function workflowClient<T extends object>(
     // Failure trackers (flaky-tickets.ts). Usually another computer's ticket,
     // so the claim service checks the ticket names these tests instead of
     // asking for its claim, and reopens into Backlog in one write.
-    reopenTracker: async (issue: { number: number }, comment: string, ref: { kind: string; tests: string[]; top?: boolean }) => {
+    reopenTracker: async (issue: { number: number }, comment: string, ref: TrackerRef) => {
       await tracker(issue.number, comment, ref, true);
     },
-    commentOnTracker: async (n: number, comment: string, ref: { kind: string; tests: string[]; top?: boolean }) => {
+    commentOnTracker: async (n: number, comment: string, ref: TrackerRef) => {
       try {
         await tracker(n, comment, ref, false);
       } catch (error) {
@@ -179,6 +181,24 @@ export function workflowClient<T extends object>(
             : match[1] !== project || x.number !== Number(match[2]),
         ),
       });
+    },
+    // GitHub knows when a ticket closed and why; the store knows whether it
+    // is closed. A ticket the store holds open is not closed, and one it has
+    // closed that GitHub still shows open closed just now, before publication.
+    listRecentlyClosedIssuesWithLabel: async (label: string, since: Date) => {
+      const [closed, items] = await Promise.all([(base as any).listRecentlyClosedIssuesWithLabel(label, since), read()]);
+      const byNumber = new Map(items.map((i) => [i.issueNumber, i]));
+      const out = (closed as Array<{ number: number }>).filter((c) => byNumber.get(c.number)?.state !== "OPEN");
+      const unpublished = items.filter((i) => i.state === "CLOSED" && i.labels.includes(label) && !out.some((c) => c.number === i.issueNumber));
+      if (unpublished.length > 0) {
+        const openOnGitHub = new Set(((await (base as any).listOpenIssuesWithLabel(label)) as Array<{ number: number }>).map((i) => i.number));
+        for (const i of unpublished) {
+          if (openOnGitHub.has(i.issueNumber)) {
+            out.push({ number: i.issueNumber, nodeId: i.issueId, title: i.title, body: i.body, labels: [...i.labels], closedAt: new Date().toISOString(), stateReason: null } as any);
+          }
+        }
+      }
+      return out;
     },
     listOpenIssuesWithLabel: async (label: string) =>
       (await read())

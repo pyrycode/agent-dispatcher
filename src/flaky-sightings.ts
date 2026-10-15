@@ -41,6 +41,14 @@ export const FLAKY_SIGHTINGS_TO_FILE = 2;
 export const FLAKY_SIGHTING_RETENTION_MS = 90 * DAY_MS;
 /** An undelivered local sighting is sent for this long, then dropped. */
 export const FLAKY_LOCAL_PENDING_MS = 30 * DAY_MS;
+/**
+ * A due sighting files or reopens its test's ticket under this lease. Two
+ * runs that reach the second sighting at once, such as two verifiers on one
+ * busy computer, otherwise both find no ticket and both file one. The lease
+ * outlives a filing by far; one that failed is retried by the next sighting
+ * after it.
+ */
+export const FLAKY_FILING_LEASE_MS = 10 * 60 * 1000;
 /** At most this many sightings in one request. */
 export const FLAKY_SIGHTINGS_PER_REQUEST = 200;
 /** The local file keeps at most this many sightings. */
@@ -75,6 +83,12 @@ export interface FlakySightingCount {
   count: number;
   /** The other counted sightings inside the window, newest first, at most five. */
   earlier: { machine: string; ticket: string; gate: FlakyGate; at: number }[];
+  /**
+   * Set by the claim service when the sighting is due: true when this one
+   * holds the filing lease (FLAKY_FILING_LEASE_MS), false when another
+   * sighting of the test does. Absent from a local count.
+   */
+  file?: boolean;
 }
 
 export interface FlakySightingOutcome {
@@ -117,6 +131,9 @@ export class FlakySightingLedger {
         run_id TEXT, machine TEXT NOT NULL, gate TEXT NOT NULL, counts INTEGER NOT NULL, at INTEGER NOT NULL
       ) STRICT;
       CREATE INDEX IF NOT EXISTS fleet_flaky_sightings_test ON fleet_flaky_sightings(project, test, at);
+      CREATE TABLE IF NOT EXISTS fleet_flaky_filing_leases (
+        project TEXT NOT NULL, test TEXT NOT NULL, sighting TEXT NOT NULL, until INTEGER NOT NULL, PRIMARY KEY(project, test)
+      ) STRICT;
     `);
   }
 
@@ -141,14 +158,28 @@ export class FlakySightingLedger {
     const count = this.db.prepare("SELECT count(*) AS n FROM fleet_flaky_sightings WHERE project=? AND test=? AND counts=1 AND at>=?");
     const earlier = this.db.prepare(`SELECT machine,ticket,gate,at FROM fleet_flaky_sightings
       WHERE project=? AND test=? AND counts=1 AND at>=? AND id<>? ORDER BY at DESC, id LIMIT 5`);
-    const results = (sightings as FlakySighting[]).map((s): FlakySightingCount => ({
-      id: s.id,
-      test: s.test,
-      count: Number((count.get(project, s.test, since) as { n: number }).n),
-      earlier: earlier.all(project, s.test, since, s.id).map((r: any) => ({
-        machine: String(r.machine), ticket: String(r.ticket), gate: r.gate as FlakyGate, at: Number(r.at),
-      })),
-    }));
+    this.db.prepare("DELETE FROM fleet_flaky_filing_leases WHERE until<?").run(now);
+    const lease = this.db.prepare("SELECT sighting FROM fleet_flaky_filing_leases WHERE project=? AND test=?");
+    const take = this.db.prepare(`INSERT INTO fleet_flaky_filing_leases VALUES (?,?,?,?)
+      ON CONFLICT(project,test) DO UPDATE SET sighting=excluded.sighting, until=excluded.until`);
+    const results = (sightings as FlakySighting[]).map((s): FlakySightingCount => {
+      const n = Number((count.get(project, s.test, since) as { n: number }).n);
+      const result: FlakySightingCount = {
+        id: s.id,
+        test: s.test,
+        count: n,
+        earlier: earlier.all(project, s.test, since, s.id).map((r: any) => ({
+          machine: String(r.machine), ticket: String(r.ticket), gate: r.gate as FlakyGate, at: Number(r.at),
+        })),
+      };
+      if (s.counts && n >= FLAKY_SIGHTINGS_TO_FILE) {
+        const held = lease.get(project, s.test) as { sighting: string } | undefined;
+        // The holder asking again, after a lost answer, keeps it.
+        result.file = !held || held.sighting === s.id;
+        if (result.file) take.run(project, s.test, s.id, now + FLAKY_FILING_LEASE_MS);
+      }
+      return result;
+    });
     return { windowMs: FLAKY_SIGHTING_WINDOW_MS, results };
   }
 
@@ -301,13 +332,16 @@ export class FlakySightingRecorder implements FlakySightingStore {
         : [];
       return { version: 1, sightings };
     } catch {
-      this.log(`   ⚠️  Flaky sightings file ${this.options.statePath} is unreadable; starting it again`);
+      // Kept beside it, since it may hold sightings not yet delivered.
+      const aside = `${this.options.statePath}.unreadable-${this.now()}`;
+      try { this.fs.renameSync(this.options.statePath, aside); } catch { /* starting again is still right */ }
+      this.log(`   ⚠️  Flaky sightings file ${this.options.statePath} is unreadable; kept as ${aside} and starting it again`);
       return { version: 1, sightings: [] };
     }
   }
 
   private save(state: LocalState): void {
-    const tmp = `${this.options.statePath}.tmp`;
+    const tmp = `${this.options.statePath}.${process.pid}.tmp`;
     try {
       this.fs.mkdirSync?.(dirname(this.options.statePath), { recursive: true });
       this.fs.writeFileSync(tmp, JSON.stringify(state) + "\n");

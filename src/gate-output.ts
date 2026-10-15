@@ -399,8 +399,8 @@ export interface GateTally {
    * Playwright only: the worker processes the run actually used, from its
    * report's `config.metadata.actualWorkers`, else the configured
    * `config.workers`. The same-tree and base re-runs use it, so a failure
-   * that came from contention is judged under the same load
-   * (`rerunLoadArguments`). Absent for formats that do not report it.
+   * that came from contention is judged under the same load (`rerunLoad`).
+   * Absent for formats that do not report it.
    */
   workers?: number;
 }
@@ -1217,36 +1217,87 @@ function buildPlaywrightBaselineFilter(qualifiedFailedNames: readonly string[]):
 
 /**
  * The names a re-run saw pass every time they ran. A name that also failed,
- * in a repeat (`rerunLoadArguments`) or in another Playwright project, did
- * not pass: under the same load it failed again.
+ * in another Playwright project that runs the same spec, did not pass.
  */
 export function namesPassedEveryTime(tally: Pick<GateTally, "passedNames" | "failedNames">): string[] {
   const failed = new Set(tally.failedNames);
   return [...new Set(tally.passedNames)].filter((name) => !failed.has(name));
 }
 
+/** What a re-run adds to run a gate's failing tests under the gate's own load. */
+export interface RerunLoad {
+  /** The gate's own worker count, passed as `--workers`. */
+  workers: number;
+  /** Tests that passed in the gate run, from other spec files, run beside the failing ones. Never judged. */
+  tests: string[];
+}
+
+/** At most this many passing tests ride along as load, in all. */
+const RERUN_LOAD_TEST_CAP = 40;
+/** At most this many from one spec file. */
+const RERUN_LOAD_FILE_CAP = 15;
+
 /**
- * Extra arguments that run a gate's failing tests under the gate's own load.
+ * The load a re-run of `failedNames` needs so a failure that came from
+ * contention meets the same contention again.
  *
- * Why. A same-tree re-run of one or two failing tests used one worker, while
- * the gate had run four, so a failure that came from contention, a busy
- * display or CPU, nearly always passed it and was filed as a flaky test.
+ * Why. A same-tree re-run of one or two failing tests used one worker,
+ * while the gate had run three or four, so a failure that came from a busy
+ * display or CPU nearly always passed it and was filed as a flaky test.
  * Desktop's re-runs on 2026-10-10 reported `actualWorkers: 1` against a
- * configured 3. So for Playwright the re-run asks for the gate's worker count
- * and, when there are fewer failing spec files than workers, repeats each
- * file enough times to keep every worker busy: Playwright gives each repeat
- * its own worker group, and tests inside one file still run in order. Each
- * failing test still gets one re-run round; it passes only if every copy
- * passes (`namesPassedEveryTime`).
+ * configured 3. Playwright with `fullyParallel: false` gives each spec file
+ * one worker, so a re-run of one file can use only one.
  *
- * Empty for other formats, and for a gate that ran one worker. Go's test
- * runner and Android instrumentation report no worker count.
+ * So the re-run asks for the gate's worker count and, when the failing tests
+ * sit in fewer spec files than that, also runs tests that passed in the gate
+ * from other spec files, one file per idle worker, taking from each file
+ * until its tests last at least as long as the slowest failing test did.
+ * Those tests are load only: their results never decide anything. Each
+ * failing test still runs exactly once, so the retry budget is unchanged.
+ * Copies of the failing test itself are not used: two copies of one test can
+ * collide on a resource the gate never shared, and more chances to pass, or to
+ * fail, would change the budget.
+ *
+ * Null for other formats and for a gate that ran one worker. Go's test runner
+ * and Android instrumentation report no worker count.
  */
-export function rerunLoadArguments(format: GateOutputFormat, failedNames: readonly string[], workers: number | undefined): string {
-  if (format !== "playwright-json" || workers === undefined || !Number.isSafeInteger(workers) || workers <= 1) return "";
-  const files = new Set(failedNames.map((n) => n.split(PLAYWRIGHT_TITLE_SEPARATOR)[0]!.trim()).filter((f) => f !== ""));
-  const repeat = Math.ceil(workers / Math.max(1, files.size));
-  return ` --workers=${workers}` + (repeat > 1 ? ` --repeat-each=${repeat}` : "");
+export function rerunLoad(
+  format: GateOutputFormat,
+  tally: Pick<GateTally, "workers" | "testDetails"> | null | undefined,
+  failedNames: readonly string[],
+): RerunLoad | null {
+  const workers = tally?.workers;
+  if (format !== "playwright-json" || workers === undefined || !Number.isSafeInteger(workers) || workers <= 1) return null;
+  const fileOf = (name: string) => name.split(PLAYWRIGHT_TITLE_SEPARATOR)[0]!.trim();
+  const failing = new Set(failedNames);
+  const failingFiles = new Set(failedNames.map(fileOf));
+  const idle = workers - failingFiles.size;
+  if (idle <= 0) return { workers, tests: [] };
+  const details = tally?.testDetails ?? [];
+  const slowest = Math.max(0, ...details.filter((d) => failing.has(d.name)).map((d) => d.durationMs ?? 0));
+  const unsafe = /['\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+  const byFile = new Map<string, GateTestDetail[]>();
+  for (const d of details) {
+    if (d.status !== "passed" || failing.has(d.name) || unsafe.test(d.name)) continue;
+    const file = fileOf(d.name);
+    if (failingFiles.has(file)) continue;
+    byFile.set(file, [...(byFile.get(file) ?? []), d]);
+  }
+  const tests: string[] = [];
+  for (const list of [...byFile.values()].slice(0, idle)) {
+    let lasted = 0;
+    for (const d of list.slice(0, RERUN_LOAD_FILE_CAP)) {
+      tests.push(d.name);
+      lasted += d.durationMs ?? 0;
+      if (lasted >= slowest) break;
+    }
+  }
+  return { workers, tests: tests.slice(0, RERUN_LOAD_TEST_CAP) };
+}
+
+/** The runner arguments for a load, appended after the filter (`buildBaselineCommand`). */
+export function rerunLoadArguments(load: RerunLoad | null | undefined): string {
+  return load ? ` --workers=${load.workers}` : "";
 }
 
 /** Placeholder a baseline command template must carry. */

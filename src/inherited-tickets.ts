@@ -10,7 +10,7 @@
 // on the branch, again on the re-run and on the base commit, so it is not in
 // doubt, and the gated ticket waits on its tracker.
 import {
-  shortTestName, failureTicketLabels, dropStaleOsRequirement, reopenTracker, FLAKY_REOPEN_WINDOW_DAYS, FLAKY_REOPEN_WINDOW_MS,
+  shortTestName, failureTicketLabels, dropStaleOsRequirement, reopenTracker, trackerKey, FLAKY_REOPEN_WINDOW_DAYS, FLAKY_REOPEN_WINDOW_MS,
   type ClosedTracker, type FlakyRunContext, type FlakyTicketClient,
 } from "./flaky-tickets.js";
 import { osName } from "./ticket-requirements.js";
@@ -169,7 +169,8 @@ export async function recordInheritedTests(
     }
     const byPrior = new Map<number, { prior: ClosedTracker; names: string[] }>();
     for (const name of untrackedNow) {
-      const prior = closed.filter(c => c.number !== ctx.gatedIssue && hasMarker(c, name))
+      // A person's not-planned or duplicate close is not reopened; a new ticket is filed as before.
+      const prior = closed.filter(c => c.number !== ctx.gatedIssue && hasMarker(c, name) && c.stateReason !== "not_planned" && c.stateReason !== "duplicate")
         .sort((a, b) => Date.parse(b.closedAt) - Date.parse(a.closedAt))[0];
       if (!prior) continue;
       const group = byPrior.get(prior.number) ?? { prior, names: [] };
@@ -178,7 +179,8 @@ export async function recordInheritedTests(
     }
     for (const { prior, names: group } of byPrior.values()) {
       try {
-        await reopenTracker(client, prior, reopenComment(group, ctx, platform, prior.closedAt), { kind: "inherited", tests: group, top: true });
+        await reopenTracker(client, prior, reopenComment(group, ctx, platform, prior.closedAt),
+          { kind: "inherited", tests: group, top: true, key: trackerKey(ctx, prior.number, "inherited-reopen") });
         groups.set(prior.number, {
           issue: { number: prior.number, nodeId: prior.nodeId ?? "", title: prior.title, body: prior.body, labels: prior.labels },
           names: group, created: true, reopened: true,

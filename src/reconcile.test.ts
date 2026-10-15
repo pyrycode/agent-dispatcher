@@ -1759,9 +1759,10 @@ describe("runRealClaudeGateExecution — outcomes", () => {
       undefined, undefined,
       { recordFlakySightings: async (_names, _ctx, shape) => { seen.push({ commentsBefore: client.addCommentCalls.length, shape }); return outcome; } },
     );
-    assert.deepEqual(seen, [{ commentsBefore: 0, shape: { failed: ["pkg.TestLiveness"], persistent: [], branchOwnsPersistent: false } }]);
-    assert.match(client.addCommentCalls[0]!.body, /- `pkg\.TestLiveness`: first sighting in 14 days, recorded; a ticket is filed if it flakes again/);
-    assert.deepEqual(handed, { shape: { failed: ["pkg.TestLiveness"], persistent: [], branchOwnsPersistent: false }, sightings: outcome });
+    const shape = { failed: ["pkg.TestLiveness"], persistent: [], branchOwnsPersistent: false, persistentTracked: false };
+    assert.deepEqual(seen, [{ commentsBefore: 0, shape }]);
+    assert.match(client.addCommentCalls[0]!.body, /- `pkg\.TestLiveness`: first sighting in 14 days, recorded/);
+    assert.deepEqual(handed, { shape, sightings: outcome });
   });
 
   test("does not call the filer when nothing was flaky", async () => {

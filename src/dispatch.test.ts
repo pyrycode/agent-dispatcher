@@ -7554,15 +7554,15 @@ describe("runRealClaudeGateSuite — same-tree re-run before the base comparison
   test("a Playwright re-run and its base comparison run under the gate's own worker count", async () => {
     // 2026-10-15: one or two failing tests re-run alone used one worker
     // against the gate's three or four, so a contention failure passed.
-    const pw = (results: Record<string, string[]>) => JSON.stringify({
-      config: { workers: 3, metadata: { actualWorkers: 3 } },
-      suites: [{ title: "real-claude-effort.spec.ts", specs: Object.entries(results).map(([title, statuses]) => ({
-        title, tests: statuses.map((st) => ({ status: st === "passed" ? "expected" : "unexpected", results: [{ status: st }] })),
-      })) }],
+    const pw = (files: Record<string, Record<string, string>>) => JSON.stringify({
+      config: { workers: 2, metadata: { actualWorkers: 2 } },
+      suites: Object.entries(files).map(([file, tests]) => ({ title: file, specs: Object.entries(tests).map(([title, st]) => ({
+        title, tests: [{ status: st === "passed" ? "expected" : "unexpected", results: [{ status: st, duration: 500 }] }],
+      })) })),
     });
-    const branch = pw({ applied: ["failed"], other: ["passed"] });
-    const rerun = pw({ applied: ["passed", "failed", "passed"] });
-    const base = pw({ applied: ["passed", "passed", "passed"] });
+    const branch = pw({ "real-claude-effort.spec.ts": { applied: "failed" }, "real-claude-mcp.spec.ts": { sheet: "passed" } });
+    const rerun = pw({ "real-claude-effort.spec.ts": { applied: "failed" }, "real-claude-mcp.spec.ts": { sheet: "failed" } });
+    const base = pw({ "real-claude-effort.spec.ts": { applied: "passed" }, "real-claude-mcp.spec.ts": { sheet: "failed" } });
     const harness = makeGateDeps({
       gitOut: (cmd) => GATE_SHAS[cmd] ?? "",
       spawnOutcome: { exitCode: 1 },
@@ -7575,11 +7575,11 @@ describe("runRealClaudeGateSuite — same-tree re-run before the base comparison
       format: "playwright-json", timeoutMs: 60_000, repoRoot: "/tmp/fake-repo", defaultBranch: "main", logsDir: "/tmp/fake-logs",
       deps: harness.deps,
     });
-    const load = " --workers=3 --repeat-each=3";
-    assert.ok(harness.spawnRequests[1].command.endsWith(`-g '(real-claude-effort\\.spec\\.ts.*applied)'${load}`), harness.spawnRequests[1].command);
-    assert.deepEqual(report.rerunFailures, ["real-claude-effort.spec.ts › applied"], "one copy failed again under the same load, so it is no flake");
-    assert.ok(harness.spawnRequests[2].command.endsWith(load), "the base meets the same load");
-    assert.deepEqual(report.baselineFailures, []);
+    const loaded = "-g '(real-claude-effort\\.spec\\.ts.*applied|real-claude-mcp\\.spec\\.ts.*sheet)' --workers=2";
+    assert.ok(harness.spawnRequests[1].command.endsWith(loaded), harness.spawnRequests[1].command);
+    assert.deepEqual(report.rerunFailures, ["real-claude-effort.spec.ts › applied"], "only the failing test is judged");
+    assert.ok(harness.spawnRequests[2].command.endsWith(loaded), "the base meets the same load");
+    assert.deepEqual(report.baselineFailures, [], "a load test failing on the base is not a failure of main");
   });
 
   test("a failure that fails again is compared against the base as before", async () => {
@@ -11886,7 +11886,7 @@ describe("pre-verifier gates — failures already on main (#123)", () => {
       assert.equal(client.createdIssues.length, 0, "no flaky ticket");
     });
 
-    test("a flaky name and a baseline name together count as green, the note lists both, and no flaky ticket is filed", async () => {
+    test("a flaky name and a baseline name together count as green, the note lists both, and the run files one ticket", async () => {
       const sightings = seenBefore();
       const { result, client } = await runGates(1762, {
         uiOutput: junit([X, Z]),
@@ -11898,8 +11898,9 @@ describe("pre-verifier gates — failures already on main (#123)", () => {
       assert.ok(!note.includes("TRIAGE MODE"));
       assert.match(note, /count as green for your verdict/);
       assert.ok(note.includes(`\`${X}\` (failed in the main sweep`));
-      assert.match(note, /### Flaky failures, not this ticket's[^]*- `de\.pyryco\.mobile\.ui\.NewTest#broken`, gate `[^`]+`: recorded only: another failure in this run failed again/);
-      assert.equal(client.createdIssues.length, 0, "X failed again on the re-run, so the run files no flaky ticket");
+      assert.match(note, /### Flaky failures, not this ticket's[^]*- `de\.pyryco\.mobile\.ui\.NewTest#broken`, gate `[^`]+`: filed #/);
+      assert.deepEqual(client.createdIssues.map((i) => i.body.includes(flakyMarker(Z))), [true], "X failed again and is main's, so the run's one ticket is Z's");
+      assert.ok(!client.createdIssues[0]!.body.includes(flakyMarker(X)));
       assert.deepEqual(sightings.recorded, [{ test: Z, counts: true }], "X is main's, so Z's sighting still counts");
     });
 
@@ -11913,7 +11914,7 @@ describe("pre-verifier gates — failures already on main (#123)", () => {
         sightings,
       });
       assert.match(result.promptNote, /TRIAGE MODE/);
-      assert.match(result.promptNote, /recorded only and not counted: this branch's own failure/);
+      assert.match(result.promptNote, /: recorded and not counted: this branch's own failure/);
       assert.equal(client.createdIssues.length, 0);
       assert.deepEqual(sightings.recorded, [{ test: Z, counts: false }]);
     });
@@ -11937,45 +11938,51 @@ describe("pre-verifier gates — failures already on main (#123)", () => {
       // passed and was filed as a flaky test.
       const PW = "npx playwright test --reporter=json";
       const PW_FORMATS = JSON.stringify({ [PW]: { format: "playwright-json", baseline: `${PW} -g {{TESTS}}` } });
-      const pw = (workers: number, results: Record<string, string[]>) => JSON.stringify({
+      /** file -> test -> statuses */
+      const pw = (workers: number, files: Record<string, Record<string, string[]>>) => JSON.stringify({
         config: { workers, metadata: { actualWorkers: workers } },
-        suites: [{ title: "flow.spec.ts", specs: Object.entries(results).map(([title, statuses]) => ({
-          title, tests: statuses.map((st) => ({ status: st === "passed" ? "expected" : "unexpected", results: [{ status: st }] })),
-        })) }],
+        suites: Object.entries(files).map(([file, tests]) => ({ title: file, specs: Object.entries(tests).map(([title, statuses]) => ({
+          title, tests: statuses.map((st) => ({ status: st === "passed" ? "expected" : "unexpected", results: [{ status: st, duration: 1000 }] })),
+        })) })),
       });
+      const gateRun = (workers: number) => pw(workers, { "flow.spec.ts": { a: ["failed"], b: ["passed"] }, "other.spec.ts": { o: ["passed"] }, "more.spec.ts": { m: ["passed"] } });
       const pwRed = (req: GateSpawnRequest): GateSpawnOutcome =>
         req.command === PW ? { exitCode: 1, timedOut: false, spawnError: null } : { exitCode: 0, timedOut: false, spawnError: null };
       const pwReruns = (calls: CallLog) => calls.gates.filter((g) => g.command.includes(" -g ") && !/verifier-gate-base-/.test(g.cwd));
       const pwBase = (calls: CallLog) => calls.gates.filter((g) => g.command.includes(" -g ") && /verifier-gate-base-/.test(g.cwd));
+      const LOADED = `${PW} -g '(flow\\.spec\\.ts.*a|other\\.spec\\.ts.*o|more\\.spec\\.ts.*m)' --workers=3`;
 
-      test("the re-run asks for the gate's workers and repeats the failing file to fill them", async () => {
+      test("the re-run asks for the gate's workers and fills the idle ones with passing tests from other files", async () => {
         const { result, calls } = await runGates(1767, {
           gates: `make check;${PW}`, formats: PW_FORMATS, gateImpl: pwRed, state: noSweep(),
-          uiOutput: pw(4, { a: ["failed"], b: ["passed"] }),
-          rerunOutput: pw(4, { a: ["passed", "passed", "passed", "passed"] }),
+          uiOutput: gateRun(3),
+          rerunOutput: pw(3, { "flow.spec.ts": { a: ["passed"] }, "other.spec.ts": { o: ["passed"] }, "more.spec.ts": { m: ["passed"] } }),
         });
-        assert.equal(pwReruns(calls)[0]!.command, `${PW} -g '(flow\\.spec\\.ts.*a)' --workers=4 --repeat-each=4`);
-        assert.match(result.promptNote, /count as green for your verdict/, "it passed every copy, so it is flaky");
+        assert.equal(pwReruns(calls)[0]!.command, LOADED, "each failing test still runs once");
+        assert.match(result.promptNote, /count as green for your verdict/);
       });
 
-      test("a copy that fails again under the same load is not a flake, and the base runs under that load too", async () => {
+      test("a load test's result decides nothing, and the base runs under the same load", async () => {
         const { result, calls, client } = await runGates(1768, {
           gates: `make check;${PW}`, formats: PW_FORMATS, gateImpl: pwRed, state: noSweep(),
-          uiOutput: pw(4, { a: ["failed"] }),
-          rerunOutput: pw(4, { a: ["passed", "failed", "passed", "passed"] }),
-          baseOutput: pw(4, { a: ["passed", "passed", "passed", "passed"] }),
+          uiOutput: gateRun(3),
+          rerunOutput: pw(3, { "flow.spec.ts": { a: ["failed"] }, "other.spec.ts": { o: ["failed"] }, "more.spec.ts": { m: ["passed"] } }),
+          baseOutput: pw(3, { "flow.spec.ts": { a: ["passed"] }, "other.spec.ts": { o: ["failed"] }, "more.spec.ts": { m: ["passed"] } }),
         });
-        assert.match(result.promptNote, /TRIAGE MODE/);
-        assert.ok(!result.promptNote.includes("Flaky failures"));
-        assert.equal(pwBase(calls)[0]!.command, `${PW} -g '(flow\\.spec\\.ts.*a)' --workers=4 --repeat-each=4`);
+        assert.equal(pwBase(calls)[0]!.command, LOADED);
+        assert.match(result.promptNote, /TRIAGE MODE/, "a failed again and passes on the base, so it is the ticket's");
+        assert.match(result.promptNote, /Judge only these remaining failures[^]*- `flow\.spec\.ts › a`/);
+        const judged = result.promptNote.split("Judge only these remaining failures")[1]!.split("\n\n")[1]!;
+        assert.equal(judged, "- `flow.spec.ts › a`", "the load test that failed is not a finding");
+        assert.ok(!result.promptNote.includes("`other.spec.ts › o` (failed"), "nor a failure on main");
         assert.equal(client.createdIssues.length, 0);
       });
 
       test("a gate that ran one worker re-runs as before", async () => {
         const { calls } = await runGates(1769, {
           gates: `make check;${PW}`, formats: PW_FORMATS, gateImpl: pwRed, state: noSweep(),
-          uiOutput: pw(1, { a: ["failed"] }),
-          rerunOutput: pw(1, { a: ["passed"] }),
+          uiOutput: gateRun(1),
+          rerunOutput: pw(1, { "flow.spec.ts": { a: ["passed"] } }),
         });
         assert.equal(pwReruns(calls)[0]!.command, `${PW} -g '(flow\\.spec\\.ts.*a)'`);
       });

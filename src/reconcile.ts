@@ -998,8 +998,11 @@ export async function runRealClaudeGateExecution(
       // its sightings do not count when one of those is the branch's.
       const flakyShape: FlakyRunShape = {
         failed: report.tally?.failedNames ?? [], persistent: [...introduced, ...preExisting], branchOwnsPersistent: introduced.length > 0,
+        // A failure on main got its shared live failure ticket above: the run's one ticket.
+        persistentTracked: preExisting.length > 0,
       };
-      const flakyCtx: FlakyRunContext = { gatedIssue: candidate.issueNumber, report, at: new Date().toISOString() };
+      // The output path is unique per gate run, so a run judged twice is one sighting.
+      const flakyCtx: FlakyRunContext = { gatedIssue: candidate.issueNumber, report, at: new Date().toISOString(), runKey: report.outputPath };
       let flakySightings: FlakySightingOutcome | undefined;
       if (flaky.length > 0 && options.recordFlakySightings) {
         try {

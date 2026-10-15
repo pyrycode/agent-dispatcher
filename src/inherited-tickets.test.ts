@@ -399,7 +399,7 @@ test("a shared failure whose fix ticket closed in the last 30 days reopens it at
   client.closed.push(closedFix(1947, 2));
   const result = await recordInheritedTests(client, [name], ctx, {}, process.platform, () => T0);
   assert.equal(client.created.length, 0, "no new ticket");
-  assert.deepEqual(client.reopened.map(r => [r.issue, r.ref]), [[1947, { kind: "inherited", tests: [name], top: true }]]);
+  assert.deepEqual(client.reopened.map(r => [r.issue, r.ref.kind, r.ref.tests, r.ref.top]), [[1947, "inherited", [name], true]]);
   assert.match(client.reopened[0].comment, /## Shared failure back after this ticket closed/);
   assert.match(client.reopened[0].comment, /\/logs\/base.log/);
   assert.deepEqual(result.blockers, [{ name, issue: 1947 }]);
