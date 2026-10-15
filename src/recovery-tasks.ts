@@ -3,6 +3,7 @@ import {parseGateOutput} from './gate-output.js';
 import type {DatabaseSync} from 'node:sqlite';
 import {scrubCredentials} from './agent-runtime.js';
 import {validateRepairPublication} from './recovery-source-publication.js';
+import {currentWorkflow,dispatcherRepairCap,withdrawCappedRepairs} from './recovery-repair-cap.js';
 import {ARTIFACT_LIMITS,artifactManifest,manifestHash,sha256,validateArtifactPath,validateManifest,type ArtifactManifest} from './recovery-artifacts.js';
 
 export const CAPABILITIES = ['linux-amd64','macos-arm64','android-emulator','dispatcher-repair','desktop-fake-suite'] as const;
@@ -171,6 +172,8 @@ export class RecoveryTasks {
   // A read-only provenance assessment never authorises a previously queued task.
   if(incident && (/Explicit operator hold|Denied permission|Pause origin unknown/.test(String(incident.reason))
     || incident.state==='escalated' && incident.decision && JSON.parse(String(incident.decision)).category==='human')) return false;
+  // A repair queued before the cap was reached does not start either (recovery-repair-cap.ts).
+  if(task.state==='queued' && task.request.recipe==='dispatcher-repair' && dispatcherRepairCap(this.db,task.ticket,currentWorkflow(this.db,task.ticket),this.now()).capped) return false;
   return task.state==='queued' && !!host?.ready && this.now()-host.updated<CAPABILITY_FRESH_MS && host.capabilities.includes(task.request.capability);
  }
  begin(id:string,machine:string,session:string,runId:string):void {
@@ -191,6 +194,8 @@ export class RecoveryTasks {
   }
   if (!['running','attention','publishing'].includes(task.state)) throw new Error('Task is not running');
   this.db.prepare('UPDATE fleet_recovery_tasks SET state=?,result=?,updated=? WHERE id=?').run(result.outcome==='completed'?'complete':'failed',JSON.stringify(result),this.now(),task.id);
+  // The failure that reaches the cap withdraws the repairs still queued behind it.
+  if(task.request.recipe==='dispatcher-repair' && result.outcome==='failed') withdrawCappedRepairs(this.db,task.ticket,this.now());
   return this.get(task.id);
  }
  prepareRepair(id:string,machine:string,session:string,publication:unknown,base?:Record<string,string|null>):RecoveryTask {

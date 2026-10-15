@@ -4,7 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 import { FleetStore } from "./fleet-store.js";
 import { RecoveryLedger, type RecoveryObservation } from "./fleet-recovery.js";
 import { RecoveryTasks, type RecoveryTaskRequest } from "./recovery-tasks.js";
-import { dispatcherRepairCap, repairFailureKind, REPAIR_CAP_REASON, REPAIR_CAP_WINDOW_MS } from "./recovery-repair-cap.js";
+import { dispatcherRepairCap, recordRepairWorkflow, repairFailureKind, REPAIR_CAP_REASON, REPAIR_CAP_WINDOW_MS } from "./recovery-repair-cap.js";
 import { recoveryReport } from "./recovery-report.js";
 
 const project = "org/core";
@@ -22,7 +22,9 @@ test("repair failures are classified from their summaries; an interrupted worker
   assert.equal(repairFailureKind("Dispatcher repair did not complete: Independent review did not complete on the checked tree."), "independent review failed");
   assert.equal(repairFailureKind(PUBLICATION), "publication refused");
   assert.equal(repairFailureKind("Publication refused: credential-shaped text (claims service 409)."), "publication refused");
-  assert.equal(repairFailureKind("Dispatcher repair did not complete: Implementation did not complete or permission was denied."), "implementation did not complete");
+  // Also how a Codex rate limit or a runner error ends: not counted.
+  assert.equal(repairFailureKind("Dispatcher repair did not complete: Implementation did not complete or permission was denied."), null);
+  assert.equal(repairFailureKind("Dispatcher repair did not complete: git fetch failed."), null);
   assert.equal(repairFailureKind(INTERRUPTED), null);
 });
 
@@ -87,12 +89,46 @@ test("a repair worker's direct request is refused at the cap; repeating an exist
   } finally { store.close(); }
 });
 
-test("the cap counts per ticket within 24 hours or per incident fingerprint, and a completed repair starts it again", () => {
+test("an unchanged ticket is capped however far apart its failures are, and a queued repair does not start (#3389)", () => {
+  const realNow = Date.now; let now = realNow();
+  Date.now = () => now;
+  const store = new FleetStore(":memory:", limits);
+  try {
+    store.tasks.report("linux", { capabilities: ["dispatcher-repair"], ready: true });
+    // The same labels every cycle, as #3389 overnight: only evidence and task results move.
+    const seen: RecoveryObservation = { ticket, status: "In Code Review", labels: ["error:verifier"], blocked: false };
+    assess(store, seen, "a1", { action: "coordinate", reason: "Repair the gate", task: repair(1) });
+    runTask(store, CHECKS);
+    now += 2 * REPAIR_CAP_WINDOW_MS;
+    store.tasks.report("linux", { capabilities: ["dispatcher-repair"], ready: true });
+    assess(store, seen, "a2", { action: "coordinate", reason: "Repair the gate again", task: repair(2) });
+    // A third repair already queued (here by the operator route) before the second one fails.
+    const early = store.tasks.request(ticket, repair(3), "operator");
+    const second = store.tasks.list(ticket).find(t => t.state === "queued" && t.id !== early.id)!;
+    assert.equal(store.taskStart("linux", second.id, "helper-2").ok, true);
+    store.taskComplete("linux", second.id, "helper-2", { outcome: "failed", summary: PUBLICATION, files: {} });
+    now += 2 * REPAIR_CAP_WINDOW_MS;
+    store.tasks.report("linux", { capabilities: ["dispatcher-repair"], ready: true });
+    assert.equal(store.tasks.get(early.id).state, "failed", "the queued repair was withdrawn when the cap was reached");
+    assert.match(store.tasks.get(early.id).result!.summary, /^Withdrawn before it started/);
+    assert.equal(store.taskStart("linux", early.id, "helper-3").ok, false);
+    const third = assess(store, seen, "a3", { action: "coordinate", reason: "Repair the gate a third time", task: repair(4) });
+    assert.equal(third.selected.action, "escalate");
+    assert.match(third.selected.reason, /with the ticket's stage and recovery labels unchanged/);
+    // A changed ticket, failures long past: repairs are allowed again.
+    const moved: RecoveryObservation = { ...seen, status: "In Development", labels: ["error:builder"] };
+    const fourth = assess(store, moved, "a4", { action: "coordinate", reason: "A different defect", task: repair(5) });
+    assert.equal(fourth.selected.action, "coordinate");
+  } finally { store.close(); Date.now = realNow; }
+});
+
+test("the 24 hour window, the workflow fingerprint and a completed repair's reset", () => {
   const db = new DatabaseSync(":memory:"); let now = 1_000_000_000;
   new RecoveryLedger(db, () => now);
   const tasks = new RecoveryTasks(db, () => now);
-  const fail = (n: number, summary: string, context = `ctx-${n}`) => {
-    const task = tasks.request(ticket, repair(n), context);
+  const fail = (n: number, summary: string, workflow: string | null = null) => {
+    const task = tasks.request(ticket, repair(n), `ctx-${n}`);
+    recordRepairWorkflow(db, task.id, ticket, workflow);
     db.prepare("UPDATE fleet_recovery_tasks SET state='failed',result=?,updated=? WHERE id=?").run(JSON.stringify({ outcome: "failed", summary, files: {} }), now, task.id);
     now += 60_000;
     return task;
@@ -101,27 +137,35 @@ test("the cap counts per ticket within 24 hours or per incident fingerprint, and
   assert.equal(dispatcherRepairCap(db, ticket, null, now).capped, false, "an interrupted worker does not count");
   fail(3, REVIEW);
   assert.equal(dispatcherRepairCap(db, ticket, null, now).capped, true);
-  // Older than the window, on different fingerprints: no longer counted.
   now += REPAIR_CAP_WINDOW_MS;
-  assert.equal(dispatcherRepairCap(db, ticket, "fp-new", now).capped, false);
-  // The same incident fingerprint ordered both failures: counted however old.
-  db.prepare("INSERT INTO fleet_recovery VALUES ('i1',?, 'fp-same','error:verifier','waiting',1,1,'r',?,0)").run(ticket, JSON.stringify({ action: "coordinate", reason: "r", task: repair(4) }));
-  db.prepare("INSERT INTO fleet_recovery VALUES ('i2',?, 'fp-same','error:verifier','waiting',1,1,'r',?,0)").run(ticket, JSON.stringify({ action: "coordinate", reason: "r", task: repair(5) }));
-  fail(4, CHECKS, "i1"); fail(5, PUBLICATION, "i2");
-  now += 2 * REPAIR_CAP_WINDOW_MS;
-  const byFingerprint = dispatcherRepairCap(db, ticket, "fp-same", now);
-  assert.equal(byFingerprint.capped, true);
-  assert.match((byFingerprint as any).reason, /for this incident/);
-  assert.equal(dispatcherRepairCap(db, ticket, "fp-other", now).capped, false);
-  // A repair that completed resets the count.
+  assert.equal(dispatcherRepairCap(db, ticket, "wf-new", now).capped, false, "older than the window, other workflow");
+  fail(4, CHECKS, "wf-same"); now += 2 * REPAIR_CAP_WINDOW_MS; fail(5, PUBLICATION, "wf-same");
+  assert.equal(dispatcherRepairCap(db, ticket, "wf-same", now + 2 * REPAIR_CAP_WINDOW_MS).capped, true);
+  assert.equal(dispatcherRepairCap(db, ticket, "wf-other", now + 2 * REPAIR_CAP_WINDOW_MS).capped, false);
   const done = tasks.request(ticket, repair(6), "ok");
   db.prepare("UPDATE fleet_recovery_tasks SET state='complete',result=?,updated=? WHERE id=?").run(JSON.stringify({ outcome: "completed", summary: "Merged", files: {} }), now, done.id);
   now += 60_000;
-  assert.equal(dispatcherRepairCap(db, ticket, "fp-same", now).capped, false);
-  fail(7, CHECKS);
-  assert.equal(dispatcherRepairCap(db, ticket, "fp-same", now).capped, false, "one failure since the success");
-  fail(8, REVIEW);
-  assert.equal(dispatcherRepairCap(db, ticket, "fp-same", now).capped, true);
+  assert.equal(dispatcherRepairCap(db, ticket, "wf-same", now).capped, false, "a completed repair resets");
+  fail(7, CHECKS, "wf-same");
+  assert.equal(dispatcherRepairCap(db, ticket, "wf-same", now).capped, false, "one failure since the success");
+  fail(8, REVIEW, "wf-same");
+  assert.equal(dispatcherRepairCap(db, ticket, "wf-same", now).capped, true);
   assert.equal(dispatcherRepairCap(db, `${project}#1`, null, now).capped, false, "per ticket");
+  db.close();
+});
+
+test("a repair queued before this version, on a ticket already at the cap, does not start", () => {
+  const db = new DatabaseSync(":memory:"); const now = 1_000_000_000;
+  new RecoveryLedger(db, () => now);
+  const tasks = new RecoveryTasks(db, () => now);
+  for (const [n, summary] of [[1, CHECKS], [2, REVIEW]] as const) {
+    const t = tasks.request(ticket, repair(n), `ctx-${n}`);
+    db.prepare("UPDATE fleet_recovery_tasks SET state='failed',result=?,updated=? WHERE id=?").run(JSON.stringify({ outcome: "failed", summary, files: {} }), now, t.id);
+  }
+  const queued = tasks.request(ticket, repair(3), "ctx-3");
+  tasks.report("linux", { capabilities: ["dispatcher-repair"], ready: true });
+  assert.equal(tasks.available("linux", queued.id), false);
+  const other = tasks.request(`${project}#1`, repair(3), "ctx");
+  assert.equal(tasks.available("linux", other.id), true, "another ticket is unaffected");
   db.close();
 });

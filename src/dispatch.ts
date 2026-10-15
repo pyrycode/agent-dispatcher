@@ -92,6 +92,7 @@ import {
   retrySpawnOnTransientError,
   scrubSpawnEnv,
   agentSpawnEnv,
+  CODEX_CAPTURE_ENV,
   shouldAttemptSafeSalvage,
   shouldUseWorktree,
   findReadyPrNumber,
@@ -2378,7 +2379,10 @@ function unstagePaths(cwd: string, deps: Pick<DispatchDeps, "execSync" | "spawnS
     cwd, encoding: "utf-8", stdio: "pipe", timeout: 15_000,
   }));
   // Only staged entries: an untouched pathspec would make git restore fail.
-  const staged = statusEntries(status).filter(e => paths.has(e.path) && ![" ", "?"].includes(e.status[0]!)).map(e => e.path);
+  // A rename pairs a deleted and an added path; either side may be excluded.
+  const staged = [...new Set(statusEntries(status)
+    .filter(e => ![" ", "?"].includes(e.status[0]!) && (paths.has(e.path) || (e.from !== undefined && paths.has(e.from))))
+    .flatMap(e => [e.path, ...(e.from !== undefined ? [e.from] : [])]))];
   if (!staged.length) return;
   const result = deps.spawnSync("git", ["restore", "--staged", "--", ...staged.map(path => `:(literal)${path}`)], { cwd, stdio: "pipe", timeout: 15_000 });
   if (result.status !== 0) throw new Error(`Could not keep gate-written fixtures out of the commit: ${result.stderr?.toString() || "git restore failed"}`);
@@ -6316,7 +6320,8 @@ function readDocsOnlyGateReuse(
  *   (capped at `VERIFIER_GATE_TAIL_CAP`). The verifier owns the baseline
  *   partition and the bounce-vs-advance call, exactly as QA does today —
  *   a deterministic bounce would loop forever on a failure that
- *   pre-exists on the merge base. Nothing is labelled or commented here;
+ *   pre-exists on the merge base. Nothing is labelled here, and the only
+ *   comment is the note on fixtures a gate rewrote (gate-fixtures.ts);
  *   routing is the model's verdict, not the gate's.
  * - **Already green on these files** → a full pass recorded on the same
  *   merged tree with the same gate list in the last 24 hours is reused:
@@ -7232,15 +7237,7 @@ export function buildGateSpawnEnv(parentEnv: NodeJS.ProcessEnv, opts: { codexCap
   return env;
 }
 
-/**
- * The Codex test login a fork sets for its live Codex tests. Only the live
- * (real-claude) gate keeps it, see `buildLiveGateSpawnEnv`. Every other gate
- * runs without it: Core's `TestCaptureLive` has no build tag, so on a computer
- * with the login a verifier's `make check` spent Codex allowance and rewrote
- * `internal/codexsup/testdata/capture/*.jsonl`, which the safety-net commit
- * then pushed (pyrycode #3385 and #3389, 2026-10-15).
- */
-export const CODEX_CAPTURE_ENV = ["PYRY_CODEX_CAPTURE_BIN", "PYRY_CODEX_CAPTURE_HOME"] as const;
+export { CODEX_CAPTURE_ENV };
 
 /**
  * The live gate's environment: `buildGateSpawnEnv` plus the Codex test login,
@@ -7872,6 +7869,7 @@ export async function runRealClaudeGateSuite(opts: {
             label: "real-claude-gate-infra-check",
             who: "Real-claude gate infrastructure check",
             evidence: { runDir: report.evidenceDir ?? null, part: "infra-check" },
+            live: true,
             deps,
           });
           failedOnBase = check.failures;
@@ -8011,6 +8009,7 @@ async function runBaselineComparison(opts: {
   const result = await runFailuresOnBase({
     ...opts, label: "real-claude-gate-base", who: "Real-claude gate",
     evidence: { runDir: opts.report.evidenceDir ?? null, part: "base" },
+    live: true,
   });
   if (result.outputPath !== null) report.baselineOutputPath = result.outputPath;
   report.baselineFailures = result.failures;
@@ -8043,6 +8042,8 @@ async function runFailuresOnBase(opts: {
   who: string;
   /** The live gate run's evidence folder and this part's name in it. Absent for the verifier gates. */
   evidence?: { runDir: string | null; part: string };
+  /** A check for the live gate: it keeps the Codex test login (buildLiveGateSpawnEnv). */
+  live?: boolean;
   deps: Pick<GateRunnerDeps, "execSync" | "spawnGate" | "readFileSync"> & { mkdirSync?: GateRunnerDeps["mkdirSync"] };
 }): Promise<{ failures: string[] | null; skipReason: string | null; outputPath: string | null }> {
   const { deps, targetRepo } = opts;
@@ -8080,8 +8081,7 @@ async function runFailuresOnBase(opts: {
     const outcome = await deps.spawnGate({
       command,
       cwd: worktreeDir,
-      // Only the live gate's base checks name an evidence folder, and only they keep the Codex test login.
-      env: {...(opts.evidence ? buildLiveGateSpawnEnv(process.env) : buildGateSpawnEnv(process.env)),...managedTaskEnv(),
+      env: {...(opts.live ? buildLiveGateSpawnEnv(process.env) : buildGateSpawnEnv(process.env)),...managedTaskEnv(),
         ...gateEvidenceEnv(opts.evidence?.runDir, opts.evidence?.part ?? "base", deps.mkdirSync ?? mkdirSync)},
       timeoutMs: opts.timeoutMs,
       stdoutPath,

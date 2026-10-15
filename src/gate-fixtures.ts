@@ -8,13 +8,12 @@
 // and #3385 (38b09727) on 2026-10-15, six capture fixtures each.
 //
 // The pre-spawn gate step snapshots `testdata/` before and after the gates.
-// Whatever the gates changed is put back where that is exact (the file was
-// clean before), and every changed path is kept out of all automatic commits
-// of the run, which is the guarantee: a restore that fails still cannot ship.
+// Whatever the gates changed is put back as it was, and every changed path is
+// kept out of all automatic commits of the run, so a restore that fails still
+// cannot ship in this run.
 
-import { createHash } from "node:crypto";
-import { lstatSync, readFileSync, rmSync } from "node:fs";
-import { resolve } from "node:path";
+import { lstatSync, mkdirSync, readFileSync, readlinkSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import type { SpawnSyncReturns } from "node:child_process";
 import { statusEntries } from "./worktree.js";
 
@@ -25,18 +24,30 @@ export function isTestdataPath(path: string): boolean {
   return /(^|\/)testdata\//.test(path);
 }
 
-/** Dirty `testdata/` paths, each with its status and content digest. */
-export type TestdataSnapshot = Map<string, string>;
+/** What a dirty `testdata/` path held: a file's bytes, a symlink's target, or nothing. */
+export interface TestdataEntry { status: string; kind: "file" | "symlink" | "missing" | "other"; data?: Buffer; target?: string }
+/** Dirty `testdata/` paths before or after the gates. */
+export type TestdataSnapshot = Map<string, TestdataEntry>;
 
-function digest(cwd: string, path: string): string {
+function entry(cwd: string, path: string, status: string): TestdataEntry {
   const full = resolve(cwd, path);
   try {
     const stat = lstatSync(full);
-    if (!stat.isFile()) return stat.isSymbolicLink() ? "symlink" : "other";
-    return createHash("sha256").update(readFileSync(full)).digest("hex");
+    if (stat.isSymbolicLink()) return { status, kind: "symlink", target: readlinkSync(full) };
+    if (stat.isFile()) return { status, kind: "file", data: readFileSync(full) };
+    return { status, kind: "other" };
   } catch {
-    return "missing";
+    return { status, kind: "missing" };
   }
+}
+/** Remove a file or symlink, dangling or not. Missing is fine; a folder is not removed. */
+function removeEntry(full: string): void {
+  const stat = lstatSync(full, { throwIfNoEntry: false });
+  if (stat && !stat.isDirectory()) unlinkSync(full);
+}
+function same(a: TestdataEntry | undefined, b: TestdataEntry | undefined): boolean {
+  return !!a && !!b && a.status === b.status && a.kind === b.kind && a.target === b.target
+    && (a.data === undefined ? b.data === undefined : b.data !== undefined && a.data.equals(b.data));
 }
 
 /** Read the worktree's dirty `testdata/` paths. Throws when git cannot be read. */
@@ -44,9 +55,9 @@ export function snapshotTestdata(cwd: string, spawnSync: SpawnSync): TestdataSna
   const status = spawnSync("git", ["status", "--porcelain", "-z", "--untracked-files=all"], { cwd, stdio: "pipe", timeout: 15_000 });
   if (status.status !== 0) throw new Error(`git status failed: ${status.stderr?.toString() || "unknown"}`);
   const snapshot: TestdataSnapshot = new Map();
-  for (const entry of statusEntries(status.stdout.toString())) {
-    for (const path of [entry.path, ...(entry.from !== undefined ? [entry.from] : [])]) {
-      if (isTestdataPath(path)) snapshot.set(path, `${entry.status}:${digest(cwd, path)}`);
+  for (const e of statusEntries(status.stdout.toString())) {
+    for (const path of [e.path, ...(e.from !== undefined ? [e.from] : [])]) {
+      if (isTestdataPath(path)) snapshot.set(path, entry(cwd, path, e.status));
     }
   }
   return snapshot;
@@ -54,35 +65,42 @@ export function snapshotTestdata(cwd: string, spawnSync: SpawnSync): TestdataSna
 
 /** Paths the gates changed: dirty now and not in that exact state before. */
 export function changedTestdata(before: TestdataSnapshot, after: TestdataSnapshot): string[] {
-  return [...after.keys()].filter(path => before.get(path) !== after.get(path)).sort();
+  return [...after.keys()].filter(path => !same(before.get(path), after.get(path))).sort();
 }
 
 export interface TestdataRestore {
   /** Put back exactly as before the gates. */
   restored: string[];
-  /** Left as the gates wrote them: dirty before the gates, or the restore failed. Never committed. */
+  /** Left as the gates wrote them because the restore failed. Never committed by this run. */
   kept: string[];
 }
 
 /**
- * Put back each changed path that was clean before the gates: a tracked file
- * returns to HEAD, a new untracked file is removed. A path that was already
- * dirty has no exact earlier state here and is kept, as is one whose restore
- * fails. The caller keeps every changed path out of automatic commits anyway.
+ * Put back each changed path as it was before the gates. One that was clean
+ * returns to HEAD, or is removed when HEAD does not have it. One that was
+ * already dirty gets its earlier bytes or link target back. A path whose
+ * restore fails, or whose earlier state was not a file or link, is kept; the
+ * caller keeps every changed path out of the run's automatic commits anyway.
  */
 export function restoreGateTestdata(cwd: string, before: TestdataSnapshot, changed: readonly string[], spawnSync: SpawnSync): TestdataRestore {
   const restored: string[] = [], kept: string[] = [];
   for (const path of changed) {
-    if (before.has(path)) { kept.push(path); continue; }
+    const full = resolve(cwd, path);
+    const earlier = before.get(path);
     try {
-      const tracked = spawnSync("git", ["cat-file", "-e", `HEAD:${path}`], { cwd, stdio: "pipe", timeout: 15_000 }).status === 0;
-      if (tracked) {
+      if (earlier) {
+        // Dirty before the gates: put the earlier bytes back. The index is left alone.
+        if (earlier.kind === "other") throw new Error("not a file");
+        removeEntry(full);
+        if (earlier.kind === "file") { mkdirSync(dirname(full), { recursive: true }); writeFileSync(full, earlier.data!); }
+        else if (earlier.kind === "symlink") { mkdirSync(dirname(full), { recursive: true }); symlinkSync(earlier.target!, full); }
+      } else if (spawnSync("git", ["cat-file", "-e", `HEAD:${path}`], { cwd, stdio: "pipe", timeout: 15_000 }).status === 0) {
         const r = spawnSync("git", ["restore", "--source=HEAD", "--staged", "--worktree", "--", `:(literal)${path}`], { cwd, stdio: "pipe", timeout: 15_000 });
         if (r.status !== 0) throw new Error(r.stderr?.toString() || "git restore failed");
       } else {
-        // Unstage first in case something added it, then remove the file.
+        // New: unstage it in case something added it, then remove the file.
         spawnSync("git", ["rm", "--cached", "--quiet", "--ignore-unmatch", "--", `:(literal)${path}`], { cwd, stdio: "pipe", timeout: 15_000 });
-        rmSync(resolve(cwd, path), { force: true });
+        removeEntry(full);
       }
       restored.push(path);
     } catch {
@@ -100,7 +118,7 @@ export function gateTestdataComment(agent: string, result: TestdataRestore): str
     "",
     `The deterministic gates before \`${agent}\` changed files under \`testdata/\`. A gate must not change the tree, so none of these is committed by the dispatcher.`,
     ...(result.restored.length ? ["", "Put back as they were before the gates:", "", list(result.restored)] : []),
-    ...(result.kept.length ? ["", "Left in the worktree and kept out of every automatic commit:", "", list(result.kept)] : []),
+    ...(result.kept.length ? ["", "Could not be put back. Left in the worktree and kept out of this run's automatic commits:", "", list(result.kept)] : []),
     "",
     "A test that writes its own fixtures on an ordinary run is a defect in that test: it should run only on request, behind a build tag or an explicit opt-in.",
   ].join("\n");

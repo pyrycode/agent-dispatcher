@@ -23,7 +23,8 @@ import type { FleetRun, FleetSnapshot } from "./fleet-store.js";
  * rewrote, see gate-fixtures.ts) never count as work to commit.
  */
 export function shouldAutoCommit(gitStatusOutput: string, exclude: ReadonlySet<string> = new Set()): boolean {
-  return statusEntries(gitStatusOutput).some(({ status, path, from }) => !exclude.has(path) && (
+  // A rename counts as excluded only when both of its sides are.
+  return statusEntries(gitStatusOutput).some(({ status, path, from }) => !(exclude.has(path) && (from === undefined || exclude.has(from))) && (
     status[0] === "D" || !isRuntimeFile(path) || (from !== undefined && !isRuntimeFile(from))));
 }
 
