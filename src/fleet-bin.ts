@@ -36,10 +36,16 @@ function shutdownDeadline(seconds: unknown): number {
 }
 async function main(): Promise<void> {
   const [command, configPath, ...args] = process.argv.slice(2);
-  if (!configPath || !["workflow", "control", "recovery-task", "claims", "manager", "status", "runner", "codex", "desired", "attention", "report-attention", "pause", "coordination", "recovery", "drain", "resume", "stop", "start", "desired-state", "drain-project", "resume-project", "free"].includes(command)) {
+  if (!configPath || !["handover", "workflow", "control", "recovery-task", "claims", "manager", "status", "runner", "codex", "desired", "attention", "report-attention", "pause", "coordination", "recovery", "drain", "resume", "stop", "start", "desired-state", "drain-project", "resume-project", "free"].includes(command)) {
     throw new Error("Usage: fleet-bin.ts claims|manager|status|runner|codex|recovery|drain|resume|stop|start|desired-state|drain-project|resume-project|free CONFIG [claude|codex|local | PROJECT | --machine MACHINE|--all-machines [--project PROJECT] | TICKET GENERATION --confirmed-stopped]");
   }
   const config = JSON.parse(readFileSync(configPath, "utf8"));
+  if(command==='handover') {
+    if(args.length!==1) throw new Error('handover CONFIG PROOF_FILE');
+    const client=new JsonClient(config.claimsUrl,secret(config.operatorTokenEnv));
+    console.log(JSON.stringify(await client.call('/handover/check',JSON.parse(readFileSync(args[0],'utf8')))));
+    return;
+  }
   if(command==='workflow') {
     const [action,project,file,boardNumber]=args;
     if(!['read','export','import','change','file','prepare','activate','cancel-preparation'].includes(action)||!project)throw new Error('workflow read|export|import|change|file|prepare|activate|cancel-preparation PROJECT [JSON_FILE]');

@@ -95,6 +95,11 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
       // Shared run evidence (evidence-store.ts). Any fleet credential reads;
       // only the computer that ran a run uploads its bundle. A service without
       // the store answers like one that predates it.
+      if(req.url==='/handover/check') {
+        if(!isAdmin) return send(403,{error:'Operator credential required'});
+        if(!evidence) return send(409,{error:'Shared evidence is required'});
+        return send(200,{...store.handoverCheck(body,evidence),mode:'preflight',ownershipChanged:false});
+      }
       if(req.url?.startsWith('/evidence/')) {
         if(!evidence) return send(404,{error:'Unknown operation'});
         if(req.url==='/evidence/usage') return send(200,evidence.usage());
