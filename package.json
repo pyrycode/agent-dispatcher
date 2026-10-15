@@ -13,7 +13,7 @@
     "typecheck": "tsc --noEmit -p .",
     "test:helpers": "python3 -m unittest discover -s codex-helpers -p 'test_*.py' && python3 -m unittest discover -s scripts -p 'test_*.py'",
     "eval:report": "tsx src/eval/report.ts",
-    "drain": "pkill -TERM -f 'tsx.*src/dispatch-bin\\.ts' && echo 'SIGTERM sent — dispatcher will exit after current dispatch completes.'",
+    "drain": "node -e \"console.error('Use the protected fleet drain command with --machine MACHINE or --all-machines'); process.exit(1)\"",
     "test:slow": "PYRY_SLOW_TESTS=1 tsx --test --test-concurrency=4 src/*.test.ts src/eval/*.test.ts"
   },
   "devDependencies": {

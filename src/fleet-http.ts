@@ -65,7 +65,7 @@ export async function listen(server: Server, port: number | string, host = "127.
   if (typeof port === "string") chmodSync(port, 0o600);
   return server;
 }
-export async function serveFleet(store: FleetStore, machines: Record<string, string>, admin: string, port: number, host = "127.0.0.1", github?: GitHubBroker, desired?: () => unknown, repairRepository?: string, repairConsumers?: Record<string,string>, controlRevision?: string, evidence?: EvidenceStore): Promise<Server> {
+export async function serveFleet(store: FleetStore, machines: Record<string, string>, admin: string, port: number, host = "127.0.0.1", github?: GitHubBroker, desired?: () => unknown, repairRepository?: string, repairConsumers?: Record<string,string>, controlRevision?: string, evidence?: EvidenceStore, releaseBackups?: string): Promise<Server> {
   const secrets = [...Object.values(machines), admin];
   if (secrets.some(s => !s) || new Set(secrets).size !== secrets.length) throw new Error("Fleet credentials must be non-empty and distinct");
   const workflowGitHub=github?new WorkflowGitHub(store,github):undefined;
@@ -79,6 +79,10 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
     const machine = Object.keys(machines).find(m => tokenMatches(req.headers.authorization, machines[m]));
     if (!isAdmin && !machine) return send(401, { error: "Authentication required" });
     try {
+      if (req.method === 'GET' && req.url === '/operations/releases') {
+        if (!isAdmin) return send(403,{error:'Operator credential required'});
+        return send(200,store.releases.list());
+      }
       if (req.method === "GET" && req.url === "/operations/desired") return send(200, desired?.() ?? {});
       if (req.method === "GET" && req.url === "/operations/control") return send(200,{desired:store.controlTarget(),centralLoaded:controlRevision});
       if (req.method === "GET" && req.url === "/operations/reports") return send(200, store.operations.list());
@@ -92,6 +96,13 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
       if (req.method === "GET" && req.url === "/github/status" && isAdmin) return send(200, github?.status() ?? { enabled: false });
       if (req.method !== "POST") return send(404, { error: "Unknown operation" });
       const body = await readJson(req, req.url?.startsWith("/workflow/") ? 32*1024*1024 : req.url?.startsWith("/tasks/") ? 8*1024*1024 : 1024*1024);
+      if (req.url === '/operations/release' || req.url === '/operations/release-complete') {
+        if (!isAdmin) return send(403,{error:'Operator credential required'});
+        if (!releaseBackups) return send(409,{error:'Configure the private release backup directory first'});
+        return send(200,req.url === '/operations/release'
+          ? store.releases.begin(body,releaseBackups)
+          : store.releases.complete(body.commandId,controlRevision,Object.keys(machines)));
+      }
       // Shared run evidence (evidence-store.ts). Any fleet credential reads;
       // only the computer that ran a run uploads its bundle. A service without
       // the store answers like one that predates it.

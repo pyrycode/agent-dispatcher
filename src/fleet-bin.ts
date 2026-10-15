@@ -36,10 +36,18 @@ function shutdownDeadline(seconds: unknown): number {
 }
 async function main(): Promise<void> {
   const [command, configPath, ...args] = process.argv.slice(2);
-  if (!configPath || !["workflow", "control", "recovery-task", "claims", "manager", "status", "runner", "codex", "desired", "attention", "report-attention", "pause", "coordination", "recovery", "drain", "resume", "stop", "start", "desired-state", "drain-project", "resume-project", "free"].includes(command)) {
+  if (!configPath || !["workflow", "release", "control", "recovery-task", "claims", "manager", "status", "runner", "codex", "desired", "attention", "report-attention", "pause", "coordination", "recovery", "drain", "resume", "stop", "start", "desired-state", "drain-project", "resume-project", "free"].includes(command)) {
     throw new Error("Usage: fleet-bin.ts claims|manager|status|runner|codex|recovery|drain|resume|stop|start|desired-state|drain-project|resume-project|free CONFIG [claude|codex|local | PROJECT | --machine MACHINE|--all-machines [--project PROJECT] | TICKET GENERATION --confirmed-stopped]");
   }
   const config = JSON.parse(readFileSync(configPath, "utf8"));
+  if(command==='drain' && !args.length) throw new Error('Choose --machine MACHINE or --all-machines for a saved central drain');
+  if(command==='release') {
+    const claims=new JsonClient(config.claimsUrl,secret(config.claimsOperatorTokenEnv??config.claimsTokenEnv));
+    if(!args.length) {console.log(JSON.stringify(await claims.call('/operations/releases')));return;}
+    if(args.length!==2 || !['set','complete'].includes(args[0])) throw new Error('release [set REQUEST.json | complete COMMAND_ID]');
+    console.log(JSON.stringify(await claims.call(args[0]==='set'?'/operations/release':'/operations/release-complete',args[0]==='set'?JSON.parse(readFileSync(args[1],'utf8')):{commandId:args[1]})));
+    return;
+  }
   if(command==='workflow') {
     const [action,project,file,boardNumber]=args;
     if(!['read','export','import','change','file','prepare','activate','cancel-preparation'].includes(action)||!project)throw new Error('workflow read|export|import|change|file|prepare|activate|cancel-preparation PROJECT [JSON_FILE]');
@@ -138,7 +146,7 @@ async function main(): Promise<void> {
     const evidenceTimer = evidence ? setInterval(evidenceSweep, 3600_000) : undefined;
     // Freed pages go back to the disk 16 MiB a minute; see EvidenceStore.vacuumStep.
     const vacuumTimer = evidence ? setInterval(() => { try { evidence.vacuumStep(); } catch (e) { console.warn("Evidence vacuum failed:", (e as Error).message); } }, 60_000) : undefined;
-    const server = await serveFleet(store, machines, secret(config.operatorTokenEnv), config.port ?? 7430, config.host ?? "127.0.0.1", github, () => updates?.snapshot() ?? {}, config.updates?.dispatcherRepository,config.updates?.consumers,execFileSync("git",["rev-parse","HEAD"],{cwd:resolve(fileURLToPath(new URL("..",import.meta.url))),encoding:"utf8"}).trim(), evidence);
+    const server = await serveFleet(store, machines, secret(config.operatorTokenEnv), config.port ?? 7430, config.host ?? "127.0.0.1", github, () => updates?.snapshot() ?? {}, config.updates?.dispatcherRepository,config.updates?.consumers,execFileSync("git",["rev-parse","HEAD"],{cwd:resolve(fileURLToPath(new URL("..",import.meta.url))),encoding:"utf8"}).trim(), evidence, config.releaseBackups ? resolve(config.releaseBackups) : undefined);
     let cli: Awaited<ReturnType<typeof serveGitHubBridge>> | undefined;
     if (github && config.github.socketPath) {
       const socket = resolve(config.github.socketPath);
@@ -265,12 +273,7 @@ async function main(): Promise<void> {
       // Central drains and stops not yet applied, or failed.
       ...("fleetDesiredState" in desired ? { desiredState: desired.fleetDesiredState.attention } : { desiredState: null, desiredStateError: desired.fleetDesiredStateError }),orphanedTasks:orphaned,...(orphanedError ? {orphanedTasksError:orphanedError} : {}),...(codexPause ? {codexPause} : {}),...(capabilityGaps.length ? {capabilityGaps} : {}),...(evidenceStore ? {evidenceStore} : {})}, null, 2)); return;
   }
-  if (command === "drain") {
-    await client.call("/drain", {});
-    console.log("Draining: no new grants. Existing grants remain reserved.");
-    console.warn("This drain is in this manager's memory only: a manager restart, as on a controller rollout, lifts it, and its dispatchers exit. Use drain --machine MACHINE for a saved central drain.");
-  }
-  else if (command === "drain-project" || command === "resume-project") {
+  if (command === "drain-project" || command === "resume-project") {
     if (args.length !== 1) throw new Error(`${command} requires PROJECT`);
     const draining = command === "drain-project";
     const state = await client.call<any>("/state");
