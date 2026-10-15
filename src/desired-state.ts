@@ -208,7 +208,11 @@ export class DesiredStateStore {
     const old = this.entries(machine).find(e => e.project === project);
     const work = change.work ?? old?.work, run = change.run ?? old?.run;
     if (old && old.work === work && old.run === run) return undefined;
-    const revision = Number(this.db.prepare("SELECT revision FROM fleet_desired_revisions WHERE machine=?").get(machine)?.revision ?? 0) + 1;
+    // Past what the manager last applied as well: after a database restore the
+    // stored revision is behind it, and the manager keeps its saved document
+    // until a change moves past it.
+    const applied = Number(this.db.prepare("SELECT applied FROM fleet_desired_polls WHERE machine=?").get(machine)?.applied ?? 0);
+    const revision = Math.max(Number(this.db.prepare("SELECT revision FROM fleet_desired_revisions WHERE machine=?").get(machine)?.revision ?? 0), applied) + 1;
     const updated = this.now();
     this.db.prepare("INSERT INTO fleet_desired_revisions VALUES (?,?) ON CONFLICT(machine) DO UPDATE SET revision=excluded.revision").run(machine, revision);
     this.db.prepare(`INSERT INTO fleet_desired_state VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(machine,project) DO UPDATE SET

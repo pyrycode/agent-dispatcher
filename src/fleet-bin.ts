@@ -286,7 +286,9 @@ async function main(): Promise<void> {
   else {
     // Desired against observed for every computer comes from the claim
     // service. Its failure never hides the local state, and is not "none".
-    const [state, fleet] = await Promise.all([client.call<any>("/state"), fleetDesired(config)]);
+    // `status --local`, which the supervisor reads many times a pass, skips it.
+    if (args.length > 1 || (args.length === 1 && args[0] !== "--local")) throw new Error("status takes only --local");
+    const [state, fleet] = await Promise.all([client.call<any>("/state"), args[0] === "--local" ? {} : fleetDesired(config)]);
     console.log(JSON.stringify({ ...state, ...fleet }, null, 2));
   }
 }

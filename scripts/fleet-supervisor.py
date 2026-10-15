@@ -28,6 +28,11 @@ SIX_HOUR_REASON = 'Operation exceeded six hours. No forced stop or second signal
 # handling. They are now waited out like any drain: no second signal is sent.
 UNCERTAIN_SIGNAL_REASONS = ('Drain acknowledgement uncertain. No second signal sent.',
                             'Drain delivery uncertain after supervisor restart. Inspect before retrying.')
+# After an unconfirmed signal, a dispatcher that is gone may have been stopped
+# by hand. Without an explicit run state it is never started automatically.
+EXITED_UNCONFIRMED_REASON = ('The dispatcher exited after a stop signal whose delivery was unconfirmed, so it may have been stopped by hand. '
+                             'Not started automatically: operator.sh start --machine THIS_COMPUTER --project PROJECT starts it on the desired versions, '
+                             'and operator.sh stop keeps it stopped.')
 UNCONFIRMED_NOTE = ('Stop signal delivery is unconfirmed. Waiting for the dispatcher to exit; '
                     'no second signal is sent, and the six-hour limit still applies.')
 # Configurable through the supervisor configuration file.
@@ -181,7 +186,13 @@ class Supervisor:
 
     def recheck_attention(self, project, desired, receipt, state):
         """Only a health latch, a six-hour record or an unconfirmed signal can resolve without a person."""
-        quiet = health_latched(state) or state.get('reason') in (SIX_HOUR_REASON, *UNCERTAIN_SIGNAL_REASONS)
+        quiet = health_latched(state) or state.get('reason') in (SIX_HOUR_REASON, EXITED_UNCONFIRMED_REASON, *UNCERTAIN_SIGNAL_REASONS)
+        if state.get('reason') == EXITED_UNCONFIRMED_REASON and self.desired_run(project) == 'running':
+            # The operator's start answers the question: continue to update and start.
+            resumed = {k: v for k, v in state.items() if k not in {'reason', 'attentionFrom'}}
+            resumed.update(phase='draining', timerFrom=self.clock())
+            atomic(receipt, resumed)
+            return resumed
         if quiet and self.desired_run(project) == 'stopped':
             # The operator wants this board stopped. Once it is, nothing will
             # be signalled or restarted, so the record has nothing left to guard.
@@ -441,9 +452,15 @@ class Supervisor:
         """Start a stopped board the operator wants running, on the desired versions."""
         if not observed.get('childrenStopped'):
             return {'phase': 'stopped', 'project': project, 'reason': 'Waiting for the previous dispatcher\'s processes to exit before starting.'}
+        before = self.adapter.status()
+        if before.get('draining'):
+            # A bare in-memory drain makes dispatchers exit; one started now would exit again.
+            return {'phase': 'stopped', 'project': project, 'reason': 'Not starting: this computer\'s manager holds an in-memory drain, which makes dispatchers exit.'}
+        if any(r['project'] == project and r['machine'] == before['machine'] and not r.get('supportTaskId') for r in before['runs']):
+            # The same check as after an update drain. A new session never adopts these.
+            return {'phase': 'stopped', 'project': project, 'reason': 'Not starting: a worker reservation of an earlier session remains. Check its worker, then free it.'}
         if not self.adapter.preflight(project, desired):
             return {'phase': 'preflight-failed', 'project': project}
-        before = self.adapter.status()
         self.adapter.update(project, desired)
         state = {'phase': 'start-requested', 'project': project, 'desired': desired, 'intent': 'start', 'created': self.clock(),
                  'claims': real_claims(before), 'policy': policy(before)}
@@ -568,18 +585,20 @@ class Supervisor:
                     # operation; new revisions wait for its verified completion.
                     desired = state['desired']
             if state['phase'] == 'draining':
-                if state.get('signalUncertain'):
-                    self.notices[project].append(UNCONFIRMED_NOTE)
-                if state.get('intent') == 'stop' or run == 'stopped':
-                    self.notices[project].append('Stopping as desired once its running jobs finish.')
-                if helpers_active(project): return state
+                def waiting():
+                    if state.get('signalUncertain'):
+                        self.notices[project].append(UNCONFIRMED_NOTE)
+                    if state.get('intent') == 'stop' or run == 'stopped':
+                        self.notices[project].append('Stopping as desired once its running jobs finish.')
+                    return state
+                if helpers_active(project): return waiting()
                 if not observed.get('stopped'):
                     groups = sorted(set(state.get('childGroups', []) + observed.get('childGroups', [])))
                     if groups != state.get('childGroups', []):
                         state['childGroups'] = groups; atomic(receipt, state)
-                    return state
+                    return waiting()
                 if not observed.get('childrenStopped'):
-                    return state
+                    return waiting()
                 if run == 'unknown':
                     self.notices[project].append('Stopped. Waiting for this computer\'s desired state before starting it again.')
                     return state
@@ -589,6 +608,8 @@ class Supervisor:
                     result = self.install_stopped(project, desired, observed)
                     receipt.unlink(missing_ok=True)
                     return result
+                if state.get('signalUncertain') and run != 'running':
+                    raise RuntimeError(EXITED_UNCONFIRMED_REASON)
                 before = self.adapter.status()
                 if any(r['project'] == project and r['machine'] == before['machine'] and not r.get('supportTaskId') for r in before['runs']):
                     raise RuntimeError('Worker reservation remains. Ownership was preserved.')

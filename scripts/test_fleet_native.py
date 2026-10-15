@@ -169,6 +169,31 @@ class CredentialPollingTests(unittest.TestCase):
         adapter=self.adapter();adapter.config['operatorCommand']=['node','fleet-bin'];adapter.config['operatorConfig']='/configured/operator.json'
         with patch.object(module,'execute',return_value='{}') as execute:
             adapter.status()
-        self.assertEqual(execute.call_args.args[0],['node','fleet-bin','status','/configured/operator.json'])
+        # Local only: the supervisor reads status many times a pass and must not wait on the fleet report.
+        self.assertEqual(execute.call_args.args[0],['node','fleet-bin','status','/configured/operator.json','--local'])
+
+class SignalClassificationTests(unittest.TestCase):
+    """Which stop signal failures are certain non-delivery, so a later pass may signal."""
+    def adapter(self,platform):
+        a=module.NativeAdapter.__new__(module.NativeAdapter)
+        a.config={'platform':platform,'stateDirectory':'/tmp','projects':{'org/core':{'container':'core'}}};return a
+    def test_linux(self):
+        a=self.adapter('linux');identity={'pid':7}
+        a.retain_publish_files=lambda p:None
+        with patch.object(a,'observe',side_effect=RuntimeError('status failed')):
+            with self.assertRaises(module.SignalNotSent):a.drain('org/core',identity)
+        with patch.object(a,'observe',return_value={'identity':{'pid':8}}):
+            with self.assertRaises(module.SignalNotSent):a.drain('org/core',identity)
+        with patch.object(a,'observe',return_value={'identity':identity}),patch.object(module,'execute',side_effect=RuntimeError('Configured workload command failed with exit 1')):
+            with self.assertRaises(module.SignalNotSent):a.drain('org/core',identity)
+        with patch.object(a,'observe',return_value={'identity':identity}),patch.object(module,'execute',side_effect=module.subprocess.TimeoutExpired('podman',90)):
+            with self.assertRaises(module.subprocess.TimeoutExpired):a.drain('org/core',identity)
+    def test_mac(self):
+        a=self.adapter('mac');identity={'pid':7}
+        with patch.object(a,'observe',return_value={'identity':identity}),patch.object(module.os,'kill',side_effect=ProcessLookupError()):
+            with self.assertRaises(module.SignalNotSent):a.drain('org/core',identity)
+        with patch.object(a,'observe',return_value={'identity':identity}),patch.object(module.os,'kill') as kill:
+            a.drain('org/core',identity)
+        kill.assert_called_once()
 
 if __name__=='__main__':unittest.main()

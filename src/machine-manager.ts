@@ -2,7 +2,7 @@ import type {RecoveryTask} from "./recovery-tasks.js";
 import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { listen, readJson, tokenMatches, ownershipRefusal, ServiceError, type FleetClient } from "./fleet-http.js";
-import { effectiveWork, desiredRun, validateDocument, workRefusal, MACHINE_SCOPE, type DesiredDocument, type DesiredPoll, type WorkState } from "./desired-state.js";
+import { effectiveWork, desiredRun, stricter, validateDocument, workRefusal, MACHINE_SCOPE, type DesiredDocument, type DesiredPoll, type WorkState } from "./desired-state.js";
 import { validateStart, validateLimits, type MachineLimits, type FleetRun } from "./fleet-store.js";
 import { scheduleMachine, runnableTickets, codexPaused, codexSpaced, isNewTicket, reviewQueue, effectiveReviewQueueLimit, lackingCapabilities, type WorkOffer } from "./machine-scheduler.js";
 import { validateCapabilityReport } from "./ticket-requirements.js";
@@ -62,8 +62,14 @@ export class MachineManager {
   private desiredError: string | undefined;
   private appliedRevision: number | null = null;
   private applyError: { revision: number; reason: string } | undefined;
-  /** Saved project drains from before central desired state, sent until the claim service has imported them. */
-  private legacyImport: boolean;
+  /**
+   * Saved project drains the central document does not hold yet: all of them
+   * on a manager's first start with desired state, or ones an older manager
+   * wrote after a rollback. Sent until the claim service has answered once.
+   */
+  private pendingImports: Set<string>;
+  /** The same drains, still applied here until a document that holds them is saved. */
+  private localFloor: Set<string>;
   private refreshing: Promise<void> | undefined;
   constructor(readonly config: MachineConfig, readonly claims: ClaimService, private readonly now = Date.now, private readonly desired?: DesiredStateOptions) {
     this.startedAt = now();
@@ -76,7 +82,9 @@ export class MachineManager {
         this.desiredMode = "cached";
       } else this.desiredMode = "unknown";
     }
-    this.legacyImport = !!desired && !desired.cached;
+    const saved = (config.drainingProjects ?? []).filter(p => config.projects.includes(p));
+    this.pendingImports = new Set(desired ? saved.filter(p => !this.desiredDoc || effectiveWork(this.desiredDoc.entries, p) === "taking") : []);
+    this.localFloor = new Set(this.pendingImports);
     validateLimits(config);
     if (config.ticketLimit !== undefined && (!Number.isSafeInteger(config.ticketLimit) || config.ticketLimit < 1)) throw new Error("Invalid ticket limit");
     if (config.reviewQueueLimit !== undefined && (!Number.isSafeInteger(config.reviewQueueLimit) || config.reviewQueueLimit < 0)) throw new Error("Invalid review queue limit");
@@ -110,7 +118,7 @@ export class MachineManager {
     const local: WorkState = this.config.drainingProjects?.includes(project) ? "tickets-drained" : "taking";
     if (!this.desired || this.desiredMode === "unsupported") return local;
     if (this.desiredMode === "unknown" || !this.desiredDoc) return "drained";
-    return effectiveWork(this.desiredDoc.entries, project);
+    return stricter(effectiveWork(this.desiredDoc.entries, project), this.localFloor.has(project) ? "tickets-drained" : undefined);
   }
   /** Local project drain commands apply only without central desired state. */
   localDrainsAllowed(): boolean { return !this.desired || this.desiredMode === "unsupported"; }
@@ -147,7 +155,7 @@ export class MachineManager {
   }
   private poll(): DesiredPoll {
     return { projects: this.config.projects, appliedRevision: this.appliedRevision, ...(this.applyError ? { applyError: this.applyError } : {}),
-      ...(this.legacyImport ? { localDrains: (this.config.drainingProjects ?? []).filter(p => this.config.projects.includes(p)) } : {}) };
+      ...(this.pendingImports.size ? { localDrains: [...this.pendingImports] } : {}) };
   }
   private async refreshOnce(): Promise<void> {
     let doc: DesiredDocument;
@@ -161,7 +169,17 @@ export class MachineManager {
       return;
     }
     this.desiredError = undefined;
-    const changed = this.desiredMode !== "central" || doc.revision !== this.appliedRevision || this.applyError !== undefined;
+    // The claim service has imported them now; sending them again would undo
+    // an operator's later resume. They stay applied until a document is saved.
+    this.pendingImports.clear();
+    if (this.appliedRevision !== null && doc.revision < this.appliedRevision) {
+      // A restored or replaced claims database. Its older document could lift
+      // drains this computer holds, so the saved one stays until the operator
+      // changes anything for this computer, which moves the revision past it.
+      this.applyError = { revision: this.appliedRevision, reason: `Central desired state is at revision ${doc.revision}, behind the applied ${this.appliedRevision}, as after a claims database restore. Keeping the saved state until an operator change for this computer.` };
+      return;
+    }
+    const changed = this.desiredMode !== "central" || doc.revision !== this.appliedRevision || this.applyError !== undefined || this.localFloor.size > 0;
     if (!changed) { this.desiredFetchedAt = this.now(); return; }
     const before = this.reportedDraining();
     const draining = this.config.projects.filter(p => effectiveWork(doc.entries, p) !== "taking");
@@ -182,7 +200,7 @@ export class MachineManager {
     this.desiredFetchedAt = at;
     this.config.drainingProjects = draining;
     this.config.projectDrainChanges = changes;
-    this.legacyImport = false;
+    this.localFloor.clear();
     // A start already sent to the claim service can still commit. Wait for
     // it before acknowledging; later admissions use the new state.
     try { await this.tickPromise; } catch { /* a lost reply remains reserved */ }

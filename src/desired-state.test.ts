@@ -194,7 +194,7 @@ test("existing saved project drains are imported, not lost, and a central resume
   await restarted.refreshDesired();
   assert.equal(restarted.work(mobile), "taking");
   assert.deepEqual(file.read().drainingProjects, []);
-  // The supervisor sees both changes as recorded central ones.
+  // The supervisor sees the resume as a recorded central change. The import changed nothing it reports.
   assert.deepEqual(file.read().projectDrainChanges.filter((c: any) => c.source === "central").map((c: any) => [c.project, c.draining]), [[mobile, false]]);
 });
 
@@ -352,4 +352,69 @@ test("the documented schema matches what the claim service creates, so a rollout
   t.after(() => store.close());
   assert.equal(store.desired.work("hp", core), "drained");
   assert.deepEqual(store.start({ ...offer(core, "1"), id: "x", machine: "hp", session: "s" }), { ok: false, reason: "drained" });
+});
+
+test("a drain an older manager saved after a rollback is imported on roll-forward, and holds meanwhile", async t => {
+  const store = new FleetStore(":memory:", limits); t.after(() => store.close());
+  const file = configFile(); t.after(file.cleanup);
+  let up = true;
+  await managerFrom(file.path, client(store, "hp", () => up)).refreshDesired();
+  // Rolled back: the older manager's drain-project writes drainingProjects and leaves desiredState in place.
+  writeFileSync(file.path, JSON.stringify({ ...file.read(), drainingProjects: [mobile] }));
+  up = false;
+  const manager = managerFrom(file.path, client(store, "hp", () => up));
+  await manager.refreshDesired();
+  assert.equal(manager.desiredStatus()?.mode, "cached");
+  assert.equal(manager.work(mobile), "tickets-drained");
+  up = true;
+  await manager.refreshDesired();
+  assert.equal(store.desired.work("hp", mobile), "tickets-drained");
+  assert.equal(manager.work(mobile), "tickets-drained");
+  assert.deepEqual(file.read().drainingProjects, [mobile]);
+});
+
+test("a saved import is not sent again after a failed save, so a later resume holds", async t => {
+  const store = new FleetStore(":memory:", limits); t.after(() => store.close());
+  const file = configFile({ drainingProjects: [mobile] }); t.after(file.cleanup);
+  let failSave = true;
+  const manager = managerFrom(file.path, client(store, "hp"), u => { if (failSave) throw new Error("disk full"); persistDesiredState(file.path, u); });
+  await manager.refreshDesired();
+  assert.equal(store.desired.work("hp", mobile), "tickets-drained");
+  // Not saved: still nothing granted, since no document is known.
+  assert.equal(manager.desiredKnown(), false);
+  store.setDesired({ machines: ["hp"], project: mobile, change: { work: "taking" } });
+  failSave = false;
+  await manager.refreshDesired();
+  assert.equal(store.desired.work("hp", mobile), "taking");
+  assert.equal(manager.work(mobile), "taking");
+});
+
+test("a claims database that goes back in revision cannot lift a saved drain until the operator acts", async t => {
+  let store = new FleetStore(":memory:", limits);
+  const file = configFile(); t.after(file.cleanup);
+  const claims = () => client(store, "hp");
+  let manager = managerFrom(file.path, claims());
+  await manager.refreshDesired();
+  store.setDesired({ machines: ["hp"], change: { work: "drained" } });
+  store.setDesired({ machines: ["hp"], change: { work: "tickets-drained" } });
+  store.setDesired({ machines: ["hp"], change: { work: "drained" } });
+  await manager.refreshDesired();
+  const applied = manager.desiredStatus()!.appliedRevision!;
+  assert.ok(applied >= 3);
+  // Replaced by an empty database.
+  store.close();
+  store = new FleetStore(":memory:", limits);
+  t.after(() => store.close());
+  manager = managerFrom(file.path, claims());
+  await manager.refreshDesired();
+  assert.equal(manager.work(core), "drained");
+  assert.match(String(manager.desiredStatus()?.applyError?.reason), /behind the applied/);
+  await manager.refreshDesired();
+  const hp = store.desired.report(store.operations.list()).find(m => m.machine === "hp")!;
+  assert.equal(hp.manager?.appliedRevision, applied);
+  // Any operator change for this computer moves past it, and then applies.
+  store.setDesired({ machines: ["hp"], change: { work: "taking" } });
+  assert.ok(store.desired.document("hp").revision > applied);
+  await manager.refreshDesired();
+  assert.equal(manager.work(core), "taking");
 });

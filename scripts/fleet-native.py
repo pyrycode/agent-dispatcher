@@ -89,7 +89,8 @@ class NativeAdapter:
     def operator(self, command):
         return json.loads(execute(self.operator_command(command)))
 
-    def status(self): return self.operator('status')
+    # Local only: this is read many times a pass, and must not wait on the claim service's fleet report.
+    def status(self): return json.loads(execute(self.operator_command('status', '--local')))
     def attention(self): return self.operator('attention')
     def publish_attention(self): execute(self.operator_command('report-attention', self.config['reportFile']))
 

@@ -138,10 +138,10 @@ class Tests(unittest.TestCase):
         self.assertTrue(json.loads(self.receipt().read_text())['signalUncertain'])
         self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'draining')
         self.assertEqual(self.adapter.calls,['drain'])
-        # Once it exits, the operation finishes as if the signal had been acknowledged.
+        # Once it exits it is not started without an explicit run state: it may have been stopped by hand.
         self.adapter.current.update(stopped=True,childrenStopped=True)
-        self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'complete')
-        self.assertEqual(self.adapter.calls,['drain','update','start'])
+        self.assertEqual(self.worker.tick(PROJECT,'new')['reason'],module.EXITED_UNCONFIRMED_REASON)
+        self.assertEqual(self.adapter.calls,['drain'])
     def test_uncertain_start_is_never_repeated(self):
         self.worker.tick(PROJECT,'new')
         state=json.loads(self.receipt().read_text());state['phase']='start-requested';module.atomic(self.receipt(),state)
@@ -818,8 +818,9 @@ class DesiredRunTests(unittest.TestCase):
         self.assertIn('unconfirmed',result['reason'])
         self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'draining')
         self.stop_board()
-        self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'complete')
-        self.assertEqual(self.adapter.calls,['drain','update','start'])
+        # It may have been stopped by hand, so without a run state it is not started.
+        self.assertEqual(self.worker.tick(PROJECT,NEW)['reason'],module.EXITED_UNCONFIRMED_REASON)
+        self.assertEqual(self.adapter.calls,['drain'])
 
     def test_older_uncertain_drain_records_become_a_wait(self):
         module.atomic(self.receipt(),{'phase':'attention','reason':'Drain acknowledgement uncertain. No second signal sent.','project':PROJECT,'desired':NEW,
@@ -854,5 +855,43 @@ class DesiredRunTests(unittest.TestCase):
         self.adapter.state['drainingProjects']=['other/repo',PROJECT]
         self.stop_board()
         self.assertEqual(self.worker.tick(PROJECT,NEW)['reason'],'Operator drain policy changed during operation.')
+
+class ReviewOneTests(unittest.TestCase):
+    setUp=DesiredRunTests.setUp;receipt=DesiredRunTests.receipt;stop_board=DesiredRunTests.stop_board
+    def uncertain_record(self):
+        module.atomic(self.receipt(),{'phase':'attention','reason':'Drain acknowledgement uncertain. No second signal sent.','project':PROJECT,'desired':NEW,
+            'identity':{'pid':20,'start':'birth'},'childGroups':[],'created':1000,'claims':{},'policy':['mac',False,['other/repo']]})
+
+    def test_an_older_uncertain_record_never_starts_a_dispatcher_that_is_already_stopped(self):
+        # Reviewer: a dispatcher stopped by hand during the inspection must not be restarted by a rollout.
+        self.uncertain_record();self.stop_board()
+        for _ in range(3):
+            result=self.worker.tick(PROJECT,NEW)
+            self.assertEqual(result['phase'],'attention')
+            self.assertEqual(result['reason'],module.EXITED_UNCONFIRMED_REASON)
+        self.assertEqual(self.adapter.calls,[])
+        # The operator's start answers it.
+        self.adapter.set_run('running')
+        self.worker.tick(PROJECT,NEW)
+        self.assertEqual(self.adapter.calls,['update','start'])
+
+    def test_an_unconfirmed_signal_with_an_explicit_stop_keeps_it_stopped(self):
+        self.uncertain_record();self.adapter.set_run('stopped');self.stop_board()
+        self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'stopped')
+        self.assertNotIn('start',self.adapter.calls)
+
+    def test_no_start_while_a_bare_in_memory_drain_holds_the_manager(self):
+        self.adapter.state['draining']=True
+        self.adapter.set_run('running');self.stop_board()
+        result=self.worker.tick(PROJECT,NEW)
+        self.assertEqual(result['phase'],'stopped')
+        self.assertIn('in-memory drain',result['reason'])
+        self.assertEqual(self.adapter.calls,[])
+
+    def test_no_start_over_a_reservation_of_an_earlier_session(self):
+        self.adapter.state['runs']=[{'project':PROJECT,'machine':'mac','id':'old'}]
+        self.adapter.set_run('running');self.stop_board()
+        self.assertIn('reservation',self.worker.tick(PROJECT,NEW)['reason'])
+        self.assertEqual(self.adapter.calls,[])
 
 if __name__=='__main__':unittest.main()
