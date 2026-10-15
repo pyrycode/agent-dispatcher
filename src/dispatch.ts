@@ -2379,10 +2379,11 @@ function unstagePaths(cwd: string, deps: Pick<DispatchDeps, "execSync" | "spawnS
     cwd, encoding: "utf-8", stdio: "pipe", timeout: 15_000,
   }));
   // Only staged entries: an untouched pathspec would make git restore fail.
-  // A rename pairs a deleted and an added path; either side may be excluded.
+  // A rename pairs a deleted and an added path. Only its excluded side is
+  // taken out; the other stays staged as a plain deletion or addition.
   const staged = [...new Set(statusEntries(status)
-    .filter(e => ![" ", "?"].includes(e.status[0]!) && (paths.has(e.path) || (e.from !== undefined && paths.has(e.from))))
-    .flatMap(e => [e.path, ...(e.from !== undefined ? [e.from] : [])]))];
+    .filter(e => ![" ", "?"].includes(e.status[0]!))
+    .flatMap(e => [e.path, e.from].filter((p): p is string => p !== undefined && paths.has(p))))];
   if (!staged.length) return;
   const result = deps.spawnSync("git", ["restore", "--staged", "--", ...staged.map(path => `:(literal)${path}`)], { cwd, stdio: "pipe", timeout: 15_000 });
   if (result.status !== 0) throw new Error(`Could not keep gate-written fixtures out of the commit: ${result.stderr?.toString() || "git restore failed"}`);
@@ -6450,7 +6451,7 @@ export async function maybeRunPreSpawnGates(
  */
 async function guardGateTestdata(ctx: DispatchContext, before: TestdataSnapshot): Promise<void> {
   let changed: string[];
-  try { changed = changedTestdata(before, snapshotTestdata(ctx.agentCwd, ctx.deps.spawnSync)); }
+  try { changed = changedTestdata(before, snapshotTestdata(ctx.agentCwd, ctx.deps.spawnSync, false)); }
   catch (e: any) {
     console.warn(`   ⚠️  Could not read testdata/ after the gates: ${e?.message ?? e}`);
     return;
@@ -7238,6 +7239,13 @@ export function buildGateSpawnEnv(parentEnv: NodeJS.ProcessEnv, opts: { codexCap
 }
 
 export { CODEX_CAPTURE_ENV };
+
+/** The environment without the Codex test login (CODEX_CAPTURE_ENV). */
+function withoutCodexCapture(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const out = { ...env };
+  for (const name of CODEX_CAPTURE_ENV) delete out[name];
+  return out;
+}
 
 /**
  * The live gate's environment: `buildGateSpawnEnv` plus the Codex test login,
@@ -10520,7 +10528,7 @@ export async function pollLoop(): Promise<void> {
                   model: runner === "codex" ? process.env.PYRY_CODEX_MODEL ?? "gpt-6.1-sol" : "sonnet",
                   effort: RECOVERY_EFFORT, maxTurns: RECOVERY_MAX_TURNS, timeoutMs: RECOVERY_TIMEOUT_MS,
                   allowedTools: "Read,Glob,Grep", disallowedTools: "Bash,Write,Edit,Agent",
-                  env: { ...scrubSpawnEnv(process.env),...managedTaskEnv(), CLAUDE_CODE_ENTRYPOINT: "recovery" } });
+                  env: { ...withoutCodexCapture(scrubSpawnEnv(process.env)),...managedTaskEnv(), CLAUDE_CODE_ENTRYPOINT: "recovery" } });
                 if (result.codexRateLimited) throw new CodexRateLimitError("Codex rate limit (429) before the assessment could run");
                 if (result.isError || result.timedOut || result.hadPermissionDenial) throw new Error("Recovery assessment failed");
                 return parseRecoveryDecision(result.output);

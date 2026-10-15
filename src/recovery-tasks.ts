@@ -3,7 +3,7 @@ import {parseGateOutput} from './gate-output.js';
 import type {DatabaseSync} from 'node:sqlite';
 import {scrubCredentials} from './agent-runtime.js';
 import {validateRepairPublication} from './recovery-source-publication.js';
-import {currentWorkflow,dispatcherRepairCap,withdrawCappedRepairs} from './recovery-repair-cap.js';
+import {currentWorkflow,dispatcherRepairCap,withdrawCappedRepairs,REPAIR_WITHDRAWN_SUMMARY} from './recovery-repair-cap.js';
 import {ARTIFACT_LIMITS,artifactManifest,manifestHash,sha256,validateArtifactPath,validateManifest,type ArtifactManifest} from './recovery-artifacts.js';
 
 export const CAPABILITIES = ['linux-amd64','macos-arm64','android-emulator','dispatcher-repair','desktop-fake-suite'] as const;
@@ -173,7 +173,11 @@ export class RecoveryTasks {
   if(incident && (/Explicit operator hold|Denied permission|Pause origin unknown/.test(String(incident.reason))
     || incident.state==='escalated' && incident.decision && JSON.parse(String(incident.decision)).category==='human')) return false;
   // A repair queued before the cap was reached does not start either (recovery-repair-cap.ts).
-  if(task.state==='queued' && task.request.recipe==='dispatcher-repair' && dispatcherRepairCap(this.db,task.ticket,currentWorkflow(this.db,task.ticket),this.now()).capped) return false;
+  // A repair an operator requests after the cap was reached may run: the cap stops automatic repairs, not a person.
+  if(task.state==='queued' && task.request.recipe==='dispatcher-repair') {
+   const cap=dispatcherRepairCap(this.db,task.ticket,currentWorkflow(this.db,task.ticket),this.now());
+   if(cap.capped && task.created<=Math.max(...cap.attempts.map(a=>a.ended))) return false;
+  }
   return task.state==='queued' && !!host?.ready && this.now()-host.updated<CAPABILITY_FRESH_MS && host.capabilities.includes(task.request.capability);
  }
  begin(id:string,machine:string,session:string,runId:string):void {
@@ -303,7 +307,8 @@ export class RecoveryTasks {
    .run(JSON.stringify({action:'escalate',category:'human',reason:scrubCredentials(reason)}),this.now(),task.ticket);
  }
  revision(ticket:string):string|undefined {
-  const terminal=this.list(ticket).filter(t=>t.result && ['complete','failed'].includes(t.state));
+  // A repair withdrawn at the cap never ran: it is not new evidence for an assessment.
+  const terminal=this.list(ticket).filter(t=>t.result && ['complete','failed'].includes(t.state) && t.result.summary!==REPAIR_WITHDRAWN_SUMMARY);
   return terminal.length?createHash('sha256').update(JSON.stringify(terminal.map(t=>[t.id,t.state,t.result,...(t.artifacts?[manifestHash(t.artifacts)]:[])]))).digest('hex'):undefined;
  }
 }

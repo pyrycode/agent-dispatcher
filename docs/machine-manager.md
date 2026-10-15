@@ -718,7 +718,10 @@ Repair-budget exhaustion records its next available time and rechecks then.
 **Dispatcher repair cap.** After two failed dispatcher repairs for one ticket,
 an assessment's next `coordinate` with recipe `dispatcher-repair` becomes a
 `human` escalation and no task is created. A repair worker's direct request for
-a new one is refused the same way, and a repair already queued does not start.
+a new one is refused the same way, and repairs already queued are withdrawn
+(ended with a `Withdrawn before it started` summary that is not counted) or, when
+queued before this rule existed, held. A repair an operator requests through
+`recovery-task operator-request` after the cap still starts.
 Two failures count when they ended within 24 hours, or when both were ordered
 under the ticket's current workflow fingerprint (stage, recovery labels and
 blockers, without the evidence and task results every attempt changes). Failed

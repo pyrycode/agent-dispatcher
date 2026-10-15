@@ -169,3 +169,28 @@ test("a repair queued before this version, on a ticket already at the cap, does 
   assert.equal(tasks.available("linux", other.id), true, "another ticket is unaffected");
   db.close();
 });
+
+test("a person can still order a repair after the cap, and a withdrawn repair is not new evidence", () => {
+  const db = new DatabaseSync(":memory:"); let now = 1_000_000_000;
+  new RecoveryLedger(db, () => now);
+  const tasks = new RecoveryTasks(db, () => now);
+  tasks.report("linux", { capabilities: ["dispatcher-repair"], ready: true });
+  const queuedBehind = tasks.request(ticket, repair(9), "queued-behind");
+  for (const [n, summary] of [[1, CHECKS], [2, REVIEW]] as const) {
+    now += 60_000;
+    const t = tasks.request(ticket, repair(n), `ctx-${n}`);
+    db.prepare("UPDATE fleet_recovery_tasks SET state='running',machine='linux',session='s',run_id='r' WHERE id=?").run(t.id);
+    tasks.complete(t.id, "linux", "s", { outcome: "failed", summary, files: {} });
+  }
+  assert.equal(tasks.get(queuedBehind.id).state, "failed", "withdrawn at the cap");
+  const revision = tasks.revision(ticket);
+  db.prepare("UPDATE fleet_recovery_tasks SET state='queued' WHERE id=?").run(queuedBehind.id);
+  assert.equal(tasks.revision(ticket), revision, "the withdrawn task does not move the evidence revision");
+  db.prepare("UPDATE fleet_recovery_tasks SET state='failed' WHERE id=?").run(queuedBehind.id);
+  now += 60_000;
+  tasks.report("linux", { capabilities: ["dispatcher-repair"], ready: true });
+  const operator = tasks.request(ticket, repair(3), "");
+  assert.equal(dispatcherRepairCap(db, ticket, null, now).capped, true);
+  assert.equal(tasks.available("linux", operator.id), true, "an operator's later request may start");
+  db.close();
+});

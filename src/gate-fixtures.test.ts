@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, statSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { changedTestdata, gateTestdataComment, isTestdataPath, restoreGateTestdata, snapshotTestdata } from "./gate-fixtures.js";
@@ -116,4 +116,28 @@ test("a fixture deleted and re-added under a near name, staged as a rename, stay
   assert.match(staged, /^R/m);
   assert.equal(shouldAutoCommit(staged.replace(/notes\.md/, "x"), new Set([from, to, "x"])), false);
   assert.equal(shouldAutoCommit(staged, new Set([to])), true, "the deletion side is still work");
+});
+
+test("a dirty fixture the gate reset to HEAD gets its earlier bytes and mode back", () => {
+  const dir = repo();
+  const plain = join(dir, "internal/codexsup/testdata/capture/plain.jsonl");
+  writeFileSync(plain, "earlier edit\n"); chmodSync(plain, 0o755);
+  const before = snapshotTestdata(dir, spawnSync);
+  execSync("git checkout -- internal/codexsup/testdata/capture/plain.jsonl", { cwd: dir });
+  const changed = changedTestdata(before, snapshotTestdata(dir, spawnSync, false));
+  assert.deepEqual(changed, ["internal/codexsup/testdata/capture/plain.jsonl"], "clean now, dirty before: still the gate's change");
+  assert.deepEqual(restoreGateTestdata(dir, before, changed, spawnSync).restored, changed);
+  assert.equal(readFileSync(plain, "utf8"), "earlier edit\n");
+  assert.equal(statSync(plain).mode & 0o777, 0o755);
+});
+
+test("only the excluded side of a rename is unstaged; the agent's own side stays", () => {
+  const dir = repo();
+  const gone = "internal/codexsup/testdata/capture/plain.jsonl", added = "internal/codexsup/testdata/capture/agent.jsonl";
+  const body = "a long enough fixture body for git to pair the two paths as a rename\n".repeat(20);
+  writeFileSync(join(dir, gone), body);
+  execSync("git commit -qam body", { cwd: dir });
+  rmSync(join(dir, gone)); writeFileSync(join(dir, added), body);
+  stageAutomaticChanges(dir, { execSync, spawnSync } as any, new Set([gone]));
+  assert.deepEqual(execSync("git diff --cached --name-status", { cwd: dir }).toString().trim().split("\n"), [`A\t${added}`]);
 });
