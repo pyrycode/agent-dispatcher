@@ -6,6 +6,13 @@
   "reportFile": "/Users/operator/.local/share/pyry-fleet/attention.json",
   "intervalSeconds": 300,
   "projects": {
+    "pyrycode/pyrycode-desktop": {
+      "agents": "/Users/operator/Workspace/Projects/pyrycode-desktop-agents",
+      "target": "/Users/operator/Workspace/Projects/pyrycode-desktop",
+      "fakeTestLauncher": "/Users/operator/.codex/bin/pyrycode-desktop-test",
+      "access": "/Users/operator/.local/bin/automation-access",
+      "runner": "codex"
+    },
     "pyrycode/pyrycode-mobile": {
       "agents": "/Users/operator/Workspace/Projects/pyrycode-mobile-agents",
       "target": "/Users/operator/Workspace/Projects/pyrycode-mobile",

@@ -6,6 +6,7 @@ import json
 import os
 import platform
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -14,7 +15,8 @@ import uuid
 from pathlib import Path
 from contextlib import contextmanager
 
-RECIPES={'platform-probe','memory-runtime-smoke','android-tool-then-text','dispatcher-repair'}
+RECIPES={'platform-probe','memory-runtime-smoke','android-tool-then-text','dispatcher-repair','desktop-fake-suite'}
+DESKTOP_PROJECT='pyrycode/pyrycode-desktop'
 # Deterministic local failures of retained artifacts. Anything else is retried next pass.
 UNRECOVERABLE_ARTIFACTS=('Capture returned no unique private recovery directory','Capture artifact escapes its private directory',
     'Capture artifacts exceed total bounds','Retained task receipt mismatch','Invalid artifact path','Task artifacts exceed total bounds')
@@ -268,12 +270,160 @@ def clone(source,destination,revision=None):
         git('-C',str(destination),'switch','main')
 
 
+def collect_desktop_report(payload,evidence,attachments,worktree,directory):
+    """Match gate-output.ts aggregate/attempt contract, retaining readable rejected records."""
+    terminal=('passed','failed','timedOut','skipped','interrupted')
+    errors=evidence['errors'];counts=evidence['counts']
+    def reject(message):errors.append(message)
+    def rows(record,key):
+        value=record.get(key,[])
+        if not isinstance(value,list):
+            reject('Desktop report has malformed '+key);return []
+        return value
+    if not isinstance(payload,dict):
+        reject('Desktop report is not an object');return
+    evidence['configuration']=payload.get('config')
+    if not isinstance(evidence['configuration'],dict):reject('Desktop report has no configuration')
+    if 'suites' not in payload:reject('Desktop report has no suites')
+    for error in rows(payload,'errors'):
+        reject(error if isinstance(error,dict) else 'Desktop report has malformed global error')
+    def visit(suite,titles=()):
+        if not isinstance(suite,dict):
+            reject('Desktop report has malformed suite');return
+        title=suite.get('title','')
+        if not isinstance(title,str):reject('Desktop suite has malformed title');title=''
+        if 'specs' not in suite and 'suites' not in suite:reject('Desktop suite has no children')
+        parents=(*titles,title)
+        for spec in rows(suite,'specs'):
+            if not isinstance(spec,dict):
+                reject('Desktop report has malformed spec');continue
+            title=spec.get('title')
+            if not isinstance(title,str) or not title.strip():reject('Desktop spec has no title');title='(unnamed)'
+            tests=rows(spec,'tests')
+            if not tests:reject('Desktop spec has no tests')
+            for test in tests:
+                if not isinstance(test,dict):
+                    reject('Desktop report has malformed test');continue
+                status=test.get('status');attempts=rows(test,'results')
+                # Count readable aggregate outcomes even when child evidence is
+                # rejected. A skipped aggregate can legitimately have no attempts.
+                if status=='skipped':counts['skipped']+=1
+                elif status in ('expected','flaky','unexpected'):
+                    counts['executed']+=1;counts['failed' if status=='unexpected' else 'passed']+=1
+                counts['retries']+=max(0,len(attempts)-1)
+                expected=test.get('expectedStatus','passed')
+                last=attempts[-1].get('status') if attempts and isinstance(attempts[-1],dict) else None
+                valid=(status in ('expected','flaky','unexpected','skipped') and isinstance(test.get('results'),list)
+                       and all(isinstance(a,dict) and a.get('status') in terminal for a in attempts)
+                       and expected in terminal)
+                if status=='skipped':valid=valid and (not attempts or last=='skipped')
+                else:valid=valid and last is not None and last!='skipped' and (last!=expected if status=='unexpected' else last==expected)
+                if not valid:reject('Desktop test has malformed or inconsistent results')
+                annotations=test.get('annotations',[])
+                row={'name':' › '.join(p for p in (*parents,title) if p),'project':test.get('projectName'),
+                     'status':status,'expectedStatus':test.get('expectedStatus'),
+                     'skipReasons':[a.get('description','unspecified') for a in annotations
+                                    if isinstance(a,dict) and a.get('type') in ('skip','fixme')] if isinstance(annotations,list) else [],
+                     'attempts':[]}
+                if status=='skipped' and not row['skipReasons']:row['skipReasons']=['No skip reason reported']
+                evidence['tests'].append(row)
+                # Validation must not stop attachment recovery in this attempt,
+                # later tests/projects, or later nested suites.
+                for attempt in attempts:
+                    if not isinstance(attempt,dict):continue
+                    item={'status':attempt.get('status'),'retry':attempt.get('retry',0),'attachments':[]}
+                    row['attempts'].append(item)
+                    for attachment in rows(attempt,'attachments'):
+                        if not isinstance(attachment,dict):reject('Desktop attempt has malformed attachment');continue
+                        name=attachment.get('name')
+                        if not isinstance(name,str) or not name.startswith('fake-daemon-setup'):continue
+                        try:
+                            if 'body' in attachment:data=base64.b64decode(attachment['body'],validate=True).decode('utf-8')
+                            else:
+                                path=Path(attachment['path'])
+                                if not path.is_absolute():path=worktree/path
+                                path=path.resolve(strict=True)
+                                if directory.resolve() not in path.parents:raise RuntimeError('Desktop setup attachment escapes private capture directory')
+                                if path.stat().st_size>ARTIFACT_BYTES:raise RuntimeError('Desktop setup attachment exceeds artifact bounds')
+                                data=path.read_bytes().decode('utf-8')
+                            ordinal=len(attachments)
+                            attachments.append({'name':name,'test':row['name'],'project':row['project'],'retry':item['retry'],'body':data})
+                            item['attachments'].append({'name':name,'file':'desktop/fake-daemon-setup.json','index':ordinal})
+                        except (OSError,ValueError,KeyError,TypeError,RuntimeError) as error:reject(str(error))
+        for child in rows(suite,'suites'):visit(child,parents)
+    for suite in rows(payload,'suites'):visit(suite)
+
+
+def desktop_capture(task,paths,directory):
+    """The checked Mac launcher accepts Desktop linked worktrees, never Core clones."""
+    files={};attachments=[];log=directory/'execution.log';report=directory/'playwright.json';listing=directory/'playwright.list.log'
+    worktree=directory/'desktop';revision=task['request']['revision']
+    evidence={'revision':revision,'repository':DESKTOP_PROJECT,'config':'playwright.config.ts','configuration':None,
+              'counts':{'executed':0,'passed':0,'failed':0,'skipped':0,'retries':0},'tests':[],'errors':[]}
+    code=1
+    try:
+        if task['ticket'].split('#')[0]!=DESKTOP_PROJECT or not re.fullmatch('[a-f0-9]{40}',revision):
+            raise RuntimeError('Desktop capture requires its own ticket and exact pushed revision')
+        if worktree.exists() or report.exists() or listing.exists():raise RuntimeError('Desktop capture requires fresh evidence and checkout paths')
+        def run(argv,cwd=directory,output=log,timeout=300):
+            # Fake transport has no account login. Preserve only launch/runtime
+            # settings, including the configured concurrency and CI retries.
+            env={k:v for k,v in os.environ.items() if k in {'HOME','USER','LOGNAME','LANG','LC_ALL','LC_CTYPE','TMPDIR','SHELL','PATH','CI','PW_WORKERS'}}
+            return execute(argv,cwd,output,env,timeout=timeout)
+        # Fetch even if the commit exists locally: an unpushed candidate cannot
+        # qualify. The configured Desktop remote supplies it, not the Core remote.
+        # --refetch disables the local-object shortcut: ordinary fetch can
+        # succeed for an unpushed object already present in this repository.
+        for argv in (['git','-C',paths['desktop'],'fetch','--refetch','origin',revision],
+                     ['git','-C',paths['desktop'],'worktree','add','--detach',str(worktree),revision]):
+            if run(argv)!=0:raise RuntimeError('Desktop checkout setup failed; inspect execution.log')
+        config=worktree/'playwright.config.ts';original=config.read_bytes().decode('utf-8')
+        files['desktop/playwright.config.ts']=original
+        evidence['configSha256']=hashlib.sha256(original.encode()).hexdigest()
+        # The narrow launcher fixes the config filename and accepts no reporter
+        # flags. Preserve its original settings by importing an exact copy beside
+        # it, overriding only reporting. No selection, workers or retries change.
+        saved=worktree/'playwright.fleet-original.config.ts'
+        if saved.exists():raise RuntimeError('Desktop reporter config path already exists')
+        saved.write_bytes(original.encode())
+        config.write_text("import config from './playwright.fleet-original.config'\nexport default { ...config, reporter: [['list'], ['json', { outputFile: "+json.dumps(str(report))+" }]] }\n")
+        for argv,timeout in ((['npm','ci'],600),(['npm','run','build'],600)):
+            if run(argv,worktree,timeout=timeout)!=0:raise RuntimeError('Desktop install/build failed; inspect execution.log')
+        # Use the same custody journal for every subprocess. The list reporter
+        # writes into execution.log; retain its exact segment separately below.
+        offset=log.stat().st_size if log.exists() else 0
+        code=run([paths['desktopLauncher'],str(worktree)],worktree,timeout=3600)
+        listing.write_bytes(log.read_bytes()[offset:] if log.exists() else b'')
+        if not report.is_file():raise RuntimeError('Desktop capture has no JSON test evidence; inspect launcher output')
+        files['desktop/playwright.json']=report.read_bytes().decode('utf-8')
+        payload=json.loads(files['desktop/playwright.json'])
+        collect_desktop_report(payload,evidence,attachments,worktree,directory)
+        counts=evidence['counts']
+        if counts['executed']==0:raise RuntimeError('Desktop capture executed zero tests')
+        if counts['failed'] or evidence['errors']:code=1
+    except (OSError,ValueError,KeyError,TypeError,RuntimeError) as error:
+        code=1;evidence['errors'].append(str(error))
+    # Even a rejected launcher or install failure returns fresh diagnostic
+    # records. Missing evidence never becomes a passing native task.
+    for name,path in [('execution.log',log),('playwright.list.log',listing),('playwright.json',report)]:
+        if path.is_file():files['desktop/'+name]=path.read_bytes().decode('utf-8')
+    files['desktop/capture.json']=json.dumps(evidence)
+    # Hundreds of tests can each launch several paired daemons. A lossless
+    # indexed bundle retains every attachment inside the ordinary file limit.
+    files['desktop/fake-daemon-setup.json']=json.dumps(attachments)
+    artifact_manifest(files)
+    counts=evidence['counts']
+    return {'outcome':'completed' if code==0 else 'failed','candidateRevision':revision,
+            'summary':'Desktop fake suite: '+json.dumps(counts)+'. '+('Inspect the full capture before acceptance.' if code==0 else 'Capture failed; inspect returned diagnostics.'),'files':files}
+
+
 def native_recipe(task,paths,directory):
     request=task['request'];recipe=request['recipe'];files={};log=directory/'execution.log'
     if recipe not in RECIPES:raise RuntimeError('Unknown fixed recipe')
     if recipe=='platform-probe':
         details={'platform':platform.system(),'architecture':platform.machine(),'candidate_tests_executed':False}
         return {'outcome':'completed','summary':'Managed native execution route is available. This probe is not candidate test evidence.','files':{'platform.json':json.dumps(details)}}
+    if recipe=='desktop-fake-suite':return desktop_capture(task,paths,directory)
     if recipe=='dispatcher-repair':
         code=execute([paths['node'], '--import', paths['tsx'], paths['repairProgram'],str(directory/'task.json')],directory,log,timeout=5400)
         record=directory/'repair-result.json'
@@ -331,6 +481,17 @@ PUBLICATION_ATTENTION_FAILURES=6
 
 def route_available(route):
     capability=route['capability']
+    if capability=='desktop-fake-suite':
+        if sys.platform!='darwin' or route.get('container'):return False
+        paths=route.get('paths',{});repo=Path(paths.get('desktop',''));launcher=Path(paths.get('desktopLauncher',''))
+        if not repo.is_absolute() or not launcher.is_absolute() or not launcher.is_file() or not os.access(launcher,os.X_OK):return False
+        if not all((repo/name).exists() for name in ('.git','playwright.config.ts','package-lock.json')):return False
+        if not all(shutil.which(tool) for tool in ('git','node','npm')):return False
+        # A wrong source remote must not advertise a Desktop execution route.
+        try:
+            remote=subprocess.run(['git','-C',str(repo),'config','--get','remote.origin.url'],capture_output=True,text=True,timeout=15,env=clean_env())
+            return remote.returncode==0 and remote.stdout.strip() in {'https://github.com/'+DESKTOP_PROJECT+'.git','https://github.com/'+DESKTOP_PROJECT,'git@github.com:'+DESKTOP_PROJECT+'.git'}
+        except (OSError,subprocess.TimeoutExpired):return False
     required=['go'] if capability in {'linux-amd64','macos-arm64'} else ['go','java','adb'] if capability=='android-emulator' else ['node','pnpm','codex']
     probe="import shutil,sys; sys.exit(0 if all(shutil.which(x) for x in "+repr(required)+") else 1)"
     args=['podman','exec',route['container'],'python3','-c',probe] if route.get('container') else [sys.executable,'-c',probe]
@@ -432,6 +593,11 @@ def service_refusal(error):
 
 class SupportSupervisor:
     def __init__(self,adapter,config):
+        desktop=config.get('projects',{}).get(DESKTOP_PROJECT,{})
+        if config.get('platform')=='mac' and desktop.get('target'):
+            config.setdefault('recoveryTasks',{})['desktop-fake-suite:desktop-fake-suite']={
+                'capability':'desktop-fake-suite','directory':str(Path(config['stateDirectory'])/'desktop-captures'),
+                'paths':{'desktop':desktop['target'],'desktopLauncher':desktop.get('fakeTestLauncher',str(Path.home()/'.codex/bin/pyrycode-desktop-test'))}}
         self.adapter=adapter;self.config=config;self.children={};self.directory=Path(config['stateDirectory'])/'tasks'
         # Optional callable(kind, subject, reason) for automatic state changes.
         self.housekeeping=None
