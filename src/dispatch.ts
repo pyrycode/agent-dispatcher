@@ -3,7 +3,7 @@ import { writeRuntimeReceipt } from "./runtime-receipt.js";
 import { type ChildProcess, execSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import type { FleetRun, FleetSnapshot } from "./fleet-store.js";
-import { readFileSync, realpathSync, lstatSync, readlinkSync, existsSync, writeFileSync, mkdirSync, mkdtempSync, rmdirSync, appendFileSync, readdirSync, createWriteStream, statSync, symlinkSync, unlinkSync, openSync, closeSync } from "node:fs";
+import { rmSync, readFileSync, realpathSync, lstatSync, readlinkSync, existsSync, writeFileSync, mkdirSync, mkdtempSync, rmdirSync, appendFileSync, readdirSync, createWriteStream, statSync, symlinkSync, unlinkSync, openSync, closeSync } from "node:fs";
 import { homedir, hostname, tmpdir } from "node:os";
 import { resolve, dirname, basename } from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -7894,29 +7894,16 @@ export interface GateSpawnOutcome {
  */
 export type GateSpawner = (req: GateSpawnRequest) => Promise<GateSpawnOutcome>;
 
-/**
- * Build the environment the gate command runs in.
- *
- * Two properties this must have, and one it must not.
- *
- * **Keeps `CLAUDE_CODE_OAUTH_TOKEN`.** This is the credential the real-claude
- * fixtures actually look for, and the fork's `.env` supplies it. The 2026-07-22
- * belief that the dispatch environment has no Claude credential was never
- * measured and is false; a full suite ran from this machine on 2026-08-07 at
- * 176 passed, 0 failed.
- *
- * **Leaves `ANTHROPIC_API_KEY` unset**, deleting it if the parent had one.
- * With no metered key present, the run bills against the subscription. Four
- * external-service tests skip as a result. That is the expected consequence
- * of the billing choice, not a defect, and the executed-test floor is set
- * with those skips already accounted for.
- *
- * **Strips the dispatcher's own secrets** via the shared `scrubSpawnEnv`, so
- * a test process cannot reach the GitHub token that drives the board.
- */
+/** Offline gates receive no live login. The explicit live gate retains its test login. */
 export function buildGateSpawnEnv(parentEnv: NodeJS.ProcessEnv, opts: { codexCapture?: boolean } = {}): NodeJS.ProcessEnv {
   const env = scrubSpawnEnv(parentEnv);
   delete env.ANTHROPIC_API_KEY;
+  delete env.GH_TOKEN;
+  delete env.PYRY_OFFLINE_GATE;
+  if (!opts.codexCapture) {
+    for (const name of ["CLAUDE_CODE_OAUTH_TOKEN","PYRY_LIVE_CLAUDE_TOKEN","OPENAI_API_KEY","CODEX_API_KEY","ANTHROPIC_AUTH_TOKEN","CODEX_HOME","CLAUDE_CONFIG_DIR"]) delete env[name];
+    env.PYRY_OFFLINE_GATE = "1";
+  }
   // Only a gate run the dispatcher made a folder for may name one; an
   // inherited value would send captures to some other run's folder.
   delete env[GATE_EVIDENCE_ENV];
@@ -7965,7 +7952,7 @@ export function buildLiveGateSpawnEnv(parentEnv: NodeJS.ProcessEnv): NodeJS.Proc
  * a timeout or a force-exit reaches the whole tree — shell, test binary, and
  * every `claude` beneath it — instead of orphaning a live suite.
  */
-export const spawnGateCommand: GateSpawner = async (req) => {
+const spawnGateCommandInner: GateSpawner = async (req) => {
   let child: ChildProcess;
   try {
     child = spawn("bash", ["-c", req.command], {
@@ -8077,6 +8064,16 @@ export const spawnGateCommand: GateSpawner = async (req) => {
   const waitCreditMs = gateDeadline(waits, Date.now(), req.timeoutMs, ceilingFactor).creditMs;
   return { exitCode: result.exitCode, timedOut, spawnError: result.spawnError, ...(waitCreditMs > 0 ? { waitCreditMs } : {}) };
 };
+
+/** Empty login directories prevent accidental account discovery by offline gates. */
+export const spawnGateCommand: GateSpawner = async req => {
+  if (req.env.PYRY_OFFLINE_GATE !== '1') return spawnGateCommandInner(req);
+  const root = mkdtempSync(resolve(tmpdir(),'pyry-offline-auth-'));
+  try {
+    return await spawnGateCommandInner({...req,env:{...req.env,CODEX_HOME:resolve(root,'codex'),CLAUDE_CONFIG_DIR:resolve(root,'claude')}});
+  } finally {rmSync(root,{recursive:true,force:true});}
+};
+
 
 /** Injectable I/O for `runRealClaudeGateSuite`. */
 /**
