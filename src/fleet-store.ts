@@ -238,7 +238,8 @@ export class FleetStore {
   /** True for a Done or closed workflow ticket, false for an open one, undefined for one the workflow store does not hold. */
   ticketDone(ticket: string): boolean | undefined {
     let item;
-    try { item = this.workflow.get(ticket); } catch { return undefined; }
+    // Only an unknown ticket is unknown; any other failure says nothing and is rethrown.
+    try { item = this.workflow.get(ticket); } catch (error) { if ((error as Error).message === "Unknown workflow ticket") return undefined; throw error; }
     return item.status === "Done" || item.state === "CLOSED";
   }
 

@@ -27,6 +27,8 @@ import type { EvidenceKind, EvidenceMeta } from "./evidence-store.js";
 const KIB = 1024, MIB = 1024 * KIB;
 /** A tail read reaches this far back, so it can start at a line boundary. */
 const TAIL_MARGIN = 64 * KIB;
+/** The dispatcher's own run logs (`agentLogPath`), the only files that carry prompt sections. */
+const AGENT_LOG = /^\d{4}-\d{2}-\d{2}T[\d-]+Z_[\w-]+_#\d+\.(?:source\.)?log$/;
 
 export interface RunEvidenceLimits {
   /** Bytes of file content in one bundle, generated files included. Under the store's 8 MiB default. */
@@ -86,14 +88,14 @@ const REDACTED = "[REDACTED]";
 const EVIDENCE_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
   // PEM private keys, whole block.
   // Bounded, so a header without its end costs 16 KiB rather than the rest of the file.
-  [/-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----(?:[\s\S]{0,16384}?-----END [A-Z0-9 ]{0,40}PRIVATE KEY-----|[\s\S]{0,16384})/g, `-----${REDACTED} PRIVATE KEY-----`],
+  [/-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----(?:[\s\S]{0,16384}?-----END [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----|[\s\S]{0,16384})/g, `-----${REDACTED} PRIVATE KEY-----`],
   // HTTP basic and other authorization schemes, cookies.
-  [/\b(Authorization|Proxy-Authorization)(\\*["']?\s*[:=]\s*\\*["']?\s*)(?:Basic|Digest|Token|Negotiate|AWS4-HMAC-SHA256)\s+[^\s"'\\]{6,}/gi, `$1$2${REDACTED}`],
+  [/\b(Authorization|Proxy-Authorization)(\\*["']?[ \t]{0,16}[:=][ \t]{0,16}\\*["']?[ \t]{0,16})(?:Basic|Digest|Token|Negotiate|AWS4-HMAC-SHA256)\s+[^\s"'\\]{6,}/gi, `$1$2${REDACTED}`],
   [/\b((?:Set-)?Cookie\\*["']?\s*[:=]\s*\\*["']?)[^\r\n"\\]{8,}/gi, `$1${REDACTED}`],
   // Provider keys without an assignment: OpenAI, AWS access key ids, Slack, Google, Stripe.
   [/\b(?:sk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{16,}|sk-[A-Za-z0-9]{32,}|(?:AKIA|ASIA)[A-Z0-9]{16}|xox[abposr]-[A-Za-z0-9-]{10,}|AIza[A-Za-z0-9_-]{35}|(?:sk|rk)_live_[A-Za-z0-9]{16,})/g, REDACTED],
   // `--token VALUE`, `--api-key VALUE`, `--password VALUE`.
-  [/(--?(?:[a-z0-9]+-)?(?:token|api-?key|key|secret|password|passwd|pass|auth)(?:\s+|=))(?!-)[^\s"']{8,}/gi, `$1${REDACTED}`],
+  [/(--?(?:[a-z0-9]+-)?(?:token|api-?key|key|secret|password|passwd|pass|auth)(?:[ \t]+|=))(?!-)[^\s"']{8,}/gi, `$1${REDACTED}`],
   // A name holding a credential word anywhere: KEYSTORE_BASE64=..., SIGNING_KEY_PASSWORD=..., DB_PASSWD=...
   [/\b([A-Z0-9_]{0,64}(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH)[A-Z0-9_]{0,64}\s*=\s*["']?)[^\s"']{8,}/g, `$1${REDACTED}`],
   // Signed URL parameters.
@@ -113,16 +115,14 @@ export function redact(text: string): string {
 }
 
 /**
- * Drop a partial first line from text that starts mid-file, so a credential
- * the cut fell inside never survives without the prefix that identifies it.
- * A file with no newline in reach loses its leading run of token characters.
+ * Drop the partial first line of text that starts mid-file, so a credential
+ * the cut fell inside, or the name that marks one, never survives without
+ * the context that identifies it. Only whole lines are kept. Null when
+ * there is no line boundary at all: such a file is pointed to, not cut.
  */
-function fromLineStart(bytes: Buffer, margin: number): Buffer {
+function fromLineStart(bytes: Buffer): Buffer | null {
   const newline = bytes.indexOf(0x0a);
-  if (newline >= 0 && newline < Math.max(margin, 1)) return bytes.subarray(newline + 1);
-  let i = Math.min(margin, bytes.length);
-  while (i < bytes.length && /[A-Za-z0-9+/_.=~%:-]/.test(String.fromCharCode(bytes[i]))) i++;
-  return bytes.subarray(i);
+  return newline < 0 ? null : bytes.subarray(newline + 1);
 }
 
 /**
@@ -132,17 +132,18 @@ function fromLineStart(bytes: Buffer, margin: number): Buffer {
  */
 export function dropOrphanKeyTail(text: string): string {
   const head = text.slice(0, 64 * 1024);
-  const end = head.search(/-----END [A-Z0-9 ]{0,40}PRIVATE KEY-----/);
-  if (end < 0 || /-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----/.test(head.slice(0, end))) return text;
+  const end = head.search(/-----END [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----/);
+  if (end < 0 || /-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----/.test(head.slice(0, end))) return text;
   const close = text.indexOf("-----", text.indexOf("PRIVATE KEY", end)) + 5;
   return `-----${REDACTED} PRIVATE KEY-----` + text.slice(close);
 }
 
-/** The last `max` bytes of already redacted `text`, cut at a line start and redacted again. */
-function tailText(text: string, max: number): string {
+/** The last `max` bytes of already redacted `text`, whole lines only, redacted again. Null without a line boundary. */
+function tailText(text: string, max: number): string | null {
   const bytes = Buffer.from(text);
   if (bytes.length <= max) return text;
-  return redact(dropOrphanKeyTail(fromLineStart(bytes.subarray(bytes.length - max), 64 * 1024).toString("utf8")));
+  const lines = fromLineStart(bytes.subarray(bytes.length - max));
+  return lines === null ? null : redact(dropOrphanKeyTail(lines.toString("utf8")));
 }
 
 /**
@@ -309,8 +310,11 @@ export async function collectRunEvidence(opts: RunEvidenceInput & {
     // A tail read starts mid-file: begin at a line start before redacting, so
     // a credential the read cut into is dropped rather than kept without the
     // prefix that identifies it. Then redact, then cut again at a line start.
-    const decoded = stripPromptSections(whole ? raw.toString("utf8") : dropOrphanKeyTail(fromLineStart(raw, TAIL_MARGIN).toString("utf8")));
-    const text = whole ? redact(decoded) : tailText(redact(decoded), limits.tailBytes);
+    const lines = whole ? raw : fromLineStart(raw);
+    const agentLog = AGENT_LOG.test(basename(source));
+    const decoded = lines === null ? null : (agentLog ? stripPromptSections : (t: string) => t)(whole ? lines.toString("utf8") : dropOrphanKeyTail(lines.toString("utf8")));
+    const text = decoded === null ? null : whole ? redact(decoded) : tailText(redact(decoded), limits.tailBytes);
+    if (text === null) { await point(source, size, modified, "one long line: no safe place to cut a tail"); note(path, source, size, "pointer"); continue; }
     const bytes = Buffer.byteLength(text);
     if (bytes > budget || Object.keys(files).length >= limits.files - 3) {
       await point(source, size, modified, "over the bundle budget");

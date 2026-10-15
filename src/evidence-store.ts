@@ -147,6 +147,7 @@ export function readEvidenceLimits(config: unknown): EvidenceLimits {
     nearCapRatio: d.nearCapRatio,
   };
   if (limits.bundleBytes > ARTIFACT_LIMITS.bytes) throw new Error("evidence.maxBundleMB is above the artifact format's 64 MiB");
+  if (limits.bundleBytes < MIB) throw new Error("evidence.maxBundleMB must be at least 1");
   if (limits.bundleBytes > limits.ticketBytes || limits.ticketBytes > limits.totalBytes) throw new Error("evidence caps must satisfy maxBundleMB <= maxTicketMB <= maxTotalMB");
   return limits;
 }

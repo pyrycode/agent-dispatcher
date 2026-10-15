@@ -381,7 +381,7 @@ test('evidence redaction covers keys, cookies, basic auth, flags, named secrets 
 });
 
 test('scrubbing stays linear on long token-like runs',()=>{
- for(const sample of ['a-'.repeat(128*1024),'Ab9_-'.repeat(52*1024)]) {
+ for(const sample of ['a-'.repeat(128*1024),'Ab9_-'.repeat(52*1024),'Authorization:'+' '.repeat(256*1024),'Cookie:'+' '.repeat(256*1024),'--token'+' '.repeat(256*1024)]) {
   const started=Date.now();scrubCredentials(sample);redact(sample);
   assert.ok(Date.now()-started<2000,`took ${Date.now()-started} ms`);
  }
@@ -458,4 +458,20 @@ test('a recovery excerpt reads the chunk before a short last chunk',async t=>{
  await box.flush();
  const excerpts=await evidenceExcerpts(f.project('hp'),'org/core#12');
  assert.match(excerpts!.bundles[0].excerpts['logs/verifier-gate__12_1.stderr.log'],/final error: relay refused/);
+});
+
+test('a long file with no line boundary near its end is pointed to, never cut mid-line',async t=>{
+ const directory=mkdtempSync(join(tmpdir(),'evidence-line-'));t.after(()=>rmSync(directory,{recursive:true,force:true}));
+ const dir=join(directory,'logs');mkdirSync(join(dir,'evidence','12'),{recursive:true});
+ // One 700 KiB JSON line: any cut lands inside it, perhaps inside "api_key".
+ writeFileSync(join(dir,'evidence','12','report.log'),'{"x":"'+'a'.repeat(400*1024)+'","api_key": "'+'S'.repeat(40)+'","y":"'+'b'.repeat(300*1024)+'"}');
+ // A gate log that prints a header shaped like the dispatcher's keeps its text: only agent logs lose prompt sections.
+ const rule='='.repeat(60);
+ writeFileSync(join(dir,'verifier-gate_#12_1.log'),[rule,'PROMPT — 2026-10-15T02:07:22.487Z',rule,'test output kept'].join('\n'));
+ const bundle=await collectRunEvidence({issueNumber:12,runId:'r',role:'verifier',kind:'agent',outcome:'failed',startedAt:Date.now()-60_000,endedAt:Date.now(),project:'org/core',machine:'box',logsDir:dir});
+ assert.ok(!Object.keys(bundle.files).some(p=>p.includes('report.log')),'no tail of a single long line');
+ assert.ok(!JSON.stringify(bundle.files).includes('SSSSSSSS'));
+ const pointers=JSON.parse(bundle.files['pointers.json']);
+ assert.ok(pointers.some((p:any)=>p.path.endsWith('report.log')&&/one long line/.test(p.reason)));
+ assert.match(bundle.files['logs/verifier-gate__12_1.log'],/test output kept/);
 });
