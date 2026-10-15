@@ -17,6 +17,9 @@ import type { AgentRunner } from './agent-runner.js';
 import { CAPABILITY_REPORT_FRESH_MS, missingCapabilities, ticketRequirements, validateCapabilityReport } from "./ticket-requirements.js";
 import { DesiredStateStore, workRefusal, type DesiredCommand, type DesiredDocument, type DesiredPoll } from './desired-state.js';
 import { CodexThrottle, startsCodex, DEFAULT_CODEX_THROTTLE, type CodexThrottleConfig, type CodexPauseState, type CodexSpacingState } from './codex-throttle.js';
+import { FlakySightingLedger } from './flaky-sightings.js';
+import { FLAKY_TEST_COLUMN, FLAKY_TEST_LABEL, hasFlakyMarker, staleLabelsOnReopen } from './flaky-tickets.js';
+import { inheritedMarker } from './inherited-tickets.js';
 
 /** An operator choice, frozen into each new grant. Null restores local settings. */
 export interface RunnerPolicy { runner: AgentRunner | null; revision: number }
@@ -209,6 +212,8 @@ export class FleetStore {
   readonly codex: CodexThrottle;
   /** The operator's central drains and stops per computer and board. See desired-state.ts. */
   readonly desired: DesiredStateStore;
+  /** Every flaky-test sighting from every computer. See flaky-sightings.ts. */
+  readonly flaky: FlakySightingLedger;
   private readonly clock: () => number;
   constructor(path: string, private readonly limits: Readonly<Record<string, MachineLimits>>, options: FleetStoreOptions = {}) {
     for (const value of Object.values(limits)) validateLimits(value);
@@ -253,6 +258,7 @@ export class FleetStore {
     this.clock = clock;
     this.codex = new CodexThrottle(this.db, clock, options.codexThrottle ?? DEFAULT_CODEX_THROTTLE, options.log);
     this.desired = new DesiredStateStore(this.db, Object.keys(limits), clock, machine => this.machineCapabilities()[machine]?.projects);
+    this.flaky = new FlakySightingLedger(this.db, clock);
   }
   close(): void { this.db.close(); }
   /** The authority's record of one run, finished or not. Evidence uploads are accepted only from its own computer. */
@@ -441,6 +447,59 @@ export class FleetStore {
   }
   workflowComment(machine:string,session:string,runId:string|undefined,ticket:string,body:string,id:string):void {
     this.transaction(()=>{this.authorizeWorkflow(machine,session,ticket,runId);this.workflow.comment(ticket,body,id);});
+  }
+  /** Record flaky-test sightings from `machine` and count them (flaky-sightings.ts). */
+  flakySightings(machine: string, project: unknown, sightings: unknown) {
+    if (!Object.hasOwn(this.limits, machine)) throw new Error("Unknown machine");
+    return this.transaction(() => this.flaky.record(machine, project, sightings));
+  }
+  /**
+   * A gate run's write on a failure tracker the pipeline filed
+   * (flaky-tickets.ts, inherited-tickets.ts): an occurrence comment on an
+   * open tracker, or a reopen of a closed one into Backlog with its stale
+   * stage labels dropped and the comment added, in one transaction.
+   *
+   * Such a tracker usually belongs to another computer, the one that filed or
+   * fixed it, and a closed ticket keeps its claim, so the ordinary ownership
+   * check would refuse every computer but that one. This write is narrower
+   * instead: the caller must hold an active run, the ticket must carry the
+   * kind's label and name one of the tests on its own marker line, and no run
+   * may be active on the ticket itself. The claim stays as it was.
+   */
+  flakyTrack(machine: string, session: unknown, project: unknown, input: any): { ticket: string; state: string; status: string; revision: number } {
+    if (!Object.hasOwn(this.limits, machine)) throw new Error("Unknown machine");
+    if (typeof project !== "string" || !/^[\w.-]+\/[\w.-]+$/.test(project)) throw new Error("Tracker writes require a project");
+    if (typeof session !== "string" || !session) throw new Error("Tracker writes require a session");
+    const { ticket, kind, tests, comment, reopen, top, commandId, runId } = input ?? {};
+    if (typeof ticket !== "string" || !ticket.startsWith(`${project}#`) || !/^[1-9]\d*$/.test(ticket.slice(project.length + 1))) throw new Error("Invalid tracker ticket");
+    if (kind !== "flaky" && kind !== "inherited") throw new Error("Invalid tracker kind");
+    if (!Array.isArray(tests) || tests.length === 0 || tests.length > 100 || tests.some((t: unknown) => typeof t !== "string" || !t || t.length > 2000)) throw new Error("Invalid tracker tests");
+    if (typeof comment !== "string" || !comment.trim() || comment.length > 60_000) throw new Error("Invalid tracker comment");
+    if (typeof reopen !== "boolean" || (top !== undefined && typeof top !== "boolean")) throw new Error("Invalid tracker change");
+    if (typeof commandId !== "string" || !/^[\w.:-]{1,200}$/.test(commandId)) throw new Error("Invalid tracker command");
+    if (typeof runId !== "string" || !runId) throw new OwnershipRefusal("Tracker writes require an admitted run");
+    if (!this.workflow.enabled(project)) throw new Error("Workflow not enabled for this project");
+    return this.transaction(() => {
+      const run = this.db.prepare("SELECT request FROM fleet_runs WHERE id=? AND machine=? AND session=? AND finished IS NULL").get(runId, machine, session);
+      if (!run || (JSON.parse(String(run.request)) as StartRequest).project !== project) throw new OwnershipRefusal("Workflow run has finished or lost ownership");
+      const summary = () => { const i = this.workflow.get(ticket); return { ticket, state: i.state, status: i.status, revision: i.revision }; };
+      // A retry of a reopen that already landed answers as it did.
+      if (reopen && this.db.prepare("SELECT 1 FROM workflow_commands WHERE id=?").get(commandId)) return summary();
+      const item = this.workflow.get(ticket);
+      const label = kind === "flaky" ? FLAKY_TEST_LABEL : "bug";
+      const named = (tests as string[]).some(t => kind === "flaky" ? hasFlakyMarker(item.body, t)
+        : item.body.split("\n").some(line => line.trim() === inheritedMarker(t)));
+      if (!item.labels.includes(label) || !named) throw new Error("Not a tracker the pipeline filed for these tests");
+      if (this.db.prepare("SELECT 1 FROM fleet_runs WHERE ticket=? AND finished IS NULL").get(ticket)) throw new OwnershipRefusal("Ticket has an active run");
+      if (reopen) {
+        if (item.state !== "CLOSED") throw new Error("Tracker is already open");
+        const stale = staleLabelsOnReopen(item.labels);
+        this.workflow.change(ticket, { state: "OPEN", status: FLAKY_TEST_COLUMN, ...(stale.length ? { removeLabels: stale } : {}), ...(top ? { top: true } : {}) },
+          `flaky:${machine}:${session}`, commandId);
+      } else if (item.state !== "OPEN") throw new Error("Tracker is closed");
+      this.workflow.comment(ticket, comment, `flaky-${commandId}`);
+      return summary();
+    });
   }
   workflowOperator(ticket: string, change: WorkflowChange, commandId: string, revision: number) {
     return this.transaction(() => {

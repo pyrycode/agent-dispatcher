@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { JsonClient } from "./fleet-http.js";
+import { unknownOperation, type JsonClient } from "./fleet-http.js";
 import type { WorkflowItem, WorkflowChange } from "./workflow-store.js";
 import {
   tallyFamilyComments,
@@ -28,6 +28,18 @@ export function workflowClient<T extends object>(
       project,
       ticket: `${project}#${number}`,
       change: value,
+      commandId: randomUUID(),
+      ...actor(),
+    });
+  const tracker = async (number: number, comment: string, ref: { kind: string; tests: string[]; top?: boolean }, reopen: boolean) =>
+    connection.call("/flaky/track", {
+      project,
+      ticket: `${project}#${number}`,
+      kind: ref.kind,
+      tests: ref.tests,
+      comment,
+      reopen,
+      ...(ref.top ? { top: true } : {}),
       commandId: randomUUID(),
       ...actor(),
     });
@@ -98,6 +110,25 @@ export function workflowClient<T extends object>(
     },
     closeIssue: async (n: number) => {
       await change(n, { state: "CLOSED" });
+    },
+    reopenIssue: async (n: number) => {
+      await change(n, { state: "OPEN" });
+    },
+    // Failure trackers (flaky-tickets.ts). Usually another computer's ticket,
+    // so the claim service checks the ticket names these tests instead of
+    // asking for its claim, and reopens into Backlog in one write.
+    reopenTracker: async (issue: { number: number }, comment: string, ref: { kind: string; tests: string[]; top?: boolean }) => {
+      await tracker(issue.number, comment, ref, true);
+    },
+    commentOnTracker: async (n: number, comment: string, ref: { kind: string; tests: string[]; top?: boolean }) => {
+      try {
+        await tracker(n, comment, ref, false);
+      } catch (error) {
+        // A service from before the route: the ordinary comment, which works
+        // wherever this run may write the ticket.
+        if (!unknownOperation(error)) throw error;
+        await methods.addComment(n, comment);
+      }
     },
     recordMergedIssue: async (n: number) => {
       const item = (await read()).find((i) => i.issueNumber === n);

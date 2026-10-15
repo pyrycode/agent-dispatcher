@@ -583,6 +583,10 @@ Every key is optional and these are the defaults; `"database"` moves the file an
 
 `status` shows `evidenceStore`: bytes used, bundle and ticket counts, the caps and whether the store is near its cap. At 90 percent of the total cap, `attention` carries `evidenceStore` with a message: the store is then evicting evidence early, so raise `maxTotalMB` if the disk allows or shorten `doneRetentionDays`.
 
+## Flaky-test sightings
+
+Every flake a gate sees, a test that failed and then passed on its same-tree re-run, is recorded in the claim service's `fleet_flaky_sightings` table through the machine manager (`/flaky/sightings`), so a second sighting on any computer files the ticket. A flaky or shared live failure ticket that belongs to another computer is commented on or reopened through `/flaky/track`, which checks that the ticket is a tracker the pipeline filed for those tests instead of asking for its claim. A manager or claim service that predates the routes answers "Unknown operation"; the dispatcher then keeps the sighting in `logs/flaky-sightings.json` and sends it later, and files nothing on a first sighting. The rules are in [flaky-tests.md](flaky-tests.md).
+
 ## Rollout
 
 1. Use the approved machine limits. Choose project order and confirm role classifications. Configure service credentials and transport.

@@ -395,6 +395,14 @@ export interface GateTally {
    * different thing from "nothing failed".
    */
   recognizedLines: number;
+  /**
+   * Playwright only: the worker processes the run actually used, from its
+   * report's `config.metadata.actualWorkers`, else the configured
+   * `config.workers`. The same-tree and base re-runs use it, so a failure
+   * that came from contention is judged under the same load
+   * (`rerunLoadArguments`). Absent for formats that do not report it.
+   */
+  workers?: number;
 }
 
 function emptyTally(): GateTally {
@@ -818,6 +826,9 @@ function parsePlaywrightJson(raw: string): GateTally {
   if (!Array.isArray(suites)) return tally;
   tally.recognizedLines = 1;
   tally.completeParse = validPlaywrightReport(doc);
+  const config = (doc as any).config;
+  const workers = [config?.metadata?.actualWorkers, config?.workers].find((w) => Number.isSafeInteger(w) && w > 0);
+  if (workers !== undefined) tally.workers = workers;
 
   // Top-level `errors` is where Playwright reports a failure with no test
   // to hang it on: a config error, a global-setup throw, a worker crash.
@@ -1204,6 +1215,40 @@ function buildPlaywrightBaselineFilter(qualifiedFailedNames: readonly string[]):
   return `'(${patterns.join("|")})'`;
 }
 
+/**
+ * The names a re-run saw pass every time they ran. A name that also failed,
+ * in a repeat (`rerunLoadArguments`) or in another Playwright project, did
+ * not pass: under the same load it failed again.
+ */
+export function namesPassedEveryTime(tally: Pick<GateTally, "passedNames" | "failedNames">): string[] {
+  const failed = new Set(tally.failedNames);
+  return [...new Set(tally.passedNames)].filter((name) => !failed.has(name));
+}
+
+/**
+ * Extra arguments that run a gate's failing tests under the gate's own load.
+ *
+ * Why. A same-tree re-run of one or two failing tests used one worker, while
+ * the gate had run four, so a failure that came from contention, a busy
+ * display or CPU, nearly always passed it and was filed as a flaky test.
+ * Desktop's re-runs on 2026-10-10 reported `actualWorkers: 1` against a
+ * configured 3. So for Playwright the re-run asks for the gate's worker count
+ * and, when there are fewer failing spec files than workers, repeats each
+ * file enough times to keep every worker busy: Playwright gives each repeat
+ * its own worker group, and tests inside one file still run in order. Each
+ * failing test still gets one re-run round; it passes only if every copy
+ * passes (`namesPassedEveryTime`).
+ *
+ * Empty for other formats, and for a gate that ran one worker. Go's test
+ * runner and Android instrumentation report no worker count.
+ */
+export function rerunLoadArguments(format: GateOutputFormat, failedNames: readonly string[], workers: number | undefined): string {
+  if (format !== "playwright-json" || workers === undefined || !Number.isSafeInteger(workers) || workers <= 1) return "";
+  const files = new Set(failedNames.map((n) => n.split(PLAYWRIGHT_TITLE_SEPARATOR)[0]!.trim()).filter((f) => f !== ""));
+  const repeat = Math.ceil(workers / Math.max(1, files.size));
+  return ` --workers=${workers}` + (repeat > 1 ? ` --repeat-each=${repeat}` : "");
+}
+
 /** Placeholder a baseline command template must carry. */
 export const BASELINE_TESTS_PLACEHOLDER = "{{TESTS}}";
 
@@ -1227,9 +1272,14 @@ export const BASELINE_TESTS_PLACEHOLDER = "{{TESTS}}";
  * of this wrapper. Returns null when the template has no placeholder, since
  * substituting nothing would silently re-run the entire suite.
  */
-export function buildBaselineCommand(template: string, filter: string): string | null {
+export function buildBaselineCommand(template: string, filter: string, load = ""): string | null {
   if (!template.includes(BASELINE_TESTS_PLACEHOLDER)) return null;
-  return template.replaceAll(BASELINE_TESTS_PLACEHOLDER, () => filter);
+  // The load arguments follow the filter only where they land inside the
+  // runner's own arguments: one placeholder that is the value of `-g` or
+  // `--grep`. Anywhere else they could start a new shell word.
+  const loaded = load !== "" && template.split(BASELINE_TESTS_PLACEHOLDER).length === 2
+    && /(?:^|\s)(?:-g|--grep)(?:\s+|=)\{\{TESTS\}\}/.test(template);
+  return template.replaceAll(BASELINE_TESTS_PLACEHOLDER, () => loaded ? filter + load : filter);
 }
 
 // --------- The finished-run report ---------
@@ -1407,6 +1457,8 @@ export function formatGateEvidenceComment(opts: {
   flaky?: readonly string[];
   /** Inherited failures the gate accepted, each with its tracking ticket. */
   acceptedInherited?: readonly { name: string; issue: number }[];
+  /** What the flaky-test record made of the flaky names (`describeFlakySightings`). */
+  flakyTracking?: string;
 }): string {
   const { report } = opts;
   const heading: Record<string, string> = {
@@ -1533,6 +1585,10 @@ export function formatGateEvidenceComment(opts: {
         `until someone shows otherwise; it is named here so it can be tracked rather than forgotten.`,
       );
       lines.push("");
+      if (opts.flakyTracking) {
+        lines.push(opts.flakyTracking);
+        lines.push("");
+      }
     }
 
     const flakySet = new Set(flaky);

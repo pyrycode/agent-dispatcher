@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { recordInheritedTests, inheritedMarker, type InheritedTicketClient } from "./inherited-tickets.js";
-import { failureTicketLabels, type FlakyRunContext } from "./flaky-tickets.js";
+import { failureTicketLabels, type ClosedTracker, type FlakyRunContext, type TrackerRef } from "./flaky-tickets.js";
 import { decideInheritedAdvance } from "./pipeline-decisions.js";
 import { parseGateOutput } from "./gate-output.js";
 import { inheritedAdvanceEnabled } from "./dispatch.js";
@@ -370,4 +370,61 @@ test("a title ending the test name with a full stop still names it exactly", asy
   client.open.push({ number: 1402, nodeId: "node-1402", title: `Broken on main: ${name}.`, body: "seen" });
   assert.deepEqual((await recordInheritedTests(client, [name], ctx, { advance: true })).tracked, [{ name, issue: 1402 }]);
   assert.equal(client.created.length, 0);
+});
+
+// 2026-10-15: a shared failure whose fix ticket closed recently reopens that
+// ticket instead of filing a new one.
+const T0 = Date.parse("2026-10-15T12:00:00.000Z");
+const DAY = 24 * 60 * 60 * 1000;
+class ReopeningClient extends Client {
+  closed: ClosedTracker[] = [];
+  reopened: { issue: number; comment: string; ref: TrackerRef }[] = [];
+  reopenError: Error | null = null;
+  async listRecentlyClosedIssuesWithLabel(label: string, since: Date) {
+    assert.equal(label, "bug");
+    return this.closed.filter(c => Date.parse(c.closedAt) >= since.getTime());
+  }
+  async reopenTracker(issue: ClosedTracker, comment: string, ref: TrackerRef) {
+    if (this.reopenError) throw this.reopenError;
+    this.reopened.push({ issue: issue.number, comment, ref });
+  }
+}
+const closedFix = (number: number, daysAgo: number): ClosedTracker => ({
+  number, nodeId: `node-${number}`, title: "fix shared live failure: permissionAnswer", body: `ctx\n${inheritedMarker(name)}`,
+  labels: ["bug", "priority:low", "merged"], closedAt: new Date(T0 - daysAgo * DAY).toISOString(),
+});
+
+test("a shared failure whose fix ticket closed in the last 30 days reopens it at the top of Backlog and waits on it", async () => {
+  const client = new ReopeningClient();
+  client.closed.push(closedFix(1947, 2));
+  const result = await recordInheritedTests(client, [name], ctx, {}, process.platform, () => T0);
+  assert.equal(client.created.length, 0, "no new ticket");
+  assert.deepEqual(client.reopened.map(r => [r.issue, r.ref]), [[1947, { kind: "inherited", tests: [name], top: true }]]);
+  assert.match(client.reopened[0].comment, /## Shared failure back after this ticket closed/);
+  assert.match(client.reopened[0].comment, /\/logs\/base.log/);
+  assert.deepEqual(result.blockers, [{ name, issue: 1947 }]);
+  assert.deepEqual(client.linked, [1947]);
+  assert.deepEqual(client.positions, [], "the reopen already placed it");
+});
+test("a fix ticket closed more than 30 days ago stays closed and a new one is filed", async () => {
+  const client = new ReopeningClient();
+  client.closed.push(closedFix(1700, 31));
+  const result = await recordInheritedTests(client, [name], ctx, {}, process.platform, () => T0);
+  assert.equal(client.reopened.length, 0);
+  assert.deepEqual(result.blockers, [{ name, issue: 1500 }]);
+});
+test("a reopen that fails files a new ticket, because the gated ticket waits on one", async t => {
+  const client = new ReopeningClient();
+  client.closed.push(closedFix(1947, 2));
+  client.reopenError = new Error("Service 409: Ticket has an active run");
+  t.mock.method(console, "warn", () => {});
+  const result = await recordInheritedTests(client, [name], ctx, {}, process.platform, () => T0);
+  assert.deepEqual(result.blockers, [{ name, issue: 1500 }]);
+});
+test("in advance mode a reopened tracker counts as a confirmed tracker", async () => {
+  const client = new ReopeningClient();
+  client.closed.push(closedFix(1947, 2));
+  const result = await recordInheritedTests(client, [name], ctx, { advance: true }, process.platform, () => T0);
+  assert.deepEqual(result.tracked, [{ name, issue: 1947 }]);
+  assert.deepEqual(client.linked, []);
 });

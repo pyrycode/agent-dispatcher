@@ -400,7 +400,8 @@ export async function serveManager(manager: MachineManager, projectTokens: Recor
         return send(200, await manager.claims.call(req.url, body));
       }
       if (["/codex/report", "/tasks/request", "/tasks/read", "/tasks/artifact", "/recovery/facts", "/recovery/evidence", "/recovery/pause", "/recovery/coordination", "/recovery/report", "/recovery/begin", "/recovery/decide", "/recovery/complete",
-        "/evidence/begin", "/evidence/put", "/evidence/commit", "/evidence/list", "/evidence/chunk", "/evidence/usage"].includes(req.url ?? "")) {
+        "/evidence/begin", "/evidence/put", "/evidence/commit", "/evidence/list", "/evidence/chunk", "/evidence/usage",
+        "/flaky/sightings", "/flaky/track"].includes(req.url ?? "")) {
         if (!manager.claims.call) throw new Error("Recovery service unavailable");
         return send(200, await manager.claims.call(req.url!, { ...body, project,
           ...(req.url === "/recovery/evidence" ? { records: body.records?.map((r: any) => ({ ...r, machine: manager.config.machine })) } : {}) }));

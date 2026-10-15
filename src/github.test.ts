@@ -254,3 +254,40 @@ describe("marker count across comment pages", () => {
     }
   });
 });
+
+test("recently closed issues: by closing time, newest first, without pull requests, across pages", async () => {
+  const since = new Date("2026-09-15T00:00:00Z");
+  const issue = (number: number, closed_at: string | null, extra: object = {}) => ({ number, node_id: `I${number}`, title: `t${number}`, body: `b${number}`, closed_at, labels: [{ name: "flaky-test" }], ...extra });
+  const pages = [
+    [...Array.from({ length: 98 }, (_, i) => issue(3000 + i, "2026-09-01T00:00:00Z")), issue(1861, "2026-10-09T09:33:44Z"), issue(5, "2026-10-14T00:00:00Z", { pull_request: {} })],
+    [issue(1978, "2026-10-15T08:59:19Z")],
+  ];
+  const urls: string[] = []; const original = globalThis.fetch;
+  globalThis.fetch = (async (input: any) => {
+    urls.push(String(input));
+    const page = Number(new URL(String(input)).searchParams.get("page"));
+    return new Response(JSON.stringify(pages[page - 1] ?? []));
+  }) as typeof fetch;
+  try {
+    const client = new GitHubProjectClient({ owner: "o", repo: "r", token: "fixture" } as any);
+    const closed = await client.listRecentlyClosedIssuesWithLabel("flaky-test", since);
+    assert.deepEqual(closed.map(c => c.number), [1978, 1861], "updated recently but closed before the cutoff does not count");
+    assert.deepEqual(closed[0].labels, ["flaky-test"]);
+    const first = new URL(urls[0]);
+    assert.equal(first.searchParams.get("state"), "closed");
+    assert.equal(first.searchParams.get("labels"), "flaky-test");
+    assert.equal(first.searchParams.get("since"), since.toISOString());
+    assert.equal(urls.length, 2);
+  } finally { globalThis.fetch = original; }
+});
+
+test("reopenIssue patches the issue open", async () => {
+  const requests: { url: string; init: any }[] = []; const original = globalThis.fetch;
+  globalThis.fetch = (async (input: any, init: any) => { requests.push({ url: String(input), init }); return new Response("{}"); }) as typeof fetch;
+  try {
+    await new GitHubProjectClient({ owner: "o", repo: "r", token: "fixture" } as any).reopenIssue(1978);
+    assert.equal(requests[0].url, "https://api.github.com/repos/o/r/issues/1978");
+    assert.equal(requests[0].init.method, "PATCH");
+    assert.deepEqual(JSON.parse(requests[0].init.body), { state: "open" });
+  } finally { globalThis.fetch = original; }
+});

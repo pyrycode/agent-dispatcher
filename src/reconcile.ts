@@ -67,7 +67,8 @@ import { findRepeatedMustFix, newestFailVerdict, parseVerdictArtifacts, staleBas
 import { GATE_PARSER_VERSION, formatGateEvidenceComment, gateCommandProvenance, gateRunFloor, gateRunRequiredTests, parseGateOutput, validateGateOutputProvenance, type GateOutputFormat, type GateRunReport } from "./gate-output.js";
 import { gateRunMetaMatches, gateRunMetaPath, parseGateRunMeta, recordAcceptedInherited, type GateRunMeta } from "./gate-report.js";
 import type { TestEvidenceRule } from "./gate-test-evidence.js";
-import type { FlakyRunContext, FlakyTicketResult } from "./flaky-tickets.js";
+import { describeFlakySightings, type FlakyRunContext, type FlakyRunFacts, type FlakyRunShape, type FlakyTicketResult } from "./flaky-tickets.js";
+import type { FlakySightingOutcome } from "./flaky-sightings.js";
 import type { InheritedTicketOptions, InheritedTicketResult } from "./inherited-tickets.js";
 
 /**
@@ -701,14 +702,20 @@ export async function runRealClaudeGateExecution(
   minExecuted: number,
   notifyDiscord: (message: string) => Promise<void>,
   inFlight = 0,
-  recordFlaky: (flaky: readonly string[], ctx: FlakyRunContext) => Promise<FlakyTicketResult> = noFlakyTickets,
+  recordFlaky: (flaky: readonly string[], ctx: FlakyRunContext, run?: FlakyRunFacts) => Promise<FlakyTicketResult> = noFlakyTickets,
   background?: RealClaudeGateBackground,
   recordInherited: (failures: readonly string[], ctx: FlakyRunContext, options?: InheritedTicketOptions) => Promise<InheritedTicketResult> = noInheritedTickets,
   /** The fork's configured gate format, used only for a saved report that
    *  predates recorded formats and whose command names no reporter.
    *  `inheritedAdvance` lets a tracked inherited failure advance the ticket
-   *  (`PYRY_REAL_CLAUDE_GATE_INHERITED_ADVANCE`); absent means it parks. */
-  options: { legacyFormat?: GateOutputFormat; testEvidence?: readonly TestEvidenceRule[]; inheritedAdvance?: boolean } = {},
+   *  (`PYRY_REAL_CLAUDE_GATE_INHERITED_ADVANCE`); absent means it parks.
+   *  `recordFlakySightings` records the run's flakes before the evidence
+   *  comment, so the comment can say which were first sightings; the same
+   *  counts then go to `recordFlaky`. */
+  options: {
+    legacyFormat?: GateOutputFormat; testEvidence?: readonly TestEvidenceRule[]; inheritedAdvance?: boolean;
+    recordFlakySightings?: (flaky: readonly string[], ctx: FlakyRunContext, shape: FlakyRunShape) => Promise<FlakySightingOutcome | undefined>;
+  } = {},
 ): Promise<boolean> {
   // Off switch. No command configured means this step never touches the
   // board, so the whole feature can land on a live dispatcher before any
@@ -986,6 +993,23 @@ export async function runRealClaudeGateExecution(
       const blockerNote = inheritedTickets.blockers.length > 0
         ? ` Shared failures tracked on ${[...new Set(inheritedTickets.blockers.map(b => `#${b.issue}`))].join(", ")}.`
         : "";
+      // The flakes' sightings, before the evidence comment that names them.
+      // A run whose other failures failed again files no flaky ticket, and
+      // its sightings do not count when one of those is the branch's.
+      const flakyShape: FlakyRunShape = {
+        failed: report.tally?.failedNames ?? [], persistent: [...introduced, ...preExisting], branchOwnsPersistent: introduced.length > 0,
+      };
+      const flakyCtx: FlakyRunContext = { gatedIssue: candidate.issueNumber, report, at: new Date().toISOString() };
+      let flakySightings: FlakySightingOutcome | undefined;
+      if (flaky.length > 0 && options.recordFlakySightings) {
+        try {
+          flakySightings = await options.recordFlakySightings(flaky, flakyCtx, flakyShape);
+        } catch (error) {
+          console.warn(`   ⚠️  Flaky sightings for #${candidate.issueNumber} not recorded: ${error}`);
+        }
+      }
+      const flakyTracking = flaky.length > 0 && options.recordFlakySightings
+        ? describeFlakySightings(flaky, flakySightings, flakyShape) : undefined;
       const artifactsPending = freshLabels.includes("needs-live-artifacts")
         && (verdict === "pass" || verdict === "flaky-pass" || verdict === "inherited-pass");
       const acceptedList = (accepted ?? []).map(t => `\`${t.name}\` (tracked on #${t.issue})`).join(", ");
@@ -1044,7 +1068,7 @@ export async function runRealClaudeGateExecution(
         await client.addComment(
           candidate.issueNumber,
           formatGateEvidenceComment({ verdict, reason, report, minExecuted, action: action + (verdict === "fail" ? blockerNote : ""), introduced, preExisting, flaky,
-            ...(accepted ? { acceptedInherited: accepted } : {}) }),
+            ...(accepted ? { acceptedInherited: accepted } : {}), ...(flakyTracking ? { flakyTracking } : {}) }),
         );
       } catch (e) {
         console.warn(`   ⚠️  Failed to post real-claude gate evidence on #${candidate.issueNumber}: ${e}`);
@@ -1090,13 +1114,16 @@ export async function runRealClaudeGateExecution(
       // flakes: a fail whose other failures reproduced still names them.
       let flakyTickets: FlakyTicketResult | null = null;
       if (flaky.length > 0) {
-        flakyTickets = await recordFlaky(flaky, {
-          gatedIssue: candidate.issueNumber,
-          report,
-          at: new Date().toISOString(),
-        });
+        flakyTickets = await recordFlaky(flaky, flakyCtx, { shape: flakyShape, ...(flakySightings ? { sightings: flakySightings } : {}) });
         for (const { name, issue } of flakyTickets.filed) console.log(`   🎫 Filed #${issue} in Backlog for flaky ${name}`);
+        for (const { name, issue } of flakyTickets.reopened ?? []) console.log(`   ♻️  Reopened #${issue} in Backlog for flaky ${name}`);
         for (const { name, issue } of flakyTickets.commented) console.log(`   💬 Flaky ${name} recorded on #${issue}`);
+        if ((flakyTickets.firstSightings?.length ?? 0) > 0) {
+          console.log(`   👀 First sighting, recorded, no ticket yet: ${flakyTickets.firstSightings.join(", ")}`);
+        }
+        if ((flakyTickets.held?.length ?? 0) > 0) {
+          console.log(`   👀 Recorded only, because a failure in the same run persisted: ${flakyTickets.held.join(", ")}`);
+        }
         if (flakyTickets.untracked.length > 0) {
           console.warn(`   ⚠️  Flaky test(s) with no ticket this run: ${flakyTickets.untracked.join(", ")}`);
         }
@@ -1219,14 +1246,16 @@ async function handOffGateConflict(
 
 /** Default for `runRealClaudeGateExecution`'s flake filing: file nothing. */
 async function noFlakyTickets(flaky: readonly string[]): Promise<FlakyTicketResult> {
-  return { filed: [], commented: [], untracked: [...flaky] };
+  return { filed: [], commented: [], reopened: [], firstSightings: [], held: [], untracked: [...flaky], sightingSource: "none" };
 }
 
 /** One sentence for the Discord ping naming where the flakes are tracked. */
 function flakyTicketNote(result: FlakyTicketResult | null): string {
   if (result === null) return "";
-  const tracked = [...result.filed, ...result.commented].map(t => `#${t.issue}`);
-  return tracked.length > 0 ? ` Tracked on ${tracked.join(", ")}.` : "";
+  const tracked = [...new Set([...result.filed, ...(result.reopened ?? []), ...result.commented].map(t => `#${t.issue}`))];
+  const first = result.firstSightings?.length ?? 0;
+  return (tracked.length > 0 ? ` Tracked on ${tracked.join(", ")}.` : "") +
+    (first > 0 ? ` ${first} first sighting(s), recorded with no ticket yet.` : "");
 }
 
 /** Missing integration cannot spend the unrelated ticket's retry budget. */

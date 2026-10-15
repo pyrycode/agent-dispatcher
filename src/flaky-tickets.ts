@@ -1,5 +1,5 @@
-// Flaky-test tickets: one open Backlog ticket per test the real-claude gate
-// saw fail and then pass on a same-tree re-run.
+// Flaky-test tickets: one Backlog ticket per test that a gate saw fail and
+// then pass on a same-tree re-run, filed on the test's SECOND such sighting.
 //
 // The re-run lets a ticket through when its failures were flakes, which is
 // right for the ticket and wrong for the suite: before it, a wrongly blamed
@@ -8,9 +8,29 @@
 // a Discord ping and a line on an unrelated ticket. pyrycode-mobile's silent
 // second-client bug went untracked for a whole day that way (2026-09-24).
 //
-// So each flaky test gets a ticket the first time, found again later by a
-// marker in its body, and each later flake adds a comment to it. The ticket
-// builds up a count and a list of runs instead of a pile of duplicates.
+// Filing on the first sighting went too far the other way. From 2026-10-05 to
+// 2026-10-15 pyrycode-desktop got 26 flaky tickets from its verifier gates,
+// most of them contention flakes that never came back, and they used about
+// 10 of its 62 agent hours. So the rules since 2026-10-15:
+//
+// 1. Every sighting is recorded in the claim service (flaky-sightings.ts),
+//    shared across computers. A ticket is filed only when the same test has
+//    flaked twice inside 14 days, on any computer or the same one. The first
+//    sighting is named on the gated ticket's evidence or in the verifier's
+//    note, so nothing is silently dropped.
+// 2. A run with more than three failing tests gets at most one ticket, naming
+//    them all: that many at once points at the machine or the display, not at
+//    each test. A run where any failure failed again on the re-run files no
+//    flaky ticket at all. Those failures are the branch's, which its own
+//    verifier or rework handles, or main's, which has its own ticket. Its
+//    flakes are recorded, and counted unless the branch owns a failure.
+// 3. A test whose ticket closed in the last 30 days gets that ticket reopened
+//    into Backlog with a comment, instead of a new one. Desktop's receipt
+//    saturation test was filed three times (#1861, #1918, #1978) because
+//    only open tickets were matched.
+//
+// Each later flake of a tracked test adds a comment to its open ticket, so a
+// ticket builds up a count and a list of runs instead of a pile of duplicates.
 //
 // The verifier gates re-run a red gate's failures the same way (#133) and
 // record their flakes on the same per-test tickets. A verifier gate run has
@@ -18,28 +38,82 @@
 
 import type { GateRunReport } from "./gate-output.js";
 import { osName, osRequirementToDrop, seenOnLabel } from "./ticket-requirements.js";
+import {
+  FLAKY_SIGHTING_WINDOW_DAYS,
+  FLAKY_SIGHTINGS_TO_FILE,
+  flakySightingId,
+  type FlakySighting,
+  type FlakySightingCount,
+  type FlakySightingOutcome,
+  type FlakySightingStore,
+} from "./flaky-sightings.js";
 
 export const FLAKY_TEST_LABEL = "flaky-test";
 export const FLAKY_TEST_COLUMN = "Backlog";
 
 /**
- * New tickets one gate run may file. More flakes than this in one run points
- * at the environment rather than at tests, and a dozen tickets for one outage
- * is noise. Tests over the cap still get a comment when they already have a
- * ticket; the rest are named in the log and on the gated ticket's evidence.
+ * More failing tests than this in one gate run, and the run files at most one
+ * ticket naming them all. Counts every failing test, not only the flaky ones.
  */
-export const MAX_NEW_FLAKY_TICKETS_PER_RUN = 5;
+export const FLAKY_RUN_TEST_LIMIT = 3;
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+/** A tracker closed this recently is reopened instead of filed again. */
+export const FLAKY_REOPEN_WINDOW_DAYS = 30;
+export const FLAKY_REOPEN_WINDOW_MS = FLAKY_REOPEN_WINDOW_DAYS * DAY_MS;
+
+/**
+ * Labels a closed ticket keeps that would mislead the pipeline once it is
+ * open again: `merged` makes the auto-merge skip it in Done, and the stage
+ * markers are the ones a merge strips (`recordMergedIssue`). Content labels,
+ * requirements and the claim display stay.
+ */
+export function staleLabelsOnReopen(labels: readonly string[]): string[] {
+  return labels.filter((l) => l === "merged" || /^(done:|wip:|needs-rework:|error:|pending-done:|pending-verdict:|merge-attempt:)/.test(l));
+}
+
+/** A tracker ticket closed inside the reopen window. */
+export interface ClosedTracker {
+  number: number;
+  nodeId?: string;
+  title?: string;
+  body: string;
+  labels?: string[];
+  /** ISO timestamp. */
+  closedAt: string;
+}
+
+/** Which tests a tracker write is for, so the claim service can check the ticket names them. */
+export interface TrackerRef {
+  kind: "flaky" | "inherited";
+  tests: string[];
+  /** Also move it to the top of Backlog. */
+  top?: boolean;
+}
 
 /** Narrow client for the filing; `GitHubProjectClient` satisfies it. */
 export interface FlakyTicketClient {
   /** `labels` lets a later sighting on another system drop an operating-system requirement. */
   listOpenIssuesWithLabel(label: string): Promise<{ number: number; body: string; labels?: string[] }[]>;
+  /** Tickets with `label` closed at or after `since`. Absent: nothing is reopened. */
+  listRecentlyClosedIssuesWithLabel?(label: string, since: Date): Promise<ClosedTracker[]>;
   createIssue(title: string, body: string, labels?: string[]): Promise<{ number: number; nodeId: string; url: string }>;
   addItemToProject(issueNodeId: string): Promise<string>;
   updateItemStatus(itemId: string, newStatus: string): Promise<void>;
   addComment(issueNumber: number, body: string): Promise<void>;
   /** Drops a `requires:` label once a failure is seen on a second system. */
   removeLabel?(issueNumber: number, label: string): Promise<void>;
+  /**
+   * On a board the claim service owns: reopen a tracker the pipeline filed
+   * into Backlog, drop its stale labels and add the comment, in one central
+   * write (`/flaky/track`). Absent: the GitHub steps below.
+   */
+  reopenTracker?(issue: ClosedTracker, comment: string, ref: TrackerRef): Promise<void>;
+  /** On a board the claim service owns: an occurrence comment on an open tracker. Absent: `addComment`. */
+  commentOnTracker?(issueNumber: number, comment: string, ref: TrackerRef): Promise<void>;
+  /** A plain GitHub reopen, for a board the claim service does not own. */
+  reopenIssue?(issueNumber: number): Promise<void>;
+  moveItemToTop?(itemId: string): Promise<void>;
 }
 
 export interface FlakyRunContext {
@@ -79,11 +153,61 @@ export interface VerifierGateFlakyContext {
 /** Either gate's run: the real-claude gate's report, or a verifier gate's own lines. */
 export type FlakyTicketContext = FlakyRunContext | VerifierGateFlakyContext;
 
+/** How one gate run's failures split on its same-tree re-run. */
+export interface FlakyRunShape {
+  /** Every test that failed in the gate run, flaky or not. */
+  failed: readonly string[];
+  /** The tests that failed again on the re-run. */
+  persistent: readonly string[];
+  /** Some persistent failure is the gated branch's own: it neither failed in the main sweep nor on the base commit. */
+  branchOwnsPersistent: boolean;
+}
+
+/**
+ * `quiet`: at most three failures and every one passed on the re-run, so each
+ * flaky test is judged on its own. `burst`: more than three, every one passed
+ * on the re-run, so the run files at most one ticket. `persistent`: some
+ * failure failed again, so the run files no flaky ticket.
+ */
+export type FlakyRunKind = "quiet" | "burst" | "persistent";
+
+export function classifyFlakyRun(flaky: readonly string[], shape?: FlakyRunShape): FlakyRunKind {
+  if ((shape?.persistent.length ?? 0) > 0) return "persistent";
+  const failed = new Set([...(shape?.failed ?? []), ...flaky]);
+  return failed.size > FLAKY_RUN_TEST_LIMIT ? "burst" : "quiet";
+}
+
 export interface FlakyTicketResult {
+  /** New tickets: one per test, or one run ticket naming every test in a burst. */
   filed: { name: string; issue: number }[];
+  /** An open ticket already tracked the test; it got an occurrence comment. */
   commented: { name: string; issue: number }[];
-  /** Names with no ticket and no comment: over the cap, or a write failed. */
+  /** A recently closed ticket was reopened into Backlog for the test. */
+  reopened: { name: string; issue: number }[];
+  /** First sighting inside the window: recorded, no ticket yet. */
+  firstSightings: string[];
+  /** Recorded only, because another failure in the run failed again on its re-run. */
+  held: string[];
+  /** Names with no ticket and no comment because a read or write failed. */
   untracked: string[];
+  /** Where the sighting counts came from. `none` when nothing could be recorded. */
+  sightingSource: "central" | "local" | "none";
+  /** True when the sightings do not count toward a ticket (the branch owns a persistent failure). */
+  uncounted?: boolean;
+}
+
+/** What the live gate already recorded before its evidence comment, and how the run split. */
+export interface FlakyRunFacts {
+  shape?: FlakyRunShape;
+  /** Sightings recorded earlier in the same run, so they are not recorded twice. */
+  sightings?: FlakySightingOutcome;
+}
+
+export interface FlakyFilingOptions extends FlakyRunFacts {
+  /** The shared sighting record. Absent with no `sightings`: nothing is recorded and nothing filed. */
+  store?: FlakySightingStore | null;
+  platform?: string;
+  now?: () => number;
 }
 
 /** The hidden line a ticket body carries so a later flake finds it. */
@@ -91,13 +215,18 @@ export function flakyMarker(name: string): string {
   return `<!-- flaky-test: ${name} -->`;
 }
 
+/** The ticket body names `name` on its own marker line. */
+export function hasFlakyMarker(body: string, name: string): boolean {
+  const marker = flakyMarker(name);
+  return (body ?? "").split("\n").some((line) => line.trim() === marker);
+}
+
 /**
  * The open ticket for `name`, matched on the whole marker line. A substring
  * match on the title would let `test_a` claim `test_ab`'s ticket.
  */
 export function findFlakyTicket(issues: readonly { number: number; body: string }[], name: string): number | null {
-  const marker = flakyMarker(name);
-  const hit = issues.find(issue => (issue.body ?? "").split("\n").some(line => line.trim() === marker));
+  const hit = issues.find((issue) => hasFlakyMarker(issue.body, name));
   return hit ? hit.number : null;
 }
 
@@ -129,8 +258,20 @@ function runLines(ctx: FlakyTicketContext, platform: string): string[] {
   ];
 }
 
-export function buildFlakyTestIssue(name: string, ctx: FlakyTicketContext, platform: string = process.platform): { title: string; body: string } {
+type Earlier = FlakySightingCount["earlier"];
+
+function earlierLines(earlier: Earlier | undefined): string[] {
+  if (!earlier || earlier.length === 0) return [];
+  return earlier.map((e) => `- ${e.gate === "live" ? "Live" : "Verifier"} gate for ${e.ticket} on ${e.machine} at ${new Date(e.at).toISOString()}`);
+}
+
+const OCCURRENCE_NOTE = "The dispatcher files a flaky-test ticket on a test's second fail-then-pass inside " +
+  `${FLAKY_SIGHTING_WINDOW_DAYS} days, on any computer, and adds a comment here each time it flakes again, ` +
+  "so the comments are the occurrence count.";
+
+export function buildFlakyTestIssue(name: string, ctx: FlakyTicketContext, platform: string = process.platform, earlier?: Earlier): { title: string; body: string } {
   const verifier = "verifierGate" in ctx;
+  const seen = earlierLines(earlier);
   const body = [
     "## User Story",
     "",
@@ -144,12 +285,12 @@ export function buildFlakyTestIssue(name: string, ctx: FlakyTicketContext, platf
         "not blamed for it, because the failure was not its branch's."
       : "The real-claude gate saw this test fail, then pass when re-run on the same merged tree. The gated ticket " +
         "went through, because the failure was not its branch's.") +
-      " The dispatcher filed this ticket and adds a " +
-      "comment here each time the test flakes again, so the comments are the occurrence count.",
+      " " + OCCURRENCE_NOTE,
     "",
-    "First seen:",
+    "This sighting:",
     "",
     ...runLines(ctx, platform),
+    ...(seen.length > 0 ? ["", `Earlier sightings in the last ${FLAKY_SIGHTING_WINDOW_DAYS} days:`, "", ...seen] : []),
     "",
     "## Acceptance Criteria",
     "",
@@ -162,13 +303,85 @@ export function buildFlakyTestIssue(name: string, ctx: FlakyTicketContext, platf
   return { title: `flaky ${verifier ? "" : "live "}test: ${shortTestName(name)}`, body };
 }
 
-export function buildFlakyRecurrenceComment(name: string, ctx: FlakyTicketContext, platform: string = process.platform): string {
+/**
+ * One ticket for a gate run in which more than three tests failed and all of
+ * them passed on the re-run. One marker per test, so a later flake of any of
+ * them comments here instead of filing its own.
+ */
+export function buildFlakyRunIssue(
+  names: readonly string[],
+  ctx: FlakyTicketContext,
+  platform: string = process.platform,
+  earlierByName: ReadonlyMap<string, Earlier> = new Map(),
+): { title: string; body: string } {
+  const verifier = "verifierGate" in ctx;
+  const seenBefore = names.filter((n) => (earlierByName.get(n)?.length ?? 0) > 0);
+  const body = [
+    "## User Story",
+    "",
+    `As the maintainer, I want the ${names.length} tests below to stop failing together in the ` +
+      `${verifier ? "verifier gates" : "live gate"}, so that one shared cause stops costing re-runs.`,
+    "",
+    "## Context",
+    "",
+    `One ${verifier ? "verifier gate" : "live gate"} run saw these ${names.length} tests fail, then pass when re-run ` +
+      "in the same tree under the gate's own worker count:",
+    "",
+    ...names.map((n) => `- \`${n}\`` + (seenBefore.includes(n) ? " (also flaked earlier, see below)" : "")),
+    "",
+    `More than ${FLAKY_RUN_TEST_LIMIT} failures in one run usually share one cause, such as a contended machine or ` +
+      "display, so the dispatcher filed one ticket for the run instead of one per test. " + OCCURRENCE_NOTE,
+    "",
+    "This run:",
+    "",
+    ...runLines(ctx, platform),
+    ...seenBefore.flatMap((n) => ["", `Earlier sightings of \`${n}\`:`, "", ...earlierLines(earlierByName.get(n))]),
+    "",
+    "## Acceptance Criteria",
+    "",
+    "- [ ] What the failures share is found from the logs before any one test is changed. A test is split off " +
+      "into its own ticket only when its cause turns out to be independent.",
+    "- [ ] The shared cause is fixed, in the tests, the harness or the product, so the failures stop. If it is " +
+      "in another repo, a ticket there is filed and linked, and this one is blocked by it.",
+    "",
+    ...names.map(flakyMarker),
+  ].join("\n");
+  return { title: `flaky ${verifier ? "" : "live "}tests: ${names.length} failed together in one gate run`, body };
+}
+
+function nameList(names: readonly string[]): string {
+  return names.length === 1 ? `\`${names[0]}\`` : names.map((n) => `\`${n}\``).join(", ");
+}
+
+export function buildFlakyRecurrenceComment(names: string | readonly string[], ctx: FlakyTicketContext, platform: string = process.platform): string {
+  const list = typeof names === "string" ? [names] : names;
   return [
     `## Flaked again`,
     "",
-    `\`${name}\` failed once and passed on the same-tree re-run.`,
+    `${nameList(list)} failed once and passed on the same-tree re-run.`,
     "",
     ...runLines(ctx, platform),
+  ].join("\n");
+}
+
+/** The comment a reopened tracker gets. */
+export function buildFlakyReopenComment(
+  names: readonly string[],
+  ctx: FlakyTicketContext,
+  closedAt: string,
+  platform: string = process.platform,
+  earlierByName: ReadonlyMap<string, Earlier> = new Map(),
+): string {
+  const seen = names.flatMap((n) => earlierLines(earlierByName.get(n)).map((l) => `${l} (\`${shortTestName(n)}\`)`));
+  return [
+    "## Flaked again after this ticket closed",
+    "",
+    `${nameList(names)} failed once and passed on the same-tree re-run. This ticket closed at ${closedAt}, ` +
+      `within ${FLAKY_REOPEN_WINDOW_DAYS} days, so the dispatcher reopened it into Backlog instead of filing a ` +
+      "new one. Whatever fixed it before did not hold, or fixed a different cause.",
+    "",
+    ...runLines(ctx, platform),
+    ...(seen.length > 0 ? ["", `Earlier sightings in the last ${FLAKY_SIGHTING_WINDOW_DAYS} days:`, "", ...seen] : []),
   ].join("\n");
 }
 
@@ -206,20 +419,112 @@ export async function dropStaleOsRequirement(
   }
 }
 
+/** An occurrence comment on an open tracker, through the claim service where it owns the board. */
+export async function commentOnTracker(client: FlakyTicketClient, issue: number, comment: string, ref: TrackerRef): Promise<void> {
+  if (client.commentOnTracker) return client.commentOnTracker(issue, comment, ref);
+  return client.addComment(issue, comment);
+}
+
 /**
- * File or update one ticket per flaky test. Never throws: a board write that
- * fails leaves the name in `untracked`, and the gate's own verdict and moves
- * have already happened by the time this runs.
+ * Reopen a recently closed tracker into Backlog with a comment. Where the
+ * claim service owns the board this is one central write that checks the
+ * ticket names these tests. Elsewhere it is the GitHub steps in order:
+ * reopen, comment, drop stale labels, place in Backlog. Throws when it
+ * cannot reopen at all; the caller then files nothing new.
+ */
+export async function reopenTracker(client: FlakyTicketClient, issue: ClosedTracker, comment: string, ref: TrackerRef): Promise<void> {
+  if (client.reopenTracker) return client.reopenTracker(issue, comment, ref);
+  if (!client.reopenIssue) throw new Error("this client cannot reopen a ticket");
+  await client.reopenIssue(issue.number);
+  await client.addComment(issue.number, comment);
+  for (const label of staleLabelsOnReopen(issue.labels ?? [])) {
+    try { await client.removeLabel?.(issue.number, label); } catch (e: any) {
+      console.warn(`   ⚠️  Could not remove ${label} from reopened #${issue.number}: ${e?.message ?? e}`);
+    }
+  }
+  if (issue.nodeId) {
+    const itemId = await client.addItemToProject(issue.nodeId);
+    await client.updateItemStatus(itemId, FLAKY_TEST_COLUMN);
+    if (ref.top) await client.moveItemToTop?.(itemId);
+  }
+}
+
+/** The latest closed tracker naming `name` on its marker line, if any. */
+function latestClosed(closed: readonly ClosedTracker[], matches: (body: string) => boolean): ClosedTracker | undefined {
+  return [...closed].filter((c) => matches(c.body)).sort((a, b) => Date.parse(b.closedAt) - Date.parse(a.closedAt))[0];
+}
+export function latestClosedFlakyTicket(closed: readonly ClosedTracker[], name: string): ClosedTracker | undefined {
+  return latestClosed(closed, (body) => hasFlakyMarker(body, name));
+}
+
+function emptyResult(): FlakyTicketResult {
+  return { filed: [], commented: [], reopened: [], firstSightings: [], held: [], untracked: [], sightingSource: "none" };
+}
+
+function outputPathOf(ctx: FlakyTicketContext): string {
+  return "verifierGate" in ctx ? ctx.verifierGate.outputPath : ctx.report.outputPath;
+}
+
+/**
+ * Record one sighting per flaky name. Never throws: a store that cannot be
+ * reached answers with this computer's own counts, and a missing store with
+ * none at all, which files nothing.
+ */
+export async function recordFlakySightings(
+  store: FlakySightingStore | null | undefined,
+  flaky: readonly string[],
+  ctx: FlakyTicketContext,
+  shape?: FlakyRunShape,
+  now: () => number = Date.now,
+): Promise<FlakySightingOutcome | undefined> {
+  const names = [...new Set(flaky)];
+  if (!store || names.length === 0) return undefined;
+  const gate = "verifierGate" in ctx ? "verifier" : "live";
+  const parsed = Date.parse(ctx.at);
+  const at = Number.isFinite(parsed) ? parsed : now();
+  const counts = !(shape?.branchOwnsPersistent ?? false);
+  const sightings: FlakySighting[] = names.map((test) => ({
+    id: flakySightingId([gate, ctx.gatedIssue, outputPathOf(ctx), ctx.at], test),
+    test, ticket: ctx.gatedIssue, gate, counts, at,
+  }));
+  return store.record(sightings);
+}
+
+function countsByName(outcome: FlakySightingOutcome | undefined): Map<string, FlakySightingCount> {
+  const out = new Map<string, FlakySightingCount>();
+  for (const c of outcome?.counts.values() ?? []) out.set(c.test, c);
+  return out;
+}
+
+/**
+ * Record each flake's sighting, then file, reopen or comment by the rules in
+ * the header. Never throws: a board write that fails leaves the name in
+ * `untracked`, and the gate's own verdict and moves have already happened by
+ * the time this runs.
  */
 export async function recordFlakyTests(
   client: FlakyTicketClient,
   flaky: readonly string[],
   ctx: FlakyTicketContext,
-  platform: string = process.platform,
+  options: FlakyFilingOptions = {},
 ): Promise<FlakyTicketResult> {
-  const result: FlakyTicketResult = { filed: [], commented: [], untracked: [] };
+  const platform = options.platform ?? process.platform;
+  const now = options.now ?? Date.now;
+  const result = emptyResult();
   const names = [...new Set(flaky)];
   if (names.length === 0) return result;
+
+  const kind = classifyFlakyRun(names, options.shape);
+  const outcome = options.sightings ?? await recordFlakySightings(options.store, names, ctx, options.shape, now);
+  result.sightingSource = outcome?.source ?? "none";
+  if (options.shape?.branchOwnsPersistent) result.uncounted = true;
+  const counts = countsByName(outcome);
+  const earlierByName = new Map([...counts].map(([n, c]) => [n, c.earlier] as const));
+
+  if (kind === "persistent") {
+    result.held.push(...names);
+    return result;
+  }
 
   let open: { number: number; body: string; labels?: string[] }[];
   try {
@@ -231,37 +536,166 @@ export async function recordFlakyTests(
     return result;
   }
 
+  // An open ticket gets one occurrence comment for all of its tests in this run.
+  const byTicket = new Map<number, string[]>();
+  const untracked: string[] = [];
   for (const name of names) {
     const existing = findFlakyTicket(open, name);
-    if (existing !== null) {
-      try {
-        await client.addComment(existing, buildFlakyRecurrenceComment(name, ctx, platform));
-        result.commented.push({ name, issue: existing });
-        await dropStaleOsRequirement(client, open.find(i => i.number === existing)!, platform);
-      } catch (e: any) {
-        console.warn(`   ⚠️  Flaky tickets: could not comment on #${existing}: ${e?.message ?? e}`);
-        result.untracked.push(name);
-      }
-      continue;
-    }
-    if (result.filed.length >= MAX_NEW_FLAKY_TICKETS_PER_RUN) {
-      result.untracked.push(name);
-      continue;
-    }
+    if (existing === null) untracked.push(name);
+    else byTicket.set(existing, [...(byTicket.get(existing) ?? []), name]);
+  }
+  for (const [issue, group] of byTicket) {
     try {
-      const { title, body } = buildFlakyTestIssue(name, ctx, platform);
+      await commentOnTracker(client, issue, buildFlakyRecurrenceComment(group, ctx, platform), { kind: "flaky", tests: group });
+      result.commented.push(...group.map((name) => ({ name, issue })));
+      await dropStaleOsRequirement(client, open.find((i) => i.number === issue)!, platform);
+    } catch (e: any) {
+      console.warn(`   ⚠️  Flaky tickets: could not comment on #${issue}: ${e?.message ?? e}`);
+      result.untracked.push(...group);
+    }
+  }
+
+  const due = untracked.filter((n) => (counts.get(n)?.count ?? 0) >= FLAKY_SIGHTINGS_TO_FILE);
+  if (due.length === 0) {
+    result.firstSightings.push(...untracked);
+    return result;
+  }
+
+  let closed: ClosedTracker[] = [];
+  if (client.listRecentlyClosedIssuesWithLabel) {
+    try {
+      closed = await client.listRecentlyClosedIssuesWithLabel(FLAKY_TEST_LABEL, new Date(now() - FLAKY_REOPEN_WINDOW_MS));
+    } catch (e: any) {
+      // A closed ticket for one of these may exist, and filing beside it is the duplicate this avoids.
+      console.warn(`   ⚠️  Flaky tickets: could not list recently closed ${FLAKY_TEST_LABEL} tickets, so nothing is filed this run: ${e?.message ?? e}`);
+      result.untracked.push(...due);
+      result.firstSightings.push(...untracked.filter((n) => !due.includes(n)));
+      return result;
+    }
+  }
+
+  const reopen = async (prior: ClosedTracker, group: readonly string[], tracked: readonly string[]): Promise<boolean> => {
+    try {
+      await reopenTracker(client, prior, buildFlakyReopenComment(group, ctx, prior.closedAt, platform, earlierByName), {
+        kind: "flaky", tests: [...tracked],
+      });
+      result.reopened.push(...group.map((name) => ({ name, issue: prior.number })));
+      open.push({ number: prior.number, body: prior.body, labels: prior.labels });
+      return true;
+    } catch (e: any) {
+      // Not filed beside it either: the next sighting tries the reopen again.
+      console.warn(`   ⚠️  Flaky tickets: could not reopen #${prior.number} for ${group.join(", ")}: ${e?.message ?? e}`);
+      result.untracked.push(...group);
+      return false;
+    }
+  };
+
+  const file = async (title: string, body: string, group: readonly string[]): Promise<void> => {
+    try {
       const labels = failureTicketLabels(["bug", FLAKY_TEST_LABEL, "priority:low"], platform);
       const issue = await client.createIssue(title, body, labels);
-      result.filed.push({ name, issue: issue.number });
+      result.filed.push(...group.map((name) => ({ name, issue: issue.number })));
       // Recorded before the board writes: the ticket exists either way, and
       // listing it as untracked would invite a second one.
       open.push({ number: issue.number, body, labels });
       const itemId = await client.addItemToProject(issue.nodeId);
       await client.updateItemStatus(itemId, FLAKY_TEST_COLUMN);
     } catch (e: any) {
-      console.warn(`   ⚠️  Flaky tickets: could not file or place a ticket for ${name}: ${e?.message ?? e}`);
-      if (!result.filed.some(f => f.name === name)) result.untracked.push(name);
+      console.warn(`   ⚠️  Flaky tickets: could not file or place a ticket for ${group.join(", ")}: ${e?.message ?? e}`);
+      for (const name of group) if (!result.filed.some((f) => f.name === name)) result.untracked.push(name);
     }
+  };
+
+  if (kind === "quiet") {
+    result.firstSightings.push(...untracked.filter((n) => !due.includes(n)));
+    // Two tests that share one closed ticket reopen it once.
+    const byPrior = new Map<number, { prior: ClosedTracker; names: string[] }>();
+    for (const name of due) {
+      const prior = latestClosedFlakyTicket(closed, name);
+      if (!prior) {
+        const { title, body } = buildFlakyTestIssue(name, ctx, platform, counts.get(name)?.earlier);
+        await file(title, body, [name]);
+        continue;
+      }
+      const group = byPrior.get(prior.number) ?? { prior, names: [] };
+      group.names.push(name);
+      byPrior.set(prior.number, group);
+    }
+    for (const { prior, names: group } of byPrior.values()) await reopen(prior, group, group);
+    return result;
   }
+
+  // A burst: at most one ticket for the whole run, naming every untracked test.
+  const prior = due.map((n) => latestClosedFlakyTicket(closed, n)).filter((c): c is ClosedTracker => c !== undefined)
+    .sort((a, b) => Date.parse(b.closedAt) - Date.parse(a.closedAt))[0];
+  if (prior) {
+    await reopen(prior, untracked, untracked.filter((n) => hasFlakyMarker(prior.body, n)));
+    return result;
+  }
+  const { title, body } = buildFlakyRunIssue(untracked, ctx, platform, earlierByName);
+  await file(title, body, untracked);
   return result;
+}
+
+/**
+ * One line per flaky test saying what became of its sighting, for the
+ * verifier's note, the gated ticket's evidence and the log. A first sighting
+ * is named here so it is never silently dropped.
+ */
+export function flakyTrackingNotes(result: FlakyTicketResult): Map<string, string> {
+  const notes = new Map<string, string>();
+  const local = result.sightingSource === "local"
+    ? " (counted on this computer only, because the shared record could not be reached)" : "";
+  for (const { name, issue } of result.filed) notes.set(name, `filed #${issue}`);
+  for (const { name, issue } of result.reopened) notes.set(name, `reopened #${issue}`);
+  for (const { name, issue } of result.commented) notes.set(name, `flaked again, recorded on #${issue}`);
+  for (const name of result.firstSightings) {
+    notes.set(name, result.sightingSource === "none"
+      ? "not recorded, because no sighting record is configured, so no ticket was filed"
+      : `first sighting in ${FLAKY_SIGHTING_WINDOW_DAYS} days, recorded${local}; a ticket is filed if it flakes again`);
+  }
+  for (const name of result.held) {
+    notes.set(name, result.uncounted
+      ? "recorded only and not counted: this branch's own failure in the same run may explain it"
+      : "recorded only: another failure in this run failed again on the re-run, so no flaky ticket is filed from it");
+  }
+  for (const name of result.untracked) notes.set(name, "not tracked this run because a ticket read or write failed, see the dispatcher log");
+  return notes;
+}
+
+/**
+ * The paragraph the live gate's evidence comment carries about its flakes,
+ * written from the sightings alone, before any ticket is filed.
+ */
+export function describeFlakySightings(
+  flaky: readonly string[],
+  outcome: FlakySightingOutcome | undefined,
+  shape?: FlakyRunShape,
+): string {
+  const names = [...new Set(flaky)];
+  if (names.length === 0) return "";
+  const kind = classifyFlakyRun(names, shape);
+  if (outcome === undefined) {
+    return "These sightings could not be recorded, so no flaky-test ticket is filed from this run.";
+  }
+  const local = outcome.source === "local"
+    ? " The shared record could not be reached, so the counts are this computer's own; the sightings are sent later." : "";
+  if (kind === "persistent") {
+    return (shape?.branchOwnsPersistent
+      ? "Recorded as sightings that do not count toward a ticket: this branch's own failure in the same run may explain them."
+      : "Recorded as sightings only: another failure in this run failed again on the re-run, so no flaky-test ticket is filed from it.") + local;
+  }
+  const counts = countsByName(outcome);
+  const lines = names.map((n) => {
+    const count = counts.get(n)?.count ?? 0;
+    return count >= FLAKY_SIGHTINGS_TO_FILE
+      ? `- \`${n}\`: seen ${count} times in ${FLAKY_SIGHTING_WINDOW_DAYS} days, so it is tracked on a flaky-test ticket`
+      : `- \`${n}\`: first sighting in ${FLAKY_SIGHTING_WINDOW_DAYS} days, recorded; a ticket is filed if it flakes again`;
+  });
+  return [
+    `Flaky-test tracking: a ticket is filed on a test's second sighting in ${FLAKY_SIGHTING_WINDOW_DAYS} days, on any computer.` +
+      (kind === "burst" ? ` More than ${FLAKY_RUN_TEST_LIMIT} tests failed in this run, so they share at most one ticket.` : "") + local,
+    "",
+    ...lines,
+  ].join("\n");
 }

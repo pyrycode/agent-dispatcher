@@ -47,6 +47,17 @@ refuses a dependency as a cycle because it still shows the reverse link, the
 publisher removes that link when the blocker's own database record does not want
 it. A cycle recorded in the database itself is reported and left for an operator.
 
+A failure tracker is the one ticket a run may write without its claim. The
+dispatcher's flaky-test and shared live failure tickets usually belong to the
+computer that filed or fixed them, and a closed ticket keeps its claim, so an
+occurrence comment or a reopen from another computer would be refused.
+`/flaky/track` takes them instead. It needs an active run of the caller, a
+ticket carrying `flaky-test` (or `bug` for a shared live failure) that names
+one of the tests on its marker line, and no run active on the ticket. A reopen
+sets the ticket open, moves it to Backlog and drops `merged` and the stage
+markers, with the comment, in one transaction, and leaves the claim alone. See
+[flaky-tests.md](flaky-tests.md).
+
 A pull request is not a workflow ticket. Comments on a PR go straight to GitHub,
 both from agents through the bridge and from the dispatcher's
 `addPullRequestComment`. The store never queues them, but it still checks

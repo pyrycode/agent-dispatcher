@@ -480,7 +480,7 @@ export class ManagedDispatch {
     base = this.authorityClient(base);
     const itemNumbers = new Map<string, number>();
     const createdNumbers = new Map<string, number>();
-    const numbers = new Set(["addLabel", "removeLabel", "addComment", "closeIssue", "addBlocker", "removeBlocker"]);
+    const numbers = new Set(["addLabel", "removeLabel", "addComment", "closeIssue", "reopenIssue", "addBlocker", "removeBlocker"]);
     const items = new Set(["updateItemStatus", "moveItemToTop"]);
     const lists = new Set(["getAllProjectItems", "getOpenProjectItems", "getItemsByStatus", "getClosedItemsNotInDone"]);
     return new Proxy(base, {
