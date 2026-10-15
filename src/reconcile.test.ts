@@ -1065,7 +1065,7 @@ describe("runRealClaudeGateExecution: infrastructure failure", () => {
       let flakyCalls = 0;
       let inheritedCalls = 0;
       await runRealClaudeGateExecution(client, async () => infraReport("2026-10-13T16:18:00.000Z"), 1, async m => { sent.push(m); }, 0,
-        async () => { flakyCalls++; return { filed: [], commented: [], untracked: [] }; }, undefined,
+        async () => { flakyCalls++; return { filed: [], commented: [], untracked: [], reopened: [], firstSightings: [], held: [], sightingSource: "none" as const }; }, undefined,
         async () => { inheritedCalls++; return { blockers: [], untracked: [] }; });
       await runReworkRouting(client);
 
@@ -1626,6 +1626,23 @@ describe("runRealClaudeGateExecution — outcomes", () => {
     });
   });
 
+  test("a flake beside a shared failure counts its shared ticket as the run's one ticket only when that ticket is confirmed", async () => {
+    await withStageSet("builder", async () => { for (const [confirmed, expected] of [[true, true], [false, false]] as const) {
+      const item = parkedItem({ issueNumber: 1397, labels: ["done:verifier", "needs-real-claude"] });
+      const client = new MockClient([item]);
+      const run = report({ exitCode: 1,
+        tally: tally({ executed: 176, passed: 174, failed: 2, failedNames: ["pkg.Flake", "pkg.TestThing"] }),
+        rerunFailures: ["pkg.TestThing"], rerunSkipReason: null, baselineFailures: ["pkg.TestThing"] });
+      const shapes: unknown[] = [];
+      await runRealClaudeGateExecution(client, async () => run, 150, async () => {}, 0,
+        async (names) => ({ filed: [], commented: [], reopened: [], firstSightings: [], held: [...names], untracked: [], sightingSource: "central" as const }),
+        undefined,
+        async () => (confirmed ? { blockers: [{ name: "pkg.TestThing", issue: 1500 }], untracked: [] } : { blockers: [], untracked: ["pkg.TestThing"] }),
+        { recordFlakySightings: async (_names, _ctx, shape) => { shapes.push(shape); return undefined; } });
+      assert.deepEqual(shapes, [{ failed: ["pkg.Flake", "pkg.TestThing"], persistent: ["pkg.TestThing"], branchOwnsPersistent: false, persistentTracked: expected }]);
+    } });
+  });
+
   test("failed shared-ticket filing parks for recovery without spending rework", async () => {
     const item = parkedItem({ labels: ["done:code-review", "needs-real-claude", "rework-count:3"] });
     const client = new MockClient([item]);
@@ -1727,12 +1744,42 @@ describe("runRealClaudeGateExecution — outcomes", () => {
       0,
       async (names, ctx) => {
         calls.push({ flaky: names, gatedIssue: ctx.gatedIssue, movedFirst: client.updateItemStatusCalls.length === 1 });
-        return { filed: [{ name: names[0], issue: 2600 }], commented: [], untracked: [] };
+        return { filed: [{ name: names[0], issue: 2600 }], commented: [], untracked: [], reopened: [], firstSightings: [], held: [], sightingSource: "none" as const };
       },
     );
 
     assert.deepEqual(calls, [{ flaky: ["pkg.TestLiveness"], gatedIssue: 1382, movedFirst: true }]);
     assert.match(notifications[0], /Tracked on #2600/);
+  });
+
+  test("records the flakes' sightings before the evidence comment, names first sightings in it, and passes the counts on", async () => {
+    // 2026-10-15: a ticket is filed on a test's second sighting, so a first
+    // sighting must still leave a trace on the gated ticket.
+    const item = parkedItem();
+    const client = new MockClient([item]);
+    const flaky = report({
+      exitCode: 1,
+      tally: tally({ executed: 176, passed: 175, failed: 1, failedNames: ["pkg.TestLiveness"], packageFailed: true }),
+      rerunFailures: [],
+      rerunSkipReason: null,
+      rerunOutputPath: "/logs/rerun.log",
+    });
+    const outcome = { source: "central" as const, counts: new Map([["id", { id: "id", test: "pkg.TestLiveness", count: 1, earlier: [] }]]) };
+    const seen: { commentsBefore: number; shape: unknown }[] = [];
+    let handed: unknown;
+    await runRealClaudeGateExecution(
+      client, async () => flaky, 150, async () => {}, 0,
+      async (names, _ctx, run) => {
+        handed = run;
+        return { filed: [], commented: [], reopened: [], firstSightings: [...names], held: [], untracked: [], sightingSource: "central" };
+      },
+      undefined, undefined,
+      { recordFlakySightings: async (_names, _ctx, shape) => { seen.push({ commentsBefore: client.addCommentCalls.length, shape }); return outcome; } },
+    );
+    const shape = { failed: ["pkg.TestLiveness"], persistent: [], branchOwnsPersistent: false, persistentTracked: false };
+    assert.deepEqual(seen, [{ commentsBefore: 0, shape }]);
+    assert.match(client.addCommentCalls[0]!.body, /- `pkg\.TestLiveness`: first sighting in 14 days, recorded/);
+    assert.deepEqual(handed, { shape, sightings: outcome });
   });
 
   test("does not call the filer when nothing was flaky", async () => {
@@ -1741,7 +1788,7 @@ describe("runRealClaudeGateExecution — outcomes", () => {
 
     await runRealClaudeGateExecution(client, async () => report(), 150, async () => {}, 0, async () => {
       called++;
-      return { filed: [], commented: [], untracked: [] };
+      return { filed: [], commented: [], untracked: [], reopened: [], firstSightings: [], held: [], sightingSource: "none" as const };
     });
 
     assert.equal(called, 0);

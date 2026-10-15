@@ -121,6 +121,7 @@ import { serializeLastVerdict } from "./verdict-handoff.js";
 import { formatGateEvidenceComment, gateRunFloor, gateRunRequiredTests } from "./gate-output.js";
 import { decideGateVerdict } from "./pipeline-decisions.js";
 import { flakyMarker } from "./flaky-tickets.js";
+import type { FlakySightingStore } from "./flaky-sightings.js";
 import { FINAL_MERGE_HANDOFF_MARKER, MERGE_RESOLUTION_NOTE_MARKER, mergeResolutionComment } from "./merge-handoff.js";
 import { runReworkRouting } from "./reconcile.js";
 import { hashGateList, type VerifierGatePass } from "./verifier-gate-reuse.js";
@@ -7707,6 +7708,38 @@ describe("runRealClaudeGateSuite — same-tree re-run before the base comparison
     assert.match(report.baselineSkipReason ?? "", /passed on the same-tree re-run/);
   });
 
+  test("a Playwright live re-run and its base comparison ask for the gate's worker count, with no load tests", async () => {
+    // 2026-10-15: one or two failing tests re-run alone used one worker
+    // against the gate's three or four. Live load tests would each be a real
+    // claude session, so the live gate passes the worker count only.
+    const pw = (files: Record<string, Record<string, string>>) => JSON.stringify({
+      config: { workers: 2, metadata: { actualWorkers: 2 } },
+      suites: Object.entries(files).map(([file, tests]) => ({ title: file, specs: Object.entries(tests).map(([title, st]) => ({
+        title, tests: [{ status: st === "passed" ? "expected" : "unexpected", results: [{ status: st, duration: 500 }] }],
+      })) })),
+    });
+    const branch = pw({ "real-claude-effort.spec.ts": { applied: "failed" }, "real-claude-mcp.spec.ts": { sheet: "passed" } });
+    const rerun = pw({ "real-claude-effort.spec.ts": { applied: "failed" } });
+    const base = pw({ "real-claude-effort.spec.ts": { applied: "passed" } });
+    const harness = makeGateDeps({
+      gitOut: (cmd) => GATE_SHAS[cmd] ?? "",
+      spawnOutcome: { exitCode: 1 },
+      readFileSync: ((path: string) => path.includes("-rerun_") ? rerun : path.includes("-base_") ? base : branch) as any,
+    });
+    const report = await runRealClaudeGateSuite({
+      issueNumber: 1382,
+      command: "npx playwright test --config playwright.real-claude.config.ts --reporter=json",
+      baselineCommand: "npx playwright test --config playwright.real-claude.config.ts --reporter=json -g {{TESTS}}",
+      format: "playwright-json", timeoutMs: 60_000, repoRoot: "/tmp/fake-repo", defaultBranch: "main", logsDir: "/tmp/fake-logs",
+      deps: harness.deps,
+    });
+    const loaded = "-g '(real-claude-effort\\.spec\\.ts.*applied)' --workers=2";
+    assert.ok(harness.spawnRequests[1].command.endsWith(loaded), harness.spawnRequests[1].command);
+    assert.deepEqual(report.rerunFailures, ["real-claude-effort.spec.ts › applied"]);
+    assert.ok(harness.spawnRequests[2].command.endsWith(loaded), "the base asks for the same workers");
+    assert.deepEqual(report.baselineFailures, []);
+  });
+
   test("a failure that fails again is compared against the base as before", async () => {
     const { run, spawnRequests } = rerunHarness(contents(rerunRed, rerunGreen));
     const report = await run();
@@ -11737,6 +11770,23 @@ describe("pre-verifier gates — failures already on main (#123)", () => {
   });
   const gateLog = (n: number, i: number) => resolve(logsDir, `verifier-gate_#${n}_${i}.log`);
   const stateFile = resolve(logsDir, "main-sweep-state.json");
+  /** A sighting record that counts each test's sightings, starting from `prior`. */
+  const seenBefore = (prior = 1): FlakySightingStore & { recorded: { test: string; counts: boolean }[] } => {
+    const seen = new Map<string, number>();
+    const recorded: { test: string; counts: boolean }[] = [];
+    return {
+      recorded,
+      record: async (sightings) => ({
+        source: "central" as const,
+        counts: new Map(sightings.map((x) => {
+          recorded.push({ test: x.test, counts: x.counts });
+          const count = (seen.get(x.test) ?? prior) + (x.counts ? 1 : 0);
+          seen.set(x.test, count);
+          return [x.id, { id: x.id, test: x.test, count, earlier: [] }];
+        })),
+      }),
+    };
+  };
   /** A red UI gate: exit 1 for the gate itself; the base re-run's own exit is irrelevant. */
   const uiRed = (req: GateSpawnRequest): GateSpawnOutcome =>
     req.command === UI ? { exitCode: 1, timedOut: false, spawnError: null } : { exitCode: 0, timedOut: false, spawnError: null };
@@ -11764,11 +11814,14 @@ describe("pre-verifier gates — failures already on main (#123)", () => {
     /** The same-tree re-run's stdout (#133). Unset reads as a missing file. */
     rerunOutput?: string;
     gateImpl?: (req: GateSpawnRequest) => GateSpawnOutcome;
+    /** The flaky sighting record. Unset: one that has seen every test before. */
+    sightings?: FlakySightingStore | null;
   }) {
     return withStageSet("builder", () => withVerifierGates(opts.gates ?? `make check;${UI}`, () => withFormats("formats" in opts ? opts.formats : FORMATS, async () => {
       const fsMap: Record<string, string> = { [gateLog(n, 2)]: opts.uiOutput };
       if (opts.state !== null) fsMap[stateFile] = opts.state ?? sweepState();
       const { deps, calls } = makeMockDeps({ execImpls: opts.exec ?? execs(), fsMap, gateImpl: opts.gateImpl ?? uiRed });
+      deps.flakySightings = opts.sightings === undefined ? seenBefore() : opts.sightings;
       const read = deps.readFileSync;
       deps.readFileSync = ((path: any, ...rest: any[]) =>
         /verifier-gate-base_#\d+\.log$/.test(String(path)) && opts.baseOutput !== undefined
@@ -11991,18 +12044,112 @@ describe("pre-verifier gates — failures already on main (#123)", () => {
       assert.equal(client.createdIssues.length, 0, "no flaky ticket");
     });
 
-    test("a flaky name and a baseline name together count as green, and the note lists both", async () => {
+    test("a flaky name and a baseline name together count as green, the note lists both, and the run files one ticket", async () => {
+      const sightings = seenBefore();
       const { result, client } = await runGates(1762, {
         uiOutput: junit([X, Z]),
         rerunOutput: junit([X], [Z]),
+        sightings,
       });
 
       const note = result.promptNote;
       assert.ok(!note.includes("TRIAGE MODE"));
       assert.match(note, /count as green for your verdict/);
       assert.ok(note.includes(`\`${X}\` (failed in the main sweep`));
-      assert.match(note, /### Flaky failures, not this ticket's[^]*- `de\.pyryco\.mobile\.ui\.NewTest#broken`/);
-      assert.deepEqual(client.createdIssues.map((i) => i.body.includes(flakyMarker(Z))), [true], "only Z is flaky");
+      assert.match(note, /### Flaky failures, not this ticket's[^]*- `de\.pyryco\.mobile\.ui\.NewTest#broken`, gate `[^`]+`: filed #/);
+      assert.deepEqual(client.createdIssues.map((i) => i.body.includes(flakyMarker(Z))), [true], "X failed again and is main's, so the run's one ticket is Z's");
+      assert.ok(!client.createdIssues[0]!.body.includes(flakyMarker(X)));
+      assert.deepEqual(sightings.recorded, [{ test: Z, counts: true }], "X is main's, so Z's sighting still counts");
+    });
+
+    test("a flake beside a failure that is the branch's own is recorded but not counted", async () => {
+      const sightings = seenBefore();
+      const { result, client } = await runGates(1764, {
+        uiOutput: junit([W, Z]),
+        state: noSweep(),
+        rerunOutput: junit([W], [Z]),
+        baseOutput: junit([], [W]),
+        sightings,
+      });
+      assert.match(result.promptNote, /TRIAGE MODE/);
+      assert.match(result.promptNote, /: recorded and not counted: this branch's own failure/);
+      assert.equal(client.createdIssues.length, 0);
+      assert.deepEqual(sightings.recorded, [{ test: Z, counts: false }]);
+    });
+
+    test("a first sighting files nothing and the verifier's note says so", async () => {
+      const { result, client, calls } = await runGates(1765, {
+        uiOutput: junit([Z]),
+        state: noSweep(),
+        rerunOutput: junit([], [Z]),
+        sightings: seenBefore(0),
+      });
+      assert.match(result.promptNote, /count as green for your verdict/);
+      assert.ok(result.promptNote.includes(`- \`${Z}\`, gate \`${UI}\`: first sighting in 14 days, recorded; a ticket is filed if it flakes again`));
+      assert.equal(client.createdIssues.length, 0, "no ticket on the first sighting");
+      assert.match(loggedText(calls), /passed on the same-tree re-run, flaky; first sighting in 14 days/);
+    });
+
+    describe("under the gate's own worker count", () => {
+      // 2026-10-15: Desktop's re-runs of one or two failing tests used one
+      // worker against the gate's four, so a contention failure nearly always
+      // passed and was filed as a flaky test.
+      const PW = "npx playwright test --reporter=json";
+      const PW_FORMATS = JSON.stringify({ [PW]: { format: "playwright-json", baseline: `${PW} -g {{TESTS}}` } });
+      /** file -> test -> statuses */
+      const pw = (workers: number, files: Record<string, Record<string, string[]>>) => JSON.stringify({
+        config: { workers, metadata: { actualWorkers: workers } },
+        suites: Object.entries(files).map(([file, tests]) => ({ title: file, specs: Object.entries(tests).map(([title, statuses]) => ({
+          title, tests: statuses.map((st) => ({ status: st === "passed" ? "expected" : "unexpected", results: [{ status: st, duration: 1000 }] })),
+        })) })),
+      });
+      const gateRun = (workers: number) => pw(workers, { "flow.spec.ts": { a: ["failed"], b: ["passed"] }, "other.spec.ts": { o: ["passed"] }, "more.spec.ts": { m: ["passed"] } });
+      const pwRed = (req: GateSpawnRequest): GateSpawnOutcome =>
+        req.command === PW ? { exitCode: 1, timedOut: false, spawnError: null } : { exitCode: 0, timedOut: false, spawnError: null };
+      const pwReruns = (calls: CallLog) => calls.gates.filter((g) => g.command.includes(" -g ") && !/verifier-gate-base-/.test(g.cwd));
+      const pwBase = (calls: CallLog) => calls.gates.filter((g) => g.command.includes(" -g ") && /verifier-gate-base-/.test(g.cwd));
+      const LOADED = `${PW} -g '(flow\\.spec\\.ts.*a|(?:^|[ /])other\\.spec\\.ts(?: |$).*o|(?:^|[ /])more\\.spec\\.ts(?: |$).*m)' --workers=3`;
+
+      test("the re-run asks for the gate's workers and fills the idle ones with passing tests from other files", async () => {
+        const { result, calls } = await runGates(1767, {
+          gates: `make check;${PW}`, formats: PW_FORMATS, gateImpl: pwRed, state: noSweep(),
+          uiOutput: gateRun(3),
+          rerunOutput: pw(3, { "flow.spec.ts": { a: ["passed"] }, "other.spec.ts": { o: ["passed"] }, "more.spec.ts": { m: ["passed"] } }),
+        });
+        assert.equal(pwReruns(calls)[0]!.command, LOADED, "each failing test still runs once");
+        assert.match(result.promptNote, /count as green for your verdict/);
+      });
+
+      test("a load test's result decides nothing, and the base runs under the same load", async () => {
+        const { result, calls, client } = await runGates(1768, {
+          gates: `make check;${PW}`, formats: PW_FORMATS, gateImpl: pwRed, state: noSweep(),
+          uiOutput: gateRun(3),
+          rerunOutput: pw(3, { "flow.spec.ts": { a: ["failed"] }, "other.spec.ts": { o: ["failed"] }, "more.spec.ts": { m: ["passed"] } }),
+          baseOutput: pw(3, { "flow.spec.ts": { a: ["passed"] }, "other.spec.ts": { o: ["failed"] }, "more.spec.ts": { m: ["passed"] } }),
+        });
+        assert.equal(pwBase(calls)[0]!.command, LOADED);
+        assert.match(result.promptNote, /TRIAGE MODE/, "a failed again and passes on the base, so it is the ticket's");
+        assert.match(result.promptNote, /Judge only these remaining failures[^]*- `flow\.spec\.ts › a`/);
+        const judged = result.promptNote.split("Judge only these remaining failures")[1]!.split("\n\n")[1]!;
+        assert.equal(judged, "- `flow.spec.ts › a`", "the load test that failed is not a finding");
+        assert.ok(!result.promptNote.includes("`other.spec.ts › o` (failed"), "nor a failure on main");
+        assert.equal(client.createdIssues.length, 0);
+      });
+
+      test("a gate that ran one worker re-runs as before", async () => {
+        const { calls } = await runGates(1769, {
+          gates: `make check;${PW}`, formats: PW_FORMATS, gateImpl: pwRed, state: noSweep(),
+          uiOutput: gateRun(1),
+          rerunOutput: pw(1, { "flow.spec.ts": { a: ["passed"] } }),
+        });
+        assert.equal(pwReruns(calls)[0]!.command, `${PW} -g '(flow\\.spec\\.ts.*a)'`);
+      });
+    });
+
+    test("without a sighting record nothing is filed", async () => {
+      const { result, client } = await runGates(1766, { uiOutput: junit([Z]), state: noSweep(), rerunOutput: junit([], [Z]), sightings: null });
+      assert.match(result.promptNote, /: not recorded, because no sighting record is configured/);
+      assert.equal(client.createdIssues.length, 0);
     });
 
     const unknown: [string, Partial<Parameters<typeof runGates>[1]>][] = [

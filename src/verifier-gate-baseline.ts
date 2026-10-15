@@ -168,6 +168,12 @@ export interface GateBaselineAssessment {
   baseSkipReason: string | null;
   /** Why the same-tree re-run told nothing, when it did not run or could not be read; for the log. */
   rerunSkipReason: string | null;
+  /**
+   * What became of each flaky name's sighting, by name: filed, reopened,
+   * recorded on an open ticket, or a first sighting with no ticket yet
+   * (`flakyTrackingNotes`). For the verifier's note and the log.
+   */
+  flakyNotes?: Record<string, string>;
 }
 
 /** A one-line description of an entry, for the note, the log and the ticket. */

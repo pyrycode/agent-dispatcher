@@ -14,6 +14,7 @@ import {
   ticketRequirements, validateCapabilityReport, CAPABILITY_REPORT_FRESH_MS,
 } from "./ticket-requirements.js";
 import { recordFlakyTests, flakyMarker, failureTicketLabels, type FlakyRunContext, type FlakyTicketClient } from "./flaky-tickets.js";
+import type { FlakySightingStore } from "./flaky-sightings.js";
 import { recordInheritedTests, type InheritedTicketClient } from "./inherited-tickets.js";
 import { buildMainSweepIssue, mainSweepIssueLabels, type MainSweepOutcome } from "./main-sweep.js";
 import type { WorkflowItem } from "./workflow-store.js";
@@ -329,6 +330,10 @@ const run: FlakyRunContext = { gatedIssue: 1936, at: "2026-10-15T08:00:00Z", rep
   outputPath: "/logs/live.log", rerunOutputPath: "/logs/rerun.log", baselineOutputPath: "/logs/base.log",
 } as FlakyRunContext["report"] };
 const NAME = "desktop.e2e#mute toggles";
+/** A record that has seen every test before, so each flake here is at least its second sighting. */
+const seenBefore: FlakySightingStore = { record: async (sightings) => ({
+  counts: new Map(sightings.map(s => [s.id, { id: s.id, test: s.test, count: 2, earlier: [] }])), source: "central" as const,
+}) };
 
 class Board implements FlakyTicketClient, InheritedTicketClient {
   open: { number: number; nodeId: string; title?: string; body: string; labels?: string[] }[] = [];
@@ -353,13 +358,13 @@ class Board implements FlakyTicketClient, InheritedTicketClient {
 
 test("a flaky test ticket requires the system it flaked on, until it flakes on another", async () => {
   const board = new Board();
-  await recordFlakyTests(board, [NAME], run, "darwin");
+  await recordFlakyTests(board, [NAME], run, { store: seenBefore, platform: "darwin" });
   assert.deepEqual(board.created[0].labels, ["bug", "flaky-test", "priority:low", "requires:macos"]);
   assert.match(board.created[0].body, /- Seen on macOS/);
-  await recordFlakyTests(board, [NAME], run, "darwin");
+  await recordFlakyTests(board, [NAME], run, { store: seenBefore, platform: "darwin" });
   assert.deepEqual(board.removed, [], "the same system again: still one system");
   assert.match(board.comments[0].body, /- Seen on macOS/);
-  await recordFlakyTests(board, [NAME], run, "linux");
+  await recordFlakyTests(board, [NAME], run, { store: seenBefore, platform: "linux" });
   assert.deepEqual(board.removed, [{ issue: 2001, label: "requires:macos" }]);
   assert.match(board.comments[1].body, /- Seen on Linux/);
   assert.equal(board.created.length, 1);
@@ -371,8 +376,9 @@ test("a failed requirement removal is logged and the sighting still counts", asy
   board.open.push({ number: 5, nodeId: "n5", body: flakyMarker(NAME), labels: ["requires:linux"] });
   board.removeLabel = async () => { throw new Error("owned elsewhere"); };
   const warn = t.mock.method(console, "warn", () => {});
-  const result = await recordFlakyTests(board, [NAME], run, "darwin");
-  assert.deepEqual(result, { filed: [], commented: [{ name: NAME, issue: 5 }], untracked: [] });
+  const result = await recordFlakyTests(board, [NAME], run, { store: seenBefore, platform: "darwin" });
+  assert.deepEqual(result.commented, [{ name: NAME, issue: 5 }]);
+  assert.deepEqual([...result.filed, ...result.untracked], []);
   assert.ok(warn.mock.calls.some(c => /Could not remove requires:linux from #5: owned elsewhere/.test(String(c.arguments[0]))));
   assert.deepEqual(board.open[0].labels, ["requires:linux"], "the label stays");
 });

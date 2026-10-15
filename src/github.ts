@@ -826,6 +826,29 @@ export class GitHubProjectClient {
     }
   }
 
+  /**
+   * Reopen a closed issue. Used to reopen a failure tracker on a board the
+   * claim service does not own (flaky-tickets.ts); an owned board reopens
+   * through the claim service instead.
+   */
+  async reopenIssue(issueNumber: number): Promise<void> {
+    const response = await fetchWithRetry(
+      `https://api.github.com/repos/${this.config.owner}/${this.config.repo}/issues/${issueNumber}`,
+      {
+        method: "PATCH",
+        headers: {
+          Authorization: `token ${this.config.token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ state: "open" }),
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error(`Failed to reopen issue: ${response.statusText}`);
+    }
+  }
+
   async getIssueLabels(issueNumber: number): Promise<string[]> {
     return freshGitHubRead(() => this.readIssueLabels(issueNumber));
   }
@@ -987,6 +1010,44 @@ export class GitHubProjectClient {
           labels: (issue.labels ?? []).map((l: any) => typeof l === "string" ? l : String(l?.name ?? "")).filter(Boolean) });
       }
       if (batch.length < 100) return found;
+    }
+  }
+
+  /**
+   * Issues carrying `label` that closed at or after `since`, newest first,
+   * across all pages. GitHub's `since` filters by last update, which a close
+   * always is, so the closing time is checked here too. Pull requests share
+   * the endpoint and are dropped.
+   */
+  async listRecentlyClosedIssuesWithLabel(label: string, since: Date): Promise<{ number: number; nodeId: string; title: string; body: string; labels: string[]; closedAt: string; stateReason: string | null }[]> {
+    const found: { number: number; nodeId: string; title: string; body: string; labels: string[]; closedAt: string; stateReason: string | null }[] = [];
+    for (let page = 1; ; page++) {
+      const response = await fetchWithRetry(
+        `https://api.github.com/repos/${this.config.owner}/${this.config.repo}/issues` +
+          `?state=closed&labels=${encodeURIComponent(label)}&since=${encodeURIComponent(since.toISOString())}` +
+          `&sort=updated&direction=desc&per_page=100&page=${page}`,
+        {
+          headers: {
+            Authorization: `token ${this.config.token}`,
+            Accept: "application/vnd.github+json",
+          },
+        },
+        3,
+        1000,
+        true, // a read is idempotent: retry transient GitHub 5xx/429
+      );
+      if (!response.ok) {
+        throw new Error(`Failed to list closed issues labelled ${label}: ${response.status} ${response.statusText}`);
+      }
+      const batch: any[] = (await response.json()) as any[];
+      for (const issue of batch) {
+        if (issue.pull_request || typeof issue.closed_at !== "string") continue;
+        if (Date.parse(issue.closed_at) < since.getTime()) continue;
+        found.push({ number: issue.number, nodeId: issue.node_id, title: issue.title, body: issue.body ?? "", closedAt: issue.closed_at,
+          stateReason: typeof issue.state_reason === "string" ? issue.state_reason : null,
+          labels: (issue.labels ?? []).map((l: any) => typeof l === "string" ? l : String(l?.name ?? "")).filter(Boolean) });
+      }
+      if (batch.length < 100) return found.sort((a, b) => Date.parse(b.closedAt) - Date.parse(a.closedAt));
     }
   }
 
