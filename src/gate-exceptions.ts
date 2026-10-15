@@ -1,7 +1,7 @@
 import {createHash} from 'node:crypto';
 import {readFileSync,lstatSync,realpathSync} from 'node:fs';
 import {execFileSync} from 'node:child_process';
-import {resolve,relative,isAbsolute} from 'node:path';
+import {resolve,relative,isAbsolute,sep} from 'node:path';
 import {release} from 'node:os';
 import {XMLParser} from 'fast-xml-parser';
 import {parseGateOutput,type GateOutputFormat} from './gate-output.js';
@@ -77,7 +77,7 @@ export function checkInheritedException(input:GateExceptionInput,now=Date.now())
   if(!input.basePath || !/^[a-f0-9]{40}$/.test(input.base) || !/^[a-f0-9]{40}$/.test(input.head)) return 'Readable exact branch and baseline evidence is required';
   if(lstatSync(input.policyFile).isSymbolicLink()) return 'The exception policy cannot be a symbolic link';
   const inside=relative(realpathSync(input.cwd),realpathSync(input.policyFile));
-  if(!inside.startsWith('..') && !isAbsolute(inside)) return 'The exception policy must be outside the ticket checkout';
+  if(!isAbsolute(inside) && inside!=='..' && !inside.startsWith('..'+sep)) return 'The exception policy must be outside the ticket checkout';
   const policy=JSON.parse(readFileSync(input.policyFile,'utf8'));
   if(policy.version!==1 || !Array.isArray(policy.exceptions) || policy.exceptions.length>200) return 'The exception policy is invalid';
   const records:GateException[]=policy.exceptions.filter((r:GateException)=>r&&r.project===input.project&&r.gate===input.gate&&r.test===input.test&&r.tracker===input.tracker);

@@ -1,3 +1,6 @@
+import {mkdtempSync,writeFileSync,rmSync} from 'node:fs';
+import {join} from 'node:path';
+import {tmpdir} from 'node:os';
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {exceptionRefusal,failureSignature,checkInheritedException,type GateException} from './gate-exceptions.js';
@@ -39,4 +42,12 @@ test('JUnit assertion messages remain distinct even with the same test identity'
  test('security classification refuses even when the failed name looks unrelated',()=>{
   assert.match(exceptionRefusal({...record,test:'pkg.TestAuthentication'},{...input,test:'pkg.TestAuthentication'},now)!,/Security/);
   assert.match(checkInheritedException({policyFile:'/absent/policy',project:record.project,gate:record.gate,test:record.test,tracker:42,format:'go-json',branchPath:'/absent/branch',basePath:null,cwd:'/tmp',base:'a'.repeat(40),head:'b'.repeat(40),securitySensitive:true},now)!,/Security/);
+ });
+
+ test('a two-dot filename is still inside the ticket checkout',()=>{
+  const root=mkdtempSync(join(tmpdir(),'gate-policy-'));
+  try {
+   const policy=join(root,'..policy.json');writeFileSync(policy,JSON.stringify({version:1,exceptions:[]}));
+   assert.match(checkInheritedException({policyFile:policy,project:record.project,gate:record.gate,test:record.test,tracker:42,format:'go-json',branchPath:'/unused',basePath:'/unused',cwd:root,base:'a'.repeat(40),head:'b'.repeat(40)},now)!,/outside the ticket checkout/);
+  } finally {rmSync(root,{recursive:true,force:true});}
  });
