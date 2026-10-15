@@ -22,6 +22,10 @@ def execute(args, **kwargs):
         raise RuntimeError('Configured workload command failed with exit ' + str(result.returncode))
     return result.stdout.strip()
 
+class SignalNotSent(RuntimeError):
+    """The stop signal was certainly not delivered, so a later pass may send it."""
+    signal_not_sent = True
+
 def lock(path):
     return dict(line.split('=', 1) for line in Path(path).read_text().splitlines())
 
@@ -85,7 +89,8 @@ class NativeAdapter:
     def operator(self, command):
         return json.loads(execute(self.operator_command(command)))
 
-    def status(self): return self.operator('status')
+    # Local only: this is read many times a pass, and must not wait on the claim service's fleet report.
+    def status(self): return json.loads(execute(self.operator_command('status', '--local')))
     def attention(self): return self.operator('attention')
     def publish_attention(self): execute(self.operator_command('report-attention', self.config['reportFile']))
 
@@ -261,13 +266,38 @@ print(json.dumps({'startupHealthy': health.get('passed'), 'runtime': receipt, 'p
         return execute(['git', '-C', cfg['agents'], 'branch', '--show-current']) == 'main'
 
     def drain(self, project, identity):
-        if self.observe(project).get('identity') != identity:
-            raise RuntimeError('Dispatcher changed before signalling')
+        # Everything before the signal itself, and a refused signal, is a
+        # certain non-delivery. Only a timeout leaves delivery unknown.
+        try:
+            current = self.observe(project).get('identity')
+        except Exception as error:
+            raise SignalNotSent('Dispatcher observation failed before signalling: ' + type(error).__name__) from error
+        if current != identity:
+            raise SignalNotSent('Dispatcher changed before signalling')
         cfg = self.config['projects'][project]
         if self.config['platform'] == 'linux':
-            self.retain_publish_files(project)
-            execute(['podman', 'exec', cfg['container'], 'kill', '-TERM', str(identity['pid'])])
-        else: os.kill(identity['pid'], signal.SIGTERM)
+            try:
+                self.retain_publish_files(project)
+            except Exception as error:
+                raise SignalNotSent('Publish files could not be retained before signalling: ' + type(error).__name__) from error
+            try:
+                execute(['podman', 'exec', cfg['container'], 'kill', '-TERM', str(identity['pid'])])
+            except subprocess.TimeoutExpired:
+                raise
+            except RuntimeError as error:
+                # podman exec or kill exited non-zero: nothing was delivered.
+                raise SignalNotSent(str(error)) from error
+        else:
+            try:
+                os.kill(identity['pid'], signal.SIGTERM)
+            except (ProcessLookupError, PermissionError) as error:
+                raise SignalNotSent('Signal refused: ' + type(error).__name__) from error
+
+    def installed(self, project):
+        """The consumer and dispatcher revisions checked out for a board."""
+        cfg = self.config['projects'][project]
+        return {'consumer': execute(['git', '-C', cfg['agents'], 'rev-parse', 'HEAD']),
+                'dispatcher': execute(['git', '-C', Path(cfg['agents']) / 'dispatcher', 'rev-parse', 'HEAD'])}
 
     def update(self, project, desired):
         cfg = self.config['projects'][project]

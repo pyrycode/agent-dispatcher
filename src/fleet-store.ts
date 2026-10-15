@@ -15,6 +15,7 @@ import {createHash} from 'node:crypto';
 import {manifestHash} from './recovery-artifacts.js';
 import type { AgentRunner } from './agent-runner.js';
 import { CAPABILITY_REPORT_FRESH_MS, missingCapabilities, ticketRequirements, validateCapabilityReport } from "./ticket-requirements.js";
+import { DesiredStateStore, workRefusal, type DesiredCommand, type DesiredDocument, type DesiredPoll } from './desired-state.js';
 import { CodexThrottle, startsCodex, DEFAULT_CODEX_THROTTLE, type CodexThrottleConfig, type CodexPauseState, type CodexSpacingState } from './codex-throttle.js';
 
 /** An operator choice, frozen into each new grant. Null restores local settings. */
@@ -143,7 +144,7 @@ export interface FleetSnapshot { workflowProjects?: string[]; claims: Claim[]; r
    */
   openTaskTickets?: string[] }
 export type StartResult = { ok: true; generation: string } | {
-  ok: false; reason: "foreign-claim" | "running" | "capacity" | "locked" | "finished" | "codex-paused" | "codex-spaced" | "incapable";
+  ok: false; reason: "foreign-claim" | "running" | "capacity" | "locked" | "finished" | "codex-paused" | "codex-spaced" | "incapable" | "drained";
 };
 /** projects: the projects the computer's manager serves; absent from a report that did not say, which counts for every project. */
 export interface MachineCapabilityReport { capabilities: string[]; projects?: string[]; updated: number }
@@ -206,6 +207,8 @@ export class FleetStore {
   readonly tasks: RecoveryTasks;
   readonly orphans: OrphanedTaskWatch;
   readonly codex: CodexThrottle;
+  /** The operator's central drains and stops per computer and board. See desired-state.ts. */
+  readonly desired: DesiredStateStore;
   private readonly clock: () => number;
   constructor(path: string, private readonly limits: Readonly<Record<string, MachineLimits>>, options: FleetStoreOptions = {}) {
     for (const value of Object.values(limits)) validateLimits(value);
@@ -249,6 +252,7 @@ export class FleetStore {
     this.orphans = new OrphanedTaskWatch(this.db, this.tasks, this.operations, clock, options.orphanedTaskMs);
     this.clock = clock;
     this.codex = new CodexThrottle(this.db, clock, options.codexThrottle ?? DEFAULT_CODEX_THROTTLE, options.log);
+    this.desired = new DesiredStateStore(this.db, Object.keys(limits), clock, machine => this.machineCapabilities()[machine]?.projects);
   }
   close(): void { this.db.close(); }
   /** The authority's record of one run, finished or not. Evidence uploads are accepted only from its own computer. */
@@ -576,6 +580,11 @@ export class FleetStore {
         if (JSON.stringify(original) !== request) throw new Error("Request ID reused with different contents");
         return previous.finished === null ? { ok: true, generation: String(previous.generation) } : { ok: false, reason: "finished" };
       }
+    // The operator's central drain or stop holds new grants here even when
+    // the computer's manager is older or has not fetched it yet. A retry of
+    // a lost reply above still recovers its grant.
+    if (workRefusal(project => this.desired.work(req.machine, project), req,
+      this.db.prepare("SELECT machine FROM fleet_claims WHERE ticket=?").get(req.ticket)?.machine === req.machine)) return { ok: false, reason: "drained" };
     if(this.workflow.preparing(req.project))return {ok:false,reason:'locked'};
     if(this.workflow.enabled(req.project) && !req.supportTaskId && req.workflowVersion!==1) return {ok:false,reason:"locked"};
     if(this.workflow.enabled(req.project) && /#[1-9]\d*$/.test(req.ticket)) {
@@ -727,6 +736,10 @@ export class FleetStore {
       return event === "clean" ? this.codex.clean(source) : this.codex.rateLimited(source);
     });
   }
+  /** A manager's desired state fetch. See DesiredStateStore.poll. */
+  desiredPoll(machine: string, poll: DesiredPoll): DesiredDocument { return this.transaction(() => this.desired.poll(machine, poll)); }
+  /** Operator: a central drain, resume, stop or start. See DesiredStateStore.set. */
+  setDesired(command: DesiredCommand) { return this.transaction(() => this.desired.set(command)); }
   /** Operator: end a Codex pause early and reset its backoff. */
   clearCodexPause(): CodexPauseState { return this.transaction(() => this.codex.clear()); }
   /** Log a Codex pause that has run out. Called on a timer by the claim service. */
