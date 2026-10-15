@@ -3,7 +3,6 @@ import { createServer, request, type IncomingMessage, type Server } from "node:h
 import { timingSafeEqual } from "node:crypto";
 import { chmodSync } from "node:fs";
 import type { GitHubBroker, GitHubRequest, GitHubResponse } from "./github-broker.js";
-import {publishRepair} from "./recovery-repair-publication.js";
 import {loadRepairBase,RepairBaseUnavailable,RepairRefusal} from "./recovery-source-publication.js";
 import { OwnershipRefusal, type Claim, type FleetStore, type FleetSnapshot, type StartRequest, type StartResult } from "./fleet-store.js";
 import type { EvidenceStore } from "./evidence-store.js";
@@ -69,7 +68,6 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
   const secrets = [...Object.values(machines), admin];
   if (secrets.some(s => !s) || new Set(secrets).size !== secrets.length) throw new Error("Fleet credentials must be non-empty and distinct");
   const workflowGitHub=github?new WorkflowGitHub(store,github):undefined;
-  const repairWrites=new Map<string,Promise<unknown>>();
   const server = createServer(async (req, res) => {
     const send = (status: number, value: unknown) => {
       res.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store" });
@@ -159,7 +157,7 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
       if (req.url === '/tasks/queue') {
         const actor = isAdmin ? body.machine : machine;
         if (!actor) return send(403,{error:'Task worker required'});
-        return send(200,store.tasks.list().filter(t => store.tasks.available(actor,t.id)));
+        return send(200,store.tasks.list().filter(t => t.request.recipe !== 'dispatcher-repair' && store.tasks.available(actor,t.id)));
       }
       if (req.url === '/tasks/uncertain') {
         const actor=isAdmin?body.machine:machine;
@@ -169,14 +167,13 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
       if (req.url === '/tasks/start' || req.url === '/tasks/complete') {
         const actor = isAdmin ? body.machine : machine;
         if (!actor) return send(403,{error:'Task worker required'});
-        // A publication write still running here may merge. Failing its task
-        // now would release the place and discard a repair that is landing.
-        if(req.url === '/tasks/complete' && body.result?.outcome === 'failed' && repairWrites.has(body.id)) return send(409,{error:'Repair publication in progress'});
+        if (req.url === '/tasks/start' && store.tasks.get(body.id).request.recipe === 'dispatcher-repair') return send(409,{error:'Automatic dispatcher repair is disabled'});
         return send(200,req.url === '/tasks/start' ? store.taskStart(actor,body.id,body.session)
           : store.taskComplete(actor,body.id,body.session,body.result,body.expectStates));
       }
       if (req.url === '/tasks/request') {
         if (!machine) return send(403,{error:'Admitted source worker required'});
+        if (body.request?.recipe === 'dispatcher-repair') return send(409,{error:'Automatic dispatcher repair is disabled'});
         return send(200,store.requestTask(machine,body.session,body.project,body.runId,body.request));
       }
       if (req.url === '/tasks/read') {
@@ -210,22 +207,15 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
           base=await loadRepairBase(github,repairRepository,task.request.revision,Object.keys(files));
         return send(200,store.prepareRepair(actor,body.id,body.session,body.publication,base));
       }
-      if (req.url === '/tasks/publish-repair') {
-        if ((!isAdmin&&!machine) || !github || !repairRepository) return send(403,{error:'Configured repair authority required'});
-        const task=store.tasks.get(body.id);
-        if(task.machine!==(isAdmin?body.machine:machine) || task.session!==body.session) return send(403,{error:'Task actor mismatch'});
-        // Only a prepared repair publishes, so every published byte passed the source scan.
-        if(task.state!=='publishing') return send(409,{error:'Repair must be prepared before publication'});
-        let work=repairWrites.get(task.id);
-        if(!work) {
-          work=publishRepair(github,repairRepository,task,body.publication,repairConsumers,sha=>{store.controlTarget(sha);return store.controlsReady(sha,controlRevision);}).finally(()=>repairWrites.delete(task.id));
-          repairWrites.set(task.id,work);
-        }
-        return send(200,await work);
+      if (req.url === '/tasks/publish-repair') return send(410,{error:'Automatic repair publication is retired. Retain the private patch for a reviewed manual pull request.'});
+      if (req.url === '/tasks/cancel-queued') {
+        if (!isAdmin) return send(403,{error:'Operator credential required'});
+        return send(200,store.cancelQueuedTask(body.id,body.reason));
       }
       if (req.url === '/tasks/operator-request') {
         if (!isAdmin) return send(403,{error:'Operator credential required'});
         if (!/^[\w.-]+\/[\w.-]+#[1-9]\d*$/.test(body.ticket)) throw new Error('Invalid source ticket');
+        if (body.request?.recipe === 'dispatcher-repair') return send(409,{error:'Automatic dispatcher repair is disabled. Submit a reviewed manual pull request.'});
         return send(200,store.tasks.request(body.ticket,body.request));
       }
       if (req.url === "/recovery/facts") return send(200, store.recoveryFacts(body.tickets,
@@ -315,6 +305,7 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
       }
       if (req.url === "/start") {
         if (!machine || body.machine !== machine) return send(403, { error: "Machine identity mismatch" });
+        if (body.supportTaskId && store.tasks.get(body.supportTaskId).request.recipe === 'dispatcher-repair') return send(409,{error:'Automatic dispatcher repair is disabled'});
         return send(200, store.start(body));
       }
       if (req.url === "/finish") {

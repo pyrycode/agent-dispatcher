@@ -952,6 +952,18 @@ class PublicationRefusalTests(unittest.TestCase):
    self.assertEqual(ops.count('schedule'),2)
    self.assertEqual(first,[]);self.assertEqual(second,[])
 
+ def test_retired_publication_settles_only_the_drained_worker_and_keeps_its_patch(self):
+  with tempfile.TemporaryDirectory() as d:
+   error=m.rpc_failure('publish-repair',1,'Service 410: {"error":"Automatic repair publication is retired"}')
+   s,calls,logged,receipt,work=self.support(d,{'publish-repair':error})
+   s.tick();s.tick()
+   self.assertEqual([op for op,_ in calls].count('publish-repair'),1)
+   result=next(body['result'] for op,body in calls if op=='complete')
+   self.assertEqual(result['outcome'],'failed')
+   self.assertIn('reviewed manual pull request',result['summary'])
+   self.assertTrue((work/'publication.json').is_file())
+   self.assertEqual(json.loads(receipt.read_text())['phase'],'complete')
+
  def test_a_lost_release_retries_the_saved_result_without_asking_again(self):
   with tempfile.TemporaryDirectory() as d:
    s,calls,logged,receipt,work=self.support(d,{'prepare-repair':m.rpc_failure('prepare-repair',1,REFUSED),

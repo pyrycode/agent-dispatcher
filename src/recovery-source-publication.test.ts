@@ -535,8 +535,8 @@ test('base reads need the revision itself, and publication needs a prepared repa
  assert.deepEqual(store.snapshot(),before);
  // Publication without preparation would skip the source scan entirely.
  const response=await post('/tasks/publish-repair',value);
- assert.equal(response.status,409);
- assert.equal((await response.json()).error,'Repair must be prepared before publication');
+ assert.equal(response.status,410);
+ assert.match((await response.json()).error,/publication is retired/);
  commitStatus=200;
  assert.equal((await post('/tasks/prepare-repair',value)).status,422,'with a readable revision a missing path is a new file');
 });

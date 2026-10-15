@@ -1,3 +1,4 @@
+import {scrubCredentials} from "./agent-runtime.js";
 import { isRepairWip } from "./recovery-labels.js";
 import { PRIORITY_HIGH } from "./ticket-priority.js";
 import { WorkflowStore, type WorkflowChange } from "./workflow-store.js";
@@ -9,7 +10,7 @@ import { RecoveryFacts, type PauseRecord, type EvidenceRecord, type Coordination
 import { RecoveryLedger, validateObservations, IDLE_RECOVERY_REASONS, RECOVERY_UNKNOWN_PAUSE_REASON, type RecoveryObservation, type RecoveryDecision, type RecoveryIncident, type RecoveryLedgerOptions } from "./fleet-recovery.js";
 import { OperationReports } from './operation-reports.js';
 import { OrphanedTaskWatch } from './orphaned-tasks.js';
-import {RecoveryTasks, assessmentTasks, recoveryTaskId, validateTaskRequest, type RecoveryTaskRequest, type RecoveryTaskResult} from './recovery-tasks.js';
+import {RecoveryTasks, assessmentTasks, recoveryTaskId, validateTaskRequest, type RecoveryTaskRequest, type RecoveryTaskResult, type RecoveryTask} from './recovery-tasks.js';
 import { currentWorkflow, recordRepairWorkflow, dispatcherRepairCap } from './recovery-repair-cap.js';
 import {createHash} from 'node:crypto';
 import {manifestHash} from './recovery-artifacts.js';
@@ -306,7 +307,8 @@ export class FleetStore {
     return this.transaction(() => {
       if (step === "begin") return this.recovery.begin(id, runId);
       if (step === "decide") {
-        const selected = this.recovery.decide(id, runId, decision!);
+        const selected = this.recovery.decide(id, runId, decision?.action === 'coordinate' && decision.task?.recipe === 'dispatcher-repair'
+          ? {action:'escalate',category:'human',reason:'Automatic dispatcher repair is disabled. Submit one reviewed manual fleet fix for Juhana to approve.'} : decision!);
         if (selected.action === 'coordinate') {
           const task = this.tasks.request(incident.ticket, selected.task!,incident.id);
           if (task.request.recipe === 'dispatcher-repair') recordRepairWorkflow(this.db, task.id, task.ticket, currentWorkflow(this.db, task.ticket));
@@ -315,6 +317,21 @@ export class FleetStore {
       }
       if (step === "complete") { this.recovery.complete(id, runId); return { ok: true }; }
       throw new Error("Invalid recovery operation");
+    });
+  }
+
+  /** Only never-started tasks can be withdrawn without stop confirmation. */
+  cancelQueuedTask(id: string, reason: string): RecoveryTask {
+    if (!/^[a-f0-9]{64}$/.test(id) || typeof reason !== 'string' || !reason.trim() || reason.length > 2000) throw new Error('Provide a task id and cancellation reason');
+    return this.transaction(() => {
+      const task = this.tasks.get(id);
+      const summary = 'Withdrawn before it started by operator: ' + scrubCredentials(reason.trim());
+      if (task.state === 'failed' && task.result?.summary === summary) return task;
+      if (task.state !== 'queued' || task.machine || task.session || task.runId
+        || this.snapshot().runs.some(run => run.supportTaskId === id)) throw new Error('Only an unstarted queued task can be cancelled');
+      this.db.prepare("UPDATE fleet_recovery_tasks SET state='failed',result=?,updated=? WHERE id=? AND state='queued'")
+        .run(JSON.stringify({outcome:'failed',summary,files:{}}),this.clock(),id);
+      return this.tasks.get(id);
     });
   }
 

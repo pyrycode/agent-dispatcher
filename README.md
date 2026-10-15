@@ -103,6 +103,8 @@ The agents repo provides:
 
 A launcher should install dependencies with `dispatcher/scripts/install-deps.sh`, not `pnpm install --silent`. The script installs unattended with a frozen lockfile, accepts a move of the pnpm store, stays quiet when nothing failed, and prints pnpm's output plus one line naming the failure when something did. On 2026-10-13, after `.npmrc` moved the store into the checkout, pyrybox's Desktop dispatcher exited with status 1 and no message 139 times: pnpm wanted to ask before removing a `node_modules` built against the old store, had no terminal to ask, and `--silent` hid it. `confirmModulesPurge: false` in `pnpm-workspace.yaml` also lets the old `pnpm install --silent` line through that switch, for launchers not yet changed.
 
+Fleet review changes and approval procedures: [fleet implementation](docs/fleet-implementation.md).
+
 ## Updating the shared dispatcher
 
 Make shared source changes in this repository. Test and publish the merged

@@ -764,6 +764,9 @@ class SupportSupervisor:
                 except ServiceRefusal as error:
                     # The authority refused these exact bytes. A retry is refused
                     # again, so the task ends here and its reservation is released.
+                    if error.operation=='publish-repair' and error.status==410:
+                        old['publicationRefused']={'at':time.time(),'reason':error.message,'retired':True}
+                        return self.refuse_publication(machine,receipt,old)
                     if error.operation=='prepare-repair' and error.refused:
                         old['publicationRefused']={'at':time.time(),'reason':error.message}
                         return self.refuse_publication(machine,receipt,old)
@@ -825,7 +828,8 @@ class SupportSupervisor:
             retained=str(Path(old.get('directory') or Path(old['result']).parent))
             summary=('Repair publication refused: '+refused['reason']+' The repair finished, but it was not published. '
                      'Its reviewed patch is retained privately on this host in '+retained+' (publication.json). '
-                     'Fix the cause of the refusal, then republish it or request the repair again.')
+                     + ('Submit the retained patch as a reviewed manual pull request.' if refused.get('retired') else
+                        'Fix the cause of the refusal, then republish it or request the repair again.'))
             # Saved before the release, so a retry sends the identical result.
             refused['retained']=retained
             refused['result']={'outcome':'failed','summary':summary,'files':{}}
