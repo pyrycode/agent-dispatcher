@@ -19,11 +19,13 @@ import type { FleetRun, FleetSnapshot } from "./fleet-store.js";
  *
  * Input is the raw output of `git status --porcelain`. Whitespace-only
  * output is treated as clean — guards against false positives from
- * trailing newlines or shell padding.
+ * trailing newlines or shell padding. Paths in `exclude` (fixtures a gate
+ * rewrote, see gate-fixtures.ts) never count as work to commit.
  */
-export function shouldAutoCommit(gitStatusOutput: string): boolean {
-  return statusEntries(gitStatusOutput).some(({ status, path, from }) =>
-    status[0] === "D" || !isRuntimeFile(path) || (from !== undefined && !isRuntimeFile(from)));
+export function shouldAutoCommit(gitStatusOutput: string, exclude: ReadonlySet<string> = new Set()): boolean {
+  // A rename counts as excluded only when both of its sides are.
+  return statusEntries(gitStatusOutput).some(({ status, path, from }) => !(exclude.has(path) && (from === undefined || exclude.has(from))) && (
+    status[0] === "D" || !isRuntimeFile(path) || (from !== undefined && !isRuntimeFile(from))));
 }
 
 /** One policy for every dispatcher automatic staging/commit path. */

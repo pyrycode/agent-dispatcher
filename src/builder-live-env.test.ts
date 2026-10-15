@@ -73,3 +73,12 @@ test("Codex builder uses names-only narrow inheritance and secret names stay rej
   assert.ok(!buildCodexInvocation({ ...opts, sourceReview: true }).args.some(arg => arg.includes("OP_SERVICE_ACCOUNT_TOKEN")));
   assert.ok(!buildCodexInvocation({ ...opts, builderLiveTests: false }).args.some(arg => arg.includes("OP_SERVICE_ACCOUNT_TOKEN")));
 });
+
+test("only the code-writing roles keep the Codex test login (pyrycode #3389)", () => {
+  const parent = { PYRY_CODEX_CAPTURE_BIN: "/opt/codex", PYRY_CODEX_CAPTURE_HOME: "/home/x/.codex-test", PATH: "/bin" };
+  for (const role of ["builder", "developer"]) assert.equal(agentSpawnEnv(parent, role).PYRY_CODEX_CAPTURE_HOME, "/home/x/.codex-test", role);
+  for (const role of ["verifier", "code-review", "qa", "refiner", "documentation", "recovery", "po", "architect"]) {
+    const env = agentSpawnEnv(parent, role);
+    assert.ok(!("PYRY_CODEX_CAPTURE_BIN" in env) && !("PYRY_CODEX_CAPTURE_HOME" in env), role);
+  }
+});
