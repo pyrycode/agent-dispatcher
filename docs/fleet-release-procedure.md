@@ -49,3 +49,6 @@ fleet. Confirm all four saved documents before retiring those paths.
 
 Queued task cancellation is covered by the earlier repair-restriction change.
 No live configuration, target, service or pin was changed by this pull request.
+
+The package-level drain entry also refuses. Its former local process signal does
+not save fleet intent. Use the protected central command with a machine selection.

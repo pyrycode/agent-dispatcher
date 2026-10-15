@@ -1,6 +1,7 @@
+import {spawnSync} from 'node:child_process';
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtempSync,rmSync,writeFileSync,statSync} from 'node:fs';
+import {mkdtempSync,rmSync,writeFileSync,statSync,readFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
@@ -60,3 +61,12 @@ test('release changes require the operator and a configured private backup direc
  await assert.rejects(machine.call('/operations/release-complete',{commandId:request.commandId}),/403/);
  assert.equal((await operator.call<any[]>('/operations/releases')).length,1);
 });
+
+ test('the package drain entry refuses without sending a local process signal',()=>{
+  const {scripts}=JSON.parse(readFileSync(new URL('../package.json',import.meta.url),'utf8'));
+  assert.ok(!scripts.drain.includes('pkill'),'Never execute the legacy local signal command in a test');
+  assert.ok(scripts.drain.startsWith('node -e '));
+  const result=spawnSync('pnpm',['run','drain'],{encoding:'utf8',timeout:10_000,env:{PATH:process.env.PATH,HOME:process.env.HOME}});
+  assert.notEqual(result.status,0);assert.match(result.stderr,/protected fleet drain command/);
+  assert.match(result.stderr,/--machine MACHINE or --all-machines/);
+ });
