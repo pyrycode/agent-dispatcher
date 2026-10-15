@@ -178,15 +178,15 @@ export interface FleetStoreOptions extends RecoveryLedgerOptions {
   log?: (line: string) => void;
 }
 
+/** How long a creating run holds its new tickets at most: the stale-reservation age. */
+export const CREATOR_HOLD_MS = 3 * 60 * 60 * 1000;
+
 /**
  * A workflow write refused because the ticket is owned elsewhere: another
  * computer's claim or run, another run on the same computer, or a run grant
  * that has finished. The HTTP layers report it as a 409 refusal with this
  * reason instead of a generic failure.
  */
-/** How long a creating run holds its new tickets at most: the stale-reservation age. */
-export const CREATOR_HOLD_MS = 3 * 60 * 60 * 1000;
-
 export class OwnershipRefusal extends Error {
   constructor(message: string) { super(message); this.name = "OwnershipRefusal"; }
 }
