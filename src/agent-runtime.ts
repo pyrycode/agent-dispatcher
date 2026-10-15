@@ -801,13 +801,26 @@ export function scrubSpawnEnv(parentEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 }
 
 /**
+ * The Codex test login a fork sets for its live Codex tests. Only the live
+ * (real-claude) gate and the code-writing roles keep it, see
+ * `buildLiveGateSpawnEnv` and `agentSpawnEnv`. Every other gate and role
+ * runs without it: Core's `TestCaptureLive` has no build tag, so on a computer
+ * with the login a verifier's `make check` spent Codex allowance and rewrote
+ * `internal/codexsup/testdata/capture/*.jsonl`, which the safety-net commit
+ * then pushed (pyrycode #3385 and #3389, 2026-10-15).
+ */
+export const CODEX_CAPTURE_ENV = ["PYRY_CODEX_CAPTURE_BIN", "PYRY_CODEX_CAPTURE_HOME"] as const;
+
+/**
  * Builders reuse the live-test login loaded at startup, or fetch it through
  * the restricted Dev Agents account. The Automation account is always
  * scrubbed first. No other role receives either service-account token.
  * Keep this separate from the non-secret PYRY_AGENT_SHELL_ENV allowlist.
+ * Only the code-writing roles keep the Codex test login (CODEX_CAPTURE_ENV).
  */
 export function agentSpawnEnv(parentEnv: NodeJS.ProcessEnv, role: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...scrubSpawnEnv(parentEnv), CLAUDE_CODE_ENTRYPOINT: role };
+  if (role !== "builder" && role !== "developer") for (const name of CODEX_CAPTURE_ENV) delete env[name];
   const token = parentEnv.PYRY_DEV_AGENTS_TOKEN;
   if (role === "builder" && token?.trim()) env.OP_SERVICE_ACCOUNT_TOKEN = token;
   const live = parentEnv.CLAUDE_CODE_OAUTH_TOKEN;

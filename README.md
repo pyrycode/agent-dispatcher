@@ -430,6 +430,10 @@ A bare `make e2e-realclaude` target will **not** work. Without `-json` it prints
 
 **Billing.** The spawn environment keeps `CLAUDE_CODE_OAUTH_TOKEN` and leaves `ANTHROPIC_API_KEY` unset, so runs bill against the subscription. Tests that need a metered key skip; the executed floor should be set with those skips already accounted for.
 
+**Codex test login.** `PYRY_CODEX_CAPTURE_BIN` and `PYRY_CODEX_CAPTURE_HOME` reach only the live gate: its own run, its same-tree rerun, its base-commit checks and its health checks. The pre-verifier gates, their baselines and the main sweep run without them, so an ordinary `make check` never starts live Codex. A fork's `.env` keeps both variables for the live gate. On 2026-10-15 the Mac's verifier `make check` ran Core's untagged `TestCaptureLive` with them, spent Codex allowance and rewrote six `testdata/capture` fixtures (pyrycode #3385 and #3389).
+
+**Fixtures a gate rewrites.** The pre-verifier gate step compares the worktree's `testdata/` files before and after the gates. A file the gates changed is put back when it was clean before (a tracked file returns to HEAD, a new one is removed), and every changed path stays out of the run's safety-net commit and partial-work salvage. The ticket gets a `Gate rewrote test fixtures` comment and the dispatch log a `GATE FIXTURES` section. A test that writes its fixtures on an ordinary run is a defect in that test.
+
 ## Layout
 
 ```

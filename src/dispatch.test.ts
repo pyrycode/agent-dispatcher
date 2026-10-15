@@ -85,6 +85,8 @@ import {
   type DispatchDeps,
   type SigintState,
   buildGateSpawnEnv,
+  buildLiveGateSpawnEnv,
+  CODEX_CAPTURE_ENV,
   runRealClaudeGateSuite,
   recordInfraPause,
   readInfraPause,
@@ -7989,6 +7991,42 @@ describe("buildGateSpawnEnv", () => {
     assert.ok(!("GITHUB_TOKEN" in spawnRequests[0].env));
     assert.ok(!("ANTHROPIC_API_KEY" in spawnRequests[0].env));
   });
+
+  // pyrycode #3385 and #3389, 2026-10-15: the Mac's Codex test login reached
+  // a verifier's `make check`, TestCaptureLive ran live Codex and rewrote six
+  // capture fixtures, and the safety-net commit pushed them.
+  const capture = { PYRY_CODEX_CAPTURE_BIN: "/opt/codex", PYRY_CODEX_CAPTURE_HOME: "/home/x/.codex-test", CLAUDE_CODE_OAUTH_TOKEN: "t" };
+  test("drops the Codex test login: no ordinary gate runs live Codex", () => {
+    const env = buildGateSpawnEnv(capture);
+    for (const name of CODEX_CAPTURE_ENV) assert.ok(!(name in env), name);
+    assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, "t");
+  });
+
+  test("the live gate keeps the Codex test login, and still drops everything else", () => {
+    const env = buildLiveGateSpawnEnv({ ...capture, ANTHROPIC_API_KEY: "metered", GITHUB_TOKEN: "ghp", PYRY_GATE_EVIDENCE_DIR: "/elsewhere" });
+    assert.equal(env.PYRY_CODEX_CAPTURE_BIN, "/opt/codex");
+    assert.equal(env.PYRY_CODEX_CAPTURE_HOME, "/home/x/.codex-test");
+    for (const name of ["ANTHROPIC_API_KEY", "GITHUB_TOKEN", "PYRY_GATE_EVIDENCE_DIR"]) assert.ok(!(name in env), name);
+  });
+
+  test("verifier gates run without the Codex test login; the live gate run gets it", async () => {
+    const saved = Object.fromEntries(CODEX_CAPTURE_ENV.map(n => [n, process.env[n]]));
+    Object.assign(process.env, { PYRY_CODEX_CAPTURE_BIN: "/opt/codex", PYRY_CODEX_CAPTURE_HOME: "/home/x/.codex-test" });
+    try {
+      const seen: NodeJS.ProcessEnv[] = [];
+      await runVerifierGates({
+        gates: ["make check"], cwd: "/tmp/fake-worktree", issueNumber: 3389, logsDir: mkdtempSync(join(tmpdir(), "gate-env-")),
+        deps: { spawnGate: async (req) => { seen.push(req.env); return { exitCode: 0, timedOut: false, spawnError: null }; }, readFileSync: (() => "") as any },
+      });
+      assert.equal(seen.length, 1);
+      for (const name of CODEX_CAPTURE_ENV) assert.ok(!(name in seen[0]!), name);
+      const { run, spawnRequests } = gateRun();
+      await run();
+      assert.equal(spawnRequests[0].env.PYRY_CODEX_CAPTURE_HOME, "/home/x/.codex-test");
+    } finally {
+      for (const [name, value] of Object.entries(saved)) { if (value === undefined) delete process.env[name]; else process.env[name] = value; }
+    }
+  });
 });
 
 describe("createCodegraphReindexer (post-merge, background, one at a time)", () => {
@@ -9555,6 +9593,31 @@ describe("pre-verifier gates — dispatchToAgent wiring", () => {
       const log = loggedText(calls);
       assert.match(log, /GATES/);
       assert.match(log, /✓ make check \(exit 0\)/);
+    }));
+  });
+
+  test("maybeRunPreSpawnGates: fixtures the gates rewrite are put back, noted on the ticket and kept out of commits (#3389)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gate-testdata-"));
+    const git = (cmd: string) => execSync(`git ${cmd}`, { cwd: dir, stdio: "pipe" });
+    git("init -q -b main"); git("config user.email t@example.com"); git("config user.name t");
+    const fixture = "internal/codexsup/testdata/capture/plain.jsonl";
+    mkdirSync(join(dir, dirname(fixture)), { recursive: true });
+    writeFileSync(join(dir, fixture), "committed\n");
+    git("add -A"); git("commit -q -m init");
+    await withStageSet("builder", () => withVerifierGates("make check", async () => {
+      const { ctx, client, calls } = makeTestContext({
+        agent: builderAgent("verifier"), item: { issueNumber: 3389 },
+        mockOptions: { gateImpl: () => { writeFileSync(join(dir, fixture), "live capture\n"); return { exitCode: 0, timedOut: false, spawnError: null }; } },
+      });
+      ctx.agentCwd = dir;
+      ctx.deps = { ...ctx.deps, spawnSync };
+      const result = await maybeRunPreSpawnGates(ctx);
+      assert.match(result.promptNote, /all passed/);
+      assert.equal(readFileSync(join(dir, fixture), "utf8"), "committed\n", "the rewrite is put back");
+      assert.deepEqual([...ctx.gateTestdata ?? []], [fixture]);
+      assert.equal(client.comments.length, 1);
+      assert.match(client.comments[0]!.body, /Gate rewrote test fixtures/);
+      assert.match(loggedText(calls), /GATE FIXTURES/);
     }));
   });
 

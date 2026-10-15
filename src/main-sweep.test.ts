@@ -222,6 +222,20 @@ describe("runMainSweep", () => {
     assert.ok(h.calls.at(-2)?.startsWith("git worktree remove "));
   });
 
+  test("runs without the Codex test login (pyrycode #3389)", async () => {
+    const saved = [process.env.PYRY_CODEX_CAPTURE_BIN, process.env.PYRY_CODEX_CAPTURE_HOME];
+    process.env.PYRY_CODEX_CAPTURE_BIN = "/opt/codex"; process.env.PYRY_CODEX_CAPTURE_HOME = "/home/x/.codex-test";
+    try {
+      const h = runnerDeps();
+      await sweep(h);
+      assert.ok(!("PYRY_CODEX_CAPTURE_BIN" in h.requests[0].env) && !("PYRY_CODEX_CAPTURE_HOME" in h.requests[0].env));
+    } finally {
+      for (const [name, value] of [["PYRY_CODEX_CAPTURE_BIN", saved[0]], ["PYRY_CODEX_CAPTURE_HOME", saved[1]]] as const) {
+        if (value === undefined) delete process.env[name]; else process.env[name] = value;
+      }
+    }
+  });
+
   test("a non-zero exit, a timeout or a spawn error is a failure", async () => {
     assert.equal((await sweep(runnerDeps({ spawn: { exitCode: 1 } }))).passed, false);
     assert.equal((await sweep(runnerDeps({ spawn: { exitCode: null, timedOut: true } }))).passed, false);

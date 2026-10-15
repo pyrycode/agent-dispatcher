@@ -1,7 +1,7 @@
 import type {RecoveryTask} from "./recovery-tasks.js";
 import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
-import { listen, readJson, tokenMatches, type FleetClient } from "./fleet-http.js";
+import { listen, readJson, tokenMatches, ownershipRefusal, type FleetClient } from "./fleet-http.js";
 import { validateStart, validateLimits, type MachineLimits, type FleetRun } from "./fleet-store.js";
 import { scheduleMachine, runnableTickets, acceptsDuringProjectDrain, codexPaused, codexSpaced, isNewTicket, reviewQueue, effectiveReviewQueueLimit, lackingCapabilities, type WorkOffer } from "./machine-scheduler.js";
 import { validateCapabilityReport } from "./ticket-requirements.js";
@@ -255,7 +255,12 @@ export async function serveManager(manager: MachineManager, projectTokens: Recor
         return send(200, await manager.claims.authorize(body.session, body.ticket, body.runId));
       }
       return send(404, { error: "Unknown operation" });
-    } catch (e) { return send(409, { error: e instanceof Error ? e.message : "Operation failed" }); }
+    } catch (e) {
+      // The claim service's ownership refusal keeps its reason, unwrapped.
+      const refusal = ownershipRefusal(e);
+      if (refusal) return send(409, refusal);
+      return send(409, { error: e instanceof Error ? e.message : "Operation failed" });
+    }
   });
   server.requestTimeout = 15_000;
   server.headersTimeout = 10_000;
