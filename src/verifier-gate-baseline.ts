@@ -34,7 +34,7 @@
 // Pure helpers here; the runs, git calls and ticket writes stay in
 // dispatch.ts.
 
-import { gateCommandProvenance, isGateOutputFormat, type GateOutputFormat, type GateTally } from "./gate-output.js";
+import { gateCommandCount, gateCommandProvenance, isGateOutputFormat, type GateOutputFormat, type GateTally } from "./gate-output.js";
 
 /** How to read one verifier gate's stdout, and how to re-run its failures. */
 export interface VerifierGateFormat {
@@ -208,13 +208,18 @@ export function verifierInheritedAdvanceEnabled(env: NodeJS.ProcessEnv): boolean
  *   it never ran on either tree and a regression there would be invisible.
  * - Every failed Go package has a failing test of exactly its own, so
  *   `example.com/foo.v2` does not explain a failing `example.com/foo`.
- * - A `go-json` or `playwright-json` gate is one direct test run. A compound
- *   command, such as `make check` or `go test -json ./... && make e2e`,
+ * - A `go-json` or `playwright-json` gate is one direct test run: a single
+ *   command, no `;`, `&&`, `||` or pipe, that the reader sees invoking the
+ *   runner. A compound command, such as `make check`,
+ *   `go test -json ./... && make e2e` or two `go test` runs joined by `&&`,
  *   stops at its first red step, so the steps after it never ran, and an
  *   accepted red would skip them. List each step as its own gate instead:
  *   the gates after an accepted red still run. A `junit-xml` gate is always
  *   a wrapper script the dispatcher cannot read, so it is trusted to be one
  *   test run, as the gate formats already require.
+ * - No stop-on-first-failure flag (`-failfast`, `-x`, `--max-failures`):
+ *   the tests after an inherited failure would never run. A Playwright
+ *   `maxFailures` set in its config file cannot be seen from here.
  */
 export function inheritedIneligibility(gate: string, format: GateOutputFormat, tally: GateTally): string | null {
   if (tally.completeParse !== true) return "its output is incomplete test evidence";
@@ -228,9 +233,12 @@ export function inheritedIneligibility(gate: string, format: GateOutputFormat, t
   }
   if (format !== "junit-xml") {
     const provenance = gateCommandProvenance(gate);
-    if (provenance.kind !== "single" || provenance.format !== format) {
+    if (gateCommandCount(gate) !== 1 || provenance.kind !== "single" || provenance.format !== format) {
       return "the gate is not one direct test run, so the steps after its red step may never have run; list each step as its own gate";
     }
+  }
+  if (/(?:^|[\s='"])(?:--?failfast(?:=true)?|-x|--max-failures(?:=\S*)?)(?=$|[\s'"])/.test(gate)) {
+    return "the gate stops at its first failure, so the tests after an inherited failure never ran";
   }
   return null;
 }

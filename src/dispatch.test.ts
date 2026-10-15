@@ -11949,8 +11949,7 @@ describe("pre-verifier gates — failures already on main (#123)", () => {
       assert.equal(ctx.failedPreSpawnGate, undefined);
       assert.deepEqual(blockers, [], "no blocker is linked");
       assert.equal(client.createdIssues.length, 0, "the open tracker is used, not a new ticket");
-      assert.ok(client.comments.some((c) => c.issueNumber === 3418 && c.body.startsWith("## Shared failure seen again")
-        && c.body.includes(`Found while verifying #3382`)), "the sighting is recorded on the tracker");
+      assert.equal(client.comments.filter((c) => c.issueNumber === 3418).length, 0, "no sighting comment on every verifier run");
       assert.equal(client.moveItemToTopCalls.length, 1, "the tracker goes to the top of Backlog");
       assert.match(loggedText(calls), /all 1 failing test\(s\) also fail on main and is tracked on #3418, so it counts as green/);
       assert.ok(!client.addLabelCalls.some((c) => c.label.startsWith("needs-rework:")));
@@ -11990,12 +11989,28 @@ describe("pre-verifier gates — failures already on main (#123)", () => {
       assert.match(result.promptNote, /TRIAGE MODE/, "untracked, so the gate fails as before");
       assert.match(result.promptNote, /### Failures on main not accepted as inherited/);
       assert.ok(result.promptNote.includes(`${Z} has no confirmed tracking ticket`));
+      assert.match(result.promptNote, /this run cannot publish PASS/);
       assert.ok(!result.promptNote.includes("Inherited failures, tracked and accepted"));
+      assert.ok(!result.promptNote.includes("Failures already on main, not this ticket's"), "held names are not also called set aside");
       assert.equal(ctx.failedPreSpawnGate, UI);
       assert.deepEqual(blockers, []);
     });
 
-    test("a new failure beside a tracked inherited one still fails the gate", async () => {
+    test("a held gate stops the run like any red gate, so the later gates do not run", async () => {
+      const { client } = board();
+      client.createIssue = async () => { throw new Error("HTTP 502"); };
+      const { calls } = await runGates(3393, {
+        gates: `make check;${UI};make lint`,
+        uiOutput: junit([Z]),
+        state: emptySweep(),
+        rerunOutput: junit([Z]),
+        baseOutput: junit([Z]),
+        client,
+      });
+      assert.deepEqual(allGates(calls), ["make check", UI]);
+    });
+
+    test("a new failure beside an inherited one still fails the gate, and the trackers are left alone", async () => {
       const { client, blockers } = board([tracker(Z)]);
       const { result, ctx } = await runGates(3385, {
         uiOutput: junit([Z, W]),
@@ -12008,8 +12023,64 @@ describe("pre-verifier gates — failures already on main (#123)", () => {
       const note = result.promptNote;
       assert.match(note, /TRIAGE MODE/);
       assert.match(note, new RegExp(`Judge only these remaining failures[^]*- \`${W}\``), "W is the ticket's");
-      assert.match(note, /### Inherited failures, tracked and accepted[^]*tracked on #3418/, "Z is still listed with its tracker");
+      assert.ok(note.includes(`\`${Z}\` (failed when re-run alone on the base commit`), "Z is still named as failing on main");
+      assert.ok(!note.includes("Inherited failures, tracked and accepted"));
       assert.equal(ctx.failedPreSpawnGate, UI);
+      assert.equal(client.moveItemToTopCalls.length, 0, "a gate red for its own failure touches no tracker");
+      assert.equal(client.createdIssues.length, 0);
+      assert.deepEqual(blockers, []);
+    });
+
+    test("an accepted gate followed by a red gate keeps the inherited list, worded for triage", async () => {
+      const { client, blockers } = board([tracker(Z)]);
+      const { result } = await runGates(3390, {
+        gates: `make check;${UI};make lint`,
+        uiOutput: junit([Z]),
+        state: emptySweep(),
+        rerunOutput: junit([Z]),
+        baseOutput: junit([Z]),
+        gateImpl: (req) => ({ exitCode: req.command === UI || req.command === "make lint" ? 1 : 0, timedOut: false, spawnError: null }),
+        client,
+      });
+
+      const note = result.promptNote;
+      assert.match(note, /TRIAGE MODE/);
+      assert.match(note, /Failing gate: `make lint`/);
+      assert.match(note, /These failures are inherited and tracked in #3418, so the gates they failed in counted as green/);
+      assert.match(note, /Triage only the failing gate above/);
+      assert.ok(!note.includes("The gates are green except"), "a red run is never called green");
+      assert.deepEqual(blockers, []);
+    });
+
+    test("with a baseline template the sweep is not used: a name the sweep lists is compared on the base commit", async () => {
+      const { client } = board([tracker(X)]);
+      const { result, calls } = await runGates(3391, {
+        uiOutput: junit([X]),
+        rerunOutput: junit([X]),
+        baseOutput: junit([], [X]),
+        client,
+      });
+
+      assert.equal(baseRuns(calls).length, 1, "X goes to the base commit although the sweep lists it");
+      assert.ok(!calls.exec.some((e) => e.cmd.includes("--is-ancestor")), "the sweep is not read");
+      assert.match(result.promptNote, /TRIAGE MODE/, "X passes on the base commit, so it is the ticket's");
+      assert.match(result.promptNote, new RegExp(`Judge only these remaining failures[^]*- \`${X}\``));
+    });
+
+    test("a gate without a baseline template accepts a sweep failure its main-failure ticket tracks", async () => {
+      // Mobile's UI gate: no template, so the ancestor main sweep is the only
+      // evidence. #1809, the sweep's own bug ticket, names both tests.
+      const { client, blockers } = board([{ number: 1809, title: "main sweep failures", body: `## Failing tests\n\n- \`${X}\`\n- \`${Y}\`` }]);
+      const { result, calls } = await runGates(3392, {
+        formats: JSON.stringify({ [UI]: "junit-xml" }),
+        uiOutput: junit([X, Y]),
+        client,
+      });
+
+      assert.ok(calls.exec.some((e) => e.cmd.includes(`git merge-base --is-ancestor ${SWEEP_SHA} HEAD`)));
+      assert.ok(!result.promptNote.includes("TRIAGE MODE"));
+      assert.ok(result.promptNote.includes(`\`${X}\` (failed in the main sweep on \`${SWEEP_SHA.slice(0, 12)}\`), gate \`${UI}\`, tracked on #1809`));
+      assert.equal(client.createdIssues.length, 0);
       assert.deepEqual(blockers, []);
     });
 

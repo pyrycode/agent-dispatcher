@@ -6290,7 +6290,12 @@ async function assessVerifierGateRed(
     }
   }
 
-  const sweep = toJudge.length > 0 ? readMainSweepState(ctx).failures : null;
+  // Accepting an inherited failure needs a comparison on the base commit, as
+  // the live gate's does, whenever the gate can re-run its failures there. A
+  // sweep may predate a fix on main the branch has merged since. Only a gate
+  // without a baseline template still leans on the sweep.
+  const useSweep = !(inheritedAdvance && spec.baselineCommand !== null);
+  const sweep = toJudge.length > 0 && useSweep ? readMainSweepState(ctx).failures : null;
   let sweepIsAncestor: boolean | null = null;
   if (sweep !== null) {
     try {
@@ -6346,7 +6351,11 @@ async function assessVerifierGateRed(
     (baseSkipReason ? ` (no base re-run: ${baseSkipReason})` : ""),
   );
   const assessment: GateBaselineAssessment = { gate, flaky, baseline, remaining, baseSkipReason, rerunSkipReason };
-  if (inheritedAdvance && baseline.length > 0) await acceptInheritedBaseline(ctx, assessment, spec.format, tally, stdoutPath);
+  // A gate red with a failure of the ticket's own stays red whatever the
+  // rest are, so its trackers are left alone.
+  if (inheritedAdvance && baseline.length > 0 && remaining.length === 0) {
+    await acceptInheritedBaseline(ctx, assessment, spec.format, tally, stdoutPath);
+  }
   return assessment;
 }
 
@@ -6492,9 +6501,9 @@ function flakyNoteLines(assessments: readonly GateBaselineAssessment[]): string[
 
 /** Prompt lines listing the failures set aside as main's. */
 function baselineNoteLines(assessments: readonly GateBaselineAssessment[], ticket: number | null): string[] {
-  // Accepted inherited failures have their own section, with their trackers.
+  // Accepted and held inherited failures have their own sections.
   const entries = assessments.flatMap((a) => a.baseline
-    .filter((entry) => !a.inherited?.some((t) => t.name === entry.name))
+    .filter((entry) => a.held === undefined && !a.inherited?.some((t) => t.name === entry.name))
     .map((entry) => `- ${describeBaselineEntry(entry)}, gate \`${a.gate}\``));
   if (entries.length === 0) return [];
   return [
@@ -6514,9 +6523,11 @@ function baselineNoteLines(assessments: readonly GateBaselineAssessment[], ticke
 /**
  * Prompt lines listing the inherited failures accepted on their trackers
  * (`PYRY_VERIFIER_GATE_INHERITED_ADVANCE`). The verdict and the pull
- * request comment must list them; none of them may become a blocker.
+ * request comment must list them; none of them may become a blocker. `red`
+ * is a later gate that failed anyway, so the wording does not call the
+ * gates green.
  */
-function inheritedNoteLines(assessments: readonly GateBaselineAssessment[]): string[] {
+function inheritedNoteLines(assessments: readonly GateBaselineAssessment[], red: boolean): string[] {
   const entries = assessments.flatMap((a) => (a.inherited ?? []).map(({ name, issue }) => {
     const entry = a.baseline.find((e) => e.name === name);
     return `- ${entry ? describeBaselineEntry(entry) : `\`${name}\``}, gate \`${a.gate}\`, tracked on #${issue}`;
@@ -6527,11 +6538,15 @@ function inheritedNoteLines(assessments: readonly GateBaselineAssessment[]): str
     "",
     "### Inherited failures, tracked and accepted",
     "",
-    `The gates are green except these inherited failures, tracked in ${trackers}. Each failed in this worktree and also fails on main, and an open ticket names it:`,
+    red
+      ? `These failures are inherited and tracked in ${trackers}, so the gates they failed in counted as green and the gates after them ran. Each failed in this worktree and also fails on main, and an open ticket names it:`
+      : `The gates are green except these inherited failures, tracked in ${trackers}. Each failed in this worktree and also fails on main, and an open ticket names it:`,
     "",
     ...entries,
     "",
-    "Judge this ticket's own change. They are not a reason to FAIL, and the gates after the one they failed in still ran. " +
+    (red
+      ? "They are not this ticket's. Triage only the failing gate above. "
+      : "Judge this ticket's own change. They are not a reason to FAIL, and the gates after the one they failed in still ran. ") +
     "List each of them with its tracking ticket in your verdict and in your pull request comment, under the Gates line. " +
     "Do not add a blocker for them, do not route them to the builder, do not file them again, and do not spend turns re-running them.",
   ];
@@ -6545,7 +6560,11 @@ function heldNoteLines(assessments: readonly GateBaselineAssessment[]): string[]
     "",
     "### Failures on main not accepted as inherited",
     "",
-    ...held.map((a) => `- Gate \`${a.gate}\`: ${a.baseline.map((e) => `\`${e.name}\``).join(", ")} also fail on main, but they were not accepted, because ${a.held}. So the gate stays red.`),
+    ...held.map((a) => `- Gate \`${a.gate}\`: ${a.baseline.map((e) => describeBaselineEntry(e)).join(", ")}. Not accepted, because ${a.held}.`),
+    "",
+    "Each of these also fails on main, so it is not a regression of this ticket: do not route it to the builder as one. " +
+    "But the gate stays red because of it, so this run cannot publish PASS. Judge the rest of the change as usual, " +
+    "and name the reason above in your verdict's Gates line, so an operator can resolve it, for example by adding the marker to the tracking ticket, and run the gates again.",
   ];
 }
 
@@ -7014,7 +7033,7 @@ async function runConfiguredPreSpawnGates(
           `apart from ${setAside}, so the gates count as green for your verdict:`,
         ),
         ...flakyNoteLines(result.baseline),
-        ...inheritedNoteLines(result.baseline),
+        ...inheritedNoteLines(result.baseline, false),
         ...baselineNoteLines(result.baseline, baselineTicket),
       ].join("\n"),
     };
@@ -7108,7 +7127,7 @@ async function runConfiguredPreSpawnGates(
     "Triage this failure before reviewing. Route demonstrated code regressions to rework. Required checks remain incomplete or failing, so this run cannot advance or publish PASS. A focused rerun cannot replace unfinished checks. Fix the test environment or arrange a complete dispatcher rerun before approval.",
     ...toolchainNote,
     ...flakyNoteLines(result.baseline),
-    ...inheritedNoteLines(result.baseline),
+    ...inheritedNoteLines(result.baseline, true),
     ...baselineNoteLines(result.baseline, baselineTicket),
     ...heldNoteLines(result.baseline),
     ...remainingNoteLines(result),

@@ -64,6 +64,13 @@ export interface InheritedTicketOptions {
    * since its fallback is a red gate, never a wait.
    */
   addBlockers?: boolean;
+  /**
+   * False skips the "seen again" comment on a tracker that already exists.
+   * The pre-verifier gate runs on every verifier dispatch of every ticket,
+   * so a comment per sighting would bury the tracker; the verifier's own
+   * verdict lists each inherited failure with its tracker instead.
+   */
+  recordSighting?: boolean;
 }
 type OpenIssue = { number: number; nodeId: string; title?: string; body: string; labels?: string[] };
 
@@ -120,26 +127,33 @@ function evidence(names: readonly string[], ctx: InheritedRunContext, platform: 
   ].join("\n");
 }
 function fixTicket(names: readonly string[], ctx: InheritedRunContext, platform: string): { title: string; body: string } {
+  // A verifier gate's failure is an offline test, not a live one, and its
+  // evidence is the gate's log and where it failed on main.
+  const verifier = "verifierGate" in ctx;
+  const kind = verifier ? "main" : "live";
+  const checks = verifier ? "pass their verifier gates" : "complete their live checks";
+  const reports = verifier ? "the gate output and the failure on main" : "the branch and base reports";
+  const passes = verifier ? "named test passes" : "named live test passes";
   if (names.length === 1) {
     const [name] = names;
     const body = ["## User Story", "",
-      `As a maintainer, I want \`${name}\` to pass on main so unrelated tickets can complete their live checks.`,
+      `As a maintainer, I want \`${name}\` to pass on main so unrelated tickets can ${checks}.`,
       "", "## Context", "", evidence(names, ctx, platform), "", "## Acceptance Criteria", "",
-      "- [ ] Diagnose the shared failure from the branch and base reports.",
+      `- [ ] Diagnose the shared failure from ${reports}.`,
       "- [ ] Repair the test or product without weakening the assertion or skipping the test.",
-      "- [ ] The named live test passes on the repaired main branch.", "", inheritedMarker(name)].join("\n");
-    return { title: `fix shared live failure: ${shortTestName(name)}`, body };
+      `- [ ] The ${passes} on the repaired main branch.`, "", inheritedMarker(name)].join("\n");
+    return { title: `fix shared ${kind} failure: ${shortTestName(name)}`, body };
   }
   // One marker per test, so a later run that sees any of them again finds this ticket.
   const body = ["## User Story", "",
-    `As a maintainer, I want these ${names.length} tests to pass on main so unrelated tickets can complete their live checks.`,
+    `As a maintainer, I want these ${names.length} tests to pass on main so unrelated tickets can ${checks}.`,
     "", "## Context", "", evidence(names, ctx, platform), "",
-    "They started failing together on one base commit, so they most likely share one cause.",
+    verifier ? "They failed together in one gate run, so they may share one cause." : "They started failing together on one base commit, so they most likely share one cause.",
     "", "## Acceptance Criteria", "",
-    "- [ ] Diagnose what the failures share from the branch and base reports before repairing any of them. Split a test off only when its cause turns out to be independent.",
+    `- [ ] Diagnose what the failures share from ${reports} before repairing any of them. Split a test off only when its cause turns out to be independent.`,
     "- [ ] Repair the tests or product without weakening an assertion or skipping a test.",
-    "- [ ] Every named live test passes on the repaired main branch.", "", ...names.map(inheritedMarker)].join("\n");
-  return { title: `fix shared live failures: ${names.length} tests fail on main`, body };
+    `- [ ] Every ${passes.replace(" passes", "")} passes on the repaired main branch.`, "", ...names.map(inheritedMarker)].join("\n");
+  return { title: `fix shared ${kind} failures: ${names.length} tests fail on main`, body };
 }
 
 /** Search first. A failed board/link write remains untracked and is retried on
@@ -161,7 +175,7 @@ export function trackInheritedTests(
   client: InheritedTrackingClient, failures: readonly string[], ctx: VerifierGateInheritedContext,
   platform: string = process.platform,
 ): Promise<InheritedTicketResult> {
-  return recordInherited(client, failures, ctx, { advance: true, addBlockers: false }, platform);
+  return recordInherited(client, failures, ctx, { advance: true, addBlockers: false, recordSighting: false }, platform);
 }
 
 async function recordInherited(
@@ -220,7 +234,9 @@ async function recordInherited(
   for (const { issue, names: groupNames, created } of groups.values()) {
     try {
       if (!created) {
-        await client.addComment(issue.number, `## Shared failure seen again\n\n${evidence(groupNames, ctx, platform)}`);
+        if (options.recordSighting !== false) {
+          await client.addComment(issue.number, `## Shared failure seen again\n\n${evidence(groupNames, ctx, platform)}`);
+        }
         // Only a ticket the pipeline filed for these tests: a person's own
         // bug ticket matched by name keeps the requirement they chose.
         if (groupNames.some(name => hasMarker(issue, name))) await dropStaleOsRequirement(client, issue, platform);

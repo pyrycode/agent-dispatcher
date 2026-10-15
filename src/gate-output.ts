@@ -320,6 +320,12 @@ export function validateGateOutputProvenance(command: string, recordedFormats: r
   return { format: [...formats][0], error: null };
 }
 
+/** How many simple commands a gate command runs, split at `;`, `&&`, `||`,
+ * `|`, `&`, parentheses and newlines, or null when it cannot be read. */
+export function gateCommandCount(command: string): number | null {
+  return gateCommandWords(command)?.length ?? null;
+}
+
 export function gateOutputFormatFromCommand(command: string): GateOutputFormat | null {
   const provenance = gateCommandProvenance(command);
   return provenance.kind === "single" ? provenance.format : null;

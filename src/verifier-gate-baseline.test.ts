@@ -174,11 +174,22 @@ describe("inheritedIneligibility (PYRY_VERIFIER_GATE_INHERITED_ADVANCE)", () => 
     assert.match(inheritedIneligibility(GO, "go-json", tally)!, /incomplete test evidence/);
   });
 
-  for (const gate of ["make check", "go test -race -json ./... && make e2e", "go test -race ./..."]) {
+  for (const gate of ["make check", "go test -race -json ./... && make e2e", "go test -race ./...",
+    "go test -json ./pkg/a && go test -json ./pkg/b", "go test -race -json ./... && go vet ./...", "cd e2e && go test -json ./..."]) {
     test(`\`${gate}\` is not one direct go-json run, so its later steps may never have run`, () => {
       assert.match(inheritedIneligibility(gate, "go-json", go(failing("example.com/p", "TestA")))!, /not one direct test run/);
     });
   }
+
+  for (const gate of ["go test -json -failfast ./...", "GOFLAGS=-failfast go test -json ./..."]) {
+    test(`\`${gate}\` stops at its first failure, so it is not accepted`, () => {
+      assert.match(inheritedIneligibility(gate, "go-json", go(failing("example.com/p", "TestA")))!, /stops at its first failure/);
+    });
+  }
+
+  test("an env prefix and a redirect still make one direct run", () => {
+    assert.equal(inheritedIneligibility("env CGO_ENABLED=1 go test -race -json ./... 2>&1", "go-json", go(failing("example.com/p", "TestA"))), null);
+  });
 
   test("a junit-xml wrapper script is trusted to be one test run", () => {
     const tally = parseGateOutput('<testsuite name="ui" tests="1" failures="1"><testcase classname="a.B" name="c"><failure message="x"/></testcase></testsuite>', "junit-xml");
