@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { recordInheritedTests, inheritedMarker, type InheritedTicketClient } from "./inherited-tickets.js";
+import { recordInheritedTests, inheritedMarker, trackInheritedTests, type InheritedTicketClient, type VerifierGateInheritedContext } from "./inherited-tickets.js";
 import { failureTicketLabels, type ClosedTracker, type FlakyRunContext, type TrackerRef } from "./flaky-tickets.js";
 import { decideInheritedAdvance } from "./pipeline-decisions.js";
 import { parseGateOutput } from "./gate-output.js";
@@ -370,6 +370,60 @@ test("a title ending the test name with a full stop still names it exactly", asy
   client.open.push({ number: 1402, nodeId: "node-1402", title: `Broken on main: ${name}.`, body: "seen" });
   assert.deepEqual((await recordInheritedTests(client, [name], ctx, { advance: true })).tracked, [{ name, issue: 1402 }]);
   assert.equal(client.created.length, 0);
+});
+
+// Pre-verifier gate (PYRY_VERIFIER_GATE_INHERITED_ADVANCE): trackers only, never a blocker.
+const verifierCtx: VerifierGateInheritedContext = {
+  gatedIssue: 1397, at: "2026-10-15T16:00:00Z",
+  verifierGate: { gate: "go test -race -json ./...", commit: "c".repeat(40), outputPath: "/logs/verifier-gate_#1397_3.log",
+    onMain: new Map([[name, `\`${name}\` (failed when re-run alone on the base commit \`bbbbbbbbbbbb\`)`]]) },
+};
+
+test("a verifier gate's inherited failure is filed with gate evidence and tracked without a blocker", async () => {
+  const client = new Client();
+  const result = await trackInheritedTests(client, [name], verifierCtx);
+  assert.deepEqual(result.tracked, [{ name, issue: 1500 }]);
+  assert.deepEqual(client.linked, []);
+  const body = client.created[0].body;
+  assert.match(body, /failed in a pre-verifier gate and also fails on main/);
+  assert.match(body, /Found while verifying #1397/);
+  assert.match(body, /Gate `go test -race -json \.\/\.\.\.`/);
+  assert.match(body, /\/logs\/verifier-gate_#1397_3\.log/);
+  assert.match(body, /On main: `p\.C#permissionAnswer` \(failed when re-run alone on the base commit `bbbbbbbbbbbb`\)/);
+  assert.ok(body.includes(inheritedMarker(name)));
+});
+
+test("a verifier gate's untracked failure falls back with a reason and still links no blocker", async () => {
+  const client = new Client();
+  client.open.push({ number: 77, nodeId: "node-77", title: "flaky permissionAnswer", body: "Seen on CI." });
+  const result = await trackInheritedTests(client, [name], verifierCtx);
+  assert.equal(result.tracked, undefined);
+  assert.match(result.fallbackReason!, /tracked on #77 only by its method name/);
+  assert.deepEqual(result.untracked, [name]);
+  assert.deepEqual(result.blockers, []);
+  assert.deepEqual(client.linked, [], "the live gate would link #77 here; the verifier gate never does");
+  assert.equal(client.created.length, 0);
+});
+
+test("a verifier gate leaves an existing Backlog tracker in place and posts no sighting", async () => {
+  const client = new Client();
+  client.open.push({ number: 1480, nodeId: "node-1480", body: inheritedMarker(name) });
+  client.statuses.set(1480, "Backlog");
+  const result = await trackInheritedTests(client, [name], verifierCtx);
+  assert.deepEqual(result.tracked, [{ name, issue: 1480 }]);
+  assert.deepEqual(client.positions, []);
+  assert.deepEqual(client.comments, []);
+});
+
+test("a verifier gate on a ticket that names its own test files and moves nothing", async () => {
+  const client = new Client();
+  client.open.push({ number: 1480, nodeId: "node-1480", body: inheritedMarker(name) });
+  const result = await trackInheritedTests(client, [name], { ...verifierCtx, gatedBody: `Fix \`${name}\`.` });
+  assert.equal(result.tracked, undefined);
+  assert.match(result.fallbackReason!, /names p\.C#permissionAnswer itself/);
+  assert.deepEqual(client.positions, []);
+  assert.deepEqual(client.created, []);
+  assert.equal(client.statuses.size, 0);
 });
 
 // 2026-10-15: a shared failure whose fix ticket closed recently reopens that

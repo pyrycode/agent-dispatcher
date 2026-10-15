@@ -124,7 +124,7 @@ import {
 } from "./main-sweep.js";
 import { flakyTrackingNotes, recordFlakySightings, recordFlakyTests, type FlakyTicketClient, type FlakyTicketResult } from "./flaky-tickets.js";
 import { FlakySightingRecorder, type FlakySightingStore } from "./flaky-sightings.js";
-import { recordInheritedTests } from "./inherited-tickets.js";
+import { recordInheritedTests, trackInheritedTests, type InheritedTrackingClient } from "./inherited-tickets.js";
 import { activeInfraPause, classifyGateFailure, extractFailureMessages, branchToolchainChanges, findAdmissionRejections, findToolchainMismatch, judgeBaseCheck, pickBaseCheckTests, testSourceTerm, INFRA_PAUSE_STATE_FILE, nextInfraPause, readInfraBreakerConfig, serializeInfraPause, type InfraBreakerConfig, type InfraPauseState } from "./infra-failure.js";
 import { dropStillHeld, HealthChecker, type HealthEnvFor, healthEnvForAgent, holdUnhealthyCandidates, liveGateHealthFailures, newHealthNoticeState, parseHealthCacheMs, parseHealthChecks, startupHealthCheck } from "./health-check.js";
 import {
@@ -144,6 +144,7 @@ import {
   attributableFailures,
   buildBaselineRecordComment,
   describeBaselineEntry,
+  inheritedIneligibility,
   parseVerifierGateFormats,
   splitByRerun,
   splitBySweep,
@@ -151,6 +152,7 @@ import {
   type BaselineEntry,
   type GateBaselineAssessment,
   type VerifierGateFormat,
+  verifierInheritedAdvanceEnabled,
 } from "./verifier-gate-baseline.js";
 import { activeStageSet, resolveStageSet } from "./stage-sets.js";
 import { resolveEffort } from "./effort-policy.js";
@@ -246,6 +248,7 @@ import {
   validateGateOutputProvenance,
   type GateOutputFormat,
   type GateRunReport,
+  type GateTally,
 } from "./gate-output.js";
 import {
   decideGateSelection,
@@ -2343,6 +2346,10 @@ export interface DispatchClient {
   listOpenIssuesWithLabel: FlakyTicketClient["listOpenIssuesWithLabel"];
   createIssue: FlakyTicketClient["createIssue"];
   addItemToProject: FlakyTicketClient["addItemToProject"];
+  /** Puts an inherited failure's tracker at the top of Backlog
+   *  (`PYRY_VERIFIER_GATE_INHERITED_ADVANCE`). A client without it accepts
+   *  no inherited failure, so its gates stay red. */
+  moveItemToTop?: InheritedTrackingClient["moveItemToTop"];
   /** A recently closed flaky ticket is reopened rather than filed again. Optional: absent, nothing is reopened. */
   listRecentlyClosedIssuesWithLabel?: FlakyTicketClient["listRecentlyClosedIssuesWithLabel"];
   reopenTracker?: FlakyTicketClient["reopenTracker"];
@@ -6261,13 +6268,17 @@ export async function runVerifierGates(opts: {
       }
       if (assessment !== null) baseline.push(assessment);
     }
-    if (assessment !== null && assessment.remaining.length === 0 && assessment.baseline.length + assessment.flaky.length > 0) {
+    if (assessment !== null && assessment.remaining.length === 0 && assessment.held === undefined
+        && assessment.baseline.length + assessment.flaky.length > 0) {
       const { flaky, baseline: onMain } = assessment;
+      const tracked = assessment.inherited && assessment.inherited.length > 0
+        ? ` and ${onMain.length === 1 ? "is" : "are"} tracked on ${[...new Set(assessment.inherited.map((t) => `#${t.issue}`))].join(", ")}`
+        : "";
       const why = flaky.length === 0
-        ? `all ${onMain.length} failing test(s) also fail on main`
+        ? `all ${onMain.length} failing test(s) also fail on main${tracked}`
         : onMain.length === 0
           ? `all ${flaky.length} failing test(s) passed on a same-tree re-run`
-          : `${flaky.length} failing test(s) passed on a same-tree re-run and ${onMain.length} also fail on main`;
+          : `${flaky.length} failing test(s) passed on a same-tree re-run and ${onMain.length} also fail on main${tracked}`;
       summary.push(`✗ ${gate} (${verdict}; ${why}, so it counts as green)`);
       continue;
     }
@@ -6409,6 +6420,7 @@ async function assessVerifierGateRed(
   gate: string,
   spec: VerifierGateFormat,
   stdoutPath: string,
+  inheritedAdvance = false,
 ): Promise<GateBaselineAssessment | null> {
   let raw: string;
   try {
@@ -6437,7 +6449,12 @@ async function assessVerifierGateRed(
     rerunOutputPath = rerun.outputPath;
   }
 
-  const sweep = toJudge.length > 0 ? readMainSweepState(ctx).failures : null;
+  // Accepting an inherited failure needs a comparison on the base commit, as
+  // the live gate's does, whenever the gate can re-run its failures there. A
+  // sweep may predate a fix on main the branch has merged since. Only a gate
+  // without a baseline template still leans on the sweep.
+  const useSweep = !(inheritedAdvance && spec.baselineCommand !== null);
+  const sweep = toJudge.length > 0 && useSweep ? readMainSweepState(ctx).failures : null;
   let sweepIsAncestor: boolean | null = null;
   if (sweep !== null) {
     try {
@@ -6515,7 +6532,75 @@ async function assessVerifierGateRed(
     logFlakyTickets(tickets);
     flakyNotes = Object.fromEntries(flakyTrackingNotes(tickets));
   }
-  return { gate, flaky, baseline, remaining, baseSkipReason, rerunSkipReason, ...(flakyNotes ? { flakyNotes } : {}) };
+  const assessment: GateBaselineAssessment = { gate, flaky, baseline, remaining, baseSkipReason, rerunSkipReason, ...(flakyNotes ? { flakyNotes } : {}) };
+  // A gate red with a failure of the ticket's own stays red whatever the
+  // rest are, so its trackers are left alone.
+  if (inheritedAdvance && baseline.length > 0 && remaining.length === 0) {
+    await acceptInheritedBaseline(ctx, assessment, spec.format, tally, stdoutPath);
+  }
+  return assessment;
+}
+
+/**
+ * `PYRY_VERIFIER_GATE_INHERITED_ADVANCE`: a red gate's baseline failures
+ * count as inherited only when the gate's run can be trusted to show every
+ * failure (`inheritedIneligibility`) and each has an open tracking ticket
+ * naming it exactly, found or filed through the live gate's tracker path
+ * (`trackInheritedTests`), which never links a blocker. Sets `inherited`
+ * when all of them are accepted, otherwise `held`, which keeps the gate red
+ * as it would be without any baseline reading. Never throws.
+ *
+ * Added after pyrycode #3382 on 2026-10-15: four macOS gate repairs that
+ * also failed on unchanged main, #3393, #3399, #3418 and #3415, were each
+ * added as its blocker in turn, though none was #3382's.
+ */
+async function acceptInheritedBaseline(
+  ctx: DispatchContext,
+  assessment: GateBaselineAssessment,
+  format: GateOutputFormat,
+  tally: GateTally,
+  stdoutPath: string,
+): Promise<void> {
+  const hold = (reason: string): void => {
+    assessment.held = reason;
+    console.log(`   🧾 \`${assessment.gate}\`: failures that also fail on main not accepted as inherited, so the gate stays red: ${reason}`);
+  };
+  const ineligible = inheritedIneligibility(assessment.gate, format, tally);
+  if (ineligible !== null) return hold(ineligible);
+  const { client } = ctx;
+  const moveItemToTop = client.moveItemToTop;
+  if (typeof moveItemToTop !== "function") return hold("this dispatcher's GitHub client cannot place a tracking ticket");
+  // Only the calls the tracker path makes, bound to the run's own client.
+  const tracking: InheritedTrackingClient = {
+    listOpenIssuesWithLabel: (label) => client.listOpenIssuesWithLabel(label) as ReturnType<InheritedTrackingClient["listOpenIssuesWithLabel"]>,
+    createIssue: (title, body, labels) => client.createIssue(title, body, labels),
+    addItemToProject: (nodeId) => client.addItemToProject(nodeId),
+    updateItemStatus: (itemId, status) => client.updateItemStatus(itemId, status),
+    addComment: (issue, body) => client.addComment(issue, body),
+    removeLabel: (issue, label) => client.removeLabel(issue, label),
+    getItemStatus: (issue) => client.getItemStatus(issue),
+    moveItemToTop: (itemId) => moveItemToTop.call(client, itemId),
+  };
+  const names = [...new Set(assessment.baseline.map((e) => e.name))];
+  const onMain = new Map<string, string>();
+  for (const entry of assessment.baseline) if (!onMain.has(entry.name)) onMain.set(entry.name, describeBaselineEntry(entry));
+  let result;
+  try {
+    result = await trackInheritedTests(tracking, names, {
+      gatedIssue: ctx.item.issueNumber,
+      at: new Date().toISOString(),
+      gatedBody: ctx.item.body,
+      verifierGate: { gate: assessment.gate, commit: mergedWorktreeHead(ctx)?.commit ?? null, outputPath: stdoutPath, onMain },
+    });
+  } catch (e: any) {
+    return hold(`the tracking tickets could not be checked: ${e?.message ?? e}`);
+  }
+  const tracked = result.tracked;
+  if (tracked === undefined || !names.every((name) => tracked.some((t) => t.name === name))) {
+    return hold(result.fallbackReason ?? `no tracking ticket could be confirmed for ${result.untracked.join(", ") || names.join(", ")}`);
+  }
+  assessment.inherited = tracked;
+  for (const { name, issue } of tracked) console.log(`   🧾 \`${assessment.gate}\`: inherited \`${name}\` is tracked on #${issue}`);
 }
 
 /** The log lines for one flaky filing, from either gate. */
@@ -6590,7 +6675,7 @@ function remainingNoteLines(result: VerifierGatesOutcome): string[] {
   if (!own) return [];
   return [
     "",
-    `Judge only these remaining failures of \`${own.gate}\`, which do not fail on main:`,
+    `Judge only these remaining failures of \`${own.gate}\`, which were not shown to fail on main:`,
     "",
     ...own.remaining.map((name) => `- \`${name}\``),
   ];
@@ -6616,7 +6701,10 @@ function flakyNoteLines(assessments: readonly GateBaselineAssessment[]): string[
 
 /** Prompt lines listing the failures set aside as main's. */
 function baselineNoteLines(assessments: readonly GateBaselineAssessment[], ticket: number | null): string[] {
-  const entries = assessments.flatMap((a) => a.baseline.map((entry) => `- ${describeBaselineEntry(entry)}, gate \`${a.gate}\``));
+  // Accepted and held inherited failures have their own sections.
+  const entries = assessments.flatMap((a) => a.baseline
+    .filter((entry) => a.held === undefined && !a.inherited?.some((t) => t.name === entry.name))
+    .map((entry) => `- ${describeBaselineEntry(entry)}, gate \`${a.gate}\``));
   if (entries.length === 0) return [];
   return [
     "",
@@ -6629,6 +6717,54 @@ function baselineNoteLines(assessments: readonly GateBaselineAssessment[], ticke
     ticket !== null
       ? `They are recorded on #${ticket}, the open main-failure ticket. Do not route them to the builder, file them again, or spend turns re-running them.`
       : "No open main-failure ticket holds them. Do not route them to the builder or spend turns re-running them.",
+  ];
+}
+
+/**
+ * Prompt lines listing the inherited failures accepted on their trackers
+ * (`PYRY_VERIFIER_GATE_INHERITED_ADVANCE`). The verdict and the pull
+ * request comment must list them; none of them may become a blocker. `red`
+ * is a later gate that failed anyway, so the wording does not call the
+ * gates green.
+ */
+function inheritedNoteLines(assessments: readonly GateBaselineAssessment[], red: boolean): string[] {
+  const entries = assessments.flatMap((a) => (a.inherited ?? []).map(({ name, issue }) => {
+    const entry = a.baseline.find((e) => e.name === name);
+    return `- ${entry ? describeBaselineEntry(entry) : `\`${name}\``}, gate \`${a.gate}\`, tracked on #${issue}`;
+  }));
+  if (entries.length === 0) return [];
+  const trackers = [...new Set(assessments.flatMap((a) => (a.inherited ?? []).map((t) => `#${t.issue}`)))].join(", ");
+  return [
+    "",
+    "### Inherited failures, tracked and accepted",
+    "",
+    red
+      ? `These failures are inherited and tracked in ${trackers}, so the gates they failed in counted as green and the gates after them ran. Each failed in this worktree and also fails on main, and an open ticket names it:`
+      : `The gates are green except these inherited failures, tracked in ${trackers}. Each failed in this worktree and also fails on main, and an open ticket names it:`,
+    "",
+    ...entries,
+    "",
+    (red
+      ? "They are not this ticket's. Triage only the failing gate above. "
+      : "Judge this ticket's own change. They are not a reason to FAIL, and the gates after the one they failed in still ran. ") +
+    "List each of them with its tracking ticket in your verdict and in your pull request comment, under the Gates line. " +
+    "Do not add a blocker for them, do not route them to the builder, do not file them again, and do not spend turns re-running them.",
+  ];
+}
+
+/** Prompt lines naming the failures that also fail on main but were not accepted as inherited. */
+function heldNoteLines(assessments: readonly GateBaselineAssessment[]): string[] {
+  const held = assessments.filter((a) => a.held !== undefined && a.baseline.length > 0);
+  if (held.length === 0) return [];
+  return [
+    "",
+    "### Failures on main not accepted as inherited",
+    "",
+    ...held.map((a) => `- Gate \`${a.gate}\`: ${a.baseline.map((e) => describeBaselineEntry(e)).join(", ")}. Not accepted, because ${a.held}.`),
+    "",
+    "Each of these also fails on main, so it is not a regression of this ticket: do not route it to the builder as one. " +
+    "But the gate stays red because of it, so this run cannot publish PASS. Judge the rest of the change as usual, " +
+    "and name the reason above in your verdict's Gates line, so an operator can resolve it, for example by adding the marker to the tracking ticket, and run the gates again.",
   ];
 }
 
@@ -6811,6 +6947,12 @@ function readDocsOnlyGateReuse(
  *   ticket, and both into the note as not this ticket's. When none remain,
  *   the gate counts as green and the next gate runs. See
  *   verifier-gate-baseline.ts.
+ * - **Red only with tracked inherited failures** → with
+ *   `PYRY_VERIFIER_GATE_INHERITED_ADVANCE` on, the default, main's failures
+ *   count only when each has an open tracking ticket and the gate is one
+ *   direct test run (`acceptInheritedBaseline`). The note lists them with
+ *   their trackers, the verifier must list them in its verdict, and nobody
+ *   links a blocker. Anything else keeps the gate red.
  */
 /** Thrown out of the overlapped verifier review when its gates found a host problem. */
 export class InfraGateHaltError extends Error {}
@@ -7032,10 +7174,13 @@ async function runConfiguredPreSpawnGates(
   // conflicted merge left for the agent has no commit to compare with main.
   const { formats, errors: formatErrors } = parseVerifierGateFormats(process.env.PYRY_VERIFIER_GATE_FORMATS);
   for (const error of formatErrors) console.warn(`   ⚠️  ${error}`);
+  // Baseline failures count only when tracked (acceptInheritedBaseline);
+  // off keeps the earlier set-aside, which needs no tracker.
+  const inheritedAdvance = verifierInheritedAdvanceEnabled(process.env);
   const assessRed = formats.size > 0 && !ctx.pendingMerge
     ? async (red: { gate: string; stdoutPath: string }) => {
       const spec = formats.get(red.gate);
-      return spec ? assessVerifierGateRed(ctx, red.gate, spec, red.stdoutPath) : null;
+      return spec ? assessVerifierGateRed(ctx, red.gate, spec, red.stdoutPath, inheritedAdvance) : null;
     }
     : undefined;
 
@@ -7089,6 +7234,7 @@ async function runConfiguredPreSpawnGates(
           `apart from ${setAside}, so the gates count as green for your verdict:`,
         ),
         ...flakyNoteLines(result.baseline),
+        ...inheritedNoteLines(result.baseline, false),
         ...baselineNoteLines(result.baseline, baselineTicket),
       ].join("\n"),
     };
@@ -7182,7 +7328,9 @@ async function runConfiguredPreSpawnGates(
     "Triage this failure before reviewing. Route demonstrated code regressions to rework. Required checks remain incomplete or failing, so this run cannot advance or publish PASS. A focused rerun cannot replace unfinished checks. Fix the test environment or arrange a complete dispatcher rerun before approval.",
     ...toolchainNote,
     ...flakyNoteLines(result.baseline),
+    ...inheritedNoteLines(result.baseline, true),
     ...baselineNoteLines(result.baseline, baselineTicket),
+    ...heldNoteLines(result.baseline),
     ...remainingNoteLines(result),
   ].join("\n");
   return { promptNote };

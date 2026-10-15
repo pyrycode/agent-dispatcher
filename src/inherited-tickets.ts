@@ -15,13 +15,37 @@ import {
 } from "./flaky-tickets.js";
 import { osName } from "./ticket-requirements.js";
 
-export interface InheritedTicketClient extends FlakyTicketClient {
-  listOpenIssuesWithLabel(label: string): Promise<{ number: number; nodeId: string; title?: string; body: string; labels?: string[] }[]>;
-  getItemStatus(issueNumber: number): Promise<string | null>;
-  moveItemToTop(itemId: string): Promise<void>;
+export interface InheritedTicketClient extends InheritedTrackingClient {
   /** Links two issues and reads the relationship back before resolving. */
   addBlocker(issueNumber: number, blockerNumber: number): Promise<void>;
 }
+/** Enough to find, file and place trackers, for a caller that never links a blocker. */
+export interface InheritedTrackingClient extends FlakyTicketClient {
+  listOpenIssuesWithLabel(label: string): Promise<{ number: number; nodeId: string; title?: string; body: string; labels?: string[] }[]>;
+  getItemStatus(issueNumber: number): Promise<string | null>;
+  moveItemToTop(itemId: string): Promise<void>;
+}
+/**
+ * A pre-verifier gate's baseline failures. Each name failed in the gate and
+ * also failed on main: in the latest main sweep on an ancestor commit, or
+ * when re-run alone on the base commit.
+ */
+export interface VerifierGateInheritedContext {
+  gatedIssue: number;
+  at: string;
+  gatedBody?: string;
+  verifierGate: {
+    /** The gate command, as configured. */
+    gate: string;
+    /** The gated worktree's merged HEAD, or null when it could not be read. */
+    commit: string | null;
+    /** The gate's own stdout log. */
+    outputPath: string;
+    /** Where each name failed on main, one line per name. */
+    onMain: ReadonlyMap<string, string>;
+  };
+}
+export type InheritedRunContext = FlakyRunContext | VerifierGateInheritedContext;
 export interface InheritedTicketResult {
   blockers: { name: string; issue: number }[];
   untracked: string[];
@@ -43,6 +67,20 @@ export interface InheritedTicketOptions {
    * falls back to the blockers of the default mode.
    */
   advance?: boolean;
+  /**
+   * Advance mode only. False links no blocker when the advance does not
+   * hold: every name without an accepted tracker comes back as untracked,
+   * with the reason in `fallbackReason`. The pre-verifier gate uses this,
+   * since its fallback is a red gate, never a wait.
+   */
+  addBlockers?: boolean;
+  /**
+   * False skips the "seen again" comment on a tracker that already exists.
+   * The pre-verifier gate runs on every verifier dispatch of every ticket,
+   * so a comment per sighting would bury the tracker; the verifier's own
+   * verdict lists each inherited failure with its tracker instead.
+   */
+  recordSighting?: boolean;
 }
 type OpenIssue = { number: number; nodeId: string; title?: string; body: string; labels?: string[] };
 
@@ -68,7 +106,22 @@ function matchesTrackingTicket(issue: { title?: string; body: string }, name: st
   return /pre-existing|unmasked|drift|flaky|tracking|regression|bug|failure|broken|intermittent/i.test(title)
     && words.includes(shortTestName(name).toLowerCase());
 }
-function evidence(names: readonly string[], ctx: FlakyRunContext, platform: string): string {
+function evidence(names: readonly string[], ctx: InheritedRunContext, platform: string): string {
+  if ("verifierGate" in ctx) {
+    const g = ctx.verifierGate;
+    const subject = names.length === 1
+      ? `\`${names[0]}\` failed in a pre-verifier gate and also fails on main.`
+      : [`These ${names.length} tests failed in a pre-verifier gate and also fail on main:`, ...names.map(n => `- \`${n}\``)].join("\n");
+    return [
+      subject,
+      `- Found while verifying #${ctx.gatedIssue} at ${ctx.at}`,
+      `- Seen on ${osName(platform)}`,
+      `- Gate \`${g.gate}\``,
+      `- Gated worktree at \`${g.commit ?? "unknown"}\``,
+      `- Gate output: \`${g.outputPath}\``,
+      ...names.map(n => `- On main: ${g.onMain.get(n) ?? `\`${n}\` failed on main`}`),
+    ].join("\n");
+  }
   const r = ctx.report;
   const subject = names.length === 1
     ? `\`${names[0]}\` failed on both the gated branch and the base commit.`
@@ -83,27 +136,34 @@ function evidence(names: readonly string[], ctx: FlakyRunContext, platform: stri
     `- Base report: \`${r.baselineOutputPath ?? "unavailable"}\``,
   ].join("\n");
 }
-function fixTicket(names: readonly string[], ctx: FlakyRunContext, platform: string): { title: string; body: string } {
+function fixTicket(names: readonly string[], ctx: InheritedRunContext, platform: string): { title: string; body: string } {
+  // A verifier gate's failure is an offline test, not a live one, and its
+  // evidence is the gate's log and where it failed on main.
+  const verifier = "verifierGate" in ctx;
+  const kind = verifier ? "main" : "live";
+  const checks = verifier ? "pass their verifier gates" : "complete their live checks";
+  const reports = verifier ? "the gate output and the failure on main" : "the branch and base reports";
+  const passes = verifier ? "named test passes" : "named live test passes";
   if (names.length === 1) {
     const [name] = names;
     const body = ["## User Story", "",
-      `As a maintainer, I want \`${name}\` to pass on main so unrelated tickets can complete their live checks.`,
+      `As a maintainer, I want \`${name}\` to pass on main so unrelated tickets can ${checks}.`,
       "", "## Context", "", evidence(names, ctx, platform), "", "## Acceptance Criteria", "",
-      "- [ ] Diagnose the shared failure from the branch and base reports.",
+      `- [ ] Diagnose the shared failure from ${reports}.`,
       "- [ ] Repair the test or product without weakening the assertion or skipping the test.",
-      "- [ ] The named live test passes on the repaired main branch.", "", inheritedMarker(name)].join("\n");
-    return { title: `fix shared live failure: ${shortTestName(name)}`, body };
+      `- [ ] The ${passes} on the repaired main branch.`, "", inheritedMarker(name)].join("\n");
+    return { title: `fix shared ${kind} failure: ${shortTestName(name)}`, body };
   }
   // One marker per test, so a later run that sees any of them again finds this ticket.
   const body = ["## User Story", "",
-    `As a maintainer, I want these ${names.length} tests to pass on main so unrelated tickets can complete their live checks.`,
+    `As a maintainer, I want these ${names.length} tests to pass on main so unrelated tickets can ${checks}.`,
     "", "## Context", "", evidence(names, ctx, platform), "",
-    "They started failing together on one base commit, so they most likely share one cause.",
+    verifier ? "They failed together in one gate run, so they may share one cause." : "They started failing together on one base commit, so they most likely share one cause.",
     "", "## Acceptance Criteria", "",
-    "- [ ] Diagnose what the failures share from the branch and base reports before repairing any of them. Split a test off only when its cause turns out to be independent.",
+    `- [ ] Diagnose what the failures share from ${reports} before repairing any of them. Split a test off only when its cause turns out to be independent.`,
     "- [ ] Repair the tests or product without weakening an assertion or skipping a test.",
-    "- [ ] Every named live test passes on the repaired main branch.", "", ...names.map(inheritedMarker)].join("\n");
-  return { title: `fix shared live failures: ${names.length} tests fail on main`, body };
+    `- [ ] Every ${passes.replace(" passes", "")} passes on the repaired main branch.`, "", ...names.map(inheritedMarker)].join("\n");
+  return { title: `fix shared ${kind} failures: ${names.length} tests fail on main`, body };
 }
 
 function reopenComment(names: readonly string[], ctx: FlakyRunContext, platform: string, closedAt: string): string {
@@ -119,11 +179,34 @@ function reopenComment(names: readonly string[], ctx: FlakyRunContext, platform:
 
 /** Search first. A failed board/link write remains untracked and is retried on
  * the same open issue on the next attempt. Never report an unconfirmed blocker. */
-export async function recordInheritedTests(
+export function recordInheritedTests(
   client: InheritedTicketClient, failures: readonly string[], ctx: FlakyRunContext,
   options: InheritedTicketOptions = {},
   platform: string = process.platform,
   now: () => number = Date.now,
+): Promise<InheritedTicketResult> {
+  return recordInherited(client, failures, ctx, options, platform, now);
+}
+
+/**
+ * Find or file a tracker for every name, as the live gate's advance mode
+ * does, and never link a blocker. `tracked` is set only when every name has
+ * an open tracker naming it exactly; otherwise `fallbackReason` says why.
+ */
+export function trackInheritedTests(
+  client: InheritedTrackingClient, failures: readonly string[], ctx: VerifierGateInheritedContext,
+  platform: string = process.platform,
+  now: () => number = Date.now,
+): Promise<InheritedTicketResult> {
+  return recordInherited(client, failures, ctx, { advance: true, addBlockers: false, recordSighting: false }, platform, now);
+}
+
+async function recordInherited(
+  client: InheritedTrackingClient & { addBlocker?: InheritedTicketClient["addBlocker"] },
+  failures: readonly string[], ctx: InheritedRunContext,
+  options: InheritedTicketOptions,
+  platform: string,
+  now: () => number,
 ): Promise<InheritedTicketResult> {
   const result: InheritedTicketResult = { blockers: [], untracked: [], owned: [] };
   const names = [...new Set(failures)];
@@ -159,7 +242,24 @@ export async function recordInheritedTests(
       untrackedNow.push(name);
     }
   }
-  if (untrackedNow.length > 0 && client.listRecentlyClosedIssuesWithLabel) {
+  // Without blockers to fall back on, a gap known before any write ends the
+  // call here, so a ticket that owns or names its test, or a loose match,
+  // files and moves nothing.
+  if (options.advance && options.addBlockers === false) {
+    const selfNamed = ctx.gatedBody === undefined ? [] : names.filter(n => namesExactly({ body: ctx.gatedBody! }, n));
+    const early = (result.owned!.length > 0 && `this ticket owns the fix for ${result.owned!.join(", ")}`)
+      || (selfNamed.length > 0 && `this ticket names ${selfNamed.join(", ")} itself, so it may be the fix`)
+      || [...groups.values()].flatMap(g => g.names.filter(n => looselyTracked.has(n)).map(n =>
+        `${n} is tracked on #${g.issue.number} only by its method name; if it is the same test, add ${inheritedMarker(n)} to that ticket's body`))[0];
+    if (early) {
+      result.fallbackReason = early;
+      result.untracked = names.filter(n => !result.owned!.includes(n));
+      return result;
+    }
+  }
+  // Reopening is the live gate's (PR 271). The pre-verifier gate's tracker
+  // path files as before (PR 272), and its client offers no closed-ticket search.
+  if (!("verifierGate" in ctx) && untrackedNow.length > 0 && client.listRecentlyClosedIssuesWithLabel) {
     let closed: ClosedTracker[] = [];
     try {
       closed = await client.listRecentlyClosedIssuesWithLabel("bug", new Date(now() - FLAKY_REOPEN_WINDOW_MS));
@@ -213,7 +313,9 @@ export async function recordInheritedTests(
     }
     try {
       if (!created) {
-        await client.addComment(issue.number, `## Shared failure seen again\n\n${evidence(groupNames, ctx, platform)}`);
+        if (options.recordSighting !== false) {
+          await client.addComment(issue.number, `## Shared failure seen again\n\n${evidence(groupNames, ctx, platform)}`);
+        }
         // Only a ticket the pipeline filed for these tests: a person's own
         // bug ticket matched by name keeps the requirement they chose.
         if (groupNames.some(name => hasMarker(issue, name))) await dropStaleOsRequirement(client, issue, platform);
@@ -222,7 +324,9 @@ export async function recordInheritedTests(
       const itemId = await client.addItemToProject(issue.nodeId);
       const entersBacklog = status === null || status === "Inbox" || status === "Done";
       if (entersBacklog) await client.updateItemStatus(itemId, "Backlog");
-      if (entersBacklog || status === "Backlog") await client.moveItemToTop(itemId);
+      // Without sighting comments, the call comes on every verifier run, so
+      // an existing Backlog tracker keeps its place rather than being bumped.
+      if (entersBacklog || (status === "Backlog" && options.recordSighting !== false)) await client.moveItemToTop(itemId);
       placed.push({ issue, names: groupNames });
     } catch (error) {
       console.warn(`   ⚠️ Could not confirm a fix ticket for ${groupNames.join(", ")}: ${error}`);
@@ -239,6 +343,10 @@ export async function recordInheritedTests(
       return { blockers: [], untracked: [], owned: [], tracked: names.map(name => ({ name, issue: placedNames.get(name)! })) };
     }
     result.fallbackReason = gap;
+  }
+  if (options.addBlockers === false || !client.addBlocker) {
+    result.untracked = names.filter(n => !result.owned!.includes(n));
+    return result;
   }
   const confirmed = new Map<string, number>();
   for (const { issue, names: groupNames } of placed) {

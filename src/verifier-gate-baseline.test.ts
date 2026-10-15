@@ -5,6 +5,7 @@ import { parseGateOutput } from "./gate-output.js";
 import {
   attributableFailures,
   buildBaselineRecordComment,
+  inheritedIneligibility,
   parseVerifierGateFormats,
   splitByRerun,
   splitBySweep,
@@ -134,5 +135,70 @@ describe("same-tree re-run split (#133)", () => {
 
   test("a re-run that told nothing excuses nothing", () => {
     assert.deepEqual(splitByRerun(["p.A#x"], null), { flaky: [], remaining: ["p.A#x"] });
+  });
+});
+
+describe("inheritedIneligibility (PYRY_VERIFIER_GATE_INHERITED_ADVANCE)", () => {
+  const go = (events: object[]) => parseGateOutput(events.map((e) => JSON.stringify(e)).join("\n"), "go-json");
+  const failing = (pkg: string, name: string, extra: object[] = []) => [
+    { Action: "start", Package: pkg },
+    { Action: "run", Package: pkg, Test: name },
+    ...extra,
+    { Action: "fail", Package: pkg, Test: name, Elapsed: 0.1 },
+    { Action: "fail", Package: pkg, Elapsed: 0.2 },
+  ];
+  const GO = "go test -race -json ./...";
+
+  test("a direct go test run whose package failure has a failing test of its own may be accepted", () => {
+    assert.equal(inheritedIneligibility(GO, "go-json", go(failing("example.com/p", "TestA"))), null);
+  });
+
+  test("a panic or a data race is never accepted, since later tests never ran", () => {
+    const tally = go(failing("example.com/p", "TestA", [{ Action: "output", Package: "example.com/p", Test: "TestA", Output: "panic: boom\n" }]));
+    assert.match(inheritedIneligibility(GO, "go-json", tally)!, /panic or a data race/);
+    const race = go(failing("example.com/p", "TestA", [{ Action: "output", Package: "example.com/p", Test: "TestA", Output: "WARNING: DATA RACE\n" }]));
+    assert.match(inheritedIneligibility(GO, "go-json", race)!, /panic or a data race/);
+  });
+
+  test("a failing package explained only by a sibling package's test is not accepted", () => {
+    const tally = go([
+      ...failing("example.com/foo.v2", "TestA"),
+      { Action: "start", Package: "example.com/foo" },
+      { Action: "fail", Package: "example.com/foo", Elapsed: 0.1 },
+    ]);
+    assert.match(inheritedIneligibility(GO, "go-json", tally)!, /package example\.com\/foo failed with no failing test of its own/);
+  });
+
+  test("incomplete output is not accepted", () => {
+    const tally = go(failing("example.com/p", "TestA").slice(0, 3));
+    assert.match(inheritedIneligibility(GO, "go-json", tally)!, /incomplete test evidence/);
+  });
+
+  for (const gate of ["make check", "go test -race -json ./... && make e2e", "go test -race ./...",
+    "go test -json ./pkg/a && go test -json ./pkg/b", "go test -race -json ./... && go vet ./...", "cd e2e && go test -json ./..."]) {
+    test(`\`${gate}\` is not one direct go-json run, so its later steps may never have run`, () => {
+      assert.match(inheritedIneligibility(gate, "go-json", go(failing("example.com/p", "TestA")))!, /not one direct test run/);
+    });
+  }
+
+  for (const gate of ["go test -json -failfast ./...", "GOFLAGS=-failfast go test -json ./...", "go test -json -failfast=1 ./...",
+    "go test -json ./... -args -test.failfast", "go test -json -failfast=T ./..."]) {
+    test(`\`${gate}\` stops at its first failure, so it is not accepted`, () => {
+      assert.match(inheritedIneligibility(gate, "go-json", go(failing("example.com/p", "TestA")))!, /stops at its first failure/);
+    });
+  }
+
+  test("-failfast=false and go's -x are not stop-first", () => {
+    assert.equal(inheritedIneligibility("go test -json -failfast=false ./...", "go-json", go(failing("example.com/p", "TestA"))), null);
+    assert.equal(inheritedIneligibility("go test -x -json ./...", "go-json", go(failing("example.com/p", "TestA"))), null);
+  });
+
+  test("an env prefix and a redirect still make one direct run", () => {
+    assert.equal(inheritedIneligibility("env CGO_ENABLED=1 go test -race -json ./... 2>&1", "go-json", go(failing("example.com/p", "TestA"))), null);
+  });
+
+  test("a junit-xml wrapper script is trusted to be one test run", () => {
+    const tally = parseGateOutput('<testsuite name="ui" tests="1" failures="1"><testcase classname="a.B" name="c"><failure message="x"/></testcase></testsuite>', "junit-xml");
+    assert.equal(inheritedIneligibility("python3 scripts/android-test-gate.py ui", "junit-xml", tally), null);
   });
 });
