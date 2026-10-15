@@ -7,8 +7,8 @@ import { join } from "node:path";
 import { FleetStore } from "./fleet-store.js";
 import { MachineManager, serveManager, type DesiredStateOptions } from "./machine-manager.js";
 import { JsonClient, ServiceError, serveFleet } from "./fleet-http.js";
-import { persistDesiredState } from "./fleet-config.js";
-import { parseDesiredCommand, effectiveWork, workRefusal, DESIRED_STATE_SCHEMA, type DesiredPoll } from "./desired-state.js";
+import { persistDesiredState, persistProjectDrains as persistDesiredStateLegacy } from "./fleet-config.js";
+import { parseDesiredCommand, effectiveWork, workRefusal, DESIRED_STATE_SCHEMA, MACHINE_SCOPE as MACHINE_SCOPE_NAME, type DesiredPoll } from "./desired-state.js";
 import type { WorkOffer } from "./machine-scheduler.js";
 
 const core = "org/core", mobile = "org/mobile";
@@ -314,11 +314,12 @@ test("operator command arguments", () => {
   assert.equal(parseDesiredCommand("drain", []), undefined);
   assert.deepEqual(parseDesiredCommand("drain", ["--machine", "mac"]), { machines: ["mac"], change: { work: "drained" } });
   assert.deepEqual(parseDesiredCommand("drain", ["--all-machines", "--project", core, "--tickets", "--reason", "rollout"]), { machines: "all", project: core, change: { work: "tickets-drained" }, reason: "rollout" });
+  assert.deepEqual(parseDesiredCommand("drain", ["--machine", "hp", "--tickets", "--loosen"]), { machines: ["hp"], change: { work: "tickets-drained" }, loosen: true });
   assert.deepEqual(parseDesiredCommand("resume", ["--machine", "hp", "--project", core]), { machines: ["hp"], project: core, change: { work: "taking" } });
   assert.deepEqual(parseDesiredCommand("stop", ["--machine", "hp", "--project", mobile]), { machines: ["hp"], project: mobile, change: { run: "stopped" } });
   assert.deepEqual(parseDesiredCommand("start", ["--all-machines", "--project", mobile]), { machines: "all", project: mobile, change: { run: "running" } });
   for (const [command, args] of [["stop", ["--machine", "hp"]], ["start", ["--all-machines"]], ["drain", ["--machine", "hp", "--all-machines"]], ["resume", ["--project", core]],
-    ["resume", ["--machine", "hp", "--tickets"]], ["drain", ["--machine"]], ["drain", ["--machine", "hp", "--exec", "sh"]], ["drain", ["--machine", "hp", "--project", "core"]]] as const) {
+    ["resume", ["--machine", "hp", "--tickets"]], ["resume", ["--machine", "hp", "--loosen"]], ["drain", ["--machine"]], ["drain", ["--machine", "hp", "--exec", "sh"]], ["drain", ["--machine", "hp", "--project", "core"]]] as const) {
     assert.throws(() => parseDesiredCommand(command, args), /./, `${command} ${args.join(" ")}`);
   }
 });
@@ -389,32 +390,93 @@ test("a saved import is not sent again after a failed save, so a later resume ho
   assert.equal(manager.work(mobile), "taking");
 });
 
-test("a claims database that goes back in revision cannot lift a saved drain until the operator acts", async t => {
+test("a claims database that goes back in revision cannot lift a saved drain or stop", async t => {
   let store = new FleetStore(":memory:", limits);
   const file = configFile(); t.after(file.cleanup);
   const claims = () => client(store, "hp");
   let manager = managerFrom(file.path, claims());
   await manager.refreshDesired();
   store.setDesired({ machines: ["hp"], change: { work: "drained" } });
-  store.setDesired({ machines: ["hp"], change: { work: "tickets-drained" } });
-  store.setDesired({ machines: ["hp"], change: { work: "drained" } });
+  store.setDesired({ machines: ["hp"], project: core, change: { run: "stopped" } });
+  store.setDesired({ machines: ["hp"], project: mobile, change: { work: "tickets-drained" } });
   await manager.refreshDesired();
   const applied = manager.desiredStatus()!.appliedRevision!;
   assert.ok(applied >= 3);
-  // Replaced by an empty database.
+  // Replaced by an empty database, as when a backup from before the change is restored.
   store.close();
   store = new FleetStore(":memory:", limits);
   t.after(() => store.close());
+  // Before the manager's next fetch, an operator change for it is refused rather than overriding its saved state.
+  store.desired.poll("hp", { projects: [core, mobile], appliedRevision: applied });
+  assert.throws(() => store.setDesired({ machines: ["hp"], project: mobile, change: { work: "taking" } }), /newer desired state/);
   manager = managerFrom(file.path, claims());
   await manager.refreshDesired();
-  assert.equal(manager.work(core), "drained");
-  assert.match(String(manager.desiredStatus()?.applyError?.reason), /behind the applied/);
-  await manager.refreshDesired();
-  const hp = store.desired.report(store.operations.list()).find(m => m.machine === "hp")!;
-  assert.equal(hp.manager?.appliedRevision, applied);
-  // Any operator change for this computer moves past it, and then applies.
-  store.setDesired({ machines: ["hp"], change: { work: "taking" } });
+  // The fetch merged the saved state back in: nothing was lifted.
+  assert.equal(store.desired.work("hp", core), "drained");
+  assert.equal(store.desired.document("hp").entries.find(e => e.project === core)?.run, "stopped");
+  assert.equal(store.desired.document("hp").entries.find(e => e.project === MACHINE_SCOPE_NAME)?.actor, "restore-merge");
   assert.ok(store.desired.document("hp").revision > applied);
+  assert.equal(manager.work(core), "drained");
+  assert.equal(manager.work(mobile), "drained");
+  assert.equal(manager.desiredStatus()?.projects[core].run, "stopped");
+  // From here operator changes apply as usual.
+  store.setDesired({ machines: ["hp"], change: { work: "taking" } });
   await manager.refreshDesired();
-  assert.equal(manager.work(core), "taking");
+  assert.equal(manager.work(mobile), "tickets-drained");
+  assert.equal(manager.work(core), "drained");
+});
+
+test("a restore and a rollback drain together: the import cannot carry the older document past the saved one", async t => {
+  let store = new FleetStore(":memory:", limits);
+  const file = configFile(); t.after(file.cleanup);
+  await managerFrom(file.path, client(store, "hp")).refreshDesired();
+  store.reportMachineCapabilities("hp", [], [core, mobile]);
+  store.setDesired({ machines: ["hp"], project: core, change: { run: "stopped" } });
+  await managerFrom(file.path, client(store, "hp")).refreshDesired();
+  // Restored claims database, and an older manager's drain-project during the rollback.
+  store.close();
+  store = new FleetStore(":memory:", limits);
+  t.after(() => store.close());
+  writeFileSync(file.path, JSON.stringify({ ...file.read(), drainingProjects: [core, mobile] }));
+  const manager = managerFrom(file.path, client(store, "hp"));
+  await manager.refreshDesired();
+  assert.equal(store.desired.document("hp").entries.find(e => e.project === core)?.run, "stopped");
+  assert.equal(store.desired.work("hp", mobile), "tickets-drained");
+  assert.equal(manager.work(core), "drained");
+  assert.equal(manager.work(mobile), "tickets-drained");
+});
+
+test("a local drain made while the claim service predates desired state is imported after its upgrade", async t => {
+  const store = new FleetStore(":memory:", limits); t.after(() => store.close());
+  const file = configFile(); t.after(file.cleanup);
+  let old = true;
+  const real = client(store, "hp");
+  const claims = { ...real, call: async <T>(path: string, body?: any): Promise<T> => {
+    if (path === "/machines/desired" && old) throw new ServiceError(404, { error: "Unknown operation" }, "Unknown operation");
+    return real.call<T>(path, body);
+  } };
+  const manager = managerFrom(file.path, claims);
+  await manager.refreshDesired();
+  assert.equal(manager.desiredStatus()?.mode, "unsupported");
+  await manager.setProjectDraining(mobile, true, (projects, changes) => persistDesiredStateLegacy(file.path, projects, changes));
+  old = false;
+  await manager.refreshDesired();
+  assert.equal(store.desired.work("hp", mobile), "tickets-drained");
+  assert.equal(manager.work(mobile), "tickets-drained");
+  assert.deepEqual(await grantsFor(manager, mobile, "s", [offer(mobile, "9")]), []);
+});
+
+test("a drain command never loosens a stricter drain without --loosen", async t => {
+  const store = new FleetStore(":memory:", limits); t.after(() => store.close());
+  store.reportMachineCapabilities("hp", [], [core, mobile]);
+  store.setDesired({ machines: ["hp"], project: mobile, change: { work: "drained" } });
+  const result = store.setDesired({ machines: ["hp"], project: mobile, change: { work: "tickets-drained" } });
+  assert.deepEqual(result.unchanged, ["hp"]);
+  assert.match(result.notes.join(" "), /already drained/);
+  assert.equal(store.desired.work("hp", mobile), "drained");
+  store.setDesired({ machines: ["hp"], project: mobile, change: { work: "tickets-drained" }, loosen: true });
+  assert.equal(store.desired.work("hp", mobile), "tickets-drained");
+  // A computer-wide resume names the boards still held by their own entries.
+  store.setDesired({ machines: ["hp"], change: { work: "drained" } });
+  assert.match(store.setDesired({ machines: ["hp"], change: { work: "taking" } }).notes.join(" "), /still holds back org\/mobile/);
 });

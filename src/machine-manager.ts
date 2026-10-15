@@ -104,6 +104,11 @@ export class MachineManager {
     persist(next, changes);
     this.config.drainingProjects = next;
     this.config.projectDrainChanges = changes;
+    // Made while the claim service predates desired state: imported once it supports it.
+    if (this.desired) {
+      if (draining) { this.pendingImports.add(project); this.localFloor.add(project); }
+      else { this.pendingImports.delete(project); this.localFloor.delete(project); }
+    }
     // A start already sent to the authority can still commit. Wait for it
     // before acknowledging the drain; subsequent jobs check the new policy.
     try { await this.tickPromise; } catch { /* a lost reply remains reserved */ }
@@ -155,7 +160,8 @@ export class MachineManager {
   }
   private poll(): DesiredPoll {
     return { projects: this.config.projects, appliedRevision: this.appliedRevision, ...(this.applyError ? { applyError: this.applyError } : {}),
-      ...(this.pendingImports.size ? { localDrains: [...this.pendingImports] } : {}) };
+      ...(this.pendingImports.size ? { localDrains: [...this.pendingImports] } : {}),
+      ...(this.desiredDoc ? { savedEntries: this.desiredDoc.entries.map(e => ({ project: e.project, ...(e.work ? { work: e.work } : {}), ...(e.run ? { run: e.run } : {}) })) } : {}) };
   }
   private async refreshOnce(): Promise<void> {
     let doc: DesiredDocument;

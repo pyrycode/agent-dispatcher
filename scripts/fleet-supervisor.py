@@ -28,6 +28,8 @@ SIX_HOUR_REASON = 'Operation exceeded six hours. No forced stop or second signal
 # handling. They are now waited out like any drain: no second signal is sent.
 UNCERTAIN_SIGNAL_REASONS = ('Drain acknowledgement uncertain. No second signal sent.',
                             'Drain delivery uncertain after supervisor restart. Inspect before retrying.')
+# A stop signal that keeps failing before delivery goes to attention after this many passes.
+SIGNAL_RETRIES = 3
 # After an unconfirmed signal, a dispatcher that is gone may have been stopped
 # by hand. Without an explicit run state it is never started automatically.
 EXITED_UNCONFIRMED_REASON = ('The dispatcher exited after a stop signal whose delivery was unconfirmed, so it may have been stopped by hand. '
@@ -141,6 +143,9 @@ class Supervisor:
         self.unhealthy_since = {}
         self.monotonic = monotonic
         self.notices = {}
+        # Consecutive stop signals that were certainly not sent, per board. In
+        # memory: a supervisor restart allows another few tries.
+        self.signal_failures = {}
         # Optional callable(project). Withdraws native task admission for the
         # project's container before a drain signal. Set by the service.
         self.withhold = None
@@ -203,6 +208,10 @@ class Supervisor:
             if observed.get('stopped') and observed.get('childrenStopped'):
                 self.retire_receipt(project, receipt, state, 'Retired ' + ('a health latch' if health_latched(state) else 'an attention record')
                                     + ': the board is stopped as desired, so nothing is restarted.')
+                return None
+            if health_latched(state) and not observed.get('stopped') and observed.get('identity'):
+                # A latch only prevents restarts. Stopping the unhealthy dispatcher is what the operator asked for.
+                self.retire_receipt(project, receipt, state, 'Retired a health latch to stop the board as desired.')
                 return None
         if state.get('reason') in UNCERTAIN_SIGNAL_REASONS and state.get('identity'):
             # Waiting for the signalled process to exit replaces inspection. It
@@ -328,6 +337,9 @@ class Supervisor:
         elif phase not in {'draining', 'waiting-for-native-task'}:
             # drain-requested and every other phase still need inspection.
             return None
+        if state.get('intent') == 'stop':
+            # A healthy dispatcher is exactly what a desired stop waits on, not a later start.
+            return None
         if observed.get('stopped') or observed.get('generation') != desired or observed.get('healthy') is not True:
             return None
         # The process the record drained or started must be gone.
@@ -375,7 +387,7 @@ class Supervisor:
             return {'phase': 'attention', 'project': project, 'reason': 'Dispatcher service is neither running nor stopped. Nothing was signalled.'}
         helpers_active = getattr(self.adapter, 'helpers_active', lambda project: False)
         if helpers_active(project):
-            state = {'phase': 'waiting-for-native-task', 'project': project, 'desired': desired, 'created': self.clock()}
+            state = {'phase': 'waiting-for-native-task', 'project': project, 'desired': desired, 'intent': intent, 'created': self.clock()}
             atomic(receipt, state)
             return state
         before = self.adapter.status()
@@ -388,7 +400,7 @@ class Supervisor:
         if self.withhold:
             self.withhold(project)
             if helpers_active(project):
-                state = {'phase': 'waiting-for-native-task', 'project': project, 'desired': desired, 'created': self.clock()}
+                state = {'phase': 'waiting-for-native-task', 'project': project, 'desired': desired, 'intent': intent, 'created': self.clock()}
                 atomic(receipt, state)
                 return state
         state = {'phase': 'drain-requested', 'project': project, 'desired': desired, 'intent': intent,
@@ -402,6 +414,7 @@ class Supervisor:
             self.adapter.drain(project, observed['identity'])
         except Exception as error:
             return self.signal_failed(project, receipt, state, error)
+        self.signal_failures.pop(project, None)
         state['phase'] = 'draining'
         atomic(receipt, state)
         if intent == 'stop':
@@ -414,16 +427,31 @@ class Supervisor:
             after = self.adapter.observe(project)
         except Exception:
             after = None
+        not_sent = getattr(error, 'signal_not_sent', False)
         if after is not None and after.get('stopped'):
-            # Gone either way: the wait for its children continues as a drain.
+            if not_sent:
+                # It stopped before any signal of ours, so it may have been stopped
+                # by hand. The next pass decides from the run state, as for any stopped board.
+                receipt.unlink(missing_ok=True)
+                return {'phase': 'stopped', 'project': project, 'reason': 'The dispatcher stopped before the stop signal was sent.'}
+            # Gone, perhaps by our signal. Without an explicit run state it is not started again.
             state['phase'] = 'draining'
+            state['signalUncertain'] = True
             atomic(receipt, state)
             return state
-        if getattr(error, 'signal_not_sent', False):
-            # Nothing was signalled, so the next pass may try again.
+        if not_sent:
+            # Nothing was signalled, so a later pass may try again, a bounded number of times.
             receipt.unlink(missing_ok=True)
-            return {'phase': 'signal-failed', 'project': project,
-                    'reason': 'Stop signal not sent: ' + redact_paths(str(error))[:200] + '. Nothing was signalled; the next pass tries again.'}
+            failures = self.signal_failures.get(project, 0) + 1
+            self.signal_failures[project] = failures
+            reason = 'Stop signal not sent: ' + redact_paths(str(error))[:200] + '. Nothing was signalled'
+            if failures >= SIGNAL_RETRIES:
+                self.signal_failures.pop(project, None)
+                held = {**{k: v for k, v in state.items() if k != 'phase'}, 'phase': 'attention', 'attentionFrom': 'signal-failed',
+                        'reason': reason + ' on ' + str(failures) + ' passes in a row. Inspect before retrying; archive this record to try again.'}
+                atomic(receipt, held)
+                return held
+            return {'phase': 'signal-failed', 'project': project, 'reason': reason + '; the next pass tries again.'}
         state['phase'] = 'draining'
         state['signalUncertain'] = True
         atomic(receipt, state)

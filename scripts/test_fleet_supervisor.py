@@ -367,7 +367,7 @@ class StaleStateTests(unittest.TestCase):
         self.assertEqual(self.worker.tick(PROJECT,'new')['phase'],'draining')
         self.assertTrue(self.receipt().exists());self.assertEqual(self.archives('retired'),[])
 
-    def test_uncertain_drain_signal_is_never_retired(self):
+    def test_uncertain_drain_signal_is_not_retired_on_the_conversion_pass(self):
         # It becomes an ordinary wait, without a second signal, and is not retired on that pass.
         self.open_record('drain-requested')
         self.adapter.current={'identity':{'pid':30,'start':'later'},'generation':'new','healthy':True,'stopped':False,'childrenStopped':False}
@@ -893,5 +893,48 @@ class ReviewOneTests(unittest.TestCase):
         self.adapter.set_run('running');self.stop_board()
         self.assertIn('reservation',self.worker.tick(PROJECT,NEW)['reason'])
         self.assertEqual(self.adapter.calls,[])
+
+class ReviewTwoTests(unittest.TestCase):
+    setUp=DesiredRunTests.setUp;receipt=DesiredRunTests.receipt;stop_board=DesiredRunTests.stop_board
+
+    def test_a_stop_waiting_for_a_native_task_is_not_retired_each_pass(self):
+        self.adapter.current['generation']=NEW
+        self.adapter.set_run('stopped')
+        self.adapter.helpers_active=lambda project:True
+        for _ in range(4):self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'waiting-for-native-task')
+        self.assertEqual(list(self.directory.glob('auto-retired-*')),[])
+        self.adapter.helpers_active=lambda project:False
+        self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'draining')
+        self.assertEqual(self.adapter.calls,['drain'])
+
+    def test_a_stop_reaches_a_latched_dispatcher_that_still_runs(self):
+        module.atomic(self.receipt(),{'phase':'attention','latch':'health','reason':module.HEALTH_LATCH_REASON,'project':PROJECT,'desired':NEW,'verified':1000,'created':900})
+        self.adapter.set_run('stopped')
+        self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'draining')
+        self.assertEqual(self.adapter.calls,['drain'])
+        # Without a desired stop, the latch still holds and nothing is signalled.
+        self.setUp()
+        module.atomic(self.receipt(),{'phase':'attention','latch':'health','reason':module.HEALTH_LATCH_REASON,'project':PROJECT,'desired':NEW,'verified':1000,'created':900})
+        self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'attention')
+        self.assertEqual(self.adapter.calls,[])
+
+    def test_a_signal_that_keeps_failing_goes_to_attention_after_three_passes(self):
+        def refuse(p,i):
+            self.adapter.calls.append('drain');error=RuntimeError('Configured workload command failed with exit 1');error.signal_not_sent=True;raise error
+        self.adapter.drain=refuse
+        self.assertEqual([self.worker.tick(PROJECT,NEW)['phase'] for _ in range(3)],['signal-failed','signal-failed','attention'])
+        self.assertIn('3 passes in a row',self.worker.tick(PROJECT,NEW)['reason'])
+        self.assertEqual(self.adapter.calls,['drain','drain','drain'])
+
+    def test_a_dispatcher_that_stopped_before_the_signal_is_not_updated_and_started(self):
+        # The Mac race: gone between the observation and the kill, perhaps by hand.
+        def gone(p,i):
+            self.adapter.calls.append('drain');self.stop_board()
+            error=RuntimeError('Signal refused: ProcessLookupError');error.signal_not_sent=True;raise error
+        self.adapter.drain=gone
+        self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'stopped')
+        self.assertFalse(self.receipt().exists())
+        for _ in range(2):self.assertEqual(self.worker.tick(PROJECT,NEW)['phase'],'stopped')
+        self.assertEqual(self.adapter.calls,['drain'])
 
 if __name__=='__main__':unittest.main()

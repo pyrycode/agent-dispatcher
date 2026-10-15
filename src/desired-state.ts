@@ -107,7 +107,9 @@ export function validateDocument(value: unknown, machine: string): DesiredDocume
 
 /** The fixed operator change set. Nothing else can be requested. */
 export interface DesiredChange { work?: WorkState; run?: RunState }
-export interface DesiredCommand { machines: string[] | "all"; project?: string; change: DesiredChange; reason?: string }
+export interface DesiredCommand { machines: string[] | "all"; project?: string; change: DesiredChange; reason?: string;
+  /** A drain command never loosens a stricter drain unless this is set. */
+  loosen?: boolean }
 
 /**
  * Parse `drain|resume|stop|start` operator arguments. Returns undefined for a
@@ -116,8 +118,8 @@ export interface DesiredCommand { machines: string[] | "all"; project?: string; 
  */
 export function parseDesiredCommand(command: string, args: readonly string[]): DesiredCommand | undefined {
   if (command === "drain" && args.length === 0) return undefined;
-  const usage = `Usage: ${command} --machine MACHINE | --all-machines${command === "stop" || command === "start" ? " --project PROJECT" : " [--project PROJECT]"}${command === "drain" ? " [--tickets]" : ""} [--reason TEXT]`;
-  let machine: string | undefined, all = false, project: string | undefined, tickets = false, reason: string | undefined;
+  const usage = `Usage: ${command} --machine MACHINE | --all-machines${command === "stop" || command === "start" ? " --project PROJECT" : " [--project PROJECT]"}${command === "drain" ? " [--tickets] [--loosen]" : ""} [--reason TEXT]`;
+  let machine: string | undefined, all = false, project: string | undefined, tickets = false, reason: string | undefined, loosen = false;
   for (let i = 0; i < args.length; i++) {
     const flag = args[i];
     const value = () => { const v = args[++i]; if (v === undefined || v.startsWith("--")) throw new Error(usage); return v; };
@@ -126,6 +128,7 @@ export function parseDesiredCommand(command: string, args: readonly string[]): D
     else if (flag === "--project" && project === undefined) project = value();
     else if (flag === "--tickets" && command === "drain" && !tickets) tickets = true;
     else if (flag === "--reason" && reason === undefined) reason = value();
+    else if (flag === "--loosen" && command === "drain" && !loosen) loosen = true;
     else throw new Error(usage);
   }
   if ((machine === undefined) === !all) throw new Error(usage);
@@ -135,7 +138,7 @@ export function parseDesiredCommand(command: string, args: readonly string[]): D
     : command === "resume" ? { work: "taking" }
     : command === "stop" ? { run: "stopped" }
     : command === "start" ? { run: "running" } : (() => { throw new Error(usage); })();
-  return { machines: all ? "all" : [machine!], ...(project ? { project } : {}), change, ...(reason ? { reason } : {}) };
+  return { machines: all ? "all" : [machine!], ...(project ? { project } : {}), change, ...(reason ? { reason } : {}), ...(loosen ? { loosen } : {}) };
 }
 
 export type AckState = "applied" | "pending" | "failed";
@@ -150,6 +153,13 @@ export interface DesiredPoll {
   applyError?: { revision: number; reason: string };
   /** Saved project drains from before central desired state, sent until they are imported. */
   localDrains?: string[];
+  /**
+   * The entries of the document the manager applies. When the claims
+   * database is behind the applied revision, as after a restore, the claim
+   * service merges them back in, never loosening anything, before any
+   * revision moves past the applied one.
+   */
+  savedEntries?: Array<{ project: string; work?: WorkState; run?: RunState }>;
 }
 
 /** How long a change may stay unacknowledged before attention reports it. */
@@ -204,6 +214,13 @@ export class DesiredStateStore {
     const row = this.db.prepare("SELECT projects FROM fleet_desired_polls WHERE machine=?").get(machine);
     return row ? JSON.parse(String(row.projects)) as string[] : this.reportedProjects(machine);
   }
+  private storedRevision(machine: string): number {
+    return Number(this.db.prepare("SELECT revision FROM fleet_desired_revisions WHERE machine=?").get(machine)?.revision ?? 0);
+  }
+  /** The revision the computer's manager last said it applied, or 0. */
+  private appliedRevision(machine: string): number {
+    return Number(this.db.prepare("SELECT applied FROM fleet_desired_polls WHERE machine=?").get(machine)?.applied ?? 0);
+  }
   private write(machine: string, project: string, change: DesiredChange, actor: string, reason?: string): DesiredEntry | undefined {
     const old = this.entries(machine).find(e => e.project === project);
     const work = change.work ?? old?.work, run = change.run ?? old?.run;
@@ -240,6 +257,8 @@ export class DesiredStateStore {
     if (!Array.isArray(targets) || !targets.length || targets.length > 50) throw new Error("Name a machine or all machines");
     for (const m of targets) this.known(m);
     const changed: Array<DesiredEntry & { machine: string }> = [], unchanged: string[] = [], skipped: string[] = [], notes: string[] = [];
+    const behind = targets.filter(m => this.appliedRevision(m) > this.storedRevision(m));
+    if (behind.length) throw new Error(`${behind.join(", ")}: its manager applied a newer desired state than this database holds, as after a restore. Its next fetch, within 15 seconds, merges that state back in; retry then.`);
     for (const machine of targets) {
       if (project !== undefined) {
         const served = this.served(machine);
@@ -248,8 +267,19 @@ export class DesiredStateStore {
           throw new Error(served ? `${machine} does not serve ${project}` : `${machine} has not reported the projects it serves; update its manager first`);
         }
       }
+      const current = this.entries(machine).find(e => e.project === (project ?? MACHINE_SCOPE));
+      if (change.work !== undefined && change.work !== "taking" && !command.loosen && stricter(current?.work, change.work) !== change.work) {
+        // drain --tickets, or the older drain-project, on a fully drained board would let owned work run again.
+        unchanged.push(machine);
+        notes.push(`${machine}${project ? ` ${project}` : ""} is already ${current!.work}, which is stricter; add --loosen to change it to ${change.work}`);
+        continue;
+      }
       const entry = this.write(machine, project ?? MACHINE_SCOPE, change, "operator", reason);
       if (entry) changed.push({ machine, ...entry }); else unchanged.push(machine);
+      if (project === undefined && change.work === "taking") {
+        const held = this.entries(machine).filter(e => e.project !== MACHINE_SCOPE && (e.work === "drained" || e.work === "tickets-drained" || e.run === "stopped"));
+        if (held.length) notes.push(`${machine} still holds back ${held.map(e => `${e.project} (${e.run === "stopped" ? "stopped" : e.work})`).join(", ")} by their own entries`);
+      }
       if (project !== undefined && change.work === "taking" && this.entries(machine).find(e => e.project === MACHINE_SCOPE)?.work === "drained") notes.push(`${machine} is still drained computer-wide; resume --machine ${machine} lifts that`);
       if (project !== undefined && change.work === "taking" && desiredRun(this.entries(machine), project) === "stopped") notes.push(`${machine} ${project} is still stopped, which holds new work; start lifts that`);
       if (!this.db.prepare("SELECT 1 FROM fleet_desired_polls WHERE machine=?").get(machine)) notes.push(`${machine}'s manager has not fetched desired state yet; the claim service enforces the work state meanwhile, and a stop or start waits for its manager and supervisor to be updated`);
@@ -272,10 +302,30 @@ export class DesiredStateStore {
     if (error !== undefined && (!error || !Number.isSafeInteger(error.revision) || typeof error.reason !== "string")) throw new Error("Invalid apply error");
     const local = poll.localDrains;
     if (local !== undefined && (!Array.isArray(local) || local.some(p => !projects.includes(p)))) throw new Error("Saved drains must name served projects");
+    const saved = poll.savedEntries;
+    if (saved !== undefined && (!Array.isArray(saved) || saved.length > 100 || saved.some(e => !e || typeof e.project !== "string"
+      || (e.project !== MACHINE_SCOPE && !projects.includes(e.project)) || (e.work !== undefined && !WORK_STATES.includes(e.work))
+      || (e.run !== undefined && (!RUN_STATES.includes(e.run) || e.project === MACHINE_SCOPE))))) throw new Error("Invalid saved entries");
     const served = [...new Set(projects)].sort();
     this.db.prepare(`INSERT INTO fleet_desired_polls VALUES (?,?,?,?,?) ON CONFLICT(machine) DO UPDATE SET
       projects=excluded.projects,applied=excluded.applied,apply_error=excluded.apply_error,polled=excluded.polled`)
       .run(machine, JSON.stringify(served), poll.appliedRevision, error ? JSON.stringify({ revision: error.revision, reason: scrubCredentials(error.reason.slice(0, 500)) }) : null, this.now());
+    if (poll.appliedRevision !== null && poll.appliedRevision > this.storedRevision(machine)) {
+      // This database is behind what the manager applies, as after a restore.
+      // Without the manager's copy nothing may move past its revision, so the
+      // older document stays refused and nothing is imported yet.
+      if (!saved) return this.document(machine);
+      for (const e of saved) {
+        const current = this.entries(machine).find(c => c.project === e.project);
+        const work = stricter(e.work, current?.work);
+        const run = e.run === "stopped" || current?.run === "stopped" ? "stopped" : current?.run;
+        if (work !== (current?.work ?? "taking") || run !== current?.run) {
+          this.write(machine, e.project, { ...(work !== (current?.work ?? "taking") ? { work } : {}), ...(run !== current?.run ? { run } : {}) }, "restore-merge", "Merged back from this computer's saved state after the claims database went back");
+        }
+      }
+      // At least as strict as what the manager holds, so it may now apply it.
+      if (this.storedRevision(machine) <= poll.appliedRevision) this.db.prepare("INSERT INTO fleet_desired_revisions VALUES (?,?) ON CONFLICT(machine) DO UPDATE SET revision=excluded.revision").run(machine, poll.appliedRevision + 1);
+    }
     for (const project of new Set(local ?? [])) {
       const board = this.entries(machine).find(e => e.project === project);
       if (stricter(board?.work, "tickets-drained") !== (board?.work ?? "taking")) {
@@ -296,8 +346,10 @@ export class DesiredStateStore {
       const report = operations.find(o => o.machine === machine);
       const workAck = (entry: DesiredEntry): Ack => {
         if (!poll) return { state: "pending", reason: "Its manager has never fetched desired state (an older manager, or offline). The claim service refuses its new grants for drained boards meanwhile." };
-        if (poll.applied !== null && poll.applied >= entry.revision) return { state: "applied" };
+        // A failed latest apply comes first: after a restore the applied revision can be ahead of this entry.
         if (poll.applyError && poll.applyError.revision >= entry.revision) return { state: "failed", reason: poll.applyError.reason };
+        if (poll.applied !== null && poll.applied > doc.revision) return { state: "failed", reason: `Its manager applied revision ${poll.applied}, ahead of this database's ${doc.revision}, as after a restore; its next fetch merges it back` };
+        if (poll.applied !== null && poll.applied >= entry.revision) return { state: "applied" };
         return { state: "pending", reason: now - poll.polled > POLL_STALE_MS ? `Its manager has not fetched desired state for ${Math.round((now - poll.polled) / 60_000)} minutes` : "Waiting for its manager's next fetch" };
       };
       const runAck = (entry: DesiredEntry): Ack | undefined => {
