@@ -178,6 +178,19 @@ export interface FleetStoreOptions extends RecoveryLedgerOptions {
   log?: (line: string) => void;
 }
 
+/** How long a creating run holds its new tickets at most: the stale-reservation age. */
+export const CREATOR_HOLD_MS = 3 * 60 * 60 * 1000;
+
+/**
+ * A workflow write refused because the ticket is owned elsewhere: another
+ * computer's claim or run, another run on the same computer, or a run grant
+ * that has finished. The HTTP layers report it as a 409 refusal with this
+ * reason instead of a generic failure.
+ */
+export class OwnershipRefusal extends Error {
+  constructor(message: string) { super(message); this.name = "OwnershipRefusal"; }
+}
+
 export class FleetStore {
   private readonly db: DatabaseSync;
   readonly recovery: RecoveryLedger;
@@ -219,6 +232,10 @@ export class FleetStore {
     this.facts = new RecoveryFacts(this.db);
     this.tasks = new RecoveryTasks(this.db);
     this.db.exec("CREATE TABLE IF NOT EXISTS fleet_assessment_releases (ticket TEXT NOT NULL, machine TEXT NOT NULL, generation TEXT NOT NULL, created INTEGER NOT NULL, PRIMARY KEY(ticket,generation)) STRICT");
+    // The run that created a ticket, by GitHub issue node ID. While that run is
+    // active the ticket is not admitted (see startAdmitted), so a refiner that
+    // splits a ticket keeps write access to its children until it finishes.
+    this.db.exec("CREATE TABLE IF NOT EXISTS fleet_ticket_creators (issue_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, created INTEGER NOT NULL) STRICT");
     this.db.exec("CREATE TABLE IF NOT EXISTS fleet_machine_capabilities (machine TEXT PRIMARY KEY, capabilities TEXT NOT NULL, projects TEXT, updated INTEGER NOT NULL) STRICT");
     this.db.exec("CREATE TABLE IF NOT EXISTS fleet_control_target (singleton INTEGER PRIMARY KEY,revision TEXT NOT NULL) STRICT; CREATE TABLE IF NOT EXISTS fleet_control_ready (machine TEXT PRIMARY KEY,revision TEXT NOT NULL) STRICT;");
     const clock = options.now ?? Date.now;
@@ -394,7 +411,7 @@ export class FleetStore {
     });
   }
   authorizeWorkflow(machine:string,session:string,ticket:string,runId?:string):void {
-    if(runId && !this.db.prepare('SELECT 1 FROM fleet_runs WHERE id=? AND machine=? AND session=? AND finished IS NULL').get(runId,machine,session)) throw new Error('Workflow run has finished or lost ownership');
+    if(runId && !this.db.prepare('SELECT 1 FROM fleet_runs WHERE id=? AND machine=? AND session=? AND finished IS NULL').get(runId,machine,session)) throw new OwnershipRefusal('Workflow run has finished or lost ownership');
     this.authorize(machine,session,ticket,runId);
   }
   workflowComment(machine:string,session:string,runId:string|undefined,ticket:string,body:string,id:string):void {
@@ -468,16 +485,16 @@ export class FleetStore {
     if (!Object.hasOwn(this.limits, machine) || !session || !/^[\w.-]+\/[\w.-]+#[1-9]\d*$/.test(ticket)) throw new Error("Invalid ownership request");
     return this.transaction(() => {
       const claim = this.db.prepare("SELECT * FROM fleet_claims WHERE ticket=?").get(ticket) as unknown as Claim | undefined;
-      if (claim && claim.machine !== machine) throw new Error("Ticket belongs to another machine");
+      if (claim && claim.machine !== machine) throw new OwnershipRefusal("Ticket belongs to another machine");
       const active = this.db.prepare("SELECT id,machine,session FROM fleet_runs WHERE ticket=? AND finished IS NULL").get(ticket);
       // An unowned ticket's run, such as an assessment, is guarded here rather than by a claim.
-      if (active && active.machine !== machine) throw new Error("Ticket is running on another machine");
-      if (active && (active.id !== runId || active.session !== session)) throw new Error("Ticket has an active run");
+      if (active && active.machine !== machine) throw new OwnershipRefusal("Ticket is running on another machine");
+      if (active && (active.id !== runId || active.session !== session)) throw new OwnershipRefusal("Ticket has an active run");
       if (claim) return claim;
       const grant = runId ? this.db.prepare("SELECT ticket,request,generation FROM fleet_runs WHERE id=? AND machine=? AND session=? AND finished IS NULL").get(runId, machine, session) : undefined;
-      if (!grant) throw new Error("Unclaimed workflow writes require a run grant");
+      if (!grant) throw new OwnershipRefusal("Unclaimed workflow writes require a run grant");
       const request = JSON.parse(String(grant.request)) as StartRequest;
-      if (!ticket.startsWith(`${request.project}#`)) throw new Error("Run project mismatch");
+      if (!ticket.startsWith(`${request.project}#`)) throw new OwnershipRefusal("Run project mismatch");
       // A run that starts no ownership writes its own ticket under its own generation.
       const generation = String(grant.ticket) === ticket ? String(grant.generation) : randomUUID();
       const result = { ticket, machine, generation, created: Date.now() };
@@ -485,6 +502,21 @@ export class FleetStore {
       // work. Only start() creates ownership after scheduling admission.
       return result;
     });
+  }
+
+  /**
+   * Record that an admitted run created this issue. Only the run's own
+   * computer and session can record it, and only while the run is active.
+   * The first creator wins, so a later write cannot move the hold. Rows
+   * past the hold limit are pruned here, so runs that end without finish()
+   * leave nothing behind for long.
+   */
+  recordTicketCreator(machine: string, session: string, runId: string | undefined, issueId: string): void {
+    if (!runId || typeof issueId !== "string" || !issueId) return;
+    const now = this.clock();
+    this.db.prepare("DELETE FROM fleet_ticket_creators WHERE created<?").run(now - CREATOR_HOLD_MS);
+    this.db.prepare("INSERT OR IGNORE INTO fleet_ticket_creators SELECT ?,id,? FROM fleet_runs WHERE id=? AND machine=? AND session=? AND finished IS NULL")
+      .run(issueId, now, runId, machine, session);
   }
 
   private transactionDepth = 0;
@@ -529,6 +561,11 @@ export class FleetStore {
       const item=this.workflow.get(req.ticket);
       const columns:Record<string,string>={po:'Backlog',refiner:'Backlog',architect:'In Architecture',developer:'In Development',builder:'In Development',qa:'In QA','code-review':'In Code Review',verifier:'In Code Review',documentation:'In Documentation'};
       if(columns[req.role] && (item.state!=='OPEN' || item.status!==columns[req.role] || item.labels.some(l=>l.startsWith('error:')||l.startsWith('needs-rework:')||(l.startsWith('wip:')&&!isRepairWip(l))||l.startsWith('needs-human:')&&l!=='needs-human:sizing') || item.blockedBy.some(b=>b.state==='OPEN'))) return {ok:false,reason:'locked'};
+      // A ticket split off by a run that is still active waits for that run,
+      // which may still be writing its labels, priority and board order.
+      // Bounded, so a creator whose computer went away cannot hold its
+      // children past the point where its reservation is reported as stale.
+      if(this.db.prepare('SELECT 1 FROM fleet_ticket_creators AS c JOIN fleet_runs AS r ON r.id=c.run_id WHERE c.issue_id=? AND r.finished IS NULL AND c.created>?').get(item.issueId,this.clock()-CREATOR_HOLD_MS)) return {ok:false,reason:'locked'};
     }
     // Every stage of a ticket with a requirement runs only where it can.
     const needs = this.requirementsOf(req.ticket);
@@ -607,6 +644,8 @@ export class FleetStore {
       // again after a recovery worker may already have started.
       if (run.finished !== null) return observation ? this.recovery.list(request.project).filter(i => i.current && i.ticket === run.ticket) : [];
       this.db.prepare("DELETE FROM fleet_locks WHERE run_id=?").run(id);
+      // Its split children are admissible from now on.
+      this.db.prepare("DELETE FROM fleet_ticket_creators WHERE run_id=?").run(id);
       this.db.prepare("UPDATE fleet_runs SET finished=?,outcome=? WHERE id=? AND finished IS NULL").run(Date.now(), unused ? "unused" : completed ? "completed" : "cancelled", id);
       // An explicitly withdrawn, never-started reservation has no work to own.
       // Preserve this generation if any actual or uncertain run used it. In

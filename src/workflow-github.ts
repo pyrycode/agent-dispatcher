@@ -156,6 +156,20 @@ export class WorkflowGitHub {
       randomUUID(),
     );
   }
+  /**
+   * A ticket a run creates, such as a refiner's split child, is not admitted
+   * until that run finishes. Recorded before adoption, so a failed board
+   * registration cannot release the hold early.
+   */
+  private recordCreator(actor: Actor | undefined, issueId: unknown) {
+    if (actor && typeof issueId === "string")
+      this.store.recordTicketCreator(
+        actor.machine,
+        actor.session,
+        actor.runId,
+        issueId,
+      );
+  }
   private node(
     item: WorkflowItem,
     labels: Array<{ node_id: string; name: string }>,
@@ -345,8 +359,11 @@ export class WorkflowGitHub {
         request.method === "POST" &&
         path === `/repos/${project}/issues` &&
         result.status === 201
-      )
-        await this.adoptIssue(project, JSON.parse(result.body).node_id);
+      ) {
+        const id = JSON.parse(result.body).node_id;
+        this.recordCreator(actor, id);
+        await this.adoptIssue(project, id);
+      }
       return result;
     }
     const doc = parse(body.query),
@@ -610,8 +627,11 @@ export class WorkflowGitHub {
         if (
           (field === "createIssue" || field === "updateIssue") &&
           payload.data?.[key]?.issue?.id
-        )
+        ) {
+          if (field === "createIssue")
+            this.recordCreator(actor, payload.data[key].issue.id);
           await this.adoptIssue(project, payload.data[key].issue.id);
+        }
         if (
           field === "addProjectV2ItemById" &&
           input.projectId === this.store.workflow.config(project)!.projectId

@@ -5,7 +5,28 @@ import { chmodSync } from "node:fs";
 import type { GitHubBroker, GitHubRequest, GitHubResponse } from "./github-broker.js";
 import {publishRepair} from "./recovery-repair-publication.js";
 import {loadRepairBase,RepairBaseUnavailable,RepairRefusal} from "./recovery-source-publication.js";
-import type { Claim, FleetStore, FleetSnapshot, StartRequest, StartResult } from "./fleet-store.js";
+import { OwnershipRefusal, type Claim, type FleetStore, type FleetSnapshot, type StartRequest, type StartResult } from "./fleet-store.js";
+
+/** A non-2xx answer from the claim service or machine manager. The message format is unchanged. */
+export class ServiceError extends Error {
+  constructor(readonly status: number, readonly body: unknown, text: string) {
+    super(`Service ${status}: ${text.slice(0, 500)}`);
+    this.name = "ServiceError";
+  }
+}
+/** The marked body of an ownership refusal (409), relayed unchanged by the manager and bridge. */
+export interface OwnershipRefusalBody { error: string; refused: "ownership" }
+/**
+ * The refusal carried by `error`, or undefined. Only the claim service's
+ * explicit marker counts: the generic 409 catch-all, a transport failure, and
+ * any GitHub status are never treated as a refusal.
+ */
+export function ownershipRefusal(error: unknown): OwnershipRefusalBody | undefined {
+  if (!(error instanceof ServiceError) || error.status !== 409) return undefined;
+  const body = error.body as Partial<OwnershipRefusalBody> | null;
+  return body && typeof body === "object" && body.refused === "ownership" && typeof body.error === "string"
+    ? { error: body.error, refused: "ownership" } : undefined;
+}
 
 export async function readJson(req: IncomingMessage, maxBytes = 1024 * 1024): Promise<any> {
   let size = 0;
@@ -268,6 +289,7 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
       // An unreadable base is temporary; the caller retries later.
       if (error instanceof RepairRefusal) return send(422, { error: error.message, refused: true });
       if (error instanceof RepairBaseUnavailable) return send(503, { error: error.message });
+      if (error instanceof OwnershipRefusal) return send(409, { error: error.message, refused: "ownership" } satisfies OwnershipRefusalBody);
       send(409, { error: error instanceof Error ? error.message : "Operation failed" });
     }
   });
@@ -297,7 +319,7 @@ export class JsonClient {
       }, response => {
         void readJson(response, path.startsWith("/workflow/") ? 32*1024*1024 : path === "/github" ? 16 * 1024 * 1024 : path.startsWith("/tasks/") ? 8*1024*1024 : 1024 * 1024).then(value => {
           if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
-            reject(new Error(`Service ${response.statusCode}: ${JSON.stringify(value).slice(0, 500)}`));
+            reject(new ServiceError(response.statusCode ?? 0, value, JSON.stringify(value)));
           } else resolve(value as T);
         }, reject);
       });
@@ -310,7 +332,12 @@ export class JsonClient {
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       signal: AbortSignal.timeout(timeoutMs), redirect: "error",
     });
-    if (!response.ok) throw new Error(`Service ${response.status}: ${(await response.text()).slice(0, 500)}`);
+    if (!response.ok) {
+      const text = await response.text();
+      let value: unknown;
+      try { value = JSON.parse(text); } catch { value = undefined; }
+      throw new ServiceError(response.status, value, text);
+    }
     return await response.json() as T;
   }
 }
