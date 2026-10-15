@@ -1,3 +1,4 @@
+import {FleetReleases} from "./fleet-releases.js";
 import { isRepairWip } from "./recovery-labels.js";
 import { PRIORITY_HIGH } from "./ticket-priority.js";
 import { WorkflowStore, type WorkflowChange } from "./workflow-store.js";
@@ -203,6 +204,7 @@ export class OwnershipRefusal extends Error {
 
 export class FleetStore {
   private readonly db: DatabaseSync;
+  readonly releases: FleetReleases;
   readonly recovery: RecoveryLedger;
   readonly workflow: WorkflowStore;
   readonly facts: RecoveryFacts;
@@ -253,6 +255,7 @@ export class FleetStore {
     this.db.exec("CREATE TABLE IF NOT EXISTS fleet_machine_capabilities (machine TEXT PRIMARY KEY, capabilities TEXT NOT NULL, projects TEXT, updated INTEGER NOT NULL) STRICT");
     this.db.exec("CREATE TABLE IF NOT EXISTS fleet_control_target (singleton INTEGER PRIMARY KEY,revision TEXT NOT NULL) STRICT; CREATE TABLE IF NOT EXISTS fleet_control_ready (machine TEXT PRIMARY KEY,revision TEXT NOT NULL) STRICT;");
     const clock = options.now ?? Date.now;
+    this.releases = new FleetReleases(this.db, clock);
     this.operations = new OperationReports(this.db, Object.keys(limits), clock);
     this.orphans = new OrphanedTaskWatch(this.db, this.tasks, this.operations, clock, options.orphanedTaskMs);
     this.clock = clock;
