@@ -85,7 +85,7 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
       // Desired against observed for every computer and board, with acknowledgements.
       if (req.method === "GET" && req.url === "/desired") return send(200, { machines: store.desired.report(store.operations.list()), attention: store.desired.attention(store.operations.list()) });
       if (req.method === "GET" && req.url === "/tasks/orphaned") return send(200, store.orphans.list());
-      if (req.method === "GET" && req.url === "/state") return send(200, {...store.snapshot(), features:{recoveryTasks:true,...(evidence?{evidence:true}:{})},requiredRepairs:store.requiredRepairs(),openTaskTickets:store.openTaskTickets(),...(evidence?{evidenceStore:evidence.cachedUsage()}:{})});
+      if (req.method === "GET" && req.url === "/state") return send(200, {...store.snapshot(), features:{recoveryTasks:true,exclusiveTests:true,...(evidence?{evidence:true}:{})},requiredRepairs:store.requiredRepairs(),openTaskTickets:store.openTaskTickets(),...(evidence?{evidenceStore:evidence.cachedUsage()}:{})});
       if (req.method === "GET" && req.url === "/runner") return send(200, store.runnerPolicy() ?? null);
       if (req.method === "GET" && req.url === "/codex") return send(200, { pause: store.codex.state(), spacing: store.codex.spacingState(), config: store.codex.config, events: store.codex.events(), recentStarts: store.codex.starts() });
       if (req.method === "GET" && req.url === "/recovery/state") return send(200, store.recovery.list());

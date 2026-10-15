@@ -81,7 +81,7 @@ export function readCodexThrottleConfig(raw: unknown): CodexThrottleConfig {
  * not state its runner is judged by role: anything else is an agent role and
  * follows the central runner choice.
  */
-export const NON_AGENT_ROLES: ReadonlySet<string> = new Set(["merge", "reconcile", "codegraph", "main-sweep", "real-claude-gate"]);
+export const NON_AGENT_ROLES: ReadonlySet<string> = new Set(["interactive-test", "merge", "reconcile", "codegraph", "main-sweep", "real-claude-gate"]);
 
 /**
  * True when admitting this request would start a Codex agent.

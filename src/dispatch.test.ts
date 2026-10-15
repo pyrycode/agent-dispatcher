@@ -8162,12 +8162,9 @@ describe("runRealClaudeGateSuite — refusing to run", () => {
 });
 
 describe("buildGateSpawnEnv", () => {
-  test("keeps the Claude OAuth token", () => {
-    // The credential the real-claude fixtures actually look for. The
-    // 2026-07-22 belief that it is absent here was never measured and is
-    // false: a full suite ran from this machine on 2026-08-07, 176 passed.
+  test("offline gates omit the Claude OAuth token", () => {
     const env = buildGateSpawnEnv({ CLAUDE_CODE_OAUTH_TOKEN: "sk-oauth-xyz", PATH: "/usr/bin" });
-    assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, "sk-oauth-xyz");
+    assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, undefined);
     assert.equal(env.PATH, "/usr/bin");
   });
 
@@ -8206,7 +8203,7 @@ describe("buildGateSpawnEnv", () => {
   test("drops the Codex test login: no ordinary gate runs live Codex", () => {
     const env = buildGateSpawnEnv(capture);
     for (const name of CODEX_CAPTURE_ENV) assert.ok(!(name in env), name);
-    assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, "t");
+    assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, undefined);
   });
 
   test("the live gate keeps the Codex test login, and still drops everything else", () => {

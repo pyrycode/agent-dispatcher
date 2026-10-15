@@ -106,6 +106,7 @@ export interface StartRequest {
   /** Absent means "fleet". See RoleLimitScope. */
   roleLimitScope?: RoleLimitScope;
   requiresRecovery?: boolean;
+  exclusiveMachine?: boolean;
   readyRepairs?: string[];
   supportTaskId?: string; parentTicket?: string;
   /** The dispatcher's own runner for an agent role. The central choice still wins; this decides only without one. */
@@ -113,7 +114,7 @@ export interface StartRequest {
 }
 export interface Claim { ticket: string; machine: string; generation: string; created: number }
 export interface FleetRun extends StartRequest { generation: string; created: number; runnerPolicy?: RunnerPolicy }
-export interface FleetSnapshot { workflowProjects?: string[]; claims: Claim[]; runs: FleetRun[]; runnerPolicy?: RunnerPolicy; idleRecoveryTickets?: string[]; priorityHighTickets?: string[]; releasedAssessmentClaims?: Claim[]; features?: {recoveryTasks:boolean; evidence?: boolean}; evidenceStore?: import("./evidence-store.js").EvidenceUsage; requiredRepairs?: Record<string,string[]>; codexPause?: CodexPauseState;
+export interface FleetSnapshot { workflowProjects?: string[]; claims: Claim[]; runs: FleetRun[]; runnerPolicy?: RunnerPolicy; idleRecoveryTickets?: string[]; priorityHighTickets?: string[]; releasedAssessmentClaims?: Claim[]; features?: {recoveryTasks:boolean; evidence?: boolean; exclusiveTests?:boolean}; evidenceStore?: import("./evidence-store.js").EvidenceUsage; requiredRepairs?: Record<string,string[]>; codexPause?: CodexPauseState;
   /**
    * Open tickets of adopted projects waiting for review with nothing holding
    * them (see awaitsReview), whoever owns them. Present, possibly empty,
@@ -167,6 +168,7 @@ export function validateStart(req: StartRequest): void {
   if (req.resource !== "heavy" && req.resource !== "medium" && req.resource !== "light") throw new Error("Invalid resource class");
   if (req.roleLimit !== undefined && (!Number.isSafeInteger(req.roleLimit) || req.roleLimit < 1)) throw new Error("Invalid role limit");
   if (req.roleLimitScope !== undefined && ((req.roleLimitScope !== "machine" && req.roleLimitScope !== "fleet") || req.roleLimit === undefined)) throw new Error("Invalid role limit scope");
+  if (req.exclusiveMachine !== undefined && (typeof req.exclusiveMachine !== "boolean" || req.role !== "interactive-test")) throw new Error("Only interactive test jobs may request exclusive machine admission");
   if (req.runner !== undefined && req.runner !== 'claude' && req.runner !== 'codex') throw new Error('Invalid runner');
   if (req.requiresRecovery !== undefined && (typeof req.requiresRecovery !== 'boolean' || req.role !== 'recovery')) throw new Error('Invalid recovery requirement');
   if(req.readyRepairs!==undefined && (!Array.isArray(req.readyRepairs)||req.readyRepairs.length>10||req.readyRepairs.some(s=>! /^[a-f0-9]{40}$/.test(s)))) throw new Error("Invalid repair readiness");
@@ -652,6 +654,8 @@ export class FleetStore {
         if (JSON.stringify(original) !== request) throw new Error("Request ID reused with different contents");
         return previous.finished === null ? { ok: true, generation: String(previous.generation) } : { ok: false, reason: "finished" };
       }
+    const activeMachine = this.db.prepare('SELECT request FROM fleet_runs WHERE machine=? AND finished IS NULL').all(req.machine);
+    if (activeMachine.length && (req.exclusiveMachine || activeMachine.some(r=>JSON.parse(String(r.request)).exclusiveMachine === true))) return {ok:false,reason:'capacity'};
     // The operator's central drain or stop holds new grants here even when
     // the computer's manager is older or has not fetched it yet. A retry of
     // a lost reply above still recovers its grant.

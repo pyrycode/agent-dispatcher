@@ -1,0 +1,12 @@
+{
+  "machine": "pyrybox",
+  "claimsUrl": "http://127.0.0.1:7430",
+  "claimsTokenEnv": "FLEET_MACHINE_TOKEN",
+  "projects": ["pyrycode/pyrycode"],
+  "receiptDirectory": "/home/pyry/pyrycode-runtime/interactive-tests",
+  "timeoutMinutes": 30,
+  "idleCache": {
+    "directory": "/home/pyry/.cache/go-build",
+    "maxBytes": 10737418240
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "defaults": {
+    "mobileHeavyLimit": 1,
+    "separateDisplays": true,
+    "interactiveBuilders": 1,
+    "offlineLiveLogin": false
+  },
+  "computers": {
+    "build-fractal-2": {
+      "playwrightWorkers": 2
+    }
+  }
+}
