@@ -45,10 +45,12 @@ test("unset and blank restricted accounts are absent", () => {
 test("the existing denylist still holds for every role", () => {
   const parent = Object.fromEntries([...SPAWN_ENV_DENYLIST].map(key => [key, "fixture"]));
   parent.PYRY_DEV_AGENTS_TOKEN = "restricted-fixture";
+  parent.PYRY_AGENT_GITHUB_TOKEN = "agent-only-fixture";
   for (const role of ["builder", "verifier"]) {
     const env = agentSpawnEnv(parent, role);
     for (const key of SPAWN_ENV_DENYLIST) {
       if (role === "builder" && key === "OP_SERVICE_ACCOUNT_TOKEN") continue;
+      if (key === "GH_TOKEN") { assert.equal(env[key], "agent-only-fixture"); continue; }
       assert.equal(env[key], undefined, key);
     }
   }

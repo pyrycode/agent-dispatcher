@@ -5,19 +5,28 @@
   "operatorTokenEnv": "FLEET_CLAIMS_OPERATOR_TOKEN",
   "github": {
     "tokenEnv": "FLEET_GITHUB_TOKEN",
-    "projects": ["pyrycode/pyrycode", "pyrycode/pyrycode-mobile", "pyrycode/pyrycode-desktop"],
+    "projects": [
+      "pyrycode/pyrycode",
+      "pyrycode/pyrycode-mobile",
+      "pyrycode/pyrycode-desktop"
+    ],
     "cacheMs": 120000,
     "readReserve": 200
   },
   "githubLabels": {
     "tokenEnv": "FLEET_GITHUB_TOKEN",
-    "projects": ["pyrycode/pyrycode", "pyrycode/pyrycode-mobile", "pyrycode/pyrycode-desktop"]
+    "projects": [
+      "pyrycode/pyrycode",
+      "pyrycode/pyrycode-mobile",
+      "pyrycode/pyrycode-desktop"
+    ]
   },
   "machines": {
     "macbook": {
       "heavyLimit": 1,
       "combinedLimit": 1,
-      "tokenEnv": "FLEET_MACBOOK_TOKEN"
+      "tokenEnv": "FLEET_MACBOOK_TOKEN",
+      "unattendedPolicy": "native-only"
     },
     "pyrybox": {
       "heavyLimit": 1,

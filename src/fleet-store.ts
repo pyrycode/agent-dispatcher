@@ -28,6 +28,7 @@ export type ResourceClass = "heavy" | "medium" | "light";
 export interface MachineLimits {
   heavyLimit: number;
   combinedLimit: number;
+  unattendedPolicy?: "native-only" | "isolated";
   /**
    * Optional. At most this many heavy runs of one project at a time on this
    * computer, inside heavyLimit. A project absent from the map has no extra
@@ -42,6 +43,7 @@ export function validateLimits(limits: MachineLimits): void {
       !Number.isSafeInteger(limits.combinedLimit) || limits.combinedLimit < limits.heavyLimit) {
     throw new Error("Limits require positive integers with combinedLimit >= heavyLimit");
   }
+  if(limits.unattendedPolicy!==undefined && !['native-only','isolated'].includes(limits.unattendedPolicy)) throw new Error('Invalid unattended policy');
   const perProject = limits.projectHeavyLimits;
   if (perProject === undefined) return;
   if (!perProject || typeof perProject !== "object" || Array.isArray(perProject)
@@ -652,6 +654,11 @@ export class FleetStore {
         if (JSON.stringify(original) !== request) throw new Error("Request ID reused with different contents");
         return previous.finished === null ? { ok: true, generation: String(previous.generation) } : { ok: false, reason: "finished" };
       }
+    // A native-only computer receives fixed native recipes, never an agent process.
+    if(this.limits[req.machine].unattendedPolicy==='native-only') {
+      if(req.role!=='recovery-task' || !req.supportTaskId
+        || this.tasks.get(req.supportTaskId).request.recipe==='dispatcher-repair') return {ok:false,reason:'incapable'};
+    }
     // The operator's central drain or stop holds new grants here even when
     // the computer's manager is older or has not fetched it yet. A retry of
     // a lost reply above still recovers its grant.

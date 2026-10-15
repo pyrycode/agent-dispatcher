@@ -773,6 +773,11 @@ export function extractRateLimitInfo(err: unknown): {
  */
 export const SPAWN_ENV_DENYLIST: ReadonlySet<string> = new Set([
   "GITHUB_TOKEN",
+  "GH_TOKEN",
+  "PYRY_AGENT_GITHUB_TOKEN",
+  "PYRY_RELEASE_TOKEN",
+  "FLEET_GITHUB_TOKEN",
+  "FLEET_CLAIMS_OPERATOR_TOKEN",
   "GITHUB_OWNER",
   "GITHUB_REPO",
   "PROJECT_NUMBER",
@@ -820,6 +825,8 @@ export const CODEX_CAPTURE_ENV = ["PYRY_CODEX_CAPTURE_BIN", "PYRY_CODEX_CAPTURE_
  */
 export function agentSpawnEnv(parentEnv: NodeJS.ProcessEnv, role: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...scrubSpawnEnv(parentEnv), CLAUDE_CODE_ENTRYPOINT: role };
+  const agentGitHub=parentEnv.PYRY_AGENT_GITHUB_TOKEN;
+  if(agentGitHub?.trim()) env.GH_TOKEN=agentGitHub;
   if (role !== "builder" && role !== "developer") for (const name of CODEX_CAPTURE_ENV) delete env[name];
   const token = parentEnv.PYRY_DEV_AGENTS_TOKEN;
   if (role === "builder" && token?.trim()) env.OP_SERVICE_ACCOUNT_TOKEN = token;

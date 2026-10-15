@@ -225,11 +225,12 @@ describe("pre-dispatch health check (agent-dispatcher#131)", () => {
 
   test("a Codex builder with live tests is checked with only the names its tool commands inherit", async () => {
     const parent = {
-      PATH: "/bin", HOME: "/home/a", GH_TOKEN: "gho_x", GITHUB_TOKEN: "dispatcher", PYRY_DEV_AGENTS_TOKEN: "restricted",
+      PATH: "/bin", HOME: "/home/a", GH_TOKEN: "broad-fixture", PYRY_AGENT_GITHUB_TOKEN: "agent-fixture", GITHUB_TOKEN: "dispatcher", PYRY_DEV_AGENTS_TOKEN: "restricted",
       CLAUDE_CODE_OAUTH_TOKEN: "oauth", RANDOM_SETTING: "1", LC_ALL: "C",
     };
     const live = healthEnvForAgent(parent, "builder", "codex");
-    assert.equal(live.env.GH_TOKEN, "gho_x");
+    assert.equal(live.env.GH_TOKEN, "agent-fixture");
+    assert.equal(live.env.PYRY_AGENT_GITHUB_TOKEN, undefined);
     assert.equal(live.env.OP_SERVICE_ACCOUNT_TOKEN, "restricted");
     assert.equal(live.env.LC_ALL, "C");
     assert.equal(live.env.RANDOM_SETTING, undefined);
@@ -253,7 +254,7 @@ describe("pre-dispatch health check (agent-dispatcher#131)", () => {
     const checks = parseHealthChecks({ PYRY_HEALTH_GITHUB_CMD: "gh auth status" });
     const { run } = fakeRunner({ "gh auth status": (env) => env.GH_TOKEN ? ok : fail("You are not logged into any GitHub hosts.") });
     const client = fakeClient();
-    const noToken = { ...parent, GH_TOKEN: undefined };
+    const noToken = { ...parent, GH_TOKEN: undefined, PYRY_AGENT_GITHUB_TOKEN: undefined };
     const out = await holdUnhealthyCandidates({
       candidates: [candidate("builder", 1746)], checks, checker: new HealthChecker({ run, cwd: "/repo", ttlMs: 0 }),
       envFor: (role) => healthEnvForAgent(noToken, role, "codex"), client, notify: async () => {}, state: newHealthNoticeState(),
