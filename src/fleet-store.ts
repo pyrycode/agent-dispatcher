@@ -136,7 +136,13 @@ export interface FleetSnapshot { workflowProjects?: string[]; claims: Claim[]; r
    */
   unreportedOwners?: Array<{ ticket: string; machine: string; requires: string[] }>;
   /** Present only while a new Codex start would be refused for spacing. */
-  codexSpacing?: CodexSpacingState }
+  codexSpacing?: CodexSpacingState;
+  /**
+   * Tickets with a support task queued, running, publishing or waiting for
+   * attention. Always present from a claim service that reports it, possibly
+   * empty; absent from an older one, which a reader must treat as unknown.
+   */
+  openTaskTickets?: string[] }
 export type StartResult = { ok: true; generation: string } | {
   ok: false; reason: "foreign-claim" | "running" | "capacity" | "locked" | "finished" | "codex-paused" | "codex-spaced" | "incapable" | "drained";
 };
@@ -852,6 +858,11 @@ export class FleetStore {
     if (!ready.length) return ready;
     const tasked = new Set(this.db.prepare("SELECT DISTINCT ticket FROM fleet_recovery_tasks WHERE state IN ('queued','running','publishing','attention')").all().map(r => String(r.ticket)));
     return ready.filter(t => !tasked.has(t));
+  }
+
+  /** Tickets with an open support task, in the states start() refuses. */
+  openTaskTickets(): string[] {
+    return this.db.prepare("SELECT DISTINCT ticket FROM fleet_recovery_tasks WHERE state IN ('queued','running','publishing','attention') ORDER BY ticket").all().map(r => String(r.ticket));
   }
 
   /** Read-only custody proof. A missing active reservation alone cannot
