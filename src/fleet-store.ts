@@ -1,3 +1,5 @@
+import {checkHandover,type HandoverProof} from './handover-check.js';
+import type {EvidenceStore} from './evidence-store.js';
 import { isRepairWip } from "./recovery-labels.js";
 import { PRIORITY_HIGH } from "./ticket-priority.js";
 import { WorkflowStore, type WorkflowChange } from "./workflow-store.js";
@@ -952,6 +954,18 @@ export class FleetStore {
     // Normal ManagedDispatch completion waits for tracked process groups
     // before /finish. Operator /free leaves no normal outcome and changes ownership.
     return prior;
+  }
+
+  /** Protected preflight uses historical completion and current central facts together. */
+  handoverCheck(proof:HandoverProof,evidence:EvidenceStore) {
+    return this.transaction(()=>{
+      const predecessor=this.db.prepare('SELECT ticket,generation,machine,finished,outcome FROM fleet_runs WHERE id=?').get(proof.runId) as
+        {ticket:string;generation:string;machine:string;finished:number|null;outcome:string|null}|undefined;
+      let workflow;
+      try {workflow=this.workflow.get(proof.ticket);} catch { /* Missing workflow refuses handover. */ }
+      const latestRunId=this.db.prepare('SELECT id FROM fleet_runs WHERE ticket=? ORDER BY created DESC,rowid DESC LIMIT 1').get(proof.ticket)?.id as string|undefined;
+      return checkHandover(proof,{snapshot:this.snapshot(),latestRunId,predecessor,workflow,tasks:this.tasks.list(proof.ticket)},evidence,this.clock());
+    });
   }
 
   snapshot(): FleetSnapshot {
