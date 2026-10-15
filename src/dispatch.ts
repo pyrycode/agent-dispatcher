@@ -3,7 +3,7 @@ import { writeRuntimeReceipt } from "./runtime-receipt.js";
 import { type ChildProcess, execSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import type { FleetRun, FleetSnapshot } from "./fleet-store.js";
-import { readFileSync, realpathSync, lstatSync, existsSync, writeFileSync, mkdirSync, mkdtempSync, rmdirSync, appendFileSync, readdirSync, createWriteStream, statSync, symlinkSync, unlinkSync, openSync, closeSync } from "node:fs";
+import { readFileSync, realpathSync, lstatSync, readlinkSync, existsSync, writeFileSync, mkdirSync, mkdtempSync, rmdirSync, appendFileSync, readdirSync, createWriteStream, statSync, symlinkSync, unlinkSync, openSync, closeSync } from "node:fs";
 import { homedir, hostname, tmpdir } from "node:os";
 import { resolve, dirname, basename } from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -149,7 +149,7 @@ import {
   type GateBaselineAssessment,
   type VerifierGateFormat,
 } from "./verifier-gate-baseline.js";
-import { activeStageSet } from "./stage-sets.js";
+import { activeStageSet, resolveStageSet } from "./stage-sets.js";
 import { resolveEffort } from "./effort-policy.js";
 import {
   REAL_CLAUDE_GATE_FAIL_COLUMN,
@@ -2355,6 +2355,8 @@ export type DispatchDeps = {
   isSymlinkPath: typeof isSymlinkPath;
   realpathSync?: typeof realpathSync;
   lstatSync?: typeof lstatSync;
+  /** Processes using a path; see processesUsingPath. */
+  processesUsingPath?: (path: string) => number[];
   /** Only supplied inside an admitted ManagedDispatch.run. */
   managedWorktree?: { run: FleetRun; snapshot: () => Promise<FleetSnapshot>; predecessor: (id: string) => Promise<FleetRun | null> };
   /** Records the run's shared evidence when it ends (run-evidence.ts). Defaults to the managed dispatcher's sink. */
@@ -3562,7 +3564,7 @@ export async function setupBranchAndWorktree(
           // A tree retained by a run on code older than custody records.
           // Removed only when nothing could be lost; refused otherwise.
           await removeLegacyManagedWorktree(ctx, path);
-          if (existsSync(worktreeDir)) throw new Error("The requested managed path already exists without the ticket branch");
+          if (existsSync(worktreeDir)) throw new LegacyRemovalIncomplete(`The legacy worktree was removed, but this run's path ${worktreeDir} exists without the ticket branch`);
           heldWorktrees = [];
           ownReuse = { reuse: false, reason: "legacy worktree removed" };
         } else {
@@ -3577,7 +3579,9 @@ export async function setupBranchAndWorktree(
         ownReuse = { reuse: false, reason: "no retained worktree" };
       }
     } catch (e) {
-      await client.addComment(item.issueNumber, `## ⚠️ Dispatch Error: ${agent.name}\n\nManaged worktree handoff refused: ${e}. All retained work and evidence were left in place.`);
+      await client.addComment(item.issueNumber, e instanceof LegacyRemovalIncomplete
+        ? `## ⚠️ Dispatch Error: ${agent.name}\n\n${e.message}. The branch ref was kept; check what is left at the path before retrying.`
+        : `## ⚠️ Dispatch Error: ${agent.name}\n\nManaged worktree handoff refused: ${e}. All retained work and evidence were left in place.`);
       try { await client.addLabel(item.issueNumber, `error:${agent.name}`); } catch {}
       return { ok: false };
     }
@@ -3933,17 +3937,59 @@ function custodyRecordAbsent(ctx: DispatchContext, path: string): boolean {
   }
 }
 
+/** Thrown once removal of a legacy worktree has begun, so the refusal
+ * comment does not claim the tree was left in place. */
+class LegacyRemovalIncomplete extends Error {}
+
+/** Processes whose working directory or an open file is inside `path`. Linux
+ * reads /proc; elsewhere `lsof` lists every open file. Throws when neither
+ * can be read, which the caller treats as a blocker. */
+export function processesUsingPath(path: string): number[] {
+  const inside = (target: string) => target === path || target.startsWith(`${path}/`);
+  const found = new Set<number>();
+  if (existsSync("/proc/self/cwd")) {
+    for (const entry of readdirSync("/proc")) {
+      if (!/^\d+$/.test(entry)) continue;
+      const pid = Number(entry);
+      try { if (inside(readlinkSync(`/proc/${entry}/cwd`))) found.add(pid); } catch { /* exited or not ours */ }
+      let fds: string[] = [];
+      try { fds = readdirSync(`/proc/${entry}/fd`); } catch { continue; }
+      for (const fd of fds) {
+        try { if (inside(readlinkSync(`/proc/${entry}/fd/${fd}`))) { found.add(pid); break; } } catch { /* closed */ }
+      }
+    }
+    return [...found];
+  }
+  const listing = spawnSync("lsof", ["-w", "-n", "-P", "-Fpn"], { encoding: "utf-8", maxBuffer: 256 * 1024 * 1024, timeout: 60_000 });
+  if (listing.error || typeof listing.stdout !== "string" || listing.stdout.length === 0) throw new Error(`lsof failed: ${listing.error ?? listing.stderr}`);
+  let pid = 0;
+  for (const line of listing.stdout.split("\n")) {
+    if (line.startsWith("p")) pid = Number(line.slice(1));
+    else if (line.startsWith("n") && inside(line.slice(1))) found.add(pid);
+  }
+  return [...found];
+}
+
+/** Every role any stage set has had, so a tree left by a role the current
+ * set no longer runs is still recognised as the dispatcher's. */
+function knownRoles(): string[] {
+  return [...new Set([...activeStageSet().agents, ...resolveStageSet("classic", {}).agents, ...resolveStageSet("builder", {}).agents].map(agent => agent.name))];
+}
+
 /**
  * Remove a worktree that holds the ticket branch but has no custody record,
  * because the run that left it predates records (PR 260). Such a tree cannot
  * be handed over, so it is removed the way removeBlockingWorktrees did before
- * managed dispatch, and only when nothing could be lost: the authority shows
- * this run alone on the ticket, in its unchanged ownership, with no open
- * support task; the path is this ticket's dispatcher path for a known role
- * in this repository; the tree is unlocked, has no unfinished Git operation,
- * holds nothing but regenerable runtime files, and every commit is on
- * origin. Anything else throws, naming each blocker, with nothing touched.
- * Never writes a custody record and never prunes other worktrees.
+ * managed dispatch, and only when nothing tracked could be lost: the
+ * authority shows this run alone on the ticket, in its unchanged ownership,
+ * with no open support task, both before the checks and again just before
+ * removal; the path is this ticket's dispatcher path for a known role in
+ * this repository; no process uses it; the tree is unlocked, has no
+ * unfinished Git operation and no hidden index entries, its only changes are
+ * unstaged CodeGraph files, and every commit is on origin. The branch ref is
+ * kept. Ignored files go with the tree, as they always did, and are named in
+ * the comment. Anything else throws, naming each blocker, with nothing
+ * touched. Never writes a custody record and never prunes other worktrees.
  */
 async function removeLegacyManagedWorktree(ctx: DispatchContext, path: string): Promise<void> {
   const managed = ctx.deps.managedWorktree!;
@@ -3951,67 +3997,103 @@ async function removeLegacyManagedWorktree(ctx: DispatchContext, path: string): 
   const run = managed.run;
   if (run.ticket !== `${run.project}#${ctx.item.issueNumber}` || run.role !== ctx.agent.name) throw new Error("Current managed grant does not match this ticket and role");
   const refuse = (blockers: string[]) => new Error(`Legacy worktree without custody record at ${path}: ${blockers.join("; ")}`);
-  const roles = activeStageSet().agents.map(agent => agent.name);
-  if (!roles.some(role => path === worktreePath(repoRoot, `${role}-${ctx.item.issueNumber}`))) throw refuse(["it is not a dispatcher worktree path for this ticket"]);
+  if (!knownRoles().some(role => path === worktreePath(repoRoot, `${role}-${ctx.item.issueNumber}`))) throw refuse(["it is not a dispatcher worktree path for this ticket"]);
+  if (path !== ctx.worktreeDir && existsSync(ctx.worktreeDir)) throw refuse([`this run's own path ${ctx.worktreeDir} already exists`]);
+  const git = (args: string, cwd: string) => String(execSync(`git ${args}`, { cwd, encoding: "utf-8", stdio: "pipe", timeout: 15_000 }));
+  const detail = (e: unknown) => (e as Error)?.message ?? String(e);
 
-  const blockers: string[] = [];
-  let state: FleetSnapshot;
-  try { state = await managed.snapshot(); }
-  catch (e) { throw refuse([`the authority could not be read (${e})`]); }
-  const ticketRuns = state.runs.filter(other => other.ticket === run.ticket);
-  if (ticketRuns.some(other => other.id !== run.id)) blockers.push("the authority shows another live run on the ticket");
-  if (!ticketRuns.some(other => other.id === run.id && other.session === run.session && other.generation === run.generation && other.machine === run.machine)) blockers.push("the authority does not show this run as admitted");
-  if (!state.claims.some(claim => claim.ticket === run.ticket && claim.machine === run.machine && claim.generation === run.generation)) blockers.push("the ticket's ownership changed");
-  if (!Array.isArray(state.openTaskTickets)) blockers.push("the authority does not report open support tasks");
-  else if (state.openTaskTickets.includes(run.ticket)) blockers.push("a support task is open for the ticket");
+  const authorityBlockers = async (): Promise<string[]> => {
+    let state: FleetSnapshot;
+    try { state = await managed.snapshot(); }
+    catch (e) { return [`the authority could not be read (${e})`]; }
+    const found: string[] = [];
+    const ticketRuns = state.runs.filter(other => other.ticket === run.ticket);
+    if (ticketRuns.some(other => other.id !== run.id)) found.push("the authority shows another live run on the ticket");
+    if (!ticketRuns.some(other => other.id === run.id && other.session === run.session && other.generation === run.generation && other.machine === run.machine)) found.push("the authority does not show this run as admitted");
+    if (!state.claims.some(claim => claim.ticket === run.ticket && claim.machine === run.machine && claim.generation === run.generation)) found.push("the authority shows no claim for this run's ownership generation");
+    if (!Array.isArray(state.openTaskTickets)) found.push("the authority does not report open support tasks");
+    else if (state.openTaskTickets.includes(run.ticket)) found.push("a support task is open for the ticket");
+    return found;
+  };
+  const processBlocker = (): string[] => {
+    try {
+      const pids = (ctx.deps.processesUsingPath ?? processesUsingPath)(path);
+      return pids.length ? [`process(es) ${pids.slice(0, 5).join(", ")} still use it`] : [];
+    } catch (e) { return [`the processes using it could not be checked (${detail(e)})`]; }
+  };
 
-  if (ctx.deps.isSymlinkPath(resolve(path, ".codegraph"))) blockers.push("it has a shared CodeGraph symlink");
+  const blockers = await authorityBlockers();
+  if (ctx.deps.isSymlinkPath(resolve(path, ".codegraph"))) blockers.push("it has a shared CodeGraph symlink from before index copies; check its target, then remove the link by hand");
   let head = "";
   try {
     worktreeIdentity(ctx, path);
-    head = String(execSync(`git rev-parse refs/heads/${ctx.branchName}`, { cwd: repoRoot, encoding: "utf-8", stdio: "pipe", timeout: 15_000 })).trim();
-  } catch (e) { blockers.push(`its identity could not be confirmed (${(e as Error)?.message ?? e})`); }
-  if (isWorktreeLocked(readWorktreeList(ctx), path)) blockers.push("it is locked");
+    head = git(`rev-parse refs/heads/${ctx.branchName}`, repoRoot).trim();
+  } catch (e) { blockers.push(`its identity could not be confirmed (${detail(e)})`); }
+  try { if (isWorktreeLocked(git("worktree list --porcelain", repoRoot), path)) blockers.push("it is locked"); }
+  catch (e) { blockers.push(`the worktree list could not be read (${detail(e)})`); }
 
-  const readStatus = () => String(execSync(`git status --porcelain -z --untracked-files=all`, { cwd: path, encoding: "utf-8", stdio: "pipe", timeout: 15_000 }));
+  const readStatus = () => git("status --porcelain -z --untracked-files=all", path);
+  // Only unstaged CodeGraph files count as regenerable here: a removal is
+  // final, so the wider runtime patterns used for automatic commits are not.
+  const removable = ({ status: code, path: file, from }: { status: string; path: string; from?: string }) =>
+    [" ", "?"].includes(code[0]!) && from === undefined && /(^|\/)\.codegraph(\/|$)/.test(file);
   let status: string | null = null;
   try {
     status = readStatus();
     if (heldOperationInProgress(ctx, path, status, true)) blockers.push("a merge, rebase, cherry-pick, revert or bisect is unfinished, or a Git lock is held");
-  } catch (e) { blockers.push(`its Git state could not be read (${(e as Error)?.message ?? e})`); }
-  if (status !== null && shouldAutoCommit(status)) {
-    const changed = statusEntries(status).filter(({ status: code, path: file, from }) => code[0] === "D" || !isRuntimeFile(file) || (from !== undefined && !isRuntimeFile(from))).map(({ path: file }) => file);
-    blockers.push(`it has uncommitted changes (${changed.slice(0, 5).join(", ")}${changed.length > 5 ? `, and ${changed.length - 5} more` : ""})`);
-  }
+    const changed = statusEntries(status).filter(entry => !removable(entry)).map(({ path: file }) => file);
+    if (changed.length) blockers.push(`it has uncommitted changes (${changed.slice(0, 5).join(", ")}${changed.length > 5 ? `, and ${changed.length - 5} more` : ""})`);
+    const hidden = git("ls-files -v -z", path).split("\0").filter(line => /^([a-z]|S) /.test(line)).map(line => line.slice(2));
+    if (hidden.length) blockers.push(`it has index entries hidden from git status by assume-unchanged or skip-worktree (${hidden.slice(0, 5).join(", ")})`);
+  } catch (e) { blockers.push(`its Git state could not be read (${detail(e)})`); }
 
+  let base = "";
   if (head) {
     try {
-      let base = `origin/${defaultBranch}`;
+      base = `origin/${defaultBranch}`;
       try { execSync(`git rev-parse --verify --quiet refs/remotes/origin/${ctx.branchName}`, { cwd: repoRoot, stdio: "pipe", timeout: 15_000 }); base = `origin/${ctx.branchName}`; }
       catch { /* no remote branch: compare with the default branch */ }
-      const missing = Number(String(execSync(`git rev-list --count ${base}..${head}`, { cwd: repoRoot, encoding: "utf-8", stdio: "pipe", timeout: 15_000 })).trim());
+      const missing = Number(git(`rev-list --count ${base}..${head}`, repoRoot).trim());
       if (!Number.isInteger(missing)) blockers.push("its commits could not be compared with origin");
       else if (missing > 0) blockers.push(`${missing} commit(s) are not on ${base}`);
-    } catch (e) { blockers.push(`its commits could not be compared with origin (${(e as Error)?.message ?? e})`); }
+    } catch (e) { blockers.push(`its commits could not be compared with origin (${detail(e)})`); }
   }
+  if (!blockers.length) blockers.push(...processBlocker());
   if (blockers.length > 0 || status === null) throw refuse(blockers);
 
-  // Runtime files only: git refuses a plain remove of a modified tree, so
-  // force it, but only after reading the same status again.
+  let ignored: string[] = [];
+  try { ignored = statusEntries(git("status --porcelain -z --ignored=matching --untracked-files=normal", path)).filter(entry => entry.status === "!!").map(entry => entry.path); }
+  catch (e) { throw refuse([`its ignored files could not be listed (${detail(e)})`]); }
+
+  // Last look just before removing: the same status, still no process, and
+  // the authority unchanged. Git refuses a plain remove of a tree with
+  // changes, so force it only when those changes were checked above.
   const force = status.length > 0;
-  if (force && readStatus() !== status) throw refuse(["its files changed while it was being checked"]);
-  execSync(`git worktree remove ${force ? "--force " : ""}"${path}"`, { cwd: repoRoot, stdio: "pipe", timeout: 60_000 });
-  if (findWorktreesForBranch(readWorktreeList(ctx), ctx.branchName).length > 0 || existsSync(path)) throw new Error(`Legacy worktree at ${path} was not fully removed`);
+  const late = await authorityBlockers();
+  try { if (readStatus() !== status) late.push("its files changed while it was being checked"); }
+  catch (e) { late.push(`its Git state could not be read again (${detail(e)})`); }
+  if (!late.length) late.push(...processBlocker());
+  if (late.length) throw refuse(late);
+
+  try {
+    execSync(`git worktree remove ${force ? "--force " : ""}"${path}"`, { cwd: repoRoot, stdio: "pipe", timeout: 600_000 });
+    if (findWorktreesForBranch(git("worktree list --porcelain", repoRoot), ctx.branchName).length > 0 || existsSync(path)) throw new Error("it is still listed or still on disk");
+  } catch (e) {
+    throw new LegacyRemovalIncomplete(`Removal of the legacy worktree without custody record at ${path} started and did not complete: ${detail(e)}`);
+  }
+
   const runtime = statusEntries(status).map(({ path: file }) => file);
-  const what = runtime.length ? `its only changes were regenerable runtime files (${runtime.slice(0, 5).join(", ")}${runtime.length > 5 ? `, and ${runtime.length - 5} more` : ""})` : "it was clean";
+  const list = (items: string[]) => `${items.slice(0, 8).map(item => `\`${item}\``).join(", ")}${items.length > 8 ? `, and ${items.length - 8} more` : ""}`;
+  const what = runtime.length ? `git status showed only CodeGraph files (${list(runtime)})` : "git status showed it clean";
   console.log(`   🧹 Removed legacy worktree without custody record ${path} (branch ${ctx.branchName} at ${head})`);
-  ctx.deps.writeLog(ctx.logFile, "LEGACY_WORKTREE_REMOVED", `path=${path} branch=${ctx.branchName} head=${head} runtimeFiles=${runtime.length}`);
+  ctx.deps.writeLog(ctx.logFile, "LEGACY_WORKTREE_REMOVED", `path=${path} branch=${ctx.branchName} head=${head} base=${base} codegraphEntries=${runtime.length} ignored=${ignored.join(",")}`);
   try {
     await ctx.client.addComment(ctx.item.issueNumber,
       `## 🧹 Removed legacy worktree without custody record\n\n` +
       `\`${path}\` held \`${ctx.branchName}\` at \`${head}\` and was left by a run that predates managed custody records, so it could not be handed over. ` +
-      `The authority showed no other live run and no open support task on this ticket, the tree had no unfinished Git operation, ${what}, and every commit is on origin. ` +
-      `The dispatcher removed it and this ${ctx.agent.name} run starts from a fresh worktree.`);
+      `The authority showed no other live run and no open support task on this ticket, no process was using the tree, it had no unfinished Git operation, ${what}, and every commit is on \`${base}\`. ` +
+      `The dispatcher removed it, kept the branch, and this ${ctx.agent.name} run starts from a fresh worktree.` +
+      (ignored.length ? `\n\nIgnored files went with it, as with the earlier cleanup: ${list(ignored)}.` : ""));
   } catch (e) { console.warn(`   ⚠️  Failed to post the legacy worktree comment: ${e}`); }
 }
 
