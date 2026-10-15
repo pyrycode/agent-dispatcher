@@ -70,7 +70,7 @@ export function repairDiagnostics(directory:string,binding?:{taskId:string;ticke
 
 /** Unit checks use their own fixtures rather than the launching consumer's configuration. */
 export function recoveryCheckEnv(parent:NodeJS.ProcessEnv):NodeJS.ProcessEnv {
- return Object.fromEntries(Object.entries(scrubSpawnEnv(parent)).filter(([name])=>!name.startsWith('FLEET_')&&!name.startsWith('PYRY_')&&!['AGENTS_REPO_PATH','TARGET_REPO_PATH','TARGET_DEFAULT_BRANCH'].includes(name)));
+ return Object.fromEntries(Object.entries(scrubSpawnEnv(parent)).filter(([name])=>!name.startsWith('FLEET_')&&!name.startsWith('PYRY_')&&!['AGENTS_REPO_PATH','TARGET_REPO_PATH','TARGET_DEFAULT_BRANCH','SALVAGE_GATES'].includes(name)));
 }
 export function runRecoveryCheck(program:string,args:string[],options:{cwd:string;env:NodeJS.ProcessEnv;log:string;timeout:number}):void {
  const started=Date.now(),fd=openSync(options.log,'w',0o600);

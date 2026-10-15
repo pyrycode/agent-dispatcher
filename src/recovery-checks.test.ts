@@ -8,8 +8,25 @@ import {syncBuiltinESMExports} from 'node:module';
 import {recoveryCheckEnv,runRecoveryCheck,repairDiagnostics} from './recovery-checks.js';
 
 test('repair checks do not inherit another consumers production role or checkout',()=>{
- const env=recoveryCheckEnv({PATH:'/tools',HOME:'/private/home',PYRY_STAGE_SET:'builder',PYRY_VERIFIER_GATES:'production gate',AGENTS_REPO_PATH:'/production/agents',TARGET_REPO_PATH:'/production/core',FLEET_ADMIN:'fixture',GITHUB_TOKEN:'fixture'});
+ const parent={PATH:'/tools',HOME:'/private/home',PYRY_STAGE_SET:'builder',PYRY_VERIFIER_GATES:'production gate',SALVAGE_GATES:'npm run build',AGENTS_REPO_PATH:'/production/agents',TARGET_REPO_PATH:'/production/core',FLEET_ADMIN:'fixture',GITHUB_TOKEN:'fixture'};
+ const env=recoveryCheckEnv(parent);
  assert.deepEqual(env,{PATH:'/tools',HOME:'/private/home'});
+ assert.equal(parent.SALVAGE_GATES,'npm run build','production configuration stays intact');
+});
+
+test('salvage fixtures reject failing gates under the unchanged consumer launcher environment',t=>{
+ const root=mkdtempSync(join(tmpdir(),'repair-inherited-gates-'));t.after(()=>rmSync(root,{recursive:true,force:true}));
+ // The already-running parent computed checkEnv before this repair. Deliberately
+ // put its leaked consumer setting back; fixing recoveryCheckEnv alone cannot help it.
+ const env:NodeJS.ProcessEnv={...recoveryCheckEnv(process.env),SALVAGE_GATES:'npm run build',AGENTS_REPO_PATH:root,TARGET_REPO_PATH:root};
+ delete env.NODE_TEST_CONTEXT;
+ const result=childProcess.spawnSync(process.execPath,['--import','tsx','--test',
+  '--test-name-pattern=committed timeout work with a failing build|consumer-configured salvage gate failure',
+  'src/dispatch.test.ts'],{cwd:new URL('..',import.meta.url),env,encoding:'utf8',timeout:30000});
+ assert.equal(result.error,undefined);
+ assert.equal(result.status,0,result.stdout+'\n'+result.stderr);
+ assert.match(result.stdout,/committed timeout work with a failing build/);
+ assert.match(result.stdout,/consumer-configured salvage gate failure/);
 });
 
 test('real pnpm repairs mismatched stores with stdin ignored and the unchanged parent runs postinstall', {timeout:60000}, t=>{

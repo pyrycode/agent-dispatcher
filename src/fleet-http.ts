@@ -248,6 +248,10 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
         if (!machine) return send(403, { error: "Machine credential required" });
         return send(200, store.authorize(machine, body.session, body.ticket, body.runId));
       }
+      if (req.url === "/worktree/predecessor") {
+        if (!machine) return send(403, { error: "Machine credential required" });
+        return send(200, store.worktreePredecessor(machine, body.session, body.runId, body.priorId));
+      }
       if (req.url === "/free") {
         if (!isAdmin) return send(403, { error: "Operator credential required" });
         store.free(body.ticket, body.generation, body.stopped);
