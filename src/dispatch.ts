@@ -1,9 +1,11 @@
 import { coordinationReceipts } from "./recovery-receipts.js";
 import { writeRuntimeReceipt } from "./runtime-receipt.js";
+import { readManagedWorktreeMigration, retainManagedWorktreeMigration, exactMigrationPredecessor, type MigrationReference, type ManagedWorktreeMigration } from "./managed-worktree-migration.js";
+import { readManagedCustody, checkManagedCustody, writeManagedCustody, type CustodyIO } from "./managed-worktree-custody.js";
 import { type ChildProcess, execSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import type { FleetRun, FleetSnapshot } from "./fleet-store.js";
-import { readFileSync, realpathSync, existsSync, writeFileSync, mkdirSync, mkdtempSync, rmdirSync, appendFileSync, readdirSync, createWriteStream, statSync, symlinkSync, unlinkSync, openSync, closeSync } from "node:fs";
+import { readFileSync, realpathSync, lstatSync, existsSync, writeFileSync, mkdirSync, mkdtempSync, rmdirSync, appendFileSync, readdirSync, createWriteStream, statSync, symlinkSync, unlinkSync, openSync, closeSync } from "node:fs";
 import { homedir, hostname, tmpdir } from "node:os";
 import { resolve, dirname, basename } from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -2315,7 +2317,7 @@ export interface DispatchClient {
 // be tested at the granularity of "did we issue the right git command".
 // `attemptSaferSalvage` accepts deps as part of its opts (called from
 // `handleAgentResultErrors`).
-export type DispatchDeps = {
+export type DispatchDeps = CustodyIO & {
   /** Test fixtures can pin gates independently of the launching consumer. */
   salvageGates?: readonly string[];
   // child_process
@@ -2330,8 +2332,11 @@ export type DispatchDeps = {
   copyCodegraphIndex: typeof copyCodegraphIndex;
   isSymlinkPath: typeof isSymlinkPath;
   realpathSync?: typeof realpathSync;
+  lstatSync?: typeof lstatSync;
   /** Only supplied inside an admitted ManagedDispatch.run. */
-  managedWorktree?: { run: FleetRun; snapshot: () => Promise<FleetSnapshot>; predecessor: (id: string) => Promise<FleetRun | null> };
+  managedWorktree?: { run: FleetRun; snapshot: () => Promise<FleetSnapshot>; predecessor: (id: string) => Promise<FleetRun | null>;
+    /** One expiring, operator-pinned legacy import in this ownership generation. */
+    migration?: MigrationReference };
   // dispatch-internal
   runClaudeStreaming: typeof runClaudeStreaming;
   notifyDiscord: (msg: string) => Promise<void>;
@@ -3483,11 +3488,17 @@ export async function setupBranchAndWorktree(
       if (paths.length > 0) {
         if (paths.length !== 1) throw new Error("Multiple worktrees hold the ticket branch");
         const path = paths[0]!;
-        await confirmManagedWorktree(ctx, path);
+        const migration = await confirmManagedWorktree(ctx, path);
         ownReuse = decideOwnReuse(ctx, heldWorktrees, branchAction, true);
         if (!ownReuse.reuse) throw new Error(ownReuse.reason);
+        checkManagedCustody(managedWorktreeRunRecordPath(path, ctx.deps.managedWorktree.run.id),
+          JSON.stringify(currentManagedWorktreeRecord(ctx, path)), ctx.deps);
+        if (migration) retainManagedWorktreeMigration(managedWorktreeRecordPath(path), migration, ctx.deps);
         ctx.worktreeDir = ctx.agentCwd = worktreeDir = path;
       } else {
+        // Refuse unsafe custody destinations before creating a branch or tree.
+        readManagedCustody(managedWorktreeRecordPath(worktreeDir), ctx.deps);
+        readManagedCustody(managedWorktreeRunRecordPath(worktreeDir, ctx.deps.managedWorktree.run.id), ctx.deps);
         if (existsSync(worktreeDir)) throw new Error("The requested managed path already exists without the ticket branch");
         heldWorktrees = [];
         ownReuse = { reuse: false, reason: "no retained worktree" };
@@ -3823,6 +3834,10 @@ export function managedWorktreeRecordPath(path: string): string {
   return resolve(LOGS_DIR, `managed-worktree-${createHash("sha256").update(path).digest("hex")}.json`);
 }
 
+function managedWorktreeRunRecordPath(path: string, runId: string): string {
+  return `${managedWorktreeRecordPath(path)}.${createHash("sha256").update(runId).digest("hex")}`;
+}
+
 function worktreeIdentity(ctx: DispatchContext, path: string): { repository: string; commonGitDir: string } {
   const canonical = ctx.deps.realpathSync ?? realpathSync;
   if (path !== resolve(path) || String(canonical(path)) !== path) throw new Error("Ambiguous or aliased managed worktree path");
@@ -3836,10 +3851,16 @@ function worktreeIdentity(ctx: DispatchContext, path: string): { repository: str
   return { repository, commonGitDir };
 }
 
-async function confirmManagedWorktree(ctx: DispatchContext, path: string): Promise<void> {
+async function confirmManagedWorktree(ctx: DispatchContext, path: string): Promise<ManagedWorktreeMigration | undefined> {
   const managed = ctx.deps.managedWorktree!;
   if (managed.run.ticket !== `${managed.run.project}#${ctx.item.issueNumber}` || managed.run.role !== ctx.agent.name) throw new Error("Current managed grant does not match this ticket and role");
-  const record = JSON.parse(String(ctx.deps.readFileSync(managedWorktreeRecordPath(path), "utf-8"))) as ManagedWorktreeRecord;
+  let record: ManagedWorktreeRecord;
+  let migration: ManagedWorktreeMigration | undefined;
+  const bytes = readManagedCustody(managedWorktreeRecordPath(path), ctx.deps);
+  if (bytes === undefined) {
+    migration = readManagedWorktreeMigration(managed.migration, managed.run, ctx.deps);
+    record = migration.record;
+  } else record = JSON.parse(bytes) as ManagedWorktreeRecord;
   const roles = activeStageSet().agents.map(agent => agent.name);
   if (!record?.run || record.path !== path || record.branch !== ctx.branchName ||
       !roles.includes(record.run.role) || !roles.some(role => path === worktreePath(repoRoot, `${role}-${ctx.item.issueNumber}`))) throw new Error("No matching recorded managed path and worker for this ticket");
@@ -3848,19 +3869,27 @@ async function confirmManagedWorktree(ctx: DispatchContext, path: string): Promi
   if (record.repository !== identity.repository || record.commonGitDir !== identity.commonGitDir) throw new Error("Recorded repository identity changed");
   const state = await managed.snapshot();
   const finishedPrior = await managed.predecessor(record.run.id);
+  if (migration && !exactMigrationPredecessor(migration, finishedPrior)) throw new Error("Legacy migration does not match the authority's exact finished predecessor");
   if (!managedPredecessorFinished(record.run, managed.run, state, finishedPrior)) throw new Error("Authority has not confirmed the prior worker and tracked children finished in this ownership generation");
+  return migration;
+}
+
+function currentManagedWorktreeRecord(ctx: DispatchContext, path: string): ManagedWorktreeRecord {
+  return {
+    ...worktreeIdentity(ctx, path), path, branch: ctx.branchName, run: ctx.deps.managedWorktree!.run,
+  };
 }
 
 function recordManagedWorktree(ctx: DispatchContext): void {
-  const record: ManagedWorktreeRecord = {
-    ...worktreeIdentity(ctx, ctx.worktreeDir), path: ctx.worktreeDir, branch: ctx.branchName, run: ctx.deps.managedWorktree!.run,
-  };
+  const record = currentManagedWorktreeRecord(ctx, ctx.worktreeDir);
   const file = managedWorktreeRecordPath(ctx.worktreeDir);
   // Retain each run's custody record as evidence when the current pointer
   // advances to the successor. Both files stay outside the worker's tree.
-  const runKey = createHash("sha256").update(record.run.id).digest("hex");
-  ctx.deps.writeFileSync(`${file}.${runKey}`, JSON.stringify(record), { mode: 0o600 });
-  ctx.deps.writeFileSync(file, JSON.stringify(record), { mode: 0o600 });
+  const archive = managedWorktreeRunRecordPath(ctx.worktreeDir, record.run.id), bytes = JSON.stringify(record);
+  readManagedCustody(file, ctx.deps);
+  checkManagedCustody(archive, bytes, ctx.deps);
+  writeManagedCustody(archive, bytes, ctx.deps);
+  writeManagedCustody(file, bytes, ctx.deps, true);
 }
 
 // Gather what decideOwnWorktreeReuse needs about the worktrees still holding
@@ -10532,6 +10561,8 @@ export async function pollLoop(): Promise<void> {
           await runConcurrentDispatches([c], client, {
             ...DEFAULT_DEPS,
             managedWorktree: { run: admittedRun, snapshot: () => managed.connection.call<FleetSnapshot>("/state"),
+              migration: process.env.PYRY_MANAGED_WORKTREE_MIGRATION ? { path: process.env.PYRY_MANAGED_WORKTREE_MIGRATION,
+                sha256: process.env.PYRY_MANAGED_WORKTREE_MIGRATION_SHA256 ?? "" } : undefined,
               predecessor: priorId => managed.connection.call<FleetRun | null>("/worktree/predecessor", { session: admittedRun.session, runId: admittedRun.id, priorId }) },
           }, managed.machine ?? hostname());
         }, recoveryEnabled ? {

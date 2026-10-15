@@ -1796,7 +1796,20 @@ test("setupBranchAndWorktree — managed verifier-to-builder recovery (#1936)", 
         : IN_PROGRESS_GIT_PATHS.map(name => `${commonGitDir}/worktrees/verifier-1936/${name}`).join("\n"),
     },
   } });
-  Object.assign(ctx.deps, { realpathSync: (value: string) => value, managedWorktree: { run: current,
+  const descriptors = new Map<number, string>();
+  const read = ctx.deps.readFileSync, write = ctx.deps.writeFileSync;
+  const stat = { isFile: () => true, nlink: 1, size: 0, dev: 1, ino: 1 };
+  Object.assign(ctx.deps, { realpathSync: (value: string) => value,
+    lstatSync: (value: string) => {
+      if (!ctx.deps.existsSync(value)) throw Object.assign(new Error("absent"), { code: "ENOENT" });
+      return stat;
+    },
+    openSync: (value: string) => { const fd = descriptors.size + 100; descriptors.set(fd, value); return fd; },
+    closeSync: (fd: number) => { descriptors.delete(fd); },
+    fstatSync: () => stat, ftruncateSync: () => {},
+    readFileSync: (value: any, options: any) => read(typeof value === "number" ? descriptors.get(value)! : value, options),
+    writeFileSync: (value: any, bytes: any) => write(typeof value === "number" ? descriptors.get(value)! : value, bytes),
+    managedWorktree: { run: current,
     predecessor: async () => prior,
     snapshot: async () => ({ claims: [{ ticket: prior.ticket, machine: prior.machine, generation: prior.generation, created: 1 }], runs: [current] }) } });
   assert.deepEqual(await setupBranchAndWorktree(ctx), { ok: true });
