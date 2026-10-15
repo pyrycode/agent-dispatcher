@@ -15,7 +15,7 @@ import { hasRecoveryPriority } from "./recovery-labels.js";
 import type { PauseRecord, EvidenceRecord, CoordinationRecord } from "./recovery-facts.js";
 import type { RecoveryObservation, RecoveryIncident, RecoveryDecision } from "./fleet-recovery.js";
 import type { AgentRunner } from './agent-runner.js';
-import {taskBridge, TASK_REQUEST_ROLES, type BridgeActions} from "./recovery-task-bridge.js";
+import {taskBridge, readsNativeTasks, TASK_REQUEST_ROLES, type BridgeActions} from "./recovery-task-bridge.js";
 import type { NativeTaskView } from "./native-task-hold.js";
 import { offerId } from "./machine-manager.js";
 import { NON_AGENT_ROLES, startsCodex, codexStartHoldMs, rearmCodexStartJitter, type CodexPauseState } from "./codex-throttle.js";
@@ -362,7 +362,7 @@ export class ManagedDispatch {
         // numbered ticket reads and awaits that ticket's native tasks, and
         // reads the shared evidence of earlier runs, from any computer.
         const actions:BridgeActions={request:this.tasksEnabled && TASK_REQUEST_ROLES.has(run.role),
-          read:this.tasksEnabled && !NON_AGENT_ROLES.has(run.role),evidence:this.evidenceEnabled};
+          read:this.tasksEnabled && readsNativeTasks(run.role),evidence:this.evidenceEnabled};
         bridge=/#[1-9]\d*$/.test(run.ticket) && (actions.request || actions.read || actions.evidence) ? await taskBridge(this.connection,run,actions) : undefined;
         if(bridge){
           const store=currentRun.getStore()!;
@@ -487,7 +487,9 @@ export class ManagedDispatch {
   async ticketTasks(ticket: string): Promise<NativeTaskView[]> {
     const facts = await this.connection.call<Array<{ ticket: string; tasks?: NativeTaskView[] }>>("/recovery/facts", { tickets: [ticket] });
     const own = Array.isArray(facts) ? facts.find(f => f?.ticket === ticket) : undefined;
-    return Array.isArray(own?.tasks) ? own!.tasks : [];
+    // An answer without a task list says nothing about the tasks: unknown, not none.
+    if (!Array.isArray(own?.tasks)) throw new Error("The claim service reported no native task list");
+    return own!.tasks;
   }
   recordEvidence(records: EvidenceRecord[]) { return this.connection.call("/recovery/evidence", { records }); }
   async recoveryReport(items: ProjectItem[]): Promise<RecoveryIncident[]> {

@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { request as httpRequest } from "node:http";
 import { promisify } from "node:util";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -11,7 +12,7 @@ import { FleetStore } from "./fleet-store.js";
 import { FleetClient, JsonClient, serveFleet } from "./fleet-http.js";
 import { MachineManager, serveManager } from "./machine-manager.js";
 import { ManagedDispatch, managedBridgeActions, managedRequestedTasks, managedTaskEnv, managedTicketTasks } from "./managed-dispatch.js";
-import { NATIVE_TASK_HOLD_LABEL, decideHandoverHold, newNativeTaskHoldState, runNativeTaskHolds } from "./native-task-hold.js";
+import { NATIVE_TASK_HOLD_LABEL, NATIVE_TASK_WAITED_LABEL, decideHandoverHold, newNativeTaskHoldState, runNativeTaskHolds } from "./native-task-hold.js";
 import { taskBridge } from "./recovery-task-bridge.js";
 
 const execute = promisify(execFile);
@@ -34,7 +35,7 @@ test("every role reads and awaits its own ticket's native task, only builders re
   t.after(async () => { await managed.stop(); await close(local); await close(claims); store.close(); rmSync(directory, { recursive: true, force: true }); });
   await managed.start();
 
-  const asRole = async <T>(issue: number, role: string, resource: "light" | "medium", work: () => Promise<T>): Promise<T> => {
+  const asRole = async <T>(issue: number, role: string, resource: "light" | "medium" | "heavy", work: () => Promise<T>): Promise<T> => {
     managed.beginCycle();
     const offer = managed.offer(issue, role, resource);
     await managed.endCycle(); await manager.tick(); await managed.sync();
@@ -60,8 +61,6 @@ test("every role reads and awaits its own ticket's native task, only builders re
     await assert.rejects(call("read", foreign.id), /outside this admitted ticket/);
     return task;
   });
-  // The builder's place is free: the hold is a label, not a run.
-  assert.equal(store.snapshot().runs.some(r => r.ticket === "org/core#40"), false, "no run holds capacity for the held ticket");
   assert.equal(store.tasks.get(requested.id).state, "queued");
 
   // The reconcile pass keeps the hold while the task is open.
@@ -70,6 +69,7 @@ test("every role reads and awaits its own ticket's native task, only builders re
   const comments: string[] = [];
   const holdClient = {
     getAllProjectItems: async () => items.map(i => ({ ...i, labels: [...i.labels] })),
+    addLabel: async (_n: number, label: string) => { if (!items[0].labels.includes(label)) items[0].labels.push(label); },
     removeLabel: async (n: number, label: string) => { removed.push(n); items[0].labels = items[0].labels.filter(l => l !== label); },
     addComment: async (_n: number, body: string) => { comments.push(body); },
     clearItemsCache: () => {},
@@ -78,6 +78,13 @@ test("every role reads and awaits its own ticket's native task, only builders re
   const readTasks = (n: number) => managed.ticketTasks(`org/core#${n}`);
   await runNativeTaskHolds({ client: holdClient, readTasks, state: holds, boundMs: BOUND });
   assert.deepEqual(removed, [], "still queued: the hold stays");
+
+  // The hold takes no place: with #40 held and its task queued, this
+  // computer's one heavy place goes straight to another ticket.
+  assert.equal(store.snapshot().runs.filter(r => r.machine === "box").length, 0, "nothing runs or is reserved for the held ticket");
+  await asRole(50, "builder", "heavy", async () => {
+    assert.equal(store.snapshot().runs.filter(r => r.machine === "box" && r.resource === "heavy").map(r => r.ticket).join(), "org/core#50");
+  });
 
   // While the task is open the claim service admits no stage on the ticket
   // (FleetStore.startAdmitted), which is what started #1998's verifier only
@@ -88,16 +95,21 @@ test("every role reads and awaits its own ticket's native task, only builders re
   assert.equal(managed.ready(early), false, "no verifier while the builder's task is open");
   managed.beginCycle(); await managed.endCycle();
 
-  // The Mac runs the check.
+  // The Mac runs the check; its worker's state is uncertain for a while.
   store.tasks.report("mac", { capabilities: ["macos-arm64"], ready: true });
   assert.equal(store.taskStart("mac", requested.id, "native").ok, true);
   await runNativeTaskHolds({ client: holdClient, readTasks, state: holds, boundMs: BOUND });
   assert.deepEqual(removed, [], "still running: the hold stays");
+  store.tasks.uncertain(requested.id, "mac", "native", "Worker state unknown after a supervisor restart");
+  assert.equal(store.tasks.get(requested.id).state, "attention");
+  await runNativeTaskHolds({ client: holdClient, readTasks, state: holds, boundMs: BOUND });
+  assert.deepEqual(removed, [], "in attention, waiting for a person: the hold stays within its bound");
   store.taskComplete("mac", requested.id, "native", { outcome: "completed", summary: "Platform route available: 429 executed, 429 passed", files: { "probe.txt": "ok\n" } });
 
   // The hold lifts once the task has finished.
   await runNativeTaskHolds({ client: holdClient, readTasks, state: holds, boundMs: BOUND });
   assert.deepEqual(removed, [40]);
+  assert.deepEqual(items[0].labels, [NATIVE_TASK_WAITED_LABEL], "released, and the next handover does not wait again");
   assert.match(comments[0], /Every native task this ticket was waiting for has finished/);
   assert.match(comments[0], /429 executed, 429 passed/);
 
@@ -109,7 +121,7 @@ test("every role reads and awaits its own ticket's native task, only builders re
     await assert.rejects(call("request", requestFile), /Native check requests are for builder and developer runs/);
     await assert.rejects(call("read", foreign.id), /outside this admitted ticket/);
     await assert.rejects(call("await", foreign.id, "--timeout", "0"), /outside this admitted ticket/);
-    assert.deepEqual(managedRequestedTasks(), [], "a refused request records nothing");
+    assert.deepEqual(managedRequestedTasks(), [], "a request refused at the socket records nothing");
   });
 
   // Documentation awaits and downloads the finished result.
@@ -162,5 +174,72 @@ test("a reading role's await waits for a running task of its ticket and returns 
   const finished = JSON.parse((await waiting).stdout);
   assert.equal(finished.state, "failed");
   assert.equal(readFileSync(join(out, "probe.txt"), "utf8"), "no route\n");
+  assert.deepEqual(bridge.requested(), []);
+});
+
+test("which roles read and which request: every agent reads but a recovery assessment, only builders and developers request", async t => {
+  const store = new FleetStore(":memory:", { box: { heavyLimit: 2, combinedLimit: 4 } });
+  const claims = await serveFleet(store, { box: "box-token" }, "admin-token", 0);
+  const manager = new MachineManager({ machine: "box", heavyLimit: 2, combinedLimit: 4, projects: ["org/core"] }, new FleetClient(url(claims), "box-token"));
+  const local = await serveManager(manager, { "org/core": "project-token" }, "operator-token", 0);
+  const managed = new ManagedDispatch("org/core", { GITHUB_OWNER: "org", GITHUB_REPO: "core", PYRY_MANAGER_URL: url(local), PYRY_MANAGER_TOKEN: "project-token" });
+  t.after(async () => { await managed.stop(); await close(local); await close(claims); store.close(); });
+  await managed.start();
+  const expected: Record<string, { request: boolean; read: boolean }> = {
+    builder: { request: true, read: true }, developer: { request: true, read: true },
+    verifier: { request: false, read: true }, documentation: { request: false, read: true },
+    "code-review": { request: false, read: true }, qa: { request: false, read: true },
+    architect: { request: false, read: true }, refiner: { request: false, read: true }, po: { request: false, read: true },
+  };
+  let issue = 60;
+  for (const [role, want] of Object.entries(expected)) {
+    managed.beginCycle();
+    const offer = managed.offer(issue++, role, "light");
+    await managed.endCycle(); await manager.tick(); await managed.sync();
+    assert.equal(managed.ready(offer), true, role);
+    await managed.run(offer, async () => {
+      const actions = managedBridgeActions();
+      assert.deepEqual({ request: actions.request, read: actions.read }, want, role);
+      if (want.read) assert.ok(Array.isArray(await managedTicketTasks()), `${role} lists its ticket's tasks`);
+      else assert.equal(await managedTicketTasks(), null, role);
+    });
+  }
+  // Recovery needs a queued incident to be admitted and merge a Done ticket;
+  // their actions come from the same rule.
+  const { readsNativeTasks, TASK_REQUEST_ROLES } = await import("./recovery-task-bridge.js");
+  assert.equal(readsNativeTasks("recovery"), false, "assessments keep their bounded excerpts");
+  for (const job of ["merge", "reconcile", "codegraph", "main-sweep", "real-claude-gate"]) assert.equal(readsNativeTasks(job), false, job);
+  for (const role of ["recovery", ...["merge", "verifier", "documentation"]]) assert.equal(TASK_REQUEST_ROLES.has(role), false, role);
+});
+
+test("a reading socket refuses another project's task, a spoofed identity, and any read once its run has finished", async t => {
+  const store = new FleetStore(":memory:", { box: { heavyLimit: 1, combinedLimit: 3 } });
+  const claims = await serveFleet(store, { box: "box-token" }, "admin-token", 0);
+  const manager = new MachineManager({ machine: "box", projects: ["org/core", "org/other"], heavyLimit: 1, combinedLimit: 3 }, new FleetClient(url(claims), "box-token"));
+  const local = await serveManager(manager, { "org/core": "core-token", "org/other": "other-token" }, "operator-token", 0);
+  assert.equal(store.start({ id: "verifier-40", machine: "box", session: "s", project: "org/core", ticket: "org/core#40", role: "verifier", resource: "light", locks: [] }).ok, true);
+  assert.equal(store.start({ id: "verifier-other-40", machine: "box", session: "s2", project: "org/other", ticket: "org/other#40", role: "verifier", resource: "light", locks: [] }).ok, true);
+  const run = store.snapshot().runs.find(r => r.id === "verifier-40")!;
+  const bridge = await taskBridge(new JsonClient(url(local), "core-token"), run, { request: false, read: true, evidence: false });
+  t.after(async () => { await bridge.close(); await close(local); await close(claims); store.close(); });
+  const probe = { recipe: "platform-probe" as const, capability: "macos-arm64" as const, reason: "check" };
+  const own = store.tasks.request("org/core#40", probe, "builder-run");
+  const sameNumber = store.tasks.request("org/other#40", probe, "builder-run");
+  // Raw requests on the socket, with a body that names another run, session and project.
+  const raw = (path: string, body: unknown) => new Promise<{ status: number; body: any }>((resolve, reject) => {
+    const req = httpRequest({ socketPath: bridge.socket, path, method: "POST", headers: { "Content-Type": "application/json" } }, res => {
+      let data = ""; res.on("data", c => data += c); res.on("end", () => resolve({ status: res.statusCode ?? 0, body: JSON.parse(data) }));
+    });
+    req.on("error", reject); req.end(JSON.stringify(body));
+  });
+  assert.equal((await raw("/read", { id: own.id, format: "manifest-v1" })).body.id, own.id);
+  assert.equal((await raw("/read", { id: sameNumber.id, format: "manifest-v1" })).status, 409, "another project's ticket with the same number");
+  for (const spoof of [{ project: "org/other" }, { runId: "verifier-other-40", session: "s2", project: "org/other" }, { ticket: "org/other#40" }]) {
+    assert.equal((await raw("/read", { id: sameNumber.id, format: "manifest-v1", ...spoof })).status, 409, JSON.stringify(spoof));
+    assert.equal((await raw("/artifact", { id: sameNumber.id, digest: "d".repeat(64), path: "probe.txt", part: 0, ...spoof })).status, 409, JSON.stringify(spoof));
+  }
+  assert.equal((await raw("/request", { request: probe })).status, 403);
+  store.finish("box", "s", "verifier-40");
+  assert.equal((await raw("/read", { id: own.id, format: "manifest-v1" })).status, 409, "a finished run reads nothing");
   assert.deepEqual(bridge.requested(), []);
 });

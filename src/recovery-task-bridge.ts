@@ -5,6 +5,7 @@ import {join} from 'node:path';
 import {readJson,listen, type JsonClient} from './fleet-http.js';
 import type {FleetRun} from './fleet-store.js';
 import {recoveryTaskId,validateTaskRequest} from './recovery-tasks.js';
+import {NON_AGENT_ROLES} from './codex-throttle.js';
 
 /**
  * What one run's socket accepts.
@@ -14,7 +15,8 @@ import {recoveryTaskId,validateTaskRequest} from './recovery-tasks.js';
  * builder judge evidence rather than make it.
  *
  * `read`: read a native task, its artifacts, and wait for it (the helper's
- * `read` and `await`). Every agent role of a numbered ticket. The claim
+ * `read` and `await`). Every agent role of a numbered ticket but a recovery
+ * assessment (readsNativeTasks). The claim
  * service answers only for a task of the run's own ticket, while the run is
  * active (FleetStore.readTask), so a run never reads another ticket's tasks.
  * Until agent-dispatcher PR 206's single `tasks` switch was split, reads went
@@ -28,6 +30,17 @@ export interface BridgeActions {request:boolean;read:boolean;evidence:boolean}
 
 /** Roles whose runs may request a native check. */
 export const TASK_REQUEST_ROLES: ReadonlySet<string> = new Set(['builder','developer']);
+
+/**
+ * Roles whose runs read their ticket's native tasks: every agent role, with
+ * two exceptions. Recovery assessments get each task's state, summary and a
+ * failed task's bounded, scrubbed diagnostics in their facts, by design
+ * (recovery-tasks.ts `assessmentTasks`), and full artifacts would widen that.
+ * Dispatcher jobs such as merge, reconcile and codegraph start no agent.
+ */
+export function readsNativeTasks(role:string):boolean {
+ return !NON_AGENT_ROLES.has(role) && role!=='recovery';
+}
 
 /** Newest bundles one evidence list returns through the socket: the helper reads at most 2 MiB a reply. */
 export const BRIDGE_EVIDENCE_BUNDLES=5;

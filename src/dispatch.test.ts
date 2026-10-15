@@ -29,7 +29,7 @@ import { execFile, execSync, spawnSync } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
 import { FleetStore } from './fleet-store.js';
 import { MachineManager, serveManager } from './machine-manager.js';
-import { ManagedDispatch, withManagedTaskRun } from './managed-dispatch.js';
+import { ManagedDispatch, managedTaskEnv, withManagedTaskRun } from './managed-dispatch.js';
 import type { RunEvidenceInput } from './run-evidence.js';
 import { completeGo, completePlaywright, loggedArtifacts, loggedFailures, mixedGoCommands, singleWrappedGoCommands, repeatedGo } from "./fixtures/gate-completeness.js";
 
@@ -125,7 +125,8 @@ import { FINAL_MERGE_HANDOFF_MARKER, MERGE_RESOLUTION_NOTE_MARKER, mergeResoluti
 import { runReworkRouting } from "./reconcile.js";
 import { hashGateList, type VerifierGatePass } from "./verifier-gate-reuse.js";
 import { resetActiveStageSetForTests, resolveStageSet } from "./stage-sets.js";
-import { NATIVE_TASK_HOLD_LABEL } from "./native-task-hold.js";
+import { NATIVE_TASK_HOLD_LABEL, NATIVE_TASK_WAITED_LABEL, decideHandoverHold } from "./native-task-hold.js";
+import { FleetClient, serveFleet } from "./fleet-http.js";
 import type { AgentConfig, BlockerInfo, ProjectItem } from "./types.js";
 import {
   decideReworkRoutes,
@@ -3306,13 +3307,44 @@ describe("handlePostRun — failure modes", () => {
       assert.ok(client.removeLabelCalls.some(c => c.label === "error-retry-count:1"), "the run succeeded, so its retry state ends");
       assert.equal(client.comments.length, 2);
       assert.match(client.comments[0]!.body, /builder agent has completed work/);
+      assert.match(client.comments[0]!.body, /Handover held\*\* until its native checks finish/);
+      assert.doesNotMatch(client.comments[0]!.body, /Ready for human review/);
       assert.match(client.comments[1]!.body, /Handover held: native task still running/);
       assert.match(client.comments[1]!.body, new RegExp(OPEN.id));
     });
 
+    test("a handover after a hold does not wait again, and ends the wait", async () => {
+      const client = new MockGitHubClient({ status: { 2007: "In Development" }, labels: { 2007: [NATIVE_TASK_WAITED_LABEL] } });
+      const seen: boolean[] = [];
+      const ctx = builderCtx(2007, async (waited) => { seen.push(waited); return decideHandoverHold([OPEN.id], [OPEN], Date.now(), 4 * 3_600_000, waited); }, client);
+
+      await handlePostRun(STREAM_OK(), ctx, false);
+
+      assert.deepEqual(seen, [true], "the check is told this handover already waited");
+      assert.ok(client.addLabelCalls.some(c => c.label === "done:builder"));
+      assert.ok(!client.addLabelCalls.some(c => c.label === NATIVE_TASK_HOLD_LABEL));
+      assert.ok(client.removeLabelCalls.some(c => c.label === NATIVE_TASK_WAITED_LABEL), "the next handover may hold again");
+      assert.match(client.comments.at(-1)!.body, /already waited for native tasks once/);
+    });
+
+    test("a hold label whose write failed but landed counts as held, so no done label goes beside it", async () => {
+      const client = new MockGitHubClient({ status: { 2008: "In Development" }, labels: { 2008: [] } });
+      client.failures.addLabel = (n, label) => {
+        if (label !== NATIVE_TASK_HOLD_LABEL) return null;
+        client.labelsByIssue.get(n)!.push(label);
+        return new Error("The operation was aborted due to timeout");
+      };
+      const ctx = builderCtx(2008, async () => ({ held: [{ id: OPEN.id, task: OPEN }], passed: [] }), client);
+
+      await handlePostRun(STREAM_OK(), ctx, false);
+
+      assert.ok(!client.addLabelCalls.some(c => c.label === "done:builder"));
+      assert.match(client.comments.at(-1)!.body, /Handover held/);
+    });
+
     test("an open task that does not hold hands over and says why", async () => {
       const client = new MockGitHubClient({ status: { 1999: "In Development" }, labels: { 1999: [] } });
-      const ctx = builderCtx(1999, async () => ({ held: [], passed: [{ task: OPEN, reason: "limit" as const }] }), client);
+      const ctx = builderCtx(1999, async () => ({ held: [], passed: [{ task: OPEN, reason: "bound" as const }] }), client);
 
       await handlePostRun(STREAM_OK(), ctx, false);
 
@@ -3346,6 +3378,17 @@ describe("handlePostRun — failure modes", () => {
       assert.ok(client.addLabelCalls.some(c => c.label === NATIVE_TASK_HOLD_LABEL));
       assert.ok(!client.addLabelCalls.some(c => c.label === `${PENDING_DONE_PREFIX}builder`), "pending-done would hand over on the next board read");
       assert.ok(!client.addLabelCalls.some(c => c.label === "done:builder"));
+    });
+
+    test("an unknown column after a hold hands over through pending-done and ends the wait", async () => {
+      const client = new MockGitHubClient({ status: { 2009: "In Development" }, labels: { 2009: [NATIVE_TASK_WAITED_LABEL] } });
+      client.failures.getItemStatus = new Error("GraphQL rate limit");
+      const ctx = builderCtx(2009, async (waited) => decideHandoverHold([OPEN.id], [OPEN], Date.now(), 4 * 3_600_000, waited), client);
+
+      await handlePostRun(STREAM_OK(), ctx, false);
+
+      assert.ok(client.addLabelCalls.some(c => c.label === `${PENDING_DONE_PREFIX}builder`));
+      assert.ok(client.removeLabelCalls.some(c => c.label === NATIVE_TASK_WAITED_LABEL));
     });
 
     test("a verifier never holds: only builders and developers request native checks", async () => {
@@ -13254,4 +13297,64 @@ describe("runAutoMerge: mergeability still settling", () => {
     assert.deepEqual(merges(), ["gh pr merge 1980 --merge --delete-branch"]);
     assert.deepEqual(client.addLabelCalls, [{ issueNumber: 1977, label: "merge-attempt:1" }]);
   });
+});
+
+// The handover hold end to end inside an admitted run: the socket records the
+// builder's request, the default check reads the ticket's tasks from the claim
+// service, and handlePostRun keeps the ticket (native-task-hold.ts).
+test("a managed builder whose requested native task is open is held by handlePostRun's own check", async t => {
+  const store = new FleetStore(":memory:", { box: { heavyLimit: 1, combinedLimit: 3 }, mac: { heavyLimit: 1, combinedLimit: 2 } });
+  const claims = await serveFleet(store, { box: "box-token", mac: "mac-token" }, "admin-token", 0);
+  const claimsAddress = claims.address(); assert.ok(claimsAddress && typeof claimsAddress !== "string");
+  const manager = new MachineManager({ machine: "box", heavyLimit: 1, combinedLimit: 3, projects: ["org/core"] }, new FleetClient(`http://127.0.0.1:${claimsAddress.port}`, "box-token"));
+  const server = await serveManager(manager, { "org/core": "project-token" }, "operator-token", 0);
+  const address = server.address(); assert.ok(address && typeof address !== "string");
+  const managed = new ManagedDispatch("org/core", { GITHUB_OWNER: "org", GITHUB_REPO: "core", PYRY_MANAGER_URL: `http://127.0.0.1:${address.port}`, PYRY_MANAGER_TOKEN: "project-token" });
+  const directory = mkdtempSync(join(tmpdir(), "managed-hold-"));
+  t.after(async () => {
+    await managed.stop(); await new Promise<void>(r => server.close(() => r())); await new Promise<void>(r => claims.close(() => r()));
+    store.close(); rmSync(directory, { recursive: true, force: true });
+  });
+  await managed.start();
+  const helper = fileURLToPath(new URL("../scripts/fleet-task.py", import.meta.url));
+  const requestFile = join(directory, "request.json");
+  writeFileSync(requestFile, JSON.stringify({ recipe: "platform-probe", capability: "macos-arm64", reason: "Native acceptance on the Mac" }));
+  // Asynchronous: the run's socket is served by this same process.
+  const requestTask = () => new Promise<any>((resolve, reject) => execFile("python3", [helper, "request", requestFile],
+    { env: { PATH: process.env.PATH, PYRY_TASK_SOCKET: managedTaskEnv().PYRY_TASK_SOCKET } },
+    (error, stdout) => error ? reject(error) : resolve(JSON.parse(stdout))));
+  const builder = { name: "builder", column: "In Development", claudeMdPath: "builder/CLAUDE.md", usesWorktree: true, producesCommits: true, opensPr: true };
+  const handOver = async (issue: number, client: MockGitHubClient) => {
+    const { ctx } = makeTestContext({ agent: builder, item: { issueNumber: issue }, client, mockOptions: { execImpls: {
+      "git status --porcelain": () => "", "git rev-list --count main..": () => "2\n", "gh pr list --head": () => JSON.stringify([{ number: 2000 }]),
+    } } });
+    return handlePostRun(STREAM_OK(), ctx, false);
+  };
+  const admit = async (issue: number) => {
+    managed.beginCycle(); const pending = managed.offer(issue, "builder", "medium");
+    await managed.endCycle(); await manager.tick(); await managed.sync();
+    assert.equal(managed.ready(pending), true); return pending;
+  };
+
+  const held = new MockGitHubClient({ status: { 80: "In Development" }, labels: { 80: [] } });
+  let taskId = "";
+  await managed.run(await admit(80), async () => {
+    taskId = (await requestTask()).id;
+    assert.deepEqual(await handOver(80, held), { ok: true });
+  });
+  assert.ok(held.addLabelCalls.some(c => c.label === NATIVE_TASK_HOLD_LABEL), "held through the default check");
+  assert.ok(!held.addLabelCalls.some(c => c.label === "done:builder"));
+  assert.match(held.comments.at(-1)!.body, new RegExp(taskId));
+
+  // A request whose task has already finished hands over as before.
+  store.tasks.report("mac", { capabilities: ["macos-arm64"], ready: true });
+  const settled = new MockGitHubClient({ status: { 81: "In Development" }, labels: { 81: [] } });
+  await managed.run(await admit(81), async () => {
+    const id = (await requestTask()).id;
+    assert.equal(store.taskStart("mac", id, "native").ok, true);
+    store.taskComplete("mac", id, "native", { outcome: "completed", summary: "Route available", files: {} });
+    await handOver(81, settled);
+  });
+  assert.ok(settled.addLabelCalls.some(c => c.label === "done:builder"));
+  assert.ok(!settled.addLabelCalls.some(c => c.label === NATIVE_TASK_HOLD_LABEL));
 });
