@@ -97,7 +97,7 @@ async function main(): Promise<void> {
     const database = resolve(config.database);
     mkdirSync(dirname(database), { recursive: true, mode: 0o700 });
     const machines = Object.fromEntries(Object.entries(config.machines).map(([id, value]) => [id, secret((value as any).tokenEnv)]));
-    const limits = Object.fromEntries(Object.entries(config.machines).map(([id, value]) => [id, { heavyLimit: (value as any).heavyLimit, combinedLimit: (value as any).combinedLimit, ...((value as any).projectHeavyLimits !== undefined ? { projectHeavyLimits: (value as any).projectHeavyLimits } : {}) }]));
+    const limits = Object.fromEntries(Object.entries(config.machines).map(([id, value]) => [id, { heavyLimit: (value as any).heavyLimit, combinedLimit: (value as any).combinedLimit, ...((value as any).unattendedPolicy !== undefined ? {unattendedPolicy:(value as any).unattendedPolicy} : {}), ...((value as any).projectHeavyLimits !== undefined ? { projectHeavyLimits: (value as any).projectHeavyLimits } : {}) }]));
     // Unchanged settled waits are reassessed after this interval. Default 24 hours.
     const safetyHours = config.recovery?.safetyRecheckHours;
     if (safetyHours !== undefined && (typeof safetyHours !== "number" || !Number.isFinite(safetyHours))) throw new Error("recovery.safetyRecheckHours must be a number");
