@@ -1,7 +1,7 @@
 import ts from 'typescript';
 import {credentialMatches,scrubCredentials} from './agent-runtime.js';
 import type {GitHubBroker} from './github-broker.js';
-import type {RepairPublication} from './recovery-repair-publication.js';
+export interface RepairPublication {files:Record<string,string|null>;modes?:Record<string,string>;message:string;review:'PASS';checksPassed:boolean}
 import {scanSourcePackage,SourceScanFindings} from './gitleaks.js';
 
 const PRIVATE_LIMIT=4*1024*1024;

@@ -90,7 +90,7 @@ test('native helpers wait for active owned work through ordinary machine capacit
  assert.equal(store.snapshot().claims.find(c=>c.ticket==='org/core#3154')?.machine,'box');
 });
 
-test('a failed completion waits for a publication still being written, and a conditional one needs the expected state', async t => {
+test('retired publication leaves the patch private and conditional completion checks its state', async t => {
  const SHA='9950e6fbd28aac7ec3f6772e2deeebbcf83b52a2';
  const store=new FleetStore(':memory:',limits);
  // A publication whose GitHub writes never answer, as one still landing.
@@ -110,8 +110,7 @@ test('a failed completion waits for a publication still being written, and a con
  store.prepareRepair('mac',job.id,'repair',publication);
  await assert.rejects(mac.call('/tasks/complete',{id:job.id,session:'repair',result:failed,expectStates:['running','attention']}),/Task state is publishing/);
  assert.equal(store.tasks.get(job.id).state,'publishing');
- void mac.call('/tasks/publish-repair',{id:job.id,session:'repair',publication}).catch(()=>{});
- await new Promise(r=>setTimeout(r,200));
- await assert.rejects(mac.call('/tasks/complete',{id:job.id,session:'repair',result:failed}),/Repair publication in progress/);
+ await assert.rejects(mac.call('/tasks/publish-repair',{id:job.id,session:'repair',publication}),/retired/);
  assert.equal(store.tasks.get(job.id).state,'publishing');
+ assert.equal(store.controlTarget(),undefined);
 });

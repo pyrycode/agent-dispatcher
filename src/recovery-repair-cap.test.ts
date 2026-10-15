@@ -44,32 +44,16 @@ function runTask(store: FleetStore, summary: string, outcome: "failed" | "comple
   store.taskComplete("linux", task.id, `helper-${task.id}`, { outcome, summary, files: {} });
 }
 
-test("after two failed dispatcher repairs the next order escalates to a person and orders nothing (#3389, 2026-10-15)", () => {
+test("automatic repair proposals escalate immediately while ordinary product rework remains available", () => {
   const store = new FleetStore(":memory:", limits);
   try {
-    store.tasks.report("linux", { capabilities: ["dispatcher-repair"], ready: true });
-    // Labels move a little each cycle, as they did overnight, so every incident has its own fingerprint.
     const seen = (n: number): RecoveryObservation => ({ ticket, status: "In Code Review", labels: ["error:verifier", `error-retry-count:${n}`], blocked: false });
-    assert.equal(assess(store, seen(1), "a1", { action: "coordinate", reason: "Repair the gate", task: repair(1) }).selected.action, "coordinate");
-    runTask(store, CHECKS);
-    assert.equal(assess(store, seen(2), "a2", { action: "coordinate", reason: "Repair the gate again", task: repair(2) }).selected.action, "coordinate");
-    runTask(store, REVIEW);
-    const third = assess(store, seen(3), "a3", { action: "coordinate", reason: "Repair the gate a third time", task: repair(3) });
-    assert.equal(third.selected.action, "escalate");
-    assert.equal(third.selected.category, "human");
-    assert.match(third.selected.reason, new RegExp(`^${REPAIR_CAP_REASON}: 2 failed dispatcher repairs for this ticket in the last 24 hours`));
-    assert.match(third.selected.reason, /checks failed; 2\) task .* independent review failed/);
-    assert.match(third.selected.reason, /Repair brief 3/);
-    assert.equal(store.tasks.list(ticket).length, 2, "no third repair task");
-    assert.equal(store.recovery.incident(third.incident.id).state, "escalated");
-    assert.deepEqual(store.recovery.escalatedTickets(), [ticket], "the ticket carries orchestrator:escalated");
-    const attention = recoveryReport(store.recovery.list(), {});
-    const decision = attention.decisions.find(d => d.ticket === ticket)!;
-    assert.equal(decision.kind, "decision-needed", "board watch reports decision-needed escalations");
-    assert.equal((decision as any).repairCap, true);
-    assert.match(decision.nextAction, /Two dispatcher repairs failed/);
-    // Other recovery actions are not capped.
-    assert.equal(assess(store, seen(4), "a4", { action: "rework", reason: "Builder repairs the test" }).selected.action, "rework");
+    const first = assess(store, seen(1), "a1", { action: "coordinate", reason: "Repair the gate", task: repair(1) });
+    assert.equal(first.selected.action, "escalate");
+    assert.equal(first.selected.category, "human");
+    assert.match(first.selected.reason, /Automatic dispatcher repair is disabled/);
+    assert.equal(store.tasks.list(ticket).length, 0);
+    assert.equal(assess(store, seen(2), "a2", { action: "rework", reason: "Builder repairs the product" }).selected.action, "rework");
   } finally { store.close(); }
 });
 
@@ -87,39 +71,6 @@ test("a repair worker's direct request is refused at the cap; repeating an exist
     // Other recipes are not capped.
     assert.equal(store.requestTask("mac", "s", project, "builder", { recipe: "platform-probe", capability: "linux-amd64", reason: "probe" }).state, "queued");
   } finally { store.close(); }
-});
-
-test("an unchanged ticket is capped however far apart its failures are, and a queued repair does not start (#3389)", () => {
-  const realNow = Date.now; let now = realNow();
-  Date.now = () => now;
-  const store = new FleetStore(":memory:", limits);
-  try {
-    store.tasks.report("linux", { capabilities: ["dispatcher-repair"], ready: true });
-    // The same labels every cycle, as #3389 overnight: only evidence and task results move.
-    const seen: RecoveryObservation = { ticket, status: "In Code Review", labels: ["error:verifier"], blocked: false };
-    assess(store, seen, "a1", { action: "coordinate", reason: "Repair the gate", task: repair(1) });
-    runTask(store, CHECKS);
-    now += 2 * REPAIR_CAP_WINDOW_MS;
-    store.tasks.report("linux", { capabilities: ["dispatcher-repair"], ready: true });
-    assess(store, seen, "a2", { action: "coordinate", reason: "Repair the gate again", task: repair(2) });
-    // A third repair already queued (here by the operator route) before the second one fails.
-    const early = store.tasks.request(ticket, repair(3), "operator");
-    const second = store.tasks.list(ticket).find(t => t.state === "queued" && t.id !== early.id)!;
-    assert.equal(store.taskStart("linux", second.id, "helper-2").ok, true);
-    store.taskComplete("linux", second.id, "helper-2", { outcome: "failed", summary: PUBLICATION, files: {} });
-    now += 2 * REPAIR_CAP_WINDOW_MS;
-    store.tasks.report("linux", { capabilities: ["dispatcher-repair"], ready: true });
-    assert.equal(store.tasks.get(early.id).state, "failed", "the queued repair was withdrawn when the cap was reached");
-    assert.match(store.tasks.get(early.id).result!.summary, /^Withdrawn before it started/);
-    assert.equal(store.taskStart("linux", early.id, "helper-3").ok, false);
-    const third = assess(store, seen, "a3", { action: "coordinate", reason: "Repair the gate a third time", task: repair(4) });
-    assert.equal(third.selected.action, "escalate");
-    assert.match(third.selected.reason, /with the ticket's stage and recovery labels unchanged/);
-    // A changed ticket, failures long past: repairs are allowed again.
-    const moved: RecoveryObservation = { ...seen, status: "In Development", labels: ["error:builder"] };
-    const fourth = assess(store, moved, "a4", { action: "coordinate", reason: "A different defect", task: repair(5) });
-    assert.equal(fourth.selected.action, "coordinate");
-  } finally { store.close(); Date.now = realNow; }
 });
 
 test("the 24 hour window, the workflow fingerprint and a completed repair's reset", () => {

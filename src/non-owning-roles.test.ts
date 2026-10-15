@@ -120,14 +120,14 @@ test("a repair decision on an unowned ticket orders work that claims normally wh
   store.close();
 });
 
-test("a coordinated repair task on an unowned ticket runs anywhere and leaves the ticket unowned", () => {
+test("a coordinated native check on an unowned ticket runs anywhere and leaves the ticket unowned", () => {
   const store = new FleetStore(":memory:", limits);
-  assess(store, "mac", "assess", failing(), { action: "coordinate", reason: "Dispatcher repair needed",
-    task: { recipe: "dispatcher-repair", capability: "dispatcher-repair", revision: "a".repeat(40), reason: "Concrete dispatcher repair" } });
+  assess(store, "mac", "assess", failing(), { action: "coordinate", reason: "Native check needed",
+    task: { recipe: "memory-runtime-smoke", capability: "linux-amd64", revision: "a".repeat(40), reason: "Concrete native check" } });
   assert.deepEqual(store.snapshot().claims, []);
   const [task] = store.tasks.list(ticket);
   assert.equal(task.state, "queued");
-  store.tasks.report("linux", { capabilities: ["dispatcher-repair"], ready: true });
+  store.tasks.report("linux", { capabilities: ["linux-amd64"], ready: true });
   assert.equal(store.taskStart("linux", task.id, "helper").ok, true);
   assert.deepEqual(store.snapshot().claims.map(c => c.ticket), [`${project}#@task-${task.id}`], "only the task's own reservation");
   store.taskComplete("linux", task.id, "helper", { outcome: "failed", summary: "Nothing to publish", files: {} });
