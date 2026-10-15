@@ -16,7 +16,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { request as httpRequest, type Server } from "node:http";
-import { FleetStore, type StartRequest } from "./fleet-store.js";
+import { CREATOR_HOLD_MS, FleetStore, type StartRequest } from "./fleet-store.js";
 import { WorkflowGitHub } from "./workflow-github.js";
 import { GitHubBroker } from "./github-broker.js";
 import { FleetClient, JsonClient, ServiceError, ownershipRefusal, serveFleet } from "./fleet-http.js";
@@ -248,4 +248,24 @@ test("only the claim service's marked refusal becomes a refusal; outages, the ca
     assert.equal((await gh(fake, "GET", "/")).status, 503);
     await close(server);
   }
+});
+
+test("the hold is bounded by the stale-reservation age, so a vanished creator cannot hold its children for ever", t => {
+  const dir = mkdtempSync(join(tmpdir(), "split-parent-"));
+  let now = 1_000_000;
+  const store = new FleetStore(join(dir, "claims.sqlite"), { pyrybox: { heavyLimit: 2, combinedLimit: 2 }, hp: { heavyLimit: 2, combinedLimit: 2 } }, { now: () => now });
+  t.after(() => { store.close(); rmSync(dir, { recursive: true, force: true }); });
+  store.workflow.import(config, [item(3247), item(3315)]);
+  const parent = start("pyrybox", 3247, "refiner");
+  assert.equal(store.start(parent).ok, true);
+  // Only the run's own computer and session can record it.
+  store.recordTicketCreator("hp", "s", parent.id, "I3315");
+  assert.equal(store.start(start("hp", 3315, "refiner", "early")).ok, true);
+  store.finish("hp", "s", "early");
+  store.recordTicketCreator("pyrybox", "s", parent.id, "I3315");
+  assert.deepEqual(store.start(start("hp", 3315, "refiner", "held")), { ok: false, reason: "locked" });
+  now += CREATOR_HOLD_MS - 1;
+  assert.deepEqual(store.start(start("hp", 3315, "refiner", "still")), { ok: false, reason: "locked" });
+  now += 1;
+  assert.equal(store.start(start("hp", 3315, "refiner", "released")).ok, true);
 });

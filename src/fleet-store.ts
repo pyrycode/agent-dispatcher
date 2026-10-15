@@ -161,6 +161,9 @@ export interface FleetStoreOptions extends RecoveryLedgerOptions {
  * that has finished. The HTTP layers report it as a 409 refusal with this
  * reason instead of a generic failure.
  */
+/** How long a creating run holds its new tickets at most: the stale-reservation age. */
+export const CREATOR_HOLD_MS = 3 * 60 * 60 * 1000;
+
 export class OwnershipRefusal extends Error {
   constructor(message: string) { super(message); this.name = "OwnershipRefusal"; }
 }
@@ -465,12 +468,16 @@ export class FleetStore {
   /**
    * Record that an admitted run created this issue. Only the run's own
    * computer and session can record it, and only while the run is active.
-   * The first creator wins, so a later write cannot move the hold.
+   * The first creator wins, so a later write cannot move the hold. Rows
+   * past the hold limit are pruned here, so runs that end without finish()
+   * leave nothing behind for long.
    */
   recordTicketCreator(machine: string, session: string, runId: string | undefined, issueId: string): void {
     if (!runId || typeof issueId !== "string" || !issueId) return;
+    const now = this.clock();
+    this.db.prepare("DELETE FROM fleet_ticket_creators WHERE created<?").run(now - CREATOR_HOLD_MS);
     this.db.prepare("INSERT OR IGNORE INTO fleet_ticket_creators SELECT ?,id,? FROM fleet_runs WHERE id=? AND machine=? AND session=? AND finished IS NULL")
-      .run(issueId, Date.now(), runId, machine, session);
+      .run(issueId, now, runId, machine, session);
   }
 
   private transactionDepth = 0;
@@ -517,7 +524,9 @@ export class FleetStore {
       if(columns[req.role] && (item.state!=='OPEN' || item.status!==columns[req.role] || item.labels.some(l=>l.startsWith('error:')||l.startsWith('needs-rework:')||(l.startsWith('wip:')&&!isRepairWip(l))||l.startsWith('needs-human:')&&l!=='needs-human:sizing') || item.blockedBy.some(b=>b.state==='OPEN'))) return {ok:false,reason:'locked'};
       // A ticket split off by a run that is still active waits for that run,
       // which may still be writing its labels, priority and board order.
-      if(this.db.prepare('SELECT 1 FROM fleet_ticket_creators AS c JOIN fleet_runs AS r ON r.id=c.run_id WHERE c.issue_id=? AND r.finished IS NULL').get(item.issueId)) return {ok:false,reason:'locked'};
+      // Bounded, so a creator whose computer went away cannot hold its
+      // children past the point where its reservation is reported as stale.
+      if(this.db.prepare('SELECT 1 FROM fleet_ticket_creators AS c JOIN fleet_runs AS r ON r.id=c.run_id WHERE c.issue_id=? AND r.finished IS NULL AND c.created>?').get(item.issueId,this.clock()-CREATOR_HOLD_MS)) return {ok:false,reason:'locked'};
     }
     if(/#[1-9]\d*$/.test(req.ticket) && req.role!=='recovery') {
       const required=this.requiredRepairs()[req.ticket]??[];
