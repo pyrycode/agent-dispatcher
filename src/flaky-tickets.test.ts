@@ -395,10 +395,22 @@ describe("flaky-test tickets", () => {
       assert.equal(client.created.length, 0);
     });
 
+    test("a ticket that can never be reopened through this path gets a new one beside it", async () => {
+      const { on } = shared(() => T0);
+      const store = on("pyrybox");
+      const client = new AdoptedClient();
+      client.closed.push(closed(1978, 1));
+      client.reopenTracker = async () => { throw new Error("Service 409: Unknown workflow ticket"); };
+      await recordFlakyTests(client, [NAME], ctx(), { store, now: () => T0 });
+      const result = await recordFlakyTests(client, [NAME], ctx(), { store, now: () => T0 });
+      assert.deepEqual(result.filed, [{ name: NAME, issue: 3000 }]);
+      assert.deepEqual(result.untracked, []);
+    });
+
     test("drops only the labels that would mislead the pipeline", () => {
       assert.deepEqual(staleLabelsOnReopen(["bug", "merged", "done:builder", "wip:verifier", "error:merge", "pending-done:documentation",
-        "needs-rework:builder", "merge-attempt:2", "claim:build-hp-1", "requires:linux", "priority:low", "family-dispatches:3"]),
-      ["merged", "done:builder", "wip:verifier", "error:merge", "pending-done:documentation", "needs-rework:builder", "merge-attempt:2"]);
+        "needs-rework:builder", "needs-human:triage", "merge-attempt:2", "claim:build-hp-1", "requires:linux", "priority:low", "family-dispatches:3"]),
+      ["merged", "done:builder", "wip:verifier", "error:merge", "pending-done:documentation", "needs-rework:builder", "needs-human:triage", "merge-attempt:2"]);
     });
   });
 

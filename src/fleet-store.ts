@@ -489,7 +489,9 @@ export class FleetStore {
       if (!run || (JSON.parse(String(run.request)) as StartRequest).project !== project) throw new OwnershipRefusal("Workflow run has finished or lost ownership");
       const summary = () => { const i = this.workflow.get(ticket); return { ticket, state: i.state, status: i.status, revision: i.revision }; };
       // A retry of a reopen that already landed answers as it did.
-      if (reopen && this.db.prepare("SELECT 1 FROM workflow_commands WHERE id=?").get(commandId)) return summary();
+      const replay = reopen ? this.db.prepare("SELECT ticket FROM workflow_commands WHERE id=?").get(commandId) : undefined;
+      if (replay && replay.ticket !== ticket) throw new Error("Workflow command identity reused");
+      if (replay) return summary();
       const item = this.workflow.get(ticket);
       const label = kind === "flaky" ? FLAKY_TEST_LABEL : "bug";
       const named = (tests as string[]).some(t => kind === "flaky" ? hasFlakyMarker(item.body, t)

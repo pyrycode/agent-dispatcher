@@ -1138,9 +1138,11 @@ export function stripPackageQualifier(qualifiedName: string): string {
 export function buildBaselineFilter(
   qualifiedFailedNames: readonly string[],
   format: GateOutputFormat = "go-json",
+  /** Playwright only: load tests (`rerunLoad`), matched with their file anchored so they pull in no other file's tests. */
+  loadNames: readonly string[] = [],
 ): string | null {
   if (format === "junit-xml") return buildJUnitBaselineFilter(qualifiedFailedNames);
-  if (format === "playwright-json") return buildPlaywrightBaselineFilter(qualifiedFailedNames);
+  if (format === "playwright-json") return buildPlaywrightBaselineFilter(qualifiedFailedNames, loadNames);
   const safe = /^[A-Za-z0-9_/#.\-]+$/;
   const bare: string[] = [];
   for (const qualified of qualifiedFailedNames) {
@@ -1200,15 +1202,18 @@ const PLAYWRIGHT_TITLE_SEPARATOR = " › ";
  * the Go rule refused them, and every pyrycode-desktop live FAIL said "could
  * not build a safe test filter" (agent-dispatcher#132, #38).
  */
-function buildPlaywrightBaselineFilter(qualifiedFailedNames: readonly string[]): string | null {
+function buildPlaywrightBaselineFilter(qualifiedFailedNames: readonly string[], loadNames: readonly string[] = []): string | null {
   const unsafe = /['\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
   const escapeRegex = (s: string) => s.replace(/[.*+?^${}()|[\]\\/]/g, (m) => `\\${m}`);
   const patterns: string[] = [];
-  for (const name of qualifiedFailedNames) {
+  for (const [name, anchored] of [...qualifiedFailedNames.map((n) => [n, false] as const), ...loadNames.map((n) => [n, true] as const)]) {
     if (unsafe.test(name)) return null;
     const segments = name.split(PLAYWRIGHT_TITLE_SEPARATOR).map((s) => s.trim()).filter((s) => s !== "");
     if (segments.length === 0) return null;
-    const pattern = segments.map(escapeRegex).join(".*");
+    // A load test's file starts a word and ends one, so `a.spec.ts` never matches `data.spec.ts`.
+    const pattern = anchored
+      ? `(?:^|[ /])${escapeRegex(segments[0]!)}(?: |$)` + segments.slice(1).map((s) => `.*${escapeRegex(s)}`).join("")
+      : segments.map(escapeRegex).join(".*");
     if (!patterns.includes(pattern)) patterns.push(pattern);
   }
   if (patterns.length === 0) return null;

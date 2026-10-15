@@ -59,6 +59,16 @@ test("the worker count follows the filter only where it stays inside the runner'
   assert.equal(buildBaselineCommand("npx playwright test", filter, load), null);
 });
 
+test("a load test's file is anchored, so it pulls in no other file's tests", () => {
+  const filter = buildBaselineFilter(["flow.spec.ts › a"], "playwright-json", ["a.spec.ts › x"])!;
+  assert.equal(filter, "'(flow\\.spec\\.ts.*a|(?:^|[ /])a\\.spec\\.ts(?: |$).*x)'");
+  const re = new RegExp(filter.slice(1, -1), "i");
+  assert.ok(re.test("parallel a.spec.ts x"));
+  assert.ok(re.test(" e2e/a.spec.ts suite x"), "a file in a folder");
+  assert.ok(!re.test("parallel data.spec.ts x"), "a longer file name is another file");
+  assert.equal(buildBaselineFilter(["flow.spec.ts › a"], "playwright-json", ["bad.spec.ts › it's"]), null, "an unsafe load name refuses the loaded filter");
+});
+
 test("a name that also failed in another project did not pass", () => {
   const tally = { passedNames: ["flow.spec.ts › a", "flow.spec.ts › b"], failedNames: ["flow.spec.ts › a"] };
   assert.deepEqual(namesPassedEveryTime(tally), ["flow.spec.ts › b"]);

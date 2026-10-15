@@ -188,7 +188,8 @@ export function workflowClient<T extends object>(
     listRecentlyClosedIssuesWithLabel: async (label: string, since: Date) => {
       const [closed, items] = await Promise.all([(base as any).listRecentlyClosedIssuesWithLabel(label, since), read()]);
       const byNumber = new Map(items.map((i) => [i.issueNumber, i]));
-      const out = (closed as Array<{ number: number }>).filter((c) => byNumber.get(c.number)?.state !== "OPEN");
+      // One the store does not hold cannot be reopened through it, so it is left out, and a new ticket filed instead.
+      const out = (closed as Array<{ number: number }>).filter((c) => byNumber.get(c.number)?.state === "CLOSED");
       const unpublished = items.filter((i) => i.state === "CLOSED" && i.labels.includes(label) && !out.some((c) => c.number === i.issueNumber));
       if (unpublished.length > 0) {
         const openOnGitHub = new Set(((await (base as any).listOpenIssuesWithLabel(label)) as Array<{ number: number }>).map((i) => i.number));

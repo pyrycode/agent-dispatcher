@@ -498,9 +498,24 @@ function runKeyOf(ctx: FlakyTicketContext): string {
   return ctx.runKey ?? `${outputPathOf(ctx)}@${ctx.at}`;
 }
 
-/** The idempotency key for one tracker write from one gate run. */
-export function trackerKey(ctx: FlakyTicketContext, issue: number, write: string): string {
-  return flakySightingId(["tracker", "verifierGate" in ctx ? "verifier" : "live", ctx.gatedIssue, runKeyOf(ctx), issue], write).slice(0, 48);
+/**
+ * The idempotency key for one tracker write from one gate run. A comment's
+ * key covers its text too, so a run judged again with other text adds a
+ * comment rather than failing on a reused key.
+ */
+export function trackerKey(ctx: FlakyTicketContext, issue: number, write: string, text = ""): string {
+  return flakySightingId(["tracker", "verifierGate" in ctx ? "verifier" : "live", ctx.gatedIssue, runKeyOf(ctx), issue, text], write).slice(0, 48);
+}
+
+/**
+ * A reopen that can never succeed: the ticket is unknown to the claim
+ * service, belongs to another computer on a board it does not own, is not
+ * the pipeline's tracker there, or closed outside the window. Filing a new
+ * ticket is then right; anything else is retried on the next sighting.
+ */
+export function permanentReopenFailure(error: unknown): boolean {
+  const text = error instanceof Error ? error.message : String(error);
+  return /Unknown workflow ticket|belongs to another machine|outside the reopen window|Not a tracker the pipeline filed|cannot reopen a ticket/.test(text);
 }
 
 /** Closed by a person who decided against tracking it. */
@@ -590,8 +605,8 @@ export async function recordFlakyTests(
   }
   for (const [issue, group] of byTicket) {
     try {
-      await commentOnTracker(client, issue, buildFlakyRecurrenceComment(group, ctx, platform),
-        { kind: "flaky", tests: group, key: trackerKey(ctx, issue, "comment") });
+      const comment = buildFlakyRecurrenceComment(group, ctx, platform);
+      await commentOnTracker(client, issue, comment, { kind: "flaky", tests: group, key: trackerKey(ctx, issue, "comment", comment) });
       result.commented.push(...group.map((name) => ({ name, issue })));
       await dropStaleOsRequirement(client, open.find((i) => i.number === issue)!, platform);
     } catch (e: any) {
@@ -631,19 +646,24 @@ export async function recordFlakyTests(
     }
   }
 
-  const reopen = async (prior: ClosedTracker, group: readonly string[], tracked: readonly string[]): Promise<boolean> => {
+  /** "reopened"; "retry" when nothing is filed beside it and the next sighting tries again; "file" when it never can be. */
+  const reopen = async (prior: ClosedTracker, group: readonly string[], tracked: readonly string[]): Promise<"reopened" | "retry" | "file"> => {
     try {
       await reopenTracker(client, prior, buildFlakyReopenComment(group, ctx, prior.closedAt, platform, earlierByName), {
         kind: "flaky", tests: [...tracked], key: trackerKey(ctx, prior.number, "reopen"),
       });
       result.reopened.push(...group.map((name) => ({ name, issue: prior.number })));
       open.push({ number: prior.number, body: prior.body, labels: prior.labels });
-      return true;
+      return "reopened";
     } catch (e: any) {
+      if (permanentReopenFailure(e)) {
+        console.warn(`   ⚠️  Flaky tickets: #${prior.number} cannot be reopened for ${group.join(", ")}, so a new ticket is filed: ${e?.message ?? e}`);
+        return "file";
+      }
       // Not filed beside it either: the next sighting tries the reopen again.
       console.warn(`   ⚠️  Flaky tickets: could not reopen #${prior.number} for ${group.join(", ")}: ${e?.message ?? e}`);
       result.untracked.push(...group);
-      return false;
+      return "retry";
     }
   };
 
@@ -691,7 +711,13 @@ export async function recordFlakyTests(
       group.names.push(name);
       byPrior.set(prior.number, group);
     }
-    for (const { prior, names: group } of byPrior.values()) await reopen(prior, group, group);
+    for (const { prior, names: group } of byPrior.values()) {
+      if (await reopen(prior, group, group) !== "file") continue;
+      for (const name of group) {
+        const { title, body } = buildFlakyTestIssue(name, ctx, platform, counts.get(name)?.earlier);
+        await file(title, body, [name]);
+      }
+    }
     return result;
   }
 
@@ -706,10 +732,7 @@ export async function recordFlakyTests(
   }
   const prior = stillDue.map((n) => priors.get(n)).filter((c): c is ClosedTracker => c !== undefined && c !== "declined")
     .sort((a, b) => Date.parse(b.closedAt) - Date.parse(a.closedAt))[0];
-  if (prior) {
-    await reopen(prior, tracking, tracking.filter((n) => hasFlakyMarker(prior.body, n)));
-    return result;
-  }
+  if (prior && await reopen(prior, tracking, tracking.filter((n) => hasFlakyMarker(prior.body, n))) !== "file") return result;
   const { title, body } = tracking.length === 1
     ? buildFlakyTestIssue(tracking[0]!, ctx, platform, counts.get(tracking[0]!)?.earlier)
     : buildFlakyRunIssue(tracking, ctx, platform, earlierByName, options.shape);

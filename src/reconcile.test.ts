@@ -1626,6 +1626,23 @@ describe("runRealClaudeGateExecution — outcomes", () => {
     });
   });
 
+  test("a flake beside a shared failure counts its shared ticket as the run's one ticket only when that ticket is confirmed", async () => {
+    await withStageSet("builder", async () => { for (const [confirmed, expected] of [[true, true], [false, false]] as const) {
+      const item = parkedItem({ issueNumber: 1397, labels: ["done:verifier", "needs-real-claude"] });
+      const client = new MockClient([item]);
+      const run = report({ exitCode: 1,
+        tally: tally({ executed: 176, passed: 174, failed: 2, failedNames: ["pkg.Flake", "pkg.TestThing"] }),
+        rerunFailures: ["pkg.TestThing"], rerunSkipReason: null, baselineFailures: ["pkg.TestThing"] });
+      const shapes: unknown[] = [];
+      await runRealClaudeGateExecution(client, async () => run, 150, async () => {}, 0,
+        async (names) => ({ filed: [], commented: [], reopened: [], firstSightings: [], held: [...names], untracked: [], sightingSource: "central" as const }),
+        undefined,
+        async () => (confirmed ? { blockers: [{ name: "pkg.TestThing", issue: 1500 }], untracked: [] } : { blockers: [], untracked: ["pkg.TestThing"] }),
+        { recordFlakySightings: async (_names, _ctx, shape) => { shapes.push(shape); return undefined; } });
+      assert.deepEqual(shapes, [{ failed: ["pkg.Flake", "pkg.TestThing"], persistent: ["pkg.TestThing"], branchOwnsPersistent: false, persistentTracked: expected }]);
+    } });
+  });
+
   test("failed shared-ticket filing parks for recovery without spending rework", async () => {
     const item = parkedItem({ labels: ["done:code-review", "needs-real-claude", "rework-count:3"] });
     const client = new MockClient([item]);

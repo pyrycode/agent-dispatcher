@@ -7551,9 +7551,10 @@ describe("runRealClaudeGateSuite — same-tree re-run before the base comparison
     assert.match(report.baselineSkipReason ?? "", /passed on the same-tree re-run/);
   });
 
-  test("a Playwright re-run and its base comparison run under the gate's own worker count", async () => {
+  test("a Playwright live re-run and its base comparison ask for the gate's worker count, with no load tests", async () => {
     // 2026-10-15: one or two failing tests re-run alone used one worker
-    // against the gate's three or four, so a contention failure passed.
+    // against the gate's three or four. Live load tests would each be a real
+    // claude session, so the live gate passes the worker count only.
     const pw = (files: Record<string, Record<string, string>>) => JSON.stringify({
       config: { workers: 2, metadata: { actualWorkers: 2 } },
       suites: Object.entries(files).map(([file, tests]) => ({ title: file, specs: Object.entries(tests).map(([title, st]) => ({
@@ -7561,8 +7562,8 @@ describe("runRealClaudeGateSuite — same-tree re-run before the base comparison
       })) })),
     });
     const branch = pw({ "real-claude-effort.spec.ts": { applied: "failed" }, "real-claude-mcp.spec.ts": { sheet: "passed" } });
-    const rerun = pw({ "real-claude-effort.spec.ts": { applied: "failed" }, "real-claude-mcp.spec.ts": { sheet: "failed" } });
-    const base = pw({ "real-claude-effort.spec.ts": { applied: "passed" }, "real-claude-mcp.spec.ts": { sheet: "failed" } });
+    const rerun = pw({ "real-claude-effort.spec.ts": { applied: "failed" } });
+    const base = pw({ "real-claude-effort.spec.ts": { applied: "passed" } });
     const harness = makeGateDeps({
       gitOut: (cmd) => GATE_SHAS[cmd] ?? "",
       spawnOutcome: { exitCode: 1 },
@@ -7575,11 +7576,11 @@ describe("runRealClaudeGateSuite — same-tree re-run before the base comparison
       format: "playwright-json", timeoutMs: 60_000, repoRoot: "/tmp/fake-repo", defaultBranch: "main", logsDir: "/tmp/fake-logs",
       deps: harness.deps,
     });
-    const loaded = "-g '(real-claude-effort\\.spec\\.ts.*applied|real-claude-mcp\\.spec\\.ts.*sheet)' --workers=2";
+    const loaded = "-g '(real-claude-effort\\.spec\\.ts.*applied)' --workers=2";
     assert.ok(harness.spawnRequests[1].command.endsWith(loaded), harness.spawnRequests[1].command);
-    assert.deepEqual(report.rerunFailures, ["real-claude-effort.spec.ts › applied"], "only the failing test is judged");
-    assert.ok(harness.spawnRequests[2].command.endsWith(loaded), "the base meets the same load");
-    assert.deepEqual(report.baselineFailures, [], "a load test failing on the base is not a failure of main");
+    assert.deepEqual(report.rerunFailures, ["real-claude-effort.spec.ts › applied"]);
+    assert.ok(harness.spawnRequests[2].command.endsWith(loaded), "the base asks for the same workers");
+    assert.deepEqual(report.baselineFailures, []);
   });
 
   test("a failure that fails again is compared against the base as before", async () => {
@@ -11950,7 +11951,7 @@ describe("pre-verifier gates — failures already on main (#123)", () => {
         req.command === PW ? { exitCode: 1, timedOut: false, spawnError: null } : { exitCode: 0, timedOut: false, spawnError: null };
       const pwReruns = (calls: CallLog) => calls.gates.filter((g) => g.command.includes(" -g ") && !/verifier-gate-base-/.test(g.cwd));
       const pwBase = (calls: CallLog) => calls.gates.filter((g) => g.command.includes(" -g ") && /verifier-gate-base-/.test(g.cwd));
-      const LOADED = `${PW} -g '(flow\\.spec\\.ts.*a|other\\.spec\\.ts.*o|more\\.spec\\.ts.*m)' --workers=3`;
+      const LOADED = `${PW} -g '(flow\\.spec\\.ts.*a|(?:^|[ /])other\\.spec\\.ts(?: |$).*o|(?:^|[ /])more\\.spec\\.ts(?: |$).*m)' --workers=3`;
 
       test("the re-run asks for the gate's workers and fills the idle ones with passing tests from other files", async () => {
         const { result, calls } = await runGates(1767, {

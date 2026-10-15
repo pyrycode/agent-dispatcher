@@ -6198,10 +6198,22 @@ function loadedRerunCommand(
 ): { filter: string | null; command: string | null; load: RerunLoad | null } {
   const plain = buildBaselineFilter(failedNames, format);
   if (plain === null) return { filter: null, command: null, load: null };
-  const loaded = load && load.tests.length > 0 ? buildBaselineFilter([...failedNames, ...load.tests], format) : plain;
+  const loaded = load && load.tests.length > 0 ? buildBaselineFilter(failedNames, format, load.tests) : plain;
   const used: RerunLoad | null = !load ? null : loaded === null ? { ...load, tests: [] } : load;
   const filter = loaded ?? plain;
   return { filter, command: buildBaselineCommand(template, filter, rerunLoadArguments(used)), load: used };
+}
+
+/**
+ * The live gate's re-runs ask for its worker count, but carry no load tests:
+ * each is a real claude session, and a failure that fails three times under
+ * load would file a shared live failure ticket on its first sighting and
+ * block the gated ticket. Desktop's live gate runs one worker, so today this
+ * changes nothing there.
+ */
+function liveRerunLoad(format: GateOutputFormat, tally: GateRunReport["tally"], failedNames: readonly string[]): RerunLoad | null {
+  const load = rerunLoad(format, tally, failedNames);
+  return load ? { ...load, tests: [] } : null;
 }
 
 /** The log's words for a re-run's load. */
@@ -8282,7 +8294,7 @@ export async function runRealClaudeGateSuite(opts: {
         issueNumber: opts.issueNumber,
         logsDir,
         stamp,
-        load: rerunLoad(opts.format, report.tally, rerunCandidates),
+        load: liveRerunLoad(opts.format, report.tally, rerunCandidates),
         deps,
       });
     } else if (rerunCandidates.length === 0 && report.rerunSkipReason === null) {
@@ -8323,7 +8335,7 @@ export async function runRealClaudeGateSuite(opts: {
         targetRepo,
         logsDir,
         stamp,
-        load: rerunLoad(opts.format, report.tally, persistent),
+        load: liveRerunLoad(opts.format, report.tally, persistent),
         deps,
       });
     } else if (persistent.length === 0 && report.baselineSkipReason === null) {

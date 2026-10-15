@@ -63,25 +63,34 @@ things made it worse:
    duplicate is left alone: nothing is reopened or filed for that test until
    the 30 days have passed. On a board the claim service owns, the reopen is
    one central write (see below). Elsewhere it is GitHub's own steps: reopen,
-   comment, drop the stale labels, move to Backlog. A reopen that fails files
-   nothing beside the closed ticket; the next sighting tries again.
+   comment, drop the stale labels, move to Backlog. A reopen that fails for a
+   passing reason files nothing beside the closed ticket; the next sighting
+   tries again. One that can never succeed, because the claim service does not
+   hold the ticket, it is not the pipeline's tracker there, it closed outside
+   the window, or another computer owns it on a board the claim service does
+   not own, files a new ticket instead.
 5. **The re-run carries the gate's own load.** For Playwright, the gate's
    report says how many workers it ran with. With `fullyParallel: false` a
    spec file runs in one worker, so a re-run of one failing file used one.
-   Now the same-tree re-run, and the base-commit re-run after it, ask for the
-   gate's worker count, and when the failing tests sit in fewer spec files
-   than that, they also run tests that passed in the gate from other spec
-   files, one file per idle worker, until those last at least as long as the
-   slowest failing test did. Those tests are load only: their results never
-   decide anything, and one that fails on the base is not a failure of main.
-   Each failing test still runs exactly once, so the retry budget is
-   unchanged. Copies of the failing test are not used: two copies of one test
-   can collide on a resource the gate never shared. A gate that ran one worker
-   re-runs exactly as before; Desktop's live gate does. `--workers` is added
-   only where the `{{TESTS}}` placeholder is the value of `-g` or `--grep`, so
-   it always lands on the runner's own command line. Go JSON and JUnit XML
-   report no worker count, so their re-runs are unchanged. A name that failed
-   in any Playwright project of the re-run did not pass it.
+   Now the verifier gate's same-tree re-run, and the base-commit re-run after
+   it, ask for the gate's worker count, and when the failing tests sit in
+   fewer spec files than that, they also run tests that passed in the gate
+   from other spec files, one file per idle worker, until those last at least
+   as long as the slowest failing test did. A load test is matched by its exact
+   file, so it pulls in no other file's tests. Load tests decide nothing, and
+   one that fails on the base is not a failure of main. Each failing test
+   still runs exactly once, so the retry budget is unchanged. Copies of the
+   failing test are not used: two copies of one test can collide on a
+   resource the gate never shared. The live gate's re-runs ask for its worker
+   count but carry no load tests, since each would be a real claude session and
+   a failure that failed three times under load would file a shared live
+   failure ticket on its first sighting; Desktop's live gate runs one worker
+   anyway. A gate that ran one worker re-runs exactly as before. `--workers` is
+   added only where the `{{TESTS}}` placeholder is the value of `-g` or
+   `--grep`, so it always lands on the runner's own command line. Go JSON and
+   JUnit XML report no worker count, so their re-runs are unchanged. In every
+   format, a name that failed anywhere in the re-run, in another Playwright
+   project or on another device, did not pass it.
 
 An open ticket for a test still gets an occurrence comment each time the test
 flakes, whatever its count, except in a run where the branch owns a failure
@@ -89,7 +98,8 @@ that failed again, so its comments are the occurrence count. A run's tests that 
 comment. A test whose ticket another run is filing or reopening right now is
 left to that run: the claim service hands out the filing for ten minutes to
 the first due sighting, so two verifiers that flake the same test at once on
-one busy computer file once.
+one busy computer file once. Without the shared record, the dispatcher keeps
+the same lease for its own runs.
 
 ## Where sightings live
 

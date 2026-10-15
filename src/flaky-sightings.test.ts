@@ -94,6 +94,7 @@ describe("the shared sighting record", () => {
     const third = sighting({ at: T0 + 2, ticket: 2011 });
     assert.equal(ledger.record("hp", "org/desktop", [second]).results[0].file, true);
     assert.equal(ledger.record("fractal", "org/desktop", [third]).results[0].file, false, "two runs at once file once");
+    now = T0 + 9 * 60 * 1000;
     assert.equal(ledger.record("hp", "org/desktop", [second]).results[0].file, true, "the holder asking again keeps it");
     now = T0 + 11 * 60 * 1000;
     assert.equal(ledger.record("fractal", "org/desktop", [sighting({ at: now, ticket: 2012 })]).results[0].file, true, "a filing that failed is retried after the lease");
@@ -158,6 +159,13 @@ describe("the dispatcher's recorder", () => {
     const count = [...again.counts.values()][0];
     assert.equal(count.count, 2);
     assert.deepEqual(count.earlier.map((e) => [e.machine, e.ticket]), [["pyrybox", "#1990"]]);
+  });
+
+  test("without the shared record, two due sightings on this computer at once file once", async () => {
+    const recorder = new FlakySightingRecorder({ connection: null, statePath: "/f.json", fs: memoryFs(), now: () => T0 });
+    await recorder.record([sighting()]);
+    const [a, b] = await Promise.all([recorder.record([sighting({ at: T0 + 1, ticket: 2020 })]), recorder.record([sighting({ at: T0 + 2, ticket: 2021 })])]);
+    assert.deepEqual([[...a.counts.values()][0].file, [...b.counts.values()][0].file], [true, false]);
   });
 
   test("unmanaged, this computer's file is the whole record, and it forgets past the window", async () => {

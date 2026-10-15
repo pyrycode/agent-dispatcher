@@ -84,9 +84,10 @@ export interface FlakySightingCount {
   /** The other counted sightings inside the window, newest first, at most five. */
   earlier: { machine: string; ticket: string; gate: FlakyGate; at: number }[];
   /**
-   * Set by the claim service when the sighting is due: true when this one
-   * holds the filing lease (FLAKY_FILING_LEASE_MS), false when another
-   * sighting of the test does. Absent from a local count.
+   * Set when the sighting is due: true when this one holds the filing lease
+   * (FLAKY_FILING_LEASE_MS), false when another sighting of the test does.
+   * The claim service holds the shared leases; a local count uses this
+   * computer's own.
    */
   file?: boolean;
 }
@@ -174,9 +175,9 @@ export class FlakySightingLedger {
       };
       if (s.counts && n >= FLAKY_SIGHTINGS_TO_FILE) {
         const held = lease.get(project, s.test) as { sighting: string } | undefined;
-        // The holder asking again, after a lost answer, keeps it.
+        // The holder asking again, after a lost answer, keeps it, without extending it.
         result.file = !held || held.sighting === s.id;
-        if (result.file) take.run(project, s.test, s.id, now + FLAKY_FILING_LEASE_MS);
+        if (!held) take.run(project, s.test, s.id, now + FLAKY_FILING_LEASE_MS);
       }
       return result;
     });
@@ -241,6 +242,8 @@ export class FlakySightingRecorder implements FlakySightingStore {
   private readonly now: () => number;
   private readonly log: (line: string) => void;
   private warned = false;
+  /** This computer's own filing leases, for when the shared record cannot be reached. */
+  private readonly localLeases = new Map<string, { id: string; until: number }>();
 
   constructor(private readonly options: FlakySightingRecorderOptions) {
     this.fs = options.fs ?? NODE_FS;
@@ -307,13 +310,20 @@ export class FlakySightingRecorder implements FlakySightingStore {
     const since = now - FLAKY_SIGHTING_WINDOW_MS;
     for (const s of sightings) {
       const same = state.sightings.filter((l) => l.test === s.test && l.counts && l.at >= since);
-      counts.set(s.id, {
+      const count: FlakySightingCount = {
         id: s.id,
         test: s.test,
         count: same.length,
         earlier: same.filter((l) => l.id !== s.id).sort((a, b) => b.at - a.at).slice(0, 5)
           .map((l) => ({ machine: this.options.machine ?? "this computer", ticket: `#${l.ticket}`, gate: l.gate, at: l.at })),
-      });
+      };
+      // Two verifiers on this computer that are due at once still file once.
+      if (s.counts && count.count >= FLAKY_SIGHTINGS_TO_FILE) {
+        const held = this.localLeases.get(s.test);
+        count.file = !held || held.until < now || held.id === s.id;
+        if (!held || held.until < now) this.localLeases.set(s.test, { id: s.id, until: now + FLAKY_FILING_LEASE_MS });
+      }
+      counts.set(s.id, count);
     }
     return { counts, source: "local" };
   }
