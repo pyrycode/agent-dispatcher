@@ -11950,7 +11950,7 @@ describe("pre-verifier gates — failures already on main (#123)", () => {
       assert.deepEqual(blockers, [], "no blocker is linked");
       assert.equal(client.createdIssues.length, 0, "the open tracker is used, not a new ticket");
       assert.equal(client.comments.filter((c) => c.issueNumber === 3418).length, 0, "no sighting comment on every verifier run");
-      assert.equal(client.moveItemToTopCalls.length, 1, "the tracker goes to the top of Backlog");
+      assert.equal(client.moveItemToTopCalls.length, 1, "a tracker off the board goes to the top of Backlog");
       assert.match(loggedText(calls), /all 1 failing test\(s\) also fail on main and is tracked on #3418, so it counts as green/);
       assert.ok(!client.addLabelCalls.some((c) => c.label.startsWith("needs-rework:")));
     });
@@ -12115,6 +12115,8 @@ describe("pre-verifier gates — failures already on main (#123)", () => {
 
       assert.match(result.promptNote, /TRIAGE MODE/);
       assert.match(result.promptNote, /names de\.pyryco\.mobile\.ui\.NewTest#broken itself, so it may be the fix/);
+      assert.equal(client.moveItemToTopCalls.length, 0, "a held name files and moves nothing");
+      assert.equal(client.createdIssues.length, 0);
       assert.deepEqual(blockers, []);
     });
 
@@ -12131,6 +12133,7 @@ describe("pre-verifier gates — failures already on main (#123)", () => {
       assert.match(result.promptNote, /TRIAGE MODE/);
       assert.match(result.promptNote, /tracked on #3418 only by its method name/);
       assert.equal(client.createdIssues.length, 0);
+      assert.equal(client.moveItemToTopCalls.length, 0);
       assert.deepEqual(blockers, []);
     });
 

@@ -181,11 +181,17 @@ describe("inheritedIneligibility (PYRY_VERIFIER_GATE_INHERITED_ADVANCE)", () => 
     });
   }
 
-  for (const gate of ["go test -json -failfast ./...", "GOFLAGS=-failfast go test -json ./..."]) {
+  for (const gate of ["go test -json -failfast ./...", "GOFLAGS=-failfast go test -json ./...", "go test -json -failfast=1 ./...",
+    "go test -json ./... -args -test.failfast", "go test -json -failfast=T ./..."]) {
     test(`\`${gate}\` stops at its first failure, so it is not accepted`, () => {
       assert.match(inheritedIneligibility(gate, "go-json", go(failing("example.com/p", "TestA")))!, /stops at its first failure/);
     });
   }
+
+  test("-failfast=false and go's -x are not stop-first", () => {
+    assert.equal(inheritedIneligibility("go test -json -failfast=false ./...", "go-json", go(failing("example.com/p", "TestA"))), null);
+    assert.equal(inheritedIneligibility("go test -x -json ./...", "go-json", go(failing("example.com/p", "TestA"))), null);
+  });
 
   test("an env prefix and a redirect still make one direct run", () => {
     assert.equal(inheritedIneligibility("env CGO_ENABLED=1 go test -race -json ./... 2>&1", "go-json", go(failing("example.com/p", "TestA"))), null);

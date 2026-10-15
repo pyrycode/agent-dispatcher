@@ -404,3 +404,24 @@ test("a verifier gate's untracked failure falls back with a reason and still lin
   assert.deepEqual(client.linked, [], "the live gate would link #77 here; the verifier gate never does");
   assert.equal(client.created.length, 0);
 });
+
+test("a verifier gate leaves an existing Backlog tracker in place and posts no sighting", async () => {
+  const client = new Client();
+  client.open.push({ number: 1480, nodeId: "node-1480", body: inheritedMarker(name) });
+  client.statuses.set(1480, "Backlog");
+  const result = await trackInheritedTests(client, [name], verifierCtx);
+  assert.deepEqual(result.tracked, [{ name, issue: 1480 }]);
+  assert.deepEqual(client.positions, []);
+  assert.deepEqual(client.comments, []);
+});
+
+test("a verifier gate on a ticket that names its own test files and moves nothing", async () => {
+  const client = new Client();
+  client.open.push({ number: 1480, nodeId: "node-1480", body: inheritedMarker(name) });
+  const result = await trackInheritedTests(client, [name], { ...verifierCtx, gatedBody: `Fix \`${name}\`.` });
+  assert.equal(result.tracked, undefined);
+  assert.match(result.fallbackReason!, /names p\.C#permissionAnswer itself/);
+  assert.deepEqual(client.positions, []);
+  assert.deepEqual(client.created, []);
+  assert.equal(client.statuses.size, 0);
+});

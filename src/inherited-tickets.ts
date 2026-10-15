@@ -218,6 +218,21 @@ async function recordInherited(
       untrackedNow.push(name);
     }
   }
+  // Without blockers to fall back on, a gap known before any write ends the
+  // call here, so a ticket that owns or names its test, or a loose match,
+  // files and moves nothing.
+  if (options.advance && options.addBlockers === false) {
+    const selfNamed = ctx.gatedBody === undefined ? [] : names.filter(n => namesExactly({ body: ctx.gatedBody! }, n));
+    const early = (result.owned!.length > 0 && `this ticket owns the fix for ${result.owned!.join(", ")}`)
+      || (selfNamed.length > 0 && `this ticket names ${selfNamed.join(", ")} itself, so it may be the fix`)
+      || [...groups.values()].flatMap(g => g.names.filter(n => looselyTracked.has(n)).map(n =>
+        `${n} is tracked on #${g.issue.number} only by its method name; if it is the same test, add ${inheritedMarker(n)} to that ticket's body`))[0];
+    if (early) {
+      result.fallbackReason = early;
+      result.untracked = names.filter(n => !result.owned!.includes(n));
+      return result;
+    }
+  }
   if (untrackedNow.length > 0) {
     try {
       const { title, body } = fixTicket(untrackedNow, ctx, platform);
@@ -245,7 +260,9 @@ async function recordInherited(
       const itemId = await client.addItemToProject(issue.nodeId);
       const entersBacklog = status === null || status === "Inbox" || status === "Done";
       if (entersBacklog) await client.updateItemStatus(itemId, "Backlog");
-      if (entersBacklog || status === "Backlog") await client.moveItemToTop(itemId);
+      // Without sighting comments, the call comes on every verifier run, so
+      // an existing Backlog tracker keeps its place rather than being bumped.
+      if (entersBacklog || (status === "Backlog" && options.recordSighting !== false)) await client.moveItemToTop(itemId);
       placed.push({ issue, names: groupNames });
     } catch (error) {
       console.warn(`   ⚠️ Could not confirm a fix ticket for ${groupNames.join(", ")}: ${error}`);

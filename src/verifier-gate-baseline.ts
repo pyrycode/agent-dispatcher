@@ -196,6 +196,21 @@ export function verifierInheritedAdvanceEnabled(env: NodeJS.ProcessEnv): boolean
   return !/^(0|false|off|no)$/i.test((env.PYRY_VERIFIER_GATE_INHERITED_ADVANCE ?? "").trim());
 }
 
+/** Go's `-failfast` in any spelling Go accepts as true, and Playwright's
+ * `-x` or a nonzero `--max-failures`. A `GOFLAGS` set with `go env -w`
+ * cannot be seen from the command. */
+function stopsAtFirstFailure(gate: string, format: GateOutputFormat): boolean {
+  for (const m of gate.matchAll(/(?:^|[\s='"])--?(?:test\.)?failfast(?:=([^\s'"]*))?/gi)) {
+    if (m[1] === undefined || !/^(0|f|false)$/i.test(m[1])) return true;
+  }
+  if (format !== "playwright-json") return false;
+  if (/(?:^|[\s'"])-x(?=$|[\s'"])/.test(gate)) return true;
+  for (const m of gate.matchAll(/(?:^|[\s'"])--max-failures(?:=|\s+)([^\s'"]*)/g)) {
+    if (m[1] !== "0") return true;
+  }
+  return false;
+}
+
 /**
  * Whether a red gate's baseline failures may be accepted as inherited at
  * all, before any tracker is looked for. Null when they may; otherwise the
@@ -217,9 +232,14 @@ export function verifierInheritedAdvanceEnabled(env: NodeJS.ProcessEnv): boolean
  *   the gates after an accepted red still run. A `junit-xml` gate is always
  *   a wrapper script the dispatcher cannot read, so it is trusted to be one
  *   test run, as the gate formats already require.
- * - No stop-on-first-failure flag (`-failfast`, `-x`, `--max-failures`):
- *   the tests after an inherited failure would never run. A Playwright
- *   `maxFailures` set in its config file cannot be seen from here.
+ * - No stop-on-first-failure flag (Go `-failfast`, Playwright `-x` or
+ *   `--max-failures`): the tests after an inherited failure would never
+ *   run. A Playwright `maxFailures` in its config file, or a `-failfast`
+ *   in `go env GOFLAGS`, cannot be seen from here.
+ *
+ * Evidence on main is the caller's: the base re-run, or for a gate without
+ * a baseline template the ancestor main sweep, which may predate a fix on
+ * main. A tracker filed on the spot does not strengthen that evidence.
  */
 export function inheritedIneligibility(gate: string, format: GateOutputFormat, tally: GateTally): string | null {
   if (tally.completeParse !== true) return "its output is incomplete test evidence";
@@ -237,7 +257,7 @@ export function inheritedIneligibility(gate: string, format: GateOutputFormat, t
       return "the gate is not one direct test run, so the steps after its red step may never have run; list each step as its own gate";
     }
   }
-  if (/(?:^|[\s='"])(?:--?failfast(?:=true)?|-x|--max-failures(?:=\S*)?)(?=$|[\s'"])/.test(gate)) {
+  if (stopsAtFirstFailure(gate, format)) {
     return "the gate stops at its first failure, so the tests after an inherited failure never ran";
   }
   return null;

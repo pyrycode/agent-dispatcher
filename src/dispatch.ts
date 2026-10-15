@@ -6477,7 +6477,7 @@ function remainingNoteLines(result: VerifierGatesOutcome): string[] {
   if (!own) return [];
   return [
     "",
-    `Judge only these remaining failures of \`${own.gate}\`, which do not fail on main:`,
+    `Judge only these remaining failures of \`${own.gate}\`, which were not shown to fail on main:`,
     "",
     ...own.remaining.map((name) => `- \`${name}\``),
   ];
