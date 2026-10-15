@@ -71,7 +71,7 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
       if (req.method === "GET" && req.url === "/operations/control") return send(200,{desired:store.controlTarget(),centralLoaded:controlRevision});
       if (req.method === "GET" && req.url === "/operations/reports") return send(200, store.operations.list());
       if (req.method === "GET" && req.url === "/tasks/orphaned") return send(200, store.orphans.list());
-      if (req.method === "GET" && req.url === "/state") return send(200, {...store.snapshot(), features:{recoveryTasks:true,...(evidence?{evidence:true}:{})},requiredRepairs:store.requiredRepairs(),...(evidence?{evidenceStore:evidence.cachedUsage()}:{})});
+      if (req.method === "GET" && req.url === "/state") return send(200, {...store.snapshot(), features:{recoveryTasks:true,...(evidence?{evidence:true}:{})},requiredRepairs:store.requiredRepairs(),openTaskTickets:store.openTaskTickets(),...(evidence?{evidenceStore:evidence.cachedUsage()}:{})});
       if (req.method === "GET" && req.url === "/runner") return send(200, store.runnerPolicy() ?? null);
       if (req.method === "GET" && req.url === "/codex") return send(200, { pause: store.codex.state(), spacing: store.codex.spacingState(), config: store.codex.config, events: store.codex.events(), recentStarts: store.codex.starts() });
       if (req.method === "GET" && req.url === "/recovery/state") return send(200, store.recovery.list());

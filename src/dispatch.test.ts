@@ -333,6 +333,14 @@ export function makeMockDeps(opts: MockDepsOptions = {}): { deps: DispatchDeps; 
     return fsMap[String(path)];
   }) as unknown as typeof import("node:fs").readFileSync;
 
+  // Every mock file is a regular file; anything else is absent.
+  const mockLstatSync = ((path: string) => {
+    if (!Object.prototype.hasOwnProperty.call(fsMap, String(path))) {
+      throw Object.assign(new Error(`ENOENT: no such file or directory, lstat '${path}'`), { code: "ENOENT", errno: -2 });
+    }
+    return { isFile: () => true, isSymbolicLink: () => false };
+  }) as unknown as typeof import("node:fs").lstatSync;
+
   const mockWriteFileSync = ((path: string, content: any) => {
     calls.fs.push({ kind: "write", path: String(path), content: String(content) });
   }) as unknown as typeof import("node:fs").writeFileSync;
@@ -397,6 +405,7 @@ export function makeMockDeps(opts: MockDepsOptions = {}): { deps: DispatchDeps; 
     spawnSync: mockSpawnSync,
     existsSync: mockExistsSync,
     readFileSync: mockReadFileSync,
+    lstatSync: mockLstatSync,
     writeFileSync: mockWriteFileSync,
     mkdirSync: mockMkdirSync,
     copyCodegraphIndex: mockCopyCodegraphIndex,

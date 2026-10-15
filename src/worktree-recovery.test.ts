@@ -265,4 +265,177 @@ test('managed verifier FAIL hands its entire retained tree to builder safely', a
       if (condition === 'active worker') f.finish();
     });
   }
+  // Module paths are fixed at first import, so these share this repository.
+  await legacyWorktreeCases(t, root, repo, store);
 });
+
+
+// Desktop #1979, #1978 and Mobile #2052: trees retained by runs on code from
+// before PR 260 have no custody record. A safe one is removed and dispatch
+// starts fresh; anything that could lose work is refused, untouched.
+async function legacyWorktreeCases(t: import('node:test').TestContext, root: string, repo: string, store: FleetStore) {
+  const gitAt = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: 'pipe' }).trim();
+  const git = (...args: string[]) => gitAt(repo, ...args);
+  const { DEFAULT_DEPS, setupBranchAndWorktree, makeDispatchContext, worktreePath, managedWorktreeRecordPath } = await import('./dispatch.js');
+  let ticket = 2050;
+  const fixture = async (opts: { push?: boolean; commit?: boolean; role?: string } = {}) => {
+    for (const run of store.snapshot().runs) store.finish(run.machine, run.session, run.id, false);
+    const number = ++ticket;
+    const request = (role: string) => ({ id: `${number}-${role}`, session: `${number}-${role}-session`, machine: 'local',
+      project: 'org/desktop', ticket: `org/desktop#${number}`, role, resource: 'medium' as const, locks: [] });
+    const start = (role: string): FleetRun => {
+      const req = request(role); assert.equal(store.start(req).ok, true);
+      return store.snapshot().runs.find(run => run.id === req.id)!;
+    };
+    // The predecessor ran on older code: a plain worktree and no record.
+    const prior = start(opts.role ?? 'verifier');
+    const path = worktreePath(repo, `${opts.role ?? 'verifier'}-${number}`);
+    git('branch', `feature/${number}`, 'main');
+    mkdirSync(resolve(path, '..'), { recursive: true });
+    git('worktree', 'add', path, `feature/${number}`);
+    if (opts.commit !== false) {
+      writeFileSync(join(path, 'source.ts'), `export const ticket = ${number};\n`);
+      gitAt(path, 'commit', '-am', 'prior work');
+    }
+    if (opts.push !== false) gitAt(path, 'push', '-u', 'origin', `feature/${number}`);
+    store.finish('local', prior.session, prior.id, false);
+    assert.equal(existsSync(managedWorktreeRecordPath(path)), false);
+    const comments: string[] = [], labels: string[] = [], commands: string[] = [];
+    const client = { addComment: async (_n: number, body: string) => { comments.push(body); },
+      addLabel: async (_n: number, label: string) => { labels.push(label); } } as unknown as DispatchClient;
+    const item = { issueNumber: number, labels: ['needs-rework:builder', 'rework-count:1'], title: 'legacy tree', id: `item-${number}` } as ProjectItem;
+    const builder = () => {
+      const run = start('builder');
+      const deps: DispatchDeps = { ...DEFAULT_DEPS,
+        managedWorktree: { run, snapshot: async () => ({ ...store.snapshot(), openTaskTickets: store.openTaskTickets() }),
+          predecessor: async id => store.worktreePredecessor(run.machine, run.session, run.id, id) },
+        execSync: ((cmd: string, o: any) => { commands.push(cmd); return execSync(cmd, o); }) as typeof execSync };
+      return makeDispatchContext({ name: 'builder', usesWorktree: true, column: 'In Development', claudeMdPath: 'builder/CLAUDE.md' } as AgentConfig, item, client, deps);
+    };
+    return { number, path, builder, comments, labels, commands };
+  };
+  const accepted = async (f: Awaited<ReturnType<typeof fixture>>, force: boolean) => {
+    const ctx = f.builder();
+    const head = git('rev-parse', `feature/${f.number}`);
+    assert.deepEqual(await setupBranchAndWorktree(ctx), { ok: true });
+    assert.equal(existsSync(f.path), false, 'the legacy tree is gone');
+    assert.equal(ctx.worktreeDir, worktreePath(repo, `builder-${f.number}`));
+    assert.equal(gitAt(ctx.worktreeDir, 'symbolic-ref', 'HEAD'), `refs/heads/feature/${f.number}`);
+    assert.equal(git('rev-parse', `feature/${f.number}`), head, 'no history was rewritten');
+    assert.equal(JSON.parse(readFileSync(managedWorktreeRecordPath(ctx.worktreeDir), 'utf8')).run.id, ctx.deps.managedWorktree!.run.id);
+    assert.equal(existsSync(managedWorktreeRecordPath(f.path)), false, 'no record is written for the removed tree');
+    assert.ok(f.commands.includes(`git worktree remove ${force ? '--force ' : ''}"${f.path}"`), f.commands.join('\n'));
+    assert.ok(!f.commands.some(cmd => /worktree prune/.test(cmd)), 'other worktrees are never pruned');
+    assert.equal(f.comments.length, 1);
+    assert.match(f.comments[0]!, /Removed legacy worktree without custody record/);
+    assert.deepEqual(f.labels, []);
+  };
+  await t.test('a clean pushed tree is removed and dispatch starts fresh', async () => {
+    const f = await fixture();
+    // Ignored files never block, as with the old cleanup.
+    writeFileSync(join(repo, '.git', 'info', 'exclude'), 'ignored-scratch\n');
+    writeFileSync(join(f.path, 'ignored-scratch'), 'x');
+    await accepted(f, false);
+    assert.match(f.comments[0]!, /it was clean/);
+  });
+  await t.test('a tree whose only changes are runtime files is removed (#1936 shape)', async () => {
+    const f = await fixture();
+    rmSync(join(f.path, '.codegraph', 'codegraph.db-wal'));
+    writeFileSync(join(f.path, 'worker.pid'), '4242\n');
+    await accepted(f, true);
+    assert.match(f.comments[0]!, /regenerable runtime files \(.*codegraph\.db-wal/);
+  });
+  await t.test('a tree with no remote branch and nothing beyond main is removed', async () => {
+    const f = await fixture({ push: false, commit: false });
+    await accepted(f, false);
+  });
+  const refusals: Array<[string, RegExp]> = [
+    ['untracked evidence', /uncommitted changes \(FAIL-evidence\.txt\)/],
+    ['modified source', /uncommitted changes \(source\.ts\)/],
+    ['staged runtime untracking', /uncommitted changes \(\.codegraph\/codegraph\.db-wal\)/],
+    ...['MERGE_HEAD', 'rebase-merge', 'rebase-apply', 'CHERRY_PICK_HEAD', 'BISECT_START', 'index.lock'].map(name => [name, /unfinished/] as [string, RegExp]),
+    ['unpushed commits', /1 commit\(s\) are not on origin\/feature\//],
+    ['no remote branch with work', /1 commit\(s\) are not on origin\/main/],
+    ['live run', /another live run on the ticket/],
+    ['open support task', /a support task is open for the ticket/],
+    ['older authority', /does not report open support tasks/],
+    ['ownership changed', /ownership changed/],
+    ['unreadable authority', /authority could not be read/],
+    ['locked', /it is locked/],
+    ['personal path', /not a dispatcher worktree path/],
+    ['shared CodeGraph symlink', /shared CodeGraph symlink/],
+  ];
+  for (const [condition, expected] of refusals) {
+    await t.test(`refuses ${condition} and leaves the tree untouched`, async () => {
+      const f = await fixture(condition === 'no remote branch with work' ? { push: false } : {});
+      let path = f.path;
+      if (condition === 'untracked evidence') writeFileSync(join(path, 'FAIL-evidence.txt'), 'gate FAIL\n');
+      if (condition === 'modified source') writeFileSync(join(path, 'source.ts'), 'export const unsaved = true;\n');
+      if (condition === 'staged runtime untracking') gitAt(path, 'rm', '--cached', '.codegraph/codegraph.db-wal');
+      if (condition === 'unpushed commits') { writeFileSync(join(path, 'more.ts'), 'x\n'); gitAt(path, 'add', 'more.ts'); gitAt(path, 'commit', '-m', 'local only'); }
+      if (condition === 'locked') git('worktree', 'lock', path);
+      if (condition === 'personal path') { const other = join(root, `personal-${f.number}`); git('worktree', 'move', path, other); path = other; }
+      if (condition === 'shared CodeGraph symlink') { rmSync(join(path, '.codegraph'), { recursive: true }); symlinkSync(join(repo, '.codegraph'), join(path, '.codegraph')); }
+      let operationPath: string | undefined;
+      if (IN_PROGRESS_GIT_PATHS.includes(condition as any)) {
+        operationPath = resolve(path, gitAt(path, 'rev-parse', '--git-path', condition));
+        if (condition.startsWith('rebase-')) mkdirSync(operationPath); else writeFileSync(operationPath, 'unfinished operation\n');
+      }
+      const ctx = f.builder();
+      const run = ctx.deps.managedWorktree!.run;
+      const authority = async () => ({ ...store.snapshot(), openTaskTickets: store.openTaskTickets() });
+      if (condition === 'live run') ctx.deps.managedWorktree!.snapshot = async () => { const s = await authority(); return { ...s, runs: [...s.runs, { ...run, id: 'still-running', role: 'verifier' }] }; };
+      if (condition === 'open support task') ctx.deps.managedWorktree!.snapshot = async () => ({ ...(await authority()), openTaskTickets: [run.ticket] });
+      if (condition === 'older authority') ctx.deps.managedWorktree!.snapshot = async () => store.snapshot();
+      if (condition === 'ownership changed') ctx.deps.managedWorktree!.snapshot = async () => { const s = await authority(); return { ...s, claims: s.claims.map(c => ({ ...c, generation: 'new-owner' })) }; };
+      if (condition === 'unreadable authority') ctx.deps.managedWorktree!.snapshot = async () => { throw new Error('unreachable'); };
+      const head = git('rev-parse', `feature/${f.number}`);
+      const status = gitAt(path, 'status', '--porcelain', '--untracked-files=all');
+      f.commands.length = 0;
+      assert.deepEqual(await setupBranchAndWorktree(ctx), { ok: false });
+      assert.equal(f.comments.length, 1);
+      assert.match(f.comments[0]!, /Managed worktree handoff refused: .*Legacy worktree without custody record/);
+      assert.match(f.comments[0]!, expected);
+      assert.deepEqual(f.labels, ['error:builder']);
+      assert.equal(existsSync(path), true);
+      assert.equal(gitAt(path, 'status', '--porcelain', '--untracked-files=all'), status);
+      assert.equal(git('rev-parse', `feature/${f.number}`), head);
+      assert.equal(existsSync(worktreePath(repo, `builder-${f.number}`)), false);
+      assert.equal(existsSync(managedWorktreeRecordPath(path)), false, 'a record is never written for a refused tree');
+      assert.ok(!f.commands.some(cmd => /worktree (add|remove|move|prune)|git add|git push|branch -f/.test(cmd)), f.commands.join('\n'));
+      if (operationPath) rmSync(operationPath, { recursive: true });
+      if (condition === 'locked') git('worktree', 'unlock', path);
+    });
+  }
+  await t.test('a dangling custody symlink is evidence, not absence', async () => {
+    const f = await fixture();
+    const record = managedWorktreeRecordPath(f.path);
+    mkdirSync(resolve(record, '..'), { recursive: true });
+    symlinkSync(join(root, 'missing-target.json'), record);
+    const ctx = f.builder();
+    assert.deepEqual(await setupBranchAndWorktree(ctx), { ok: false });
+    assert.match(f.comments[0]!, /Custody record is not a regular file/);
+    assert.equal(existsSync(f.path), true);
+    assert.equal(existsSync(join(root, 'missing-target.json')), false, 'nothing was written through the link');
+    assert.ok(!f.commands.some(cmd => /worktree (add|remove)/.test(cmd)));
+  });
+  await t.test('a fresh tree never writes its custody record through a link', async () => {
+    const f = await fixture();
+    const fresh = worktreePath(repo, `builder-${f.number}`);
+    const target = join(root, `planted-${f.number}.json`);
+    mkdirSync(resolve(managedWorktreeRecordPath(fresh), '..'), { recursive: true });
+    symlinkSync(target, managedWorktreeRecordPath(fresh));
+    const ctx = f.builder();
+    assert.deepEqual(await setupBranchAndWorktree(ctx), { ok: false });
+    assert.equal(existsSync(target), false, 'nothing was written through the link');
+    assert.match(f.comments.at(-1)!, /Could not record managed worktree custody: .*not a regular file/);
+  });
+  await t.test('an unreadable custody record location refuses', async () => {
+    const f = await fixture();
+    const ctx = f.builder();
+    ctx.deps.lstatSync = (() => { throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' }); }) as any;
+    assert.deepEqual(await setupBranchAndWorktree(ctx), { ok: false });
+    assert.match(f.comments[0]!, /EACCES/);
+    assert.equal(existsSync(f.path), true);
+  });
+}
