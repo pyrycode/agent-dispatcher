@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { recordInheritedTests, inheritedMarker, type InheritedTicketClient } from "./inherited-tickets.js";
-import type { FlakyRunContext } from "./flaky-tickets.js";
+import { failureTicketLabels, type FlakyRunContext } from "./flaky-tickets.js";
 import { decideInheritedAdvance } from "./pipeline-decisions.js";
 import { parseGateOutput } from "./gate-output.js";
 import { inheritedAdvanceEnabled } from "./dispatch.js";
@@ -25,7 +25,7 @@ class Client implements InheritedTicketClient {
     return this.open;
   }
   async createIssue(title: string, body: string, labels: string[] = []) {
-    assert.deepEqual(labels, ["bug", "priority:low"]);
+    assert.deepEqual(labels, failureTicketLabels(["bug", "priority:low"]));
     if (this.fail === "create") throw Error("create failed");
     const issue = { number: 1500 + this.created.length, nodeId: `node-${1500 + this.created.length}`, title, body };
     this.created.push(issue); this.open.push(issue);

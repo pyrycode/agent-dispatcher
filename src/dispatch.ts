@@ -105,6 +105,7 @@ import {
 import { selectDispatches } from "./dispatch-selection.js";
 import {
   buildMainSweepIssue,
+  mainSweepIssueLabels,
   buildMainSweepUpdateComment,
   decideMainSweep,
   holdVerifiersDuringSweep,
@@ -8525,7 +8526,7 @@ async function recordMainSweep(r: {
       repo: opts.repo, head, lastGoodSha: state.lastGoodSha, mergeSubjects, command: config.command, outcome,
     });
     try {
-      const issue = await opts.client.createIssue(title, body, ["bug", "priority:low"]);
+      const issue = await opts.client.createIssue(title, body, mainSweepIssueLabels(outcome));
       const itemId = await opts.client.addItemToProject(issue.nodeId);
       await opts.client.updateItemStatus(itemId, "Backlog");
       next.openIssue = issue.number;

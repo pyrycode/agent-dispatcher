@@ -1,6 +1,7 @@
 import { countsForRoleLimit, heavyProject, type FleetSnapshot, type MachineLimits, type ResourceClass, type RoleLimitScope } from "./fleet-store.js";
 import type { AgentRunner } from "./agent-runner.js";
 import { startsCodex } from "./codex-throttle.js";
+import { missingCapabilities } from "./ticket-requirements.js";
 
 export interface WorkOffer {
   workflowVersion?: 1;
@@ -53,6 +54,18 @@ function idleAssessment(offer: WorkOffer, state: FleetSnapshot): boolean {
  */
 function urgentVerifier(offer: WorkOffer, priorityHigh: ReadonlySet<string>): boolean {
   return offer.role === "verifier" && /#[1-9]\d*$/.test(offer.ticket) && priorityHigh.has(offer.ticket);
+}
+
+/**
+ * The capabilities this computer lacks for an offer's ticket, from the
+ * authority's requirement list. Empty when it can run the offer. The
+ * authority refuses the start anyway; skipping it here lets other work
+ * start in its place. A support task carries its own platform and is not
+ * a ticket stage, so it is never held here.
+ */
+export function lackingCapabilities(offer: WorkOffer, state: FleetSnapshot, capabilities: readonly string[] | undefined): string[] {
+  const required = /#[1-9]\d*$/.test(offer.ticket) ? state.ticketRequirements?.[offer.ticket] : undefined;
+  return required?.length ? missingCapabilities(required, capabilities) : [];
 }
 
 /** Draining stops new tickets, while reconciliation can still advance owned work. */
@@ -112,6 +125,8 @@ export function effectiveReviewQueueLimit(limits: { heavyLimit: number; reviewQu
 /** Offers are already eligible: blockers, errors and backoff belong to the dispatcher. */
 export function scheduleMachine(opts: {
   machine: string; projects: readonly string[]; drainingProjects?: readonly string[]; ticketLimit?: number;
+  /** What this computer advertises to tickets with a `requires:` label. See ticket-requirements.ts. */
+  capabilities?: readonly string[];
   /**
    * While this computer has at least this many owned tickets waiting for
    * review, it takes no new ticket. Owned work always continues. Defaults to
@@ -161,6 +176,7 @@ export function scheduleMachine(opts: {
     if (idleAssessment(job, opts.state) && [...localRuns, ...selected].some(r => /#[1-9]\d*$/.test(r.ticket))) continue;
     if (active.has(job.ticket) || locks.has(`${job.project}:reconcile`) || job.locks.some(l => locks.has(l))) continue;
     if (codexPaused(job, opts.state) || codexSpaced(job, opts.state)) continue;
+    if (lackingCapabilities(job, opts.state, opts.capabilities).length) continue;
     if (job.roleLimit !== undefined && [...opts.state.runs, ...selected].filter(r => countsForRoleLimit(r, job, opts.machine)).length >= job.roleLimit) continue;
     const newTicket = /#[1-9]\d*$/.test(job.ticket) && !claims.has(job.ticket);
     if (newTicket && ticketPlaces === 0) continue;

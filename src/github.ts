@@ -930,6 +930,8 @@ export class GitHubProjectClient {
     body: string,
     labels: string[] = [],
   ): Promise<{ number: number; nodeId: string; url: string }> {
+    // GitHub creates a missing label in grey; create it first in its family colour.
+    for (const label of labels) await this.ensureLabel(label);
     const response = await fetchWithRetry(
       `https://api.github.com/repos/${this.config.owner}/${this.config.repo}/issues`,
       {
@@ -959,8 +961,8 @@ export class GitHubProjectClient {
    * Every open issue carrying `label`, with its body, across all pages.
    * Pull requests share the issues endpoint and are dropped.
    */
-  async listOpenIssuesWithLabel(label: string): Promise<{ number: number; nodeId: string; title: string; body: string }[]> {
-    const found: { number: number; nodeId: string; title: string; body: string }[] = [];
+  async listOpenIssuesWithLabel(label: string): Promise<{ number: number; nodeId: string; title: string; body: string; labels: string[] }[]> {
+    const found: { number: number; nodeId: string; title: string; body: string; labels: string[] }[] = [];
     for (let page = 1; ; page++) {
       const response = await fetchWithRetry(
         `https://api.github.com/repos/${this.config.owner}/${this.config.repo}/issues` +
@@ -981,7 +983,8 @@ export class GitHubProjectClient {
       const batch: any[] = (await response.json()) as any[];
       for (const issue of batch) {
         if (issue.pull_request) continue;
-        found.push({ number: issue.number, nodeId: issue.node_id, title: issue.title, body: issue.body ?? "" });
+        found.push({ number: issue.number, nodeId: issue.node_id, title: issue.title, body: issue.body ?? "",
+          labels: (issue.labels ?? []).map((l: any) => typeof l === "string" ? l : String(l?.name ?? "")).filter(Boolean) });
       }
       if (batch.length < 100) return found;
     }
