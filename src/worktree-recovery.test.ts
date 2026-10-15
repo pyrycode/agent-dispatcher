@@ -314,8 +314,7 @@ async function legacyWorktreeCases(t: import('node:test').TestContext, root: str
     };
     return { number, path, builder, comments, labels, commands };
   };
-  const accepted = async (f: Awaited<ReturnType<typeof fixture>>, force: boolean) => {
-    const ctx = f.builder();
+  const accepted = async (f: Awaited<ReturnType<typeof fixture>>, force: boolean, ctx = f.builder()) => {
     const head = git('rev-parse', `feature/${f.number}`);
     assert.deepEqual(await setupBranchAndWorktree(ctx), { ok: true });
     assert.equal(ctx.worktreeDir, worktreePath(repo, `builder-${f.number}`));
@@ -339,6 +338,19 @@ async function legacyWorktreeCases(t: import('node:test').TestContext, root: str
     await accepted(f, false);
     assert.match(f.comments[0]!, /git status showed it clean/);
     assert.match(f.comments[0]!, /Ignored files went with it.*`ignored-scratch`/);
+  });
+  await t.test('macOS unnamed non-filesystem descriptors permit both retained-tree inspections', async () => {
+    const f = await fixture();
+    const ctx = f.builder();
+    const claims = store.snapshot().claims;
+    let inspections = 0;
+    ctx.deps.processesUsingPath = path => processesUsingPath(path, { platform: 'darwin', spawnSync: (() => {
+      inspections++;
+      return lsofResult({ stdout: MACOS_UNNAMED_LSOF });
+    }) as unknown as typeof spawnSync });
+    await accepted(f, false, ctx);
+    assert.equal(inspections, 2);
+    assert.deepEqual(store.snapshot().claims, claims);
   });
   await t.test('a tree whose only changes are runtime files is removed (#1936 shape)', async () => {
     const f = await fixture();
@@ -455,7 +467,7 @@ async function legacyWorktreeCases(t: import('node:test').TestContext, root: str
     assert.doesNotMatch(f.comments[0]!, /left in place/);
     assert.deepEqual(f.labels, ['error:builder']);
   });
-  for (const condition of ['active process', 'launch failure', 'timeout', 'nonzero exit', 'incomplete output', 'late inspection failure']) {
+  for (const condition of ['active process', 'late active process', 'unnamed filesystem descriptor', 'launch failure', 'timeout', 'nonzero exit', 'incomplete output', 'late inspection failure']) {
     await t.test(`macOS inspection refuses a retained tree on ${condition}`, async () => {
       const f = await fixture();
       const ctx = f.builder();
@@ -468,16 +480,19 @@ async function legacyWorktreeCases(t: import('node:test').TestContext, root: str
       let inspections = 0;
       ctx.deps.processesUsingPath = path => processesUsingPath(path, { platform: 'darwin', spawnSync: (() => {
         inspections++;
-        const stdout = condition === 'active process' ? `p4242\nn${path}/source.ts\n` : 'p4242\nn/elsewhere\n';
+        const active = condition === 'active process' || (condition === 'late active process' && inspections === 2);
+        let stdout = MACOS_UNNAMED_LSOF + (active ? `f7\ntREG\nn${path}/source.ts\n` : '');
         if (condition === 'late inspection failure' && inspections === 1) return lsofResult({ stdout });
         if (condition === 'launch failure') return lsofResult({ error: Object.assign(new Error('ENOENT'), { code: 'ENOENT' }), status: null, stdout: '' });
         if (condition === 'timeout' || condition === 'late inspection failure') return lsofResult({ error: Object.assign(new Error('ETIMEDOUT'), { code: 'ETIMEDOUT' }), status: null, stdout });
-        return lsofResult({ stdout: condition === 'incomplete output' ? 'p4242\nn/elsewhere' : stdout, status: condition === 'nonzero exit' ? 1 : 0 });
+        if (condition === 'incomplete output') stdout = stdout.slice(0, -1);
+        if (condition === 'unnamed filesystem descriptor') stdout += 'f7\ntREG\nn\n';
+        return lsofResult({ stdout, status: condition === 'nonzero exit' ? 1 : 0 });
       }) as unknown as typeof spawnSync });
       f.commands.length = 0;
       assert.deepEqual(await setupBranchAndWorktree(ctx), { ok: false });
-      assert.equal(inspections, condition === 'late inspection failure' ? 2 : 1);
-      assert.match(f.comments[0]!, condition === 'active process' ? /process\(es\) 4242 still use it/ : /processes using it could not be checked.*lsof failed/);
+      assert.equal(inspections, condition.startsWith('late ') ? 2 : 1);
+      assert.match(f.comments[0]!, condition.endsWith('active process') ? /process\(es\) 4242 still use it/ : /processes using it could not be checked.*lsof failed/);
       assert.deepEqual(f.labels, ['error:builder']);
       assert.deepEqual(store.snapshot().claims, claims);
       assert.deepEqual(ctx.item.labels, ['needs-rework:builder', 'rework-count:1']);
@@ -522,9 +537,27 @@ async function legacyWorktreeCases(t: import('node:test').TestContext, root: str
   });
 }
 
+// Portable, path-redacted /usr/sbin/lsof -b -w -n -P -Fpfnt fixture:
+// keep process/file boundaries, types and the legitimately empty NPOLICY name.
+const MACOS_UNNAMED_LSOF = 'p4242\nfcwd\ntDIR\nn/elsewhere\nf6\ntNPOLICY\nn\n';
+
 function lsofResult(overrides: Partial<SpawnSyncReturns<string>> = {}): SpawnSyncReturns<string> {
-  return { pid: 42, status: 0, signal: null, stdout: 'p4242\nn/elsewhere\n', stderr: '', output: [], ...overrides };
+  return { pid: 42, status: 0, signal: null, stdout: MACOS_UNNAMED_LSOF, stderr: '', output: [], ...overrides };
 }
+
+test('macOS processesUsingPath accepts unnamed non-filesystem records and checks later paths', async () => {
+  const { processesUsingPath } = await import('./dispatch.js');
+  for (const [stdout, pids] of [
+    [MACOS_UNNAMED_LSOF, []],
+    [MACOS_UNNAMED_LSOF + 'f7\ntREG\nn/retained-tree/source.ts\n', [4242]],
+    [MACOS_UNNAMED_LSOF + 'p4243\nf7\ntREG\nn/retained-tree/source.ts\n', [4243]],
+    ['p4242\nf6\ntNPOLICY\nn\n', []],
+    ['p4242\nf6\nn\ntNPOLICY\n', []],
+    ...['KQUEUE', 'PIPE', 'IPv4', 'IPv6', 'systm'].map(type => [`p4242\nf6\nt${type}\nn\n`, []] as const),
+  ] as const) {
+    assert.deepEqual(processesUsingPath('/retained-tree', { platform: 'darwin', spawnSync: (() => lsofResult({ stdout })) as unknown as typeof spawnSync }), pids);
+  }
+});
 
 test('macOS processesUsingPath discovers system lsof with /usr/sbin absent from PATH', async t => {
   const { processesUsingPath } = await import('./dispatch.js');
@@ -534,7 +567,7 @@ test('macOS processesUsingPath discovers system lsof with /usr/sbin absent from 
   const linked = join(root, 'link');
   const restrictedPath = join(root, 'empty-bin');
   mkdirSync(tree); mkdirSync(restrictedPath); symlinkSync(tree, linked);
-  const stdout = `p0\nfcwd\nn/elsewhere\np1000001\nfcwd\nn${tree}\nf3\nn${tree}/nested/file\np1000002\nfcwd\nn${tree}-sibling/file\np1000003\nf4\nn${linked}/file\np1000004\nf5\nn${tree}/removed (deleted)\n`;
+  const stdout = MACOS_UNNAMED_LSOF + `p0\nfcwd\ntDIR\nn/elsewhere\np1000001\nfcwd\ntDIR\nn${tree}\nf3\ntREG\nn${tree}/nested/file\np1000002\nfcwd\ntDIR\nn${tree}-sibling/file\np1000003\nf4\ntREG\nn${linked}/file\np1000004\nf5\ntREG\nn${tree}/removed (deleted)\n`;
   const installedLsof = join(root, 'installed-lsof');
   writeFileSync(installedLsof, `#!${process.execPath}\nprocess.stdout.write(${JSON.stringify(stdout)});\n`, { mode: 0o700 });
   const commands: string[] = [];
@@ -542,7 +575,7 @@ test('macOS processesUsingPath discovers system lsof with /usr/sbin absent from 
   // A bare lsof must still go through real executable discovery and fail.
   const run = ((file: string, args: string[], options: any) => {
     commands.push(file);
-    assert.deepEqual(args, ['-b', '-w', '-n', '-P', '-Fpn']);
+    assert.deepEqual(args, ['-b', '-w', '-n', '-P', '-Fpfnt']);
     return spawnSync(file === '/usr/sbin/lsof' ? installedLsof : file, args, options);
   }) as typeof spawnSync;
   const oldPath = process.env.PATH;
@@ -569,6 +602,26 @@ test('macOS processesUsingPath refuses failed or incomplete lsof inspection', as
     ['missing file records', lsofResult({ stdout: 'p4242\n' })],
     ['missing process record', lsofResult({ stdout: 'n/elsewhere\n' })],
     ['invalid process record', lsofResult({ stdout: 'pNaN\nn/elsewhere\n' })],
+    ...[
+      ['unnamed regular file', MACOS_UNNAMED_LSOF + 'f7\ntREG\nn\n'],
+      ['unnamed directory', MACOS_UNNAMED_LSOF + 'f7\ntDIR\nn\n'],
+      ['unnamed FIFO', MACOS_UNNAMED_LSOF + 'f7\ntFIFO\nn\n'],
+      ['unnamed unknown type', MACOS_UNNAMED_LSOF + 'f7\ntUNKNOWN\nn\n'],
+      ['unnamed unix socket', MACOS_UNNAMED_LSOF + 'f7\ntunix\nn\n'],
+      ['unnamed missing type', MACOS_UNNAMED_LSOF + 'f7\nn\n'],
+      ['named file missing type', MACOS_UNNAMED_LSOF + 'f7\nn/elsewhere\n'],
+      ['type from preceding descriptor', 'p4242\nf6\ntNPOLICY\nn\nf7\nn\n'],
+      ['incomplete trailing file', MACOS_UNNAMED_LSOF + 'f7\n'],
+      ['incomplete file before process', MACOS_UNNAMED_LSOF + 'f7\ntREG\np4243\nfcwd\ntDIR\nn/elsewhere\n'],
+      ['missing name on non-filesystem object', 'p4242\nf6\ntNPOLICY\n'],
+      ['missing descriptor', 'p4242\ntNPOLICY\nn\n'],
+      ['empty descriptor', 'p4242\nf\ntNPOLICY\nn\n'],
+      ['duplicate type', 'p4242\nf6\ntNPOLICY\ntREG\nn\n'],
+      ['duplicate name', MACOS_UNNAMED_LSOF + 'n/elsewhere\n'],
+      ['unexpected field', MACOS_UNNAMED_LSOF + 'xunexpected\n'],
+      ['empty internal line', MACOS_UNNAMED_LSOF + '\n'],
+      ['incomplete process after a match', 'p4242\nf7\ntREG\nn/retained-tree/source.ts\np4243\n'],
+    ].map(([name, stdout]) => [name, lsofResult({ stdout })] as const),
   ] as const) {
     assert.throws(() => processesUsingPath('/retained-tree', { platform: 'darwin', spawnSync: (() => result) as unknown as typeof spawnSync }), /lsof failed/, name);
   }
