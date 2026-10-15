@@ -599,6 +599,47 @@ class SupervisorReportTests(unittest.TestCase):
             self.assertIn('Native task pass failed. FileNotFoundError',published['reason'])
             self.assertEqual(published['housekeeping'],[{k:v for k,v in json.loads((state/'housekeeping.jsonl').read_text()).items() if k!='archive'}])
 
+    def test_desktop_bootstraps_through_main_with_absent_or_empty_recovery_tasks(self):
+        for configured in (False, True):
+            for ready in (False, True):
+                with self.subTest(configured=configured, ready=ready), tempfile.TemporaryDirectory() as folder:
+                    root = Path(folder)
+                    (root/'fleet-supervisor.py').write_bytes(Path(__file__).with_name('fleet-supervisor.py').read_bytes())
+                    # Use the real support constructor and scheduling pass. Only the
+                    # host availability probe and control transport are fixtures.
+                    support = Path(__file__).with_name('fleet-support.py').read_text()
+                    support += """
+def route_available(route):
+    return Path(route['paths']['desktopLauncher']).is_file()
+def rpc(self, operation, body):
+    if operation == 'capabilities': self.adapter.capabilities = body['record']
+    return []
+SupportSupervisor.rpc = rpc
+"""
+                    (root/'fleet-support.py').write_text(support)
+                    (root/'fleet-native.py').write_text("""class NativeAdapter:
+    def __init__(self, config): self.config = config; self.capabilities = None
+    def desired(self): return {}
+    def status(self): return {'machine': 'mac'}
+    def attention(self): return {'capabilities': self.capabilities, 'routes': self.config.get('recoveryTasks')}
+    def publish_attention(self): pass
+""")
+                    launcher = root/'desktop-test'
+                    if ready: launcher.touch()
+                    config = {'platform': 'mac', 'stateDirectory': str(root/'state'), 'reportFile': str(root/'report.json'),
+                              'projects': {'pyrycode/pyrycode-desktop': {'target': str(root/'desktop'), 'fakeTestLauncher': str(launcher)}}}
+                    if configured: config['recoveryTasks'] = {}
+                    path = root/'config.json'; path.write_text(json.dumps(config)); path.chmod(0o600)
+                    run = subprocess.run([sys.executable, str(root/'fleet-supervisor.py'), str(path), '--once'],
+                                         capture_output=True, text=True, timeout=5)
+                    self.assertEqual(run.returncode, 0, run.stderr)
+                    published = json.loads((root/'report.json').read_text())
+                    self.assertEqual(published['capabilities'], {'capabilities': ['desktop-fake-suite'] if ready else [], 'ready': True})
+                    route = published['routes']['desktop-fake-suite:desktop-fake-suite']
+                    self.assertEqual(route['paths'], {'desktop': str(root/'desktop'), 'desktopLauncher': str(launcher)})
+                    self.assertEqual(published['localTasks'], [])
+                    self.assertNotIn('service', published)
+
     def run_once(self,support_source):
         with tempfile.TemporaryDirectory() as folder:
             root=Path(folder)

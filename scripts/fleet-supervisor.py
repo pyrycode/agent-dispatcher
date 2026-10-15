@@ -486,7 +486,8 @@ def main():
         support = None
         support_module = None
         control_module = None
-        if config.get('recoveryTasks'):
+        if config.get('recoveryTasks') or (config.get('platform') == 'mac' and
+                config.get('projects', {}).get('pyrycode/pyrycode-desktop', {}).get('target')):
             support_spec = importlib.util.spec_from_file_location('fleet_support', Path(__file__).with_name('fleet-support.py'))
             support_module = importlib.util.module_from_spec(support_spec); support_spec.loader.exec_module(support_module)
             support = support_module.SupportSupervisor(adapter, config)
