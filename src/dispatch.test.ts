@@ -23,6 +23,7 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { execFile, execSync, spawnSync } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
@@ -135,7 +136,7 @@ import {
 } from "./pipeline-decisions.js";
 import { AGENTS } from "./types.js";
 import { AgentRunFailedError, AgentRunStoppedError, buildResumePrompt, idleStallMessage, noResultErrorMessage, ResourceExhaustedError, timeoutFor } from "./agent-runtime.js";
-import { resolveAgentsRepoRoot, resolveTargetRepoRoot } from "./worktree.js";
+import { AUTO_STAGE_COMMAND, IN_PROGRESS_GIT_PATHS, resolveAgentsRepoRoot, resolveTargetRepoRoot } from "./worktree.js";
 import { CodexStreamAdapter, TOOL_UNAVAILABLE_REASON } from "./agent-runner.js";
 
 // Importing dispatch.ts loads the fork's .env, so a fork running this suite
@@ -152,7 +153,9 @@ resetActiveStageSetForTests();
 
 // Recompute agentsRepoRoot the same way dispatch.ts does so test
 // fsMaps can use the absolute paths the production code resolves.
-const TEST_AGENTS_REPO_ROOT = resolveAgentsRepoRoot(dirname(fileURLToPath(import.meta.url)));
+const TEST_AGENTS_REPO_ROOT = process.env.AGENTS_REPO_PATH
+  ? resolve(process.env.AGENTS_REPO_PATH)
+  : resolveAgentsRepoRoot(dirname(fileURLToPath(import.meta.url)));
 // Mirror dispatch.ts:63's env-precedence pattern so tests can compute
 // the same `repoRoot` the production code resolves.
 const TEST_REPO_ROOT = process.env.TARGET_REPO_PATH
@@ -386,6 +389,7 @@ export function makeMockDeps(opts: MockDepsOptions = {}): { deps: DispatchDeps; 
   }) as DispatchDeps["spawnGate"];
 
   const deps: DispatchDeps = {
+    salvageGates: ["go vet ./...", "go build ./..."],
     execSync: mockExecSync,
     spawnSync: mockSpawnSync,
     existsSync: mockExistsSync,
@@ -1595,7 +1599,7 @@ describe("setupBranchAndWorktree — reusing the agent's own preserved worktree"
     assert.equal(commits.length, 1, "exactly one commit");
     assert.equal(commits[0]!.opts?.cwd, ctx.worktreeDir);
     assert.ok(commits[0]!.args.includes("wip(builder): partial work from an interrupted run (#1603)"));
-    const addIdx = calls.exec.findIndex(c => c.cmd === "git add -A" && c.opts?.cwd === ctx.worktreeDir);
+    const addIdx = calls.exec.findIndex(c => c.cmd === AUTO_STAGE_COMMAND && c.opts?.cwd === ctx.worktreeDir);
     assert.ok(addIdx >= 0, "the leftovers are staged in the worktree");
 
     // The commit lands before the pre-run merge of main.
@@ -1733,7 +1737,7 @@ describe("setupBranchAndWorktree — reusing the agent's own preserved worktree"
       assert.match(client.comments[0]!.body, /Failed to create git worktree/);
       assert.ok(client.comments[0]!.body.includes(`- \`${own}\` has uncommitted changes`));
       assert.equal(wipCommits(calls).length, 0);
-      assert.ok(!calls.exec.some(c => c.cmd === "git add -A"), "nothing staged");
+      assert.ok(!calls.exec.some(c => c.cmd === AUTO_STAGE_COMMAND), "nothing staged");
     });
   }
 
@@ -1761,6 +1765,47 @@ describe("setupBranchAndWorktree — reusing the agent's own preserved worktree"
     assert.ok(!calls.exec.some(c => /--force|reset --hard|checkout -- |git clean/.test(c.cmd)));
   });
 });
+
+// Desktop #1936: a verifier publishes FAIL, exits, and leaves runtime dirt.
+// Before the repair, normal cleanup retains this tree and setup tries an
+// impossible second checkout of the same branch, before builder can start.
+test("setupBranchAndWorktree — managed verifier-to-builder recovery (#1936)", async () => withStageSet("builder", async () => {
+  const number = 1936;
+  const path = makeTestContext({ item: { issueNumber: number }, agent: { name: "verifier" } }).ctx.worktreeDir;
+  const commonGitDir = resolve(TEST_REPO_ROOT, ".git");
+  const prior = { id: "verifier-run", machine: "local", session: "prior-session", generation: "retained-owner",
+    project: "org/desktop", ticket: "org/desktop#1936", role: "verifier", resource: "heavy" as const, locks: [], created: 1 };
+  const current = { ...prior, id: "builder-run", session: "next-session", role: "builder", created: 2 };
+  const recordPath = resolve(TEST_AGENTS_REPO_ROOT, "logs", `managed-worktree-${createHash("sha256").update(path).digest("hex")}.json`);
+  const { ctx, client, calls } = makeTestContext({ item: { issueNumber: number }, agent: { name: "builder" }, mockOptions: {
+    fsMap: { [recordPath]: JSON.stringify({ repository: TEST_REPO_ROOT, commonGitDir, path, branch: "feature/1936", run: prior }) },
+    execImpls: {
+      "git rev-parse --verify": () => "synced\n",
+      "git rev-parse origin/feature/1936": () => "synced\n",
+      "git rev-parse feature/1936": () => "synced\n",
+      "git rev-parse refs/heads/feature/1936": () => "synced\n",
+      "git rev-parse HEAD": () => "synced\n",
+      "git worktree list --porcelain": () => `worktree ${path}\nHEAD synced\nbranch refs/heads/feature/1936\n\n`,
+      "git worktree remove": () => execError({ stderr: "contains modified or untracked files" }),
+      "git worktree add": () => execError({ stderr: "feature/1936 is already checked out" }),
+      "git status --porcelain": () => " M .codegraph/codegraph.db-wal\n?? worker.pid\n",
+      "git rev-parse --show-toplevel": () => path,
+      "git rev-parse --path-format=absolute --git-common-dir": () => commonGitDir,
+      "git symbolic-ref --quiet HEAD": () => "refs/heads/feature/1936",
+      "git rev-parse --git-path": (cmd) => cmd.includes("refs/heads/") ? `${commonGitDir}/refs/heads/feature/1936.lock`
+        : IN_PROGRESS_GIT_PATHS.map(name => `${commonGitDir}/worktrees/verifier-1936/${name}`).join("\n"),
+    },
+  } });
+  Object.assign(ctx.deps, { realpathSync: (value: string) => value, managedWorktree: { run: current,
+    predecessor: async () => prior,
+    snapshot: async () => ({ claims: [{ ticket: prior.ticket, machine: prior.machine, generation: prior.generation, created: 1 }], runs: [current] }) } });
+  assert.deepEqual(await setupBranchAndWorktree(ctx), { ok: true });
+  assert.equal(ctx.worktreeDir, path);
+  assert.equal(ctx.agentCwd, path);
+  assert.deepEqual(client.addLabelCalls, []);
+  assert.ok(!calls.exec.some(call => /worktree (add|remove|move)|git add|git push/.test(call.cmd)));
+  assert.ok(!calls.spawn.some(call => call.cmd === "git" && call.args[0] === "commit"));
+}));
 
 // pyrycode-mobile #1340, 2026-10-02: the verifier crashed after the pre-run
 // merge of main, the merge commit was only ever pushed at the end of a run,
@@ -2573,7 +2618,25 @@ describe("handleAgentResultErrors", () => {
     await assert.rejects(handleAgentResultErrors(
       streamResult({ isError: true, terminalReason: "", timedOut: true }), ctx,
     ), /Agent error/);
+    assert.ok(calls.exec.some(c => c.cmd === "go build ./..."), "the configured failing gate ran");
     assert.ok(!calls.spawn.some(c => c.args[0] === "push" || c.cmd === "gh"));
+  });
+
+  test("a consumer-configured salvage gate failure prevents push and draft creation", async () => {
+    const { ctx, calls } = makeTestContext({ mockOptions: {
+      execImpls: {
+        "gh pr list --head": () => "[]", "git status --porcelain": () => "",
+        "npm run build": () => execError({ stderr: "configured gate failed" }),
+      },
+      spawnImpls: { "git diff --quiet": () => 1 },
+    } });
+    ctx.deps.salvageGates = ["npm run build"];
+    await assert.rejects(handleAgentResultErrors(
+      streamResult({ isError: true, terminalReason: "", timedOut: true }), ctx,
+    ), /Agent error/);
+    assert.ok(calls.exec.some(c => c.cmd === "npm run build"));
+    assert.ok(!calls.spawn.some(c => c.cmd === "git" && c.args[0] === "push"));
+    assert.ok(!calls.spawn.some(c => c.cmd === "gh" && c.args.includes("create")));
   });
 
   test("isError=false → returns false (no salvage, success path runs)", async () => {
@@ -11069,7 +11132,7 @@ describe("partial-work salvage — stopped run with an existing PR (mobile #1430
     const commit = commitOf(calls);
     assert.ok(commit, "the dirty tree is committed");
     assert.equal(commit!.args[2], "wip(documentation): partial work from a timed-out run (#1430)");
-    assert.ok(calls.exec.some(c => c.cmd === "git add -A"));
+    assert.ok(calls.exec.some(c => c.cmd === AUTO_STAGE_COMMAND));
     assert.deepEqual(pushOf(calls)?.args, ["push", "-u", "origin", "feature/1430"]);
     const saved = client.comments.findIndex(c => /Partial work saved/.test(c.body));
     const parked = client.comments.findIndex(c => /Agent Error: documentation/.test(c.body));
@@ -11163,7 +11226,7 @@ describe("partial-work salvage — stopped run with an existing PR (mobile #1430
 
     await dispatchToAgent(agent, item, client, deps);
 
-    assert.ok(!calls.exec.some(c => c.cmd === "git add -A"));
+    assert.ok(!calls.exec.some(c => c.cmd === AUTO_STAGE_COMMAND));
     assert.equal(commitOf(calls), undefined);
     assert.equal(pushOf(calls), undefined);
     assert.ok(calls.logs.some(l => l.section === "PARTIAL_SALVAGE_SKIPPED" && /MERGE_HEAD/.test(l.content)));
