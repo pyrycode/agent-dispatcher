@@ -4029,17 +4029,40 @@ export function processesUsingPath(path: string, options: { platform?: NodeJS.Pl
   if (typeof listing.stdout !== "string" || !listing.stdout.endsWith("\n")) throw new Error("lsof failed: incomplete output");
   let pid: number | undefined;
   let hasFile = false;
-  let file: { type?: string; name?: string } | undefined;
+  let file: { descriptor: string; type?: string; name?: string } | undefined;
   // These types identify kernel objects without filesystem paths. An empty
   // name on a filesystem object, a Unix socket or an unknown type remains
   // ambiguous and must block removal. Never carry type/name evidence
   // across descriptor boundaries, even within the same process.
-  const unnamedTypes = new Set(["NPOLICY", "KQUEUE", "PIPE", "IPv4", "IPv6", "systm"]);
+  // Darwin proc_info.h identifies NEXUS as a kernel descriptor; lsof's
+  // TYPE documentation identifies rte as AF_ROUTE (neither has a path).
+  const unnamedTypes = new Set(["NPOLICY", "NEXUS", "KQUEUE", "PIPE", "IPv4", "IPv6", "systm", "rte"]);
+  const pathTypes = new Set(["REG", "DIR", "CHR", "BLK", "FIFO", "LINK", "unix"]);
+  // Inventory the entire structurally valid stream even when a descriptor
+  // cannot be inspected. Bound diagnostic samples and never include names:
+  // a later vnode refusal must not be hidden by an unsupported type first.
+  const issues = new Map<string, { count: number; samples: string[] }>();
+  const inventory = new Map<string, number>();
+  let processes = 0, files = 0, unlisted = 0;
+  const field = (value: string) => JSON.stringify(value.slice(0, 32));
   const finishFile = () => {
     if (!file) return;
-    if (pid === undefined || !file.type || file.name === undefined ||
-        (file.name === "" && !unnamedTypes.has(file.type))) throw new Error("lsof failed: incomplete file record");
-    if (file.name && inside(file.name)) found.add(pid);
+    if (pid === undefined) throw new Error("lsof failed: incomplete file record");
+    const type = file.type === undefined ? "<absent>" : field(file.type);
+    const name = file.name === undefined ? "absent" : file.name === "" ? "empty" : file.name === "no more information" ? "unavailable" : "present";
+    const key = `${type}/${name}`;
+    files++;
+    if (inventory.has(key) || inventory.size < 16) inventory.set(key, (inventory.get(key) ?? 0) + 1);
+    else unlisted++;
+    if (!file.type || file.name === undefined || name === "unavailable" ||
+        (name === "empty" && !unnamedTypes.has(file.type))) {
+      const reason = file.type && name === "empty" && !pathTypes.has(file.type)
+        ? "unsupported unnamed type" : "unresolved filesystem/vnode inspection";
+      const issue = issues.get(reason) ?? { count: 0, samples: [] };
+      issue.count++;
+      if (issue.samples.length < 5) issue.samples.push(`pid=${pid} fd=${field(file.descriptor)} type=${type} name=${name}`);
+      issues.set(reason, issue);
+    } else if (file.name && inside(file.name)) found.add(pid);
     hasFile = true;
     file = undefined;
   };
@@ -4049,11 +4072,12 @@ export function processesUsingPath(path: string, options: { platform?: NodeJS.Pl
       if (pid !== undefined && !hasFile) throw new Error("lsof failed: incomplete process record");
       pid = Number(line.slice(1));
       if (!/^\d+$/.test(line.slice(1)) || !Number.isSafeInteger(pid)) throw new Error("lsof failed: invalid process record");
+      processes++;
       hasFile = false;
     } else if (line.startsWith("f")) {
       if (pid === undefined || line.length === 1) throw new Error("lsof failed: incomplete file record");
       finishFile();
-      file = {};
+      file = { descriptor: line.slice(1) };
     } else if (line.startsWith("t")) {
       if (!file || file.type !== undefined || line.length === 1) throw new Error("lsof failed: invalid file type");
       file.type = line.slice(1);
@@ -4066,6 +4090,11 @@ export function processesUsingPath(path: string, options: { platform?: NodeJS.Pl
   }
   finishFile();
   if (pid === undefined || !hasFile) throw new Error("lsof failed: incomplete process record");
+  if (issues.size) {
+    const detail = [...issues].map(([reason, issue]) => `${reason}: ${issue.count} record(s) [${issue.samples.join("; ")}${issue.count > issue.samples.length ? "; further records omitted" : ""}]`).join("; ");
+    const dialect = [...inventory].map(([key, count]) => `${key}=${count}`).join(", ");
+    throw new Error(`lsof failed: ${detail}; inventory: processes=${processes} files=${files}, ${dialect}${unlisted ? `, ${unlisted} other record(s)` : ""}; inspection incomplete`);
+  }
   return [...found];
 }
 
