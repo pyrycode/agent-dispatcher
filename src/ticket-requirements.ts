@@ -116,15 +116,19 @@ export function osRequirementToDrop(labels: readonly string[], platform: string 
  */
 export function capabilityAttention(state: {
   noCapableMachine?: Array<{ ticket: string; requires: string[]; missing: string[] }>;
+  unreportedOwners?: Array<{ ticket: string; machine: string; requires: string[] }>;
   machineCapabilities?: Record<string, { capabilities: string[]; projects?: string[]; updated: number }>;
-}): Array<{ ticket: string; requires: string[]; missing: string[]; reason: string }> {
+}): Array<{ ticket: string; requires: string[]; missing?: string[]; owner?: string; reason: string }> {
   const reports = Object.entries(state.machineCapabilities ?? {});
-  return (state.noCapableMachine ?? []).map(gap => {
+  // The owner keeps its claim but cannot start the ticket until it reports.
+  const unreported = (state.unreportedOwners ?? []).map(o => ({ ticket: o.ticket, requires: o.requires, owner: o.machine,
+    reason: `Owned by ${o.machine}, which has not reported its capabilities, so no computer can start ${o.ticket}. Update ${o.machine}'s manager, or free the ticket once its worker has stopped.` }));
+  return [...unreported, ...(state.noCapableMachine ?? []).map(gap => {
     const project = gap.ticket.split("#")[0];
     const known = reports.filter(([, r]) => (!r.projects || r.projects.includes(project)) && !missingCapabilities(gap.requires, r.capabilities).length).map(([m]) => m);
     const reason = known.length
       ? `No computer that reported in the last ${CAPABILITY_REPORT_FRESH_MS / 60_000} minutes offers ${gap.requires.join(" and ")}. ${known.join(", ")} did earlier; check that its manager is running.`
-      : `No computer serving ${project} offers ${gap.requires.join(" and ")}. Configure one, or remove the requires: label.`;
+      : `No computer serving ${project} offers ${gap.requires.join(" and ")}. Configure one, or remove the requires: label through operator.sh workflow change (a GitHub edit is reverted).`;
     return { ...gap, reason };
-  });
+  })];
 }

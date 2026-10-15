@@ -126,6 +126,13 @@ export interface FleetSnapshot { workflowProjects?: string[]; claims: Claim[]; r
   machineCapabilities?: Record<string, MachineCapabilityReport>;
   /** Requirements no computer with a fresh report can satisfy. Absent when there are none. */
   noCapableMachine?: CapabilityGap[];
+  /**
+   * Claims on tickets with a requirement held by a computer that has never
+   * reported its capabilities, such as one still on an older manager. The
+   * claim is kept, since the owner may be able to run the ticket, but the
+   * owner's starts are refused until it reports. Absent when there are none.
+   */
+  unreportedOwners?: Array<{ ticket: string; machine: string; requires: string[] }>;
   /** Present only while a new Codex start would be refused for spacing. */
   codexSpacing?: CodexSpacingState }
 export type StartResult = { ok: true; generation: string } | {
@@ -795,6 +802,9 @@ export class FleetStore {
     const ticketRequirements = workflowProjects.length ? this.workflow.openTicketRequirements() : {};
     const machineCapabilities = this.machineCapabilities();
     const noCapableMachine = this.capabilityGaps(ticketRequirements, machineCapabilities);
+    const claims = this.db.prepare("SELECT * FROM fleet_claims ORDER BY created,ticket").all() as unknown as Claim[];
+    const unreportedOwners = claims.filter(c => ticketRequirements[c.ticket] && !Object.hasOwn(machineCapabilities, c.machine))
+      .map(c => ({ ticket: c.ticket, machine: c.machine, requires: ticketRequirements[c.ticket] }));
     return {
       ...(codexPause ? { codexPause } : {}),
       ...(codexSpacing ? { codexSpacing } : {}),
@@ -806,8 +816,9 @@ export class FleetStore {
       ...(Object.keys(ticketRequirements).length ? { ticketRequirements } : {}),
       ...(Object.keys(machineCapabilities).length ? { machineCapabilities } : {}),
       ...(noCapableMachine.length ? { noCapableMachine } : {}),
+      ...(unreportedOwners.length ? { unreportedOwners } : {}),
       ...(releasedAssessmentClaims.length ? { releasedAssessmentClaims } : {}),
-      claims: this.db.prepare("SELECT * FROM fleet_claims ORDER BY created,ticket").all() as unknown as Claim[],
+      claims,
       runs: this.db.prepare("SELECT request,generation,created FROM fleet_runs WHERE finished IS NULL ORDER BY created,id").all()
         .map(row => ({ ...JSON.parse(String(row.request)), generation: String(row.generation), created: Number(row.created) })),
     };

@@ -180,8 +180,17 @@ test("a claim is kept while only its owner can finish something, and an owner th
     label(4, { addLabels: ["requires:macos"] });
     label(5, { addLabels: ["requires:linux"] });
     const db = (store as unknown as { db: import("node:sqlite").DatabaseSync }).db;
-    db.prepare("INSERT INTO fleet_recovery_tasks (id,ticket,request,state,created,updated) VALUES (?,?,?,?,1,1)").run("t4", `${DESKTOP}#4`, "{}", "running");
-    assert.deepEqual(store.releaseIncapableClaims(), [], "saved verdicts, a stranded wip label, a running support task and an unknown owner all keep the claim");
+    db.prepare("INSERT INTO fleet_recovery_tasks (id,ticket,request,state,created,updated) VALUES (?,?,?,?,1,1)").run("t4", `${DESKTOP}#4`, "{}", "queued");
+    for (const state of ["queued", "running", "publishing", "attention"]) {
+      db.prepare("UPDATE fleet_recovery_tasks SET state=? WHERE id='t4'").run(state);
+      assert.deepEqual(store.releaseIncapableClaims(), [], `saved verdicts, a stranded wip label, a ${state} support task and an unknown owner all keep the claim`);
+    }
+    // The unknown owner cannot start #5 and keeps it, so attention names it.
+    assert.deepEqual(store.start(request("b5-next", "fractal", 5)), { ok: false, reason: "incapable" });
+    assert.deepEqual(store.snapshot().unreportedOwners, [{ ticket: `${DESKTOP}#5`, machine: "fractal", requires: ["linux"] }]);
+    const lines = capabilityAttention(store.snapshot());
+    assert.equal(lines[0].owner, "fractal");
+    assert.match(lines[0].reason, /Owned by fractal, which has not reported its capabilities, so no computer can start org\/desktop#5\. Update fractal's manager/);
     // Once the support task ends, #4 goes.
     db.prepare("UPDATE fleet_recovery_tasks SET state='complete' WHERE id='t4'").run();
     assert.deepEqual(store.releaseIncapableClaims().map(c => c.ticket), [`${DESKTOP}#4`]);
@@ -191,6 +200,7 @@ test("a claim is kept while only its owner can finish something, and an owner th
     // Fractal reports Linux: it can run #5, so it keeps it.
     store.reportMachineCapabilities("fractal", ["linux"]);
     assert.deepEqual(store.releaseIncapableClaims(), []);
+    assert.equal(store.snapshot().unreportedOwners, undefined);
     assert.deepEqual(store.snapshot().claims.map(c => c.ticket), [`${DESKTOP}#2`, `${DESKTOP}#3`, `${DESKTOP}#5`]);
   } finally { store.close(); }
 });
@@ -232,7 +242,7 @@ test("the snapshot lists requirements, reports and the requirements nobody fresh
     assert.deepEqual(state.noCapableMachine?.map(g => g.ticket), [`${DESKTOP}#1`, `${DESKTOP}#2`, `${DESKTOP}#4`]);
     const attention = capabilityAttention(state);
     assert.match(attention[0].reason, /mac did earlier; check that its manager is running/);
-    assert.match(attention[2].reason, /No computer serving org\/desktop offers gpu\. Configure one, or remove the requires: label/);
+    assert.match(attention[2].reason, /No computer serving org\/desktop offers gpu\. Configure one, or remove the requires: label through operator\.sh workflow change/);
     // A stale report still admits: capabilities do not change while a computer is away.
     assert.equal(store.start(request("mac-r1", "mac", 1, "refiner", "light")).ok, true);
     // Removing the label ends the requirement.
