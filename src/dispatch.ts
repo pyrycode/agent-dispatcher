@@ -3942,10 +3942,17 @@ function custodyRecordAbsent(ctx: DispatchContext, path: string): boolean {
 class LegacyRemovalIncomplete extends Error {}
 
 /** Processes whose working directory or an open file is inside `path`. Linux
- * reads /proc; elsewhere `lsof` lists every open file. Throws when neither
- * can be read, which the caller treats as a blocker. */
+ * reads /proc; elsewhere `lsof` lists every open file. Only processes this
+ * dispatcher may inspect are seen: its own user's, in its own container or
+ * PID namespace. Throws when neither source can be read, which the caller
+ * treats as a blocker. */
 export function processesUsingPath(path: string): number[] {
-  const inside = (target: string) => target === path || target.startsWith(`${path}/`);
+  let root = path;
+  try { root = realpathSync(path); } catch { /* compare the path as given */ }
+  const inside = (target: string) => {
+    const name = target.endsWith(" (deleted)") ? target.slice(0, -" (deleted)".length) : target;
+    return [root, path].some(base => name === base || name.startsWith(`${base}/`));
+  };
   const found = new Set<number>();
   if (existsSync("/proc/self/cwd")) {
     for (const entry of readdirSync("/proc")) {
@@ -3960,7 +3967,7 @@ export function processesUsingPath(path: string): number[] {
     }
     return [...found];
   }
-  const listing = spawnSync("lsof", ["-w", "-n", "-P", "-Fpn"], { encoding: "utf-8", maxBuffer: 256 * 1024 * 1024, timeout: 60_000 });
+  const listing = spawnSync("lsof", ["-b", "-w", "-n", "-P", "-Fpn"], { encoding: "utf-8", maxBuffer: 256 * 1024 * 1024, timeout: 60_000 });
   if (listing.error || typeof listing.stdout !== "string" || listing.stdout.length === 0) throw new Error(`lsof failed: ${listing.error ?? listing.stderr}`);
   let pid = 0;
   for (const line of listing.stdout.split("\n")) {
@@ -4023,7 +4030,15 @@ async function removeLegacyManagedWorktree(ctx: DispatchContext, path: string): 
   };
 
   const blockers = await authorityBlockers();
-  if (ctx.deps.isSymlinkPath(resolve(path, ".codegraph"))) blockers.push("it has a shared CodeGraph symlink from before index copies; check its target, then remove the link by hand");
+  // A link from before index copies is removed as a link, never followed,
+  // but only when it points at this repository's canonical index.
+  const codegraph = resolve(path, ".codegraph");
+  if (ctx.deps.isSymlinkPath(codegraph)) {
+    let target = "";
+    try { target = resolve(path, readlinkSync(codegraph)); } catch { /* unreadable: refused below */ }
+    if (target !== resolve(repoRoot, ".codegraph")) blockers.push("it has a CodeGraph symlink that does not point at this repository's index");
+  }
+  if (existsSync(resolve(path, ".gitmodules"))) blockers.push("it has submodules, which git will not remove with the tree");
   let head = "";
   try {
     worktreeIdentity(ctx, path);
@@ -4036,7 +4051,7 @@ async function removeLegacyManagedWorktree(ctx: DispatchContext, path: string): 
   // Only unstaged CodeGraph files count as regenerable here: a removal is
   // final, so the wider runtime patterns used for automatic commits are not.
   const removable = ({ status: code, path: file, from }: { status: string; path: string; from?: string }) =>
-    [" ", "?"].includes(code[0]!) && from === undefined && /(^|\/)\.codegraph(\/|$)/.test(file);
+    [" ", "?"].includes(code[0]!) && from === undefined && /^\.codegraph(\/|$)/.test(file);
   let status: string | null = null;
   try {
     status = readStatus();

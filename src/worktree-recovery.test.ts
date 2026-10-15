@@ -347,6 +347,13 @@ async function legacyWorktreeCases(t: import('node:test').TestContext, root: str
     await accepted(f, true);
     assert.match(f.comments[0]!, /only CodeGraph files \(.*codegraph\.db-wal/);
   });
+  await t.test('an old shared CodeGraph link is removed as a link and the canonical index survives', async () => {
+    const f = await fixture();
+    rmSync(join(f.path, '.codegraph'), { recursive: true });
+    symlinkSync(join(repo, '.codegraph'), join(f.path, '.codegraph'));
+    await accepted(f, true);
+    assert.equal(readFileSync(join(repo, '.codegraph', 'codegraph.db-wal'), 'utf8'), 'historically tracked runtime\n');
+  });
   await t.test("a legacy tree at this run's own path is removed and recreated there", async () => {
     const f = await fixture({ role: 'builder' });
     await accepted(f, false);
@@ -379,7 +386,8 @@ async function legacyWorktreeCases(t: import('node:test').TestContext, root: str
     ['unreadable authority', /authority could not be read/],
     ['locked', /it is locked/],
     ['personal path', /not a dispatcher worktree path/],
-    ['shared CodeGraph symlink', /shared CodeGraph symlink/],
+    ['foreign CodeGraph symlink', /CodeGraph symlink that does not point at this repository's index/],
+    ['submodules', /it has submodules/],
   ];
   for (const [condition, expected] of refusals) {
     await t.test(`refuses ${condition} and leaves the tree untouched`, async () => {
@@ -394,7 +402,8 @@ async function legacyWorktreeCases(t: import('node:test').TestContext, root: str
       if (condition === 'unpushed commits') { writeFileSync(join(path, 'more.ts'), 'x\n'); gitAt(path, 'add', 'more.ts'); gitAt(path, 'commit', '-m', 'local only'); }
       if (condition === 'locked') git('worktree', 'lock', path);
       if (condition === 'personal path') { const other = join(root, `personal-${f.number}`); git('worktree', 'move', path, other); path = other; }
-      if (condition === 'shared CodeGraph symlink') { rmSync(join(path, '.codegraph'), { recursive: true }); symlinkSync(join(repo, '.codegraph'), join(path, '.codegraph')); }
+      if (condition === 'foreign CodeGraph symlink') { mkdirSync(join(root, `elsewhere-${f.number}`)); rmSync(join(path, '.codegraph'), { recursive: true }); symlinkSync(join(root, `elsewhere-${f.number}`), join(path, '.codegraph')); }
+      if (condition === 'submodules') writeFileSync(join(path, '.gitmodules'), '[submodule "x"]\n\tpath = x\n');
       let operationPath: string | undefined;
       if (IN_PROGRESS_GIT_PATHS.includes(condition as any)) {
         operationPath = resolve(path, gitAt(path, 'rev-parse', '--git-path', condition));
@@ -478,3 +487,18 @@ async function legacyWorktreeCases(t: import('node:test').TestContext, root: str
     assert.equal(existsSync(f.path), true);
   });
 }
+
+test('processesUsingPath finds a process working inside a tree, also through a linked path', async t => {
+  const { processesUsingPath } = await import('./dispatch.js');
+  const { spawn } = await import('node:child_process');
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'processes-using-')));
+  const tree = join(root, 'tree');
+  mkdirSync(join(tree, 'nested'), { recursive: true });
+  symlinkSync(tree, join(root, 'link'));
+  const child = spawn('sleep', ['30'], { cwd: join(tree, 'nested'), stdio: 'ignore' });
+  t.after(() => { child.kill('SIGKILL'); rmSync(root, { recursive: true, force: true }); });
+  await new Promise(resolve => child.once('spawn', resolve));
+  assert.ok(processesUsingPath(tree).includes(child.pid!));
+  assert.ok(processesUsingPath(join(root, 'link')).includes(child.pid!));
+  assert.ok(!processesUsingPath(join(root, 'tree-sibling')).includes(child.pid!));
+});
