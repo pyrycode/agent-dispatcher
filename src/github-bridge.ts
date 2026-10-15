@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync, existsSync, symlinkSync, readFileSync, mkdi
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { JsonClient, listen } from "./fleet-http.js";
+import { JsonClient, listen, ownershipRefusal } from "./fleet-http.js";
 import type { GitHubRequest, GitHubResponse } from "./github-broker.js";
 import { configureGitHubTransport } from "./github-transport.js";
 
@@ -23,7 +23,15 @@ export async function serveGitHubBridge(socket: string, request: (req: GitHubReq
         fresh: /\/pulls(?:\/|\?)|\bpullRequest\s*\(/.test((req.url ?? "") + body),
       });
       res.writeHead(result.status, result.headers); res.end(result.body);
-    } catch {
+    } catch (error) {
+      // An ownership refusal is final, not an outage: report it as one, with
+      // its reason. Everything else stays the generic unavailable answer.
+      const refusal = ownershipRefusal(error);
+      if (refusal) {
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ message: `Workflow write refused: ${refusal.error}`, refused: "ownership" }));
+        return;
+      }
       res.writeHead(503, { "Content-Type": "application/json" });
       res.end('{"message":"Shared GitHub unavailable; no direct fallback was attempted"}');
     }
