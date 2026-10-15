@@ -125,6 +125,8 @@ export class ManagedDispatch {
   tasksEnabled: boolean;
   /** The claim service holds the shared evidence store (evidence-store.ts). */
   evidenceEnabled = false;
+  /** The shared evidence store's per-bundle cap, from the last snapshot. */
+  evidenceBundleBytes(): number | undefined { return this.state.evidenceStore?.limits?.bundleBytes; }
   private readonly tasksDisabled: boolean;
 
   constructor(readonly project: string, private readonly env: NodeJS.ProcessEnv) {

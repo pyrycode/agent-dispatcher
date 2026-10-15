@@ -95,6 +95,11 @@ export interface EvidenceUsage {
 export interface RunOwner { machine: string; ticket: string; role: string }
 
 const TICKET = /^[\w.-]+\/[\w.-]+#[1-9]\d*$/;
+/**
+ * Newest means when the run ended, not when its upload began: a backlog
+ * flushed from an outbox after an outage must not list or evict as newest.
+ */
+const runOrder = (direction: "ASC" | "DESC", table = "") => `json_extract(${table}meta,'$.endedAt') ${direction}, ${table}created ${direction}`;
 const RUN_ID = /^[\w.:@-]{1,128}$/;
 
 export function validateEvidenceTicket(ticket: unknown): string {
@@ -162,6 +167,7 @@ export class EvidenceStore {
       PRAGMA auto_vacuum=INCREMENTAL;
       PRAGMA busy_timeout=5000;
       PRAGMA journal_mode=WAL;
+      PRAGMA journal_size_limit=67108864;
       CREATE TABLE IF NOT EXISTS evidence_bundles (
         ticket TEXT NOT NULL, run_id TEXT NOT NULL, machine TEXT NOT NULL, role TEXT NOT NULL,
         meta TEXT NOT NULL, manifest TEXT NOT NULL, digest TEXT NOT NULL, bytes INTEGER NOT NULL,
@@ -278,7 +284,7 @@ export class EvidenceStore {
     let evicted = 0;
     let used = Number(this.db.prepare("SELECT COALESCE(SUM(bytes),0) AS n FROM evidence_bundles WHERE ticket=? AND committed IS NOT NULL").get(ticket)!.n);
     if (used <= this.limits.ticketBytes) return 0;
-    for (const r of this.db.prepare("SELECT run_id,bytes FROM evidence_bundles WHERE ticket=? AND committed IS NOT NULL AND run_id!=? ORDER BY created ASC, committed ASC").all(ticket, keepRun)) {
+    for (const r of this.db.prepare(`SELECT run_id,bytes FROM evidence_bundles WHERE ticket=? AND committed IS NOT NULL AND run_id!=? ORDER BY ${runOrder("ASC")}`).all(ticket, keepRun)) {
       if (used <= this.limits.ticketBytes) break;
       this.remove(ticket, String(r.run_id)); used -= Number(r.bytes); evicted++;
     }
@@ -290,7 +296,7 @@ export class EvidenceStore {
     if (used <= this.limits.totalBytes) return 0;
     let evicted = 0;
     const candidates = this.db.prepare(`SELECT b.ticket,b.run_id,b.bytes FROM evidence_bundles b LEFT JOIN evidence_done d ON d.ticket=b.ticket
-      WHERE b.committed IS NOT NULL ORDER BY (d.ticket IS NULL) ASC, b.created ASC`).all();
+      WHERE b.committed IS NOT NULL ORDER BY (d.ticket IS NULL) ASC, ${runOrder("ASC", "b.")}`).all();
     for (const r of candidates) {
       if (used <= this.limits.totalBytes) break;
       if (r.ticket === keepTicket && r.run_id === keepRun) continue;
@@ -306,7 +312,7 @@ export class EvidenceStore {
   list(ticketValue: unknown, runIdValue?: unknown): EvidenceBundleView[] {
     const ticket = validateEvidenceTicket(ticketValue);
     const rows = runIdValue === undefined || runIdValue === null
-      ? this.db.prepare("SELECT * FROM evidence_bundles WHERE ticket=? AND committed IS NOT NULL ORDER BY created DESC, committed DESC LIMIT ?").all(ticket, EVIDENCE_LIST_LIMIT)
+      ? this.db.prepare(`SELECT * FROM evidence_bundles WHERE ticket=? AND committed IS NOT NULL ORDER BY ${runOrder("DESC")} LIMIT ?`).all(ticket, EVIDENCE_LIST_LIMIT)
       : this.db.prepare("SELECT * FROM evidence_bundles WHERE ticket=? AND run_id=? AND committed IS NOT NULL").all(ticket, validateRunId(runIdValue));
     return rows.map(r => ({ ticket: String(r.ticket), runId: String(r.run_id), machine: String(r.machine), role: String(r.role),
       meta: JSON.parse(String(r.meta)), created: Number(r.created), committed: Number(r.committed), digest: String(r.digest),
@@ -357,7 +363,8 @@ export class EvidenceStore {
       for (const r of this.db.prepare("SELECT DISTINCT ticket FROM evidence_bundles").all()) {
         const ticket = String(r.ticket);
         let state: boolean | undefined;
-        try { state = done(ticket); } catch { state = undefined; }
+        // A lookup that fails says nothing: the ticket keeps its Done clock and its bundles.
+        try { state = done(ticket); } catch { continue; }
         if (state === true) this.db.prepare("INSERT OR IGNORE INTO evidence_done VALUES (?,?)").run(ticket, now);
         else if (state === false) this.db.prepare("DELETE FROM evidence_done WHERE ticket=?").run(ticket);
         else {
@@ -377,7 +384,21 @@ export class EvidenceStore {
       deleted += this.enforceTotalCap();
     });
     this.usageCache = undefined;
-    if (deleted > 0) this.db.exec("PRAGMA incremental_vacuum");
+    if (deleted > 0) this.vacuumStep();
     return { deleted };
+  }
+
+  /**
+   * Return freed pages to the file system in bounded steps, so a large
+   * deletion never holds the claim service for long or grows the WAL by the
+   * whole store. The service calls this every minute; it does nothing when
+   * nothing is free. Returns the free pages left.
+   */
+  vacuumStep(pages = 4096): number {
+    const free = Number(this.db.prepare("PRAGMA freelist_count").get()!.freelist_count ?? 0);
+    if (free === 0) return 0;
+    this.db.exec(`PRAGMA incremental_vacuum(${Math.max(1, Math.floor(pages))})`);
+    this.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    return Number(this.db.prepare("PRAGMA freelist_count").get()!.freelist_count ?? 0);
   }
 }

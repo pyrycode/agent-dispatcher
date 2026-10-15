@@ -127,6 +127,8 @@ async function main(): Promise<void> {
     const evidenceSweep = () => { try { const { deleted } = evidence!.sweep(ticket => store.ticketDone(ticket)); if (deleted) console.log(`Evidence retention removed ${deleted} bundle(s)`); } catch (e) { console.warn("Evidence retention failed:", (e as Error).message); } };
     if (evidence) evidenceSweep();
     const evidenceTimer = evidence ? setInterval(evidenceSweep, 3600_000) : undefined;
+    // Freed pages go back to the disk 16 MiB a minute; see EvidenceStore.vacuumStep.
+    const vacuumTimer = evidence ? setInterval(() => { try { evidence.vacuumStep(); } catch (e) { console.warn("Evidence vacuum failed:", (e as Error).message); } }, 60_000) : undefined;
     const server = await serveFleet(store, machines, secret(config.operatorTokenEnv), config.port ?? 7430, config.host ?? "127.0.0.1", github, () => updates?.snapshot() ?? {}, config.updates?.dispatcherRepository,config.updates?.consumers,execFileSync("git",["rev-parse","HEAD"],{cwd:resolve(fileURLToPath(new URL("..",import.meta.url))),encoding:"utf8"}).trim(), evidence);
     let cli: Awaited<ReturnType<typeof serveGitHubBridge>> | undefined;
     if (github && config.github.socketPath) {
@@ -154,7 +156,7 @@ async function main(): Promise<void> {
     const stopLabels = startClaimLabelSync(config.githubLabels, () => store.snapshot().claims, process.env, labelFetch, () => store.recovery.escalatedTickets(), project=>store.workflow.enabled(project));
     // A display pass writes the database after its GitHub calls, so it may finish.
     const shutdown = new ServiceShutdown({ servers: cli ? [server, cli] : [server],
-      stop: [() => clearInterval(updateTimer), () => clearInterval(workflowTimer), () => clearInterval(codexTimer), () => clearInterval(evidenceTimer), stopLabels],
+      stop: [() => clearInterval(updateTimer), () => clearInterval(workflowTimer), () => clearInterval(codexTimer), () => clearInterval(evidenceTimer), () => clearInterval(vacuumTimer), stopLabels],
       pending: () => publishing, close: () => { store.close(); evidence?.close(); }, deadlineMs: stopDeadline });
     process.on("SIGTERM", () => void shutdown.stop("SIGTERM")); process.on("SIGINT", () => void shutdown.stop("SIGINT"));
     console.log("Claim service listening", server.address());

@@ -9849,7 +9849,8 @@ export async function pollLoop(): Promise<void> {
   // Shared run evidence: every run's bundle goes through this dispatcher's
   // machine manager to the claim service's store. PYRY_RUN_EVIDENCE=0 turns it off.
   runEvidence = managed && process.env.PYRY_RUN_EVIDENCE !== "0"
-    ? new RunEvidence({ connection: managed.connection, project: managed.project, logsDir: LOGS_DIR, machine: () => managed.machine ?? hostname(), dispatcherRevision: managed.loadedRevision })
+    ? new RunEvidence({ connection: managed.connection, project: managed.project, logsDir: LOGS_DIR, machine: () => managed.machine ?? hostname(), dispatcherRevision: managed.loadedRevision,
+        storeBundleBytes: () => managed.evidenceBundleBytes() })
     : null;
   const client = managed ? managed.client(rawClient) : rawClient;
   const maintenanceClient = managed ? managed.client(rawClient, true) : rawClient;

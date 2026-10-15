@@ -25,6 +25,8 @@ import { ARTIFACT_LIMITS, artifactManifest, sha256, type ArtifactManifest } from
 import type { EvidenceKind, EvidenceMeta } from "./evidence-store.js";
 
 const KIB = 1024, MIB = 1024 * KIB;
+/** A tail read reaches this far back, so it can start at a line boundary. */
+const TAIL_MARGIN = 64 * KIB;
 
 export interface RunEvidenceLimits {
   /** Bytes of file content in one bundle, generated files included. Under the store's 8 MiB default. */
@@ -49,7 +51,7 @@ export const DEFAULT_RUN_EVIDENCE_LIMITS: RunEvidenceLimits = {
   tailBytes: 256 * KIB,
   files: 200,
   pointers: 300,
-  hashBytes: 4096 * MIB,
+  hashBytes: 256 * MIB,
 };
 
 export interface EvidencePointer { machine: string; path: string; bytes: number; sha256: string | null; modified: number; reason: string }
@@ -75,18 +77,104 @@ export interface RunEvidenceInput {
 }
 export interface EvidenceConnection { call<T>(path: string, body?: unknown): Promise<T> }
 
+const REDACTED = "[REDACTED]";
+/**
+ * Shapes the shared scrubber does not blank, for evidence only. Before this
+ * store these logs stayed on their own computer; now every agent can read
+ * them. Each pattern is linear: no unbounded run before a keyword.
+ */
+const EVIDENCE_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
+  // PEM private keys, whole block.
+  // Bounded, so a header without its end costs 16 KiB rather than the rest of the file.
+  [/-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----(?:[\s\S]{0,16384}?-----END [A-Z0-9 ]{0,40}PRIVATE KEY-----|[\s\S]{0,16384})/g, `-----${REDACTED} PRIVATE KEY-----`],
+  // HTTP basic and other authorization schemes, cookies.
+  [/\b(Authorization|Proxy-Authorization)(\\*["']?\s*[:=]\s*\\*["']?\s*)(?:Basic|Digest|Token|Negotiate|AWS4-HMAC-SHA256)\s+[^\s"'\\]{6,}/gi, `$1$2${REDACTED}`],
+  [/\b((?:Set-)?Cookie\\*["']?\s*[:=]\s*\\*["']?)[^\r\n"\\]{8,}/gi, `$1${REDACTED}`],
+  // Provider keys without an assignment: OpenAI, AWS access key ids, Slack, Google, Stripe.
+  [/\b(?:sk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{16,}|sk-[A-Za-z0-9]{32,}|(?:AKIA|ASIA)[A-Z0-9]{16}|xox[abposr]-[A-Za-z0-9-]{10,}|AIza[A-Za-z0-9_-]{35}|(?:sk|rk)_live_[A-Za-z0-9]{16,})/g, REDACTED],
+  // `--token VALUE`, `--api-key VALUE`, `--password VALUE`.
+  [/(--?(?:[a-z0-9]+-)?(?:token|api-?key|key|secret|password|passwd|pass|auth)(?:\s+|=))(?!-)[^\s"']{8,}/gi, `$1${REDACTED}`],
+  // A name holding a credential word anywhere: KEYSTORE_BASE64=..., SIGNING_KEY_PASSWORD=..., DB_PASSWD=...
+  [/\b([A-Z0-9_]{0,64}(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH)[A-Z0-9_]{0,64}\s*=\s*["']?)[^\s"']{8,}/g, `$1${REDACTED}`],
+  // Signed URL parameters.
+  [/([?&](?:sig|signature|X-Amz-Signature|X-Amz-Credential|X-Amz-Security-Token|X-Goog-Signature|X-Goog-Credential|token|access_token|code)=)[^&\s"']{8,}/gi, `$1${REDACTED}`],
+];
+
 /** Redact until nothing changes: one pass can expose a new match at a cut edge. */
 export function redact(text: string): string {
   let out = text;
-  for (let i = 0; i < 4; i++) { const next = scrubCredentials(out); if (next === out) break; out = next; }
+  for (let i = 0; i < 4; i++) {
+    let next = scrubCredentials(out);
+    for (const [pattern, replacement] of EVIDENCE_PATTERNS) next = next.replace(pattern, replacement);
+    if (next === out) break;
+    out = next;
+  }
   return out;
 }
 
-/** The last `max` bytes of `text` as valid UTF-8, redacted after the cut. */
+/**
+ * Drop a partial first line from text that starts mid-file, so a credential
+ * the cut fell inside never survives without the prefix that identifies it.
+ * A file with no newline in reach loses its leading run of token characters.
+ */
+function fromLineStart(bytes: Buffer, margin: number): Buffer {
+  const newline = bytes.indexOf(0x0a);
+  if (newline >= 0 && newline < Math.max(margin, 1)) return bytes.subarray(newline + 1);
+  let i = Math.min(margin, bytes.length);
+  while (i < bytes.length && /[A-Za-z0-9+/_.=~%:-]/.test(String.fromCharCode(bytes[i]))) i++;
+  return bytes.subarray(i);
+}
+
+/**
+ * Text that starts mid-file may hold the end of a private key whose header
+ * fell before the cut, which no pattern can recognise: everything up to that
+ * key's end marker goes.
+ */
+export function dropOrphanKeyTail(text: string): string {
+  const head = text.slice(0, 64 * 1024);
+  const end = head.search(/-----END [A-Z0-9 ]{0,40}PRIVATE KEY-----/);
+  if (end < 0 || /-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----/.test(head.slice(0, end))) return text;
+  const close = text.indexOf("-----", text.indexOf("PRIVATE KEY", end)) + 5;
+  return `-----${REDACTED} PRIVATE KEY-----` + text.slice(close);
+}
+
+/** The last `max` bytes of already redacted `text`, cut at a line start and redacted again. */
 function tailText(text: string, max: number): string {
   const bytes = Buffer.from(text);
   if (bytes.length <= max) return text;
-  return redact(bytes.subarray(bytes.length - max).toString("utf8"));
+  return redact(dropOrphanKeyTail(fromLineStart(bytes.subarray(bytes.length - max), 64 * 1024).toString("utf8")));
+}
+
+/**
+ * The prompt and system prompt the dispatcher writes into an agent's log.
+ * They are instructions, not evidence, and stay on this computer. The agent's
+ * stream that follows them, timestamped `[hh:mm:ss]`, is kept.
+ */
+export function stripPromptSections(text: string): string {
+  if (!text.includes("PROMPT — ")) return text;
+  const lines = text.split("\n");
+  const out: string[] = [];
+  const rule = "=".repeat(60);
+  let inPrompt = false, skipped = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line === rule && i + 2 < lines.length && lines[i + 2] === rule && / — \d{4}-\d{2}-\d{2}T/.test(lines[i + 1])) {
+      if (inPrompt && skipped) out.push(`[${skipped} prompt line(s) omitted from shared evidence]`);
+      inPrompt = /PROMPT — /.test(lines[i + 1]);
+      skipped = 0;
+      out.push(line, lines[i + 1], lines[i + 2]);
+      i += 2;
+      continue;
+    }
+    if (inPrompt && /^\[\d{2}:\d{2}:\d{2}\] /.test(line)) {
+      if (skipped) out.push(`[${skipped} prompt line(s) omitted from shared evidence]`);
+      inPrompt = false; skipped = 0;
+    }
+    if (inPrompt) { skipped++; continue; }
+    out.push(line);
+  }
+  if (inPrompt && skipped) out.push(`[${skipped} prompt line(s) omitted from shared evidence]`);
+  return out.join("\n");
 }
 
 function readTail(path: string, size: number, max: number): Buffer {
@@ -146,7 +234,7 @@ export function ticketLogName(name: string, n: number, role: string): boolean {
 function priority(path: string): number {
   const name = basename(path);
   if (path.startsWith("handoff/")) return 0;
-  if (/\.(?:meta|pass)\.json$|^verdict-last-/.test(name)) return 1;
+  if (/\.meta\.(?:json|log)$|\.pass\.json$|^verdict-last-/.test(name)) return 1;
   if (/\.xml$/i.test(name)) return 2;
   if (/stderr/.test(name)) return 3;
   if (path.startsWith("logs/") && /_(?:verifier-gate|real-claude-gate)|^verifier-gate_/.test(name)) return 4;
@@ -164,27 +252,45 @@ export async function collectRunEvidence(opts: RunEvidenceInput & {
 }): Promise<EvidenceBundle> {
   const limits = opts.limits ?? DEFAULT_RUN_EVIDENCE_LIMITS;
   const since = opts.startedAt - 5_000;
-  const candidates = new Map<string, string>(); // bundle path -> absolute path
+  const candidates = new Map<string, string>(); // absolute path -> wanted bundle path
   let names: string[] = [];
   try { names = readdirSync(opts.logsDir); } catch { /* no logs folder */ }
   for (const name of names) {
     if (!ticketLogName(name, opts.issueNumber, opts.role)) continue;
     const path = resolve(opts.logsDir, name);
     try { const st = lstatSync(path); if (!st.isFile() || st.mtimeMs < since) continue; } catch { continue; }
-    candidates.set(bundlePath("logs", name), path);
+    candidates.set(path, bundlePath("logs", name));
   }
-  if (opts.logFile && existsSync(opts.logFile)) candidates.set(bundlePath("logs", basename(opts.logFile)), opts.logFile);
+  if (opts.logFile && existsSync(opts.logFile)) candidates.set(resolve(opts.logFile), bundlePath("logs", basename(opts.logFile)));
   if (opts.verdictHandoffPath) {
-    try { if (lstatSync(opts.verdictHandoffPath).isFile() && statSync(opts.verdictHandoffPath).mtimeMs >= since) candidates.set(bundlePath("handoff", basename(opts.verdictHandoffPath)), opts.verdictHandoffPath); } catch { /* none written */ }
+    try { if (lstatSync(opts.verdictHandoffPath).isFile() && statSync(opts.verdictHandoffPath).mtimeMs >= since) candidates.set(resolve(opts.verdictHandoffPath), bundlePath("handoff", basename(opts.verdictHandoffPath))); } catch { /* none written */ }
   }
   const ticketEvidence = resolve(opts.logsDir, "evidence", String(opts.issueNumber));
-  for (const path of walk(ticketEvidence, since)) candidates.set(bundlePath("evidence", relative(ticketEvidence, path)), path);
+  for (const path of walk(ticketEvidence, since)) candidates.set(path, bundlePath("evidence", relative(ticketEvidence, path)));
 
   const files: Record<string, string> = {};
   const pointers: EvidencePointer[] = [];
   const index: Array<{ path: string; source: string; bytes: number; included: "whole" | "tail" | "pointer" }> = [];
-  let budget = limits.bundleBytes - 128 * KIB; // room for run.json, pointers.json and SHA256SUMS
-  const ordered = [...candidates.entries()].sort((a, b) => priority(a[0]) - priority(b[0]) || a[0].localeCompare(b[0]));
+  let omitted = 0;
+  // The index is bounded like the pointers, so run.json stays small.
+  const note = (path: string, source: string, bytes: number, included: "whole" | "tail" | "pointer") => {
+    if (index.length < limits.files + limits.pointers) index.push({ path, source, bytes, included }); else omitted++;
+  };
+  // Two sources can sanitise to one name, or one name can be another's folder.
+  const used = new Set<string>(["run.json", "pointers.json", "SHA256SUMS"]);
+  const claim = (wanted: string): string => {
+    let path = wanted;
+    const clash = (p: string) => used.has(p) || [...used].some(u => u.startsWith(p + "/") || p.startsWith(u + "/"));
+    // On a clash, flatten into the top folder (logs, evidence, handoff), which is never a file.
+    const top = wanted.split("/")[0], hash = createHash("sha256").update(wanted).digest("hex").slice(0, 8);
+    for (let n = 1; clash(path) && n < 10_000; n++) path = `${top}/${n}-${hash}-${basename(wanted).slice(-180)}`;
+    used.add(path);
+    return path;
+  };
+  // Room for run.json, pointers.json and SHA256SUMS, each bounded above.
+  let budget = limits.bundleBytes - 512 * KIB;
+  const ordered = [...candidates.entries()].map(([source, path]) => [path, source] as const)
+    .sort((a, b) => priority(a[0]) - priority(b[0]) || a[0].localeCompare(b[0]));
   const point = async (source: string, size: number, modified: number, reason: string) => {
     if (pointers.length >= limits.pointers) return;
     let digest: string | null = null;
@@ -198,36 +304,41 @@ export async function collectRunEvidence(opts: RunEvidenceInput & {
     const report = /\.(?:xml|json)$/i.test(source);
     const whole = size <= (report ? limits.reportBytes : limits.wholeBytes);
     let raw: Buffer;
-    try { raw = whole ? readFileSync(source) : readTail(source, size, limits.tailBytes + 4 * KIB); } catch { await point(source, size, modified, "unreadable"); index.push({ path, source, bytes: size, included: "pointer" }); continue; }
-    if (raw.subarray(0, 8192).includes(0)) { await point(source, size, modified, "binary"); index.push({ path, source, bytes: size, included: "pointer" }); continue; }
-    // Redact the wider read, then cut: a credential cut in half at the edge
-    // would no longer look like one.
-    const text = whole ? redact(raw.toString("utf8")) : tailText(redact(raw.toString("utf8")), limits.tailBytes);
+    try { raw = whole ? readFileSync(source) : readTail(source, size, limits.tailBytes + TAIL_MARGIN); } catch { await point(source, size, modified, "unreadable"); note(path, source, size, "pointer"); continue; }
+    if (raw.subarray(0, 8192).includes(0)) { await point(source, size, modified, "binary"); note(path, source, size, "pointer"); continue; }
+    // A tail read starts mid-file: begin at a line start before redacting, so
+    // a credential the read cut into is dropped rather than kept without the
+    // prefix that identifies it. Then redact, then cut again at a line start.
+    const decoded = stripPromptSections(whole ? raw.toString("utf8") : dropOrphanKeyTail(fromLineStart(raw, TAIL_MARGIN).toString("utf8")));
+    const text = whole ? redact(decoded) : tailText(redact(decoded), limits.tailBytes);
     const bytes = Buffer.byteLength(text);
-    const target = whole ? path : `${path}.tail`;
     if (bytes > budget || Object.keys(files).length >= limits.files - 3) {
       await point(source, size, modified, "over the bundle budget");
-      index.push({ path, source, bytes: size, included: "pointer" });
+      note(path, source, size, "pointer");
       continue;
     }
+    const target = claim(whole ? path : `${path}.tail`);
     files[target] = text;
     budget -= bytes;
-    index.push({ path: target, source, bytes: size, included: whole ? "whole" : "tail" });
+    note(target, source, size, whole ? "whole" : "tail");
     if (!whole) await point(source, size, modified, `longer than ${Math.round(limits.tailBytes / KIB)} KiB; the bundle holds the tail`);
   }
   const ticket = `${opts.project}#${opts.issueNumber}`;
   const meta: EvidenceMeta = { kind: opts.kind, role: opts.role, outcome: opts.outcome, startedAt: Math.round(opts.startedAt), endedAt: Math.round(opts.endedAt),
     ...(opts.dispatcherRevision && /^[a-f0-9]{40}$/.test(opts.dispatcherRevision) ? { dispatcherRevision: opts.dispatcherRevision } : {}) };
   files["run.json"] = redact(JSON.stringify({ ticket, runId: opts.runId, machine: opts.machine, ...meta,
-    files: index.map(i => ({ path: i.path, source: i.source, bytes: i.bytes, included: i.included })) }, null, 2));
-  files["pointers.json"] = redact(JSON.stringify(pointers, null, 2));
+    files: index.map(i => ({ path: i.path, source: i.source, bytes: i.bytes, included: i.included })), ...(omitted ? { omittedFiles: omitted } : {}) }));
+  files["pointers.json"] = redact(JSON.stringify(pointers));
   files["SHA256SUMS"] = Object.keys(files).sort().map(p => `${sha256(Buffer.from(files[p]))}  ${p}`).join("\n") + "\n";
   return { version: 1, ticket, runId: opts.runId, meta, files };
 }
 
 /** Upload one bundle: begin, the missing chunks, commit. Throws on any failure. */
 export async function uploadEvidenceBundle(connection: EvidenceConnection, bundle: EvidenceBundle): Promise<{ digest: string }> {
-  const manifest: ArtifactManifest = artifactManifest(bundle.files);
+  let manifest: ArtifactManifest;
+  // A bundle this computer cannot even describe never becomes valid by waiting.
+  try { manifest = artifactManifest(bundle.files); }
+  catch (error) { throw new Error(`Invalid evidence bundle: ${error instanceof Error ? error.message : error}`); }
   const begun = await connection.call<{ digest: string; committed: boolean; missing: Record<string, number[]> }>("/evidence/begin",
     { ticket: bundle.ticket, runId: bundle.runId, meta: bundle.meta, manifest });
   if (!begun.committed) {
@@ -245,11 +356,13 @@ export async function uploadEvidenceBundle(connection: EvidenceConnection, bundl
 
 /** A refusal no retry can change: the bundle itself is wrong. Anything else is retried. */
 export function permanentEvidenceRefusal(message: string): boolean {
+  if (message.startsWith("Invalid evidence bundle:")) return true;
   return /Service (?:409|422)/.test(message) && /Invalid evidence|exceeds the per-bundle cap|too many files|already committed|credential-shaped|Evidence run owner mismatch|Evidence project mismatch|Invalid artifact|not exact UTF-8/.test(message);
 }
 
 export interface OutboxLimits { files: number; bytes: number; ageMs: number }
-export const DEFAULT_OUTBOX_LIMITS: OutboxLimits = { files: 500, bytes: 512 * MIB, ageMs: 7 * 24 * 60 * 60 * 1000 };
+/** Per dispatcher: five project dispatchers on one computer keep at most 640 MiB waiting. */
+export const DEFAULT_OUTBOX_LIMITS: OutboxLimits = { files: 500, bytes: 128 * MIB, ageMs: 7 * 24 * 60 * 60 * 1000 };
 
 /**
  * One dispatcher's evidence: record a run into the outbox, then upload in the
@@ -265,6 +378,8 @@ export class RunEvidence {
     connection: EvidenceConnection; project: string; logsDir: string; machine: () => string | undefined;
     dispatcherRevision?: string; limits?: RunEvidenceLimits; outbox?: string; outboxLimits?: OutboxLimits;
     now?: () => number; log?: (message: string) => void;
+    /** The claim service's per-bundle cap, from its snapshot. A bundle is sized under it. */
+    storeBundleBytes?: () => number | undefined;
   }) {
     this.outbox = opts.outbox ?? resolve(opts.logsDir, "evidence-outbox");
   }
@@ -274,8 +389,11 @@ export class RunEvidence {
   /** Gather and spool one run's bundle, then start an upload. Resolves when the bundle is safe on local disk. */
   async record(input: RunEvidenceInput): Promise<string | null> {
     try {
+      const limits = { ...(this.opts.limits ?? DEFAULT_RUN_EVIDENCE_LIMITS) };
+      const cap = this.opts.storeBundleBytes?.();
+      if (typeof cap === "number" && Number.isFinite(cap) && cap > 0) limits.bundleBytes = Math.min(limits.bundleBytes, cap - 64 * KIB);
       const bundle = await collectRunEvidence({ ...input, project: this.opts.project, machine: this.opts.machine() ?? "unknown", logsDir: this.opts.logsDir,
-        dispatcherRevision: this.opts.dispatcherRevision, limits: this.opts.limits });
+        dispatcherRevision: this.opts.dispatcherRevision, limits });
       mkdirSync(this.outbox, { recursive: true, mode: 0o700 });
       chmodSync(this.outbox, 0o700);
       const name = `${String(input.endedAt).padStart(14, "0")}-${input.issueNumber}-${createHash("sha256").update(input.runId).digest("hex").slice(0, 16)}.json`;
@@ -296,6 +414,14 @@ export class RunEvidence {
   }
   private prune(): void {
     const limits = this.opts.outboxLimits ?? DEFAULT_OUTBOX_LIMITS;
+    // A spool write a crash interrupted.
+    try {
+      for (const name of readdirSync(this.outbox)) {
+        if (!name.endsWith(".tmp")) continue;
+        const path = resolve(this.outbox, name);
+        try { if (this.now() - statSync(path).mtimeMs > 3600_000) unlinkSync(path); } catch { /* next time */ }
+      }
+    } catch { /* no outbox yet */ }
     const entries = this.pending().map(path => { try { const st = statSync(path); return { path, bytes: st.size, mtime: st.mtimeMs }; } catch { return null; } })
       .filter((e): e is { path: string; bytes: number; mtime: number } => e !== null);
     let total = entries.reduce((n, e) => n + e.bytes, 0), count = entries.length;
@@ -375,7 +501,8 @@ export async function readEvidenceFile(connection: EvidenceConnection, bundle: E
  * evidence, like every other input to the assessment. Null when the store
  * cannot be read.
  */
-export async function evidenceExcerpts(connection: EvidenceConnection, ticket: string, budget = { bundles: 6, characters: 48_000, perFile: 12_000 }) {
+export async function evidenceExcerpts(connection: EvidenceConnection, ticket: string, budget = { bundles: 6, characters: 48_000, perFile: 12_000 }, deadlineMs = 30_000) {
+  const deadline = Date.now() + deadlineMs;
   let listing: EvidenceListing;
   try { listing = await connection.call<EvidenceListing>("/evidence/list", { ticket }); } catch { return null; }
   let remaining = budget.characters;
@@ -387,11 +514,14 @@ export async function evidenceExcerpts(connection: EvidenceConnection, ticket: s
     let reads = 0;
     for (const file of files) {
       // Eight reads a bundle bound the calls; the character budget bounds the size.
-      if (remaining <= 0 || reads >= 8 || file.path === "run.json") continue;
+      // The assessment holds its place while this runs, so it stops at a deadline too.
+      if (remaining <= 0 || reads >= 8 || file.path === "run.json" || Date.now() >= deadline) continue;
       if (priority(file.path) > 5 && !/\.(?:log|tail|txt|json|xml)$/.test(file.path)) continue;
       try {
         reads++;
-        const text = await readEvidenceFile(connection, bundle, file.path, Math.max(0, file.chunks.length - 1));
+        // The last chunk, and the one before when the last is too short for an excerpt.
+        const last = file.chunks.length - 1, lastBytes = file.bytes - Math.max(0, last) * ARTIFACT_LIMITS.chunkBytes;
+        const text = await readEvidenceFile(connection, bundle, file.path, Math.max(0, lastBytes < budget.perFile ? last - 1 : last));
         const excerpt = text.slice(-Math.min(budget.perFile, remaining));
         if (!excerpt.trim()) continue;
         excerpts[file.path] = redact(excerpt);

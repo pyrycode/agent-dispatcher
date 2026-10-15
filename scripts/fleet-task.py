@@ -98,7 +98,7 @@ def download(manifest,digest,root,cache_key,fetch):
         private_write(target,data,replace=False)
 
 def safe_name(value):
-    if not isinstance(value,str) or not re.fullmatch(r'[\w.:@-]{1,128}',value,flags=re.ASCII):raise RuntimeError('Invalid evidence run identity')
+    if not isinstance(value,str) or value in {'.','..'} or not re.fullmatch(r'[\w.:@-]{1,128}',value,flags=re.ASCII):raise RuntimeError('Invalid evidence run identity')
     return re.sub(r'[^\w.-]','_',value,flags=re.ASCII)
 
 def evidence(ticket,destination,run=None,limit=5):
@@ -110,19 +110,25 @@ def evidence(ticket,destination,run=None,limit=5):
     if not isinstance(bundles,list):raise RuntimeError('Invalid evidence listing')
     summary=[]
     for bundle in bundles:
-        manifest,digest=inventory(bundle.get('manifest'))
-        if bundle.get('digest')!=digest:raise RuntimeError('Evidence bundle digest mismatch')
-        entry={'runId':bundle.get('runId'),'machine':bundle.get('machine'),'role':bundle.get('role'),'meta':bundle.get('meta'),'created':bundle.get('created'),
-               'files':[{'path':f['path'],'bytes':f['bytes']} for f in manifest['files']]}
-        if destination:
-            root=Path(destination).resolve().joinpath(safe_name(bundle.get('runId')))
-            root.mkdir(parents=True,exist_ok=True,mode=0o700)
-            fetch=lambda f,part,b=bundle,d=digest:request('evidence-chunk',{'ticket':listing['ticket'],'runId':b['runId'],'digest':d,'path':f['path'],'part':part})
-            download(manifest,digest,root,'evidence-'+digest,fetch)
-            private_write(contained(root,'.fleet-task-manifest.json'),json.dumps({'evidence':{k:v for k,v in bundle.items() if k!='manifest'},'digest':digest},separators=(',',':')).encode(),replace=False)
-            entry['directory']=str(root)
+        entry={'runId':bundle.get('runId'),'machine':bundle.get('machine'),'role':bundle.get('role'),'meta':bundle.get('meta'),'created':bundle.get('created')}
+        try:
+            fetch_bundle(listing,bundle,destination,entry)
+        except Exception as error: # One unreadable bundle never hides the others.
+            entry['error']=str(error)[:300]
         summary.append(entry)
     return {'ticket':listing.get('ticket'),'bundles':summary}
+
+def fetch_bundle(listing,bundle,destination,entry):
+    manifest,digest=inventory(bundle.get('manifest'))
+    if bundle.get('digest')!=digest:raise RuntimeError('Evidence bundle digest mismatch')
+    entry['files']=[{'path':f['path'],'bytes':f['bytes']} for f in manifest['files']]
+    if destination:
+        root=Path(destination).resolve().joinpath(safe_name(bundle.get('runId')))
+        root.mkdir(parents=True,exist_ok=True,mode=0o700)
+        fetch=lambda f,part,b=bundle,d=digest:request('evidence-chunk',{'ticket':listing['ticket'],'runId':b['runId'],'digest':d,'path':f['path'],'part':part})
+        download(manifest,digest,root,'evidence-'+digest,fetch)
+        private_write(contained(root,'.fleet-task-manifest.json'),json.dumps({'evidence':{k:v for k,v in bundle.items() if k!='manifest'},'digest':digest},separators=(',',':')).encode(),replace=False)
+        entry['directory']=str(root)
 
 class Connection(http.client.HTTPConnection):
     def connect(self):
