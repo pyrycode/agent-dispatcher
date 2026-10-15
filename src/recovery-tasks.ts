@@ -173,10 +173,13 @@ export class RecoveryTasks {
   if(incident && (/Explicit operator hold|Denied permission|Pause origin unknown/.test(String(incident.reason))
     || incident.state==='escalated' && incident.decision && JSON.parse(String(incident.decision)).category==='human')) return false;
   // A repair queued before the cap was reached does not start either (recovery-repair-cap.ts).
-  // A repair an operator requests after the cap was reached may run: the cap stops automatic repairs, not a person.
+  // While capped, no automatic repair starts, including one an assessment or a
+  // worker queued before this rule existed. A repair an operator requested after
+  // the cap was reached may run: the cap stops automatic repairs, not a person.
   if(task.state==='queued' && task.request.recipe==='dispatcher-repair') {
    const cap=dispatcherRepairCap(this.db,task.ticket,currentWorkflow(this.db,task.ticket),this.now());
-   if(cap.capped && task.created<=Math.max(...cap.attempts.map(a=>a.ended))) return false;
+   const operator=task.id===recoveryTaskId(task.ticket,task.request,'') && task.created>Math.max(...(cap.capped?cap.attempts.map(a=>a.ended):[]));
+   if(cap.capped && !operator) return false;
   }
   return task.state==='queued' && !!host?.ready && this.now()-host.updated<CAPABILITY_FRESH_MS && host.capabilities.includes(task.request.capability);
  }

@@ -192,5 +192,8 @@ test("a person can still order a repair after the cap, and a withdrawn repair is
   const operator = tasks.request(ticket, repair(3), "");
   assert.equal(dispatcherRepairCap(db, ticket, null, now).capped, true);
   assert.equal(tasks.available("linux", operator.id), true, "an operator's later request may start");
+  // An assessment's order queued after the failures, as 51d9c8b9 on #3389 was, is still held.
+  const automatic = tasks.request(ticket, repair(4), "incident-after-the-failures");
+  assert.equal(tasks.available("linux", automatic.id), false);
   db.close();
 });

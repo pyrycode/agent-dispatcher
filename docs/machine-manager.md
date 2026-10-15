@@ -720,7 +720,7 @@ an assessment's next `coordinate` with recipe `dispatcher-repair` becomes a
 `human` escalation and no task is created. A repair worker's direct request for
 a new one is refused the same way, and repairs already queued are withdrawn
 (ended with a `Withdrawn before it started` summary that is not counted) or, when
-queued before this rule existed, held. A repair an operator requests through
+queued before this rule existed, held. Only a repair an operator requests through
 `recovery-task operator-request` after the cap still starts.
 Two failures count when they ended within 24 hours, or when both were ordered
 under the ticket's current workflow fingerprint (stage, recovery labels and
