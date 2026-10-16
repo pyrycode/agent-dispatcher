@@ -353,6 +353,18 @@ they explicitly enable this option.
 
 ### Real-claude gate
 
+`PYRY_REAL_CLAUDE_GATE_ENABLED=0` retires this consumer's label gate as well as
+execution: labelled reviewed tickets follow normal advancement, no ticket parks
+for a live gate, and no live runner or live-only health check starts even if a
+stale command remains configured. Only explicit `0` opts out; the default
+retains the existing guard. Clearing `PYRY_REAL_CLAUDE_GATE_CMD` alone still parks
+labelled tickets for an operator. Desktop enforces retirement in its startup
+preload because its normal application suite now runs captured client replay.
+Other consumers keep this gate. Existing running markers, errors, rework and
+native blockers remain safety holds; retirement does not clear them or assert
+that explicit live acceptance has passed. Reassess parked tickets through the
+orchestrator with their acceptance criteria preserved.
+
 Some tickets can only be accepted by running against real claude rather than the pipeline's fakes. The PO marks them `needs-real-claude` during refinement. After code review such a ticket is parked in Inbox, and if this fork sets `PYRY_REAL_CLAUDE_GATE_CMD` the dispatcher then runs the suite itself, once per cycle, before it picks any other ticket.
 
 **Running alone, or in the background.** By default the gate runs alone: once a ticket is waiting, nothing new is dispatched until every agent run has finished, and the loop then waits for the suite. On mobile that cost up to 81 minutes of drain before one gate and about nine minutes of a stalled board during each. With `PYRY_REAL_CLAUDE_GATE_BACKGROUND=1` the gate waits only for running verifiers and the main sweep, then runs beside the loop. While it waits or runs, new verifiers and the main sweep are held back, because their device runs share the emulator and would hit their own time limits queued behind the suite. Everything else keeps dispatching, merging and advancing. With `PYRY_REAL_CLAUDE_GATE_HOLD_VERIFIERS=0` verifiers are not held either: the gate no longer waits out a verifier's whole run, most of which is review with the emulator idle, and the two queue on the device hold only for their emulator work. Turn it on only where the suite tolerates other work on the host. Mobile can, because its test script holds the emulator host-wide, so a builder's device run queues instead of colliding.

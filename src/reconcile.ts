@@ -30,6 +30,7 @@ import { type ProjectItem } from "./types.js";
 import { activeStageSet } from "./stage-sets.js";
 import {
   MANUAL_ADVANCE_GATES,
+  realClaudeGateEnabled,
   REAL_CLAUDE_GATE_FAIL_COLUMN,
   REAL_CLAUDE_GATE_FROM_COLUMN,
   REAL_CLAUDE_GATE_LABEL,
@@ -152,6 +153,7 @@ export async function runAutoAdvance(
     itemsByColumn,
     runsInFlight,
     maxConcurrent,
+    realClaudeGateEnabled(process.env),
   );
 
   let waitingForSeat = 0;
@@ -606,6 +608,7 @@ async function settleStaleBase(
 // ticket, so a skipped or removed gate step still cannot un-gate one).
 
 export async function runRealClaudeGate(client: ReconcileClient): Promise<void> {
+  if (!realClaudeGateEnabled(process.env)) return;
   // The gate's trigger + rework labels come from the resolved stage set:
   // classic keys on done:code-review / needs-rework:developer (identical
   // to the pre-stage-set literals), builder on done:verifier /
@@ -720,7 +723,7 @@ export async function runRealClaudeGateExecution(
   // Off switch. No command configured means this step never touches the
   // board, so the whole feature can land on a live dispatcher before any
   // fork opts in.
-  if (runner === null) return false;
+  if (!realClaudeGateEnabled(process.env) || runner === null) return false;
 
   // Same stage-set keys as the park step above.
   const { realClaudeGate } = activeStageSet();
