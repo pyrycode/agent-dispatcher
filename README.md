@@ -1047,3 +1047,13 @@ ready label and parks the review with its error label unless rework was requeste
 After fixing the gate or its environment, remove that error label to rerun the
 configured checks. Existing machine-checked flaky and baseline assessments still
 continue through the remaining gates before review.
+
+### Managed Mobile candidate checks
+
+Mobile tickets can request `mobile-scripted-evidence` or `mobile-in-depth` with capability `mobile-android` and a full pushed Mobile revision. The first runs the existing reply-suggestion and selection-copy scripted checks. The second runs the existing complete UI profile with `UI_GATE_FULL=1 UI_DEVICE_ALL=1 UI_SHARDS=2`. Its 1800-second budget includes checkout, preparation and device admission. Neither uses Claude or the production daemon.
+
+These routes fetch the candidate from the Mobile remote. Supporting agents, daemon and relay revisions are recorded separately. Results include the selected commands, elapsed phases, counted XML and retained failure diagnostics. The authority rejects missing, zero-test, failed, incomplete, wrong-revision or wrong-profile success claims. A returned diagnostic does not establish that a product defect is repaired.
+
+Linux supervisors derive these fixed routes from their configured Android runtime. They advertise `mobile-android` only after checking the configured Mobile source, SDK, acceleration and required tools. Existing Core capture remains available separately. Deployment must update the authority before supervisors advertise the new capability.
+
+For a manually reviewed dispatcher release, the protected operator accepts `control target FULL_REVISION`. Only the central operator credential can select it. The service checks that the revision belongs to upstream main before saving the existing controller target. Supervisors then use their existing backup, fast-forward, graceful restart and readiness procedure. This does not change ticket state or loosen drains. The central authority must first load the new source so it recognises the command and capability.

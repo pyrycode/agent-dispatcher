@@ -112,6 +112,15 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
         if(!actor) return send(403,{error:'Control worker required'});
         store.recordControlReady(actor,body.revision);return send(200,{ok:true});
       }
+      if(req.url==='/operations/control-target') {
+        if(!isAdmin)return send(403,{error:'Operator credential required'});
+        if(!github || !repairRepository || !/^[a-f0-9]{40}$/.test(body.revision??'') || Object.keys(body).some(k=>k!=='revision')) throw new Error('Exact upstream controller revision required');
+        const response=await github.request(repairRepository,{method:'GET',path:`/repos/${repairRepository}/compare/${body.revision}...main`,fresh:true});
+        if(response.status!==200)throw new Error('Cannot verify the controller revision on upstream main');
+        const comparison=JSON.parse(response.body);
+        if(!['ahead','identical'].includes(comparison.status) || comparison.merge_base_commit?.sha!==body.revision)throw new Error('Controller revision must belong to upstream main');
+        store.controlTarget(body.revision);return send(200,{desired:body.revision});
+      }
       if (req.url === '/runner') {
         if (!isAdmin) return send(403, { error: 'Operator credential required' });
         return send(200, store.setRunner(body.runner));
