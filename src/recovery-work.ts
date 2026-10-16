@@ -2,6 +2,7 @@ import { recoveryFingerprint, recoveryTrigger, hasOperatorHold, canInspectUnknow
 import type { AgentConfig, ProjectItem } from "./types.js";
 import { AUTO_RETRY_RESET_COMMENT_MARKER } from "./pipeline-decisions.js";
 import { githubPauseMs } from "./github-transport.js";
+import { HOST_TESTING_POLICY } from "./testing-policy.js";
 import { RECOVERY_INVESTIGATING, RECOVERY_ASSIGNMENT_LABELS, RECOVERY_PRIORITY_LABELS, hasRecoveryPriority, hasRunningWip, recoveryAssignmentLabels, isRepairWip } from "./recovery-labels.js";
 
 export { RECOVERY_INVESTIGATING, RECOVERY_PRIORITY, RECOVERY_REPAIRING, LEGACY_RECOVERY_PRIORITY, LEGACY_RECOVERY_REPAIRING } from "./recovery-labels.js";
@@ -53,7 +54,9 @@ For stopped runs that ended without a completed outcome, inspect saved work and 
 If a passed review cannot be recovered and the publishing fault is demonstrably cleared, request a fresh normal verifier run. It must recreate its own judgment and required gates; never invent or publish the missing PASS.
 centralEvidence holds the redacted evidence bundles every computer's runs of this ticket uploaded: verifier and gate logs with stderr, test reports, verdicts and agent log tails, with the computer and run of each. Read it before logs, which holds only this computer's files. Missing remote files must first be sought in centralEvidence, related comments and the cross-computer evidence inventory. Provide a portable reproduction recipe to the ordinary code agent when an isolated authenticated capture is needed. It uses ordinary test admission.
 escalate: supply category human for a real operator decision, denied permission or uncertain worker. Supply category operational for temporary missing computer capability or infrastructure not yet repaired; it is checked again when a capability becomes ready, a named dependency changes, or the ticket changes. An available configured platform or dispatcher defect should receive coordinate. Escalate only for an operator decision, denied permissions, uncertain worker state, or work the pipeline cannot perform. Explain what you investigated and the specific action that needs an operator. Missing evidence is grounds for escalation only after available logs and source reads cannot establish a safe action. A repository defect in build or test infrastructure can be handed to its code agent for repair.
-Never treat main failing too as proof a branch is correct. Never recommend accepting a failed live gate, resetting rework counters, bypassing review or touching a USB phone.`;
+Never treat main failing too as proof a branch is correct. Never recommend accepting a failed live gate, resetting rework counters, bypassing review or touching a USB phone.
+${HOST_TESTING_POLICY}
+For recovery, use the implementation computer's operating system when judging required test evidence. Do not introduce a second operating system because an assessment runs elsewhere.`;
 
 export function parseRecoveryDecision(output: string): RecoveryDecision {
   let value = JSON.parse(output);
