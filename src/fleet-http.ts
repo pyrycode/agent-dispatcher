@@ -232,6 +232,10 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
         }
         return send(200,await work);
       }
+      if (req.url === '/tasks/cancel-queued') {
+        if (!isAdmin) return send(403,{error:'Operator credential required'});
+        return send(200,store.cancelQueuedTask(body.id,body.reason));
+      }
       if (req.url === '/tasks/operator-request') {
         if (!isAdmin) return send(403,{error:'Operator credential required'});
         if (!/^[\w.-]+\/[\w.-]+#[1-9]\d*$/.test(body.ticket)) throw new Error('Invalid source ticket');

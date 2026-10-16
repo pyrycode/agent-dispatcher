@@ -1,3 +1,4 @@
+import {scrubCredentials} from './agent-runtime.js';
 import { isRepairWip } from "./recovery-labels.js";
 import { PRIORITY_HIGH } from "./ticket-priority.js";
 import { WorkflowStore, type WorkflowChange } from "./workflow-store.js";
@@ -315,6 +316,20 @@ export class FleetStore {
       }
       if (step === "complete") { this.recovery.complete(id, runId); return { ok: true }; }
       throw new Error("Invalid recovery operation");
+    });
+  }
+
+  /** An unstarted request has no worker whose stop needs confirmation. */
+  cancelQueuedTask(id: string, reason: string) {
+    if (!/^[a-f0-9]{64}$/.test(id) || typeof reason !== 'string' || !reason.trim() || reason.length > 2000) throw new Error('Provide a task id and cancellation reason');
+    return this.transaction(() => {
+      const task=this.tasks.get(id);
+      const summary='Withdrawn before it started by operator: '+scrubCredentials(reason.trim());
+      if(task.state==='failed' && task.result?.summary===summary)return task;
+      if(task.state!=='queued' || task.machine || task.session || task.runId || this.snapshot().runs.some(run=>run.supportTaskId===id))throw new Error('Only an unstarted queued task can be cancelled');
+      this.db.prepare("UPDATE fleet_recovery_tasks SET state='failed',result=?,updated=? WHERE id=? AND state='queued'")
+        .run(JSON.stringify({outcome:'failed',summary,files:{}}),this.clock(),id);
+      return this.tasks.get(id);
     });
   }
 
