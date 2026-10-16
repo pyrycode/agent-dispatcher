@@ -237,6 +237,32 @@ In the classic set this feature is entirely inert (locked by test): no gate runs
 
 The newest real-claude gate run is also reported test by test: every test with its status (passed, failed, flaky or skipped with its reason), attempts and duration where the format reports them, and its `daemon-revision` annotations on Playwright. A header gives the tested branch head and main commit and how the run ended, read from a run record the dispatcher keeps beside each live gate output as `<stamp>_real-claude-gate_#<N>.meta.log`, and the daemon revision: the distinct `daemon-revision` annotation values and `PYRY_BIN` for Playwright, and for the Go suite, which builds the daemon from the tested tree, the tested commits. A failure that passed on the dispatcher's same-tree re-run says so. A suite of over 150 tests, such as the Go live suite, lists only its failures, flakes, skips and the tests the issue, the plan or the verifier's last verdict names, and counts the rest. Tests named in the verifier's last verdict, whose documentation handoff often names them, count as named in the section above too. Added after the desktop documentation agent parked five tickets overnight on 2026-10-06 (#1658, #1729, #1731, #1817, #1818) asking for named live results and the daemon revision, which an operator then posted from the gate log by hand.
 
+**Completed steps after a failed attempt.** Set `PYRY_VERIFIER_GATE_INPUTS_CMD`
+to a read-only command that describes external toolchain and consumer inputs.
+With normal gate reuse enabled, a retry on the same clean tree retains only the
+raw-green prefix. The environment, external input snapshot and ordered gate list
+must match. Missing or modified log bytes, dirty files, a changed HEAD or evidence
+older than one day run the steps again. Formatted test steps need complete,
+nonempty passing evidence. An excused failure never enters the retained prefix.
+The failed step and every unfinished step run again. Original failure output is
+archived before later attempts replace the current gate logs. A resumed full
+pass keeps the earliest retained evidence's age.
+
+**Exact JSON test selections.** A baseline template may use `{{TESTS_JSON}}`
+instead of `{{TESTS}}`. The replacement is one shell-quoted JSON array containing
+the full exact failing test names. Consumers must parse that argument as an array,
+for example `--tests-json {{TESTS_JSON}}`. Commas, whitespace and apostrophes
+remain part of their individual names. Mixing the two placeholder types or using
+the JSON placeholder twice refuses the filtered run. Legacy selectors remain
+unchanged.
+
+**Shared native test admission.** Core and Mobile standard heavy commands use the
+same host lock through `scripts/test-admission.py`. The dispatcher recognizes that
+exact wrapper before a direct Go JSON invocation. It credits reported admission
+waiting up to the normal hard deadline ceiling. Raw commands and isolated
+container filesystems do not participate unless explicitly wired to the same
+lock backing.
+
 **Parallel source review.** With `PYRY_VERIFIER_PARALLEL_REVIEW=1`, a Claude or Codex
 verifier starts its complete source review while the configured gates run. This
 preliminary phase uses an empty temporary working directory and ignores user

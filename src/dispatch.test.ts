@@ -9356,6 +9356,17 @@ describe("runVerifierGates — deterministic gate execution", () => {
     return { deps, calls };
   };
 
+  test("a retained passing step cannot bless a late failure or skip an unfinished gate", async () => {
+    const { deps, calls } = gateDeps({ gateImpl: req => ({ exitCode: req.command === "test" ? 1 : 0, timedOut: false, spawnError: null }) });
+    const result = await runVerifierGates({ gates: ["vet", "test", "build"], cwd: "/wt", issueNumber: 7, deps,
+      passedPrefix: [{ gate: "vet", summary: "✓ vet (exit 0)", logs: ["out", "err"], evidence: "hash" }] });
+    assert.equal(result.ok, false);
+    assert.equal(result.failedGate, "test");
+    assert.deepEqual(calls.gates.map(g => g.command), ["test"]);
+    assert.deepEqual(result.summary, ["✓ vet (exit 0)", "✗ test (exit 1)"]);
+    assert.deepEqual(result.logPaths.slice(0, 2), ["out", "err"]);
+  });
+
   test("runs every gate in the worktree cwd with the 20-minute cap, in order", async () => {
     const { deps, calls } = gateDeps();
     const result = await runVerifierGates({
@@ -9959,6 +9970,39 @@ describe("pre-verifier gates — reusing a pass on the same files (2026-10-02, #
       return { result, calls };
     }));
   }
+
+  test("a failed attempt retains only its completed prefix and archives the original failure", async () => {
+    const previous = process.env.PYRY_VERIFIER_GATE_INPUTS_CMD;
+    process.env.PYRY_VERIFIER_GATE_INPUTS_CMD = "snapshot-inputs";
+    try {
+      const files = Object.fromEntries(gateLogs(1599, 3).map(path => [path, path.includes("_2.log") ? "original failure" : ""]));
+      const spawnImpls = {
+        "git status --porcelain --untracked-files=normal": () => ({ status: 0, stdout: "" }),
+        "git rev-parse HEAD^{tree}": () => ({ status: 0, stdout: TREE }),
+        "sh -c snapshot-inputs": () => ({ status: 0, stdout: "stable external input snapshot" }),
+      };
+      const first = await runGates(1599, { execImpls: headImpls(), spawnImpls, fsMap: files,
+        gateImpl: req => ({ exitCode: req.command === "test" ? 1 : 0, timedOut: false, spawnError: null }) }, "vet;test;build");
+      assert.match(first.result.promptNote, /TRIAGE MODE/);
+      const prefixWrite = first.calls.fs.find(f => f.kind === "write" && f.path.endsWith(".prefix.json"));
+      assert.ok(prefixWrite, "passing prefix recorded before the later failure");
+      assert.deepEqual(JSON.parse(prefixWrite.content!).gates.map((g: any) => g.gate), ["vet"]);
+      assert.ok(first.calls.fs.some(f => f.kind === "write" && f.path.includes(".failure-") && f.content === "original failure"));
+      const retry = await runGates(1599, { execImpls: headImpls(), spawnImpls,
+        fsMap: { ...files, [prefixWrite.path]: prefixWrite.content! } }, "vet;test;build");
+      assert.deepEqual(retry.calls.gates.map(g => g.command), ["test", "build"]);
+      assert.ok(!retry.result.promptNote.includes("TRIAGE MODE"));
+      assert.deepEqual(JSON.parse(passWrites(retry.calls, 1599)[0]!.content!).summary,
+        ["✓ vet (exit 0)", "✓ test (exit 0)", "✓ build (exit 0)"]);
+      const dirty = await runGates(1599, { execImpls: headImpls(), spawnImpls: { ...spawnImpls,
+        "git status --porcelain --untracked-files=normal": () => ({ status: 0, stdout: " M dependency.go" }) },
+        fsMap: { ...files, [prefixWrite.path]: prefixWrite.content! } }, "vet;test;build");
+      assert.deepEqual(dirty.calls.gates.map(g => g.command), ["vet", "test", "build"]);
+    } finally {
+      if (previous === undefined) delete process.env.PYRY_VERIFIER_GATE_INPUTS_CMD;
+      else process.env.PYRY_VERIFIER_GATE_INPUTS_CMD = previous;
+    }
+  });
 
   test("a green run records the pass; a retry on the same commit reuses it and runs no gate", async () => {
     const first = await runGates(1500, { execImpls: headImpls() });

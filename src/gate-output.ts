@@ -229,6 +229,10 @@ export function gateCommandProvenance(command: string): GateCommandProvenance {
           } else if (!/^--(?:unset|chdir)=.+/.test(option)) return { kind: "ambiguous" };
         }
         while (/^[A-Za-z_][A-Za-z_0-9]*=/.test(value(start))) start++;
+      } else if (/^python(?:3(?:\.\d+)?)?$/.test(wrapper) && value(start + 1) === "scripts/test-admission.py" && value(start + 2) === "--") {
+        // The product's admission wrapper supervises exactly the argv after --.
+        // No options, alternate script path or nested shell are inferred.
+        start += 3;
       } else if (wrapper === "npx") {
         start++;
         while (["--no-install", "--yes", "-y", "--quiet"].includes(value(start))) start++;
@@ -1313,6 +1317,14 @@ export function rerunLoadArguments(load: RerunLoad | null | undefined): string {
 
 /** Placeholder a baseline command template must carry. */
 export const BASELINE_TESTS_PLACEHOLDER = "{{TESTS}}";
+export const BASELINE_TESTS_JSON_PLACEHOLDER = "{{TESTS_JSON}}";
+
+/** JSON selection preserves commas, whitespace and punctuation inside names.
+ * Single-quote the complete argument; a literal quote closes and reopens it. */
+export function buildBaselineJSONFilter(names: readonly string[]): string | null {
+  if (!names.length || names.some(name => typeof name !== "string" || !name.trim() || name.includes("\u0000"))) return null;
+  return "'" + JSON.stringify([...new Set(names)]).replaceAll("'", "'\"'\"'") + "'";
+}
 
 /**
  * Substitute a test filter into a baseline command template.
@@ -1335,6 +1347,10 @@ export const BASELINE_TESTS_PLACEHOLDER = "{{TESTS}}";
  * substituting nothing would silently re-run the entire suite.
  */
 export function buildBaselineCommand(template: string, filter: string, load = ""): string | null {
+  if (template.includes(BASELINE_TESTS_JSON_PLACEHOLDER)) {
+    if (template.includes(BASELINE_TESTS_PLACEHOLDER) || template.split(BASELINE_TESTS_JSON_PLACEHOLDER).length !== 2) return null;
+    return template.replace(BASELINE_TESTS_JSON_PLACEHOLDER, () => filter);
+  }
   if (!template.includes(BASELINE_TESTS_PLACEHOLDER)) return null;
   // The load arguments follow the filter only where they land inside the
   // runner's own arguments: one placeholder that is the value of `-g` or

@@ -34,6 +34,16 @@ const slotWaiting = (m: number) => `Pyrycode build slots: all 2 places are taken
 const slotGot = (s: number) => `Pyrycode build slots: got a place after ${s} s.`;
 const SLOT_GAVE_UP = "Pyrycode build slots: no place after 20 minutes; building without one.";
 
+test("shared host admission waits earn bounded credit, then settle", () => {
+  let state = initGateWaitState(0);
+  state = advanceGateWaitState(state, "Test admission: waiting (0 s so far).", 1000);
+  assert.equal(gateWaitCreditMs(state, 31000), 30000);
+  assert.equal(gateWaitCreditMs(state, 1000000), 75000);
+  state = advanceGateWaitState(state, "Test admission: acquired after 40s waiting", 41000);
+  assert.equal(gateWaitCreditMs(state, 1000000), 40000);
+  assert.deepEqual(finishedWaits("Test admission: acquired after 40s waiting"), [{ queue: "admission", ms: 40000, line: "Test admission: acquired after 40s waiting" }]);
+});
+
 describe("wait messages — what the device hold and build places print", () => {
   test("reads every finished wait, in seconds or minutes", () => {
     assert.deepEqual(finishedWaits([

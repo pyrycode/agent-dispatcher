@@ -52,9 +52,10 @@ function clipTo(intervals: readonly Interval[], [lo, hi]: Interval): Interval[] 
 // so a `grep -n` or `rg` hit on the scripts' own source never counts. The
 // device messages go to stderr, the build-slot ones to Gradle's stdout.
 
-type WaitQueue = "device" | "slot";
+type WaitQueue = "device" | "slot" | "admission";
 
 const FINISHED_WAITS: ReadonlyArray<{ queue: WaitQueue; pattern: RegExp; unitMs: number }> = [
+  { queue: "admission", pattern: /^Test admission: acquired after (\d+)s waiting$/, unitMs: 1000 },
   // Printed once the hold is taken after waiting.
   { queue: "device", pattern: /^Android gate: device free after (\d+)s waiting$/, unitMs: 1000 },
   // Printed when the wait limit runs out. The gate exits without testing.
@@ -69,6 +70,7 @@ const FINISHED_WAITS: ReadonlyArray<{ queue: WaitQueue; pattern: RegExp; unitMs:
 const DEVICE_WAIT_STARTED = /^Android gate: device held by .+; waiting up to (\d+)s$/;
 /** Printed when a build starts waiting and then once a minute; M is minutes so far. */
 const SLOT_WAITING = /^Pyrycode build slots: all \d+ places are taken by other pipeline builds; waiting \((\d+) min so far\)\.$/;
+const ADMISSION_WAITING = /^Test admission: waiting \((\d+) s so far\)\.$/;
 
 const ANSI_ESCAPE = /\x1b\[[0-9;]*[A-Za-z]/g;
 
@@ -77,7 +79,7 @@ function cleanLine(line: string): string {
 }
 
 function mentionsQueue(line: string): boolean {
-  return line.startsWith("Android gate:") || line.startsWith("Pyrycode build slots:");
+  return line.startsWith("Android gate:") || line.startsWith("Pyrycode build slots:") || line.startsWith("Test admission:");
 }
 
 /** One finished wait a queue reported: the line itself and how long it waited. */
@@ -172,6 +174,7 @@ export interface GateWaitState {
   readonly done: readonly Interval[];
   readonly device: OpenDeviceWait | null;
   readonly slot: OpenSlotWait | null;
+  readonly admission?: OpenSlotWait | null;
 }
 
 export function initGateWaitState(startedAt: number): GateWaitState {
@@ -190,6 +193,7 @@ export function advanceGateWaitState(state: GateWaitState, rawLine: string, now:
       done: [...state.done, span],
       device: finished.queue === "device" ? null : state.device,
       slot: finished.queue === "slot" ? null : state.slot,
+      ...(finished.queue === "admission" ? { admission: null } : {}),
     };
   }
   const started = DEVICE_WAIT_STARTED.exec(line);
@@ -200,6 +204,11 @@ export function advanceGateWaitState(state: GateWaitState, rawLine: string, now:
   if (waiting) {
     const since = state.slot?.since ?? Math.max(state.startedAt, now - Number(waiting[1]) * 60_000);
     return { ...state, slot: { since, lastNoteAt: now } };
+  }
+  const admission = ADMISSION_WAITING.exec(line);
+  if (admission) {
+    const since = state.admission?.since ?? Math.max(state.startedAt, now - Number(admission[1]) * 1000);
+    return { ...state, admission: { since, lastNoteAt: now } };
   }
   return state;
 }
@@ -214,6 +223,7 @@ export function gateWaitCreditMs(state: GateWaitState, now: number): number {
   const open: Interval[] = [];
   if (state.device) open.push([state.device.since, Math.min(now, state.device.since + state.device.limitMs)]);
   if (state.slot) open.push([state.slot.since, Math.min(now, state.slot.lastNoteAt + SLOT_NOTE_SPAN_MS)]);
+  if (state.admission) open.push([state.admission.since, Math.min(now, state.admission.lastNoteAt + SLOT_NOTE_SPAN_MS)]);
   return unionLengthMs([...state.done, ...open]);
 }
 
