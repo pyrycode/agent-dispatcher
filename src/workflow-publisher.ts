@@ -266,7 +266,9 @@ export class WorkflowPublisher {
         )
           throw new Error("Workflow display acknowledgement missing");
         if (!item.archived && (item.positioned || item.position < 0)) {
-          const ordered = this.store.workflow.list(project),
+          const ordered = this.store.workflow
+              .list(project)
+              .filter((i) => !i.archived),
             position = ordered.findIndex((i) => i.id === item.id);
           await this.gql(
             project,
