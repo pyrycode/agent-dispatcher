@@ -67,6 +67,9 @@ export interface VerifierGatePass {
   summary: string[];
   /** The stdout and stderr log of every gate in the run. */
   logPaths: string[];
+  /** Strict consumers bind full passes to the same external/env snapshot as partial passes. */
+  inputsHash?: string;
+  evidenceHash?: string;
 }
 
 /**
@@ -94,6 +97,8 @@ export function parseVerifierGatePass(raw: string): VerifierGatePass | null {
     || typeof r.passedAt !== "string"
     || !isStrings(r.summary)
     || !isStrings(r.logPaths)
+    || (r.inputsHash !== undefined && typeof r.inputsHash !== "string")
+    || (r.evidenceHash !== undefined && typeof r.evidenceHash !== "string")
   ) {
     return null;
   }
@@ -106,6 +111,8 @@ export function parseVerifierGatePass(raw: string): VerifierGatePass | null {
     passedAt: r.passedAt,
     summary: r.summary,
     logPaths: r.logPaths,
+    ...(typeof r.inputsHash === "string" ? { inputsHash: r.inputsHash } : {}),
+    ...(typeof r.evidenceHash === "string" ? { evidenceHash: r.evidenceHash } : {}),
   };
 }
 
@@ -113,7 +120,7 @@ export type VerifierGateReuseDecision =
   | { reuse: true; pass: VerifierGatePass }
   | {
     reuse: false;
-    reason: "no-record" | "other-issue" | "tree-changed" | "gates-changed" | "expired" | "log-missing";
+    reason: "no-record" | "other-issue" | "tree-changed" | "gates-changed" | "expired" | "log-missing" | "inputs-changed";
   };
 
 /**
@@ -131,12 +138,14 @@ export function decideVerifierGateReuse(opts: {
   gatesHash: string;
   nowMs: number;
   logExists: (path: string) => boolean;
+  inputsHash?: string;
 }): VerifierGateReuseDecision {
   const { pass } = opts;
   if (pass === null) return { reuse: false, reason: "no-record" };
   if (pass.issueNumber !== opts.issueNumber) return { reuse: false, reason: "other-issue" };
   if (opts.tree === "" || pass.tree !== opts.tree) return { reuse: false, reason: "tree-changed" };
   if (pass.gatesHash !== opts.gatesHash) return { reuse: false, reason: "gates-changed" };
+  if (opts.inputsHash !== undefined && pass.inputsHash !== opts.inputsHash) return { reuse: false, reason: "inputs-changed" };
   // A pass stamped in the future, or with no readable time, is not trusted.
   const ageMs = opts.nowMs - Date.parse(pass.passedAt);
   if (!(ageMs >= 0 && ageMs < VERIFIER_GATE_REUSE_MAX_AGE_MS)) return { reuse: false, reason: "expired" };
@@ -226,6 +235,7 @@ export function decideDocsOnlyGateReuse(opts: {
   tree: string;
   gates: readonly string[];
   gatesHash: string;
+  inputsHash?: string;
   nowMs: number;
   logExists: (path: string) => boolean;
   docsPaths: readonly string[];

@@ -246,7 +246,11 @@ older than one day run the steps again. Formatted test steps need complete,
 nonempty passing evidence. An excused failure never enters the retained prefix.
 The failed step and every unfinished step run again. Original failure output is
 archived before later attempts replace the current gate logs. A resumed full
-pass keeps the earliest retained evidence's age.
+pass keeps the earliest retained evidence's age. When an input snapshot command
+is configured, full-pass reuse uses the same strict snapshot and byte-bound log
+evidence. Legacy passes are invalidated once. Documentation-only changes
+conservatively rerun all steps in this strict mode. A changed or unreadable
+snapshot during checks cannot create a reusable pass.
 
 **Exact JSON test selections.** A baseline template may use `{{TESTS_JSON}}`
 instead of `{{TESTS}}`. The replacement is one shell-quoted JSON array containing

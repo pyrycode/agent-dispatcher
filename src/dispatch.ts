@@ -6296,6 +6296,8 @@ export async function runVerifierGates(opts: {
   /** A validated raw-green prefix. No failing or excused step belongs here. */
   passedPrefix?: readonly PassedGate[];
   onPassed?: (pass: PassedGate, index: number) => void;
+  /** Preserve every raw red before a rerun or baseline assessment can excuse it. */
+  onFailed?: (logs: [string, string]) => void;
   deps: Pick<DispatchDeps, "spawnGate" | "readFileSync">;
 }): Promise<VerifierGatesOutcome> {
   const logsDir = opts.logsDir ?? LOGS_DIR;
@@ -6320,6 +6322,7 @@ export async function runVerifierGates(opts: {
       stderrPath,
     });
     const failed = outcome.spawnError !== null || outcome.timedOut || outcome.exitCode !== 0;
+    if (failed && opts.onFailed) opts.onFailed([stdoutPath, stderrPath]);
     const verdict = outcome.spawnError !== null
       ? `spawn error: ${outcome.spawnError}`
       : outcome.timedOut
@@ -6938,20 +6941,29 @@ function readReusableGatePass(
   pass: VerifierGatePass | null,
   tree: string,
   gatesHash: string,
+  inputsHash?: string,
 ): VerifierGatePass | null {
   if (pass === null) return null;
+  if (inputsHash !== undefined && pass.evidenceHash !== verifierEvidenceHash(ctx, pass.logPaths)) return null;
   const issueNumber = ctx.item.issueNumber;
   const decision = decideVerifierGateReuse({
     pass,
     issueNumber,
     tree,
     gatesHash,
+    inputsHash,
     nowMs: Date.now(),
     logExists: (p) => ctx.deps.existsSync(p),
   });
   if (decision.reuse) return decision.pass;
   console.log(`   🧪 Recorded gate pass for #${issueNumber} not reused (${decision.reason})`);
   return null;
+}
+
+function verifierEvidenceHash(ctx: DispatchContext, paths: readonly string[]): string | null {
+  try {
+    return gatePrefixKey("", [], {}, JSON.stringify(paths.map(path => [path, String(ctx.deps.readFileSync(path, "utf-8"))])));
+  } catch { return null; }
 }
 
 /**
@@ -6965,19 +6977,15 @@ function reusableGatesForNextRun(ctx: DispatchContext): { commit: string; untilM
   if (gates.length === 0 || !verifierGateReuseEnabled(process.env)) return null;
   const head = mergedWorktreeHead(ctx);
   if (head === null) return null;
+  const strictInputs = !!process.env.PYRY_VERIFIER_GATE_INPUTS_CMD?.trim();
+  const inputsHash = strictInputs ? verifierPrefixInputs(ctx, gates, head.tree) : undefined;
+  if (inputsHash === null) return null;
   const pass = readRecordedGatePass(ctx, resolve(LOGS_DIR, verifierGatePassFileName(ctx.item.issueNumber)));
   if (pass === null) return null;
-  const decision = decideVerifierGateReuse({
-    pass,
-    issueNumber: ctx.item.issueNumber,
-    tree: head.tree,
-    gatesHash: hashGateList(gates),
-    nowMs: Date.now(),
-    logExists: (p) => ctx.deps.existsSync(p),
-  });
-  if (!decision.reuse) return null;
-  const passedAtMs = Date.parse(decision.pass.passedAt);
-  return Number.isNaN(passedAtMs) ? null : { commit: decision.pass.commit, untilMs: passedAtMs + VERIFIER_GATE_REUSE_MAX_AGE_MS };
+  const reused = readReusableGatePass(ctx, pass, head.tree, hashGateList(gates), inputsHash);
+  if (reused === null) return null;
+  const passedAtMs = Date.parse(reused.passedAt);
+  return Number.isNaN(passedAtMs) ? null : { commit: reused.commit, untilMs: passedAtMs + VERIFIER_GATE_REUSE_MAX_AGE_MS };
 }
 
 /**
@@ -7233,11 +7241,14 @@ async function runConfiguredPreSpawnGates(
   // HEAD unknown, nothing is read or recorded and the gates run as before.
   const passFile = resolve(LOGS_DIR, verifierGatePassFileName(item.issueNumber));
   const gatesHash = hashGateList(gates);
-  const head = verifierGateReuseEnabled(process.env) ? mergedWorktreeHead(ctx) : null;
+  let head = verifierGateReuseEnabled(process.env) ? mergedWorktreeHead(ctx) : null;
+  const strictInputs = !!process.env.PYRY_VERIFIER_GATE_INPUTS_CMD?.trim();
+  const inputsHash = strictInputs && head !== null ? verifierPrefixInputs(ctx, gates, head.tree) : undefined;
+  if (strictInputs && !inputsHash) head = null;
   let docsOnly: ReturnType<typeof readDocsOnlyGateReuse> = null;
   if (head !== null) {
     const recordedPass = readRecordedGatePass(ctx, passFile);
-    const reused = readReusableGatePass(ctx, recordedPass, head.tree, gatesHash);
+    const reused = readReusableGatePass(ctx, recordedPass, head.tree, gatesHash, inputsHash ?? undefined);
     if (reused !== null) {
       const sameCommit = reused.commit === head.commit;
       console.log(`   ♻️  Pre-${agent.name} gates already passed at ${reused.passedAt} on ${reused.commit.slice(0, 12)}${sameCommit ? "" : `, same files as ${head.commit.slice(0, 12)}`}; reusing that result`);
@@ -7260,7 +7271,7 @@ async function runConfiguredPreSpawnGates(
     }
     // Only documentation changed since the recorded pass (#134): the code
     // gates' results stand, and only the documentation gates run below.
-    docsOnly = readDocsOnlyGateReuse(ctx, recordedPass, head.tree, gates, gatesHash);
+    if (!strictInputs) docsOnly = readDocsOnlyGateReuse(ctx, recordedPass, head.tree, gates, gatesHash);
   }
   const toRun = docsOnly?.rerun ?? gates;
   const docsOnlyNote = (): string => {
@@ -7304,7 +7315,7 @@ async function runConfiguredPreSpawnGates(
     : undefined;
 
   const prefixFile = resolve(LOGS_DIR, `verifier-gate_#${item.issueNumber}.prefix.json`);
-  const inputKey = head !== null && docsOnly === null ? verifierPrefixInputs(ctx, gates, head.tree) : null;
+  const inputKey = head !== null && docsOnly === null ? inputsHash ?? null : null;
   const readEvidence = (path: string): string | null => {
     try { return String(ctx.deps.readFileSync(path, "utf-8")); } catch { return null; }
   };
@@ -7340,22 +7351,21 @@ async function runConfiguredPreSpawnGates(
     assessRed,
     passedPrefix: prefix,
     onPassed,
+    onFailed: paths => {
+      const attempt = Date.now();
+      for (const path of paths) {
+        const raw = readEvidence(path);
+        if (raw !== null) {
+          try { ctx.deps.writeFileSync(`${path}.failure-${attempt}.log`, raw); }
+          catch (error) { console.warn(`Could not archive original red-gate output ${path}: ${error}`); }
+        }
+      }
+    },
     // A rerun gate keeps its number in the full list, so the reused gates'
     // logs, the evidence the pass rests on, are not overwritten.
     logNumbers: docsOnly !== null ? toRun.map((g) => gates.indexOf(g) + 1) : undefined,
     deps: ctx.deps,
   });
-  if (!result.ok) {
-    // A later retry overwrites the current gate logs. Preserve the original
-    // failure bytes separately before any later run can replace them.
-    const attempt = Date.now();
-    for (const path of result.logPaths.slice(-2)) {
-      const raw = readEvidence(path);
-      if (raw !== null) {
-        try { ctx.deps.writeFileSync(`${path}.failure-${attempt}.log`, raw); } catch { /* Current logs remain available. */ }
-      }
-    }
-  }
   if (testdataBefore !== null) await guardGateTestdata(ctx, testdataBefore);
   const baselineLog = result.baseline.flatMap((a) => [
     ...a.flaky.map((name) => `  ${a.gate}: \`${name}\` (passed on the same-tree re-run, flaky` +
@@ -7397,7 +7407,7 @@ async function runConfiguredPreSpawnGates(
     console.log(`   ✅ Pre-${agent.name} gates green`);
     // Only a full pass is recorded. A red, timed-out or unspawnable gate
     // never is, so a retry after a flaky failure runs the gates again.
-    if (head !== null) {
+    if (head !== null && (!strictInputs || (prefix.length === gates.length && verifierPrefixInputs(ctx, gates, head.tree) === inputsHash))) {
       // A docs-only pass is recorded for this tree too, so a retry on the
       // same files is an exact match. It combines the reused code gates'
       // lines with the rerun documentation gates' lines, names the same
@@ -7415,6 +7425,7 @@ async function runConfiguredPreSpawnGates(
           ? result.summary
           : gates.map((g, i) => (docsOnly!.rerun.includes(g) ? rerunLine(g) : docsOnly!.pass.summary[i]) ?? `✓ ${g}`),
         logPaths: docsOnly?.pass.logPaths ?? result.logPaths,
+        ...(inputsHash ? { inputsHash, evidenceHash: verifierEvidenceHash(ctx, result.logPaths) ?? undefined } : {}),
       };
       try {
         ctx.deps.writeFileSync(passFile, JSON.stringify(pass, null, 2) + "\n");
