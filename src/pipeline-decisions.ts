@@ -208,6 +208,7 @@ export function decideAutoAdvance(
   itemsByColumn: ReadonlyMap<string, readonly DecisionItem[]>,
   seatsTaken: number,
   maxConcurrent: number,
+  liveGateEnabled = true,
 ): AutoAdvanceDecision {
   const advances: AdvanceAction[] = [];
   const gatedAwaiting: { column: string; itemNumbers: number[] }[] = [];
@@ -232,7 +233,7 @@ export function decideAutoAdvance(
     // `runRealClaudeGateExecution` to run.
     // This is the structural guarantee — it does not depend on the gate step
     // running, so removing or breaking that step cannot un-gate a ticket.
-    !(rule.from === REAL_CLAUDE_GATE_FROM_COLUMN && item.labels.includes(REAL_CLAUDE_GATE_LABEL)) &&
+    !(liveGateEnabled && rule.from === REAL_CLAUDE_GATE_FROM_COLUMN && item.labels.includes(REAL_CLAUDE_GATE_LABEL)) &&
     // A background gate run is still writing its verdict. A failure moves the
     // ticket to its rework column before adding the rework label, so for a
     // moment it reads as a finished stage with no rework pending. The running
@@ -518,6 +519,13 @@ export function decideUnroutableRework(
     }
   }
   return out;
+}
+
+/** Retiring a consumer's gate removes both label parking and execution.
+ * An absent command alone still parks labelled tickets for an operator.
+ * Only explicit 0 opts out; other consumers retain the existing guard. */
+export function realClaudeGateEnabled(env: NodeJS.ProcessEnv): boolean {
+  return env.PYRY_REAL_CLAUDE_GATE_ENABLED?.trim() !== "0";
 }
 
 // --------- Real-claude operator gate ---------
