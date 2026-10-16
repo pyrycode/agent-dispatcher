@@ -66,6 +66,10 @@ async function main(): Promise<void> {
   }
   if(command==='control') {
     const claims=new JsonClient(config.claimsUrl,secret(config.claimsOperatorTokenEnv ?? config.claimsTokenEnv));
+    if(args[0]==='target') {
+      if(args.length!==2 || !/^[a-f0-9]{40}$/.test(args[1]))throw new Error('control target requires an exact upstream main revision');
+      console.log(JSON.stringify(await claims.call('/operations/control-target',{revision:args[1]})));return;
+    }
     console.log(JSON.stringify(await claims.call(args.length?'/operations/control-ready':'/operations/control',args.length?JSON.parse(readFileSync(args[0],'utf8')):undefined)));
     return;
   }

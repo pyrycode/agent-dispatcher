@@ -6,12 +6,13 @@ import {validateRepairPublication} from './recovery-source-publication.js';
 import {currentWorkflow,dispatcherRepairCap,withdrawCappedRepairs,REPAIR_WITHDRAWN_SUMMARY} from './recovery-repair-cap.js';
 import {ARTIFACT_LIMITS,artifactManifest,manifestHash,sha256,validateArtifactPath,validateManifest,type ArtifactManifest} from './recovery-artifacts.js';
 
-export const CAPABILITIES = ['linux-amd64','macos-arm64','android-emulator','dispatcher-repair','desktop-fake-suite'] as const;
+export const CAPABILITIES = ['linux-amd64','macos-arm64','android-emulator','mobile-android','dispatcher-repair','desktop-fake-suite'] as const;
+const MOBILE_RECIPES = ['mobile-scripted-evidence','mobile-in-depth'];
 export type Capability = typeof CAPABILITIES[number];
 /** A capability report older than this is stale: its machine may be offline. */
 export const CAPABILITY_FRESH_MS = 180_000;
 export interface RecoveryTaskRequest {
- recipe: 'platform-probe'|'memory-runtime-smoke'|'android-tool-then-text'|'dispatcher-repair'|'desktop-fake-suite';
+ recipe: 'platform-probe'|'memory-runtime-smoke'|'android-tool-then-text'|'dispatcher-repair'|'desktop-fake-suite'|'mobile-scripted-evidence'|'mobile-in-depth';
  capability: Capability; revision?: string; reason: string;
 }
 export interface RecoveryTaskResult {outcome:'completed'|'failed';summary:string;files:Record<string,string>;dispatcherRevision?:string;candidateRevision?:string}
@@ -71,7 +72,7 @@ export function recoveryTaskId(ticket:string,request:RecoveryTaskRequest,context
 }
 export function validateTaskRequest(value:unknown): RecoveryTaskRequest {
  const r=value as RecoveryTaskRequest;
- if (!r || !['platform-probe','memory-runtime-smoke','android-tool-then-text','dispatcher-repair','desktop-fake-suite'].includes(r.recipe)
+ if (!r || !['platform-probe','memory-runtime-smoke','android-tool-then-text','dispatcher-repair','desktop-fake-suite',...MOBILE_RECIPES].includes(r.recipe)
   || !CAPABILITIES.includes(r.capability) || typeof r.reason!=='string' || !r.reason.trim() || r.reason.length>6000
   || Object.keys(r).some(k=>!['recipe','capability','revision','reason'].includes(k))) throw new Error('Invalid recovery task');
  if (r.recipe!=='platform-probe' && !/^[a-f0-9]{40}$/.test(r.revision??'')) throw new Error('An executed task requires an exact revision');
@@ -79,6 +80,8 @@ export function validateTaskRequest(value:unknown): RecoveryTaskRequest {
   || r.recipe==='memory-runtime-smoke' && !['linux-amd64','macos-arm64'].includes(r.capability)
   || r.recipe==='desktop-fake-suite' && r.capability!=='desktop-fake-suite'
   || r.capability==='desktop-fake-suite' && r.recipe!=='desktop-fake-suite'
+  || MOBILE_RECIPES.includes(r.recipe) && r.capability!=='mobile-android'
+  || r.capability==='mobile-android' && !MOBILE_RECIPES.includes(r.recipe)
   || r.recipe==='dispatcher-repair' && r.capability!=='dispatcher-repair') throw new Error('Recipe does not match the required platform');
  return {recipe:r.recipe,capability:r.capability,...(r.revision?{revision:r.revision}:{}),reason:scrubCredentials(r.reason)};
 }
@@ -100,6 +103,27 @@ export function validateTaskResult(value:RecoveryTaskResult): RecoveryTaskResult
 
 /** A reported pass must carry executed evidence, also on the chunked path. */
 function validateDesktopEvidence(task:RecoveryTask,result:RecoveryTaskResult,files:Record<string,string>):void {
+ if(MOBILE_RECIPES.includes(task.request.recipe) && result.outcome==='completed') {
+  try {
+   const capture=JSON.parse(files['mobile/capture.json']);
+   const selections=task.request.recipe==='mobile-in-depth'?[['ui']]:[['scripted','reply-suggestion'],['scripted','selection-copy']];
+   if(result.candidateRevision!==task.request.revision || capture.revision!==task.request.revision
+    || capture.repository!=='pyrycode/pyrycode-mobile' || capture.recipe!==task.request.recipe
+    || !capture.complete || !Array.isArray(capture.errors) || capture.errors.length
+    || !Array.isArray(capture.runs) || capture.runs.length!==selections.length
+    || !Number.isFinite(capture.elapsedSeconds) || capture.elapsedSeconds>1800
+    || capture.supportingRevisions?.mobile!==task.request.revision
+    || !/^[a-f0-9]{40}$/.test(capture.supportingRevisions?.agents??'')) throw new Error();
+   if(task.request.recipe==='mobile-in-depth' && (capture.profile?.UI_GATE_FULL!=='1' || capture.profile?.UI_DEVICE_ALL!=='1' || capture.profile?.UI_SHARDS!=='2')) throw new Error();
+   for(let index=0;index<selections.length;index++) {
+    const run=capture.runs[index],tally=parseGateOutput(files[`mobile/gate-${index}.xml`]??'','junit-xml');
+    if(run.exitCode!==0 || !Array.isArray(run.command) || JSON.stringify(run.command.slice(2))!==JSON.stringify(selections[index])
+     || !tally.completeParse || tally.packageFailed || !tally.executed || tally.failed) throw new Error();
+    for(const key of ['executed','passed','failed','skipped'] as const) if(run.counts?.[key]!==tally[key]) throw new Error();
+   }
+  }catch {throw new Error('Mobile capture requires complete nonzero passing evidence for its exact revision and profile');}
+  return;
+ }
  if(task.request.recipe!=='desktop-fake-suite' || result.outcome!=='completed') return;
  try {
   for(const path of ['desktop/capture.json','desktop/playwright.json','desktop/playwright.list.log','desktop/playwright.config.ts','desktop/fake-daemon-setup.json']) {
@@ -147,6 +171,7 @@ export class RecoveryTasks {
  request(ticket:string,value:RecoveryTaskRequest,context=""):RecoveryTask {
   const request=validateTaskRequest(value);
   if(request.recipe==='desktop-fake-suite' && ticket.split('#')[0]!=='pyrycode/pyrycode-desktop') throw new Error('Desktop capture requires a Desktop source ticket');
+  if(MOBILE_RECIPES.includes(request.recipe) && ticket.split('#')[0]!=='pyrycode/pyrycode-mobile') throw new Error('Mobile capture requires a Mobile source ticket');
   const id=recoveryTaskId(ticket,request,context);
   this.db.prepare("INSERT OR IGNORE INTO fleet_recovery_tasks VALUES (?,?,?,'queued',?,?,NULL,NULL,NULL,NULL)").run(id,ticket,JSON.stringify(request),this.now(),this.now());
   return this.get(id);
@@ -281,7 +306,7 @@ export class RecoveryTasks {
    // Check complete reconstructed content: secrets may span any chunk boundary.
    if(scrubCredentials(text)!==text) throw new Error('Artifact contains credential-shaped text; retain it privately and return a sanitised diagnostic');
    if(terminal && task.result && Object.hasOwn(task.result.files,file.path) && task.result.files[file.path]!==text) throw new Error('Retained artifact changed');
-   if(task.request.recipe==='desktop-fake-suite') desktopFiles[file.path]=text;
+   if(task.request.recipe==='desktop-fake-suite' || MOBILE_RECIPES.includes(task.request.recipe)) desktopFiles[file.path]=text;
   }
   if(terminal && task.result && Object.keys(task.result.files).some(path=>!manifest.files.some(f=>f.path===path))) throw new Error('Retained artifact inventory incomplete');
   validateDesktopEvidence(task,result,desktopFiles);

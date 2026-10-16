@@ -15,7 +15,9 @@ import uuid
 from pathlib import Path
 from contextlib import contextmanager
 
-RECIPES={'platform-probe','memory-runtime-smoke','android-tool-then-text','dispatcher-repair','desktop-fake-suite'}
+RECIPES={'platform-probe','memory-runtime-smoke','android-tool-then-text','dispatcher-repair','desktop-fake-suite','mobile-scripted-evidence','mobile-in-depth'}
+MOBILE_RECIPES={'mobile-scripted-evidence','mobile-in-depth'}
+MOBILE_PROJECT='pyrycode/pyrycode-mobile'
 DESKTOP_PROJECT='pyrycode/pyrycode-desktop'
 # Deterministic local failures of retained artifacts. Anything else is retried next pass.
 UNRECOVERABLE_ARTIFACTS=('Capture returned no unique private recovery directory','Capture artifact escapes its private directory',
@@ -255,16 +257,19 @@ def execute(argv,cwd,log,env=None,timeout=3600,*,cleanup_timeout=15):
             # Persist custody even if a non-signal failure interrupts report collection.
             save()
 
-def clone(source,destination,revision=None):
+def clone(source,destination,revision=None,repository='pyrycode/pyrycode',deadline=None):
     if destination.exists():raise RuntimeError('A task checkout already exists; it must not be overwritten')
     log=destination.parent/'execution.log'
     def git(*args):
-        if execute(['git',*args],destination.parent,log,timeout=300)!=0:
+        bound=300 if deadline is None else min(300,deadline-time.monotonic())
+        if bound<=0:raise RuntimeError('Capture preparation exhausted its time budget')
+        if execute(['git',*args],destination.parent,log,timeout=bound)!=0:
             raise RuntimeError('Checkout setup failed or has incomplete custody; private logs retained')
     git('clone','--no-checkout',str(source),str(destination))
     if revision:
-        git('-C',str(destination),'remote','set-url','origin','https://github.com/pyrycode/pyrycode.git')
-        git('-C',str(destination),'fetch','origin',revision)
+        if repository not in {'pyrycode/pyrycode',MOBILE_PROJECT}:raise RuntimeError('Unsupported candidate repository')
+        git('-C',str(destination),'remote','set-url','origin','https://github.com/'+repository+'.git')
+        git('-C',str(destination),'fetch','--refetch','origin',revision)
         git('-C',str(destination),'switch','--detach',revision)
     else:
         git('-C',str(destination),'switch','main')
@@ -420,6 +425,92 @@ def desktop_capture(task,paths,directory):
             'summary':'Desktop fake suite: '+json.dumps(counts)+'. '+('Inspect the full capture before acceptance.' if code==0 else 'Capture failed; inspect returned diagnostics.'),'files':files}
 
 
+def mobile_report_counts(text):
+    """The gate's stripped report must be complete and contain real passing cases."""
+    import xml.etree.ElementTree as ET
+    try:root=ET.fromstring(text)
+    except ET.ParseError as error:raise ValueError('Malformed JUnit report') from error
+    if root.tag not in {'testsuite','testsuites'}:raise ValueError('Missing JUnit suite')
+    cases=root.findall('.//testcase')
+    suites=[root] if root.tag=='testsuite' else list(root.findall('testsuite'))
+    for suite in suites:
+        held=suite.findall('.//testcase')
+        if int(suite.get('tests',len(held)))!=len(held):raise ValueError('Incomplete JUnit suite')
+        for attribute,tag in [('failures','failure'),('errors','error'),('skipped','skipped')]:
+            actual=sum(c.find(tag) is not None for c in held)
+            if int(suite.get(attribute,actual))!=actual:raise ValueError('JUnit outcome count mismatch')
+    if root.tag=='testsuites' and root.get('tests') is not None and int(root.get('tests'))!=len(cases):raise ValueError('Incomplete JUnit root')
+    if any(not c.get('name') or not c.get('classname') for c in cases):raise ValueError('Unnamed test outcome')
+    skipped=sum(c.find('skipped') is not None for c in cases)
+    failed=sum(c.find('failure') is not None or c.find('error') is not None for c in cases)
+    return {'executed':len(cases)-skipped,'passed':len(cases)-skipped-failed,'failed':failed,'skipped':skipped}
+
+def mobile_capture(task,paths,directory):
+    """Fixed offline Mobile checks. A candidate revision can never name Core."""
+    request=task['request'];recipe=request['recipe'];revision=request.get('revision')
+    started=time.monotonic();deadline=started+1800;files={};log=directory/'execution.log'
+    evidence={'repository':MOBILE_PROJECT,'revision':revision,'recipe':recipe,'runs':[],'errors':[],'supportingRevisions':{},
+              'host':platform.node(),'loadBefore':list(os.getloadavg())}
+    code=1
+    try:
+        if task.get('ticket','').split('#')[0]!=MOBILE_PROJECT or not re.fullmatch('[a-f0-9]{40}',revision or ''):
+            raise RuntimeError('Mobile capture requires its own ticket and exact pushed revision')
+        mobile=directory/'mobile'
+        clone(paths['mobile'],mobile,revision,repository=MOBILE_PROJECT,deadline=deadline)
+        env=clean_env()
+        env.update(PYRY_MOBILE_REPO=str(mobile),PYRY_GATE_EVIDENCE_DIR=str(directory/'device-evidence'))
+        # Supporting sources are separate from the submitted Mobile candidate.
+        if recipe=='mobile-scripted-evidence':
+            for key,variable in [('core','PYRYCODE_SRC'),('relay','PYRYCODE_RELAY_SRC')]:
+                target=directory/key
+                clone(paths[key],target,deadline=deadline)
+                env[variable]=str(target)
+        gate=Path(paths['mobileAgents'])/'scripts/android-test-gate.py'
+        if recipe=='mobile-in-depth':env.update(UI_GATE_FULL='1',UI_DEVICE_ALL='1',UI_SHARDS='2')
+        evidence['profile']={key:env[key] for key in ['UI_GATE_FULL','UI_DEVICE_ALL','UI_SHARDS'] if key in env}
+        # Pin supporting revision provenance without reading environment or credentials.
+        for key,target in [('mobile',mobile),('agents',Path(paths['mobileAgents']))]+(
+                [('core',directory/'core'),('relay',directory/'relay')] if recipe=='mobile-scripted-evidence' else []):
+            offset=log.stat().st_size if log.exists() else 0
+            if execute(['git','-C',str(target),'rev-parse','HEAD'],directory,log,timeout=min(30,max(.01,deadline-time.monotonic())))!=0:
+                raise RuntimeError('Cannot establish '+key+' revision')
+            output=log.read_bytes()[offset:].decode('utf-8').strip()
+            if not re.fullmatch('[a-f0-9]{40}',output):raise RuntimeError('Invalid '+key+' revision provenance')
+            evidence['supportingRevisions'][key]=output
+        if evidence['supportingRevisions']['mobile']!=revision:raise RuntimeError('Mobile checkout does not match requested revision')
+        selections=[['ui']] if recipe=='mobile-in-depth' else [['scripted','reply-suggestion'],['scripted','selection-copy']]
+        code=0
+        for index,selection in enumerate(selections):
+            remaining=deadline-time.monotonic()
+            if remaining<=0:raise RuntimeError('Mobile diagnostic exceeded its 1800 second budget')
+            report=directory/f'gate-{index}.xml';child_env={**env,'PYRY_MOBILE_CAPTURE_STDOUT':str(report)}
+            command=[sys.executable,str(gate),*selection]
+            # The wrapper redirects only the counted gate report. stderr and all
+            # child processes remain under execute's existing custody journal.
+            wrapper='import os,subprocess,sys; f=open(os.environ["PYRY_MOBILE_CAPTURE_STDOUT"],"w"); sys.exit(subprocess.call(sys.argv[1:],stdout=f))'
+            before=time.monotonic()
+            exit_code=execute([sys.executable,'-c',wrapper,*command],mobile,log,child_env,timeout=remaining)
+            record={'command':command,'exitCode':exit_code,'startedSeconds':before-started,'elapsedSeconds':time.monotonic()-before}
+            evidence['runs'].append(record)
+            if report.is_file():
+                text=report.read_text();files[f'mobile/gate-{index}.xml']=text
+                record['counts']=mobile_report_counts(text)
+            if exit_code!=0 or not record.get('counts',{}).get('executed') or record['counts']['failed']:
+                code=1
+        if time.monotonic()>deadline:raise RuntimeError('Mobile diagnostic exceeded its 1800 second budget')
+    except (OSError,ValueError,KeyError,TypeError,RuntimeError) as error:
+        code=1;evidence['errors'].append(str(error))
+    evidence['elapsedSeconds']=time.monotonic()-started
+    evidence['loadAfter']=list(os.getloadavg())
+    evidence['complete']=code==0
+    for index,path in enumerate(sorted((directory/'device-evidence').glob('*/phases.jsonl'))):
+        files[f'mobile/phases-{index}.jsonl']=path.read_text()
+    files['mobile/capture.json']=json.dumps(evidence)
+    if log.is_file():files['mobile/execution.log']=log.read_text()
+    artifact_manifest(files)
+    return {'outcome':'completed' if code==0 else 'failed','candidateRevision':revision,
+            'summary':'Mobile '+recipe+': '+('complete counted checks' if code==0 else 'failed; inspect retained diagnostics'), 'files':files}
+
 def native_recipe(task,paths,directory):
     request=task['request'];recipe=request['recipe'];files={};log=directory/'execution.log'
     if recipe not in RECIPES:raise RuntimeError('Unknown fixed recipe')
@@ -427,6 +518,7 @@ def native_recipe(task,paths,directory):
         details={'platform':platform.system(),'architecture':platform.machine(),'candidate_tests_executed':False}
         return {'outcome':'completed','summary':'Managed native execution route is available. This probe is not candidate test evidence.','files':{'platform.json':json.dumps(details)}}
     if recipe=='desktop-fake-suite':return desktop_capture(task,paths,directory)
+    if recipe in MOBILE_RECIPES:return mobile_capture(task,paths,directory)
     if recipe=='dispatcher-repair':
         code=execute([paths['node'], '--import', paths['tsx'], paths['repairProgram'],str(directory/'task.json')],directory,log,timeout=5400)
         record=directory/'repair-result.json'
@@ -484,6 +576,22 @@ PUBLICATION_ATTENTION_FAILURES=6
 
 def route_available(route):
     capability=route['capability']
+    if capability=='mobile-android':
+        paths=route.get('paths',{})
+        if not all(paths.get(key) for key in ['mobile','mobileAgents','core','relay']):return False
+        # Report this route only from a Linux runtime with the SDK, acceleration
+        # and the exact configured Mobile checkout, not a generic platform probe.
+        probe=("import os,pathlib,shutil,subprocess,sys; p="+repr(paths)+"; "
+               "sdk=pathlib.Path(os.environ.get('ANDROID_HOME','/missing')); "
+               "remote=subprocess.run(['git','-C',p['mobile'],'config','--get','remote.origin.url'],capture_output=True,text=True); "
+               "ok=sys.platform=='linux' and all(shutil.which(x) for x in ['go','java','adb','git']) and "
+               "os.access('/dev/kvm',os.R_OK|os.W_OK) and (sdk/'emulator/emulator').is_file() and "
+               "(pathlib.Path(p['mobile'])/'gradlew').is_file() and (pathlib.Path(p['mobileAgents'])/'scripts/android-test-gate.py').is_file() and "
+               "all((pathlib.Path(p[x])/'.git').exists() for x in ['core','relay']) and "
+               "remote.returncode==0 and remote.stdout.strip() in "+repr({'https://github.com/'+MOBILE_PROJECT+'.git','https://github.com/'+MOBILE_PROJECT,'git@github.com:'+MOBILE_PROJECT+'.git'})+"; sys.exit(0 if ok else 1)")
+        args=['podman','exec',route['container'],'python3','-c',probe] if route.get('container') else [sys.executable,'-c',probe]
+        try:return subprocess.run(args,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=15).returncode==0
+        except (OSError,subprocess.TimeoutExpired):return False
     if capability=='desktop-fake-suite':
         if sys.platform!='darwin' or route.get('container'):return False
         paths=route.get('paths',{});repo=Path(paths.get('desktop',''));launcher=Path(paths.get('desktopLauncher',''))
@@ -596,6 +704,12 @@ def service_refusal(error):
 
 class SupportSupervisor:
     def __init__(self,adapter,config):
+        android=config.get('recoveryTasks',{}).get('android-tool-then-text:android-emulator')
+        if android:
+            paths=dict(android.get('paths',{}))
+            if paths.get('core'):paths.setdefault('relay',str(Path(paths['core']).with_name('pyrycode-relay')))
+            for recipe in MOBILE_RECIPES:
+                config['recoveryTasks'].setdefault(recipe+':mobile-android',{**android,'capability':'mobile-android','paths':paths})
         desktop=config.get('projects',{}).get(DESKTOP_PROJECT,{})
         if config.get('platform')=='mac' and desktop.get('target'):
             config.setdefault('recoveryTasks',{})['desktop-fake-suite:desktop-fake-suite']={
