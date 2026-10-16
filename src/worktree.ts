@@ -379,9 +379,9 @@ export function managedPredecessorFinished(prior: FleetRun, current: FleetRun, s
  * - it is not locked, its status could be read, and no merge, rebase,
  *   cherry-pick or revert is unfinished in it.
  * - there is something to continue from: retained local files, or local
- *   commits origin lacks (`abort-local-strictly-ahead`). A diverged branch
- *   or one origin moved ahead of keeps today's handling. A confirmed managed
- *   predecessor may also hand off a clean tree without removing it.
+ *   commits origin lacks (`abort-local-strictly-ahead`). A confirmed managed
+ *   predecessor may also hand off a clean tree without removing it, including
+ *   one strictly behind origin. Divergence still refuses continuation.
  *
  * `gitStatusOutput` is `git status --porcelain` in the worktree, or null
  * when it could not be read. Pure; the caller does the I/O.
@@ -406,6 +406,11 @@ export function decideOwnWorktreeReuse(opts: {
   if (opts.gitStatusOutput === null) return { reuse: false, reason: "could not read the worktree's status" };
   if (opts.operationInProgress) return { reuse: false, reason: "a merge, rebase, cherry-pick or revert is unfinished in it" };
   const dirty = shouldAutoCommit(opts.gitStatusOutput);
+  if (opts.branchAction === "fast-forward-from-origin" && opts.managedHandoff) {
+    return opts.gitStatusOutput.length === 0
+      ? { reuse: true, commitLeftovers: false }
+      : { reuse: false, reason: "fast-forward requires a clean managed worktree" };
+  }
   if (opts.branchAction === "abort-local-strictly-ahead") return { reuse: true, commitLeftovers: dirty };
   if (opts.branchAction === "reuse-local-no-remote" || opts.branchAction === "reuse-local-already-synced") {
     return dirty || opts.managedHandoff || opts.gitStatusOutput.trim().length > 0

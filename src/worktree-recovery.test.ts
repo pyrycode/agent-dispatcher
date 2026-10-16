@@ -10,6 +10,19 @@ test('a confirmed same-ticket predecessor can hand its runtime-dirty worktree to
   }), {reuse: true, commitLeftovers: false});
 });
 
+test('fast-forward reuse requires confirmed custody and completely clean readable state', () => {
+  const ready = { ownPath: '/managed/builder-3503', held: [{ path: '/managed/builder-3503', error: 'retained' }],
+    branchAction: 'fast-forward-from-origin' as const, locked: false, operationInProgress: false,
+    gitStatusOutput: '', managedHandoff: true };
+  assert.deepEqual(decideOwnWorktreeReuse(ready), { reuse: true, commitLeftovers: false });
+  for (const change of [{ managedHandoff: false }, { locked: true }, { operationInProgress: true },
+    { held: [] }, { gitStatusOutput: null }, { gitStatusOutput: ' M source.ts\u0000' },
+    { gitStatusOutput: ' M .codegraph/codegraph.db-wal\u0000' }, { gitStatusOutput: '?? evidence.txt\u0000' },
+    { branchAction: 'abort-local-diverged' as const }]) {
+    assert.equal(decideOwnWorktreeReuse({ ...ready, ...change }).reuse, false);
+  }
+});
+
 // Desktop #1936: CodeGraph writers leave runtime files after verifier FAIL.
 test('runtime-only dirt is never an automatic commit, even when already tracked', () => {
   for (const status of ['?? .codegraph/\n', ' M .codegraph/codegraph.db-wal\n',
@@ -182,6 +195,52 @@ test('managed verifier FAIL hands its entire retained tree to builder safely', a
     assert.equal(readFileSync(join(f.path, '.codegraph', 'codegraph.db-wal'), 'utf8'), 'retained WAL bytes\n');
     f.finish();
   });
+  for (const condition of ['clean', 'ignored collision', 'merge failure', 'authority lost before merge']) {
+    await t.test(`remote advance of a retained managed tree: ${condition}`, async () => {
+      const f = await fixture();
+      writeFileSync(join(f.path, '.gitignore'), 'FAIL-evidence.txt\nworker.pid\nruntime/\n.codegraph/*\n');
+      gitAt(f.path, 'add', '.gitignore', '.codegraph/codegraph.db-wal');
+      gitAt(f.path, 'commit', '-m', 'retain runtime evidence'); gitAt(f.path, 'push');
+      const before = gitAt(f.path, 'rev-parse', 'HEAD');
+      const record = managedWorktreeRecordPath(f.path);
+      const custody = readFileSync(record, 'utf8');
+      const remote = join(root, `advance-${f.number}`);
+      git('worktree', 'add', '--detach', remote, `origin/feature/${f.number}`);
+      const added = condition === 'ignored collision' ? 'FAIL-evidence.txt' : 'remote.txt';
+      writeFileSync(join(remote, added), 'maintainer repair\n');
+      gitAt(remote, 'add', ...(condition === 'ignored collision' ? ['-f'] : []), added);
+      gitAt(remote, 'commit', '-m', 'maintainer repair');
+      gitAt(remote, 'push', 'origin', `HEAD:refs/heads/feature/${f.number}`);
+      const target = gitAt(remote, 'rev-parse', 'HEAD');
+      f.finish();
+      const claims = store.snapshot().claims;
+      const ctx = f.builder();
+      if (condition === 'authority lost before merge') {
+        const snapshot = ctx.deps.managedWorktree!.snapshot;
+        let reads = 0;
+        ctx.deps.managedWorktree!.snapshot = async () => {
+          if (++reads > 1) throw new Error('authority unavailable');
+          return snapshot();
+        };
+      }
+      const execute = ctx.deps.execSync;
+      ctx.deps.execSync = ((cmd: string, options: any) => {
+        if (condition === 'merge failure' && cmd.startsWith('git merge --ff-only')) throw new Error('fast-forward failed');
+        return execute(cmd, options);
+      }) as typeof execSync;
+      f.commands.length = 0;
+      assert.deepEqual(await setupBranchAndWorktree(ctx), { ok: condition === 'clean' });
+      assert.equal(gitAt(f.path, 'rev-parse', 'HEAD'), condition === 'clean' ? target : before);
+      assert.equal(ctx.worktreeDir, f.path);
+      assert.deepEqual(store.snapshot().claims, claims);
+      assert.match(readFileSync(join(f.path, 'FAIL-evidence.txt'), 'utf8'), /gate FAIL/);
+      assert.equal(readFileSync(join(f.path, '.codegraph', 'codegraph.db-shm'), 'utf8'), 'retained SHM bytes\n');
+      assert.equal(readFileSync(record + '.' + createHash('sha256').update(f.prior.id).digest('hex'), 'utf8'), custody);
+      if (condition !== 'clean') assert.equal(readFileSync(record, 'utf8'), custody);
+      assert.ok(!f.commands.some(cmd => /worktree (add|remove|move)|branch -f|reset|git add|git push/.test(cmd)));
+      if (condition === 'clean') assert.ok(f.commands.includes(`git merge --ff-only --no-overwrite-ignore ${target}`));
+    });
+  }
   for (const condition of ['unknown worker', 'invented worker', 'active worker', 'lost authority', 'unreadable status', 'unreadable operation state', 'unreadable branch lock', 'incomplete operation paths', 'ambiguous holders', 'ownership changed', 'locked', ...IN_PROGRESS_GIT_PATHS, 'branch lock', 'diverged', 'behind origin', 'personal path', 'aliased path', 'wrong repository', 'recorded branch mismatch', 'shared CodeGraph symlink']) {
     await t.test(`refuses ${condition} without changing retained files or Git history`, async () => {
       const f = await fixture();

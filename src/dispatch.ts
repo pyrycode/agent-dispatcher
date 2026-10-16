@@ -3672,7 +3672,18 @@ export async function setupBranchAndWorktree(
         console.log(`   📌 Reusing local branch ${branchName} (already at origin)`);
         break;
       case "fast-forward-from-origin":
-        execSync(`git branch -f ${branchName} origin/${branchName}`, { cwd: repoRoot, stdio: "pipe" });
+        if (ctx.deps.managedWorktree && ownReuse.reuse) {
+          // Recheck custody and local state immediately before advancing the
+          // retained tree. Use the inspected commit, preserving ignored evidence.
+          await confirmManagedWorktree(ctx, worktreeDir);
+          const fresh = decideOwnReuse(ctx, heldWorktrees, branchAction, true);
+          if (!fresh.reuse) throw new Error(fresh.reason);
+          const head = String(execSync("git rev-parse HEAD", { cwd: worktreeDir, encoding: "utf-8", stdio: "pipe" })).trim();
+          if (head !== localSha || !/^[a-f0-9]{40,64}$/.test(originSha)) throw new Error("Retained branch changed before fast-forward");
+          execSync(`git merge --ff-only --no-overwrite-ignore ${originSha}`, { cwd: worktreeDir, stdio: "pipe", timeout: 30_000 });
+        } else {
+          execSync(`git branch -f ${branchName} origin/${branchName}`, { cwd: repoRoot, stdio: "pipe" });
+        }
         console.log(`   🚀 Fast-forwarded local ${branchName} to origin/${branchName}`);
         break;
       case "abort-local-strictly-ahead":
