@@ -2,8 +2,24 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {FleetStore} from './fleet-store.js';
 import {validateTaskRequest} from './recovery-tasks.js';
+import {FleetClient,serveFleet} from './fleet-http.js';
+import {MachineManager} from './machine-manager.js';
 
 const revision='a'.repeat(40);
+test('Mobile support runs on its board when Core is drained',async t=>{
+ const store=new FleetStore(':memory:',{hp:{heavyLimit:1,combinedLimit:2}});
+ const server=await serveFleet(store,{hp:'machine-test'},'operator-test',0,'127.0.0.1');
+ t.after(async()=>{await new Promise<void>(r=>server.close(()=>r()));store.close();});
+ const address=server.address();assert.ok(address&&typeof address!=='string');
+ const core='pyrycode/pyrycode',mobile='pyrycode/pyrycode-mobile';
+ store.reportMachineCapabilities('hp',[],[core,mobile]);
+ store.setDesired({machines:['hp'],project:core,change:{work:'drained'}});
+ const task=store.tasks.request(mobile+'#2169',{recipe:'mobile-scripted-evidence',revision,capability:'mobile-android',reason:'Exact native evidence'});
+ store.tasks.report('hp',{capabilities:['mobile-android'],ready:true});
+ const manager=new MachineManager({machine:'hp',projects:[core,mobile],heavyLimit:1,combinedLimit:2},new FleetClient(`http://127.0.0.1:${address.port}`,'machine-test'));
+ const jobs=await manager.support('native');assert.equal(jobs.length,1);
+ assert.equal(jobs[0].task.id,task.id);assert.equal(jobs[0].run.project,mobile);
+});
 for(const recipe of ['mobile-scripted-evidence','mobile-in-depth'] as const) {
  test(recipe+' is restricted to a pushed Mobile revision and Mobile Android readiness',()=>{
   const request={recipe,revision,capability:'mobile-android' as const,reason:'Run the unchanged native candidate'};
