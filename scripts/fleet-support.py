@@ -752,6 +752,12 @@ class SupportSupervisor:
         self.rpc('capabilities',{'machine':state['machine'],'record':self.capability_record(state,{container})})
 
     def route_ready(self,route):
+        if route.get('capability')=='mobile-android':
+            # The native container mounts both runners even though its own
+            # container is separate from the product dispatchers.
+            for project in ['pyrycode/pyrycode','pyrycode/pyrycode-mobile']:
+                receipt=Path(self.config['stateDirectory'])/(project.replace('/','_')+'.json')
+                if receipt.exists() and operation_open(json.loads(receipt.read_text())):return False
         if route.get('container'):
             for project,cfg in self.config.get('projects',{}).items():
                 if cfg.get('container')!=route['container']:continue

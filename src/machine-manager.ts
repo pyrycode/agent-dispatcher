@@ -286,8 +286,11 @@ export class MachineManager {
   async support(session:string):Promise<Array<{task:RecoveryTask;run:FleetRun}>> {
     if(!this.claims.call||!session||session.length>200) throw new Error('Support scheduling requires a configured operator');
     const tasks=await this.claims.call<RecoveryTask[]>('/tasks/queue',{});
-    const project=this.config.projects.includes('pyrycode/pyrycode')?'pyrycode/pyrycode':this.config.projects[0];
-    this.supportOffers={session,at:this.now(),work:tasks.map(task=>({project,ticket:`${project}#@task-${task.id}`,role:'recovery-task',resource:task.request.recipe==='platform-probe'?'light':'heavy',locks:[],key:task.id,order:-5,recovery:true,recoveryError:true,supportTaskId:task.id,parentTicket:task.ticket}))};
+    const fallback=this.config.projects.includes('pyrycode/pyrycode')?'pyrycode/pyrycode':this.config.projects[0];
+    this.supportOffers={session,at:this.now(),work:tasks.map(task=>{
+      const source=task.ticket.split('#')[0],project=this.config.projects.includes(source)?source:fallback;
+      return {project,ticket:`${project}#@task-${task.id}`,role:'recovery-task',resource:task.request.recipe==='platform-probe'?'light':'heavy',locks:[],key:task.id,order:-5,recovery:true,recoveryError:true,supportTaskId:task.id,parentTicket:task.ticket};
+    })};
     await this.tick();
     const state=await this.claims.snapshot();
     const active=state.runs.filter(r=>r.machine===this.config.machine&&r.session===session&&r.supportTaskId);

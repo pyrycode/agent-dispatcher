@@ -12,6 +12,19 @@ SHA = 'a' * 40
 
 
 class MobileCaptureTests(unittest.TestCase):
+    def test_mobile_route_waits_for_both_mounted_runner_updates(self):
+        with tempfile.TemporaryDirectory() as d:
+            route={'capability':'mobile-android','container':'native'}
+            supervisor=m.SupportSupervisor(object(),{'stateDirectory':d,'projects':{},'recoveryTasks':{}})
+            for project in ['pyrycode_pyrycode','pyrycode_pyrycode-mobile']:
+                receipt=Path(d,project+'.json')
+                receipt.write_text(json.dumps({'phase':'draining'}))
+                with patch.object(m,'route_available',return_value=True):
+                    self.assertFalse(supervisor.route_ready(route))
+                receipt.write_text(json.dumps({'phase':'complete'}))
+            with patch.object(m,'route_available',return_value=True):
+                self.assertTrue(supervisor.route_ready(route))
+
     def run_capture(self, recipe, report=None, code=0):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
