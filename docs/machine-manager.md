@@ -648,6 +648,22 @@ Every automatic clear, retirement and skipped record is appended to `housekeepin
 
 Supervisor operation summaries are published to the existing claim authority. Only the authenticated computer can submit its summary. Reports contain phases and reasons, without commands, credentials or ownership records. The existing five-minute board-watch timer reads the consolidated decision report and uses its existing Pyrycode-client delivery path. No Codex reporting heartbeat is needed.
 
+## Ticket testing operating system
+
+Since 2026-10-16, each ticket runs the applicable tests on the operating system
+running its implementation. A Linux ticket needs Linux results. A macOS ticket
+needs macOS results. Do not require or request the other operating system, even
+when older issue criteria or repository instructions ask for both. Every normal
+agent role receives this operator policy after its role instructions. Recovery
+receives the same policy and judges the implementation computer's evidence.
+
+Keep normal assertions, security checks, live acceptance and device checks.
+Record the tested operating system. Omitted second-OS checks are outside the
+ticket's verification scope, never reported as passed. An operating-system bug
+still uses its existing `requires:linux` or `requires:macos` placement. Native
+routes remain available for checks within that scope and device work. Existing
+workers and reservations still require proof of stopping before release.
+
 ## Executable recovery work
 
 An admitted recovery can return `coordinate` with a fixed `task` request instead

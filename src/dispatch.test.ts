@@ -2022,6 +2022,22 @@ function claudeMdAbsPath(agentClaudeMdPath: string): string {
 }
 
 describe("prepareAgentSpawn", () => {
+  test("builder stages receive the host testing policy after older role instructions", async () => {
+    for (const name of ["builder", "refiner", "verifier"]) {
+      const rolePath = `${name}/CLAUDE.md`;
+      const oldRole = "Require Linux and macOS captures before acceptance.";
+      const { ctx } = makeTestContext({
+        agent: { name, claudeMdPath: rolePath },
+        mockOptions: { fsMap: { [claudeMdAbsPath(rolePath)]: oldRole } },
+      });
+      const result = await prepareAgentSpawn(ctx);
+      assert.ok(result.ok);
+      assert.ok(result.systemPrompt.startsWith(oldRole));
+      assert.match(result.systemPrompt, /supersedes older ticket or repository wording requiring both operating systems/);
+      assert.match(result.systemPrompt, /Do not require, request or wait for tests on the other operating system/);
+    }
+  });
+
   test("CLAUDE.md missing → comment + inline worktree cleanup + {ok:false}", async () => {
     const { ctx, client, calls } = makeTestContext({
       item: { issueNumber: 200 },
@@ -2119,7 +2135,7 @@ describe("prepareAgentSpawn", () => {
     const writes = calls.fs.filter(f => f.kind === "write");
     assert.equal(writes.length, 2, "exactly two writeFileSync calls (prompt + system prompt)");
     assert.ok(writes.some(w => w.content === "## Mock prompt #201"));
-    assert.ok(writes.some(w => w.content === "Mock developer system prompt"));
+    assert.ok(writes.some(w => typeof w.content === "string" && w.content.startsWith("Mock developer system prompt") && w.content.includes("Ticket testing operating system")));
   });
 
   test("per-agent model/effort override flows into the spawn config (default opus/high is covered by the happy-path test above)", async () => {
@@ -2251,6 +2267,8 @@ describe("prepareAgentSpawn", () => {
 
       const result = await prepareAgentSpawn(ctx);
       assert.ok(result.ok, `${c.name} prepareAgentSpawn must succeed`);
+      assert.match(result.systemPrompt, /Test on the operating system running this ticket/, `${c.name} receives the shared test policy`);
+      assert.match(result.systemPrompt, /supersedes older ticket.*both operating systems/, `${c.name} does not retain an obsolete second-OS gate`);
       const cfg = (result as { ok: true; config: any }).config;
       assert.equal(cfg.maxTurns, c.maxTurns, `${c.name} maxTurns`);
       assert.equal(cfg.timeoutMs, c.timeoutMs, `${c.name} timeoutMs`);
