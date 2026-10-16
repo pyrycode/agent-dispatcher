@@ -141,6 +141,8 @@ import {
   type VerifierGatePass,
 } from "./verifier-gate-reuse.js";
 import { outOfTimeComment, ReviewBudgetExhaustedError, reviewBudgetStop, type ReviewProgress } from "./verifier-out-of-time.js";
+import { gatePrefixKey, retainedGatePrefix, retainableGateEvidence, type GatePrefix, type PassedGate } from "./verifier-gate-prefix.js";
+import { BASELINE_TESTS_JSON_PLACEHOLDER, buildBaselineJSONFilter } from "./gate-output.js";
 import {
   attributableFailures,
   buildBaselineRecordComment,
@@ -6291,13 +6293,19 @@ export async function runVerifierGates(opts: {
   /** Look for a toolchain mismatch in a red gate's output. Defaults to the
    *  infrastructure breaker's switch, `PYRY_INFRA_BREAKER`. */
   detectInfra?: boolean;
+  /** A validated raw-green prefix. No failing or excused step belongs here. */
+  passedPrefix?: readonly PassedGate[];
+  onPassed?: (pass: PassedGate, index: number) => void;
+  /** Preserve every raw red before a rerun or baseline assessment can excuse it. */
+  onFailed?: (logs: [string, string]) => void;
   deps: Pick<DispatchDeps, "spawnGate" | "readFileSync">;
 }): Promise<VerifierGatesOutcome> {
   const logsDir = opts.logsDir ?? LOGS_DIR;
-  const summary: string[] = [];
-  const logPaths: string[] = [];
+  const prefix = opts.passedPrefix ?? [];
+  const summary: string[] = prefix.map(p => p.summary);
+  const logPaths: string[] = prefix.flatMap(p => p.logs);
   const baseline: GateBaselineAssessment[] = [];
-  for (let i = 0; i < opts.gates.length; i++) {
+  for (let i = prefix.length; i < opts.gates.length; i++) {
     const gate = opts.gates[i]!;
     const n = opts.logNumbers?.[i] ?? i + 1;
     const stdoutPath = resolve(logsDir, `verifier-gate_#${opts.issueNumber}_${n}.log`);
@@ -6314,6 +6322,7 @@ export async function runVerifierGates(opts: {
       stderrPath,
     });
     const failed = outcome.spawnError !== null || outcome.timedOut || outcome.exitCode !== 0;
+    if (failed && opts.onFailed) opts.onFailed([stdoutPath, stderrPath]);
     const verdict = outcome.spawnError !== null
       ? `spawn error: ${outcome.spawnError}`
       : outcome.timedOut
@@ -6368,6 +6377,13 @@ export async function runVerifierGates(opts: {
       continue;
     }
     summary.push(`${failed ? "✗" : "✓"} ${gate} (${verdict})`);
+    if (!failed && opts.onPassed) {
+      try {
+        const out = String(opts.deps.readFileSync(stdoutPath, "utf-8"));
+        const err = String(opts.deps.readFileSync(stderrPath, "utf-8"));
+        opts.onPassed({ gate, summary: summary.at(-1)!, logs: [stdoutPath, stderrPath], evidence: gatePrefixKey("", [], {}, out + "\u0000" + err) }, i);
+      } catch { /* Missing evidence cannot be retained. The gate result stands. */ }
+    }
     if (failed) {
       const combined = [readTail(stdoutPath), readTail(stderrPath)]
         .filter((s) => s.length > 0)
@@ -6401,6 +6417,10 @@ function loadedRerunCommand(
   format: GateOutputFormat,
   load: RerunLoad | null | undefined,
 ): { filter: string | null; command: string | null; load: RerunLoad | null } {
+  if (template.includes(BASELINE_TESTS_JSON_PLACEHOLDER)) {
+    const filter = buildBaselineJSONFilter(failedNames);
+    return { filter, command: filter === null ? null : buildBaselineCommand(template, filter), load: null };
+  }
   const plain = buildBaselineFilter(failedNames, format);
   if (plain === null) return { filter: null, command: null, load: null };
   const loaded = load && load.tests.length > 0 ? buildBaselineFilter(failedNames, format, load.tests) : plain;
@@ -6874,6 +6894,23 @@ function mergedWorktreeHead(ctx: DispatchContext): { commit: string; tree: strin
   }
 }
 
+/** Partial reuse is opt-in: the consumer must describe its external inputs.
+ * An unreadable snapshot or any worktree change disables it. */
+function verifierPrefixInputs(ctx: DispatchContext, gates: readonly string[], tree: string): string | null {
+  const command = process.env.PYRY_VERIFIER_GATE_INPUTS_CMD?.trim();
+  if (!command || !verifierGateReuseEnabled(process.env) || ctx.pendingMerge) return null;
+  try {
+    const git = ctx.deps.spawnSync("git", ["status", "--porcelain", "--untracked-files=normal"], { cwd: ctx.agentCwd, encoding: "utf8", timeout: 15_000 });
+    if (git.error || git.status !== 0 || git.stdout.toString().trim()) return null;
+    const current = ctx.deps.spawnSync("git", ["rev-parse", "HEAD^{tree}"], { cwd: ctx.agentCwd, encoding: "utf8", timeout: 15_000 });
+    if (current.error || current.status !== 0 || current.stdout.toString().trim() !== tree) return null;
+    const env = buildGateSpawnEnv(process.env);
+    const snapshot = ctx.deps.spawnSync("sh", ["-c", command], { cwd: ctx.agentCwd, env, encoding: "utf8", timeout: 15_000 });
+    if (snapshot.error || snapshot.status !== 0 || !snapshot.stdout.toString().trim()) return null;
+    return gatePrefixKey(tree, gates, env, command + "\n" + process.execPath + "\n" + process.version + "\n" + snapshot.stdout.toString());
+  } catch { return null; }
+}
+
 /**
  * The recorded gate pass for this issue. Any read or parse failure returns
  * null, and the caller runs the gates as normal.
@@ -6904,20 +6941,29 @@ function readReusableGatePass(
   pass: VerifierGatePass | null,
   tree: string,
   gatesHash: string,
+  inputsHash?: string,
 ): VerifierGatePass | null {
   if (pass === null) return null;
+  if (inputsHash !== undefined && pass.evidenceHash !== verifierEvidenceHash(ctx, pass.logPaths)) return null;
   const issueNumber = ctx.item.issueNumber;
   const decision = decideVerifierGateReuse({
     pass,
     issueNumber,
     tree,
     gatesHash,
+    inputsHash,
     nowMs: Date.now(),
     logExists: (p) => ctx.deps.existsSync(p),
   });
   if (decision.reuse) return decision.pass;
   console.log(`   🧪 Recorded gate pass for #${issueNumber} not reused (${decision.reason})`);
   return null;
+}
+
+function verifierEvidenceHash(ctx: DispatchContext, paths: readonly string[]): string | null {
+  try {
+    return gatePrefixKey("", [], {}, JSON.stringify(paths.map(path => [path, String(ctx.deps.readFileSync(path, "utf-8"))])));
+  } catch { return null; }
 }
 
 /**
@@ -6931,19 +6977,15 @@ function reusableGatesForNextRun(ctx: DispatchContext): { commit: string; untilM
   if (gates.length === 0 || !verifierGateReuseEnabled(process.env)) return null;
   const head = mergedWorktreeHead(ctx);
   if (head === null) return null;
+  const strictInputs = !!process.env.PYRY_VERIFIER_GATE_INPUTS_CMD?.trim();
+  const inputsHash = strictInputs ? verifierPrefixInputs(ctx, gates, head.tree) : undefined;
+  if (inputsHash === null) return null;
   const pass = readRecordedGatePass(ctx, resolve(LOGS_DIR, verifierGatePassFileName(ctx.item.issueNumber)));
   if (pass === null) return null;
-  const decision = decideVerifierGateReuse({
-    pass,
-    issueNumber: ctx.item.issueNumber,
-    tree: head.tree,
-    gatesHash: hashGateList(gates),
-    nowMs: Date.now(),
-    logExists: (p) => ctx.deps.existsSync(p),
-  });
-  if (!decision.reuse) return null;
-  const passedAtMs = Date.parse(decision.pass.passedAt);
-  return Number.isNaN(passedAtMs) ? null : { commit: decision.pass.commit, untilMs: passedAtMs + VERIFIER_GATE_REUSE_MAX_AGE_MS };
+  const reused = readReusableGatePass(ctx, pass, head.tree, hashGateList(gates), inputsHash);
+  if (reused === null) return null;
+  const passedAtMs = Date.parse(reused.passedAt);
+  return Number.isNaN(passedAtMs) ? null : { commit: reused.commit, untilMs: passedAtMs + VERIFIER_GATE_REUSE_MAX_AGE_MS };
 }
 
 /**
@@ -7199,11 +7241,14 @@ async function runConfiguredPreSpawnGates(
   // HEAD unknown, nothing is read or recorded and the gates run as before.
   const passFile = resolve(LOGS_DIR, verifierGatePassFileName(item.issueNumber));
   const gatesHash = hashGateList(gates);
-  const head = verifierGateReuseEnabled(process.env) ? mergedWorktreeHead(ctx) : null;
+  let head = verifierGateReuseEnabled(process.env) ? mergedWorktreeHead(ctx) : null;
+  const strictInputs = !!process.env.PYRY_VERIFIER_GATE_INPUTS_CMD?.trim();
+  const inputsHash = strictInputs && head !== null ? verifierPrefixInputs(ctx, gates, head.tree) : undefined;
+  if (strictInputs && !inputsHash) head = null;
   let docsOnly: ReturnType<typeof readDocsOnlyGateReuse> = null;
   if (head !== null) {
     const recordedPass = readRecordedGatePass(ctx, passFile);
-    const reused = readReusableGatePass(ctx, recordedPass, head.tree, gatesHash);
+    const reused = readReusableGatePass(ctx, recordedPass, head.tree, gatesHash, inputsHash ?? undefined);
     if (reused !== null) {
       const sameCommit = reused.commit === head.commit;
       console.log(`   ♻️  Pre-${agent.name} gates already passed at ${reused.passedAt} on ${reused.commit.slice(0, 12)}${sameCommit ? "" : `, same files as ${head.commit.slice(0, 12)}`}; reusing that result`);
@@ -7226,7 +7271,7 @@ async function runConfiguredPreSpawnGates(
     }
     // Only documentation changed since the recorded pass (#134): the code
     // gates' results stand, and only the documentation gates run below.
-    docsOnly = readDocsOnlyGateReuse(ctx, recordedPass, head.tree, gates, gatesHash);
+    if (!strictInputs) docsOnly = readDocsOnlyGateReuse(ctx, recordedPass, head.tree, gates, gatesHash);
   }
   const toRun = docsOnly?.rerun ?? gates;
   const docsOnlyNote = (): string => {
@@ -7269,6 +7314,27 @@ async function runConfiguredPreSpawnGates(
     }
     : undefined;
 
+  const prefixFile = resolve(LOGS_DIR, `verifier-gate_#${item.issueNumber}.prefix.json`);
+  const inputKey = head !== null && docsOnly === null ? inputsHash ?? null : null;
+  const readEvidence = (path: string): string | null => {
+    try { return String(ctx.deps.readFileSync(path, "utf-8")); } catch { return null; }
+  };
+  const prefix = inputKey === null ? [] : retainedGatePrefix(readEvidence(prefixFile) ?? "", inputKey, gates, Date.now(), readEvidence);
+  const reusedPrefixCount = prefix.length;
+  let prefixAt = Date.now();
+  if (prefix.length) {
+    // Keep the earliest evidence age when adding later passing steps.
+    prefixAt = (JSON.parse(readEvidence(prefixFile)!) as GatePrefix).passedAt;
+    console.log(`   ♻️ Retaining ${prefix.length} completed gate(s) from the failed attempt; failed and unfinished gates run again`);
+  }
+  const onPassed = inputKey === null || head === null ? undefined : (pass: PassedGate, index: number) => {
+    if (index !== prefix.length || verifierPrefixInputs(ctx, gates, head.tree) !== inputKey) return;
+    const format = formats.get(pass.gate)?.format;
+    if (!retainableGateEvidence(readEvidence(pass.logs[0]) ?? "", format)) return;
+    prefix.push(pass);
+    ctx.deps.writeFileSync(prefixFile, JSON.stringify({ key: inputKey, passedAt: prefixAt, gates: prefix } satisfies GatePrefix, null, 2) + "\n");
+  };
+
   if (docsOnly !== null) {
     console.log(`   ♻️  Pre-${agent.name} code gates already passed at ${docsOnly.pass.passedAt} on ${docsOnly.pass.commit.slice(0, 12)}; only documentation changed since (${docsOnly.files.length} file(s)), reusing that result`);
   }
@@ -7283,6 +7349,18 @@ async function runConfiguredPreSpawnGates(
     cwd: agentCwd,
     issueNumber: item.issueNumber,
     assessRed,
+    passedPrefix: prefix,
+    onPassed,
+    onFailed: paths => {
+      const attempt = Date.now();
+      for (const path of paths) {
+        const raw = readEvidence(path);
+        if (raw !== null) {
+          try { ctx.deps.writeFileSync(`${path}.failure-${attempt}.log`, raw); }
+          catch (error) { console.warn(`Could not archive original red-gate output ${path}: ${error}`); }
+        }
+      }
+    },
     // A rerun gate keeps its number in the full list, so the reused gates'
     // logs, the evidence the pass rests on, are not overwritten.
     logNumbers: docsOnly !== null ? toRun.map((g) => gates.indexOf(g) + 1) : undefined,
@@ -7300,7 +7378,7 @@ async function runConfiguredPreSpawnGates(
     `Reused the pass recorded at ${docsOnly.pass.passedAt} on commit ${docsOnly.pass.commit} (tree ${docsOnly.pass.tree}) for every gate except the documentation gates; only documentation changed since: ${docsOnly.files.join(", ")}`,
     ...gates.flatMap((g, i) => (docsOnly!.rerun.includes(g) ? [] : [docsOnly!.pass.summary[i] ?? `✓ ${g}`])),
   ];
-  ctx.deps.writeLog(logFile, "GATES", [...docsOnlyLog, ...result.summary, ...baselineLog].join("\n"));
+  ctx.deps.writeLog(logFile, "GATES", [...(reusedPrefixCount ? [`${reusedPrefixCount} completed green step(s) retained from a matching input snapshot; original logs preserved. Failed and unfinished steps ran again.`] : []), ...docsOnlyLog, ...result.summary, ...baselineLog].join("\n"));
   const baselineTicket = await recordBaselineOnMainFailureTicket(ctx, result.baseline);
 
   if (result.ok && result.baseline.length > 0) {
@@ -7329,7 +7407,7 @@ async function runConfiguredPreSpawnGates(
     console.log(`   ✅ Pre-${agent.name} gates green`);
     // Only a full pass is recorded. A red, timed-out or unspawnable gate
     // never is, so a retry after a flaky failure runs the gates again.
-    if (head !== null) {
+    if (head !== null && (!strictInputs || (prefix.length === gates.length && verifierPrefixInputs(ctx, gates, head.tree) === inputsHash))) {
       // A docs-only pass is recorded for this tree too, so a retry on the
       // same files is an exact match. It combines the reused code gates'
       // lines with the rerun documentation gates' lines, names the same
@@ -7342,11 +7420,12 @@ async function runConfiguredPreSpawnGates(
         tree: head.tree,
         gatesHash,
         gates,
-        passedAt: docsOnly?.pass.passedAt ?? new Date().toISOString(),
+        passedAt: docsOnly?.pass.passedAt ?? (reusedPrefixCount ? new Date(prefixAt).toISOString() : new Date().toISOString()),
         summary: docsOnly === null
           ? result.summary
           : gates.map((g, i) => (docsOnly!.rerun.includes(g) ? rerunLine(g) : docsOnly!.pass.summary[i]) ?? `✓ ${g}`),
         logPaths: docsOnly?.pass.logPaths ?? result.logPaths,
+        ...(inputsHash ? { inputsHash, evidenceHash: verifierEvidenceHash(ctx, result.logPaths) ?? undefined } : {}),
       };
       try {
         ctx.deps.writeFileSync(passFile, JSON.stringify(pass, null, 2) + "\n");
