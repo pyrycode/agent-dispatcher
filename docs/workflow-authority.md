@@ -83,6 +83,8 @@ Archived GitHub cards stay archived. Their issue labels still update, but GitHub
 refuses column and position changes while archived. Restoring a card allows the
 next content scan to resume its column display updates. Archiving is a display
 choice and does not change the database workflow or pause scheduling.
+Position updates use the nearest preceding unarchived card, or the top when
+there is none. Archived neighbours do not prevent dependency publication.
 
 ## Migration
 

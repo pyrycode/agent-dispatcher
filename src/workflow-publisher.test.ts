@@ -119,6 +119,15 @@ function fakeGitHub(
       }
       if (query.includes("updateProjectV2ItemPosition")) {
         calls.push(`position ${v.input.itemId}`);
+        calls.push(`after ${v.input.itemId} ${v.input.afterId ?? "top"}`);
+        if (
+          v.input.afterId &&
+          store.workflow.find(v.input.afterId)?.item.archived
+        )
+          return validation(
+            "updateProjectV2ItemPosition",
+            "The item is archived and cannot be used as a position anchor",
+          );
         if (!/items\((first|last):/.test(query))
           return Response.json({
             data: { updateProjectV2ItemPosition: { items: null } },
@@ -244,6 +253,39 @@ test("a repositioned ticket publishes with a bounded items page", async (t) => {
   await new WorkflowPublisher(store, github, { now: () => 1000 }).tick();
   assert.deepEqual(pendingTickets(store), []);
   assert.ok(calls.includes("position P1"));
+});
+
+test("archived neighbours do not hide a repositioned ticket's blockers", async (t) => {
+  const store = fixture(t);
+  store.workflow.import(config, [
+    item(1),
+    item(2, { archived: true }),
+    item(3, { archived: true }),
+    item(4, { positioned: true, blockedBy: blocked(5) }),
+    item(5),
+  ]);
+  const { github, calls, edges } = fakeGitHub(store);
+  await new WorkflowPublisher(store, github, { now: () => 1000 }).tick();
+  assert.ok(calls.includes("after P4 P1"));
+  assert.deepEqual([...edges.get("I4")!], ["I5"]);
+  assert.deepEqual(pendingTickets(store), []);
+  assert.equal(store.workflow.get("org/relay#2").archived, true);
+  assert.equal(store.workflow.get("org/relay#3").archived, true);
+});
+
+test("a repositioned ticket uses the top when all preceding cards are archived", async (t) => {
+  const store = fixture(t);
+  store.workflow.import(config, [
+    item(1, { archived: true }),
+    item(2, { archived: true }),
+    item(3, { positioned: true, blockedBy: blocked(4) }),
+    item(4),
+  ]);
+  const { github, calls, edges } = fakeGitHub(store);
+  await new WorkflowPublisher(store, github, { now: () => 1000 }).tick();
+  assert.ok(calls.includes("after P3 top"));
+  assert.deepEqual([...edges.get("I3")!], ["I4"]);
+  assert.deepEqual(pendingTickets(store), []);
 });
 
 test("one failing ticket does not hold the rest of the batch and waits with backoff", async (t) => {
