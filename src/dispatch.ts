@@ -158,6 +158,7 @@ import {
 import { activeStageSet, resolveStageSet } from "./stage-sets.js";
 import { resolveEffort } from "./effort-policy.js";
 import {
+  realClaudeGateEnabled,
   REAL_CLAUDE_GATE_FAIL_COLUMN,
   REAL_CLAUDE_GATE_RUN_FROM_COLUMN,
   INFRA_FAILURE_LABEL,
@@ -387,11 +388,14 @@ const CURATION_COOLDOWN_MS =
 // Like every other module-top env read in this file, these must stay below
 // the `config()` call near the top — see the note there for why.
 //
-// The command is the on/off switch. Empty means the dispatcher does not run
+// ENABLED=0 retires both label parking and execution for this consumer.
+// Otherwise, an empty command means the dispatcher does not run
 // gates and a gated ticket waits in Inbox for an operator, exactly as before
 // 2026-08-07. That default is what lets the whole feature land on a live
 // dispatcher as a strict no-op.
-const REAL_CLAUDE_GATE_CMD = (process.env.PYRY_REAL_CLAUDE_GATE_CMD ?? "").trim();
+const REAL_CLAUDE_GATE_ENABLED = realClaudeGateEnabled(process.env);
+const REAL_CLAUDE_GATE_CMD = REAL_CLAUDE_GATE_ENABLED
+  ? (process.env.PYRY_REAL_CLAUDE_GATE_CMD ?? "").trim() : "";
 
 // How to read what the command wrote. The command MUST emit per-test
 // machine-readable output: for Go that means `go test -json`, and the bare
@@ -400,6 +404,7 @@ const REAL_CLAUDE_GATE_CMD = (process.env.PYRY_REAL_CLAUDE_GATE_CMD ?? "").trim(
 // cannot be counted, and the executed-test floor is the entire point of the
 // gate. This is a contract, not a detail.
 const REAL_CLAUDE_GATE_FORMAT: GateOutputFormat | null = (() => {
+  if (!REAL_CLAUDE_GATE_ENABLED) return null;
   const raw = (process.env.PYRY_REAL_CLAUDE_GATE_FORMAT ?? "go-json").trim();
   if (isGateOutputFormat(raw)) return raw;
   console.error(
@@ -413,6 +418,7 @@ const REAL_CLAUDE_GATE_FORMAT: GateOutputFormat | null = (() => {
 // in its agents repo (gate-test-evidence.ts). Null when the file is present but
 // invalid: the gate is then off, loudly, rather than judging without the rules.
 const REAL_CLAUDE_GATE_TEST_EVIDENCE: readonly TestEvidenceRule[] | null = (() => {
+  if (!REAL_CLAUDE_GATE_ENABLED) return [];
   const { rules, error } = loadTestEvidenceRules(agentsRepoRoot);
   if (error === null) return rules;
   console.error(`   ❌ ${error}. The real-claude gate is disabled until the file is fixed.`);
@@ -8933,6 +8939,7 @@ async function runBranchRerun(opts: {
  * and gated tickets park for an operator exactly as they did before.
  */
 export function makeRealClaudeGateRunner(): RealClaudeGateRunner | null {
+  if (!REAL_CLAUDE_GATE_ENABLED) return null;
   if (REAL_CLAUDE_GATE_CMD === "") return null;
   if (REAL_CLAUDE_GATE_FORMAT === null) return null; // bad format, already reported
   if (REAL_CLAUDE_GATE_TEST_EVIDENCE === null) return null; // bad evidence rules, already reported
@@ -10756,7 +10763,9 @@ export async function pollLoop(): Promise<void> {
   // rather than discovered on the first gated ticket, hours later.
   const realClaudeGateRunner = makeRealClaudeGateRunner();
   console.log(
-    realClaudeGateRunner === null
+    !REAL_CLAUDE_GATE_ENABLED
+      ? `   Real-claude gate: retired for this consumer; needs-real-claude does not hold advancement (PYRY_REAL_CLAUDE_GATE_ENABLED=0)`
+      : realClaudeGateRunner === null
       ? `   Real-claude gate: not configured — gated tickets park in Inbox for an operator (PYRY_REAL_CLAUDE_GATE_CMD)`
       : `   Real-claude gate: enabled, floor ${REAL_CLAUDE_GATE_MIN_EXECUTED} executed test(s), ` +
         `${Math.round(REAL_CLAUDE_GATE_TIMEOUT_MS / 60_000)}min wall clock, format ${REAL_CLAUDE_GATE_FORMAT}` +
