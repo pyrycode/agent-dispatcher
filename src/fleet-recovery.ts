@@ -13,6 +13,8 @@ export interface RecoveryObservation {
   pause?: PauseRecord;
   familyHold?: string;
   assessmentPolicy?: number;
+  /** Only the claim authority supplies a retained-evidence investigation identity. */
+  investigationRevision?:string;
 }
 export type RecoveryAction = "wait" | "retry" | "rework" | "resume" | "refine" | "unblock" | "propose-close" | "coordinate" | "escalate";
 /** What should reopen a settled wait or operational escalation. Recovery task ids and full ticket references only. */
@@ -112,14 +114,17 @@ export function validateObservations(project: string, observations: RecoveryObse
     if (o.artifactRevision !== undefined && !/^[a-f0-9]{64}$/.test(o.artifactRevision)) throw new Error("Invalid artifact revision");
     if (o.evidenceRevision !== undefined && !/^[a-f0-9]{64}$/.test(o.evidenceRevision)) throw new Error("Invalid evidence revision");
     if (o.assessmentPolicy !== undefined && (!Number.isSafeInteger(o.assessmentPolicy) || o.assessmentPolicy < 1)) throw new Error("Invalid assessment policy");
+    if(o.investigationRevision!==undefined && !/^[a-f0-9]{64}$/.test(o.investigationRevision)) throw new Error('Invalid investigation identity');
     if (o.familyHold !== undefined && (typeof o.familyHold !== "string" || !o.familyHold.startsWith(`${project}#`) || !/^[1-9]\d*$/.test(o.familyHold.slice(project.length + 1)))) throw new Error("Invalid family hold");
     seen.add(o.ticket);
   }
 }
 export function recoveryFingerprint(o: RecoveryObservation): string {
-  return createHash("sha256").update(JSON.stringify([o.status, o.blocked,
+  const basis:unknown[]=[o.status, o.blocked,
     o.labels.filter(l => l !== "error:family-breaker" && (l === RECOVERY_RETURNED_INBOX || /^(error:|error-retry-count:|needs-human:|rework-count:|done:|needs-rework:|needs-real-claude$)/.test(l))).sort(),
-    o.evidenceRevision ?? null, o.artifactRevision ?? null, o.pause ?? null])).digest("hex");
+    o.evidenceRevision ?? null, o.artifactRevision ?? null, o.pause ?? null];
+  if(o.investigationRevision) basis.push(o.investigationRevision);
+  return createHash('sha256').update(JSON.stringify(basis)).digest('hex');
 }
 /**
  * True when the code owner's work has passed review since its last rework:
@@ -156,6 +161,7 @@ export function recoveryTrigger(o: RecoveryObservation): { reason: string; manua
   const errors = o.labels.filter(l => l.startsWith("error:") && l !== "error:family-breaker");
   if (errors.length) return { reason: errors.sort().join(", "), manual: false };
   if (o.blocked) return { reason: RECOVERY_DEPENDENCY_REASON, manual: false };
+  if(o.investigationRevision) return {reason:'Retained-evidence test investigation requested by builder',manual:false};
   if (o.labels.some(l => l.startsWith("error-retry-count:"))) return null;
   // The assigned repair already addresses these retained historical counts.
   // A new stage error still triggers diagnosis above.

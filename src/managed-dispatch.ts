@@ -19,13 +19,15 @@ import {taskBridge, readsNativeTasks, TASK_REQUEST_ROLES, type BridgeActions} fr
 import type { NativeTaskView } from "./native-task-hold.js";
 import { offerId } from "./machine-manager.js";
 import { NON_AGENT_ROLES, startsCodex, codexStartHoldMs, rearmCodexStartJitter, type CodexPauseState } from "./codex-throttle.js";
+import {bindTestContext} from './test-context.js';
+import {managedGoPath} from './managed-go.js';
 
 const DEFAULT_RESOURCE_CLASSES: Readonly<Record<string, ResourceClass>> = {
   builder: "medium", developer: "medium", refiner: "light", po: "light", documentation: "light",
 };
 export type CodexReportEvent = "rate-limited" | "clean";
 type CodexReporter = (event: CodexReportEvent) => Promise<CodexPauseState | null>;
-const currentRun = new AsyncLocalStorage<{ run: FleetRun; groups: Set<number>; taskSocket?: string; taskActions?: BridgeActions; githubEnv?:NodeJS.ProcessEnv; reportCodex?: CodexReporter;
+const currentRun = new AsyncLocalStorage<{ run: FleetRun; groups: Set<number>; testContexts?:Map<string,()=>void>; goPath?:ReturnType<typeof managedGoPath>; taskSocket?: string; taskActions?: BridgeActions; githubEnv?:NodeJS.ProcessEnv; reportCodex?: CodexReporter;
   requestedTasks?: () => string[]; ticketTasks?: () => Promise<NativeTaskView[]> }>();
 /**
  * Reports the current admitted run's Codex events to the fleet's Codex
@@ -40,6 +42,11 @@ export function managedRunRunner(): AgentRunner | undefined { return currentRun.
 export function managedTaskEnv(): NodeJS.ProcessEnv {
   const socket=currentRun.getStore()?.taskSocket;
   return {...currentRun.getStore()?.githubEnv,...(socket?{PYRY_TASK_SOCKET:socket}:{})};
+}
+/** Agent-only tool entry. It never changes the frozen socket role. */
+export function managedAgentEnv():NodeJS.ProcessEnv {
+ const path=currentRun.getStore()?.goPath?.path;
+ return {...managedTaskEnv(),...(path?{PATH:path,PYRY_TEST_PATH:path}:{})};
 }
 /** What the current run's task socket accepts: native check requests, native task reads, shared evidence reads, or none. */
 export function managedBridgeActions(): BridgeActions { return currentRun.getStore()?.taskActions ?? { request: false, read: false, evidence: false }; }
@@ -56,6 +63,15 @@ export async function managedTicketTasks(): Promise<NativeTaskView[] | null> {
 }
 /** The admitted run this code runs inside, or undefined outside a managed run. */
 export function managedRun(): FleetRun | undefined { return currentRun.getStore()?.run; }
+/** Bind only supported product worktrees after their actual Git setup completes. */
+export function bindManagedTestWorktree(root:string):void {
+ const store=currentRun.getStore();
+ if(!store || !['pyrycode/pyrycode','pyrycode/pyrycode-mobile'].includes(store.run.project))return;
+ if(!store.taskSocket)throw new Error('Managed test policy socket is unavailable');
+ store.testContexts??=new Map();
+ if(!store.testContexts.has(root))store.testContexts.set(root,bindTestContext(root,{runId:store.run.id,project:store.run.project,socket:store.taskSocket}));
+ if(store.run.project==='pyrycode/pyrycode' && TASK_REQUEST_ROLES.has(store.run.role) && !store.goPath)store.goPath=managedGoPath(root,process.env.PATH??'');
+}
 /** Native repair recipes use the same tracked-child completion rule as project workers. */
 export async function withManagedTaskRun<T>(run: FleetRun, work: () => Promise<T>): Promise<T> {
   return currentRun.run({run,groups:new Set()},async()=>{
@@ -363,7 +379,8 @@ export class ManagedDispatch {
         // reads the shared evidence of earlier runs, from any computer.
         const actions:BridgeActions={request:this.tasksEnabled && TASK_REQUEST_ROLES.has(run.role),
           read:this.tasksEnabled && readsNativeTasks(run.role),evidence:this.evidenceEnabled};
-        bridge=/#[1-9]\d*$/.test(run.ticket) && (actions.request || actions.read || actions.evidence) ? await taskBridge(this.connection,run,actions) : undefined;
+        const testPolicy=['pyrycode/pyrycode','pyrycode/pyrycode-mobile'].includes(run.project);
+        bridge=/#[1-9]\d*$/.test(run.ticket) && (testPolicy || actions.request || actions.read || actions.evidence) ? await taskBridge(this.connection,run,actions) : undefined;
         if(bridge){
           const store=currentRun.getStore()!;
           store.taskSocket=bridge.socket;store.taskActions=actions;store.requestedTasks=bridge.requested;
@@ -376,9 +393,11 @@ export class ManagedDispatch {
         completed = result !== false;
         return result;
       } finally {
-        if (bridge) await bridge.close();
         const groups = currentRun.getStore()!.groups;
         while ([...groups].some(managedGroupAlive)) await sleep(1000);
+        currentRun.getStore()!.goPath?.release();
+        for(const release of currentRun.getStore()!.testContexts?.values()??[])release();
+        if (bridge) await bridge.close();
         if (recovery) {
           // Keep the slot until fresh failure evidence and its successor offer
           // are recorded. The authority commits the incident with slot release.
@@ -470,13 +489,13 @@ export class ManagedDispatch {
   }
   async recoveryFacts(tickets: string[]) {
     const run=currentRun.getStore()?.run;
-    return this.connection.call<Array<{ ticket: string; pause?: PauseRecord; artifactRevision?: string; evidence: EvidenceRecord[]; coordination: CoordinationRecord[] }>>("/recovery/facts", {
+    return this.connection.call<Array<{ ticket: string; pause?: PauseRecord; artifactRevision?: string; evidence: EvidenceRecord[]; coordination: CoordinationRecord[]; investigation?:import('./test-investigation.js').TestInvestigation }>>("/recovery/facts", {
       tickets,...(run?.role==='recovery'?{project:this.project,session:run.session,runId:run.id}:{}),
     });
   }
   async hydrateRecovery(item: ProjectItem): Promise<ProjectItem> {
     const [facts] = await this.recoveryFacts([`${this.project}#${item.issueNumber}`]);
-    return { ...item, recoveryPause: facts.pause, artifactRevision: facts.artifactRevision };
+    return { ...item, recoveryPause: facts.pause, artifactRevision: facts.artifactRevision, testInvestigationRevision:facts.investigation?.id };
   }
   /**
    * A ticket's native tasks, newest first, read through the recovery facts

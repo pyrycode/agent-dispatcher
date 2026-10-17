@@ -188,6 +188,10 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
         if (!machine) return send(403,{error:'Admitted source worker required'});
         return send(200,store.requestTask(machine,body.session,body.project,body.runId,body.request));
       }
+      if(req.url==='/tasks/investigate') {
+        if(!machine) return send(403,{error:'Admitted source worker required'});
+        return send(200,store.requestInvestigation(machine,body.session,body.project,body.runId,body.request,evidence));
+      }
       if (req.url === '/tasks/read') {
         if (!machine) return send(403,{error:'Admitted source worker required'});
         return send(200,store.readTask(machine,body.session,body.project,body.runId,body.id,body.format));

@@ -68,6 +68,17 @@ export async function taskBridge(connection:JsonClient,run:FleetRun,actions:Brid
   const send=(status:number,value:unknown)=>{res.writeHead(status,{'Content-Type':'application/json'});res.end(JSON.stringify(value));};
   try {
    const url=req.url??'';
+   if(req.method==='POST' && url==='/test-context') {
+    // The socket belongs to one admitted run. Client-supplied roles, origins
+    // and environment variables never change that authority.
+    await readJson(req);
+    return send(200,{version:1,runId:run.id,project:run.project,role:run.role,origin:'agent'});
+   }
+   if(req.method==='POST' && url==='/investigate') {
+    if(!TASK_REQUEST_ROLES.has(run.role))return send(403,{error:'Wider investigation requests are for builder and developer runs'});
+    const body=await readJson(req);
+    return send(200,await connection.call('/tasks/investigate',{request:body.request,project:run.project,session:run.session,runId:run.id}));
+   }
    if(req.method==='POST' && actions.evidence && ['/evidence-list','/evidence-chunk'].includes(url)) {
     const body=await readJson(req);
     const ticket=evidenceTicket(body.ticket,run.project);
@@ -86,6 +97,7 @@ export async function taskBridge(connection:JsonClient,run:FleetRun,actions:Brid
    }
    const body=await readJson(req);
    if(url==='/request') {
+    if(TASK_REQUEST_ROLES.has(run.role) && body.request?.recipe==='mobile-in-depth')return send(403,{error:'Test selection policy: complete Mobile suites are dispatcher-owned. Submit investigate with retained failed-test evidence and requested scope; no diagnostic has executed.'});
     try {requested.add(recoveryTaskId(run.ticket,validateTaskRequest(body.request),run.id));}catch {/* invalid: the service refuses it too */}
    }
    const reply=await connection.call<{id?:unknown}>('/tasks'+url,{...body,project:run.project,session:run.session,runId:run.id});

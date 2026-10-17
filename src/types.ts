@@ -45,6 +45,7 @@ export interface ProjectItem {
   evidenceRevision?: string;
   artifactRevision?: string;
   recoveryPause?: import("./recovery-facts.js").PauseRecord;
+  testInvestigationRevision?: string;
 }
 
 export interface AgentConfig {

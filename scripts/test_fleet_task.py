@@ -111,4 +111,31 @@ class RetrievalTests(unittest.TestCase):
    with self.assertRaisesRegex(RuntimeError,'still transferring'):m.main()
    self.assertEqual(list(Path(d).iterdir()),[])
 
+class InvestigationTests(unittest.TestCase):
+ def test_evidence_listing_exposes_the_verified_bundle_digest_for_a_request(self):
+  task,_,digest=RetrievalTests().fixture()
+  bundle={'runId':'verifier-run','digest':digest,'manifest':task['artifacts'],'role':'verifier'}
+  with patch.object(m,'request',return_value={'ticket':'org/app#1','bundles':[bundle]}):
+   listing=m.evidence('org/app#1',None)
+  self.assertEqual(listing['bundles'][0]['digest'],digest)
+  self.assertIn({'path':'mobile/child.stdout','bytes':task['artifacts']['files'][1]['bytes']},listing['bundles'][0]['files'])
+ def test_request_queues_only_an_assessment_and_preserves_the_evidence_reference(self):
+  payload={'revision':'a'*40,'failedTests':['ScreenTest#screenOpen'],
+   'evidence':[{'runId':'verifier-run','digest':'b'*64,'path':'logs/failed.xml'}],
+   'scope':{'kind':'sequence','selectors':['ScreenTest#restore','ScreenTest#screenOpen']},
+   'narrowerInsufficient':'The isolated case passes; investigate the preceding restore.'}
+  receipt={'status':'assessment-queued','id':'c'*64,'executed':0}
+  with tempfile.TemporaryDirectory() as d:
+   path=Path(d,'request.json');path.write_text(json.dumps(payload));output=io.StringIO()
+   with patch.object(sys,'argv',['fleet-task.py','investigate','--request-file',str(path)]),patch.object(m,'request',return_value=receipt) as request,redirect_stdout(output):
+    m.main()
+   request.assert_called_once_with('investigate',{'request':payload})
+   self.assertEqual(json.loads(output.getvalue()),receipt)
+ def test_a_native_task_or_missing_zero_execution_acknowledgement_is_not_an_investigation_receipt(self):
+  with tempfile.TemporaryDirectory() as d:
+   path=Path(d,'request.json');path.write_text('{}')
+   for reply in [{'id':'a'*64,'state':'running'},{'status':'assessment-queued','id':'a'*64,'executed':1},{'status':'assessment-queued','executed':0}]:
+    with patch.object(sys,'argv',['fleet-task.py','investigate','--request-file',str(path)]),patch.object(m,'request',return_value=reply):
+     with self.assertRaisesRegex(RuntimeError,'acknowledgement'):m.main()
+
 if __name__=='__main__':unittest.main()
