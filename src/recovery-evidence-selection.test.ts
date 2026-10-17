@@ -51,6 +51,21 @@ test('metadata and unreadable files do not claim that a required evidence role w
   assert.match(result.bundles.find(b => b.runId === 'recovery')?.excerpts['pointers.json'] ?? '', /omitted/);
 });
 
+test('remaining excerpt places preserve earlier verifier and builder findings before metadata', async () => {
+  const metadata = Array.from({ length: 8 }, (_, n) => retained('metadata-' + n, 'recovery', { 'run.json': '{}' }, 30 - n));
+  const history = [retained('builder-new', 'builder', { 'logs/new.log': 'latest repair' }, 5),
+    retained('verifier-new', 'verifier', { 'handoff/new.md': 'latest unresolved findings' }, 4),
+    retained('recovery', 'recovery', { 'logs/recovery.log': 'compare repair history' }, 3),
+    retained('verifier-old', 'verifier', { 'handoff/old.md': 'earlier unresolved findings' }, 2),
+    retained('builder-old', 'builder', { 'logs/old.log': 'earlier repair' }, 1)];
+  const { client } = connection([...metadata, ...history]);
+  const result = await evidenceExcerpts(client, ticket);
+  assert.ok(result);
+  assert.deepEqual(result.bundles.slice(0, 5).map(b => b.runId), history.map(b => b.runId));
+  assert.ok(result.bundles.find(b => b.runId === 'verifier-old')?.inspectedPaths.length);
+  assert.ok(result.bundles.find(b => b.runId === 'builder-old')?.inspectedPaths.length);
+});
+
 test('a corrupt manifest digest or another ticket cannot supply recovery inspection evidence', async () => {
   const corrupt = retained('corrupt', 'builder', { 'logs/builder.log': 'repair' }, 3);
   corrupt.digest = '0'.repeat(64);

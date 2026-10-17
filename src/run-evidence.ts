@@ -523,7 +523,9 @@ export async function evidenceExcerpts(connection: EvidenceConnection, ticket: s
     const bundle = valid.find(b => b.role === role && b.manifest.files.some(substantive));
     return bundle ? [bundle] : [];
   }).sort((a, b) => valid.indexOf(a) - valid.indexOf(b));
-  const selected = [...preferred, ...valid.filter(b => !preferred.includes(b))].slice(0, budget.bundles);
+  const remainingBundles = valid.filter(b => !preferred.includes(b));
+  const selected = [...preferred, ...remainingBundles.filter(b => b.manifest.files.some(substantive)),
+    ...remainingBundles.filter(b => !b.manifest.files.some(substantive))].slice(0, budget.bundles);
   let remaining = budget.characters;
   const out: Array<Pick<EvidenceListing['bundles'][number], 'runId' | 'digest' | 'machine' | 'role' | 'meta' | 'created'> & {
     fileCount: number; files: Array<{ path: string; bytes: number }>; excerpts: Record<string, string>; inspectedPaths: string[];
