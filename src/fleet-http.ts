@@ -288,7 +288,16 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
       if (req.url?.startsWith('/workflow/')) {
         const project=body.project;
         if(typeof project!=='string' || !/^[\w.-]+\/[\w.-]+$/.test(project)) throw new Error('Workflow project required');
-        if(req.url==='/workflow/read') return send(200,{enabled:store.workflow.enabled(project),preparing:store.workflow.preparing(project),config:store.workflow.config(project),items:store.workflow.list(project),pending:store.workflow.pending(10000,project).length});
+        if(req.url==='/workflow/read') return send(200,{enabled:store.workflow.enabled(project),preparing:store.workflow.preparing(project),config:store.workflow.config(project),items:store.workflow.list(project).map(item=>({...item,approvalState:store.approvals.get(`${project}#${item.issueNumber}`)})),pending:store.workflow.pending(10000,project).length});
+        if(req.url==='/workflow/approval-outcome') {
+          if(!machine) return send(403,{error:'Machine credential required'});
+          return send(200,store.recordApprovalOutcome(machine,body.session,project,body.runId,body.ticket,body.outcome));
+        }
+        if(req.url==='/workflow/approval-authorize') {
+          if(!isAdmin) return send(403,{error:'Operator credential required'});
+          if(body.ticket?.split('#')[0]!==project) throw new Error('Workflow project mismatch');
+          return send(200,store.authorizeApproval(body.ticket,body.runId,body.commandId,body.reason,body.revision));
+        }
         if(['/workflow/prepare','/workflow/activate','/workflow/cancel-preparation'].includes(req.url)) {
           if(!isAdmin)return send(403,{error:'Operator credential required'});
           if(req.url==='/workflow/prepare')store.workflow.prepare(project);

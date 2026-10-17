@@ -19,6 +19,7 @@ import { recoveryInventory, relatedTickets, relatedEvidence } from "./recovery-e
 import { recoveryLogContext } from "./recovery-context.js";
 import { RECOVERY_RETURNED_INBOX, type RecoveryIncident, type RecoveryDecision } from "./fleet-recovery.js";
 import { ManagedDispatch, bindManagedTestWorktree, managedAgentEnv, managedTaskEnv, managedRunRunner, trackManagedChild, managedCodexReporter, managedBridgeActions, managedRun, managedRequestedTasks, managedTicketTasks } from "./managed-dispatch.js";
+import {approvalHandoff,ApprovalHandoffError,type ApprovalOutcome} from './approval-state.js';
 import { NATIVE_TASK_HOLD_LABEL, NATIVE_TASK_WAITED_LABEL, decideHandoverHold, formatHoldBound, holdComment, nativeTaskReadNote, newNativeTaskHoldState, parseNativeTaskHoldMs, passedComment, runNativeTaskHolds, type HandoverHoldDecision, type NativeTaskView } from "./native-task-hold.js";
 import { TASK_REQUEST_ROLES } from "./recovery-task-bridge.js";
 import { RunEvidence, evidenceExcerpts, type RunEvidenceInput } from "./run-evidence.js";
@@ -2281,6 +2282,8 @@ async function attemptPermissionDenialSalvage(opts: {
 // `dispatch.test.ts` pass a hand-rolled mock without `as any` casting.
 // Mirrors the `ReconcileClient` pattern in `reconcile.ts`.
 export interface DispatchClient {
+  /** Dispatcher-only observation, persisted before scheduling a replacement run. */
+  recordApprovalOutcome?: (issueNumber:number,outcome:ApprovalOutcome)=>Promise<unknown>;
   recordMergedIssue?(issueNumber:number):Promise<void>;
   recordCoordination?(record: import("./recovery-facts.js").CoordinationRecord): Promise<void>;
   addLabel(issueNumber: number, label: string): Promise<void>;
@@ -3391,7 +3394,7 @@ export async function handleDispatchError(
     console.log(`   ⏸️  #${item.issueNumber} Codex rate limit: waits for the fleet Codex pause, no retry counted`);
     return;
   }
-  if (item.issueNumber > 0) {
+  if (item.issueNumber > 0 && !(error instanceof ApprovalHandoffError)) {
     const classifyText = isResourceExhausted
       ? `${error.message} ${(error as ResourceExhaustedError).errno}`
       : withoutStderrSection(error?.message ?? "");
@@ -4571,7 +4574,7 @@ export async function prepareAgentSpawn(
   const claudeMdPath = resolve(agentsRepoRoot, agent.claudeMdPath);
   let systemPrompt: string;
   try {
-    systemPrompt = readFileSync(claudeMdPath, "utf-8") + "\n" + HOST_TESTING_POLICY;
+    systemPrompt = readFileSync(claudeMdPath, "utf-8") + "\n" + HOST_TESTING_POLICY + approvalHandoff(item.approvalState);
   } catch (e) {
     console.error(`   ❌ Agent CLAUDE.md not found: ${claudeMdPath}`);
     if (item.issueNumber > 0) {
@@ -4986,6 +4989,17 @@ export async function handleAgentResultErrors(
   streamResult: StreamResult,
   ctx: DispatchContext,
 ): Promise<boolean> {
+  if(streamResult.runner==='codex' && streamResult.isError && ctx.item.issueNumber>0 && ctx.client.recordApprovalOutcome
+    && (streamResult.approvalReviewFailed || streamResult.hadPermissionDenial)) {
+    try {
+      await ctx.client.recordApprovalOutcome(ctx.item.issueNumber,{
+        approvalReviewFailed:streamResult.approvalReviewFailed===true,
+        hadPermissionDenial:streamResult.hadPermissionDenial===true,
+      });
+    } catch {
+      throw new ApprovalHandoffError('Approval outcome could not be saved. Preserved work requires recovery before another run; no automatic retry scheduled.');
+    }
+  }
   if (!streamResult.isError && !streamResult.stoppedAtDenial) return false;
   // A tool still missing after the in-run retries parks with the reason
   // `retryRequiredMcpStartup` wrote. The agent stopped at once, so there is

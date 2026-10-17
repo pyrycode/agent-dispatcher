@@ -22,6 +22,7 @@ import { FlakySightingLedger } from './flaky-sightings.js';
 import { FLAKY_REOPEN_WINDOW_MS, FLAKY_TEST_COLUMN, FLAKY_TEST_LABEL, hasFlakyMarker, staleLabelsOnReopen } from './flaky-tickets.js';
 import { inheritedMarker } from './inherited-tickets.js';
 import {TestInvestigations} from './test-investigation.js';
+import {ApprovalStates, type ApprovalOutcome} from './approval-state.js';
 import type {EvidenceStore} from './evidence-store.js';
 
 /** An operator choice, frozen into each new grant. Null restores local settings. */
@@ -218,6 +219,7 @@ export class FleetStore {
   /** Every flaky-test sighting from every computer. See flaky-sightings.ts. */
   readonly flaky: FlakySightingLedger;
   readonly investigations: TestInvestigations;
+  readonly approvals: ApprovalStates;
   private readonly clock: () => number;
   constructor(path: string, private readonly limits: Readonly<Record<string, MachineLimits>>, options: FleetStoreOptions = {}) {
     for (const value of Object.values(limits)) validateLimits(value);
@@ -248,6 +250,7 @@ export class FleetStore {
     this.workflow = new WorkflowStore(this.db);
     this.recovery = new RecoveryLedger(this.db, Date.now, options);
     this.facts = new RecoveryFacts(this.db);
+    this.approvals = new ApprovalStates(this.db,options.now ?? Date.now);
     this.investigations = new TestInvestigations(this.db);
     this.tasks = new RecoveryTasks(this.db);
     this.db.exec("CREATE TABLE IF NOT EXISTS fleet_assessment_releases (ticket TEXT NOT NULL, machine TEXT NOT NULL, generation TEXT NOT NULL, created INTEGER NOT NULL, PRIMARY KEY(ticket,generation)) STRICT");
@@ -595,6 +598,28 @@ export class FleetStore {
       return this.workflow.change(ticket, change, 'operator', commandId, revision);
     });
   }
+  recordApprovalOutcome(machine:string,session:string,project:string,runId:string,ticket:string,outcome:ApprovalOutcome) {
+    return this.transaction(()=>{
+      const run=this.snapshot().runs.find(r=>r.id===runId && r.machine===machine && r.session===session && r.project===project && r.ticket===ticket);
+      if(!run || !/#[1-9]\d*$/.test(ticket)) throw new Error('Approval outcome requires its admitted source run');
+      this.authorize(machine,session,ticket,runId);
+      return this.approvals.record(ticket,runId,run.role,outcome) ?? null;
+    });
+  }
+  authorizeApproval(ticket:string,runId:string,commandId:string,reason:string,revision:number) {
+    return this.transaction(()=>{
+      const record=this.approvals.authorize(ticket,runId,commandId,reason);
+      const change={
+        removeLabels:[`error:${record.role}`,'orchestrator:escalated'],addLabels:['orchestrator:recovery-priority'],
+      };
+      // Recover a lost acknowledgement after the replacement has started.
+      // change() verifies every original argument before returning its saved result.
+      const replay=this.db.prepare('SELECT 1 FROM workflow_commands WHERE id=?').get(commandId);
+      const item=replay ? this.workflow.change(ticket,change,'operator',commandId,revision)
+        : this.workflowOperator(ticket,change,commandId,revision);
+      return {approval:record,item};
+    });
+  }
   /** The final step of an operator filing. A retry hours later must not overwrite a running ticket. */
   workflowFile(id: string, ticket: string, change: WorkflowChange) {
     return this.transaction(() => {
@@ -614,7 +639,7 @@ export class FleetStore {
     const facts=tickets.map(ticket => {
       const totalCount=this.tasks.count(ticket);
       const investigation=this.investigations.pending(ticket);
-      return {ticket,pause:this.facts.getPause(ticket),artifactRevision:this.artifactRevision(ticket),evidence:evidence.filter(e=>e.ticket===ticket),capabilities:this.tasks.capabilities(),
+      return {ticket,pause:this.facts.getPause(ticket),approvalState:this.approvals.get(ticket),artifactRevision:this.artifactRevision(ticket),evidence:evidence.filter(e=>e.ticket===ticket),capabilities:this.tasks.capabilities(),
         ...(investigation?{investigation}:{}),
         tasks:[] as ReturnType<typeof assessmentTasks>,taskHistory:{totalCount,returnedCount:0,omittedCount:totalCount},coordination:this.facts.getCoordination(ticket)};
     });
@@ -734,6 +759,8 @@ export class FleetStore {
     if (workRefusal(project => this.desired.work(req.machine, project), req,
       this.db.prepare("SELECT machine FROM fleet_claims WHERE ticket=?").get(req.ticket)?.machine === req.machine)) return { ok: false, reason: "drained" };
     if(this.workflow.preparing(req.project))return {ok:false,reason:'locked'};
+    const approval=this.approvals.get(req.ticket);
+    if(req.role!=='recovery' && approval?.kind==='rejected' && !approval.authorization) return {ok:false,reason:'locked'};
     if(this.workflow.enabled(req.project) && !req.supportTaskId && req.workflowVersion!==1) return {ok:false,reason:"locked"};
     if(this.workflow.enabled(req.project) && /#[1-9]\d*$/.test(req.ticket)) {
       const item=this.workflow.get(req.ticket);

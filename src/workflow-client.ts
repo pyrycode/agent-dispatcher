@@ -78,6 +78,9 @@ export function workflowClient<T extends object>(
     };
   };
   const methods: Record<string, (...args: any[]) => Promise<any>> = {
+    recordApprovalOutcome:(number:number,outcome:import('./approval-state.js').ApprovalOutcome)=>connection.call('/workflow/approval-outcome',{
+      project,ticket:`${project}#${number}`,outcome,...actor(),
+    }),
     initialize: async () => {
       const state = await connection.call<any>("/workflow/read", { project });
       (base as any).initializeFromWorkflow(state.config);
