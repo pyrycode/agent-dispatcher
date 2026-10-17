@@ -10309,7 +10309,7 @@ function featureFamilyReadyToClose(item: ProjectItem, all: readonly ProjectItem[
     } else if (part.subIssues?.total) {
       if (children.length < part.subIssues.total) return false;
     } else if (children.length === 0 && part.issueNumber !== root) {
-      if (part.status !== 'Done' || !part.labels.includes('merged') || (part as ProjectItem & { state?: string }).state === 'OPEN') return false;
+      if (part.status !== 'Done' || !part.labels.includes('merged') || (part as ProjectItem & { state?: string }).state !== 'CLOSED') return false;
     }
   }
   return family.some(part => part.issueNumber !== root);

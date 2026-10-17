@@ -715,7 +715,7 @@ export class MockGitHubClient implements DispatchClient {
   async getAllProjectItems(): Promise<ProjectItem[]> {
     this.getAllProjectItemsCalls += 1;
     if (this.failures.getAllProjectItems) throw this.failures.getAllProjectItems;
-    return [...this.itemsByIssueNumber.values()].map(({ state: _state, ...item }) => item);
+    return [...this.itemsByIssueNumber.values()];
   }
 
   async getStrandedWipMarkers(issueNumber: number): Promise<{ observedAt: Date | null; sweptAt: Date | null }> {
@@ -6624,6 +6624,18 @@ describe("runParentClose", () => {
       { issueNumber: 1500, status: 'Done', subIssues: { total: 1, completed: 1 }, featureRoot: 'test/repo#1500' },
     ] });
     client.failures.getAllProjectItems = new Error('workflow temporarily unavailable');
+    const { deps } = makeMockDeps();
+    await runParentClose(client, deps);
+    assert.deepEqual(client.closeIssueCalls, []);
+  });
+
+  test("missing closed state cannot prove completion of an explicitly tracked leaf", async () => {
+    const root = 'test/repo#1500';
+    const client = new MockGitHubClient({ items: [
+      { issueNumber: 1500, status: 'Done', subIssues: { total: 1, completed: 1 }, featureRoot: root },
+      { issueNumber: 1501, status: 'Done', state: 'CLOSED', parentNumber: 1500, featureRoot: root, labels: ['merged'] },
+    ] });
+    client.getAllProjectItems = async () => [...client.itemsByIssueNumber.values()].map(({ state: _state, ...part }) => part);
     const { deps } = makeMockDeps();
     await runParentClose(client, deps);
     assert.deepEqual(client.closeIssueCalls, []);
