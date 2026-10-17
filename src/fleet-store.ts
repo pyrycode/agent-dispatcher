@@ -25,6 +25,7 @@ import { FLAKY_REOPEN_WINDOW_MS, FLAKY_TEST_COLUMN, FLAKY_TEST_LABEL, hasFlakyMa
 import { inheritedMarker } from './inherited-tickets.js';
 import {TestInvestigations} from './test-investigation.js';
 import {ApprovalStates, type ApprovalOutcome} from './approval-state.js';
+import {VerifierHandoffs, type VerifierHandoffRequest, type VerifierHandoff, type VerificationPin} from './verifier-handoff.js';
 import type {EvidenceStore} from './evidence-store.js';
 
 /** An operator choice, frozen into each new grant. Null restores local settings. */
@@ -99,6 +100,8 @@ export function startsOwnership(role: string): boolean {
 }
 
 export interface StartRequest {
+  /** Issued only by atomic operator handoff admission. */
+  verificationPin?: VerificationPin;
   workflowVersion?: 1;
   id: string;
   machine: string;
@@ -119,7 +122,7 @@ export interface StartRequest {
 }
 export interface Claim { ticket: string; machine: string; generation: string; created: number }
 export interface FleetRun extends StartRequest { generation: string; created: number; runnerPolicy?: RunnerPolicy }
-export interface FleetSnapshot { workflowProjects?: string[]; claims: Claim[]; runs: FleetRun[]; runnerPolicy?: RunnerPolicy; idleRecoveryTickets?: string[]; priorityHighTickets?: string[]; releasedAssessmentClaims?: Claim[]; features?: {recoveryTasks:boolean; evidence?: boolean}; evidenceStore?: import("./evidence-store.js").EvidenceUsage; requiredRepairs?: Record<string,string[]>; codexPause?: CodexPauseState;
+export interface FleetSnapshot { verifierHandoffs?: VerifierHandoff[]; workflowProjects?: string[]; claims: Claim[]; runs: FleetRun[]; runnerPolicy?: RunnerPolicy; idleRecoveryTickets?: string[]; priorityHighTickets?: string[]; releasedAssessmentClaims?: Claim[]; features?: {recoveryTasks:boolean; evidence?: boolean}; evidenceStore?: import("./evidence-store.js").EvidenceUsage; requiredRepairs?: Record<string,string[]>; codexPause?: CodexPauseState;
   /**
    * Open tickets of adopted projects waiting for review with nothing holding
    * them (see awaitsReview), whoever owns them. Present, possibly empty,
@@ -223,6 +226,7 @@ export class FleetStore {
   readonly flaky: FlakySightingLedger;
   readonly investigations: TestInvestigations;
   readonly approvals: ApprovalStates;
+  readonly verifierHandoffs: VerifierHandoffs;
   private readonly clock: () => number;
   constructor(path: string, private readonly limits: Readonly<Record<string, MachineLimits>>, options: FleetStoreOptions = {}) {
     for (const value of Object.values(limits)) validateLimits(value);
@@ -267,6 +271,7 @@ export class FleetStore {
     this.operations = new OperationReports(this.db, Object.keys(limits), clock);
     this.orphans = new OrphanedTaskWatch(this.db, this.tasks, this.operations, clock, options.orphanedTaskMs);
     this.clock = clock;
+    this.verifierHandoffs = new VerifierHandoffs(this.db, this.clock);
     this.splits = new RecoverySplits(this.db);
     this.codex = new CodexThrottle(this.db, clock, options.codexThrottle ?? DEFAULT_CODEX_THROTTLE, options.log);
     this.desired = new DesiredStateStore(this.db, Object.keys(limits), clock, machine => this.machineCapabilities()[machine]?.projects);
@@ -653,9 +658,11 @@ export class FleetStore {
   }
   /** No workflow or GitHub mutation is authorised while any affected worker is active. */
   private guardRecoverySplit(record: RecoverySplitRecord, allowedRun?: string): void {
+    const affected = new Set([...Object.keys(record.affected), ...Object.values(record.children)]);
+    if (this.verifierHandoffs.pending().some(h => h.expires > this.clock() && affected.has(h.ticket)))
+      throw new Error('An affected verifier handoff is pending; cancel it or wait for expiry before splitting');
     const incident = this.recovery.incident(record.id);
     const source = incident.runId && this.runOwner(incident.runId);
-    const affected = new Set([...Object.keys(record.affected), ...Object.values(record.children)]);
     for (const run of this.snapshot().runs) {
       const task = run.supportTaskId ? this.tasks.get(run.supportTaskId) : undefined;
       if (run.id !== allowedRun && (affected.has(run.ticket) || !!run.parentTicket && affected.has(run.parentTicket) || !!task && affected.has(task.ticket)))
@@ -872,9 +879,89 @@ export class FleetStore {
     finally {this.transactionDepth--;}
   }
 
+  private verifierHandoffValid(h: VerifierHandoffRequest): boolean {
+    if(this.splits.pending(h.ticket)) return false;
+    const claim=this.db.prepare('SELECT * FROM fleet_claims WHERE ticket=?').get(h.ticket);
+    if(!claim || claim.machine!==h.source || claim.generation!==h.generation) return false;
+    if(this.db.prepare('SELECT 1 FROM fleet_runs WHERE ticket=? AND finished IS NULL').get(h.ticket)) return false;
+    if(!this.workflow.reviewReadyTickets().includes(h.ticket)) return false;
+    const item=this.workflow.get(h.ticket);
+    if(item.revision!==h.revision || this.workflow.preparing('pyrycode/pyrycode-desktop')) return false;
+    if(this.tasks.list(h.ticket).some(t=>t.artifactsPending || ['queued','running','publishing','attention'].includes(t.state))) return false;
+    const approval=this.approvals.get(h.ticket);
+    if(approval?.kind==='rejected' && !approval.authorization) return false;
+    for(const machine of [h.source,h.target]) {
+      if(!Object.hasOwn(this.limits,machine)) return false;
+      if(workRefusal(p=>this.desired.work(machine,p),{project:'pyrycode/pyrycode-desktop',ticket:h.ticket,role:'verifier'},machine===h.source)) return false;
+      const report=this.machineCapabilities()[machine];
+      if(!report || this.clock()-report.updated>CAPABILITY_REPORT_FRESH_MS || !report.projects?.includes('pyrycode/pyrycode-desktop')) return false;
+    }
+    return !missingCapabilities(this.requirementsOf(h.ticket),this.reportedCapabilities(h.target)).length;
+  }
+  activeVerifierHandoffs(): VerifierHandoff[] {return this.verifierHandoffs.active(h=>this.verifierHandoffValid(h));}
+  requestVerifierHandoff(input: VerifierHandoffRequest): VerifierHandoff {
+    return this.transaction(()=>this.verifierHandoffs.request(input,()=>{
+      this.activeVerifierHandoffs();
+      if(!this.verifierHandoffValid(input))throw new Error('Handoff requires unchanged ready workflow, idle source ticket, fresh capable hosts and taking target');
+    }));
+  }
+  cancelVerifierHandoff(id:string):VerifierHandoff {return this.transaction(()=>this.verifierHandoffs.cancel(id));}
+  confirmVerifierHandoff(machine:string,id:string,session:string,target?:StartRequest,evidence?:Pick<EvidenceStore,'list'>):VerifierHandoff {
+    return this.transaction(()=>{
+      const h=this.verifierHandoffs.get(id);
+      if(!session || session.length>200 || ![h.source,h.target].includes(machine))throw new Error('Handoff actor mismatch');
+      if(h.state==='admitted'||h.state==='accepted') {
+        if(machine!==h.target || target?.id!==h.runId)throw new Error('Handoff already admitted');
+        return h;
+      }
+      if(!this.activeVerifierHandoffs().some(r=>r.commandId===id))throw new Error('Handoff is no longer pending');
+      if(machine===h.source){
+        if(target)throw new Error('Source cannot choose target admission');
+        const builder=this.db.prepare("SELECT id,outcome FROM fleet_runs WHERE ticket=? AND machine=? AND generation=? AND json_extract(request,'$.role')='builder' ORDER BY created DESC,rowid DESC LIMIT 1").get(h.ticket,h.source,h.generation);
+        if(!builder || builder.outcome!=='completed' || !evidence?.list(h.ticket,String(builder.id)).some(b=>b.machine===h.source && b.role==='builder' && b.meta.outcome==='completed' && b.meta.candidateRevision===h.candidate))throw new Error('Latest builder evidence must cover the exact handoff candidate');
+        return this.verifierHandoffs.save({...h,sourceSession:session,sourceAt:this.clock()});
+      }
+      if(h.sourceAt===undefined || this.clock()-h.sourceAt>30_000)throw new Error('Fresh source confirmation required');
+      if(!target || target.machine!==machine || target.session!==session || target.ticket!==h.ticket || target.project!=='pyrycode/pyrycode-desktop'
+        || target.role!=='verifier' || target.resource!=='heavy' || target.verificationPin || target.supportTaskId)throw new Error('Target verifier offer mismatch');
+      const pin:VerificationPin={handoff:id,candidate:h.candidate,revision:h.revision,sourceGeneration:h.generation};
+      this.db.prepare('UPDATE fleet_claims SET machine=?,generation=? WHERE ticket=? AND generation=?').run(machine,randomUUID(),h.ticket,h.generation);
+      const result=this.startAdmitted({...target,verificationPin:pin});
+      if(!result.ok)throw new Error('Handoff target admission refused: '+result.reason);
+      this.db.prepare('INSERT OR IGNORE INTO fleet_assessment_releases VALUES(?,?,?,?)').run(h.ticket,h.source,h.generation,this.clock());
+      return this.verifierHandoffs.save({...h,state:'admitted',runId:target.id});
+    });
+  }
+
+  /** A transferred candidate remains an obligation across declined/failed attempts.
+   * Only a later real builder or explicit unused return ends it. */
+  private durableVerifierPin(ticket:string,machine:string):VerificationPin|undefined {
+    const row=this.db.prepare("SELECT r.rowid AS ordinal,r.generation,h.record FROM fleet_verifier_handoffs h JOIN fleet_runs r ON r.id=json_extract(h.record,'$.runId') JOIN fleet_claims c ON c.ticket=h.ticket AND c.machine=r.machine AND c.generation=r.generation WHERE h.ticket=? AND r.machine=? AND json_extract(h.record,'$.state')='admitted' ORDER BY r.rowid DESC LIMIT 1").get(ticket,machine);
+    if(!row || this.db.prepare("SELECT 1 FROM fleet_runs WHERE ticket=? AND rowid>? AND json_extract(request,'$.role')='builder' AND (finished IS NULL OR outcome IS NULL OR outcome!='unused')").get(ticket,row.ordinal))return undefined;
+    const h=JSON.parse(String(row.record)) as VerifierHandoff;
+    return {handoff:h.commandId,candidate:h.candidate,revision:h.revision,sourceGeneration:h.generation};
+  }
+  verificationCandidate(ticket:string):string|undefined {
+    const claim=this.db.prepare('SELECT machine FROM fleet_claims WHERE ticket=?').get(ticket);
+    return claim?this.durableVerifierPin(ticket,String(claim.machine))?.candidate:undefined;
+  }
+  invalidateVerificationCandidate(ticket:string,candidate:string):void {
+    this.transaction(()=>{
+      if(this.verificationCandidate(ticket)!==candidate)return;
+      const item=this.workflow.get(ticket);
+      if(item.status==='In Code Review' && item.labels.includes('error:verifier') && !item.labels.some(l=>['done:verifier','done:documentation'].includes(l)))return;
+      this.workflow.change(ticket,{status:'In Code Review',removeLabels:['done:verifier','done:documentation'],addLabels:['error:verifier']},'handoff-candidate-check',randomUUID());
+    });
+  }
   start(req: StartRequest): StartResult {
     return this.transaction(() => {
       const prior=this.db.prepare('SELECT id FROM fleet_runs WHERE id=?').get(req.id);
+      if(req.verificationPin && !prior) throw new Error('Verification pins require operator handoff admission');
+      if(!req.verificationPin && req.role==='verifier') {
+        const saved=prior ? this.db.prepare('SELECT request FROM fleet_runs WHERE id=?').get(req.id) : undefined;
+        const pin=saved ? (JSON.parse(String(saved.request)) as StartRequest).verificationPin : this.durableVerifierPin(req.ticket,req.machine);
+        if(pin)req={...req,verificationPin:pin};
+      }
       if(req.supportTaskId && !prior) {
         validateStart(req);
         const task=this.tasks.get(req.supportTaskId);
@@ -899,6 +986,7 @@ export class FleetStore {
         if (JSON.stringify(original) !== request) throw new Error("Request ID reused with different contents");
         return previous.finished === null ? { ok: true, generation: String(previous.generation) } : { ok: false, reason: "finished" };
       }
+    if (!req.verificationPin && this.activeVerifierHandoffs().some(h=>h.ticket===req.ticket)) return {ok:false,reason:'locked'};
     // The operator's central drain or stop holds new grants here even when
     // the computer's manager is older or has not fetched it yet. A retry of
     // a lost reply above still recovers its grant.
@@ -984,7 +1072,8 @@ export class FleetStore {
 
   finish(machine: string, session: string, id: string, completed?: boolean, unused?: boolean): void;
   finish(machine: string, session: string, id: string, completed: boolean, unused: boolean, observation: RecoveryObservation | undefined): RecoveryIncident[];
-  finish(machine: string, session: string, id: string, completed = true, unused = false, observation?: RecoveryObservation): RecoveryIncident[] {
+  finish(machine: string, session: string, id: string, completed: boolean, unused: boolean, observation: RecoveryObservation | undefined, verificationAccepted: string | undefined): RecoveryIncident[];
+  finish(machine: string, session: string, id: string, completed = true, unused = false, observation?: RecoveryObservation, verificationAccepted?:string): RecoveryIncident[] {
     if (unused && completed) throw new Error("Unused work cannot be completed");
     return this.transaction(() => {
       const run = this.db.prepare("SELECT * FROM fleet_runs WHERE id=?").get(id);
@@ -997,10 +1086,29 @@ export class FleetStore {
       // Recover the original result after a lost acknowledgement. Do not report
       // again after a recovery worker may already have started.
       if (run.finished !== null) return observation ? this.recovery.list(request.project).filter(i => i.current && i.ticket === run.ticket) : [];
+      if(verificationAccepted!==undefined) {
+        const pin=request.verificationPin,item=this.workflow.get(request.ticket);
+        const valid=completed && !unused && pin?.candidate===verificationAccepted && item.state==='OPEN' && item.status==='In Code Review' && item.labels.includes('done:verifier') && !item.labels.some(l=>/^(error:|needs-rework:|pending-verdict:|pending-done:|held:|needs-human:)/.test(l));
+        if(valid && pin) {
+          const h=this.verifierHandoffs.get(pin.handoff);
+          if(h.state==='admitted')this.verifierHandoffs.save({...h,state:'accepted',acceptedRunId:id});
+          else completed=false;
+        } else {
+          // Late holds or label changes refuse acceptance, not completion.
+          // Children are already drained: retain the pin and release the place.
+          completed=false;
+          this.workflow.change(request.ticket,{removeLabels:['done:verifier'],addLabels:['error:verifier']},'handoff-acceptance-refused',randomUUID());
+        }
+      }
       this.db.prepare("DELETE FROM fleet_locks WHERE run_id=?").run(id);
       // Its split children are admissible from now on.
       this.db.prepare("DELETE FROM fleet_ticket_creators WHERE run_id=?").run(id);
       this.db.prepare("UPDATE fleet_runs SET finished=?,outcome=? WHERE id=? AND finished IS NULL").run(Date.now(), unused ? "unused" : completed ? "completed" : "cancelled", id);
+      if(unused && request.verificationPin && !this.db.prepare("SELECT 1 FROM fleet_runs WHERE ticket=? AND generation=? AND id!=? AND (finished IS NULL OR outcome IS NULL OR outcome!='unused')").get(run.ticket,run.generation,id)) {
+        const h=this.verifierHandoffs.get(request.verificationPin.handoff);
+        this.db.prepare('UPDATE fleet_claims SET machine=?,generation=? WHERE ticket=? AND generation=?').run(h.source,h.generation,h.ticket,run.generation);
+        this.verifierHandoffs.save({...h,state:'cancelled',reason:'Target confirmed admission was unused; source ownership restored'});
+      }
       // An explicitly withdrawn, never-started reservation has no work to own.
       // Preserve this generation if any actual or uncertain run used it. In
       // particular, blocked/failed work and offline reservations remain owned.
@@ -1207,6 +1315,7 @@ export class FleetStore {
   }
 
   snapshot(): FleetSnapshot {
+    const verifierHandoffs = this.activeVerifierHandoffs();
     const runnerPolicy = this.runnerPolicy();
     const idleRecoveryTickets = this.db.prepare(`SELECT ticket FROM fleet_recovery WHERE present=1 AND state='queued' AND reason IN (${IDLE_RECOVERY_REASONS.map(() => '?').join(',')})`)
       .all(...IDLE_RECOVERY_REASONS).map(r => String(r.ticket));
@@ -1224,6 +1333,7 @@ export class FleetStore {
     const unreportedOwners = claims.filter(c => ticketRequirements[c.ticket] && !Object.hasOwn(machineCapabilities, c.machine))
       .map(c => ({ ticket: c.ticket, machine: c.machine, requires: ticketRequirements[c.ticket] }));
     return {
+      ...(verifierHandoffs.length ? { verifierHandoffs } : {}),
       ...(codexPause ? { codexPause } : {}),
       ...(codexSpacing ? { codexSpacing } : {}),
       ...(workflowProjects.length ? { workflowProjects } : {}),

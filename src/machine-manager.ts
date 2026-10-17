@@ -314,6 +314,29 @@ export class MachineManager {
     if (this.offers.get(project)?.session === session) this.offers.delete(project);
     return runs;
   }
+  /** Readiness is checked before Git preflight and again immediately before admission. */
+  async verifierHandoffPreflight(project:string,session:string,id:string) {
+    if(!this.claims.call || this.draining || !this.desiredKnown())throw new Error('Manager cannot confirm handoff');
+    const state=await this.claims.snapshot();
+    const h=state.verifierHandoffs?.find(r=>r.commandId===id && r.ticket.startsWith(project+'#'));
+    if(!h)throw new Error('No pending handoff for project');
+    const current=this.offers.get(project);
+    if(!current || current.session!==session || this.now()-current.at>=180_000)throw new Error('No fresh dispatcher offers');
+    const verifier=current.work.find(o=>o.ticket===h.ticket && o.role==='verifier');
+    if(!verifier)throw new Error('Dispatcher is not offering this verifier');
+    if(this.config.machine===h.source)return {h};
+    if(this.config.machine!==h.target)throw new Error('Wrong handoff target');
+    // Target is a new owner. Apply ticket/review limits and every local drain before moving anything.
+    const hypothetical={...state,claims:state.claims.filter(c=>c.ticket!==h.ticket)};
+    const available=[...this.offers.values()].filter(o=>this.now()-o.at<180_000).flatMap(o=>o.work).filter(o=>!this.finished.has(`${o.project}/${o.key}`));
+    if(!scheduleMachine({...this.config,...this.schedulingDrains(),offers:available,state:hypothetical}).some(o=>o.key===verifier.key))throw new Error('Handoff target held by manager scheduling controls');
+    const {key:_key,order:_order,recovery:_recovery,recoveryError:_error,...request}=verifier;
+    return {h,target:{...request,id:offerId(this.config.machine,session,verifier),machine:this.config.machine,session}};
+  }
+  async confirmVerifierHandoff(project:string,session:string,id:string):Promise<unknown> {
+    const prepared=await this.verifierHandoffPreflight(project,session,id);
+    return this.claims.call!('/verification-handoff/confirm',{id,session,...(prepared.target?{target:prepared.target}:{})});
+  }
   async status() {
     const state = await this.claims.snapshot();
     const available = [...this.offers.values(),...(this.supportOffers?[this.supportOffers]:[])].filter(o => this.now() - o.at < 180_000).flatMap(o => o.work);
@@ -354,11 +377,12 @@ export class MachineManager {
     const ids = new Set(current.work.map(o => offerId(this.config.machine, session, o)));
     return (await this.claims.snapshot()).runs.filter(r => r.machine === this.config.machine && r.project === project && r.session === session && ids.has(r.id));
   }
-  async finish(project: string, session: string, id: string, completed = true, unused = false): Promise<void> {
+  async finish(project: string, session: string, id: string, completed = true, unused = false, verificationAccepted?:string): Promise<void> {
     const state = await this.claims.snapshot();
     const run = state.runs.find(r => r.id === id);
     if (run && (run.project !== project || run.session !== session || run.machine !== this.config.machine)) throw new Error("Run owner mismatch");
-    await this.claims.finish(session, id, completed, unused);
+    if(verificationAccepted!==undefined){if(!this.claims.call)throw new Error('Handoff completion unavailable');await this.claims.call('/finish',{session,id,completed,unused,verificationAccepted});}
+    else await this.claims.finish(session, id, completed, unused);
   }
 }
 
@@ -397,6 +421,8 @@ export async function serveManager(manager: MachineManager, projectTokens: Recor
         return send(200, { ok: true, drainingProjects: manager.config.drainingProjects });
       }
       if (!project) return send(403, { error: "Project credential required" });
+      if(req.url==='/verification-handoff/preflight'){await manager.verifierHandoffPreflight(project,body.session,body.id);return send(200,{ready:true});}
+      if(req.url==='/verification-handoff/confirm')return send(200,await manager.confirmVerifierHandoff(project,body.session,body.id));
       if (req.url === "/worktree/predecessor") {
         const run = (await manager.claims.snapshot()).runs.find(run => run.id === body.runId);
         if (!manager.claims.call || !run || run.project !== project || run.machine !== manager.config.machine || run.session !== body.session) return send(403, { error: "Run owner mismatch" });
@@ -429,7 +455,7 @@ export async function serveManager(manager: MachineManager, projectTokens: Recor
           if (!manager.claims.call || body.observation?.ticket?.split('#')[0] !== project) throw new Error('Completion project mismatch');
           return send(200, await manager.claims.call('/finish', body));
         }
-        await manager.finish(project, body.session, body.id, body.completed !== false, body.unused === true);
+        await manager.finish(project, body.session, body.id, body.completed !== false, body.unused === true, body.verificationAccepted);
         return send(200, { ok: true });
       }
       if (req.url === "/authorize") {

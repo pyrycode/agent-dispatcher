@@ -64,6 +64,7 @@ export const EVIDENCE_LIST_LIMIT = 20;
 
 export type EvidenceKind = "agent" | "gate" | "recovery";
 export interface EvidenceMeta {
+  candidateRevision?: string;
   kind: EvidenceKind;
   role: string;
   outcome: string;
@@ -117,8 +118,9 @@ function validateMeta(value: unknown): EvidenceMeta {
     || !["agent", "gate", "recovery"].includes(m.kind) || !word(m.role, 64) || !word(m.outcome, 32)
     || !Number.isSafeInteger(m.startedAt) || !Number.isSafeInteger(m.endedAt) || m.startedAt < 0 || m.endedAt < 0
     || (m.dispatcherRevision !== undefined && !/^[a-f0-9]{40}$/.test(String(m.dispatcherRevision)))
-    || Object.keys(m).some(k => !["kind", "role", "outcome", "startedAt", "endedAt", "dispatcherRevision"].includes(k))) throw new Error("Invalid evidence metadata");
-  return { kind: m.kind, role: m.role, outcome: m.outcome, startedAt: m.startedAt, endedAt: m.endedAt,
+    || (m.candidateRevision !== undefined && !/^[a-f0-9]{40}$/.test(String(m.candidateRevision)))
+    || Object.keys(m).some(k => !["candidateRevision", "kind", "role", "outcome", "startedAt", "endedAt", "dispatcherRevision"].includes(k))) throw new Error("Invalid evidence metadata");
+  return { ...(m.candidateRevision!==undefined?{candidateRevision:m.candidateRevision}:{}),kind: m.kind, role: m.role, outcome: m.outcome, startedAt: m.startedAt, endedAt: m.endedAt,
     ...(m.dispatcherRevision !== undefined ? { dispatcherRevision: m.dispatcherRevision } : {}) };
 }
 

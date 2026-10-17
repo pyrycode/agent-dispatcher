@@ -1,3 +1,4 @@
+import {guardPinnedPublication} from './verifier-handoff-publication.js';
 import { renderRecoverySlice } from "./recovery-split.js";
 import type { EvidenceStore } from "./evidence-store.js";
 import {
@@ -202,6 +203,11 @@ export class WorkflowGitHub {
       return this.upstream.request(project, request);
     const path = request.path.split("?")[0],
       body = JSON.parse(request.body ?? "{}");
+    const mutating=request.method!=='GET' && (path!=='/graphql' || /\bmutation\b/.test(String(body.query??'')));
+    if(mutating && actor?.runId) {
+      const run=this.store.snapshot().runs.find(r=>r.id===actor.runId && r.machine===actor.machine && r.session===actor.session);
+      if(run)await guardPinnedPublication(this.store,this.upstream,run.ticket);
+    }
     const match = path.match(
       /^\/repos\/([^/]+\/[^/]+)\/issues\/(\d+)(?:\/(labels|comments)(?:\/(.*))?)?$/,
     );

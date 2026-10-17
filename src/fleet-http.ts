@@ -1,3 +1,4 @@
+import {guardPinnedPublication,PublishedCandidateChanged} from './verifier-handoff-publication.js';
 import {WorkflowGitHub} from "./workflow-github.js";
 import { createServer, request, type IncomingMessage, type Server } from "node:http";
 import { timingSafeEqual } from "node:crypto";
@@ -95,6 +96,17 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
       // Shared run evidence (evidence-store.ts). Any fleet credential reads;
       // only the computer that ran a run uploads its bundle. A service without
       // the store answers like one that predates it.
+      if(req.url?.startsWith('/verification-handoff/')) {
+        if(req.url==='/verification-handoff/confirm') {
+          if(!machine) return send(403,{error:'Machine credential required'});
+          return send(200,store.confirmVerifierHandoff(machine,body.id,body.session,body.target,evidence));
+        }
+        if(!isAdmin)return send(403,{error:'Operator credential required'});
+        if(req.url==='/verification-handoff/request')return send(200,store.requestVerifierHandoff(body));
+        if(req.url==='/verification-handoff/cancel')return send(200,store.cancelVerifierHandoff(body.id));
+        if(req.url==='/verification-handoff/read')return send(200,store.verifierHandoffs.get(body.id));
+        return send(404,{error:'Unknown handoff operation'});
+      }
       if(req.url?.startsWith('/evidence/')) {
         if(!evidence) return send(404,{error:'Unknown operation'});
         if(req.url==='/evidence/usage') return send(200,evidence.usage());
@@ -330,13 +342,17 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
         }
         if(!machine) return send(403,{error:'Machine credential required'});
         if(body.ticket?.split('#')[0]!==project) throw new Error('Workflow project mismatch');
-        if(req.url==='/workflow/change') return send(200,store.workflowChange(machine,body.session,body.runId,body.ticket,body.change,body.commandId,body.revision));
+        if(req.url==='/workflow/change') {
+          store.authorizeWorkflow(machine,body.session,body.ticket,body.runId);
+          if(body.change?.addLabels?.some((l:string)=>l.startsWith('done:')) || body.change?.labels?.some((l:string)=>l.startsWith('done:')) || ['In Documentation','Done'].includes(body.change?.status))await guardPinnedPublication(store,github,body.ticket);
+          return send(200,store.workflowChange(machine,body.session,body.runId,body.ticket,body.change,body.commandId,body.revision));
+        }
         if(req.url==='/workflow/comments') return send(200,store.workflow.comments(body.ticket));
         // Ownership for a write that does not go to the store, a PR comment:
         // the same refusal of a finished run or lost ownership that a ticket
         // comment gets from workflowComment.
         if(req.url==='/workflow/authorize') {
-          store.authorizeWorkflow(machine,body.session,body.ticket,body.runId);return send(200,{ok:true});
+          store.authorizeWorkflow(machine,body.session,body.ticket,body.runId);await guardPinnedPublication(store,github,body.ticket);return send(200,{ok:true});
         }
         if(req.url==='/workflow/comment') {
           store.workflowComment(machine,body.session,body.runId,body.ticket,body.body,body.commandId);return send(200,{ok:true});
@@ -353,7 +369,19 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
       }
       if (req.url === "/finish") {
         if (!machine) return send(403, { error: "Machine credential required" });
-        const incidents = store.finish(machine, body.session, body.id, body.completed !== false, body.unused === true, body.observation);
+        if(body.verificationAccepted!==undefined) {
+          const run=store.snapshot().runs.find(r=>r.id===body.id && r.machine===machine && r.session===body.session);
+          if(run) {
+            try {await guardPinnedPublication(store,github,run.ticket);}
+            catch(e) {
+              store.invalidateVerificationCandidate(run.ticket,String(body.verificationAccepted));
+              store.workflow.comment(run.ticket,e instanceof PublishedCandidateChanged?'Verification acceptance refused because the published candidate changed. A fresh review or repair is required.':'Verification acceptance refused because the published candidate could not be read. The run ended and released capacity. Its exact candidate remains required for a fresh review.','handoff-acceptance-'+run.id);
+              body.verificationAccepted=undefined;body.completed=false;
+              if(body.observation)body.observation={...body.observation,labels:store.workflow.get(run.ticket).labels};
+            }
+          }
+        }
+        const incidents = store.finish(machine, body.session, body.id, body.completed !== false, body.unused === true, body.observation, body.verificationAccepted);
         return send(200, { ok: true, incidents });
       }
       if (req.url === "/authorize") {
