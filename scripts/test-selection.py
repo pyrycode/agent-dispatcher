@@ -197,7 +197,8 @@ def gradle_selection(args):
         refuse('Gradle default tasks do not define a focused check')
     compilation = re.compile(r'(?:assemble(?:Debug|Release)?(?:AndroidTest)?|compile(?:Debug|Release)(?:UnitTest|AndroidTest)?Kotlin|lint(?:Debug|Release)?|spotless(?:Check|Apply)|clean|help|tasks|properties|dependencies)')
     for task in tasks:
-        if compilation.fullmatch(task):
+        # This managed-device setup prepares its image without running tests.
+        if compilation.fullmatch(task) or task == 'pixel2Api33AtdSetup':
             continue
         if task == 'testDebugUnitTest' and tests:
             names = []

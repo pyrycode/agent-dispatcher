@@ -13,6 +13,18 @@ spec.loader.exec_module(policy)
 
 
 class SelectionTests(unittest.TestCase):
+    def test_managed_emulator_setup_is_an_exact_non_test_task(self):
+        policy.gradle_selection([':app:pixel2Api33AtdSetup', '--rerun', '--console=plain'])
+        for args in [
+            [':app:pixel2Api33AtdSetupAll'],
+            [':app:OtherSetup'], [':app:p2A33AtdSetup'],
+            [':app:pixel2Api33AtdDebugAndroidTest', '--rerun', '--console=plain'],
+            [':app:pixel2Api33AtdSetup', ':app:check'],
+            [':app:pixel2Api33AtdSetup', ':app:testDebugUnitTest', '--tests', '*'],
+        ]:
+            with self.subTest(args=args), self.assertRaises(policy.PolicyError):
+                policy.gradle_selection(args)
+
     def test_go_full_and_effective_catch_all_requests_are_refused(self):
         commands = [
             ['test', './...'], ['test', '-run', '.', './internal/thread'],
@@ -99,6 +111,9 @@ class SelectionTests(unittest.TestCase):
                 with self.assertRaises(policy.PolicyError):
                     policy.check(root, 'go', ['test', './...'])
                 policy.check(root, 'go', ['test', './internal/thread'])
+                policy.check(root, 'gradle', [':app:pixel2Api33AtdSetup', '--rerun', '--console=plain'])
+                with self.assertRaises(policy.PolicyError):
+                    policy.check(root, 'gradle', [':app:pixel2Api33AtdDebugAndroidTest'])
             with patch.object(policy, 'socket_context', return_value={**reply, 'role': 'verifier'}):
                 policy.check(root, 'go', ['test', './...'])
             with patch.object(policy, 'socket_context', side_effect=OSError('gone')):
