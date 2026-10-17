@@ -126,6 +126,9 @@ export function builderLiveInheritedNames(shellEnvNames: readonly string[]): str
   return [
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_*", "TERM", "TMPDIR", "TMP", "TEMP",
     "GH_TOKEN", "DISPLAY", "PLAYWRIGHT_BROWSERS_PATH",
+    // AGP uses this mounted home for debug.keystore. Without it, Java's
+    // image-user home can generate a different signer on fresh workers.
+    "ANDROID_USER_HOME",
     "AGENTS_REPO_PATH", ...shellEnvNames, "OP_SERVICE_ACCOUNT_TOKEN", "PYRY_LIVE_CLAUDE_TOKEN",
   ];
 }
