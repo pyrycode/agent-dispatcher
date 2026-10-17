@@ -107,6 +107,95 @@ A computer also takes no new ticket while too many of its own tickets wait for r
 
 The claim service names the review-ready tickets of adopted projects, whoever owns them, in its snapshot as `reviewReadyTickets`, read from the workflow store through an index on status; the manager keeps its own owned tickets that no run holds and whose review it is offered. The manager enforces the hold, as it does the ticket limit; the claim service does not refuse a start for it. Status shows `reviewQueue`: `limit`, the waiting `tickets` and `full`, and a held offer's queue state is `review-queue-full`. Projects not adopted into the workflow store are not counted. A claim service from before this change sends no list: status then shows `tickets: null` and nothing is held. An older manager ignores the list. Either mix behaves as before the change, so the order of upgrade does not matter.
 
+### Controlled Desktop verifier handoff
+
+An operator can move an unstarted Desktop verifier to a named computer that
+has capacity. There is no automatic computer selection. This path initially
+supports only `pyrycode/pyrycode-desktop`.
+
+Use the protected central wrapper on pyrybox at
+`/home/pyry/pyrycode-runtime/fleet/operator.sh`. The examples below run beside
+that wrapper. Other hosts may have only a machine credential and cannot initiate
+a handoff. No credential is copied or added.
+
+Read the current claim generation through `operator.sh status` and the workflow
+revision through `operator.sh workflow read pyrycode/pyrycode-desktop`. Check the
+published candidate and save a private request file:
+
+```json
+{
+  "commandId": "desktop-verifier-123-1",
+  "ticket": "pyrycode/pyrycode-desktop#123",
+  "source": "build-fractal-2",
+  "generation": "CURRENT-CLAIM-GENERATION",
+  "revision": 12,
+  "candidate": "EXACT-40-CHARACTER-PUBLISHED-COMMIT",
+  "target": "pyrybox"
+}
+```
+
+```sh
+operator.sh handoff-verifier request /absolute/path/request.json
+operator.sh handoff-verifier read desktop-verifier-123-1
+operator.sh handoff-verifier cancel desktop-verifier-123-1
+```
+
+The operator credential alone can request or cancel a pending transfer. Reuse
+the same command identity and fields after an uncertain reply. Unknown fields,
+including supplied confirmation metadata, are refused. A request waits for up
+to three minutes. Source ownership stays intact while it waits. New runs on
+that ticket wait too. Expiry, cancellation or changed workflow and controls
+remove that wait without releasing an existing worker or discarding work.
+
+Both running dispatchers must offer the verifier. The target can see only this
+pending foreign verifier through its ordinary ticket selection. It gains no
+write authority until admission. Each host checks clean local candidate work
+and the exact published branch. The source's latest completed builder in the
+current ownership generation must already have shared evidence naming that
+candidate. Older builder evidence without this field cannot authorize a
+handoff. Unpublished work, pending verdicts, open native work or native artifacts
+still uploading prevent it. The canonical checkout's `.dispatcher.lock` is the
+only nonignored file excluded from its cleanliness check. Candidate worktrees
+receive no exclusion.
+
+The target manager checks its normal capacity, ticket and review limits before
+Git preparation. Checks retry at most once per fifteen seconds. The authority
+requires a source confirmation from the last thirty seconds and atomically
+moves the claim and reserves the target's exact verifier offer. Every normal
+capability, repair, lock, runner and admission check still applies. A drained
+or stopped target is refused. The operation never resumes a machine or board,
+raises a limit or releases uncertain work.
+
+The target runs exactly the saved candidate. Both main merges and automatic
+source commits and pushes are disabled. It runs fresh gates even when older
+matching gate evidence exists on that computer. The published branch is
+checked again before verdict publication. Saved-verdict recovery is disabled
+for this path. A changed candidate retains evidence, removes the review's
+completion label and requires repair or a fresh review.
+
+The pin persists through declined callbacks, setup failures, model failures
+and later verifier attempts. A clean retained worktree can be reused only
+through existing predecessor and process-custody proof. Dirty or uncertain
+work stays untouched. A target restart leaves the original reservation and pin
+in place; it does not infer that the old worker stopped. Cancelling an
+explicitly unused first admission restores the source claim and its original
+generation. After actual target work, an unused retry preserves target custody.
+
+Only an actual accepted verifier result supplies the completion proof. The
+authority checks the exact current published candidate and the completed
+review labels before accepting it and settling the run together. Late holds,
+changed labels or unreadable publication evidence refuse acceptance while
+releasing finished execution capacity. The pin remains for recovery. A later
+real builder supersedes it. After accepted verification, documentation and merge
+follow the existing normal rules. The accepted record retains its candidate
+and accepting run. This feature does not change those later stages' existing
+checks.
+
+Deploy the claim service and managers before advancing the Desktop dispatcher
+pin. Keep every saved drain and intentionally stopped service intact. A mixed
+version host that cannot confirm a request leaves it pending until expiry.
+Do not move a live ticket merely to demonstrate deployment.
+
 ### Ticket requirements
 
 Since 2026-10-15 a ticket can say where it must run. A `requires:macos`, `requires:linux` or `requires:android-device` label holds every stage of the ticket, refiner, builder, verifier, documentation, merge and recovery assessment alike, to a computer that advertises the capability. A ticket with no `requires:` label runs anywhere, as before. Several labels must all be met by one computer. An unknown name such as `requires:gpu` is kept as a requirement no computer meets, so the ticket waits visibly instead of running anywhere. Shared jobs (`@reconcile`, main sweeps, codegraph) and support tasks are not ticket stages and carry no requirement; a support task keeps its own platform route. The motivation was pyrycode-desktop #1983, a mute test that failed only on macOS while a Linux builder that could not reproduce it owned the ticket.

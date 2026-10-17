@@ -36,7 +36,7 @@ function shutdownDeadline(seconds: unknown): number {
 }
 async function main(): Promise<void> {
   const [command, configPath, ...args] = process.argv.slice(2);
-  if (!configPath || !["workflow", "control", "recovery-task", "claims", "manager", "status", "runner", "codex", "desired", "attention", "report-attention", "pause", "coordination", "recovery", "drain", "resume", "stop", "start", "desired-state", "drain-project", "resume-project", "free"].includes(command)) {
+  if (!configPath || !["handoff-verifier", "workflow", "control", "recovery-task", "claims", "manager", "status", "runner", "codex", "desired", "attention", "report-attention", "pause", "coordination", "recovery", "drain", "resume", "stop", "start", "desired-state", "drain-project", "resume-project", "free"].includes(command)) {
     throw new Error("Usage: fleet-bin.ts claims|manager|status|runner|codex|recovery|drain|resume|stop|start|desired-state|drain-project|resume-project|free CONFIG [claude|codex|local | PROJECT | --machine MACHINE|--all-machines [--project PROJECT] | TICKET GENERATION --confirmed-stopped]");
   }
   const config = JSON.parse(readFileSync(configPath, "utf8"));
@@ -87,6 +87,12 @@ async function main(): Promise<void> {
     const claims = new JsonClient(config.claimsUrl,secret(config.claimsOperatorTokenEnv ?? config.claimsTokenEnv));
     console.log(JSON.stringify(await claims.call('/tasks/'+args[0],body)));
     return;
+  }
+  if(command==='handoff-verifier') {
+    if(args.length!==2 || !['request','read','cancel'].includes(args[0]))throw new Error('Usage: handoff-verifier CONFIG request REQUEST.json | read ID | cancel ID');
+    const claims=new JsonClient(config.claimsUrl,secret(config.claimsOperatorTokenEnv??config.claimsTokenEnv));
+    const body=args[0]==='request'?JSON.parse(readFileSync(args[1],'utf8')):{id:args[1]};
+    console.log(JSON.stringify(await claims.call('/verification-handoff/'+args[0],body),null,2));return;
   }
   if (command === 'runner') {
     if (args.length > 1 || (args.length === 1 && !['claude', 'codex', 'local'].includes(args[0]))) throw new Error('Runner accepts claude, codex or local; omit to show the current choice');

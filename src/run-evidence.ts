@@ -65,6 +65,7 @@ export interface EvidenceBundle {
   files: Record<string, string>;
 }
 export interface RunEvidenceInput {
+  candidateRevision?: string;
   issueNumber: number;
   runId: string;
   role: string;
@@ -328,7 +329,7 @@ export async function collectRunEvidence(opts: RunEvidenceInput & {
     if (!whole) await point(source, size, modified, `longer than ${Math.round(limits.tailBytes / KIB)} KiB; the bundle holds the tail`);
   }
   const ticket = `${opts.project}#${opts.issueNumber}`;
-  const meta: EvidenceMeta = { kind: opts.kind, role: opts.role, outcome: opts.outcome, startedAt: Math.round(opts.startedAt), endedAt: Math.round(opts.endedAt),
+  const meta: EvidenceMeta = { ...(opts.candidateRevision?{candidateRevision:opts.candidateRevision}:{}), kind: opts.kind, role: opts.role, outcome: opts.outcome, startedAt: Math.round(opts.startedAt), endedAt: Math.round(opts.endedAt),
     ...(opts.dispatcherRevision && /^[a-f0-9]{40}$/.test(opts.dispatcherRevision) ? { dispatcherRevision: opts.dispatcherRevision } : {}) };
   files["run.json"] = redact(JSON.stringify({ ticket, runId: opts.runId, machine: opts.machine, ...meta,
     files: index.map(i => ({ path: i.path, source: i.source, bytes: i.bytes, included: i.included })), ...(omitted ? { omittedFiles: omitted } : {}) }));

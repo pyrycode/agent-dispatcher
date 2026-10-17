@@ -10126,6 +10126,17 @@ describe("pre-verifier gates — reusing a pass on the same files (2026-10-02, #
     }
   });
 
+  test("a transferred verifier runs fresh gates despite an existing matching target pass", async () => {
+    await withStageSet("builder",()=>withVerifierGates("make check",async()=>{
+      const {ctx,calls}=makeTestContext({agent:builderAgent("verifier"),item:{issueNumber:1597},mockOptions:{execImpls:headImpls(),fsMap:fsWith(1597,recorded(1597))}});
+      ctx.deps.managedWorktree={run:{id:'pin',project:'pyrycode/pyrycode-desktop',ticket:'pyrycode/pyrycode-desktop#1597',role:'verifier',machine:'target',session:'s',generation:'g',created:1,resource:'heavy',locks:[],verificationPin:{handoff:'h',candidate:HEAD,revision:1,sourceGeneration:'old'}},snapshot:async()=>({claims:[],runs:[]}),predecessor:async()=>null};
+      const result=await maybeRunPreSpawnGates(ctx);
+      assert.deepEqual(calls.gates.map(g=>g.command),['make check']);
+      assert.doesNotMatch(result.promptNote,/reused from that run/);
+      assert.equal(passWrites(calls,1597).length,1,'fresh target evidence replaces the old pass');
+    }));
+  });
+
   test("a green run records the pass; a retry on the same commit reuses it and runs no gate", async () => {
     const first = await runGates(1500, { execImpls: headImpls() });
     assert.equal(first.calls.gates.length, 1);

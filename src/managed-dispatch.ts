@@ -27,7 +27,7 @@ const DEFAULT_RESOURCE_CLASSES: Readonly<Record<string, ResourceClass>> = {
 };
 export type CodexReportEvent = "rate-limited" | "clean";
 type CodexReporter = (event: CodexReportEvent) => Promise<CodexPauseState | null>;
-const currentRun = new AsyncLocalStorage<{ run: FleetRun; groups: Set<number>; testContexts?:Map<string,()=>void>; goPath?:ReturnType<typeof managedGoPath>; taskSocket?: string; testContextSocket?:string; taskActions?: BridgeActions; githubEnv?:NodeJS.ProcessEnv; reportCodex?: CodexReporter;
+const currentRun = new AsyncLocalStorage<{ verificationAccepted?: string; run: FleetRun; groups: Set<number>; testContexts?:Map<string,()=>void>; goPath?:ReturnType<typeof managedGoPath>; taskSocket?: string; testContextSocket?:string; taskActions?: BridgeActions; githubEnv?:NodeJS.ProcessEnv; reportCodex?: CodexReporter;
   requestedTasks?: () => string[]; ticketTasks?: () => Promise<NativeTaskView[]> }>();
 /**
  * Reports the current admitted run's Codex events to the fleet's Codex
@@ -63,6 +63,12 @@ export async function managedTicketTasks(): Promise<NativeTaskView[] | null> {
 }
 /** The admitted run this code runs inside, or undefined outside a managed run. */
 export function managedRun(): FleetRun | undefined { return currentRun.getStore()?.run; }
+/** Called only after the dispatcher accepted a fresh final verifier result. */
+export function acceptManagedVerification(candidate:string):void {
+ const active=currentRun.getStore();
+ if(active?.run.verificationPin?.candidate===candidate)active.verificationAccepted=candidate;
+}
+
 /** Bind only supported product worktrees after their actual Git setup completes. */
 export function bindManagedTestWorktree(root:string):void {
  const store=currentRun.getStore();
@@ -144,6 +150,7 @@ export class ManagedDispatch {
   private syncing = false;
   private errorAt = 0;
   private readonly cooldown = new Map<string, number>();
+  private readonly handoffChecks = new Map<string, number>();
   private readonly dispatcherRoot=fileURLToPath(new URL("..",import.meta.url));
   readonly loadedRevision=execFileSync("git",["rev-parse","HEAD"],{cwd:this.dispatcherRoot,encoding:"utf8"}).trim();
   private readonly repairProofs=new Map<string,boolean>();
@@ -151,6 +158,7 @@ export class ManagedDispatch {
   draining = false;
   /** This dispatcher's runner for a role, without the central choice. Stated on agent offers. */
   localRunner: ((role: string) => AgentRunner) | undefined;
+  verifierHandoffPreflight?: (h: import("./verifier-handoff.js").VerifierHandoff,machine:string)=>Promise<void>;
   tasksEnabled: boolean;
   /** The claim service holds the shared evidence store (evidence-store.ts). */
   evidenceEnabled = false;
@@ -330,6 +338,17 @@ export class ManagedDispatch {
       // at once, so each draws a fresh random spread before its next start.
       if (this.state.codexPause?.active && state.codexPause && !state.codexPause.active) rearmCodexStartJitter(this.env);
       const runs = await this.connection.call<FleetRun[]>("/offers", { session: this.session, offers: this.offers() });
+      if(!this.draining && !state.draining && this.verifierHandoffPreflight) {
+        for(const h of state.verifierHandoffs??[]) {
+          if(h.ticket.split('#')[0]!==this.project || ![h.source,h.target].includes(state.machine) || Date.now()<(this.handoffChecks.get(h.commandId)??0))continue;
+          this.handoffChecks.set(h.commandId,Date.now()+15_000);
+          try {
+            await this.connection.call('/verification-handoff/preflight',{id:h.commandId,session:this.session});
+            await this.verifierHandoffPreflight(h,state.machine);
+            await this.connection.call('/verification-handoff/confirm',{id:h.commandId,session:this.session});
+          } catch(e) { console.warn(`Verifier handoff ${h.commandId} waiting: ${(e as Error).message}`); }
+        }
+      }
       this.state = state;
       this.tasksEnabled = !this.tasksDisabled && state.features?.recoveryTasks === true;
       this.evidenceEnabled = state.features?.evidence === true;
@@ -422,7 +441,7 @@ export class ManagedDispatch {
                   prepared = true;
                 }
                 await this.connection.call('/offers', { session: this.session, offers: this.offers(pending) });
-                const result = await this.connection.call<{ incidents?: RecoveryIncident[] }>('/finish', { session: this.session, id: run.id, completed, observation });
+                const result = await this.connection.call<{ incidents?: RecoveryIncident[] }>('/finish', { session: this.session, id: run.id, completed, observation, verificationAccepted:currentRun.getStore()!.verificationAccepted });
                 const incidents = result.incidents ?? [];
                 if (successor && !incidents.some(i => i.state === 'queued' && i.current !== false)) {
                   successor.retired = true;
@@ -438,7 +457,7 @@ export class ManagedDispatch {
         } else {
           // Never free a slot on an uncertain reply or on parent-process exit alone.
           while (true) {
-            try { await this.finish(run, completed); break; }
+            try { await this.finish(run, completed, false, currentRun.getStore()!.verificationAccepted); break; }
             catch { await sleep(5000); }
           }
         }
@@ -471,8 +490,8 @@ export class ManagedDispatch {
       return null;
     }
   }
-  private async finish(run: FleetRun, completed = true, unused = false): Promise<void> {
-    await this.connection.call("/finish", { session: this.session, id: run.id, completed, unused });
+  private async finish(run: FleetRun, completed = true, unused = false, verificationAccepted?:string): Promise<void> {
+    await this.connection.call("/finish", { session: this.session, id: run.id, completed, unused, verificationAccepted });
   }
   async authorize(issue: number): Promise<void> {
     await this.connection.call<Claim>("/authorize", { session: this.session, ticket: `${this.project}#${issue}`, runId: currentRun.getStore()?.run.id });
@@ -573,7 +592,7 @@ export class ManagedDispatch {
             const ticket = `${this.project}#${item.issueNumber}`;
             const claim = this.state.claims.find(c => c.ticket === ticket);
             const machine = (this.state as FleetSnapshot & { machine?: string }).machine;
-            if (claim && claim.machine !== machine) return false;
+            if (claim && claim.machine !== machine && !(!maintenance && item.status==='In Code Review' && this.state.verifierHandoffs?.some(h=>h.ticket===ticket && h.target===machine))) return false;
             return !maintenance || !this.state.runs.some(r => r.ticket === ticket);
           });
         };

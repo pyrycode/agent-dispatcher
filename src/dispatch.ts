@@ -1,3 +1,5 @@
+import {acceptManagedVerification} from './managed-dispatch.js';
+import {preflightVerifierHandoff,setupPinnedVerifier,assertPinnedVerifier} from './verifier-handoff-local.js';
 import { coordinationReceipts } from "./recovery-receipts.js";
 import { HOST_TESTING_POLICY } from "./testing-policy.js";
 import { writeRuntimeReceipt } from "./runtime-receipt.js";
@@ -2739,6 +2741,7 @@ export type DispatchContext = {
   useWorktree: boolean;
   agentCwd: string;
   logFile: string;
+  candidateRevision?: string;
   startTime: number;
   startTs: string;
   deps: DispatchDeps;
@@ -3077,7 +3080,7 @@ export async function dispatchToAgent(
     const run = deps.managedWorktree?.run ?? managedRun();
     if (run && item.issueNumber > 0) await (deps.recordEvidence ?? recordRunEvidence)({
       issueNumber: item.issueNumber, runId: run.id, role: agent.name, kind: "agent", outcome: outcome.value,
-      startedAt: ctx.startTime, endedAt: Date.now(), logFile: ctx.logFile, ...(ctx.verdictHandoffPath ? { verdictHandoffPath: ctx.verdictHandoffPath } : {}),
+      startedAt: ctx.startTime, endedAt: Date.now(), logFile: ctx.logFile, ...(ctx.candidateRevision?{candidateRevision:ctx.candidateRevision}:{}), ...(ctx.verdictHandoffPath ? { verdictHandoffPath: ctx.verdictHandoffPath } : {}),
     });
   }
 }
@@ -3142,10 +3145,16 @@ async function dispatchWithContext(ctx: DispatchContext, outcome: { value: strin
     // The two model phases already share one budget. Do not grant another
     // full budget through the normal single-phase continuation path.
     if (!parallelReview) streamResult = await maybeResumeExhaustedRun(streamResult, spawn.config, ctx);
+    if(ctx.deps.managedWorktree?.run.verificationPin)assertPinnedVerifier(ctx.agentCwd,ctx.deps.managedWorktree.run.verificationPin);
     saferSalvaged = await handleAgentResultErrors(streamResult, ctx);
     const postRun = await handlePostRun(streamResult, ctx, saferSalvaged);
     outcome.value = postRun.ok && !saferSalvaged ? "completed" : "failed";
     if (!postRun.ok) return;
+    if(ctx.useWorktree && agent.name==='builder')ctx.candidateRevision=readWorktreeHead(ctx.deps.execSync,ctx.agentCwd);
+    if(ctx.deps.managedWorktree?.run.verificationPin && !saferSalvaged && (await ctx.client.getIssueLabels(item.issueNumber)).includes('done:verifier')) {
+      assertPinnedVerifier(ctx.agentCwd,ctx.deps.managedWorktree.run.verificationPin);
+      acceptManagedVerification(ctx.deps.managedWorktree.run.verificationPin.candidate);
+    }
   } catch (error: any) {
     outcome.value = "failed";
     // The overlapped review's gates hit a host problem: halt, never rework.
@@ -3158,7 +3167,7 @@ async function dispatchWithContext(ctx: DispatchContext, outcome: { value: strin
     // publish the saved verdict and carry on as a success, or hold the
     // ticket for the next cycle. Anything else falls through and parks as
     // before. See verdict-handoff.ts (agent-dispatcher#118).
-    const recovered = ctx.verdictHandoffPath && streamResult && !saferSalvaged
+    const recovered = !ctx.deps.managedWorktree?.run.verificationPin && ctx.verdictHandoffPath && streamResult && !saferSalvaged
       ? await recoverSavedVerdict(ctx, error?.message ?? "", streamResult.hadPermissionDenial)
       : null;
     if (recovered?.kind === "posted") {
@@ -3177,7 +3186,7 @@ async function dispatchWithContext(ctx: DispatchContext, outcome: { value: strin
       await cleanupAfterDispatch(ctx);
       return;
     }
-    const preserveBlockedWork = streamResult?.runner === "codex"
+    const preserveBlockedWork = !!ctx.deps.managedWorktree?.run.verificationPin || streamResult?.runner === "codex"
       && ["codex_blocked", "needs_refinement"].includes(streamResult.terminalReason) && ctx.useWorktree;
     if (preserveBlockedWork) error.message += `\nWorktree preserved for recovery: ${ctx.worktreeDir}`;
     // A run that failed (wall clock, idle stall, crash or error result):
@@ -3528,6 +3537,28 @@ export async function setupBranchAndWorktree(
   const { agent, item, client, branchName, useWorktree } = ctx;
   let { worktreeDir } = ctx;
   const { execSync, mkdirSync, existsSync, copyCodegraphIndex, isSymlinkPath } = ctx.deps;
+
+  const pin=ctx.deps.managedWorktree?.run.verificationPin;
+  if(pin) {
+    if(agent.name!=='verifier' || ctx.deps.managedWorktree?.run.project!=='pyrycode/pyrycode-desktop' || !useWorktree)throw new Error('Pinned handoff is Desktop verification only');
+    mkdirSync(dirname(worktreeDir),{recursive:true});
+    try {
+      if(existsSync(worktreeDir)) {
+        await confirmManagedWorktree(ctx,worktreeDir);
+        assertPinnedVerifier(worktreeDir,pin);
+        const reuse=decideOwnReuse(ctx,[{path:worktreeDir,error:'pinned predecessor'}],'reuse-local-already-synced',true);
+        if(!reuse.reuse || reuse.commitLeftovers)throw new Error('Retained pinned worktree is not clean and reusable');
+      } else setupPinnedVerifier(repoRoot,worktreeDir,branchName,pin);
+      recordManagedWorktree(ctx);
+    }
+    catch(e) {
+      await client.addLabel(item.issueNumber,'error:verifier');
+      await client.addComment(item.issueNumber,`Pinned verifier could not start: ${(e as Error).message}. Candidate work and evidence were retained.`);
+      return {ok:false};
+    }
+    console.log(`   Verifier handoff ${pin.handoff}: exact candidate ${pin.candidate}; main merges disabled`);
+    return {ok:true};
+  }
 
   // PO and issue-0 (manual dispatch) run on the default branch — just pull latest
   if (!useWorktree) {
@@ -4478,6 +4509,7 @@ function pushPreRunMerge(ctx: DispatchContext, remoteExists: boolean, headBefore
  */
 function refreshBaseBeforeGates(ctx: DispatchContext): string {
   const { agent, item, useWorktree, worktreeDir, branchName } = ctx;
+  if(ctx.deps.managedWorktree?.run.verificationPin){assertPinnedVerifier(worktreeDir,ctx.deps.managedWorktree.run.verificationPin);return "\nExplicit verifier handoff: review the pinned candidate. Current main was not merged.\n";}
   if (!useWorktree || item.issueNumber <= 0 || ctx.pendingMerge) return "";
   if (activeStageSet().preSpawnGate?.agentNames.has(agent.name) !== true) return "";
   const { execSync: exec } = ctx.deps;
@@ -5562,6 +5594,7 @@ async function recoverSavedVerdict(
   approvalRejected: boolean,
 ): Promise<VerdictRecoveryOutcome> {
   const { agent, item, logFile, startTime, verdictHandoffPath: path } = ctx;
+  if(ctx.deps.managedWorktree?.run.verificationPin)return null;
   if (!path || !agent.requiresVerdict || item.issueNumber <= 0) return null;
   if (!isVerdictPublishFailure(failureText, { approvalRejected })) return null;
 
@@ -5781,7 +5814,7 @@ export async function handlePostRun(
   // case where an agent forgets — which has happened, and the failure mode
   // is silent loss of the run's output. Run unconditionally inside the
   // worktree so we don't have to know which agents write files.
-  if (item.issueNumber > 0 && useWorktree) {
+  if (item.issueNumber > 0 && useWorktree && !ctx.deps.managedWorktree?.run.verificationPin) {
     try {
       const dirty = execSync(`git status --porcelain -z --untracked-files=all`, { cwd: agentCwd, stdio: "pipe" }).toString();
       const gateTestdata = ctx.gateTestdata ?? new Set<string>();
@@ -5829,7 +5862,7 @@ export async function handlePostRun(
   // 2026-05-07 when code-review on #155 ran on a stale worktree, FAILed,
   // tried to push its review comments, hit non-fast-forward, but the
   // dispatcher continued to apply done:code-review and auto-advance.
-  if (item.issueNumber > 0 && useWorktree) {
+  if (item.issueNumber > 0 && useWorktree && !ctx.deps.managedWorktree?.run.verificationPin) {
     try {
       execSync(`git push -u origin ${branchName}`, { cwd: agentCwd, stdio: "pipe" });
       console.log(`   📤 Pushed ${branchName} to origin`);
@@ -7287,7 +7320,8 @@ async function runConfiguredPreSpawnGates(
   const inputsHash = strictInputs && head !== null ? verifierPrefixInputs(ctx, gates, head.tree) : undefined;
   if (strictInputs && !inputsHash) head = null;
   let docsOnly: ReturnType<typeof readDocsOnlyGateReuse> = null;
-  if (head !== null) {
+  const pinnedVerification=!!ctx.deps.managedWorktree?.run.verificationPin;
+  if (head !== null && !pinnedVerification) {
     const recordedPass = readRecordedGatePass(ctx, passFile);
     const reused = readReusableGatePass(ctx, recordedPass, head.tree, gatesHash, inputsHash ?? undefined);
     if (reused !== null) {
@@ -7356,7 +7390,7 @@ async function runConfiguredPreSpawnGates(
     : undefined;
 
   const prefixFile = resolve(LOGS_DIR, `verifier-gate_#${item.issueNumber}.prefix.json`);
-  const inputKey = head !== null && docsOnly === null ? inputsHash ?? null : null;
+  const inputKey = !pinnedVerification && head !== null && docsOnly === null ? inputsHash ?? null : null;
   const readEvidence = (path: string): string | null => {
     try { return String(ctx.deps.readFileSync(path, "utf-8")); } catch { return null; }
   };
@@ -10715,6 +10749,9 @@ export async function pollLoop(): Promise<void> {
   // hold Codex work during a fleet pause even without a central runner choice.
   // Without the admitted run's frozen central choice: the offer states the local answer only.
   if (managed) managed.localRunner = createRunnerSelector({ path: () => runnerFilePath(process.env, agentsRepoRoot), env: process.env, warn: () => {} });
+  if(managed && managed.project==='pyrycode/pyrycode-desktop')managed.verifierHandoffPreflight=async(h,machine)=>{
+    preflightVerifierHandoff(repoRoot,h,machine);
+  };
   if (managed) {await managed.start();rawClient=managed.authorityClient(rawClient);}
   // Shared run evidence: every run's bundle goes through this dispatcher's
   // machine manager to the claim service's store. PYRY_RUN_EVIDENCE=0 turns it off.
