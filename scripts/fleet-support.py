@@ -473,7 +473,11 @@ def mobile_capture(task,paths,directory):
         mobile=directory/'mobile'
         clone(paths['mobile'],mobile,revision,repository=MOBILE_PROJECT,deadline=deadline)
         env=clean_env()
-        env.update(PYRY_MOBILE_REPO=str(mobile),PYRY_GATE_EVIDENCE_DIR=str(directory/'device-evidence'))
+        # The isolated checkout has no sibling agents repository. The candidate's
+        # forwarding wrappers, which the gate's APK build runs, resolve the helper
+        # through AGENTS_REPO_PATH, so name the configured checkout, never an inherited one.
+        env.update(PYRY_MOBILE_REPO=str(mobile),PYRY_GATE_EVIDENCE_DIR=str(directory/'device-evidence'),
+                   AGENTS_REPO_PATH=str(paths['mobileAgents']))
         # Supporting sources are separate from the submitted Mobile candidate.
         if recipe=='mobile-scripted-evidence':
             for key,variable in [('core','PYRYCODE_SRC'),('relay','PYRYCODE_RELAY_SRC')]:
