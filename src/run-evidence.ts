@@ -21,7 +21,7 @@ import { createHash } from "node:crypto";
 import { createReadStream, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, openSync, readSync, closeSync, chmodSync } from "node:fs";
 import { basename, relative, resolve } from "node:path";
 import { scrubCredentials } from "./agent-runtime.js";
-import { ARTIFACT_LIMITS, artifactManifest, sha256, type ArtifactManifest } from "./recovery-artifacts.js";
+import { ARTIFACT_LIMITS, artifactManifest, manifestHash, sha256, validateManifest, type ArtifactManifest } from "./recovery-artifacts.js";
 import type { EvidenceKind, EvidenceMeta } from "./evidence-store.js";
 
 const KIB = 1024, MIB = 1024 * KIB;
@@ -500,7 +500,7 @@ export async function readEvidenceFile(connection: EvidenceConnection, bundle: E
 }
 
 /**
- * Bounded excerpts of a ticket's newest bundles for a recovery assessment:
+ * Bounded excerpts of a ticket's retained bundles for a recovery assessment:
  * each bundle's metadata and file list, then the tails of its most telling
  * files in priority order, until the character budget is spent. Untrusted
  * evidence, like every other input to the assessment. Null when the store
@@ -510,31 +510,57 @@ export async function evidenceExcerpts(connection: EvidenceConnection, ticket: s
   const deadline = Date.now() + deadlineMs;
   let listing: EvidenceListing;
   try { listing = await connection.call<EvidenceListing>("/evidence/list", { ticket }); } catch { return null; }
+  const requiredRoles = ['builder', 'verifier', 'recovery'];
+  const substantive = (file: ArtifactManifest['files'][number]) => file.bytes > 0
+    && !['SHA256SUMS', 'run.json', 'pointers.json'].includes(file.path)
+    && (priority(file.path) <= 5 || /\.(?:log|tail|txt|json|xml)$/.test(file.path));
+  // Preserve the authority's newest-first order. Reject a mismatched manifest
+  // before exposing a digest an assessment could cite in a workflow request.
+  const valid = listing.bundles.filter(bundle => {
+    try { return bundle.ticket === ticket && manifestHash(validateManifest(bundle.manifest)) === bundle.digest; }
+    catch { return false; }
+  });
+  const preferred = requiredRoles.flatMap(role => {
+    const bundle = valid.find(b => b.role === role && b.manifest.files.some(substantive));
+    return bundle ? [bundle] : [];
+  }).sort((a, b) => valid.indexOf(a) - valid.indexOf(b));
+  const remainingBundles = valid.filter(b => !preferred.includes(b));
+  const selected = [...preferred, ...remainingBundles.filter(b => b.manifest.files.some(substantive)),
+    ...remainingBundles.filter(b => !b.manifest.files.some(substantive))].slice(0, budget.bundles);
   let remaining = budget.characters;
-  const out = [];
-  for (const bundle of listing.bundles.slice(0, budget.bundles)) {
+  const out: Array<Pick<EvidenceListing['bundles'][number], 'runId' | 'digest' | 'machine' | 'role' | 'meta' | 'created'> & {
+    fileCount: number; files: Array<{ path: string; bytes: number }>; excerpts: Record<string, string>; inspectedPaths: string[];
+  }> = [];
+  for (let index = 0; index < selected.length; index++) {
+    const bundle = selected[index];
     const excerpts: Record<string, string> = {};
-    const files = bundle.manifest.files.filter(f => f.path !== "SHA256SUMS")
+    const inspectedPaths: string[] = [];
+    const files = bundle.manifest.files.filter(f => substantive(f) || f.path === 'pointers.json' && f.bytes > 0)
       .sort((a, b) => priority(a.path) - priority(b.path) || (a.path === "run.json" ? -1 : 0));
+    // One verbose builder log cannot consume the verifier's or recovery's
+    // reserved share. Empty/unreadable bundles return their unused share.
+    let bundleRemaining = Math.floor(remaining / (selected.length - index));
     let reads = 0;
     for (const file of files) {
       // Eight reads a bundle bound the calls; the character budget bounds the size.
       // The assessment holds its place while this runs, so it stops at a deadline too.
-      if (remaining <= 0 || reads >= 8 || file.path === "run.json" || Date.now() >= deadline) continue;
-      if (priority(file.path) > 5 && !/\.(?:log|tail|txt|json|xml)$/.test(file.path)) continue;
+      if (bundleRemaining <= 0 || reads >= 8 || Date.now() >= deadline) continue;
       try {
         reads++;
         // The last chunk, and the one before when the last is too short for an excerpt.
         const last = file.chunks.length - 1, lastBytes = file.bytes - Math.max(0, last) * ARTIFACT_LIMITS.chunkBytes;
         const text = await readEvidenceFile(connection, bundle, file.path, Math.max(0, lastBytes < budget.perFile ? last - 1 : last));
-        const excerpt = text.slice(-Math.min(budget.perFile, remaining));
+        const excerpt = text.slice(-Math.min(budget.perFile, bundleRemaining));
         if (!excerpt.trim()) continue;
         excerpts[file.path] = redact(excerpt);
+        if (substantive(file)) inspectedPaths.push(file.path);
         remaining -= excerpt.length;
+        bundleRemaining -= excerpt.length;
       } catch { excerpts[file.path] = "unreadable"; }
     }
-    out.push({ runId: bundle.runId, machine: bundle.machine, role: bundle.role, meta: bundle.meta, created: bundle.created,
-      fileCount: bundle.manifest.files.length, files: bundle.manifest.files.slice(0, 60).map(f => ({ path: f.path, bytes: f.bytes })), excerpts });
+    out.push({ runId: bundle.runId, digest: bundle.digest, machine: bundle.machine, role: bundle.role, meta: bundle.meta, created: bundle.created,
+      fileCount: bundle.manifest.files.length, files: bundle.manifest.files.slice(0, 60).map(f => ({ path: f.path, bytes: f.bytes })), excerpts, inspectedPaths });
   }
-  return { ticket, bundleCount: listing.bundles.length, bundles: out };
+  const missingRoles = requiredRoles.filter(role => !out.some(b => b.role === role && b.inspectedPaths.length));
+  return { ticket, bundleCount: listing.bundles.length, bundles: out, missingRoles };
 }

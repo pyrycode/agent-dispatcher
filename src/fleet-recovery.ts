@@ -1,3 +1,4 @@
+import { validateRecoverySplit, type RecoverySplitPlan } from "./recovery-split.js";
 import { createHash, randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { FleetSnapshot } from "./fleet-store.js";
@@ -16,10 +17,10 @@ export interface RecoveryObservation {
   /** Only the claim authority supplies a retained-evidence investigation identity. */
   investigationRevision?:string;
 }
-export type RecoveryAction = "wait" | "retry" | "rework" | "resume" | "refine" | "unblock" | "propose-close" | "coordinate" | "escalate";
+export type RecoveryAction = "wait" | "retry" | "rework" | "split" | "resume" | "refine" | "unblock" | "propose-close" | "coordinate" | "escalate";
 /** What should reopen a settled wait or operational escalation. Recovery task ids and full ticket references only. */
 export interface RecoveryWaitFor { tasks?: string[]; tickets?: string[] }
-export interface RecoveryDecision { action: RecoveryAction; reason: string; blocker?: string; retryReset?: string; recheckAt?: number; task?: RecoveryTaskRequest; category?: "operational" | "human";
+export interface RecoveryDecision { split?: RecoverySplitPlan; action: RecoveryAction; reason: string; blocker?: string; retryReset?: string; recheckAt?: number; task?: RecoveryTaskRequest; category?: "operational" | "human";
   waitFor?: RecoveryWaitFor;
   /** Code-only: a transient transport failure keeps its short cooldown. Never accepted from an assessment. */
   cooldown?: boolean }
@@ -173,7 +174,7 @@ export function recoveryTrigger(o: RecoveryObservation): { reason: string; manua
 }
 export function validateRecoveryDecision(value: unknown): RecoveryDecision {
   const d = value as RecoveryDecision;
-  if (!d || !["wait", "retry", "rework", "resume", "refine", "unblock", "propose-close", "coordinate", "escalate"].includes(d.action) || typeof d.reason !== "string" || !d.reason.trim() || d.reason.length > 6000) throw new Error("Invalid recovery decision");
+  if (!d || !["wait", "retry", "rework", "split", "resume", "refine", "unblock", "propose-close", "coordinate", "escalate"].includes(d.action) || typeof d.reason !== "string" || !d.reason.trim() || d.reason.length > 6000) throw new Error("Invalid recovery decision");
   if (d.action === "unblock" && !/^[\w.-]+\/[\w.-]+#[1-9]\d*$/.test(d.blocker ?? "")) throw new Error("Unblock requires a full blocker ticket");
   if (d.retryReset !== undefined && (!['retry', 'rework', 'refine', 'resume'].includes(d.action)
     || typeof d.retryReset !== "string" || !d.retryReset.trim() || d.retryReset.length > 6000)) throw new Error("Invalid retry reset finding");
@@ -183,7 +184,7 @@ export function validateRecoveryDecision(value: unknown): RecoveryDecision {
   const hint = (values: unknown, pattern: RegExp) => Array.isArray(values) ? [...new Set(values.filter((v): v is string => typeof v === "string" && pattern.test(v)))].slice(0, 10) : [];
   const waitFor = (d.action === "wait" || d.action === "escalate") && d.waitFor && typeof d.waitFor === "object"
     ? { tasks: hint(d.waitFor.tasks, TASK_ID), tickets: hint(d.waitFor.tickets, FULL_TICKET) } : undefined;
-  return { action: d.action, reason: d.reason, ...(task ? {task} : {}), ...(d.action === "escalate" && d.category ? {category:d.category} : {}), ...(d.action === "unblock" ? { blocker: d.blocker } : {}),
+  return { action: d.action, reason: d.reason, ...(d.action === "split" ? {split: validateRecoverySplit(d.split)} : {}), ...(task ? {task} : {}), ...(d.action === "escalate" && d.category ? {category:d.category} : {}), ...(d.action === "unblock" ? { blocker: d.blocker } : {}),
     ...(d.retryReset !== undefined ? { retryReset: d.retryReset } : {}),
     ...(waitFor && (waitFor.tasks.length || waitFor.tickets.length) ? { waitFor } : {}),
     ...(d.cooldown === true && d.action === "escalate" && d.category === "operational" ? { cooldown: true } : {}) };
@@ -514,7 +515,7 @@ export class RecoveryLedger {
       const { cooldown: _, ...rest } = decision;
       decision = { ...rest, recheckAt: this.now() + RECOVERY_RECHECK_MS };
     }
-    const state = ["retry", "rework", "resume", "refine", "unblock"].includes(decision.action) ? "applying" : decision.action === "coordinate" ? "waiting" : decision.action === "wait" ? "complete" : "escalated";
+    const state = ["retry", "rework", "split", "resume", "refine", "unblock"].includes(decision.action) ? "applying" : decision.action === "coordinate" ? "waiting" : decision.action === "wait" ? "complete" : "escalated";
     this.db.prepare("UPDATE fleet_recovery SET state=?, decision=?, updated=? WHERE id=?").run(state, JSON.stringify(decision), this.now(), id);
     if (settles(state, decision)) this.settle(id, incident.ticket, incident.fingerprint, decision);
     return decision;

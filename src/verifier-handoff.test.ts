@@ -2,11 +2,15 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {FleetStore, type StartRequest} from './fleet-store.js';
 import type {WorkflowItem} from './workflow-store.js';
+import {mkdtempSync,rmSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import type {RecoverySplitPlan} from './recovery-split.js';
 const evidence={list:()=>[{machine:'source',role:'builder',meta:{outcome:'completed',candidateRevision:'a'.repeat(40)}}]} as any;
 const project='pyrycode/pyrycode-desktop',ticket=project+'#1',candidate='a'.repeat(40);
-function fixture(){
+function fixture(database=':memory:'){
  let now=100000;
- const store=new FleetStore(':memory:',{source:{heavyLimit:1,combinedLimit:2},target:{heavyLimit:1,combinedLimit:2}},{now:()=>now});
+ const store=new FleetStore(database,{source:{heavyLimit:1,combinedLimit:2},target:{heavyLimit:1,combinedLimit:2}},{now:()=>now});
  const item:WorkflowItem={id:'P1',issueId:'I1',issueNumber:1,title:'t',body:'b',url:`https://github.com/${project}/issues/1`,status:'In Development',labels:[],blockedBy:[],parentNumber:null,grandparentNumber:null,state:'OPEN',revision:1,position:1};
  store.workflow.import({project,projectId:'P',statusFieldId:'S',options:{Inbox:'i',Done:'done','In Development':'d','In Code Review':'r'}},[item]);
  const req:StartRequest={workflowVersion:1,id:'build',machine:'source',session:'s',project,ticket,role:'builder',resource:'medium',locks:[]};
@@ -122,4 +126,28 @@ test('a late hold refuses acceptance while releasing drained capacity and retain
  assert.equal(store.snapshot().runs.length,0);assert.equal(store.verificationCandidate(ticket),candidate);assert.equal(store.verifierHandoffs.get(input.commandId).state,'admitted');
  assert.ok(store.workflow.get(ticket).labels.includes('held:operator'));assert.ok(!store.workflow.get(ticket).labels.includes('done:verifier'));
  }finally{store.close();}
+});
+test('durable split and handoff admission guards exclude each other in either preparation order',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'handoff-split-'));
+ const limits={source:{heavyLimit:1,combinedLimit:2},target:{heavyLimit:1,combinedLimit:2}};
+ const plan:RecoverySplitPlan={featureRoot:ticket,bodyHash:'0'.repeat(64),classification:'accumulating-behaviours',justification:'Two independent results',smallerResult:'Each child delivers one result',evidence:[],findings:[],behaviours:[],requirements:[],children:[]};
+ try{for(const first of ['handoff','split']){
+  const database=join(dir,first+'.sqlite');let {store,input}=fixture(database);
+  const before=store.snapshot().claims;
+  if(first==='handoff')store.requestVerifierHandoff(input);
+  // The split ledger represents the durable preparation boundary. Its policy
+  // validation and external publication remain covered by recovery-split.test.
+  const split=store.splits.prepare('split-1',ticket,plan,[store.workflow.get(ticket)],project,{[ticket]:`${input.source}:${input.generation}`});
+  store.close();store=new FleetStore(database,limits,{now:()=>100000});
+  try{
+   if(first==='handoff'){
+    assert.throws(()=>(store as any).guardRecoverySplit(split),/verifier handoff is pending/);
+    assert.equal(store.verifierHandoffs.get(input.commandId).state,'pending');
+    store.cancelVerifierHandoff(input.commandId);
+    assert.throws(()=>(store as any).guardRecoverySplit(split),/Unknown recovery incident/,'cancellation reaches the ordinary recovery validation');
+   }else assert.throws(()=>store.requestVerifierHandoff(input),/unchanged ready workflow/);
+   assert.deepEqual(store.snapshot().claims,before);assert.equal(store.snapshot().runs.length,0);
+   assert.equal(store.workflow.get(ticket).state,'OPEN');
+  }finally{store.close();}
+ }}finally{rmSync(dir,{recursive:true,force:true});}
 });

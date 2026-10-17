@@ -166,6 +166,11 @@ capability, repair, lock, runner and admission check still applies. A drained
 or stopped target is refused. The operation never resumes a machine or board,
 raises a limit or releases uncertain work.
 
+A pending recovery split prevents a handoff. A pending handoff prevents splitting
+an affected ticket until it is cancelled or expires. These durable checks share
+the authority's admission transaction. Once admitted, ordinary active-run and
+ownership checks prevent a concurrent split from closing or replacing the ticket.
+
 The target runs exactly the saved candidate. Both main merges and automatic
 source commits and pushes are disabled. It runs fresh gates even when older
 matching gate evidence exists on that computer. The published branch is
