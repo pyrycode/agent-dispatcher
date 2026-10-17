@@ -723,6 +723,16 @@ This prevents a remote check from being treated as new unclaimed work. Active
 workers keep their reservations. Native execution uses heavy capacity. Platform-route probes are light and cannot claim
 that candidate tests passed. Helpers do not transfer or claim their product ticket.
 
+Before starting either Android native route, the supervisor starts or checks the
+shared device connection server with the SDK's own adb executable. The test gate
+uses that same SDK. The server belongs to the Android environment and may survive
+individual tests. It starts before the worker's process tracking begins, so it
+does not keep a finished test's capacity reserved. This preparation runs before
+every launch. A failed or timed-out preparation saves a failed result and confirms
+that no task worker started. The normal completion path returns that result and
+releases the place. Unexpected descendants remain tracked, including a service
+restarted from inside a test. No process is ignored by its name.
+
 Native host helpers do not hold unrelated product restart reservations. A helper
 inside a container must finish before that container receives its drain signal.
 Once an update is waiting or draining, its container route admits no new helpers.

@@ -1,5 +1,9 @@
 import importlib.util
 import json
+import os
+import signal
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +16,94 @@ SHA = 'a' * 40
 
 
 class MobileCaptureTests(unittest.TestCase):
+    def native_supervisor(self, directory, capability='mobile-android'):
+        class Adapter:
+            def status(self): return {'machine': 'fixture', 'draining': False}
+        recipe = 'mobile-in-depth' if capability == 'mobile-android' else 'android-tool-then-text'
+        route = {'capability': capability, 'container': 'android', 'directory': directory,
+                 'containerDirectory': '/tasks', 'paths': {}}
+        supervisor = m.SupportSupervisor(Adapter(), {'stateDirectory': directory, 'projects': {},
+            'recoveryTasks': {recipe + ':' + capability: route}})
+        grant = {'task': {'id': 'a' * 64, 'ticket': 'pyrycode/pyrycode-mobile#2179',
+                         'request': {'recipe': recipe, 'capability': capability}},
+                 'run': {'id': 'run', 'session': 'session'}}
+        supervisor.rpc = lambda operation, body: [grant] if operation == 'schedule' else {}
+        return supervisor, grant
+
+    def test_android_service_is_prepared_before_task_custody_for_both_routes(self):
+        for capability in ['mobile-android', 'android-emulator']:
+            with self.subTest(capability=capability), tempfile.TemporaryDirectory() as d:
+                supervisor, _ = self.native_supervisor(d, capability)
+                events = []
+                def prepare(argv, **kwargs):
+                    events.append('service')
+                    self.assertEqual(argv[:4], ['podman', 'exec', 'android', 'python3'])
+                    self.assertIn('ANDROID_HOME', argv[-1])
+                    self.assertIn('platform-tools', argv[-1])
+                    self.assertIn('start-server', argv[-1])
+                    self.assertLessEqual(kwargs['timeout'], 60)
+                    return subprocess.CompletedProcess(argv, 0)
+                class Child:
+                    pid = 123
+                def launch(*args, **kwargs):
+                    events.append('task')
+                    return Child()
+                with patch.object(supervisor, 'route_ready', return_value=True), \
+                     patch.object(m.subprocess, 'run', side_effect=prepare), \
+                     patch.object(m.subprocess, 'Popen', side_effect=launch), \
+                     patch.object(m, 'process_snapshot', return_value={}):
+                    supervisor.tick()
+                self.assertEqual(events, ['service', 'task'])
+
+    def test_android_service_failure_finishes_without_launch_or_retained_capacity(self):
+        for failure in [OSError('unavailable'), subprocess.TimeoutExpired('adb', 45),
+                        subprocess.CalledProcessError(1, 'adb')]:
+            with self.subTest(failure=type(failure).__name__), tempfile.TemporaryDirectory() as d:
+                supervisor, grant = self.native_supervisor(d)
+                with patch.object(supervisor, 'route_ready', return_value=True), \
+                     patch.object(m.subprocess, 'run', side_effect=failure), \
+                     patch.object(m.subprocess, 'Popen') as launch:
+                    supervisor.tick()
+                    receipt = supervisor.directory / (grant['task']['id'] + '.receipt.json')
+                    saved = json.loads(receipt.read_text())
+                    result = json.loads(Path(saved['result']).read_text())
+                    self.assertTrue(saved['drainConfirmed'])
+                    self.assertNotIn('pid', saved)
+                    self.assertEqual(result['outcome'], 'failed')
+                    self.assertIn('No task worker was started', result['summary'])
+                    with patch.object(supervisor, 'return_artifacts', return_value='digest') as upload:
+                        supervisor.tick()
+                    upload.assert_called_once()
+                    self.assertEqual(json.loads(receipt.read_text())['phase'], 'complete')
+                    launch.assert_not_called()
+
+    @unittest.skipUnless(m.process_snapshot() is not None, 'Requires native process census')
+    def test_shared_android_service_survives_a_drained_task_without_becoming_its_descendant(self):
+        with tempfile.TemporaryDirectory() as d:
+            directory = Path(d)
+            adb = directory / 'sdk/platform-tools/adb'
+            adb.parent.mkdir(parents=True)
+            pid_file = directory / 'server.pid'
+            adb.write_text('#!' + sys.executable + '\nimport pathlib,subprocess,sys\n'
+                'child=subprocess.Popen([sys.executable,"-c","import time;time.sleep(60)"],'
+                'stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)\n'
+                'pathlib.Path(' + repr(str(pid_file)) + ').write_text(str(child.pid))\n')
+            adb.chmod(0o700)
+            try:
+                with patch.dict(os.environ, {'ANDROID_HOME': str(directory / 'sdk')}):
+                    m.prepare_android_service({'capability': 'mobile-android'}, directory / 'service.log')
+                pid = int(pid_file.read_text())
+                log = directory / 'execution.log'
+                self.assertEqual(m.execute([sys.executable, '-c', 'print("test completed")'], directory, log), 0)
+                self.assertEqual(m.directory_custody(directory), 'drained')
+                os.kill(pid, 0)
+                journal = json.loads(m.custody_file(log).read_text())
+                self.assertTrue(all(str(pid) not in record['owned'] for record in journal['commands']))
+            finally:
+                if pid_file.exists():
+                    try: os.kill(int(pid_file.read_text()), signal.SIGTERM)
+                    except ProcessLookupError: pass
+
     def test_mobile_route_waits_for_both_mounted_runner_updates(self):
         with tempfile.TemporaryDirectory() as d:
             route={'capability':'mobile-android','container':'native'}
