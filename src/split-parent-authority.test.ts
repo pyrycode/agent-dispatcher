@@ -104,7 +104,7 @@ async function stack(t: TestContext, store: FleetStore, fetcher: typeof fetch, d
   t.after(async () => { for (const server of servers) await close(server); });
   /** The gh socket of one admitted run, carrying that run's identity. */
   const bridge = async (machine: string, runId: string) => {
-    const socket = join(dir, `${runId}.sock`);
+    const socket = join(dir, `${machine}-${runId}.sock`);
     const server = await runGitHubBridge({ socket, url: `unix://${managers[machine]}`, token: `${machine}-core`, actor: { session: "s", runId } });
     t.after(() => close(server));
     return socket;
@@ -268,4 +268,97 @@ test("the hold is bounded by the stale-reservation age, so a vanished creator ca
   assert.deepEqual(store.start(start("hp", 3315, "refiner", "still")), { ok: false, reason: "locked" });
   now += 1;
   assert.equal(store.start(start("hp", 3315, "refiner", "released")).ok, true);
+});
+
+const mobile = "org/mobile";
+function dependent(n: number, blockers = [3533]): WorkflowItem {
+  return { ...item(n), id: `M${n}`, issueId: `MI${n}`, url: `https://github.com/${mobile}/issues/${n}`,
+    blockedBy: blockers.map(number => ({ number, state: "OPEN", url: item(number).url })) };
+}
+function splitTransfer(store: FleetStore) {
+  store.workflow.import(config, [item(3533), { ...item(3538, "Done"), state: "CLOSED", parentNumber: 3533 }, item(9999)]);
+  store.workflow.import({ ...config, project: mobile, projectId: "MP" }, [dependent(2205, [3533, 9999]), dependent(2206, [])]);
+  const run = start("pyrybox", 3533, "refiner");
+  assert.equal(store.start(run).ok, true);
+  return run;
+}
+const dependency = (child = "I3538", target = "MI2205", operation = "addBlockedBy") => ({
+  query: `mutation($input:${operation === "addBlockedBy" ? "Add" : "Remove"}BlockedByInput!){${operation}(input:$input){issue{id repository{nameWithOwner}} blockingIssue{id}}}`,
+  variables: { input: { issueId: target, blockingIssueId: child } },
+});
+const comment = (subjectId = "MI2205") => ({
+  query: "mutation($input:AddCommentInput!){addComment(input:$input){commentEdge{node{id body}}}}",
+  variables: { input: { subjectId, body: "The split child now carries this prerequisite. The original parent edge is retained." } },
+});
+
+test("Core #3533: an active parent refiner transfers existing foreign dependents to its child, without taking ownership", async t => {
+  const { store, dir } = fixture(t);
+  const run = splitTransfer(store);
+  // A completed builder's foreign claim must remain intact while a narrowly
+  // scoped dependency handoff updates its idle dependent.
+  const originalBlockers = store.workflow.get(`${mobile}#2205`).blockedBy;
+  store.workflowOperator(`${mobile}#2205`, { status: "In Development", blockedBy: [] }, "dev", store.workflow.get(`${mobile}#2205`).revision);
+  const owner = { ...start("hp", 2205, "builder"), project: mobile, ticket: `${mobile}#2205` };
+  assert.equal(store.start(owner).ok, true);
+  store.finish("hp", "s", owner.id);
+  store.workflowOperator(`${mobile}#2205`, { status: "Backlog", blockedBy: originalBlockers, addLabels: ["needs-human:decision"] }, "backlog", store.workflow.get(`${mobile}#2205`).revision);
+  const before = store.workflow.get(`${mobile}#2205`);
+  const claims = store.snapshot().claims;
+  const { bridge } = await stack(t, store, async () => { throw new Error("No upstream mutation allowed"); }, dir);
+  const socket = await bridge("pyrybox", run.id);
+  const early = await gh(socket, "POST", "/graphql", comment());
+  assert.equal(early.status, 409);
+  const updated = await gh(socket, "POST", "/graphql", dependency());
+  assert.equal(updated.status, 200);
+  assert.deepEqual(updated.body.data.addBlockedBy.issue, { id: "MI2205", repository: { nameWithOwner: mobile } });
+  // Retry is harmless, including when the child has already completed.
+  assert.equal((await gh(socket, "POST", "/graphql", dependency())).status, 200);
+  const after = store.workflow.get(`${mobile}#2205`);
+  assert.deepEqual(after.blockedBy.map(b => b.url), [item(3533).url, item(9999).url, item(3538).url]);
+  for (const key of ["labels", "status", "state", "position"] as const) assert.deepEqual(after[key], before[key]);
+  assert.deepEqual(store.snapshot().claims, claims);
+  assert.equal((await gh(socket, "POST", "/graphql", comment())).status, 200);
+  assert.equal((await gh(socket, "POST", `/repos/${mobile}/issues/2205/comments`, { body: "Split prerequisite handoff confirmed." })).status, 200);
+  assert.equal(store.workflow.comments(`${mobile}#2205`).length, 2);
+  store.finish("pyrybox", "s", run.id);
+  const late = await gh(socket, "POST", "/graphql", dependency());
+  assert.equal(late.status, 409);
+  assert.equal(late.body.refused, "ownership");
+});
+
+test("split transfer refuses unrelated edges, broad edits, and active foreign workers", async t => {
+  const { store, dir } = fixture(t);
+  const run = splitTransfer(store);
+  const { bridge } = await stack(t, store, async () => { throw new Error("No upstream mutation allowed"); }, dir);
+  const socket = await bridge("pyrybox", run.id);
+  const before = store.workflow.get(`${mobile}#2205`);
+  assert.throws(() => store.workflowSplitDependency("pyrybox", "stale-session", run.id, project, `${mobile}#2205`, `${project}#3538`), /active planning run/);
+  const refused = [
+    dependency("I9999"), dependency("I3538", "MI2206"), dependency("I3533"), dependency("I3538", "MI2205", "removeBlockedBy"),
+    { query: 'mutation{closeIssue(input:{issueId:"MI2205"}){issue{id}}}' },
+    { query: 'mutation{updateIssue(input:{id:"MI2205",state:OPEN}){issue{id}}}' },
+    comment("MI2206"),
+    { query: 'mutation{addLabelsToLabelable(input:{labelableId:"MI2205",labelIds:["L1"]}){labelable{id}}}' },
+    { query: 'mutation{updateProjectV2ItemFieldValue(input:{projectId:"P",itemId:"M2205",fieldId:"S",value:{singleSelectOptionId:"dev"}}){projectV2Item{id}}}' },
+  ];
+  for (const request of refused) {
+    const result = await gh(socket, "POST", "/graphql", request);
+    assert.equal(result.status, 409, JSON.stringify(request));
+    assert.equal(result.body.refused, "ownership");
+    assert.deepEqual(store.workflow.get(`${mobile}#2205`), before);
+  }
+  const worker = { ...start("hp", 2205, "deployment-check"), project: mobile, ticket: `${mobile}#2205` };
+  assert.equal(store.start(worker).ok, true);
+  const active = await gh(socket, "POST", "/graphql", dependency());
+  assert.equal(active.status, 409);
+  assert.match(active.body.message, /active run/);
+  assert.deepEqual(store.workflow.get(`${mobile}#2205`), before);
+  store.finish("hp", "s", worker.id);
+  assert.equal((await gh(socket, "POST", "/graphql", dependency())).status, 200);
+  const other = await bridge("hp", run.id);
+  assert.equal((await gh(other, "POST", "/graphql", dependency())).status, 409);
+  const wrongRole = start("pyrybox", 9999, "builder");
+  store.workflowOperator(`${project}#9999`, { status: "In Development" }, "builder-dev", store.workflow.get(`${project}#9999`).revision);
+  assert.equal(store.start(wrongRole).ok, true);
+  assert.equal((await gh(await bridge("pyrybox", wrongRole.id), "POST", "/graphql", dependency())).status, 409);
 });

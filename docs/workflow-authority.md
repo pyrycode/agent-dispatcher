@@ -23,6 +23,17 @@ label, comment and close command in Mobile #1984's split on 2026-10-13. Finished
 workers cannot publish a late verdict or change workflow. Cross-ticket writes
 retain the existing ownership rules.
 
+An active parent refiner or PO can transfer a cross-project prerequisite to a
+split child. The dependent must already depend on that parent. The added blocker
+must be an imported child of that same parent in the planner's project. The
+operation adds the child and retains every existing blocker. Once that child edge
+exists, the planner can post its handoff comment on the dependent through either
+GraphQL or REST. A dependent with an active run refuses both operations, even on
+the same computer. The dependent's ownership, stage, labels and holds stay intact.
+Finished runs, other roles, unrelated tickets, dependency removals and general
+foreign workflow edits remain refused. A permission refusal is reported to the
+worker as an ownership refusal with its reason, rather than a service outage.
+
 Finishing a run removes that role's running marker in the same transaction as
 releasing its reservation. GitHub availability cannot leave a completed builder
 marked as running. Uncertain workers keep their reservations.
