@@ -708,6 +708,15 @@ the agent's summary, which always mentions the approval. A genuine rejection, "T
 action was rejected due to unacceptable risk", still parks, even beside a reviewer
 failure.
 
+For imported projects, the dispatcher saves that distinction in the claim
+database before scheduling another run. The replacement worker receives the
+record in its role instructions. A historical review outage alone does not
+require operator permission. Necessary commands still pass through normal
+approval review. Failure to save the outcome parks the ticket instead of starting
+a replacement without the evidence. Unsafe rejections remain admission-blocked
+even if an error label is removed. Operator continuation uses the protected
+[approval decision command](docs/workflow-authority.md#approval-review-continuation).
+
 "Codex output" means only the text Codex itself writes about a refused action: the
 message on a `codex_core::tools::router` ERROR line on stderr, the output of a
 `declined` command item, and the error or result text of a `failed` MCP call. Each

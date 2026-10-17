@@ -159,6 +159,47 @@ resolve the actual state. Reuse the same command identity only for the exact sam
 request. The controls also support `state`, `labels`, `blockedBy`, `top` and `afterItemId`.
 Changing a status does not bypass dependency, review, ownership or admission checks.
 
+### Approval review continuation
+
+Approval outcomes belong to the claim database, separately from ticket prose and
+GitHub labels. Only an admitted source run can report the dispatcher's observed
+review failure or safety rejection. A safety rejection takes precedence over a
+review outage. Replayed reports cannot change their kind. Finished runs cannot
+report new outcomes. The next worker receives the saved distinction in its role
+instructions. Normal approval checks remain required.
+
+An unresolved safety rejection blocks new ordinary admission even when its error
+label is removed. Recovery may still inspect it. After reviewing the saved stop,
+an operator can authorise continuation from preserved work:
+
+```sh
+operator.sh workflow approval-authorize owner/repo decision.json
+```
+
+```json
+{
+  "commandId": "approval-decision-1947-1",
+  "ticket": "owner/repo#1947",
+  "runId": "exact-source-run-from-approvalState",
+  "revision": 12,
+  "reason": "Reviewed the recorded refusal and authorised continuation from the saved commit."
+}
+```
+
+Read `approvalState` and the workflow revision with the protected workflow read
+command first. The decision is operator-only and binds to that recorded run. It
+atomically records permission, clears that role's error and escalation labels and
+adds recovery priority. It preserves stage, ownership, retry counts, blockers and
+other holds. An active worker or stale revision refuses the whole change. Repeat
+an uncertain request with the same command identity and exact arguments. A fresh
+safety rejection requires a fresh decision. Neither ticket text nor an old
+decision can bypass a new approval check. Operator reasons remain audit data and
+are never inserted as instructions in the worker prompt.
+
+Deploy the claim service and every manager before advancing consumer dispatcher
+pins. Workers running the older version produce no approval records. Historical
+stops without such records still require ordinary operator investigation.
+
 ### Filing a ticket
 
 An interactive session files a new ticket in one step:

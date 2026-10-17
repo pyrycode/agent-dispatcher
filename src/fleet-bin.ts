@@ -42,7 +42,7 @@ async function main(): Promise<void> {
   const config = JSON.parse(readFileSync(configPath, "utf8"));
   if(command==='workflow') {
     const [action,project,file,boardNumber]=args;
-    if(!['read','export','import','change','file','prepare','activate','cancel-preparation'].includes(action)||!project)throw new Error('workflow read|export|import|change|file|prepare|activate|cancel-preparation PROJECT [JSON_FILE]');
+    if(!['read','export','import','change','file','prepare','activate','cancel-preparation','approval-authorize'].includes(action)||!project)throw new Error('workflow read|export|import|change|file|prepare|activate|cancel-preparation|approval-authorize PROJECT [JSON_FILE]');
     if(action==='export') {
       if(!file)throw new Error('Export output path required');
       const entry=config.projects?.find((p:any)=>p.repo===project);
@@ -57,6 +57,10 @@ async function main(): Promise<void> {
     if(action==='read') {console.log(JSON.stringify(await claims.call('/workflow/read',{project})));return;}
     if(!file)throw new Error('Saved workflow request required');
     const input=JSON.parse(readFileSync(file,'utf8'));
+    if(action==='approval-authorize') {
+      if(!input.commandId) throw new Error('Approval decision requires a commandId kept for retries');
+      console.log(JSON.stringify(await claims.call('/workflow/approval-authorize',{...input,project})));return;
+    }
     // A filing is retried by repeating the same commandId, so it never gets a random one.
     if(action==='file') {
       if(!input.commandId)throw new Error('Filing request requires a commandId kept for retries');

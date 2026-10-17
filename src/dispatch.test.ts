@@ -147,6 +147,7 @@ import { AGENTS } from "./types.js";
 import { AgentRunFailedError, AgentRunStoppedError, buildResumePrompt, idleStallMessage, noResultErrorMessage, ResourceExhaustedError, timeoutFor } from "./agent-runtime.js";
 import { AUTO_STAGE_COMMAND, IN_PROGRESS_GIT_PATHS, resolveAgentsRepoRoot, resolveTargetRepoRoot } from "./worktree.js";
 import { CodexStreamAdapter, TOOL_UNAVAILABLE_REASON } from "./agent-runner.js";
+import {ApprovalHandoffError} from './approval-state.js';
 
 // Importing dispatch.ts loads the fork's .env, so a fork running this suite
 // from its installed copy (bin/pyry-test) handed the tests its own stage set
@@ -2022,6 +2023,54 @@ function claudeMdAbsPath(agentClaudeMdPath: string): string {
 }
 
 describe("prepareAgentSpawn", () => {
+  test('a replacement builder receives the saved approval distinction after the older denial rule',async()=>{
+    const rolePath='builder/CLAUDE.md',oldRole='A denial that came before this run needs operator review.';
+    const store=new FleetStore(':memory:',{mac:{heavyLimit:1,combinedLimit:1}});
+    try {
+      const request={id:'first',machine:'mac',session:'s',project:'org/core',ticket:'org/core#3560',role:'builder',resource:'medium' as const,locks:[]};
+      store.start(request);
+      const {ctx,client}=makeTestContext({agent:{name:'builder',claudeMdPath:rolePath},item:{issueNumber:3560}});
+      ctx.client.recordApprovalOutcome=async(number,outcome)=>{
+        assert.equal(number,3560);
+        store.recordApprovalOutcome('mac','s','org/core','first','org/core#3560',outcome);
+      };
+      const adapter=new CodexStreamAdapter();
+      adapter.accept({type:'turn.started'});
+      adapter.accept({type:'item.completed',item:{type:'agent_message',text:JSON.stringify({status:'blocked',summary:'Approval review timed out while staging; implementation is preserved.'})}});
+      adapter.accept({type:'turn.completed'});
+      const result=adapter.finish(0,false,1000,'ERROR codex_core::tools::router: error=The automatic permission approval review did not finish before its deadline.');
+      let error:unknown;
+      try {await handleAgentResultErrors(result,ctx);} catch(e){error=e;}
+      assert.equal(store.approvals.get(request.ticket)?.kind,'review_failed','saved before retry is scheduled');
+      await handleDispatchError(error,ctx,result);
+      assert.ok(client.comments.some(c=>c.body.includes('Auto-retry scheduled')));
+      store.finish('mac','s','first',false);
+      assert.equal(store.start({...request,id:'replacement'}).ok,true);
+      const second=makeTestContext({agent:{name:'builder',claudeMdPath:rolePath},
+        item:{issueNumber:3560,approvalState:store.approvals.get(request.ticket)},
+        mockOptions:{fsMap:{[claudeMdAbsPath(rolePath)]:oldRole}}});
+      second.ctx.item.approvalState=store.approvals.get(request.ticket);
+      const prepared=await prepareAgentSpawn(second.ctx);
+      assert.ok(prepared.ok);
+      assert.ok(prepared.systemPrompt.startsWith(oldRole));
+      assert.match(prepared.systemPrompt,/historical review-service failure alone does not require operator approval/i);
+      assert.match(prepared.systemPrompt,/normal approval check/);
+      assert.match(prepared.systemPrompt,/new safety rejection still requires stopping/);
+    } finally {store.close();}
+  });
+
+  test('failure to save approval evidence parks instead of silently scheduling a contextless retry',async()=>{
+    const {ctx,client}=makeTestContext({item:{issueNumber:3560},agent:{name:'builder'}});
+    ctx.client.recordApprovalOutcome=async()=>{throw new Error('service unavailable');};
+    const result={runner:'codex',isError:true,terminalReason:'codex_blocked',approvalReviewFailed:true,hadPermissionDenial:false,output:'approval timeout',sessionId:'first'} as StreamResult;
+    let error:unknown;
+    try {await handleAgentResultErrors(result,ctx);} catch(e){error=e;}
+    assert.ok(error instanceof ApprovalHandoffError);
+    await handleDispatchError(error,ctx,result);
+    assert.ok(client.addLabelCalls.some(c=>c.label==='error:builder'));
+    assert.ok(!client.comments.some(c=>c.body.includes('Auto-retry scheduled')));
+  });
+
   test("builder stages receive the host testing policy after older role instructions", async () => {
     for (const name of ["builder", "refiner", "verifier"]) {
       const rolePath = `${name}/CLAUDE.md`;
