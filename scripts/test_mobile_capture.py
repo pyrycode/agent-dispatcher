@@ -185,5 +185,103 @@ class MobileCaptureTests(unittest.TestCase):
             self.assertIn('checkout failed', result['files']['mobile/capture.json'])
 
 
+# The candidate's forwarding path: the gate's APK build runs the checkout's
+# compatibility wrapper, which forwards to agent-tool.py. The fixture copies
+# only agent-tool.py's helper resolution, AGENTS_REPO_PATH or a sibling
+# checkout, not its tool allowlist, test scope or admission.
+CANDIDATE_WRAPPER = (
+    'import os,sys\nfrom pathlib import Path\n'
+    'os.execv(sys.executable,[sys.executable,str(Path(__file__).with_name("agent-tool.py")),Path(__file__).name,*sys.argv[1:]])\n')
+CANDIDATE_AGENT_TOOL = (
+    'import os,sys\nfrom pathlib import Path\n'
+    'root=Path(__file__).resolve().parents[1]\n'
+    'agents=Path(os.environ.get("AGENTS_REPO_PATH",root.parent/"pyrycode-mobile-agents"))\n'
+    'script=agents/"scripts"/sys.argv[1]\n'
+    'if not script.is_file():\n'
+    '    sys.exit("Install pyrycode-mobile-agents beside this checkout or set AGENTS_REPO_PATH.")\n'
+    'os.execv(sys.executable,[sys.executable,str(script),*sys.argv[2:]])\n')
+# The agents gate builds APKs through the candidate before any device test.
+AGENTS_GATE = (
+    'import os,subprocess,sys\nfrom pathlib import Path\n'
+    'root=Path(os.environ["PYRY_MOBILE_REPO"])\n'
+    'build=subprocess.run([sys.executable,str(root/"scripts/gradle-gate.py"),":app:assembleDebug"],stdout=sys.stderr)\n'
+    'if build.returncode:\n'
+    '    print("no device test was started",file=sys.stderr);sys.exit(1)\n'
+    'print(\'<testsuite tests="1"><testcase classname="C" name="passes"/></testsuite>\')\n')
+AGENTS_GRADLE = 'import sys\nprint("configured agents gradle helper ran",file=sys.stderr)\n'
+
+
+@unittest.skipUnless(m.process_snapshot() is not None, 'Requires native process census')
+class MobileCaptureAgentsCheckoutTests(unittest.TestCase):
+    """#294: the isolated candidate has no sibling agents checkout."""
+
+    def repository(self, path, files):
+        path.mkdir(parents=True)
+        for name, content in files.items():
+            (path / name).parent.mkdir(parents=True, exist_ok=True)
+            (path / name).write_text(content)
+        # Host git settings such as signing or template hooks cannot affect the fixture.
+        env = {**{k: v for k, v in os.environ.items() if not k.startswith('GIT_')},
+               'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1'}
+        git = ['git', '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', '-C', str(path)]
+        subprocess.run(['git', 'init', '-q', '--template=', '-b', 'main', str(path)], check=True, env=env)
+        subprocess.run([*git, 'add', '-A'], check=True, env=env)
+        subprocess.run([*git, 'commit', '-q', '-m', 'fixture'], check=True, env=env)
+        return subprocess.check_output(['git', '-C', str(path), 'rev-parse', 'HEAD'], text=True).strip()
+
+    def capture(self, recipe, agents_files, inherited=None):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        revision = self.repository(root / 'sources/mobile', {
+            'scripts/gradle-gate.py': CANDIDATE_WRAPPER, 'scripts/agent-tool.py': CANDIDATE_AGENT_TOOL})
+        self.repository(root / 'configured/mobile-agents', agents_files)
+        for key in ['core', 'relay']:
+            self.repository(root / 'sources' / key, {'README': key})
+        directory = root / 'task'
+        directory.mkdir()
+        def clone(source, destination, revision=None, repository=None, deadline=None):
+            # Local and offline. Only the network fetch of the real clone is replaced.
+            subprocess.run(['git', 'clone', '-q', str(source), str(destination)], check=True)
+            if revision:
+                subprocess.run(['git', '-C', str(destination), 'switch', '-q', '--detach', revision], check=True)
+        paths = {key: str(root / 'sources' / key) for key in ['mobile', 'core', 'relay']}
+        paths['mobileAgents'] = str(root / 'configured/mobile-agents')
+        environment = {k: v for k, v in os.environ.items() if k != 'AGENTS_REPO_PATH'}
+        if inherited is not None:
+            environment['AGENTS_REPO_PATH'] = inherited
+        with patch.object(m, 'clone', side_effect=clone), patch.dict(os.environ, environment, clear=True):
+            result = m.native_recipe({'ticket': 'pyrycode/pyrycode-mobile#2169', 'request': {
+                'recipe': recipe, 'capability': 'mobile-android', 'revision': revision}}, paths, directory)
+        self.assertFalse((directory / 'pyrycode-mobile-agents').exists())
+        return result, json.loads(result['files']['mobile/capture.json'])
+
+    def test_nested_candidate_build_finds_the_configured_agents_helper(self):
+        agents = {'scripts/android-test-gate.py': AGENTS_GATE, 'scripts/gradle-gate.py': AGENTS_GRADLE}
+        for recipe in sorted(m.MOBILE_RECIPES):
+            for inherited in [None, '/nonexistent/inherited-agents']:
+                with self.subTest(recipe=recipe, inherited=inherited):
+                    result, evidence = self.capture(recipe, agents, inherited)
+                    log = result['files']['mobile/execution.log']
+                    self.assertNotIn('Install pyrycode-mobile-agents', log)
+                    self.assertIn('configured agents gradle helper ran', log)
+                    self.assertEqual(result['outcome'], 'completed', evidence['errors'])
+                    self.assertTrue(evidence['complete'])
+                    self.assertTrue(evidence['runs'])
+                    for run in evidence['runs']:
+                        self.assertEqual(run['counts'], {'executed': 1, 'passed': 1, 'failed': 0, 'skipped': 0})
+
+    def test_missing_configured_helper_fails_and_keeps_the_preparation_diagnostic(self):
+        result, evidence = self.capture('mobile-in-depth', {'scripts/android-test-gate.py': AGENTS_GATE})
+        log = result['files']['mobile/execution.log']
+        self.assertEqual(result['outcome'], 'failed')
+        self.assertFalse(evidence['complete'])
+        self.assertIn('Install pyrycode-mobile-agents beside this checkout or set AGENTS_REPO_PATH.', log)
+        self.assertIn('no device test was started', log)
+        self.assertEqual(result['files']['mobile/gate-0.xml'], '')
+        self.assertIn('Malformed JUnit report', evidence['errors'])
+        self.assertNotIn('counts', evidence['runs'][0])
+
+
 if __name__ == '__main__':
     unittest.main()
