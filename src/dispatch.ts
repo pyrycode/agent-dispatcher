@@ -1211,8 +1211,14 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
     // Codex: between a turn's end and the process exit the run has its
     // outcome, so silence there is not a stall.
     let codexTurnEnded = false;
+    // Claude: the same between a result frame and whatever follows it. A
+    // run that waits on Monitor or a background task ends its turn with a
+    // result and then sits silent until a notification re-enters it, so the
+    // watchdog stands down at each result and re-arms on the next turn's
+    // first assistant frame (pyrycode/pyrycode#3563).
+    let claudeTurnEnded = false;
     const idleTimer = idleMs > 0 ? setInterval(() => {
-      if (idleStalled || timedOut || codexTurnEnded || !shouldFireIdleWatchdog(idleState, Date.now(), idleMs)) return;
+      if (idleStalled || timedOut || codexTurnEnded || claudeTurnEnded || !shouldFireIdleWatchdog(idleState, Date.now(), idleMs)) return;
       idleStalled = true;
       if (idleTimer) clearInterval(idleTimer);
       appendFileSync(opts.logFile, `\n💤 IDLE STALL — no stream output for ${idleMs / 1000}s with no tool call outstanding; killing agent\n`);
@@ -1278,7 +1284,14 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
             // The run has its outcome. A process that lingers after its
             // result is not a stalled agent; the wall clock bounds it as
             // before, and the result still counts.
-            if (idleTimer) clearInterval(idleTimer);
+            claudeTurnEnded = true;
+          } else if (msg.type === "assistant" && claudeTurnEnded) {
+            // A notification re-entered the session after its result, so
+            // the run is working again: that result was an interim one, not
+            // the outcome. Drop it, so a run stopped from here is reported
+            // by why it stopped, and only a later result counts.
+            claudeTurnEnded = false;
+            resultMsg = null;
           }
           // Drive the Layer 2 denial watchdog. State transitions are
           // pure; only side effects (log lines, SIGTERM) go through
@@ -4647,7 +4660,8 @@ export async function prepareAgentSpawn(
   // the run when the agent fell back to a shell loop (pyrycode/pyrycode#3563,
   // builder, 2026-10-17). Under `claude -p` a Monitor event re-enters the
   // session and the run continues to its next result frame, which is the one
-  // the dispatcher keeps. The name must match the tool exactly.
+  // the dispatcher keeps; runClaudeStreaming's idle watchdog stands down at
+  // each result and re-arms on the next turn. The name must match exactly.
   const baseTools = "Bash,Monitor,Read,Write,Edit,Glob,Grep,TodoWrite,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status,mcp__plugin_context7_context7__resolve-library-id,mcp__plugin_context7_context7__query-docs,mcp__codegraph__codegraph_explore,mcp__plugin_figma_figma__get_design_context,mcp__plugin_figma_figma__get_screenshot,mcp__plugin_figma_figma__get_metadata,mcp__plugin_figma_figma__get_variable_defs,mcp__plugin_figma_figma__search_design_system";
   // codegraph 1.x lists one MCP tool, codegraph_explore; it returns the source, call paths
   // and blast radius the 0.x search/callers/callees/impact/node/context tools gave
