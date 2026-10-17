@@ -2133,7 +2133,7 @@ describe("prepareAgentSpawn", () => {
     assert.equal(config.cwd, ctx.agentCwd);
     assert.equal(config.timeoutMs, 1_500_000, "developer = 25min");
     // baseTools without Agent (developer doesn't sub-dispatch).
-    assert.ok(config.allowedTools.includes("Bash,Read,Write,Edit"));
+    for (const tool of ["Bash", "Monitor", "Read", "Write", "Edit"]) assert.ok(config.allowedTools.split(",").includes(tool), tool);
     assert.ok(config.allowedTools.includes("mcp__codegraph__codegraph_explore"));
     assert.ok(
       config.allowedTools.includes("mcp__plugin_context7_context7__resolve-library-id"),
@@ -2185,6 +2185,28 @@ describe("prepareAgentSpawn", () => {
     assert.equal(writes.length, 2, "exactly two writeFileSync calls (prompt + system prompt)");
     assert.ok(writes.some(w => w.content === "## Mock prompt #201"));
     assert.ok(writes.some(w => typeof w.content === "string" && w.content.startsWith("Mock developer system prompt") && w.content.includes("Ticket testing operating system")));
+  });
+
+  test("every Claude role that can run Bash in the background may also wait on it with Monitor (pyrycode#3563)", async () => {
+    // Claude Code blocks `sleep N; cat <output>` and tells the agent to wait
+    // through Monitor. Under dontAsk a Monitor missing from the allowlist is
+    // denied, and the denial watchdog force-exits the run on the agent's next
+    // tool call, as it did to the #3563 builder on 2026-10-17.
+    for (const name of ["developer", "architect", "code-review", "po", "refiner", "builder", "verifier"]) {
+      const claudeMd = claudeMdAbsPath(`${name}/CLAUDE.md`);
+      const { ctx } = makeTestContext({
+        agent: { name, claudeMdPath: `${name}/CLAUDE.md` },
+        item: { issueNumber: 3563, title: "Monitor grant" },
+        mockOptions: { fsMap: { [claudeMd]: `Mock ${name} system prompt` }, buildPromptResult: "## Mock prompt #3563" },
+      });
+      const result = await prepareAgentSpawn(ctx);
+      if (!result.ok) assert.fail(`${name}: expected ok:true`);
+      const allowed = result.config.allowedTools.split(",");
+      assert.ok(allowed.includes("Bash"), `${name} runs Bash`);
+      // Exact tool name: a near miss such as "monitor" never matches and is silently denied.
+      assert.ok(allowed.includes("Monitor"), `${name} must be allowed Monitor`);
+      assert.ok(!result.config.disallowedTools.split(",").includes("Monitor"), `${name} must not have Monitor denied`);
+    }
   });
 
   test("per-agent model/effort override flows into the spawn config (default opus/high is covered by the happy-path test above)", async () => {

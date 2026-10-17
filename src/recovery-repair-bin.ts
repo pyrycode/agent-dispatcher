@@ -34,7 +34,7 @@ await withManagedTaskRun(task.admission.run,async()=>{
   writeFileSync(system,'You are the shared dispatcher implementation agent in an isolated task checkout. Work only in this checkout. Read its instructions and relevant existing source. Make the smallest cause-specific repair. Do not send GitHub messages, push, merge, deploy or change external state. The fixed parent runs full checks and independent review and performs ordinary publication. Never force-push, reset, discard user work or bypass a denied permission. Return completed only when the patch is ready for review.');
   const built=await runClaudeStreaming({runner,promptFile:buildPrompt,systemPromptFile:system,cwd:repo,logFile:join(directory,'builder.log'),
    model:runner==='codex'?process.env.PYRY_CODEX_MODEL??'gpt-6.1-sol':'sonnet',effort:'xhigh',maxTurns:80,timeoutMs:30*60_000,
-   allowedTools:'Bash,Read,Write,Edit,Glob,Grep',disallowedTools:'Agent,AskUserQuestion',env});
+   allowedTools:'Bash,Monitor,Read,Write,Edit,Glob,Grep',disallowedTools:'Agent,AskUserQuestion',env});
   writeFileSync(join(directory,'builder.result.txt'),built.lastAssistantText??built.output,{mode:0o600});
   writeFileSync(join(directory,'builder.output.txt'),built.output,{mode:0o600});
   if(built.isError||built.timedOut||built.hadPermissionDenial) throw new Error('Implementation did not complete or permission was denied');

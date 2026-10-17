@@ -16,6 +16,9 @@ import { AgentRunFailedError } from "./agent-runtime.js";
 //   tool-silence  a tool call that runs longer than the idle threshold
 //   crash         stderr only, exit 1, no result frame (pyrycode-mobile #1340)
 //   crash-after-work  a text message and a tool call, then as crash
+//   reenter       an interim result, silence past the idle threshold, then a
+//                 new turn and a final result (a Monitor wait, pyrycode#3563)
+//   reenter-stall an interim result, then a new turn that goes silent
 const FIXTURE = `#!${process.execPath}
 const out = (m) => process.stdout.write(JSON.stringify(m) + "\\n");
 const mode = process.env.MODE;
@@ -41,6 +44,19 @@ if (mode === "linger") {
   out({ type: "assistant", message: { content: [{ type: "tool_use", id: "commit", name: "Bash", input: { command: "git commit -m 'fix(thread): close the prompt'" } }] } });
   process.stderr.write("Error: socket hang up\\n");
   process.exitCode = 1;
+} else if (mode === "reenter" || mode === "reenter-stall") {
+  out({ type: "assistant", message: { content: [{ type: "text", text: "Monitor is watching the test run." }] } });
+  out({ type: "result", subtype: "success", is_error: false, num_turns: 3, result: "waiting for the tests", session_id: "sess-fixture", terminal_reason: "completed" });
+  setTimeout(() => {
+    out({ type: "user", message: { content: [{ type: "text", text: "<task-notification>tests finished</task-notification>" }] } });
+    if (mode === "reenter") {
+      out({ type: "assistant", message: { content: [{ type: "text", text: "Tests pass." }] } });
+      out({ type: "result", subtype: "success", is_error: false, num_turns: 1, result: "final", session_id: "sess-fixture", terminal_reason: "completed" });
+    } else {
+      out({ type: "assistant", message: { content: [{ type: "thinking", thinking: "reading the output" }] } });
+      setTimeout(() => {}, 30_000);
+    }
+  }, 2500);
 } else if (mode === "tool-silence") {
   out({ type: "assistant", message: { content: [{ type: "tool_use", id: "gradle", name: "Bash", input: {} }] } });
   setTimeout(() => {
@@ -102,6 +118,26 @@ test("idle watchdog stands down once the result is in: a process lingering after
   assert.equal(result.output, "done");
   assert.equal(result.timedOut, true, "the wall clock, not the watchdog, ended the lingering process");
   assert.doesNotMatch(readFileSync(logFile, "utf8"), /IDLE STALL/);
+});
+
+test("a run that re-enters after an interim result is not a stall, and its final result is the outcome (pyrycode#3563)", async t => {
+  const { run, logFile } = await runFixture(t, "reenter", "0.01");
+  const result = await run;
+  assert.equal(result.isError, false);
+  assert.equal(result.output, "final");
+  assert.equal(result.timedOut, false);
+  assert.doesNotMatch(readFileSync(logFile, "utf8"), /IDLE STALL/, "silence after a result is a wait, not a stall");
+});
+
+test("idle watchdog re-arms when a run re-enters after an interim result, and the interim result does not count", async t => {
+  const { run, logFile } = await runFixture(t, "reenter-stall", "0.01");
+  const started = Date.now();
+  await assert.rejects(run, (err: Error) => {
+    assert.match(err.message, /idle_stall/);
+    return true;
+  });
+  assert.ok(Date.now() - started < 10_000, "fired on the idle threshold, not the 20s wall clock");
+  assert.match(readFileSync(logFile, "utf8"), /IDLE STALL/);
 });
 
 test("idle watchdog stays quiet while a tool call is outstanding", async t => {
