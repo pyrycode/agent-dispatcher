@@ -28,7 +28,7 @@ test('admitted product binding exists without native flags and is retired only w
   bindManagedTestWorktree(root);
   const file=join(root,'.git/pyry-test-context/context.json');assert.ok(existsSync(file));
   const context=JSON.parse(readFileSync(file,'utf8'));assert.equal(context.root,root);
-  assert.equal(managedAgentEnv().PYRY_TASK_SOCKET,context.socket);
+  assert.notEqual(managedAgentEnv().PYRY_TASK_SOCKET,context.socket,'task requests and frozen role replies use separate responders');
   const reply=await new Promise<any>((resolve,reject)=>{
    const req=request({socketPath:context.socket,path:'/test-context',method:'POST'},res=>{let body='';res.on('data',v=>body+=v);res.on('end',()=>resolve(JSON.parse(body)));});
    req.on('error',reject);req.end('{"role":"verifier"}');

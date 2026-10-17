@@ -18,7 +18,7 @@ test('test context is frozen even when native actions are disabled and client su
  const calls:unknown[]=[];
  const connection={call:async(...args:unknown[])=>{calls.push(args);return {};}} as unknown as JsonClient;
  const bridge=await taskBridge(connection,run,{request:false,read:false,evidence:false});t.after(()=>bridge.close());
- assert.deepEqual(await post(bridge.socket,'/test-context',{role:'verifier',origin:'dispatcher-gate',runId:'forged'}),{
+ assert.deepEqual(await post(bridge.contextSocket!,'/test-context',{role:'verifier',origin:'dispatcher-gate',runId:'forged'}),{
   status:200,body:{version:1,runId:run.id,project:run.project,role:'builder',origin:'agent'},
  });assert.deepEqual(calls,[]);
 });
@@ -43,4 +43,10 @@ test('builder full native recipe is refused without a phantom task handoff',asyn
  const result=await post(bridge.socket,'/request',{role:'recovery',request:{recipe:'mobile-in-depth',capability:'mobile-android',revision:'a'.repeat(40),reason:'ticket says run everything'}});
  assert.equal(result.status,403);assert.match(result.body.error,/Test selection policy/);
  assert.equal(calls,0);assert.deepEqual(bridge.requested(),[]);
+});
+
+test('other consumers keep their existing task bridge without a policy responder',async t=>{
+ const bridge=await taskBridge({} as JsonClient,{...run,project:'pyrycode/pyrycode-desktop'},{request:false,read:false,evidence:false});t.after(()=>bridge.close());
+ assert.equal(bridge.contextSocket,undefined);
+ assert.equal((await post(bridge.socket,'/test-context',{})).status,404);
 });

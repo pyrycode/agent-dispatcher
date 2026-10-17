@@ -20,7 +20,7 @@ test('ordinary Go uses frozen builder selection before launch and preserves focu
  writeFileSync(join(bin,'go'),`#!/bin/sh\nprintf '%s\\n' "$@" > '${marker}'\nexit 17\n`,{mode:0o700});
  const frozen={id:'builder-one',project:'pyrycode/pyrycode',role:'builder',session:'one',ticket:'pyrycode/pyrycode#2202'} as FleetRun;
  const bridge=await taskBridge({} as JsonClient,frozen,{request:false,read:false,evidence:false});t.after(()=>bridge.close());
- const release=bindTestContext(root,{runId:frozen.id,project:frozen.project,socket:bridge.socket});t.after(release);
+ const release=bindTestContext(root,{runId:frozen.id,project:frozen.project,socket:bridge.contextSocket!});t.after(release);
  const shim=managedGoPath(root,bin+':'+process.env.PATH);t.after(shim.release);
  const env={...process.env,PATH:shim.path,PYRY_TEST_PATH:shim.path,CLAUDE_CODE_ENTRYPOINT:'verifier',PYRY_TASK_SOCKET:'/forged/socket'};
  assert.equal(resolveAgentShellEnv(env).PATH,shim.path,'Codex tool commands retain the generated PATH');
@@ -48,7 +48,7 @@ test('the same managed Go entry preserves full verifier acceptance',async t=>{
  writeFileSync(join(bin,'go'),'#!/bin/sh\nexit 23\n',{mode:0o700});
  const run={id:'verifier-one',project:'pyrycode/pyrycode',role:'verifier'} as FleetRun;
  const bridge=await taskBridge({} as JsonClient,run,{request:false,read:false,evidence:false});t.after(()=>bridge.close());
- t.after(bindTestContext(root,{runId:run.id,project:run.project,socket:bridge.socket}));
+ t.after(bindTestContext(root,{runId:run.id,project:run.project,socket:bridge.contextSocket!}));
  const shim=managedGoPath(root,bin+':'+process.env.PATH);t.after(shim.release);
  await assert.rejects(execute('go',['test','./...'],{cwd:root,env:{...process.env,PATH:shim.path}}),error=>(error as any).code===23);
 });

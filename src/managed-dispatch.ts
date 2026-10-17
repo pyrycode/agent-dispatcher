@@ -27,7 +27,7 @@ const DEFAULT_RESOURCE_CLASSES: Readonly<Record<string, ResourceClass>> = {
 };
 export type CodexReportEvent = "rate-limited" | "clean";
 type CodexReporter = (event: CodexReportEvent) => Promise<CodexPauseState | null>;
-const currentRun = new AsyncLocalStorage<{ run: FleetRun; groups: Set<number>; testContexts?:Map<string,()=>void>; goPath?:ReturnType<typeof managedGoPath>; taskSocket?: string; taskActions?: BridgeActions; githubEnv?:NodeJS.ProcessEnv; reportCodex?: CodexReporter;
+const currentRun = new AsyncLocalStorage<{ run: FleetRun; groups: Set<number>; testContexts?:Map<string,()=>void>; goPath?:ReturnType<typeof managedGoPath>; taskSocket?: string; testContextSocket?:string; taskActions?: BridgeActions; githubEnv?:NodeJS.ProcessEnv; reportCodex?: CodexReporter;
   requestedTasks?: () => string[]; ticketTasks?: () => Promise<NativeTaskView[]> }>();
 /**
  * Reports the current admitted run's Codex events to the fleet's Codex
@@ -67,9 +67,9 @@ export function managedRun(): FleetRun | undefined { return currentRun.getStore(
 export function bindManagedTestWorktree(root:string):void {
  const store=currentRun.getStore();
  if(!store || !['pyrycode/pyrycode','pyrycode/pyrycode-mobile'].includes(store.run.project))return;
- if(!store.taskSocket)throw new Error('Managed test policy socket is unavailable');
+ if(!store.testContextSocket)throw new Error('Managed test policy socket is unavailable');
  store.testContexts??=new Map();
- if(!store.testContexts.has(root))store.testContexts.set(root,bindTestContext(root,{runId:store.run.id,project:store.run.project,socket:store.taskSocket}));
+ if(!store.testContexts.has(root))store.testContexts.set(root,bindTestContext(root,{runId:store.run.id,project:store.run.project,socket:store.testContextSocket}));
  if(store.run.project==='pyrycode/pyrycode' && TASK_REQUEST_ROLES.has(store.run.role) && !store.goPath)store.goPath=managedGoPath(root,process.env.PATH??'');
 }
 /** Native repair recipes use the same tracked-child completion rule as project workers. */
@@ -383,7 +383,7 @@ export class ManagedDispatch {
         bridge=/#[1-9]\d*$/.test(run.ticket) && (testPolicy || actions.request || actions.read || actions.evidence) ? await taskBridge(this.connection,run,actions) : undefined;
         if(bridge){
           const store=currentRun.getStore()!;
-          store.taskSocket=bridge.socket;store.taskActions=actions;store.requestedTasks=bridge.requested;
+          store.taskSocket=bridge.socket;store.testContextSocket=bridge.contextSocket;store.taskActions=actions;store.requestedTasks=bridge.requested;
           if(actions.read) store.ticketTasks=()=>this.ticketTasks(run.ticket);
         }
         // Fresh authority check before starting, including after a manual release.
