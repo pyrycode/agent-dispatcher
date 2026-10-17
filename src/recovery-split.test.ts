@@ -1,5 +1,8 @@
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { FleetStore } from './fleet-store.js';
 import { GitHubBroker } from './github-broker.js';
 import { WorkflowGitHub } from './workflow-github.js';
@@ -8,6 +11,8 @@ import { artifactManifest, manifestHash } from './recovery-artifacts.js';
 import { splitBodyHash, splitRequirements, validateRecoverySplit, validateSplitAgainstTicket, type RecoverySplitPlan } from './recovery-split.js';
 import type { WorkflowItem, WorkflowProject } from './workflow-store.js';
 import { observationFor, runRecoveryWork } from './recovery-work.js';
+import { serveFleet, FleetClient, JsonClient } from './fleet-http.js';
+import { MachineManager, serveManager } from './machine-manager.js';
 const project = 'org/app', ticket = `${project}#3`;
 const config: WorkflowProject = {project, projectId:'P',statusFieldId:'S',options:{Inbox:'i',Backlog:'b','In Development':'d','In Code Review':'r',Done:'x'}};
 const item = (n:number, extra:Partial<WorkflowItem> = {}):WorkflowItem => ({id:`P${n}`,issueId:`I${n}`,issueNumber:n,title:`Ticket ${n}`,body:'',status:'Backlog',labels:[],url:`https://github.com/${project}/issues/${n}`,blockedBy:[],parentNumber:null,grandparentNumber:null,state:'OPEN',revision:1,position:n,...extra});
@@ -23,12 +28,12 @@ export function recoverySplitFixturePlan():RecoverySplitPlan {
     behaviours:[{id:'history',description:'Selected host history stays isolated',child:'host-history',verification:'Cross-host history regression'},{id:'menu',description:'Background task menu updates independently',child:'task-menu',verification:'Background menu completion regression'}],
     requirements:[{text:'Selected host history stays isolated',child:'host-history'},{text:'Background task menu updates independently',child:'task-menu'},{text:'Authentication checks remain required',child:'host-history'},{text:'Authentication checks remain required',child:'task-menu'}],children};
 }
-async function fixture(t:TestContext, options:{metadata?:boolean;causal?:boolean;oversized?:boolean}={}) {
-  const store = new FleetStore(':memory:',{mac:{heavyLimit:4,combinedLimit:4},linux:{heavyLimit:4,combinedLimit:4}});
+async function fixture(t:TestContext, options:{metadata?:boolean;causal?:boolean;oversized?:boolean;database?:string;evidenceDatabase?:string}={}) {
+  const store = new FleetStore(options.database ?? ':memory:',{mac:{heavyLimit:4,combinedLimit:4},linux:{heavyLimit:4,combinedLimit:4}});
   store.reportMachineCapabilities('mac',[],[project]);
   const parent = item(3,{blockedBy:options.causal?[{number:5,state:'OPEN',url:'https://github.com/org/app/issues/5'}]:[],parentNumber:2,grandparentNumber:1,status:'In Code Review',body,labels:['rework-count:3','error:rework-loop','security-sensitive','needs-real-claude','priority:high']});
   store.workflow.import(config,[item(1,{state:'CLOSED',status:'Done'}),item(2,{parentNumber:1,state:'CLOSED',status:'Done'}),parent,item(4,{blockedBy:[{number:3,state:'OPEN',url:parent.url}]}),...(options.causal?[item(5)]:[])]);
-  const evidence = new EvidenceStore(':memory:',{...DEFAULT_EVIDENCE_LIMITS,totalBytes:1024*1024,ticketBytes:512*1024,bundleBytes:256*1024},id=>store.runOwner(id));
+  const evidence = new EvidenceStore(options.evidenceDatabase ?? ':memory:',{...DEFAULT_EVIDENCE_LIMITS,totalBytes:1024*1024,ticketBytes:512*1024,bundleBytes:256*1024},id=>store.runOwner(id));
   const plan = recoverySplitFixturePlan();
   for (const reference of plan.evidence) {
     // Historical runs remain intact. The test uses ordinary authority run records and real hashed bundles.
@@ -77,8 +82,10 @@ async function fixture(t:TestContext, options:{metadata?:boolean;causal?:boolean
   }) as typeof fetch;
   const broker = new GitHubBroker({token:'test',projects:[project],fetcher});
   const bridge = new WorkflowGitHub(store,broker), actor={machine:'mac',session:'session',runId:recoveryRun.id};
-  t.after(()=>{evidence.close();store.close();});
-  return {store,evidence,plan,incident,actor,bridge,calls,faults,issues};
+  let closed = false;
+  const close = () => { if (!closed) { evidence.close(); store.close(); closed = true; } };
+  t.after(close);
+  return {store,evidence,plan,incident,actor,bridge,broker,calls,faults,issues,close};
 }
 
 test('grandchild recovery split preserves full feature root, security, regression, evidence, ownership and dependency order',async t=>{
@@ -233,4 +240,49 @@ test('one broad original acceptance criterion can be retained by the final child
   validateRecoverySplit(p);
   validateSplitAgainstTicket(p,item(3,{body:parentBody,labels:['rework-count:2']}),'org/app#1');
   assert.equal(p.requirements.length,1);assert.equal(p.behaviours.length,2);
+});
+
+test('manager and central HTTP routes bind the project credential to the active source recovery run',async t=>{
+  const f=await fixture(t);
+  const central=await serveFleet(f.store,{mac:'machine-mac',linux:'machine-linux'},'central-operator',0,'127.0.0.1',f.broker,undefined,undefined,undefined,undefined,f.evidence);
+  const ca=central.address();assert(ca&&typeof ca!=='string');
+  const centralUrl=`http://127.0.0.1:${ca.port}`;
+  const manager=new MachineManager({machine:'mac',projects:[project,'org/other'],heavyLimit:4,combinedLimit:4},new FleetClient(centralUrl,'machine-mac'));
+  const server=await serveManager(manager,{[project]:'project-app','org/other':'project-other'},'local-operator',0);
+  t.after(async()=>{await new Promise<void>(r=>server.close(()=>r()));await new Promise<void>(r=>central.close(()=>r()));});
+  const sa=server.address();assert(sa&&typeof sa!=='string');const url=`http://127.0.0.1:${sa.port}`;
+  const owner=new JsonClient(url,'project-app'),foreign=new JsonClient(url,'project-other');
+  const request={id:f.incident.id,project,session:f.actor.session,runId:f.actor.runId};
+  await assert.rejects(foreign.call('/recovery/split',request),/project mismatch/,'another project cannot borrow the source project, session or run');
+  await assert.rejects(owner.call('/recovery/split',{...request,session:'foreign-session'}),/ownership|owner|run/i);
+  await assert.rejects(new JsonClient(url,'local-operator').call('/recovery/split',request),/Project credential required/);
+  await assert.rejects(new JsonClient(url,'unknown').call('/recovery/split',request),/Authentication required/);
+  assert.equal(f.issues.size,0,'rejected transport requests create no child or partial workflow');
+  const result=await owner.call<any>('/recovery/split',request);
+  assert.equal(result.state,'complete');assert.equal(f.issues.size,2);
+});
+
+test('a fresh authority resumes a persisted partial split without recreating children or losing evidence and ownership',async t=>{
+  const directory=mkdtempSync(join(tmpdir(),'recovery-split-restart-'));
+  const database=join(directory,'claims.sqlite'), evidenceDatabase=join(directory,'evidence.sqlite');
+  let reopened: FleetStore | undefined, retained: EvidenceStore | undefined;
+  t.after(()=>{retained?.close();reopened?.close();rmSync(directory,{recursive:true,force:true});});
+  const f=await fixture(t,{database,evidenceDatabase});f.faults.afterLink=1;
+  await assert.rejects(f.bridge.recoverySplit(f.incident.id,f.evidence,f.actor),/GitHub unavailable/);
+  assert.equal(f.store.workflow.get(ticket).state,'OPEN');
+  f.store.finish('mac','session',f.actor.runId,false);
+  const claims=f.store.snapshot().claims, record=f.store.splits.get(f.incident.id)!;
+  assert.equal(record.state,'preparing');assert.equal(f.evidence.list(ticket).length,3);
+  f.close();
+  reopened=new FleetStore(database,{mac:{heavyLimit:4,combinedLimit:4},linux:{heavyLimit:4,combinedLimit:4}});
+  retained=new EvidenceStore(evidenceDatabase,{...DEFAULT_EVIDENCE_LIMITS,totalBytes:1024*1024,ticketBytes:512*1024,bundleBytes:256*1024},id=>reopened!.runOwner(id));
+  const bridge=new WorkflowGitHub(reopened,f.broker);
+  assert.deepEqual(reopened.splits.get(f.incident.id),record,'the durable plan, source and partial child survive process state loss');
+  const result = await bridge.recoverySplit(f.incident.id,retained) as {state:string};
+  assert.equal(result.state,'complete');
+  assert.equal(reopened.workflow.get(ticket).state,'CLOSED');
+  assert.equal(f.calls.filter(c=>c==='create:100').length,1);assert.equal(f.calls.filter(c=>c==='link:100').length,1);
+  assert.deepEqual(reopened.snapshot().claims,claims);assert.equal(retained.list(ticket).length,3);
+  assert.equal(reopened.splits.get(f.incident.id)?.source.body,body);
+  assert.equal(reopened.workflow.get('org/app#100').featureRoot,'org/app#1');
 });
