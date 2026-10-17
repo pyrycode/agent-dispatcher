@@ -485,6 +485,43 @@ export class FleetStore {
   workflowComment(machine:string,session:string,runId:string|undefined,ticket:string,body:string,id:string):void {
     this.transaction(()=>{this.authorizeWorkflow(machine,session,ticket,runId);this.workflow.comment(ticket,body,id);});
   }
+  /** A parent planner may add its child to an existing cross-project dependent.
+   * This never grants general authority or changes the dependent's claim. */
+  private splitDependent(machine: string, session: string, runId: string | undefined, project: string, ticket: string) {
+    const row = runId && this.db.prepare("SELECT ticket,request FROM fleet_runs WHERE id=? AND machine=? AND session=? AND finished IS NULL").get(runId, machine, session);
+    if (!row) throw new OwnershipRefusal("Split handoff requires an active planning run");
+    const run = JSON.parse(String(row.request)) as StartRequest;
+    if (run.project !== project || !["refiner", "po"].includes(run.role))
+      throw new OwnershipRefusal("Split handoff requires the parent planning run");
+    const parent = this.workflow.get(String(row.ticket));
+    this.authorizeWorkflow(machine, session, String(row.ticket), runId);
+    const target = this.workflow.get(ticket);
+    const has = (url: string) => target.blockedBy.some(b => b.url === url);
+    if (ticket.split("#")[0] === project || target.state !== "OPEN" || !has(parent.url))
+      throw new OwnershipRefusal("Split handoff requires an existing foreign dependent of the parent");
+    if (this.db.prepare("SELECT 1 FROM fleet_runs WHERE ticket=? AND finished IS NULL").get(ticket))
+      throw new OwnershipRefusal("Split dependent has an active run");
+    return { target, children: this.workflow.list(project).filter(i => i.parentNumber === parent.issueNumber) };
+  }
+  workflowSplitDependency(machine: string, session: string, runId: string | undefined, project: string, ticket: string, childTicket: string) {
+    return this.transaction(() => {
+      const { target, children } = this.splitDependent(machine, session, runId, project, ticket);
+      const child = children.find(i => `${project}#${i.issueNumber}` === childTicket);
+      if (!child) throw new OwnershipRefusal("Split dependency must be a child of the admitted parent");
+      return this.workflow.change(ticket, { blockedBy: [
+        ...target.blockedBy.filter(b => b.url !== child.url),
+        { number: child.issueNumber, state: child.state, url: child.url },
+      ] }, machine + ':' + session, randomUUID());
+    });
+  }
+  workflowSplitComment(machine: string, session: string, runId: string | undefined, project: string, ticket: string, body: string, id: string) {
+    this.transaction(() => {
+      const { target, children } = this.splitDependent(machine, session, runId, project, ticket);
+      if (!children.some(child => target.blockedBy.some(b => b.url === child.url)))
+        throw new OwnershipRefusal("Split handoff comment requires the transferred child dependency");
+      this.workflow.comment(ticket, body, id);
+    });
+  }
   /** Record flaky-test sightings from `machine` and count them (flaky-sightings.ts). */
   flakySightings(machine: string, project: unknown, sightings: unknown) {
     if (!Object.hasOwn(this.limits, machine)) throw new Error("Unknown machine");

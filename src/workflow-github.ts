@@ -9,7 +9,7 @@ import {
   type OperationDefinitionNode,
 } from "graphql";
 import { randomUUID } from "node:crypto";
-import type { FleetStore } from "./fleet-store.js";
+import { OwnershipRefusal, type FleetStore } from "./fleet-store.js";
 import type {
   GitHubBroker,
   GitHubRequest,
@@ -146,7 +146,7 @@ export class WorkflowGitHub {
     actor?: Actor,
   ) {
     if (ticket.split("#")[0] !== project || !actor)
-      throw new Error("Workflow changes require the owning run identity");
+      throw new OwnershipRefusal("Workflow changes require the owning run identity");
     return this.store.workflowChange(
       actor.machine,
       actor.session,
@@ -210,6 +210,12 @@ export class WorkflowGitHub {
       this.store.workflow.enabled(match[1])
     )
       return this.request(match[1], request);
+    if (match && match[1] !== project && match[3] === "comments" && request.method === "POST" && this.store.workflow.enabled(match[1])) {
+      if (!actor) throw new OwnershipRefusal("Split handoff comment requires a run");
+      const ticket = `${match[1]}#${match[2]}`, id = randomUUID();
+      this.store.workflowSplitComment(actor.machine, actor.session, actor.runId, project, ticket, body.body, id);
+      return response({ id, node_id: id, body: body.body, html_url: this.store.workflow.get(ticket).url, created_at: new Date().toISOString() });
+    }
     if (match && match[1] === project) {
       const ticket = `${project}#${match[2]}`;
       let item = this.store.workflow
@@ -418,6 +424,9 @@ export class WorkflowGitHub {
           input.subjectId ??
           "",
       );
+      if (found && found.ticket.split("#")[0] !== project &&
+        ["addLabelsToLabelable", "removeLabelsFromLabelable", "updateIssue", "closeIssue", "reopenIssue", "updateProjectV2ItemFieldValue", "updateProjectV2ItemPosition", "removeBlockedBy"].includes(field))
+        throw new OwnershipRefusal("Foreign workflow changes are limited to split dependency handoffs");
       let pullRequestLabel = false;
       if (
         !found &&
@@ -544,11 +553,14 @@ export class WorkflowGitHub {
       if (change) {
         if (!found)
           throw new Error("Import the ticket before changing its workflow");
-        const item = this.mutate(project, found.ticket, change, actor),
+        const item = field === "addBlockedBy" && found.ticket.split("#")[0] !== project && actor
+          ? this.store.workflowSplitDependency(actor.machine, actor.session, actor.runId, project, found.ticket, this.store.workflow.find(input.blockingIssueId)!.ticket)
+          : this.mutate(project, found.ticket, change, actor),
+          targetProject = found.ticket.split("#")[0],
           node = {
             __typename: "Issue",
-            ...this.node(item, this.catalog.get(project) ?? []),
-            repository: { nameWithOwner: project },
+            ...this.node(item, this.catalog.get(targetProject) ?? []),
+            repository: { nameWithOwner: targetProject },
           },
           card = { __typename: "ProjectV2Item", id: item.id, type: "ISSUE", content: node };
         output[key] = selectResponse(
@@ -566,21 +578,11 @@ export class WorkflowGitHub {
         );
       } else if (field === "addComment" && found) {
         if (!actor) throw new Error("Workflow comment requires a run");
-        this.store.authorizeWorkflow(
-          actor.machine,
-          actor.session,
-          found.ticket,
-          actor.runId,
-        );
         const id = randomUUID();
-        this.store.workflowComment(
-          actor.machine,
-          actor.session,
-          actor.runId,
-          found.ticket,
-          input.body,
-          id,
-        );
+        if (found.ticket.split("#")[0] !== project)
+          this.store.workflowSplitComment(actor.machine, actor.session, actor.runId, project, found.ticket, input.body, id);
+        else
+          this.store.workflowComment(actor.machine, actor.session, actor.runId, found.ticket, input.body, id);
         output[key] = selectResponse(
           {
             __typename: payloadType(field),
