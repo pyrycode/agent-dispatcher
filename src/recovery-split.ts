@@ -48,6 +48,24 @@ export function splitRequirements(body: string): string[] {
   }
   return [...new Set(requirements)];
 }
+/** Only review/gate/security constraints may bind more than one behaviour slice. */
+function sharedRequirements(body: string): Set<string> {
+  const shared = new Set<string>();
+  let sectionDepth: number | undefined;
+  for (const line of body.split('\n')) {
+    const heading = line.match(/^(#{1,6})\s+(.+)/);
+    if (heading) {
+      if (sectionDepth === undefined || heading[1].length <= sectionDepth) sectionDepth = /security review|documentation handoff|required gates|common constraints/i.test(heading[2]) ? heading[1].length : undefined;
+      continue;
+    }
+    const value = normal(line.replace(/^\s*[-*]\s+\[[ xX]\]\s+/, ''));
+    if (value && (sectionDepth !== undefined || /\b(?:security review|acceptance gates?|live gates?|authentication checks)\b/i.test(value))) shared.add(value);
+  }
+  return shared;
+}
+export function renderRecoverySlice(plan: RecoverySplitPlan, parent: number, slice: RecoverySlice): string {
+  return `${slice.body}\n\n## Observable result\n${slice.outcome}\n${plan.behaviours.filter(b=>b.child===slice.key).map(b=>b.description+'\nVerification: '+b.verification).join('\n')}\n\n## Required checks\n${slice.checks.map(c=>'- '+c).join('\n')}\n\n## Unresolved findings\n${plan.findings.filter(f=>f.child===slice.key).map(f=>f.id+': '+f.description).join('\n')}\n\nSplit from #${parent}\n\n<!-- ticket-scope-policy: behaviour-slices-v1 -->\n<!-- feature-root: ${plan.featureRoot} -->`;
+}
 /** The retained scope, rather than mutable titles or justifications, identifies a repeated split. */
 export function recoverySplitScope(plan: RecoverySplitPlan): string {
   return splitBodyHash(JSON.stringify([
@@ -56,7 +74,7 @@ export function recoverySplitScope(plan: RecoverySplitPlan): string {
 }
 export function validateRecoverySplit(value: unknown): RecoverySplitPlan {
   const p = value as RecoverySplitPlan;
-  if (!p || !ref.test(p.featureRoot) || !digest.test(p.bodyHash) || p.classification !== 'accumulating-behaviours'
+  if (!p || JSON.stringify(p).length > 80000 || !ref.test(p.featureRoot) || !digest.test(p.bodyHash) || p.classification !== 'accumulating-behaviours'
     || !text(p.justification) || !text(p.smallerResult) || !Array.isArray(p.children) || p.children.length < 2 || p.children.length > 8
     || !Array.isArray(p.evidence) || p.evidence.length < 3 || p.evidence.length > 30
     || !Array.isArray(p.findings) || !p.findings.length || p.findings.length > 100
@@ -64,6 +82,7 @@ export function validateRecoverySplit(value: unknown): RecoverySplitPlan {
     || !Array.isArray(p.behaviours) || p.behaviours.length < 2 || p.behaviours.length > 100) throw new Error('Invalid recovery split plan');
   for (const child of p.children) {
     const markedRoot = parseFeatureRoot(child.body, p.featureRoot.split('#')[0]);
+    if (/<!-- ticket-scope-policy: (?!behaviour-slices-v1 -->)/.test(child.body)) throw new Error('Recovery children must preserve the admitted behaviour-slices policy');
     if (markedRoot && markedRoot !== p.featureRoot) throw new Error('Conflicting feature root in recovery child');
   }
   const preceding = new Set<string>();
@@ -102,7 +121,7 @@ export function validateRecoverySplit(value: unknown): RecoverySplitPlan {
     }
     const assigned = p.behaviours.filter(b => b.child === child.key);
     if (!assigned.length || assigned.length >= p.behaviours.length) throw new Error('Each result must contain a strict subset of observable behaviours');
-    if (!p.requirements.some(r => r.child === child.key) || !p.findings.some(f => f.child === child.key)) throw new Error('A recovery child must be a smaller independently verifiable part of the retained scope');
+    if (!p.findings.some(f => f.child === child.key)) throw new Error('A recovery child must be a smaller independently verifiable part of the retained scope');
   }
   const roles = new Set<string>();
   for (const e of p.evidence) {
@@ -119,10 +138,15 @@ export function validateSplitAgainstTicket(plan: RecoverySplitPlan, item: Projec
   const expected = [...new Set(splitRequirements(item.body))].sort();
   if (!expected.length || JSON.stringify(expected) !== JSON.stringify([...new Set(plan.requirements.map(r => normal(r.text)))].sort()))
     throw new Error('Recovery split must preserve every original acceptance requirement');
+  const shared = sharedRequirements(item.body);
+  const productRequirements = expected.filter(r=>!shared.has(r));
+  for (const requirement of productRequirements) {
+    if (plan.requirements.filter(r=>normal(r.text) === requirement).length !== 1) throw new Error('Observable acceptance scope cannot be duplicated across children');
+  }
   const prior = (item as ProjectItem & {recoverySlice?:{behaviours:string[]}}).recoverySlice;
   if (prior && JSON.stringify([...prior.behaviours].sort()) !== JSON.stringify(plan.behaviours.map(b => normal(b.description)).sort()))
     throw new Error('A further recovery split must partition the immutable previously assigned behaviour scope');
-  if (item.labels.some(l => ['error:infra','error:real-claude-gate'].includes(l) || /^(?:flaky-test|inherited-test-failure)$/.test(l))) throw new Error('Infrastructure and flaky-test failures require their own recovery');
+  if (item.labels.some(l => l === 'error:infra' || /^(?:flaky-test|inherited-test-failure)$/.test(l))) throw new Error('Infrastructure and flaky-test failures require their own recovery');
   if (!item.labels.some(l => /^rework-count:\d+$/.test(l) && Number(l.split(':')[1]) >= 2)) throw new Error('Recovery splitting requires repeated rework evidence');
 }
 
@@ -161,6 +185,11 @@ export class RecoverySplits {
     if (record.children[key] && record.children[key] !== ticket) throw new Error('Recovery child identity changed');
     record.children[key] = ticket;
     this.db.prepare('UPDATE fleet_recovery_splits SET children=? WHERE id=?').run(JSON.stringify(record.children), id);
+  }
+  enlist(id: string, ticket: string, basis: string, owner: string|null): void {
+    const record = this.get(id)!;
+    record.affected[ticket] = basis; record.owners[ticket] = owner;
+    this.db.prepare('UPDATE fleet_recovery_splits SET affected=?,owners=? WHERE id=?').run(JSON.stringify(record.affected),JSON.stringify(record.owners),id);
   }
   bindChild(id: string, ticket: string, basis: string): void {
     const record = this.get(id)!;

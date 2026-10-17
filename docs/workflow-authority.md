@@ -305,3 +305,137 @@ A rollback requires draining the project, saving the current database state,
 finishing display publication and verifying an export against the database before
 restoring the previous control path. There is deliberately no automatic fallback
 or live unimport command that could create two authorities.
+
+### Recovery splits after repeated rework
+
+The recovery assessor can propose `action: "split"` after retained reviews show
+new independently useful behaviours accumulating during repair. Two reworks
+trigger assessment. They do not establish that splitting is justified. A
+shrinking defect stays with its shared-cause repair. Infrastructure outages,
+broken test preparation and flaky tests keep their existing recovery route.
+The assessor must inspect substantive retained builder, verifier and recovery
+artifacts. Bundle metadata and pointers alone cannot authorise a split.
+
+The claim service owns the split. It can exceed the ordinary refiner depth
+limit. The ordinary refiner limit remains unchanged. Each new child carries the `behaviour-slices-v1` policy marker and starts in
+Backlog without completion labels and receives ordinary refinement, building,
+security review, verification and required live gates.
+
+The assessment prompt supplies `facts[].splitContext` with the exact body hash,
+original feature root, original acceptance requirements and any immutable
+previous behaviour allocation. It supplies verified bundle digests and the
+substantive paths actually read. A split decision has this shape:
+
+```json
+{
+  "action": "split",
+  "reason": "Earlier repairs fixed host selection. Later reviews exposed independently useful history and task-menu results.",
+  "split": {
+    "featureRoot": "owner/repo#100",
+    "bodyHash": "64-character hash supplied by splitContext",
+    "classification": "accumulating-behaviours",
+    "justification": "Explain why the retained failures justify another split.",
+    "smallerResult": "Explain how each narrower result can merge and be checked while the app works.",
+    "evidence": [
+      { "runId": "builder-run", "digest": "verified bundle digest", "role": "builder", "findings": ["history"], "inspectedPaths": ["logs/builder.log"], "conclusion": "What the actual retained work proves." },
+      { "runId": "verifier-run", "digest": "verified bundle digest", "role": "verifier", "findings": ["history", "menu"], "inspectedPaths": ["handoff/verifier-101.md"], "conclusion": "Which findings were fixed and which distinct behaviours remain." },
+      { "runId": "earlier-recovery-run", "digest": "verified bundle digest", "role": "recovery", "findings": ["menu"], "inspectedPaths": ["logs/recovery.log"], "conclusion": "Compare earlier recovery with the latest failure." }
+    ],
+    "findings": [
+      { "id": "history", "description": "Selected host history loses isolation.", "child": "history" },
+      { "id": "menu", "description": "Background task menu is independently stale.", "child": "menu" }
+    ],
+    "behaviours": [
+      { "id": "history", "description": "Selected host history stays isolated", "child": "history", "verification": "Cross-host history regression." },
+      { "id": "menu", "description": "Background task menu updates independently", "child": "menu", "verification": "Background completion updates its menu." }
+    ],
+    "requirements": [
+      { "text": "Selected host history stays isolated", "child": "history" },
+      { "text": "Background task menu updates independently", "child": "menu" }
+    ],
+    "children": [
+      { "key": "history", "title": "Preserve selected host history", "body": "## Acceptance Criteria\n- [ ] Selected host history stays isolated\nRegression: history cannot cross hosts", "outcome": "Selected host history stays isolated", "checks": ["History isolation regression fails before and passes after the fix."], "kind": "bug", "regression": "Regression: history cannot cross hosts", "dependsOn": [], "reuse": ["Preserved parent branch and exact candidate commit."] },
+      { "key": "menu", "title": "Update background task menu", "body": "## Acceptance Criteria\n- [ ] Background task menu updates independently\nRegression: menu follows task completion", "outcome": "Background task menu updates independently", "checks": ["Background task completion updates the menu."], "kind": "bug", "regression": "Regression: menu follows task completion", "dependsOn": ["history"], "reuse": ["Preserved parent review and exact candidate commit."] }
+    ]
+  }
+}
+```
+
+Replace the hash and digest descriptions with values supplied by the authority.
+Use exact requirement text. Plain prose and nested acceptance clauses count,
+as do security requirements and documentation handoffs. Every unresolved
+finding names its child. Observable requirements belong to one child. Common
+security reviews and acceptance gates can bind several children. The authority
+rejects copied whole-scope child bodies and keeps a bug with its regression.
+Each child must contain a strict subset of the source's observable behaviours.
+An original criterion can cover several behaviours. Preserve that full criterion
+in the final dependent child, which can check it after earlier siblings merge.
+Earlier children still need their own useful outcome, finding and independent
+proof. The criterion count never establishes the split boundary. File boundaries and line counts do not establish a useful result.
+
+A later recovery split must partition the exact behaviour inventory assigned by
+the previous recovery split. Rewording that inventory or supplying a new title
+cannot obtain another split. Missing evidence or an indivisible result remains
+unresolved for ordinary recovery. It never becomes permission to drop a
+requirement. The source body, exact plan, evidence references and allocation
+remain in the durable split record.
+
+Before creating anything, the authority verifies every named artifact against
+the retained bundle and run owner. It checks every complete rendered child
+request. It captures the parent, descendants, dependents and their ownership.
+Any affected active reservation or queued, running, publishing or unresolved
+support task prevents the split. Holds, approval rejections and operator drains
+remain effective. The split never releases claims or changes an existing
+branch, commit or pull request.
+
+Each child filing uses one durable identity. During creation it stays in Inbox
+and depends on the open parent. The authority also refuses starts from partial
+filing markers. It reads parentage before retrying a link after a lost answer.
+It verifies the exact intended body, labels and lineage before binding a child.
+All original parent evidence is pinned against expiry and capacity eviction.
+An upload that cannot fit around pinned evidence is refused.
+
+One final transaction activates every child, preserves causal blockers, orders
+children after the parent and chains siblings. It adds child blockers to outside
+dependents before closing the replaced parent. A newly discovered dependent is
+safely enlisted under the same worker, ownership and hold checks. Existing
+parent blockers remain as history. Closing the replaced parent records that
+the original feature is incomplete. Feature completion requires the named leaf
+results to merge and pass the full acceptance contract.
+
+### Retrying a stopped recovery split
+
+Use the protected operator wrapper with the original incident identity:
+
+```sh
+operator.sh workflow recovery-split owner/repo retry.json
+```
+
+```json
+{ "id": "original-recovery-incident-uuid" }
+```
+
+The equivalent fleet command is:
+
+```sh
+node --import tsx src/fleet-bin.ts workflow OPERATOR_CONFIG recovery-split owner/repo retry.json
+```
+
+The request accepts only the retained incident id. It cannot replace the plan.
+The protected route is `POST /recovery/split`. It requires the admitted recovery
+actor or the operator credential. A worker cannot continue another worker's
+assessment. The operator can continue the saved split after the assessment
+worker has stopped. An identical completed retry returns the saved result.
+
+A lost creation or linking answer is read back before another external write.
+Existing children are reused. Partial children remain blocked until activation.
+A prerequisite completing naturally does not invalidate a retry. Its current
+state is inherited at activation. A newly added drain or hold refuses further
+work. The same identity can continue after the operator lifts that control.
+
+A changed source body, changed ownership or edited child cannot be silently
+rebased. Preserve the record and failed evidence. Inspect the retained source,
+plan, child filings and authoritative workflow before using ordinary protected
+operator commands to resolve the change. Restore only the reviewed intended
+scope when appropriate. Do not delete a requirement, dependent, hold or branch
+to obtain a successful retry. Do not start another split under a new identity.

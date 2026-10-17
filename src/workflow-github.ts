@@ -1,3 +1,4 @@
+import { renderRecoverySlice } from "./recovery-split.js";
 import type { EvidenceStore } from "./evidence-store.js";
 import {
   parse,
@@ -686,11 +687,16 @@ export class WorkflowGitHub {
         || !bundle.totalBytes || !reference.inspectedPaths.every(path => bundle.manifest.files.some(f => f.path === path && f.bytes > 0 && !/^(?:run\.json|pointers\.json|SHA256SUMS)$|metadata|run-meta|manifest|result\.json/i.test(f.path))))
         throw new Error('Split evidence must name substantive retained builder, verifier and recovery bundles from this ticket');
       for (const path of reference.inspectedPaths) {
-        if (!/\.(?:log|tail|txt|json|xml)$/.test(path)) throw new Error('Split evidence must cite readable retained text, reviews or test reports');
+        if (!/\.(?:log|tail|txt|json|xml|md)$/.test(path)) throw new Error('Split evidence must cite readable retained text, reviews or test reports');
         const file = bundle.manifest.files.find(f=>f.path===path)!;
         evidence.read(incident.ticket,reference.runId,reference.digest,path,file.chunks.length-1);
       }
     }
+    // Render every complete request before admission or creation. An oversized later child cannot strand an earlier one.
+    const source = this.store.workflow.get(incident.ticket), sourceProject = incident.ticket.split('#')[0];
+    for (const slice of incident.decision.split.children) this.filingRequest(sourceProject,{
+      commandId:`recovery-split:${id}:${slice.key}`,title:slice.title,body:renderRecoverySlice(incident.decision.split,source.issueNumber,slice),labels:[],workflow:{stage:'Inbox',blockedBy:[source.issueNumber]},
+    });
     const record = this.store.prepareRecoverySplit(id,actor);
     const project = record.ticket.split('#')[0], parent = this.store.workflow.get(record.ticket);
     evidence.pinTicket(record.ticket,`Recovery split ${id} retains all original failed evidence`);
@@ -701,7 +707,7 @@ export class WorkflowGitHub {
         const labels = parent.labels.filter(l => !/^(wip:|done:|error:|error-retry-count:|rework-count:|needs-rework:|claim:|orchestrator:|needs-human:)/.test(l));
         const child = await this.file(project,{
           commandId:`recovery-split:${id}:${slice.key}`,title:slice.title,
-          body:`${slice.body}\n\n## Observable result\n${slice.outcome}\n${record.plan.behaviours.filter(b=>b.child===slice.key).map(b=>b.description+'\nVerification: '+b.verification).join('\n')}\n\n## Required checks\n${slice.checks.map(c=>'- '+c).join('\n')}\n\n## Unresolved findings\n${record.plan.findings.filter(f=>f.child===slice.key).map(f=>f.id+': '+f.description).join('\n')}\n\nSplit from #${parent.issueNumber}\n\n<!-- feature-root: ${record.plan.featureRoot} -->`,
+          body:renderRecoverySlice(record.plan,parent.issueNumber,slice),
           labels,workflow:{stage:'Inbox',labels:[],blockedBy:[parent.issueNumber]},
         });
         childTicket = child.ticket;

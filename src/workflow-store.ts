@@ -727,6 +727,9 @@ export class WorkflowStore {
       return { fresh: true, startedAt };
     });
   }
+  filingMatches(id: string, issueId: string): boolean {
+    return !!this.db.prepare('SELECT 1 FROM workflow_filings WHERE id=? AND issue_id=?').get(id,issueId);
+  }
   filingCreated(id: string, issueId: string): void {
     this.db
       .prepare(

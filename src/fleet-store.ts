@@ -1,4 +1,4 @@
-import { RecoverySplits, splitBodyHash, splitRequirements, splitItemBasis, validateSplitAgainstTicket, validateRecoverySplit, type RecoverySplitRecord } from './recovery-split.js';
+import { RecoverySplits, renderRecoverySlice, splitBodyHash, splitRequirements, splitItemBasis, validateSplitAgainstTicket, validateRecoverySplit, type RecoverySplitRecord } from './recovery-split.js';
 import { parseFeatureRoot } from './feature-lineage.js';
 import {scrubCredentials} from './agent-runtime.js';
 import { isRepairWip } from "./recovery-labels.js";
@@ -9,7 +9,7 @@ import { WorkflowStore, type WorkflowChange } from "./workflow-store.js";
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { RecoveryFacts, type PauseRecord, type EvidenceRecord, type CoordinationRecord } from "./recovery-facts.js";
-import { RecoveryLedger, validateObservations, IDLE_RECOVERY_REASONS, RECOVERY_UNKNOWN_PAUSE_REASON, type RecoveryObservation, type RecoveryDecision, type RecoveryIncident, type RecoveryLedgerOptions } from "./fleet-recovery.js";
+import { RecoveryLedger, recoveryFingerprint, validateObservations, IDLE_RECOVERY_REASONS, RECOVERY_UNKNOWN_PAUSE_REASON, type RecoveryObservation, type RecoveryDecision, type RecoveryIncident, type RecoveryLedgerOptions } from "./fleet-recovery.js";
 import { OperationReports } from './operation-reports.js';
 import { OrphanedTaskWatch } from './orphaned-tasks.js';
 import {RecoveryTasks, assessmentTasks, recoveryTaskId, validateTaskRequest, type RecoveryTaskRequest, type RecoveryTaskResult} from './recovery-tasks.js';
@@ -687,6 +687,8 @@ export class FleetStore {
       if (old?.state === 'complete') return old;
       const project = incident.ticket.split('#')[0], item = this.workflow.get(incident.ticket);
       const plan = validateRecoverySplit(incident.decision.split);
+      if (!old && recoveryFingerprint({ticket:incident.ticket,status:item.status,labels:item.labels,blocked:item.blockedBy.some(b=>b.state==='OPEN'),evidenceRevision:item.evidenceRevision,artifactRevision:this.artifactRevision(incident.ticket),pause:this.facts.getPause(incident.ticket),investigationRevision:this.investigations.pending(incident.ticket)?.id}) !== incident.fingerprint)
+        throw new Error('Recovery evidence or workflow changed after assessment; retain the decision and reassess before splitting');
       validateSplitAgainstTicket(plan,item,this.recoveryFeatureRoot(incident.ticket));
       if (!old && this.workflow.list(project).some(i => i.parentNumber === item.issueNumber)) throw new Error('The parent already has children; resume its existing split');
       const all = this.workflow.projects().flatMap(p => this.workflow.list(p.project));
@@ -702,9 +704,12 @@ export class FleetStore {
       if (old) {
         for (const candidate of all.filter(i=>affected.has(i.url))) {
           const reference = candidate.url.replace('https://github.com/','').replace('/issues/','#');
-          const provisional = plan.children.some(c=>candidate.body.includes(`<!-- orchestrator-filing:recovery-split:${id}:${c.key} -->`));
-          if (!Object.hasOwn(old.affected,reference) && !Object.values(old.children).includes(reference) && !provisional)
-            throw new Error('A new affected dependent appeared during the split; keep the parent open for reassessment');
+          const provisional = plan.children.some(c=>this.workflow.filingMatches(`recovery-split:${id}:${c.key}`,candidate.issueId));
+          if (!Object.hasOwn(old.affected,reference) && !Object.values(old.children).includes(reference) && !provisional) {
+            if (candidate.parentNumber === item.issueNumber) throw new Error('Another child appeared during recovery; preserve both split records for operator assessment');
+            const claim=this.snapshot().claims.find(c=>c.ticket===reference);
+            this.splits.enlist(id,reference,splitItemBasis(candidate),claim?`${claim.machine}:${claim.generation}`:null);
+          }
         }
       }
       const record = this.splits.prepare(id,incident.ticket,plan,all.filter(i => affected.has(i.url)),project,Object.fromEntries(all.filter(i => affected.has(i.url)).map(i=>{const ref=i.url.replace('https://github.com/','').replace('/issues/','#');const claim=this.snapshot().claims.find(c=>c.ticket===ref);return [ref,claim?`${claim.machine}:${claim.generation}`:null];})));
@@ -722,6 +727,12 @@ export class FleetStore {
       const record = this.splits.get(id)!;
       if (!record.plan.children.some(c => c.key === key)) throw new Error('Unexpected recovery child');
       const child = this.workflow.get(ticket);
+      const slice = record.plan.children.find(c=>c.key===key)!;
+      const parent = this.workflow.get(record.ticket);
+      const expectedBody = renderRecoverySlice(record.plan,parent.issueNumber,slice)+`\n\n<!-- orchestrator-filing:recovery-split:${id}:${key} -->`;
+      const expectedLabels = parent.labels.filter(l=>! /^(wip:|done:|error:|error-retry-count:|rework-count:|needs-rework:|claim:|orchestrator:|needs-human:)/.test(l)).sort();
+      if (child.body !== expectedBody || child.title !== slice.title || JSON.stringify([...child.labels].sort()) !== JSON.stringify(expectedLabels))
+        throw new Error('Recovery child content changed before binding; preserve its original acceptance and partial evidence');
       if (child.state !== 'OPEN' || child.status !== 'Inbox' || !child.blockedBy.some(b => b.url === this.workflow.get(record.ticket).url && b.state === 'OPEN'))
         throw new Error('Partial recovery children must remain blocked by the open parent');
       this.splits.child(id,key,ticket);

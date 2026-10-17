@@ -7,7 +7,7 @@ import { EvidenceStore, DEFAULT_EVIDENCE_LIMITS } from './evidence-store.js';
 import { artifactManifest, manifestHash } from './recovery-artifacts.js';
 import { splitBodyHash, splitRequirements, validateRecoverySplit, validateSplitAgainstTicket, type RecoverySplitPlan } from './recovery-split.js';
 import type { WorkflowItem, WorkflowProject } from './workflow-store.js';
-import { observationFor } from './recovery-work.js';
+import { observationFor, runRecoveryWork } from './recovery-work.js';
 const project = 'org/app', ticket = `${project}#3`;
 const config: WorkflowProject = {project, projectId:'P',statusFieldId:'S',options:{Inbox:'i',Backlog:'b','In Development':'d','In Code Review':'r',Done:'x'}};
 const item = (n:number, extra:Partial<WorkflowItem> = {}):WorkflowItem => ({id:`P${n}`,issueId:`I${n}`,issueNumber:n,title:`Ticket ${n}`,body:'',status:'Backlog',labels:[],url:`https://github.com/${project}/issues/${n}`,blockedBy:[],parentNumber:null,grandparentNumber:null,state:'OPEN',revision:1,position:n,...extra});
@@ -23,27 +23,31 @@ export function recoverySplitFixturePlan():RecoverySplitPlan {
     behaviours:[{id:'history',description:'Selected host history stays isolated',child:'host-history',verification:'Cross-host history regression'},{id:'menu',description:'Background task menu updates independently',child:'task-menu',verification:'Background menu completion regression'}],
     requirements:[{text:'Selected host history stays isolated',child:'host-history'},{text:'Background task menu updates independently',child:'task-menu'},{text:'Authentication checks remain required',child:'host-history'},{text:'Authentication checks remain required',child:'task-menu'}],children};
 }
-async function fixture(t:TestContext, options:{metadata?:boolean}={}) {
+async function fixture(t:TestContext, options:{metadata?:boolean;causal?:boolean;oversized?:boolean}={}) {
   const store = new FleetStore(':memory:',{mac:{heavyLimit:4,combinedLimit:4},linux:{heavyLimit:4,combinedLimit:4}});
-  const parent = item(3,{parentNumber:2,grandparentNumber:1,status:'In Code Review',body,labels:['rework-count:3','error:rework-loop','security-sensitive','needs-real-claude','priority:high']});
-  store.workflow.import(config,[item(1,{state:'CLOSED',status:'Done'}),item(2,{parentNumber:1,state:'CLOSED',status:'Done'}),parent,item(4,{blockedBy:[{number:3,state:'OPEN',url:parent.url}]})]);
+  store.reportMachineCapabilities('mac',[],[project]);
+  const parent = item(3,{blockedBy:options.causal?[{number:5,state:'OPEN',url:'https://github.com/org/app/issues/5'}]:[],parentNumber:2,grandparentNumber:1,status:'In Code Review',body,labels:['rework-count:3','error:rework-loop','security-sensitive','needs-real-claude','priority:high']});
+  store.workflow.import(config,[item(1,{state:'CLOSED',status:'Done'}),item(2,{parentNumber:1,state:'CLOSED',status:'Done'}),parent,item(4,{blockedBy:[{number:3,state:'OPEN',url:parent.url}]}),...(options.causal?[item(5)]:[])]);
   const evidence = new EvidenceStore(':memory:',{...DEFAULT_EVIDENCE_LIMITS,totalBytes:1024*1024,ticketBytes:512*1024,bundleBytes:256*1024},id=>store.runOwner(id));
   const plan = recoverySplitFixturePlan();
   for (const reference of plan.evidence) {
     // Historical runs remain intact. The test uses ordinary authority run records and real hashed bundles.
     const role = reference.role;
     const prior = store.workflow.get(ticket);
-    store.workflow.change(ticket,{status:role==='verifier'?'In Code Review':'In Development',labels:[]},'operator',`prepare-${role}`);
+    store.workflow.change(ticket,{status:role==='verifier'?'In Code Review':'In Development',labels:[],blockedBy:[]},'operator',`prepare-${role}`);
     store.start({id:reference.runId,machine:'mac',session:'session',project,ticket,role:role==='recovery'?'recovery':role,resource:'heavy',locks:[],workflowVersion:1});
-    const files = {[options.metadata?'run.json':`${role}.log`]:`Retained ${role}: host isolation and task-menu findings\n`};
+    const evidencePath = role === 'verifier' ? 'handoff/verifier-3.md' : `${role}.log`;
+    reference.inspectedPaths = [evidencePath];
+    const files = {[options.metadata?'run.json':evidencePath]:`Retained ${role}: host isolation and task-menu findings\n`};
     const manifest = artifactManifest(files), digest = manifestHash(manifest);
     evidence.begin('mac',project,ticket,reference.runId,{kind:role==='recovery'?'recovery':'agent',role,outcome:'failed',startedAt:1,endedAt:2},manifest);
     for (const [path,content] of Object.entries(files)) evidence.put('mac',project,ticket,reference.runId,digest,path,0,Buffer.from(content).toString('base64'));
     evidence.commit('mac',project,ticket,reference.runId,digest);
     store.finish('mac','session',reference.runId);
     reference.digest = digest;
-    store.workflow.change(ticket,{status:prior.status,labels:prior.labels},'operator',`restore-${role}`);
+    store.workflow.change(ticket,{status:prior.status,labels:prior.labels,blockedBy:prior.blockedBy},'operator',`restore-${role}`);
   }
+  if(options.oversized) {plan.children[1].body += '\n'+'context '.repeat(5500);plan.children[1].checks=['check '.repeat(900),'another '.repeat(700),'third '.repeat(900)];}
   const [incident] = store.recoveryReport('mac',project,[observationFor(project,store.workflow.get(ticket))]);
   const recoveryRun = {id:'active-recovery',machine:'mac',session:'session',project,ticket,role:'recovery',resource:'heavy' as const,locks:[],workflowVersion:1 as const};
   assert.equal(store.start(recoveryRun).ok,true);
@@ -83,7 +87,7 @@ test('grandchild recovery split preserves full feature root, security, regressio
   assert.equal(result.state,'complete');
   const parent=f.store.workflow.get(ticket), a=f.store.workflow.get('org/app#100'), b=f.store.workflow.get('org/app#101');
   assert.equal(parent.state,'CLOSED');assert.equal(parent.status,'Done');assert.equal(f.store.ticketDone(ticket),false);
-  for (const child of [a,b]) {assert.equal(child.featureRoot,'org/app#1');assert.equal(child.parentNumber,3);assert.equal(child.status,'Backlog');assert(child.labels.includes('security-sensitive'));assert(child.labels.includes('needs-real-claude'));assert(!child.labels.includes('done:verifier'));assert(!child.labels.includes('done:refiner'));assert(child.body.includes('Regression:'));}
+  for (const child of [a,b]) {assert.equal(child.featureRoot,'org/app#1');assert.equal(child.parentNumber,3);assert.equal(child.status,'Backlog');assert(child.labels.includes('security-sensitive'));assert(child.labels.includes('needs-real-claude'));assert(!child.labels.includes('done:verifier'));assert(!child.labels.includes('done:refiner'));assert(child.body.includes('Regression:'));assert(child.body.includes('<!-- ticket-scope-policy: behaviour-slices-v1 -->'));}
   assert(a.position>parent.position && b.position>a.position);
   assert(b.blockedBy.some(x=>x.number===100&&x.state==='OPEN'));
   assert(!a.blockedBy.some(x=>x.number===3));
@@ -138,6 +142,8 @@ test('scope validation rejects infrastructure, dropped acceptance, detached regr
   assert.throws(()=>validateRecoverySplit({...p,children:p.children.map((c,i)=>i?c:{...c,body:c.body+'\n<!-- feature-root: org/app#9 -->'})}));
   assert.deepEqual(splitRequirements(body),['Selected host history stays isolated','Background task menu updates independently','Authentication checks remain required']);
   const current=item(3,{body,labels:['rework-count:2']});
+  const duplicated = {...p,children:p.children.map(c=>({...c,body:body+'\n'+c.regression})),requirements:splitRequirements(body).flatMap(text=>p.children.map(c=>({text,child:c.key})))};
+  assert.throws(()=>validateSplitAgainstTicket(duplicated,current,'org/app#1'),/cannot be duplicated/);
   assert.throws(()=>validateSplitAgainstTicket({...p,requirements:p.requirements.slice(1)},current,'org/app#1'),/every original acceptance/);
   assert.throws(()=>validateSplitAgainstTicket(p,{...current,recoverySlice:{id:'old',featureRoot:'org/app#1',behaviours:['Only the assigned original result']}},'org/app#1'),/immutable previously assigned/);
 });
@@ -151,12 +157,13 @@ test('lost issue creation answer resumes by its retained marker without duplicat
   assert.equal(f.issues.size,2);assert.equal(f.calls.filter(c=>c==='create:100').length,1);
 });
 
-test('a newly discovered dependent during partial creation prevents premature unblocking',async t=>{
+test('a newly discovered dependent is safely enlisted and remains blocked after replacement',async t=>{
   const f=await fixture(t);f.faults.afterLink=1;
   await assert.rejects(f.bridge.recoverySplit(f.incident.id,f.evidence,f.actor));
   f.store.workflow.observe(project,[item(9,{blockedBy:[{number:3,state:'OPEN',url:f.store.workflow.get(ticket).url}]})]);
-  await assert.rejects(f.bridge.recoverySplit(f.incident.id,f.evidence,f.actor),/new affected dependent/);
-  assert.equal(f.store.workflow.get(ticket).state,'OPEN');assert.equal(f.issues.size,1);
+  await f.bridge.recoverySplit(f.incident.id,f.evidence,f.actor);
+  assert.equal(f.store.workflow.get(ticket).state,'CLOSED');
+  assert.deepEqual(f.store.workflow.get('org/app#9').blockedBy.filter(b=>b.state==='OPEN').map(b=>b.number),[100,101]);
 });
 
 test('plain and nested acceptance clauses remain required, while fenced source examples are evidence',()=>{
@@ -184,13 +191,46 @@ test('metadata-only evidence failure leaves no durable split lock or half-applie
 });
 
 test('a completed prerequisite during partial creation does not strand the same retry',async t=>{
-  const f=await fixture(t);
-  f.store.workflow.observe(project,[item(5)]);
-  f.store.workflow.change(ticket,{blockedBy:[{number:5,state:'OPEN',url:'https://github.com/org/app/issues/5'}]},'operator','causal-blocker');
+  const f=await fixture(t,{causal:true});
   f.faults.afterLink=1;
   await assert.rejects(f.bridge.recoverySplit(f.incident.id,f.evidence,f.actor));
   f.store.workflow.change('org/app#5',{state:'CLOSED',status:'Done'},'operator','prerequisite-completed');
   await f.bridge.recoverySplit(f.incident.id,f.evidence,f.actor);
   const child=f.store.workflow.get('org/app#100');
   assert(child.blockedBy.some(b=>b.number===5 && b.state==='CLOSED'));
+});
+
+
+test('a changed child recovered after a lost create answer cannot replace its original acceptance',async t=>{
+  const f=await fixture(t);f.faults.loseCreate=1;
+  await assert.rejects(f.bridge.recoverySplit(f.incident.id,f.evidence,f.actor));
+  const child=f.issues.get(100)!;child.body=child.body.replaceAll('Selected host history stays isolated','Dropped original result');
+  await assert.rejects(f.bridge.recoverySplit(f.incident.id,f.evidence,f.actor),/content changed/);
+  assert.equal(f.store.workflow.get(ticket).state,'OPEN');assert.equal(f.issues.size,1);
+});
+
+
+test('assessment split decision invokes only its protected split handoff and preserves ordinary counters',async t=>{
+  const f=await fixture(t);let handoffs=0, completed=0;
+  await runRecoveryWork(f.incident,{project,agents:[],readCurrent:async()=>f.store.workflow.get(ticket),begin:async()=>({...f.incident,state:'assessing'}),assess:async()=>({action:'split',reason:f.plan.justification,split:f.plan}),decide:async decision=>decision,complete:async()=>{completed++;},split:async()=>{handoffs++;return f.bridge.recoverySplit(f.incident.id,f.evidence,f.actor);},comment:async()=>{throw new Error('Generic handback cannot edit split parents');},addLabel:async()=>{},removeLabel:async()=>{},move:async()=>{throw new Error('Generic handback cannot move split parents');},notify:async()=>{}});
+  assert.equal(handoffs,1);assert.equal(completed,1);assert(f.store.workflow.get(ticket).labels.includes('rework-count:3'));
+});
+
+test('every fully rendered child is checked before durable locks or any external creation',async t=>{
+  const f=await fixture(t,{oversized:true});
+  await assert.rejects(f.bridge.recoverySplit(f.incident.id,f.evidence,f.actor),/60000/);
+  assert.equal(f.store.splits.get(f.incident.id),undefined);assert.equal(f.issues.size,0);
+});
+
+
+test('one broad original acceptance criterion can be retained by the final child of two useful behaviours',()=>{
+  const p=recoverySplitFixturePlan();
+  const original='The selected host history and background task menu both work after repair';
+  const parentBody=`## Acceptance Criteria\n- [ ] ${original}`;
+  p.bodyHash=splitBodyHash(parentBody);
+  p.requirements=[{text:original,child:'task-menu'}];
+  p.children[1].body+=`\n- [ ] ${original}`;
+  validateRecoverySplit(p);
+  validateSplitAgainstTicket(p,item(3,{body:parentBody,labels:['rework-count:2']}),'org/app#1');
+  assert.equal(p.requirements.length,1);assert.equal(p.behaviours.length,2);
 });
