@@ -21,6 +21,8 @@ import { CodexThrottle, startsCodex, DEFAULT_CODEX_THROTTLE, type CodexThrottleC
 import { FlakySightingLedger } from './flaky-sightings.js';
 import { FLAKY_REOPEN_WINDOW_MS, FLAKY_TEST_COLUMN, FLAKY_TEST_LABEL, hasFlakyMarker, staleLabelsOnReopen } from './flaky-tickets.js';
 import { inheritedMarker } from './inherited-tickets.js';
+import {TestInvestigations} from './test-investigation.js';
+import type {EvidenceStore} from './evidence-store.js';
 
 /** An operator choice, frozen into each new grant. Null restores local settings. */
 export interface RunnerPolicy { runner: AgentRunner | null; revision: number }
@@ -215,6 +217,7 @@ export class FleetStore {
   readonly desired: DesiredStateStore;
   /** Every flaky-test sighting from every computer. See flaky-sightings.ts. */
   readonly flaky: FlakySightingLedger;
+  readonly investigations: TestInvestigations;
   private readonly clock: () => number;
   constructor(path: string, private readonly limits: Readonly<Record<string, MachineLimits>>, options: FleetStoreOptions = {}) {
     for (const value of Object.values(limits)) validateLimits(value);
@@ -245,6 +248,7 @@ export class FleetStore {
     this.workflow = new WorkflowStore(this.db);
     this.recovery = new RecoveryLedger(this.db, Date.now, options);
     this.facts = new RecoveryFacts(this.db);
+    this.investigations = new TestInvestigations(this.db);
     this.tasks = new RecoveryTasks(this.db);
     this.db.exec("CREATE TABLE IF NOT EXISTS fleet_assessment_releases (ticket TEXT NOT NULL, machine TEXT NOT NULL, generation TEXT NOT NULL, created INTEGER NOT NULL, PRIMARY KEY(ticket,generation)) STRICT");
     // The run that created a ticket, by GitHub issue node ID. While that run is
@@ -297,7 +301,8 @@ export class FleetStore {
   recoveryReport(machine: string, project: string, observations: RecoveryObservation[]) {
     if (!Object.hasOwn(this.limits, machine)) throw new Error("Unknown machine");
     return this.transaction(() => this.recovery.report(machine, project, observations.map(o => ({ ...o,
-      pause: this.facts.getPause(o.ticket), artifactRevision: this.artifactRevision(o.ticket) })), this.snapshot()));
+      pause: this.facts.getPause(o.ticket), artifactRevision: this.artifactRevision(o.ticket),
+      investigationRevision:this.investigations.pending(o.ticket)?.id })), this.snapshot()));
   }
   recoveryStep(machine: string, session: string, project: string, id: string, runId: string, step: "begin" | "decide" | "complete", decision?: RecoveryDecision) {
     const incident = this.recovery.incident(id);
@@ -305,7 +310,11 @@ export class FleetStore {
     if (!run || run.project !== project || run.ticket !== incident.ticket || run.role !== "recovery" || run.resource !== "heavy") throw new Error("Recovery requires its admitted heavy run");
     this.authorize(machine, session, incident.ticket, runId);
     return this.transaction(() => {
-      if (step === "begin") return this.recovery.begin(id, runId);
+      if (step === "begin") {
+        const result=this.recovery.begin(id, runId);
+        this.investigations.begin(incident.ticket,id);
+        return result;
+      }
       if (step === "decide") {
         const selected = this.recovery.decide(id, runId, decision!);
         if (selected.action === 'coordinate') {
@@ -314,7 +323,11 @@ export class FleetStore {
         }
         return selected;
       }
-      if (step === "complete") { this.recovery.complete(id, runId); return { ok: true }; }
+      if (step === "complete") {
+        this.recovery.complete(id, runId);
+        if(this.recovery.incident(id).decision?.action!=='coordinate') this.investigations.complete(id);
+        return { ok: true };
+      }
       throw new Error("Invalid recovery operation");
     });
   }
@@ -356,6 +369,8 @@ export class FleetStore {
     const run = this.snapshot().runs.find(r => r.id === runId && r.machine === machine && r.session === session && r.project === project);
     if (!run || !['builder','developer','recovery'].includes(run.role) || !/#[1-9]\d*$/.test(run.ticket)) throw new Error('Task needs an admitted source worker');
     this.authorize(machine, session, run.ticket, runId);
+    if(['builder','developer'].includes(run.role) && request?.recipe==='mobile-in-depth')
+      throw new Error('Complete Mobile suites are dispatcher-owned; request an investigation with retained failure evidence');
     return this.transaction(() => {
       // The same cap as an assessment's order. Repeating an existing request still returns it.
       let known = false;
@@ -369,6 +384,13 @@ export class FleetStore {
       if (task.request.recipe === 'dispatcher-repair') recordRepairWorkflow(this.db, task.id, task.ticket, workflow);
       return task;
     });
+  }
+  requestInvestigation(machine:string,session:string,project:string,runId:string,request:unknown,evidence?:Pick<EvidenceStore,'list'>) {
+    const run=this.snapshot().runs.find(r=>r.id===runId && r.machine===machine && r.session===session && r.project===project);
+    if(!run || !['builder','developer'].includes(run.role) || !/#[1-9]\d*$/.test(run.ticket))
+      throw new Error('Investigation requires its admitted builder or developer');
+    this.authorize(machine,session,run.ticket,runId);
+    return this.transaction(()=>this.investigations.request(run.ticket,run.id,machine,request,evidence));
   }
   taskStart(machine: string, id: string, session: string): StartResult & {runnerPolicy?: RunnerPolicy;run?:FleetRun} {
     if(!Object.hasOwn(this.limits,machine)) throw new Error('Unknown machine');
@@ -554,7 +576,9 @@ export class FleetStore {
     const evidence = this.facts.getEvidence(tickets);
     const facts=tickets.map(ticket => {
       const totalCount=this.tasks.count(ticket);
+      const investigation=this.investigations.pending(ticket);
       return {ticket,pause:this.facts.getPause(ticket),artifactRevision:this.artifactRevision(ticket),evidence:evidence.filter(e=>e.ticket===ticket),capabilities:this.tasks.capabilities(),
+        ...(investigation?{investigation}:{}),
         tasks:[] as ReturnType<typeof assessmentTasks>,taskHistory:{totalCount,returnedCount:0,omittedCount:totalCount},coordination:this.facts.getCoordination(ticket)};
     });
     // The Unix client permits 1 MiB for /recovery/facts. Reserve the existing

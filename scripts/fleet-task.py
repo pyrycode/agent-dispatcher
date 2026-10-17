@@ -121,6 +121,7 @@ def evidence(ticket,destination,run=None,limit=5):
 def fetch_bundle(listing,bundle,destination,entry):
     manifest,digest=inventory(bundle.get('manifest'))
     if bundle.get('digest')!=digest:raise RuntimeError('Evidence bundle digest mismatch')
+    entry['digest']=digest
     entry['files']=[{'path':f['path'],'bytes':f['bytes']} for f in manifest['files']]
     if destination:
         root=Path(destination).resolve().joinpath(safe_name(bundle.get('runId')))
@@ -146,10 +147,16 @@ def request(action,body):
     return data
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('action',choices=['request','read','await','evidence'])
-    p.add_argument('value');p.add_argument('--out');p.add_argument('--timeout',type=int,default=3600)
+    p=argparse.ArgumentParser();p.add_argument('action',choices=['request','read','await','evidence','investigate'])
+    p.add_argument('value',nargs='?');p.add_argument('--request-file');p.add_argument('--out');p.add_argument('--timeout',type=int,default=3600)
     p.add_argument('--run');p.add_argument('--limit',type=int,default=5)
     a=p.parse_args()
+    if a.action=='investigate':
+        if not a.request_file or a.value or a.out or a.run:p.error('investigate requires --request-file FILE and starts no tests')
+        receipt=request('investigate',{'request':json.loads(Path(a.request_file).read_text())})
+        if receipt.get('status')!='assessment-queued' or receipt.get('executed')!=0 or not isinstance(receipt.get('id'),str) or not HASH.fullmatch(receipt['id']):raise RuntimeError('Invalid investigation acknowledgement')
+        print(json.dumps(receipt));return
+    if not a.value or a.request_file:p.error('provide the task or ticket value')
     if a.action=='evidence':
         print(json.dumps(evidence(a.value,a.out,a.run,a.limit)));return
     if a.action=='request':

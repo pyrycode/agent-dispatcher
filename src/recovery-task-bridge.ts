@@ -1,11 +1,12 @@
 import {createServer} from 'node:http';
-import {mkdtempSync} from 'node:fs';
+import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {readJson,listen, type JsonClient} from './fleet-http.js';
 import type {FleetRun} from './fleet-store.js';
 import {recoveryTaskId,validateTaskRequest} from './recovery-tasks.js';
 import {NON_AGENT_ROLES} from './codex-throttle.js';
+import {startTestContextServer} from './test-context-server.js';
 
 /**
  * What one run's socket accepts.
@@ -62,12 +63,17 @@ export function evidenceTicket(value:unknown,project:string):string {
  * lost on the way back still counts.
  */
 export async function taskBridge(connection:JsonClient,run:FleetRun,actions:BridgeActions={request:true,read:true,evidence:false}) {
- const socket=join(mkdtempSync(join(tmpdir(),'pyry-task-')),'api.sock');
+ const directory=mkdtempSync(join(tmpdir(),'pyry-task-')),socket=join(directory,'api.sock');
  const requested=new Set<string>();
  const server=createServer(async(req,res)=>{
   const send=(status:number,value:unknown)=>{res.writeHead(status,{'Content-Type':'application/json'});res.end(JSON.stringify(value));};
   try {
    const url=req.url??'';
+   if(req.method==='POST' && url==='/investigate') {
+    if(!TASK_REQUEST_ROLES.has(run.role))return send(403,{error:'Wider investigation requests are for builder and developer runs'});
+    const body=await readJson(req);
+    return send(200,await connection.call('/tasks/investigate',{request:body.request,project:run.project,session:run.session,runId:run.id}));
+   }
    if(req.method==='POST' && actions.evidence && ['/evidence-list','/evidence-chunk'].includes(url)) {
     const body=await readJson(req);
     const ticket=evidenceTicket(body.ticket,run.project);
@@ -86,6 +92,7 @@ export async function taskBridge(connection:JsonClient,run:FleetRun,actions:Brid
    }
    const body=await readJson(req);
    if(url==='/request') {
+    if(TASK_REQUEST_ROLES.has(run.role) && body.request?.recipe==='mobile-in-depth')return send(403,{error:'Test selection policy: complete Mobile suites are dispatcher-owned. Submit investigate with retained failed-test evidence and requested scope; no diagnostic has executed.'});
     try {requested.add(recoveryTaskId(run.ticket,validateTaskRequest(body.request),run.id));}catch {/* invalid: the service refuses it too */}
    }
    const reply=await connection.call<{id?:unknown}>('/tasks'+url,{...body,project:run.project,session:run.session,runId:run.id});
@@ -94,5 +101,12 @@ export async function taskBridge(connection:JsonClient,run:FleetRun,actions:Brid
   }catch {send(409,{error:'Task request unavailable or outside this admitted ticket'});}
  });
  server.requestTimeout=15000;await listen(server,socket);
- return {socket,requested:()=>[...requested],close:()=>new Promise<void>(resolve=>server.close(()=>resolve()))};
+ let context:Awaited<ReturnType<typeof startTestContextServer>>|undefined;
+ try {if(['pyrycode/pyrycode','pyrycode/pyrycode-mobile'].includes(run.project))context=await startTestContextServer(run);}
+ catch(error){await new Promise<void>(resolve=>server.close(()=>resolve()));rmSync(directory,{recursive:true});throw error;}
+ let closing:Promise<void>|undefined;
+ return {socket,contextSocket:context?.socket,requested:()=>[...requested],close:()=>closing??=(async()=>{
+  await Promise.all([new Promise<void>(resolve=>server.close(()=>resolve())),context?.close()]);
+  rmSync(directory,{recursive:true});
+ })()};
 }
