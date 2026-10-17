@@ -32,11 +32,13 @@ export interface ProjectItem {
    *  Read by the family circuit breaker to resolve a ticket's family
    *  ROOT without walking descendants. */
   parentNumber: number | null;
-  /** The parent's own parent, or null. The PO's split-depth cap keeps
-   *  chains at most 3 deep (grandchild), so two levels fully resolve any
-   *  ticket's root: `grandparentNumber ?? parentNumber ?? issueNumber`
-   *  (see `resolveFamilyRoot` in pipeline-decisions.ts). */
+  /** The parent's own parent, or null. Older tickets use this snapshot for
+   *  family accounting. Recovery descendants can exceed two parent links,
+   *  so their original feature request is retained separately. */
   grandparentNumber: number | null;
+  /** Original owner/repository#issue reference from the feature-root marker.
+   *  Preserve it through recovery splits even when ancestors are closed. */
+  featureRoot?: string;
   /** GitHub's sub-issue tally for this issue (`subIssuesSummary`):
    *  how many sub-issues it has and how many are closed. Absent when the
    *  fetch did not carry it. Read by `runParentClose` to close a Done

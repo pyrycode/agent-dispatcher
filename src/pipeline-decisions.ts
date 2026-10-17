@@ -8,6 +8,7 @@
 // (the only cross-file dependency in this file).
 
 import { hasRunningWip, isRepairWip } from "./recovery-labels.js";
+import { featureRootIssueNumber, featureRootProject, parseFeatureRoot } from './feature-lineage.js';
 import { hasOpenBlockers } from "./blockers.js";
 import { byTicketPriority } from "./ticket-priority.js";
 import { MERGE_HANDOFF_LABEL } from "./merge-handoff.js";
@@ -1770,17 +1771,23 @@ export const FAMILY_BREAKER_COMMENT_MARKER = "<!-- family-breaker-tripped -->";
 export const FAMILY_DISPATCH_RESET_MARKER = "<!-- family-dispatch-reset -->";
 
 /**
- * A ticket's family ROOT: the top of its split lineage. The PO's
- * split-depth cap guarantees chains are at most 3 deep (grandchild), so
- * two levels of parent — carried on the board snapshot — fully resolve
- * the root without any descendant walk or extra query.
+ * The original feature request survives recovery splits beyond the refiner's
+ * ordinary depth limit. Older tickets without that record keep their existing
+ * two-level snapshot interpretation. Blockers never establish parentage.
  */
 export function resolveFamilyRoot(item: {
   issueNumber: number;
   parentNumber?: number | null;
   grandparentNumber?: number | null;
+  featureRoot?: string;
+  body?: string;
+  url?: string;
 }): number {
-  return item.grandparentNumber ?? item.parentNumber ?? item.issueNumber;
+  const project = featureRootProject(item.url);
+  const marker = item.body === undefined ? undefined : parseFeatureRoot(item.body, project);
+  if (item.featureRoot && marker && item.featureRoot.toLowerCase() !== marker.toLowerCase()) throw new Error('Conflicting feature root records');
+  const root = item.featureRoot ?? marker;
+  return root === undefined ? item.grandparentNumber ?? item.parentNumber ?? item.issueNumber : featureRootIssueNumber(root, project);
 }
 
 /**
@@ -1805,6 +1812,9 @@ export function collectOffBoardFamilyRoots(
     issueNumber: number;
     parentNumber?: number | null;
     grandparentNumber?: number | null;
+    featureRoot?: string;
+    body?: string;
+    url?: string;
   }>,
   known: ReadonlyMap<number, readonly string[]>,
 ): Set<number> {
