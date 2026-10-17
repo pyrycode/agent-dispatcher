@@ -64,6 +64,21 @@ def clean_env():
     # Trusted launchers retain their own authentication. Build/test processes cannot access fleet administrators.
     return {k:v for k,v in os.environ.items() if not k.startswith('FLEET_') and k not in {'GITHUB_TOKEN','GH_TOKEN','OP_SERVICE_ACCOUNT_TOKEN','PYRY_MANAGER_TOKEN','PYRY_MANAGER_URL','PYRY_DEV_AGENTS_TOKEN','PYRY_LIVE_CLAUDE_TOKEN','ANTHROPIC_API_KEY','CLAUDE_CODE_OAUTH_TOKEN'}}
 
+def prepare_android_service(route,log):
+    """The environment owns adb's persistent server, before any task owns children.
+
+    Use the same SDK executable as the managed gate. Starting a different adb
+    can make the gate replace its server from inside task custody instead.
+    Recheck for each launch, including after the native container restarts.
+    """
+    if route.get('capability') not in {'mobile-android','android-emulator'}:return
+    program=("import os,pathlib,subprocess; "
+             "adb=pathlib.Path(os.environ['ANDROID_HOME'])/'platform-tools'/'adb'; "
+             "subprocess.run([str(adb),'start-server'],check=True,timeout=30)")
+    command=['podman','exec',route['container'],'python3','-c',program] if route.get('container') else [sys.executable,'-c',program]
+    with log.open('ab') as output:
+        subprocess.run(command,stdin=subprocess.DEVNULL,stdout=output,stderr=output,env=clean_env(),timeout=45,check=True)
+
 def process_snapshot():
     """Read identities, never commands/environments. Failure is uncertainty, not absence."""
     try:
@@ -1063,6 +1078,19 @@ class SupportSupervisor:
             else:command=[sys.executable,str(program),'--worker',str(folder)]
             saved={'id':task['id'],'session':session,'phase':'launch-requested','result':str(result),'created':time.time(),'container':route.get('container'),'directory':str(folder)}
             if route.get('container'):saved['containerDirectory']=root
+            try:
+                # This persistent environment service must exist before the
+                # worker's descendant census. Never exclude adb by name from
+                # that census: unexpected task children still retain custody.
+                prepare_android_service(route,folder/'android-service.log')
+            except (OSError,subprocess.SubprocessError) as error:
+                # No task worker was launched. Retain a failed result through
+                # the ordinary upload path, without an uncertain reservation.
+                atomic(result,{'outcome':'failed','summary':'Android service preparation failed. No task worker was started.',
+                               'files':{'android-service.log':(folder/'android-service.log').read_text() if (folder/'android-service.log').exists() else type(error).__name__}})
+                saved.update(phase='running',drainConfirmed=True,notStarted='android-service-preparation')
+                atomic(receipt,saved);deferred.unlink(missing_ok=True)
+                return running+[saved]
             receipt=self.directory/(task['id']+'.receipt.json');atomic(receipt,saved)
             # The launch receipt exists first, so a drain sees this task as active.
             deferred.unlink(missing_ok=True)
