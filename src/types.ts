@@ -39,6 +39,9 @@ export interface ProjectItem {
   /** Original owner/repository#issue reference from the feature-root marker.
    *  Preserve it through recovery splits even when ancestors are closed. */
   featureRoot?: string;
+  /** A closed replacement records required work, never feature completion. */
+  recoverySplit?: { id: string; featureRoot: string; children: string[]; state: 'replaced' };
+  recoverySlice?: { id: string; featureRoot: string; behaviours: string[] };
   /** GitHub's sub-issue tally for this issue (`subIssuesSummary`):
    *  how many sub-issues it has and how many are closed. Absent when the
    *  fetch did not carry it. Read by `runParentClose` to close a Done
