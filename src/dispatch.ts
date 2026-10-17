@@ -1,3 +1,4 @@
+import { splitBodyHash } from "./recovery-split.js";
 import { coordinationReceipts } from "./recovery-receipts.js";
 import { HOST_TESTING_POLICY } from "./testing-policy.js";
 import { writeRuntimeReceipt } from "./runtime-receipt.js";
@@ -11390,6 +11391,7 @@ export async function pollLoop(): Promise<void> {
               begin: () => managed.recoveryStep<RecoveryIncident>("begin", incident.id),
               decide: decision => managed.recoveryStep<RecoveryDecision>("decide", incident.id, decision),
               complete: () => managed.recoveryStep("complete", incident.id),
+              split: () => managed.connection.call("/recovery/split", { project: managed.project, id: incident.id, session: recoveryAdmitted.session, runId: recoveryAdmitted.id }),
               assess: async item => {
                 const runner = selectRunner("recovery");
                 if (runner === "codex" && !process.env.PYRY_CODEX_BIN) process.env.PYRY_CODEX_BIN = resolveCodexExecutable(process.env);
@@ -11409,7 +11411,7 @@ export async function pollLoop(): Promise<void> {
                 const centralEvidence = await evidenceExcerpts(managed.connection, incident.ticket);
                 const logs = recoveryLogContext(LOGS_DIR, issue);
                 for (const ref of related.filter(t => t.startsWith(managed.project + "#")).slice(0, 3)) logs.push(...recoveryLogContext(LOGS_DIR, Number(ref.split("#")[1])));
-                writeFileSync(promptFile, scrubCredentials(JSON.stringify({ incident, ticket: item, comments, centralEvidence, logs, relatedIssues, facts })), { mode: 0o600 });
+                writeFileSync(promptFile, scrubCredentials(JSON.stringify({ incident, ticket: item, bodyHash: splitBodyHash(item.body), featureRoot: item.featureRoot, comments, centralEvidence, logs, relatedIssues, facts })), { mode: 0o600 });
                 writeFileSync(systemPromptFile, RECOVERY_INSTRUCTIONS, { mode: 0o600 });
                 const result = await runClaudeStreaming({ runner, sourceReview: true, sourceReviewRoot: repoRoot,
                   promptFile, systemPromptFile, cwd: repoRoot, logFile,

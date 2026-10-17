@@ -269,6 +269,12 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
         if (!machine) return send(403, { error: "Machine credential required" });
         return send(200, store.recoveryReport(machine, body.project, body.observations));
       }
+      if (req.url === "/recovery/split") {
+        if (!workflowGitHub || !evidence) throw new Error("Recovery split requires protected workflow and retained evidence stores");
+        if (!isAdmin && !machine) return send(403,{error:"Recovery actor or operator required"});
+        const actor = isAdmin ? undefined : {machine:machine!,session:body.session,runId:body.runId};
+        return send(200,await workflowGitHub.recoverySplit(body.id,evidence,actor));
+      }
       if (["/recovery/begin", "/recovery/decide", "/recovery/complete"].includes(req.url ?? "")) {
         if (!machine) return send(403, { error: "Machine credential required" });
         return send(200, store.recoveryStep(machine, body.session, body.project, body.id, body.runId,
@@ -389,7 +395,7 @@ export class JsonClient {
   }
   async call<T>(path: string, body?: unknown): Promise<T> {
     // Preparation reads the repair's base from GitHub and scans it twice.
-    const timeoutMs = path === "/tasks/publish-repair" || path === "/tasks/prepare-repair" ? 120_000 : path === "/github" || path === "/workflow/file" ? 60_000 : 10_000;
+    const timeoutMs = path === "/tasks/publish-repair" || path === "/tasks/prepare-repair" ? 120_000 : path === "/github" || path === "/workflow/file" || path === "/recovery/split" ? 60_000 : 10_000;
     if (this.socketPath) return new Promise<T>((resolve, reject) => {
       const req = request({ socketPath: this.socketPath, path, method: body === undefined ? "GET" : "POST",
         headers: { Authorization: `Bearer ${this.token}`, "Content-Type": "application/json" },

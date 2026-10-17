@@ -1,3 +1,4 @@
+import type { EvidenceStore } from "./evidence-store.js";
 import {
   parse,
   print,
@@ -662,6 +663,54 @@ export class WorkflowGitHub {
     );
     this.filings.set(request.commandId, { key, work });
     return work;
+  }
+  /** One durable split, including safe continuation after an HTTP or process failure. */
+  async recoverySplit(id: string, evidence: EvidenceStore, actor?: {machine:string;session:string;runId:string}) {
+    const running = this.recoverySplits.get(id);
+    if (running) return running;
+    const work = this.recoverySplitOnce(id,evidence,actor).finally(() => this.recoverySplits.delete(id));
+    this.recoverySplits.set(id,work);
+    return work;
+  }
+  private recoverySplits = new Map<string,Promise<unknown>>();
+  private async recoverySplitOnce(id: string, evidence: EvidenceStore, actor?: {machine:string;session:string;runId:string}) {
+    const record = this.store.prepareRecoverySplit(id,actor);
+    if (record.state === 'complete') return record;
+    const project = record.ticket.split('#')[0], parent = this.store.workflow.get(record.ticket);
+    for (const reference of record.plan.evidence) {
+      const bundle = evidence.list(record.ticket,reference.runId).find(b => b.digest === reference.digest);
+      const owner = this.store.runOwner(reference.runId);
+      const role = (name:string) => ['builder','developer'].includes(name) ? 'builder' : ['verifier','code-review'].includes(name) ? 'verifier' : name;
+      if (!bundle || !owner || owner.ticket !== record.ticket || role(owner.role) !== reference.role || role(bundle.meta.role) !== reference.role
+        || !bundle.totalBytes || !bundle.manifest.files.some(f => f.bytes > 0 && !/metadata|run-meta|manifest|result\.json/i.test(f.path)))
+        throw new Error('Split evidence must name substantive retained builder, verifier and recovery bundles from this ticket');
+    }
+    evidence.pinTicket(record.ticket,`Recovery split ${id} retains all original failed evidence`);
+    for (const slice of record.plan.children) {
+      this.store.checkRecoverySplit(id,actor);
+      let childTicket = this.store.splits.get(id)!.children[slice.key];
+      if (!childTicket) {
+        const labels = parent.labels.filter(l => !/^(wip:|done:|error:|error-retry-count:|rework-count:|needs-rework:|claim:|orchestrator:|needs-human:)/.test(l));
+        const child = await this.file(project,{
+          commandId:`recovery-split:${id}:${slice.key}`,title:slice.title,
+          body:`${slice.body}\n\nSplit from #${parent.issueNumber}\n\n<!-- feature-root: ${record.plan.featureRoot} -->`,
+          labels,workflow:{stage:'Inbox',labels:[],blockedBy:[parent.issueNumber]},
+        });
+        childTicket = child.ticket;
+        this.store.recordRecoveryChild(id,slice.key,childTicket);
+      }
+      this.store.checkRecoverySplit(id,actor);
+      // addSubIssue is idempotent only after reading parentage. A lost reply is read before retry.
+      const child = this.store.workflow.get(childTicket);
+      await this.adoptIssue(project,child.issueId);
+      const linked = this.store.workflow.get(childTicket);
+      if (linked.parentNumber !== parent.issueNumber) {
+        if (linked.parentNumber) throw new Error('Recovery child belongs to another parent');
+        await this.checked(project,{method:'POST',path:'/graphql',body:JSON.stringify({query:'mutation($parent:ID!,$child:ID!){addSubIssue(input:{issueId:$parent,subIssueId:$child}){issue{id}}}',variables:{parent:parent.issueId,child:child.issueId}})});
+      }
+    }
+    this.store.checkRecoverySplit(id,actor);
+    return this.store.completeRecoverySplit(id,actor);
   }
   private filings = new Map<string, { key: string; work: Promise<FiledTicket> }>();
   private filingRequest(project: string, input: any): FilingRequest {

@@ -1,3 +1,4 @@
+import { parseFeatureRoot } from "./feature-lineage.js";
 import type { EvidenceSeen } from "./evidence-revision.js";
 import type { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
@@ -507,6 +508,7 @@ export class WorkflowStore {
           // A newly discovered closed issue is history, not a new job.
           const item = {
             ...observed,
+            featureRoot: parseFeatureRoot(observed.body, project),
             status: observed.state === "CLOSED" ? "Done" : "Inbox",
             labels: observed.labels.filter(
               (l) =>
@@ -527,8 +529,11 @@ export class WorkflowStore {
             .run(ticket, project, JSON.stringify(item), position);
         } else {
           const current = this.decode(prior);
+          const observedRoot = parseFeatureRoot(observed.body, project);
+          if (observedRoot && current.featureRoot && observedRoot !== current.featureRoot) throw new Error("Feature root cannot change");
           const content = {
             ...current,
+            featureRoot: current.featureRoot ?? observedRoot,
             id: observed.id,
             issueId: observed.issueId,
             title: observed.title,
@@ -760,6 +765,13 @@ export class WorkflowStore {
         .run(JSON.stringify(result), id);
       return result;
     });
+  }
+  /** Lineage and scope are claim-authority metadata, never an arbitrary workflow command. */
+  recoveryMetadata(ticket: string, fields: Record<string, unknown>): void {
+    const item = this.get(ticket);
+    this.db.prepare("UPDATE workflow_tickets SET item=?,revision=revision+1 WHERE ticket=?")
+      .run(JSON.stringify({...item,...fields}), ticket);
+    this.event(ticket, "recovery-split", JSON.stringify(fields));
   }
   finish(ticket: string, role: string, runId: string): void {
     if (
