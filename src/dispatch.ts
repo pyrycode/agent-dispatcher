@@ -1281,9 +1281,9 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
           advanceClock(msg, msg.type === "user");
           if (msg.type === "result") {
             resultMsg = msg;
-            // The run has its outcome. A process that lingers after its
-            // result is not a stalled agent; the wall clock bounds it as
-            // before, and the result still counts.
+            // The run has its outcome unless a later turn starts. A process
+            // that lingers after its result is not a stalled agent; the wall
+            // clock bounds it as before, and the result still counts.
             claudeTurnEnded = true;
           } else if (msg.type === "assistant" && claudeTurnEnded) {
             // A notification re-entered the session after its result, so
