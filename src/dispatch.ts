@@ -4640,7 +4640,15 @@ export async function prepareAgentSpawn(
   // visible via get_design_context. Write tools (use_figma, generate_diagram) deliberately excluded
   // — agents read Figma, never modify it. Per-agent prescriptions in each fork's <role>/CLAUDE.md
   // gate actual usage.
-  const baseTools = "Bash,Read,Write,Edit,Glob,Grep,TodoWrite,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status,mcp__plugin_context7_context7__resolve-library-id,mcp__plugin_context7_context7__query-docs,mcp__codegraph__codegraph_explore,mcp__plugin_figma_figma__get_design_context,mcp__plugin_figma_figma__get_screenshot,mcp__plugin_figma_figma__get_metadata,mcp__plugin_figma_figma__get_variable_defs,mcp__plugin_figma_figma__search_design_system";
+  // Monitor is granted alongside Bash. Bash can start a command in the
+  // background, and Claude Code blocks `sleep N; cat <output>` with advice
+  // to wait through Monitor with an until-loop instead. Without Monitor on
+  // the allowlist, dontAsk denied that call and the denial watchdog killed
+  // the run when the agent fell back to a shell loop (pyrycode/pyrycode#3563,
+  // builder, 2026-10-17). Under `claude -p` a Monitor event re-enters the
+  // session and the run continues to its next result frame, which is the one
+  // the dispatcher keeps. The name must match the tool exactly.
+  const baseTools = "Bash,Monitor,Read,Write,Edit,Glob,Grep,TodoWrite,mcp__qmd__query,mcp__qmd__get,mcp__qmd__multi_get,mcp__qmd__status,mcp__plugin_context7_context7__resolve-library-id,mcp__plugin_context7_context7__query-docs,mcp__codegraph__codegraph_explore,mcp__plugin_figma_figma__get_design_context,mcp__plugin_figma_figma__get_screenshot,mcp__plugin_figma_figma__get_metadata,mcp__plugin_figma_figma__get_variable_defs,mcp__plugin_figma_figma__search_design_system";
   // codegraph 1.x lists one MCP tool, codegraph_explore; it returns the source, call paths
   // and blast radius the 0.x search/callers/callees/impact/node/context tools gave
   // piecemeal. Those names are gone from the server's default surface, and the containers
