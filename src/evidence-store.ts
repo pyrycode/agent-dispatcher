@@ -191,6 +191,16 @@ export class EvidenceStore {
     this.db.prepare('INSERT OR IGNORE INTO evidence_pins VALUES (?,?)').run(ticket, reason);
   }
   private pinned(ticket: string): boolean { return !!this.db.prepare('SELECT 1 FROM evidence_pins WHERE ticket=?').get(ticket); }
+  private protectCapacity(ticket: string, runId: string, bytes: number): void {
+    if (this.pinned(ticket)) {
+      const retained = Number(this.db.prepare("SELECT COALESCE(SUM(bytes),0) AS n FROM evidence_bundles WHERE ticket=? AND run_id!=?").get(ticket, runId)!.n);
+      if (retained + bytes > this.limits.ticketBytes) throw new Error("Protected evidence fills the ticket cap; retain this upload for retry");
+    }
+    // Pending manifests reserve their complete declared size. Excluding this
+    // run permits exact retries without charging its reservation twice.
+    const protectedBytes = Number(this.db.prepare("SELECT COALESCE(SUM(b.bytes),0) AS n FROM evidence_bundles b LEFT JOIN evidence_pins p ON p.ticket=b.ticket WHERE (p.ticket IS NOT NULL OR b.committed IS NULL) AND NOT (b.ticket=? AND b.run_id=?)").get(ticket, runId)!.n);
+    if (protectedBytes + bytes > this.limits.totalBytes) throw new Error("Protected evidence and pending uploads fill the total cap; retain this upload for retry");
+  }
 
   private transaction<T>(work: () => T): T {
     this.db.exec("BEGIN IMMEDIATE");
@@ -230,6 +240,9 @@ export class EvidenceStore {
         if (old.digest !== digest) throw new Error("Evidence bundle already committed with different content");
         return { digest, committed: true, missing: {} };
       }
+      // Split evidence is retained permanently. Refuse an upload that cannot
+      // fit beside it before storing anything, so the uploader keeps its outbox.
+      this.protectCapacity(ticket, runId, manifest.totalBytes);
       if (old && old.digest !== digest) this.remove(ticket, runId);
       if (!old || old.digest !== digest) {
         this.db.prepare("INSERT INTO evidence_bundles VALUES (?,?,?,?,?,?,?,?,?,NULL)")
@@ -269,6 +282,7 @@ export class EvidenceStore {
       if (!row || row.digest !== digest || row.machine !== machine) throw new Error("Unknown evidence upload");
       if (row.committed != null) return { committed: true as const, evicted: 0 };
       const manifest: ArtifactManifest = JSON.parse(String(row.manifest));
+      this.protectCapacity(ticket, runId, manifest.totalBytes);
       for (const file of manifest.files) {
         const parts = file.chunks.map((hash, i) => {
           const data = this.chunk(ticket, runId, file.path, i);
