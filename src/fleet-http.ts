@@ -272,6 +272,8 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
       if (req.url === "/recovery/split") {
         if (!workflowGitHub || !evidence) throw new Error("Recovery split requires protected workflow and retained evidence stores");
         if (!isAdmin && !machine) return send(403,{error:"Recovery actor or operator required"});
+        if (typeof body.id !== 'string' || Object.keys(body).some(k=>!['id','project','session','runId'].includes(k))) throw new Error('Recovery split accepts a retained incident identity, never a replacement plan');
+        if (body.project && store.recovery.incident(body.id).ticket.split('#')[0] !== body.project) throw new Error('Recovery split project mismatch');
         const actor = isAdmin ? undefined : {machine:machine!,session:body.session,runId:body.runId};
         return send(200,await workflowGitHub.recoverySplit(body.id,evidence,actor));
       }

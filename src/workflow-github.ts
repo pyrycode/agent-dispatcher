@@ -667,24 +667,32 @@ export class WorkflowGitHub {
   /** One durable split, including safe continuation after an HTTP or process failure. */
   async recoverySplit(id: string, evidence: EvidenceStore, actor?: {machine:string;session:string;runId:string}) {
     const running = this.recoverySplits.get(id);
-    if (running) return running;
+    if (running) { this.store.checkRecoverySplit(id,actor); return running; }
     const work = this.recoverySplitOnce(id,evidence,actor).finally(() => this.recoverySplits.delete(id));
     this.recoverySplits.set(id,work);
     return work;
   }
   private recoverySplits = new Map<string,Promise<unknown>>();
   private async recoverySplitOnce(id: string, evidence: EvidenceStore, actor?: {machine:string;session:string;runId:string}) {
-    const record = this.store.prepareRecoverySplit(id,actor);
-    if (record.state === 'complete') return record;
-    const project = record.ticket.split('#')[0], parent = this.store.workflow.get(record.ticket);
-    for (const reference of record.plan.evidence) {
-      const bundle = evidence.list(record.ticket,reference.runId).find(b => b.digest === reference.digest);
+    const incident = this.store.recovery.incident(id);
+    if (incident.decision?.action !== 'split' || !incident.decision.split) throw new Error('A retained recovery split decision is required');
+    const saved = this.store.splits.get(id);
+    if (saved?.state === 'complete') return this.store.prepareRecoverySplit(id,actor);
+    for (const reference of incident.decision.split.evidence) {
+      const bundle = evidence.list(incident.ticket,reference.runId).find(b => b.digest === reference.digest);
       const owner = this.store.runOwner(reference.runId);
       const role = (name:string) => ['builder','developer'].includes(name) ? 'builder' : ['verifier','code-review'].includes(name) ? 'verifier' : name;
-      if (!bundle || !owner || owner.ticket !== record.ticket || role(owner.role) !== reference.role || role(bundle.meta.role) !== reference.role
-        || !bundle.totalBytes || !bundle.manifest.files.some(f => f.bytes > 0 && !/metadata|run-meta|manifest|result\.json/i.test(f.path)))
+      if (!bundle || !owner || owner.ticket !== incident.ticket || role(owner.role) !== reference.role || role(bundle.meta.role) !== reference.role
+        || !bundle.totalBytes || !reference.inspectedPaths.every(path => bundle.manifest.files.some(f => f.path === path && f.bytes > 0 && !/^(?:run\.json|pointers\.json|SHA256SUMS)$|metadata|run-meta|manifest|result\.json/i.test(f.path))))
         throw new Error('Split evidence must name substantive retained builder, verifier and recovery bundles from this ticket');
+      for (const path of reference.inspectedPaths) {
+        if (!/\.(?:log|tail|txt|json|xml)$/.test(path)) throw new Error('Split evidence must cite readable retained text, reviews or test reports');
+        const file = bundle.manifest.files.find(f=>f.path===path)!;
+        evidence.read(incident.ticket,reference.runId,reference.digest,path,file.chunks.length-1);
+      }
     }
+    const record = this.store.prepareRecoverySplit(id,actor);
+    const project = record.ticket.split('#')[0], parent = this.store.workflow.get(record.ticket);
     evidence.pinTicket(record.ticket,`Recovery split ${id} retains all original failed evidence`);
     for (const slice of record.plan.children) {
       this.store.checkRecoverySplit(id,actor);
@@ -693,7 +701,7 @@ export class WorkflowGitHub {
         const labels = parent.labels.filter(l => !/^(wip:|done:|error:|error-retry-count:|rework-count:|needs-rework:|claim:|orchestrator:|needs-human:)/.test(l));
         const child = await this.file(project,{
           commandId:`recovery-split:${id}:${slice.key}`,title:slice.title,
-          body:`${slice.body}\n\nSplit from #${parent.issueNumber}\n\n<!-- feature-root: ${record.plan.featureRoot} -->`,
+          body:`${slice.body}\n\n## Observable result\n${slice.outcome}\n${record.plan.behaviours.filter(b=>b.child===slice.key).map(b=>b.description+'\nVerification: '+b.verification).join('\n')}\n\n## Required checks\n${slice.checks.map(c=>'- '+c).join('\n')}\n\n## Unresolved findings\n${record.plan.findings.filter(f=>f.child===slice.key).map(f=>f.id+': '+f.description).join('\n')}\n\nSplit from #${parent.issueNumber}\n\n<!-- feature-root: ${record.plan.featureRoot} -->`,
           labels,workflow:{stage:'Inbox',labels:[],blockedBy:[parent.issueNumber]},
         });
         childTicket = child.ticket;

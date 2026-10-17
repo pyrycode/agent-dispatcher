@@ -1,3 +1,4 @@
+import { parseFeatureRoot } from "./feature-lineage.js";
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import type { ProjectItem } from './types.js';
@@ -5,7 +6,7 @@ import type { WorkflowItem } from './workflow-store.js';
 
 export interface RecoverySplitEvidence {
   runId: string; digest: string; role: 'builder' | 'verifier' | 'recovery';
-  findings: string[]; conclusion: string;
+  findings: string[]; inspectedPaths: string[]; conclusion: string;
 }
 export interface RecoverySlice {
   key: string; title: string; body: string; outcome: string; checks: string[];
@@ -21,6 +22,7 @@ export interface RecoverySplitPlan {
 }
 export interface RecoverySplitRecord {
   id: string; ticket: string; plan: RecoverySplitPlan; scope: string;
+  source: WorkflowItem; owners: Record<string, string | null>;
   affected: Record<string, string>; children: Record<string, string>;
   state: 'preparing' | 'complete';
 }
@@ -30,18 +32,19 @@ const ref = /^[\w.-]+\/[\w.-]+#[1-9]\d*$/;
 const text = (v: unknown, max = 6000): v is string => typeof v === 'string' && !!v.trim() && v.length <= max;
 export const splitBodyHash = (body: string) => createHash('sha256').update(body).digest('hex');
 const normal = (s: string) => s.replace(/\s+/g, ' ').trim();
-export const splitItemBasis = (item: WorkflowItem) => splitBodyHash(JSON.stringify({body:item.body,state:item.state,status:item.status,labels:item.labels.filter(l => !['orchestrator:investigating','wip:recovery'].includes(l)).sort(),blockedBy:item.blockedBy,position:item.position,root:item.featureRoot ?? null}));
+export const splitItemBasis = (item: WorkflowItem) => splitBodyHash(JSON.stringify({body:item.body,state:item.state,status:item.status,labels:item.labels.filter(l => !['orchestrator:investigating','wip:recovery'].includes(l)).sort(),blockedBy:item.blockedBy.map(b=>b.url ?? b.number).sort(),position:item.position,root:item.featureRoot ?? null}));
 export function splitRequirements(body: string): string[] {
   const requirements: string[] = [];
-  let section = false, fenced = false;
+  let sectionDepth: number | undefined, fence: string | undefined;
   for (const line of body.split('\n')) {
-    if (/^\s*```/.test(line)) { fenced = !fenced; continue; }
-    if (fenced) continue;
-    const heading = line.match(/^#{1,6}\s+(.+)/);
-    if (heading) { section = /acceptance|requirements|security|documentation handoff/i.test(heading[1]); continue; }
+    const boundary = line.match(/^\s{0,3}(`{3,}|~{3,})/);
+    if (boundary) { if (!fence) fence = boundary[1]; else if (boundary[1][0] === fence[0] && boundary[1].length >= fence.length) fence = undefined; continue; }
+    if (fence) continue;
+    const heading = line.match(/^(#{1,6})\s+(.+)/);
+    if (heading) { if (sectionDepth === undefined || heading[1].length <= sectionDepth) sectionDepth = /acceptance|requirements|security|documentation handoff/i.test(heading[2]) ? heading[1].length : undefined; continue; }
     const checkbox = line.match(/^\s*[-*]\s+\[[ xX]\]\s+(.+)$/);
     if (checkbox) requirements.push(normal(checkbox[1]));
-    else if (line.trim() && (section || /\b(must|never|required|preserve|retain)\b/i.test(line))) requirements.push(normal(line));
+    else if (line.trim() && (sectionDepth !== undefined || /\b(must|never|required|preserve|retain)\b/i.test(line))) requirements.push(normal(line));
   }
   return [...new Set(requirements)];
 }
@@ -59,6 +62,10 @@ export function validateRecoverySplit(value: unknown): RecoverySplitPlan {
     || !Array.isArray(p.findings) || !p.findings.length || p.findings.length > 100
     || !Array.isArray(p.requirements) || !p.requirements.length || p.requirements.length > 100
     || !Array.isArray(p.behaviours) || p.behaviours.length < 2 || p.behaviours.length > 100) throw new Error('Invalid recovery split plan');
+  for (const child of p.children) {
+    const markedRoot = parseFeatureRoot(child.body, p.featureRoot.split('#')[0]);
+    if (markedRoot && markedRoot !== p.featureRoot) throw new Error('Conflicting feature root in recovery child');
+  }
   const preceding = new Set<string>();
   for (const child of p.children) {
     if (!child || !key.test(child.key) || preceding.has(child.key) || !text(child.title, 200) || !text(child.body, 50000)
@@ -89,6 +96,10 @@ export function validateRecoverySplit(value: unknown): RecoverySplitPlan {
     behaviours.add(normal(b.description));
   }
   for (const child of p.children) {
+    for (const requirement of p.requirements) {
+      if (!p.requirements.some(r => r.text === requirement.text && r.child === child.key) && normal(child.body).includes(normal(requirement.text)))
+        throw new Error('A child body repeats scope allocated solely to another child');
+    }
     const assigned = p.behaviours.filter(b => b.child === child.key);
     if (!assigned.length || assigned.length >= p.behaviours.length) throw new Error('Each result must contain a strict subset of observable behaviours');
     if (!p.requirements.some(r => r.child === child.key) || !p.findings.some(f => f.child === child.key)) throw new Error('A recovery child must be a smaller independently verifiable part of the retained scope');
@@ -96,7 +107,7 @@ export function validateRecoverySplit(value: unknown): RecoverySplitPlan {
   const roles = new Set<string>();
   for (const e of p.evidence) {
     if (!e || !text(e.runId, 128) || !digest.test(e.digest) || !['builder', 'verifier', 'recovery'].includes(e.role)
-      || !text(e.conclusion) || !Array.isArray(e.findings) || e.findings.some(id => !ids.has(id))) throw new Error('Invalid retained recovery split evidence');
+      || !text(e.conclusion) || !Array.isArray(e.inspectedPaths) || !e.inspectedPaths.length || e.inspectedPaths.some(p => !text(p, 500)) || !Array.isArray(e.findings) || e.findings.some(id => !ids.has(id))) throw new Error('Invalid retained recovery split evidence');
     roles.add(e.role);
   }
   if (roles.size !== 3 || p.findings.some(f => !p.evidence.some(e => e.findings.includes(f.id)))) throw new Error('Inspect retained builder, verifier and recovery evidence and account for every finding');
@@ -111,6 +122,7 @@ export function validateSplitAgainstTicket(plan: RecoverySplitPlan, item: Projec
   const prior = (item as ProjectItem & {recoverySlice?:{behaviours:string[]}}).recoverySlice;
   if (prior && JSON.stringify([...prior.behaviours].sort()) !== JSON.stringify(plan.behaviours.map(b => normal(b.description)).sort()))
     throw new Error('A further recovery split must partition the immutable previously assigned behaviour scope');
+  if (item.labels.some(l => ['error:infra','error:real-claude-gate'].includes(l) || /^(?:flaky-test|inherited-test-failure)$/.test(l))) throw new Error('Infrastructure and flaky-test failures require their own recovery');
   if (!item.labels.some(l => /^rework-count:\d+$/.test(l) && Number(l.split(':')[1]) >= 2)) throw new Error('Recovery splitting requires repeated rework evidence');
 }
 
@@ -119,19 +131,19 @@ export class RecoverySplits {
   constructor(private db: DatabaseSync) {
     db.exec(`CREATE TABLE IF NOT EXISTS fleet_recovery_splits (
       id TEXT PRIMARY KEY, ticket TEXT NOT NULL UNIQUE, plan TEXT NOT NULL, scope TEXT NOT NULL,
-      affected TEXT NOT NULL, children TEXT NOT NULL, state TEXT NOT NULL
+      affected TEXT NOT NULL, children TEXT NOT NULL, state TEXT NOT NULL, source TEXT NOT NULL, owners TEXT NOT NULL
     ) STRICT;`);
   }
   get(id: string): RecoverySplitRecord | undefined {
     const row = this.db.prepare('SELECT * FROM fleet_recovery_splits WHERE id=?').get(id);
     return row ? { id: String(row.id), ticket: String(row.ticket), plan: JSON.parse(String(row.plan)), scope: String(row.scope),
-      affected: JSON.parse(String(row.affected)), children: JSON.parse(String(row.children)), state: row.state as RecoverySplitRecord['state'] } : undefined;
+      source: JSON.parse(String(row.source)), owners: JSON.parse(String(row.owners)), affected: JSON.parse(String(row.affected)), children: JSON.parse(String(row.children)), state: row.state as RecoverySplitRecord['state'] } : undefined;
   }
   pending(ticket: string): boolean {
     return this.db.prepare("SELECT affected,children FROM fleet_recovery_splits WHERE state='preparing'").all()
       .some(r => Object.hasOwn(JSON.parse(String(r.affected)), ticket) || Object.values(JSON.parse(String(r.children))).includes(ticket));
   }
-  prepare(id: string, ticket: string, plan: RecoverySplitPlan, affected: WorkflowItem[], project: string): RecoverySplitRecord {
+  prepare(id: string, ticket: string, plan: RecoverySplitPlan, affected: WorkflowItem[], project: string, owners: Record<string,string|null>): RecoverySplitRecord {
     const old = this.get(id);
     if (old) {
       if (old.ticket !== ticket || JSON.stringify(old.plan) !== JSON.stringify(plan)) throw new Error('Recovery split identity reused');
@@ -140,8 +152,8 @@ export class RecoverySplits {
     const scope = recoverySplitScope(plan);
     if (this.db.prepare('SELECT 1 FROM fleet_recovery_splits WHERE ticket=? OR (json_extract(plan,\'$.featureRoot\')=? AND scope=?)').get(ticket, plan.featureRoot, scope))
       throw new Error('This unchanged scope already has a recovery split');
-    this.db.prepare("INSERT INTO fleet_recovery_splits VALUES (?,?,?,?,?,?,'preparing')")
-      .run(id, ticket, JSON.stringify(plan), scope, JSON.stringify(Object.fromEntries(affected.map(i => [`${i.url.match(/github\.com\/([^/]+\/[^/]+)\/issues\//)?.[1] ?? project}#${i.issueNumber}`, splitItemBasis(i)]))), '{}');
+    this.db.prepare("INSERT INTO fleet_recovery_splits VALUES (?,?,?,?,?,?,'preparing',?,?)")
+      .run(id, ticket, JSON.stringify(plan), scope, JSON.stringify(Object.fromEntries(affected.map(i => [`${i.url.match(/github\.com\/([^/]+\/[^/]+)\/issues\//)?.[1] ?? project}#${i.issueNumber}`, splitItemBasis(i)]))), '{}',JSON.stringify(affected.find(i => `${project}#${i.issueNumber}` === ticket)),JSON.stringify(owners));
     return this.get(id)!;
   }
   child(id: string, key: string, ticket: string): void {
@@ -149,6 +161,11 @@ export class RecoverySplits {
     if (record.children[key] && record.children[key] !== ticket) throw new Error('Recovery child identity changed');
     record.children[key] = ticket;
     this.db.prepare('UPDATE fleet_recovery_splits SET children=? WHERE id=?').run(JSON.stringify(record.children), id);
+  }
+  bindChild(id: string, ticket: string, basis: string): void {
+    const record = this.get(id)!;
+    record.affected[ticket] = basis; record.owners[ticket] = null;
+    this.db.prepare('UPDATE fleet_recovery_splits SET affected=?,owners=? WHERE id=?').run(JSON.stringify(record.affected),JSON.stringify(record.owners),id);
   }
   complete(id: string): void { this.db.prepare("UPDATE fleet_recovery_splits SET state='complete' WHERE id=?").run(id); }
 }
