@@ -82,3 +82,22 @@ test("only the code-writing roles keep the Codex test login (pyrycode #3389)", (
     assert.ok(!("PYRY_CODEX_CAPTURE_BIN" in env) && !("PYRY_CODEX_CAPTURE_HOME" in env), role);
   }
 });
+
+test("fresh and resumed live builders preserve the persistent Android signer home by name only", () => {
+  const parent = {
+    PATH: "/bin", HOME: "/home/agent", ANDROID_USER_HOME: "/home/agent/.android",
+    PYRY_LIVE_CLAUDE_TOKEN: "untrusted-alias-fixture", CLAUDE_CODE_OAUTH_TOKEN: "loaded-live-fixture",
+    JAVA_TOOL_OPTIONS: "-Dunrelated.secret=must-not-be-propagated", RANDOM_SETTING: "dropped",
+  };
+  const health = healthEnvForAgent(parent, "builder", "codex");
+  assert.equal(health.env.ANDROID_USER_HOME, parent.ANDROID_USER_HOME);
+  assert.equal(health.env.JAVA_TOOL_OPTIONS, undefined);
+  assert.equal(health.env.RANDOM_SETTING, undefined);
+  for (const resumeThreadId of [undefined, "saved-thread"]) {
+    const { args } = buildCodexInvocation({ cwd: "/repo", role: "builder", model: "", effort: "", builderLiveTests: true, resumeThreadId });
+    const names = JSON.parse(args.find(arg => arg.startsWith("shell_environment_policy.include_only="))!.split("=").slice(1).join("="));
+    assert.ok(names.includes("ANDROID_USER_HOME"));
+    assert.ok(!names.includes("JAVA_TOOL_OPTIONS"));
+    assert.ok(!args.some(arg => arg.includes(parent.ANDROID_USER_HOME)), "the home value must not enter argv");
+  }
+});
