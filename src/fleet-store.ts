@@ -1,3 +1,5 @@
+import { RecoverySplits, renderRecoverySlice, splitBodyHash, splitRequirements, splitItemBasis, validateSplitAgainstTicket, validateRecoverySplit, type RecoverySplitRecord } from './recovery-split.js';
+import { parseFeatureRoot } from './feature-lineage.js';
 import {scrubCredentials} from './agent-runtime.js';
 import { isRepairWip } from "./recovery-labels.js";
 import { PRIORITY_HIGH } from "./ticket-priority.js";
@@ -7,7 +9,7 @@ import { WorkflowStore, type WorkflowChange } from "./workflow-store.js";
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { RecoveryFacts, type PauseRecord, type EvidenceRecord, type CoordinationRecord } from "./recovery-facts.js";
-import { RecoveryLedger, validateObservations, IDLE_RECOVERY_REASONS, RECOVERY_UNKNOWN_PAUSE_REASON, type RecoveryObservation, type RecoveryDecision, type RecoveryIncident, type RecoveryLedgerOptions } from "./fleet-recovery.js";
+import { RecoveryLedger, recoveryFingerprint, validateObservations, IDLE_RECOVERY_REASONS, RECOVERY_UNKNOWN_PAUSE_REASON, type RecoveryObservation, type RecoveryDecision, type RecoveryIncident, type RecoveryLedgerOptions } from "./fleet-recovery.js";
 import { OperationReports } from './operation-reports.js';
 import { OrphanedTaskWatch } from './orphaned-tasks.js';
 import {RecoveryTasks, assessmentTasks, recoveryTaskId, validateTaskRequest, type RecoveryTaskRequest, type RecoveryTaskResult} from './recovery-tasks.js';
@@ -208,6 +210,7 @@ export class OwnershipRefusal extends Error {
 export class FleetStore {
   private readonly db: DatabaseSync;
   readonly recovery: RecoveryLedger;
+  readonly splits: RecoverySplits;
   readonly workflow: WorkflowStore;
   readonly facts: RecoveryFacts;
   readonly operations: OperationReports;
@@ -264,6 +267,7 @@ export class FleetStore {
     this.operations = new OperationReports(this.db, Object.keys(limits), clock);
     this.orphans = new OrphanedTaskWatch(this.db, this.tasks, this.operations, clock, options.orphanedTaskMs);
     this.clock = clock;
+    this.splits = new RecoverySplits(this.db);
     this.codex = new CodexThrottle(this.db, clock, options.codexThrottle ?? DEFAULT_CODEX_THROTTLE, options.log);
     this.desired = new DesiredStateStore(this.db, Object.keys(limits), clock, machine => this.machineCapabilities()[machine]?.projects);
     this.flaky = new FlakySightingLedger(this.db, clock);
@@ -282,6 +286,8 @@ export class FleetStore {
     let item;
     // Only an unknown ticket is unknown; any other failure says nothing and is rethrown.
     try { item = this.workflow.get(ticket); } catch (error) { if ((error as Error).message === "Unknown workflow ticket") return undefined; throw error; }
+    // Replacement closure is not completion, and must not age out its failed evidence.
+    if ((item as any).recoverySplit) return false;
     return item.status === "Done" || item.state === "CLOSED";
   }
 
@@ -627,6 +633,145 @@ export class FleetStore {
       return this.workflow.completeFiling(id, ticket, change);
     });
   }
+  /** The full lineage is resolved once before a recovery split and kept on every child. */
+  recoveryFeatureRoot(ticket: string): string {
+    const project = ticket.split('#')[0];
+    let item = this.workflow.get(ticket);
+    const seen = new Set<number>();
+    for (;;) {
+      const explicit = item.featureRoot ?? parseFeatureRoot(item.body, project);
+      if (explicit) return explicit;
+      if (seen.has(item.issueNumber)) throw new Error('Cyclic feature lineage');
+      seen.add(item.issueNumber);
+      if (!item.parentNumber) return `${project}#${item.issueNumber}`;
+      try { item = this.workflow.get(`${project}#${item.parentNumber}`); }
+      catch (error) {
+        if ((error as Error).message !== 'Unknown workflow ticket') throw error;
+        throw new Error('Original feature-root lineage is incomplete; inspect the actual parent chain before splitting');
+      }
+    }
+  }
+  /** No workflow or GitHub mutation is authorised while any affected worker is active. */
+  private guardRecoverySplit(record: RecoverySplitRecord, allowedRun?: string): void {
+    const incident = this.recovery.incident(record.id);
+    const source = incident.runId && this.runOwner(incident.runId);
+    const affected = new Set([...Object.keys(record.affected), ...Object.values(record.children)]);
+    for (const run of this.snapshot().runs) {
+      const task = run.supportTaskId ? this.tasks.get(run.supportTaskId) : undefined;
+      if (run.id !== allowedRun && (affected.has(run.ticket) || !!run.parentTicket && affected.has(run.parentTicket) || !!task && affected.has(task.ticket)))
+        throw new Error('An affected ticket or support worker is running; drain it before splitting');
+    }
+    for (const [ticket, basis] of Object.entries(record.affected)) {
+      const item = this.workflow.get(ticket);
+      const claim = this.snapshot().claims.find(c => c.ticket === ticket);
+      if ((claim ? `${claim.machine}:${claim.generation}` : null) !== record.owners[ticket]) throw new OwnershipRefusal('Affected ownership changed; preserve partial recovery work');
+      if (this.tasks.list(ticket).some(task=>['queued','running','publishing','attention'].includes(task.state))) throw new Error('An affected support task remains pending; preserve its recovery before splitting');
+      if (splitItemBasis(item) !== basis) throw new Error('Affected workflow changed; preserve the partial split and reassess before continuing');
+      if (item.labels.some(l => l.startsWith('needs-human:') && l !== 'needs-human:sizing' || l.startsWith('health-hold:') || l.startsWith('held:') || l.includes('permission_denied'))
+        || item.status === 'Halted' || this.approvals.get(ticket)?.kind === 'rejected' && !this.approvals.get(ticket)?.authorization)
+        throw new Error('Recovery split cannot override a hold or approval rejection');
+      const owner = this.snapshot().claims.find(c => c.ticket === ticket)?.machine ?? (source ? source.machine : undefined);
+      if (!owner || this.desired.work(owner, ticket.split('#')[0]) !== 'taking') throw new Error('Recovery split preserves operator drains and stops');
+    }
+  }
+  prepareRecoverySplit(id: string, actor?: {machine:string;session:string;runId:string}): RecoverySplitRecord {
+    return this.transaction(() => {
+      const incident = this.recovery.incident(id);
+      if (incident.decision?.action !== 'split') throw new Error('A retained recovery split decision is required');
+      if (actor) {
+        const run = this.snapshot().runs.find(r => r.id === actor.runId && r.ticket === incident.ticket && r.role === 'recovery');
+        if (!run || incident.runId !== run.id) throw new OwnershipRefusal('Split requires its admitted recovery assessment');
+        this.authorizeWorkflow(actor.machine,actor.session,incident.ticket,actor.runId);
+      }
+      const old = this.splits.get(id);
+      if (old?.state === 'complete') return old;
+      const project = incident.ticket.split('#')[0], item = this.workflow.get(incident.ticket);
+      const plan = validateRecoverySplit(incident.decision.split);
+      if (!old && recoveryFingerprint({ticket:incident.ticket,status:item.status,labels:item.labels,blocked:item.blockedBy.some(b=>b.state==='OPEN'),evidenceRevision:item.evidenceRevision,artifactRevision:this.artifactRevision(incident.ticket),pause:this.facts.getPause(incident.ticket),investigationRevision:this.investigations.pending(incident.ticket)?.id}) !== incident.fingerprint)
+        throw new Error('Recovery evidence or workflow changed after assessment; retain the decision and reassess before splitting');
+      validateSplitAgainstTicket(plan,item,this.recoveryFeatureRoot(incident.ticket));
+      if (!old && this.workflow.list(project).some(i => i.parentNumber === item.issueNumber)) throw new Error('The parent already has children; resume its existing split');
+      const all = this.workflow.projects().flatMap(p => this.workflow.list(p.project));
+      const affected = new Set([item.url]);
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const candidate of all) {
+          const parentUrl = `https://github.com/${candidate.url.match(/github.com\/([^/]+\/[^/]+)\/issues\//)?.[1]}/issues/${candidate.parentNumber}`;
+          if (!affected.has(candidate.url) && (affected.has(parentUrl) || candidate.state === 'OPEN' && candidate.blockedBy.some(b => !!b.url && affected.has(b.url)))) { affected.add(candidate.url); changed = true; }
+        }
+      }
+      if (old) {
+        for (const candidate of all.filter(i=>affected.has(i.url))) {
+          const reference = candidate.url.replace('https://github.com/','').replace('/issues/','#');
+          const provisional = plan.children.some(c=>this.workflow.filingMatches(`recovery-split:${id}:${c.key}`,candidate.issueId));
+          if (!Object.hasOwn(old.affected,reference) && !Object.values(old.children).includes(reference) && !provisional) {
+            if (candidate.parentNumber === item.issueNumber) throw new Error('Another child appeared during recovery; preserve both split records for operator assessment');
+            const claim=this.snapshot().claims.find(c=>c.ticket===reference);
+            this.splits.enlist(id,reference,splitItemBasis(candidate),claim?`${claim.machine}:${claim.generation}`:null);
+          }
+        }
+      }
+      const record = this.splits.prepare(id,incident.ticket,plan,all.filter(i => affected.has(i.url)),project,Object.fromEntries(all.filter(i => affected.has(i.url)).map(i=>{const ref=i.url.replace('https://github.com/','').replace('/issues/','#');const claim=this.snapshot().claims.find(c=>c.ticket===ref);return [ref,claim?`${claim.machine}:${claim.generation}`:null];})));
+      this.guardRecoverySplit(record,actor?.runId);
+      return record;
+    });
+  }
+  checkRecoverySplit(id: string, actor?: {machine:string;session:string;runId:string}): RecoverySplitRecord {
+    const record = this.prepareRecoverySplit(id,actor);
+    if (record.state !== 'complete') this.guardRecoverySplit(record,actor?.runId);
+    return record;
+  }
+  recordRecoveryChild(id: string, key: string, ticket: string): void {
+    this.transaction(() => {
+      const record = this.splits.get(id)!;
+      if (!record.plan.children.some(c => c.key === key)) throw new Error('Unexpected recovery child');
+      const child = this.workflow.get(ticket);
+      const slice = record.plan.children.find(c=>c.key===key)!;
+      const parent = this.workflow.get(record.ticket);
+      const expectedBody = renderRecoverySlice(record.plan,parent.issueNumber,slice)+`\n\n<!-- orchestrator-filing:recovery-split:${id}:${key} -->`;
+      const expectedLabels = parent.labels.filter(l=>! /^(wip:|done:|error:|error-retry-count:|rework-count:|needs-rework:|claim:|orchestrator:|needs-human:)/.test(l)).sort();
+      if (child.body !== expectedBody || child.title !== slice.title || JSON.stringify([...child.labels].sort()) !== JSON.stringify(expectedLabels))
+        throw new Error('Recovery child content changed before binding; preserve its original acceptance and partial evidence');
+      if (child.state !== 'OPEN' || child.status !== 'Inbox' || !child.blockedBy.some(b => b.url === this.workflow.get(record.ticket).url && b.state === 'OPEN'))
+        throw new Error('Partial recovery children must remain blocked by the open parent');
+      this.splits.child(id,key,ticket);
+      record.affected[ticket] = splitItemBasis(child);
+      this.splits.bindChild(id,ticket,splitItemBasis(child));
+    });
+  }
+  completeRecoverySplit(id: string, actor?: {machine:string;session:string;runId:string}): RecoverySplitRecord {
+    return this.transaction(() => {
+      const record = this.checkRecoverySplit(id,actor);
+      if (record.state === 'complete') return record;
+      const parent = this.workflow.get(record.ticket), project = record.ticket.split('#')[0];
+      if (record.plan.children.some(c => !record.children[c.key])) throw new Error('All recovery children must exist before activation');
+      const children = record.plan.children.map(c => ({slice:c,ticket:record.children[c.key],item:this.workflow.get(record.children[c.key])}));
+      for (const {item} of children) if (item.status !== 'Inbox' || item.state !== 'OPEN' || item.labels.some(l => l.startsWith('needs-human:') && l !== 'needs-human:sizing')) throw new Error('Partial child workflow changed; preserve it for operator assessment');
+      let after = parent.id;
+      const common = parent.labels.filter(l => !/^(wip:|done:|error:|error-retry-count:|rework-count:|needs-rework:|claim:|orchestrator:)/.test(l) && l !== 'needs-human:sizing');
+      for (const {slice,ticket,item} of children) {
+        // All children wait for prior siblings, including shared insertion points, and inherit causal dependencies.
+        const earlier = children.slice(0,children.findIndex(c => c.ticket === ticket));
+        this.workflow.change(ticket,{status:'Backlog',addLabels:common,blockedBy:[...parent.blockedBy,...earlier.map(c => ({number:c.item.issueNumber,state:c.item.state,url:c.item.url}))],afterItemId:after},'recovery-split',`${id}:activate:${slice.key}`,item.revision);
+        this.workflow.recoveryMetadata(ticket,{featureRoot:record.plan.featureRoot,parentNumber:parent.issueNumber,grandparentNumber:parent.parentNumber,
+          recoverySlice:{id,featureRoot:record.plan.featureRoot,behaviours:record.plan.behaviours.filter(b=>b.child===slice.key).map(b=>b.description.replace(/\s+/g,' ').trim())}});
+        this.workflow.comment(ticket,`Recovery split from ${record.ticket}. Feature root: ${record.plan.featureRoot}.\n\nResult: ${slice.outcome}\n\nVerification: ${slice.checks.join('; ')}\n\nPreserved work to reuse: ${slice.reuse.join('; ') || 'Inspect the retained parent branches, commits, reviews and evidence before implementation.'}\n\nUnresolved findings: ${record.plan.findings.filter(f=>f.child===slice.key).map(f=>`${f.id}: ${f.description}`).join('; ')}\n\nEvery normal security review and acceptance gate still applies.`,`${id}:brief:${slice.key}`);
+        after = item.id;
+      }
+      for (const ticket of Object.keys(record.affected).filter(t => t !== record.ticket && !Object.values(record.children).includes(t))) {
+        const dependent = this.workflow.get(ticket);
+        if (!dependent.blockedBy.some(b => b.url === parent.url)) continue;
+        this.workflow.change(ticket,{blockedBy:[...dependent.blockedBy,...children.map(c=>({number:c.item.issueNumber,state:c.item.state,url:c.item.url}))]},'recovery-split',`${id}:dependent:${ticket}`,dependent.revision);
+      }
+      this.workflow.recoveryMetadata(record.ticket,{featureRoot:record.plan.featureRoot,recoverySplit:{id,featureRoot:record.plan.featureRoot,children:children.map(c=>c.ticket),state:'replaced'}});
+      this.workflow.comment(record.ticket,`Replaced by recovery split. Feature ${record.plan.featureRoot} remains incomplete until its required leaf results merge and pass all acceptance.\n\nReason another split was justified: ${record.plan.justification}\n\nSmaller independently verifiable result: ${record.plan.smallerResult}\n\nChildren: ${children.map(c=>c.ticket).join(', ')}\n\nAll original commits, branches, reviews and failed evidence are retained. No requirement was removed.\n\nRequirement and finding allocation:\n${JSON.stringify({requirements:record.plan.requirements,findings:record.plan.findings,behaviours:record.plan.behaviours,evidence:record.plan.evidence},null,2)}`,`${id}:replacement`);
+      this.workflow.change(record.ticket,{status:'Done',state:'CLOSED'},'recovery-split',`${id}:replace`,this.workflow.get(record.ticket).revision);
+      this.splits.complete(id);
+      this.db.prepare("UPDATE fleet_recovery SET state='complete',updated=? WHERE id=?").run(this.clock(),id);
+      return this.splits.get(id)!;
+    });
+  }
   recoveryFacts(tickets: string[], assessment?:{machine:string;session:string;project:string;runId:string}) {
     let diagnosticTicket: string | undefined;
     if(assessment) {
@@ -641,6 +786,7 @@ export class FleetStore {
       const investigation=this.investigations.pending(ticket);
       return {ticket,pause:this.facts.getPause(ticket),approvalState:this.approvals.get(ticket),artifactRevision:this.artifactRevision(ticket),evidence:evidence.filter(e=>e.ticket===ticket),capabilities:this.tasks.capabilities(),
         ...(investigation?{investigation}:{}),
+        ...(ticket === diagnosticTicket ? {splitContext: (()=>{try {const item=this.workflow.get(ticket);return {featureRoot:this.recoveryFeatureRoot(ticket),bodyHash:splitBodyHash(item.body),requirements:splitRequirements(item.body),priorBehaviours:(item as any).recoverySlice?.behaviours};}catch(error){return {unavailable:(error as Error).message};}})()} : {}),
         tasks:[] as ReturnType<typeof assessmentTasks>,taskHistory:{totalCount,returnedCount:0,omittedCount:totalCount},coordination:this.facts.getCoordination(ticket)};
     });
     // The Unix client permits 1 MiB for /recovery/facts. Reserve the existing
@@ -758,12 +904,15 @@ export class FleetStore {
     // a lost reply above still recovers its grant.
     if (workRefusal(project => this.desired.work(req.machine, project), req,
       this.db.prepare("SELECT machine FROM fleet_claims WHERE ticket=?").get(req.ticket)?.machine === req.machine)) return { ok: false, reason: "drained" };
+    if (this.splits.pending(req.ticket) || req.parentTicket && this.splits.pending(req.parentTicket)) return {ok:false,reason:'locked'};
     if(this.workflow.preparing(req.project))return {ok:false,reason:'locked'};
     const approval=this.approvals.get(req.ticket);
     if(req.role!=='recovery' && approval?.kind==='rejected' && !approval.authorization) return {ok:false,reason:'locked'};
     if(this.workflow.enabled(req.project) && !req.supportTaskId && req.workflowVersion!==1) return {ok:false,reason:"locked"};
     if(this.workflow.enabled(req.project) && /#[1-9]\d*$/.test(req.ticket)) {
       const item=this.workflow.get(req.ticket);
+      const recoveryFiling = item.body.match(/<!-- orchestrator-filing:recovery-split:([a-f0-9-]{36}):[a-z][a-z0-9-]* -->/);
+      if (recoveryFiling && this.splits.get(recoveryFiling[1])?.state === 'preparing') return {ok:false,reason:'locked'};
       const columns:Record<string,string>={po:'Backlog',refiner:'Backlog',architect:'In Architecture',developer:'In Development',builder:'In Development',qa:'In QA','code-review':'In Code Review',verifier:'In Code Review',documentation:'In Documentation'};
       if(columns[req.role] && (item.state!=='OPEN' || item.status!==columns[req.role] || item.labels.some(l=>l.startsWith('error:')||l.startsWith('needs-rework:')||(l.startsWith('wip:')&&!isRepairWip(l))||l.startsWith('needs-human:')&&l!=='needs-human:sizing') || item.blockedBy.some(b=>b.state==='OPEN'))) return {ok:false,reason:'locked'};
       // A ticket split off by a run that is still active waits for that run,

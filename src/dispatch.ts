@@ -1,5 +1,7 @@
+import { splitBodyHash } from "./recovery-split.js";
 import { coordinationReceipts } from "./recovery-receipts.js";
 import { HOST_TESTING_POLICY } from "./testing-policy.js";
+import { featureRootIssueNumber, featureRootProject, parseFeatureRoot } from './feature-lineage.js';
 import { writeRuntimeReceipt } from "./runtime-receipt.js";
 import { type ChildProcess, execSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -10289,6 +10291,31 @@ export async function runAutoMerge(
   }
 }
 
+function featureFamilyReadyToClose(item: ProjectItem, all: readonly ProjectItem[]): boolean {
+  const root = resolveFamilyRoot(item);
+  const family = all.filter(part => resolveFamilyRoot(part) === root);
+  const tracked = family.some(part => part.featureRoot !== undefined || part.recoverySplit || parseFeatureRoot(part.body) !== undefined);
+  if (!tracked) return true;
+  const byNumber = new Map(family.map(part => [part.issueNumber, part]));
+  const project = featureRootProject(item.url);
+  for (const part of family) {
+    const children = family.filter(child => child.parentNumber === part.issueNumber);
+    if (part.recoverySplit) {
+      if (featureRootIssueNumber(part.recoverySplit.featureRoot, project) !== root || part.recoverySplit.children.length === 0) return false;
+      for (const reference of part.recoverySplit.children) {
+        const child = byNumber.get(featureRootIssueNumber(reference, project));
+        if (!child || child.parentNumber !== part.issueNumber) return false;
+      }
+    } else if (part.subIssues?.total) {
+      if (children.length < part.subIssues.total) return false;
+    } else if (children.length === 0 && part.issueNumber !== root) {
+      if (part.status !== 'Done' || !part.labels.includes('merged') || (part as ProjectItem & { state?: string }).state !== 'CLOSED') return false;
+    }
+  }
+  return family.some(part => part.issueNumber !== root);
+}
+
+
 /**
  * Close parent tickets whose work is finished.
  *
@@ -10308,12 +10335,14 @@ export async function runAutoMerge(
  * cycle's snapshot still shows a parent whose PR the auto-merge is about
  * to merge as open, and the open-PR check keeps it out.
  */
+
 export async function runParentClose(
   client: DispatchClient,
   deps: DispatchDeps = DEFAULT_DEPS,
 ): Promise<void> {
   const { execSync } = deps;
   let doneItems: ProjectItem[];
+  let allItems: ProjectItem[] | undefined;
   try {
     doneItems = await client.getItemsByStatus("Done");
   } catch (error: any) {
@@ -10324,6 +10353,13 @@ export async function runParentClose(
     const subs = item.subIssues;
     if (!subs || subs.total === 0 || subs.completed < subs.total) continue;
     if (item.labels.includes("error:merge-conflict")) continue;
+    try {
+      allItems ??= await client.getAllProjectItems();
+      if (!featureFamilyReadyToClose(item, allItems)) continue;
+    } catch (error) {
+      console.warn(`Parent #${item.issueNumber} remains open: feature completion evidence is unavailable: ${error}`);
+      continue;
+    }
     try {
       const openPr = execSync(
         `gh pr list --head "feature/${item.issueNumber}" --state open --json number --jq '.[0].number'`,
@@ -10337,6 +10373,7 @@ export async function runParentClose(
       await client.addComment(
         item.issueNumber,
         `Closing: all ${subs.completed} of ${subs.total} sub-issues are closed and this ticket is in Done. ` +
+        (item.featureRoot || parseFeatureRoot(item.body) ? 'All required feature parts have merged. ' : '') +
         `Reopen it if work remains.\n\n*Closed automatically by the dispatcher.*`,
       );
       await client.closeIssue(item.issueNumber);
@@ -11390,6 +11427,7 @@ export async function pollLoop(): Promise<void> {
               begin: () => managed.recoveryStep<RecoveryIncident>("begin", incident.id),
               decide: decision => managed.recoveryStep<RecoveryDecision>("decide", incident.id, decision),
               complete: () => managed.recoveryStep("complete", incident.id),
+              split: () => managed.connection.call("/recovery/split", { project: managed.project, id: incident.id, session: recoveryAdmitted.session, runId: recoveryAdmitted.id }),
               assess: async item => {
                 const runner = selectRunner("recovery");
                 if (runner === "codex" && !process.env.PYRY_CODEX_BIN) process.env.PYRY_CODEX_BIN = resolveCodexExecutable(process.env);
@@ -11409,7 +11447,7 @@ export async function pollLoop(): Promise<void> {
                 const centralEvidence = await evidenceExcerpts(managed.connection, incident.ticket);
                 const logs = recoveryLogContext(LOGS_DIR, issue);
                 for (const ref of related.filter(t => t.startsWith(managed.project + "#")).slice(0, 3)) logs.push(...recoveryLogContext(LOGS_DIR, Number(ref.split("#")[1])));
-                writeFileSync(promptFile, scrubCredentials(JSON.stringify({ incident, ticket: item, comments, centralEvidence, logs, relatedIssues, facts })), { mode: 0o600 });
+                writeFileSync(promptFile, scrubCredentials(JSON.stringify({ incident, ticket: item, bodyHash: splitBodyHash(item.body), featureRoot: item.featureRoot, comments, centralEvidence, logs, relatedIssues, facts })), { mode: 0o600 });
                 writeFileSync(systemPromptFile, RECOVERY_INSTRUCTIONS, { mode: 0o600 });
                 const result = await runClaudeStreaming({ runner, sourceReview: true, sourceReviewRoot: repoRoot,
                   promptFile, systemPromptFile, cwd: repoRoot, logFile,

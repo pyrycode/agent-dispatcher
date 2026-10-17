@@ -715,7 +715,7 @@ export class MockGitHubClient implements DispatchClient {
   async getAllProjectItems(): Promise<ProjectItem[]> {
     this.getAllProjectItemsCalls += 1;
     if (this.failures.getAllProjectItems) throw this.failures.getAllProjectItems;
-    return [...this.itemsByIssueNumber.values()].map(({ state: _state, ...item }) => item);
+    return [...this.itemsByIssueNumber.values()];
   }
 
   async getStrandedWipMarkers(issueNumber: number): Promise<{ observedAt: Date | null; sweptAt: Date | null }> {
@@ -817,6 +817,9 @@ export function makeProjectItem(overrides: Partial<ProjectItem> = {}): ProjectIt
     parentNumber: overrides.parentNumber ?? null,
     grandparentNumber: overrides.grandparentNumber ?? null,
     ...(overrides.subIssues ? { subIssues: overrides.subIssues } : {}),
+    ...(overrides.featureRoot === undefined ? {} : { featureRoot: overrides.featureRoot }),
+    ...(overrides.recoverySplit ? { recoverySplit: overrides.recoverySplit } : {}),
+    ...(overrides.recoverySlice ? { recoverySlice: overrides.recoverySlice } : {}),
   };
 }
 
@@ -6554,6 +6557,90 @@ describe("runAutoMerge", () => {
 // touched — tui-driver #185 sits open in Done on purpose.
 
 describe("runParentClose", () => {
+  test("closed direct children do not complete a feature while a recovery leaf is open", async () => {
+    const root = 'test/repo#1500';
+    const client = new MockGitHubClient({ items: [
+      { issueNumber: 1500, status: 'Done', subIssues: { total: 1, completed: 1 }, featureRoot: root },
+      { issueNumber: 1501, status: 'Done', state: 'CLOSED', parentNumber: 1500, featureRoot: root,
+        recoverySplit: { id: 'split', featureRoot: root, children: ['test/repo#1502'], state: 'replaced' } },
+      { issueNumber: 1502, status: 'In Development', parentNumber: 1501, featureRoot: root },
+    ] });
+    const { deps, calls } = makeMockDeps();
+    await runParentClose(client, deps);
+    assert.deepEqual(client.closeIssueCalls, []);
+    assert.equal(calls.exec.length, 0);
+  });
+
+  test("a marked feature closes only after every required leaf has merged", async () => {
+    const root = 'test/repo#1500';
+    const client = new MockGitHubClient({ items: [
+      { issueNumber: 1500, status: 'Done', subIssues: { total: 1, completed: 1 }, featureRoot: root },
+      { issueNumber: 1501, status: 'Done', state: 'CLOSED', parentNumber: 1500, featureRoot: root,
+        recoverySplit: { id: 'split', featureRoot: root, children: ['test/repo#1502'], state: 'replaced' } },
+      { issueNumber: 1502, status: 'Done', state: 'CLOSED', parentNumber: 1501, featureRoot: root },
+    ] });
+    const { deps } = makeMockDeps({ execImpls: { 'gh pr list --head "feature/1500"': () => '' } });
+    await runParentClose(client, deps);
+    assert.deepEqual(client.closeIssueCalls, [], 'closed without merge evidence is incomplete');
+    client.itemsByIssueNumber.get(1502)!.labels.push('merged');
+    await runParentClose(client, deps);
+    assert.deepEqual(client.closeIssueCalls, [1500]);
+    assert.match(client.comments[0]!.body, /required feature parts.*merged/);
+  });
+
+  test("missing children and unreadable lineage cannot supply feature completion", async () => {
+    const root = 'test/repo#1500';
+    for (const missing of [true, false]) {
+      const client = new MockGitHubClient({ items: [
+        { issueNumber: 1500, status: 'Done', subIssues: { total: 1, completed: 1 }, featureRoot: root },
+        { issueNumber: 1501, status: 'Done', state: 'CLOSED', parentNumber: 1500, featureRoot: root,
+          recoverySplit: { id: 'split', featureRoot: root, children: ['test/repo#1502'], state: 'replaced' } },
+        ...(!missing ? [{ issueNumber: 1502, status: 'Done', state: 'CLOSED' as const, parentNumber: 1501,
+          featureRoot: 'test/repo#1503', body: '<!-- feature-root: test/repo#1500 -->', labels: ['merged'] }] : []),
+      ] });
+      const { deps } = makeMockDeps();
+      await runParentClose(client, deps);
+      assert.deepEqual(client.closeIssueCalls, []);
+    }
+  });
+
+  test("an older unmarked root still waits for its marked recovery descendants", async () => {
+    const client = new MockGitHubClient({ items: [
+      { issueNumber: 1500, status: 'Done', subIssues: { total: 1, completed: 1 } },
+      { issueNumber: 1501, status: 'Done', state: 'CLOSED', parentNumber: 1500,
+        subIssues: { total: 1, completed: 1 } },
+      { issueNumber: 1502, status: 'Done', state: 'CLOSED', parentNumber: 1501, grandparentNumber: 1500,
+        subIssues: { total: 1, completed: 1 } },
+      { issueNumber: 1503, status: 'In Development', parentNumber: 1502, grandparentNumber: 1501,
+        featureRoot: 'test/repo#1500' },
+    ] });
+    const { deps } = makeMockDeps();
+    await runParentClose(client, deps);
+    assert.deepEqual(client.closeIssueCalls, []);
+  });
+
+  test("an unavailable family snapshot leaves parent completion for a later cycle", async () => {
+    const client = new MockGitHubClient({ items: [
+      { issueNumber: 1500, status: 'Done', subIssues: { total: 1, completed: 1 }, featureRoot: 'test/repo#1500' },
+    ] });
+    client.failures.getAllProjectItems = new Error('workflow temporarily unavailable');
+    const { deps } = makeMockDeps();
+    await runParentClose(client, deps);
+    assert.deepEqual(client.closeIssueCalls, []);
+  });
+
+  test("missing closed state cannot prove completion of an explicitly tracked leaf", async () => {
+    const root = 'test/repo#1500';
+    const client = new MockGitHubClient({ items: [
+      { issueNumber: 1500, status: 'Done', subIssues: { total: 1, completed: 1 }, featureRoot: root },
+      { issueNumber: 1501, status: 'Done', state: 'CLOSED', parentNumber: 1500, featureRoot: root, labels: ['merged'] },
+    ] });
+    client.getAllProjectItems = async () => [...client.itemsByIssueNumber.values()].map(({ state: _state, ...part }) => part);
+    const { deps } = makeMockDeps();
+    await runParentClose(client, deps);
+    assert.deepEqual(client.closeIssueCalls, []);
+  });
+
   test("Done parent with every sub-issue closed and no open PR → comment + close", async () => {
     const client = new MockGitHubClient({
       items: [

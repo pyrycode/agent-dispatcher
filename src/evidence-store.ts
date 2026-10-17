@@ -178,11 +178,29 @@ export class EvidenceStore {
         ticket TEXT NOT NULL, run_id TEXT NOT NULL, path TEXT NOT NULL, part INTEGER NOT NULL, data BLOB NOT NULL,
         PRIMARY KEY(ticket, run_id, path, part)
       ) STRICT;
+      CREATE TABLE IF NOT EXISTS evidence_pins (ticket TEXT PRIMARY KEY, reason TEXT NOT NULL) STRICT;
       CREATE TABLE IF NOT EXISTS evidence_done (ticket TEXT PRIMARY KEY, since INTEGER NOT NULL) STRICT;
       CREATE INDEX IF NOT EXISTS evidence_age ON evidence_bundles(committed, created);
     `);
   }
   close(): void { this.db.close(); }
+  /** Recovery replacement is audit history. It must survive closure and capacity pruning. */
+  pinTicket(ticket: string, reason: string): void {
+    validateEvidenceTicket(ticket);
+    if (!reason) throw new Error('Evidence preservation reason required');
+    this.db.prepare('INSERT OR IGNORE INTO evidence_pins VALUES (?,?)').run(ticket, reason);
+  }
+  private pinned(ticket: string): boolean { return !!this.db.prepare('SELECT 1 FROM evidence_pins WHERE ticket=?').get(ticket); }
+  private protectCapacity(ticket: string, runId: string, bytes: number): void {
+    if (this.pinned(ticket)) {
+      const retained = Number(this.db.prepare("SELECT COALESCE(SUM(bytes),0) AS n FROM evidence_bundles WHERE ticket=? AND run_id!=?").get(ticket, runId)!.n);
+      if (retained + bytes > this.limits.ticketBytes) throw new Error("Protected evidence fills the ticket cap; retain this upload for retry");
+    }
+    // Pending manifests reserve their complete declared size. Excluding this
+    // run permits exact retries without charging its reservation twice.
+    const protectedBytes = Number(this.db.prepare("SELECT COALESCE(SUM(b.bytes),0) AS n FROM evidence_bundles b LEFT JOIN evidence_pins p ON p.ticket=b.ticket WHERE (p.ticket IS NOT NULL OR b.committed IS NULL) AND NOT (b.ticket=? AND b.run_id=?)").get(ticket, runId)!.n);
+    if (protectedBytes + bytes > this.limits.totalBytes) throw new Error("Protected evidence and pending uploads fill the total cap; retain this upload for retry");
+  }
 
   private transaction<T>(work: () => T): T {
     this.db.exec("BEGIN IMMEDIATE");
@@ -222,6 +240,9 @@ export class EvidenceStore {
         if (old.digest !== digest) throw new Error("Evidence bundle already committed with different content");
         return { digest, committed: true, missing: {} };
       }
+      // Split evidence is retained permanently. Refuse an upload that cannot
+      // fit beside it before storing anything, so the uploader keeps its outbox.
+      this.protectCapacity(ticket, runId, manifest.totalBytes);
       if (old && old.digest !== digest) this.remove(ticket, runId);
       if (!old || old.digest !== digest) {
         this.db.prepare("INSERT INTO evidence_bundles VALUES (?,?,?,?,?,?,?,?,?,NULL)")
@@ -261,6 +282,7 @@ export class EvidenceStore {
       if (!row || row.digest !== digest || row.machine !== machine) throw new Error("Unknown evidence upload");
       if (row.committed != null) return { committed: true as const, evicted: 0 };
       const manifest: ArtifactManifest = JSON.parse(String(row.manifest));
+      this.protectCapacity(ticket, runId, manifest.totalBytes);
       for (const file of manifest.files) {
         const parts = file.chunks.map((hash, i) => {
           const data = this.chunk(ticket, runId, file.path, i);
@@ -287,6 +309,7 @@ export class EvidenceStore {
     if (used <= this.limits.ticketBytes) return 0;
     for (const r of this.db.prepare(`SELECT run_id,bytes FROM evidence_bundles WHERE ticket=? AND committed IS NOT NULL AND run_id!=? ORDER BY ${runOrder("ASC")}`).all(ticket, keepRun)) {
       if (used <= this.limits.ticketBytes) break;
+      if (this.pinned(ticket)) continue;
       this.remove(ticket, String(r.run_id)); used -= Number(r.bytes); evicted++;
     }
     return evicted;
@@ -301,6 +324,7 @@ export class EvidenceStore {
     for (const r of candidates) {
       if (used <= this.limits.totalBytes) break;
       if (r.ticket === keepTicket && r.run_id === keepRun) continue;
+      if (this.pinned(String(r.ticket))) continue;
       this.remove(String(r.ticket), String(r.run_id)); used -= Number(r.bytes); evicted++;
     }
     return evicted;
@@ -363,6 +387,7 @@ export class EvidenceStore {
       }
       for (const r of this.db.prepare("SELECT DISTINCT ticket FROM evidence_bundles").all()) {
         const ticket = String(r.ticket);
+        if (this.pinned(ticket)) continue;
         let state: boolean | undefined;
         // A lookup that fails says nothing: the ticket keeps its Done clock and its bundles.
         try { state = done(ticket); } catch { continue; }
@@ -377,6 +402,7 @@ export class EvidenceStore {
       }
       for (const r of this.db.prepare("SELECT d.ticket FROM evidence_done d WHERE d.since<?").all(now - this.limits.doneRetentionMs)) {
         const ticket = String(r.ticket);
+        if (this.pinned(ticket)) continue;
         deleted += Number(this.db.prepare("SELECT COUNT(*) AS n FROM evidence_bundles WHERE ticket=?").get(ticket)!.n);
         this.db.prepare("DELETE FROM evidence_chunks WHERE ticket=?").run(ticket);
         this.db.prepare("DELETE FROM evidence_bundles WHERE ticket=?").run(ticket);
