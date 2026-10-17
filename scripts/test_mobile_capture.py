@@ -185,9 +185,10 @@ class MobileCaptureTests(unittest.TestCase):
             self.assertIn('checkout failed', result['files']['mobile/capture.json'])
 
 
-# The candidate's real forwarding shape: the gate's APK build runs the
-# checkout's compatibility wrapper, which forwards to agent-tool.py, which
-# resolves the agents helper from AGENTS_REPO_PATH or a sibling checkout.
+# The candidate's forwarding path: the gate's APK build runs the checkout's
+# compatibility wrapper, which forwards to agent-tool.py. The fixture copies
+# only agent-tool.py's helper resolution, AGENTS_REPO_PATH or a sibling
+# checkout, not its tool allowlist, test scope or admission.
 CANDIDATE_WRAPPER = (
     'import os,sys\nfrom pathlib import Path\n'
     'os.execv(sys.executable,[sys.executable,str(Path(__file__).with_name("agent-tool.py")),Path(__file__).name,*sys.argv[1:]])\n')
@@ -219,10 +220,13 @@ class MobileCaptureAgentsCheckoutTests(unittest.TestCase):
         for name, content in files.items():
             (path / name).parent.mkdir(parents=True, exist_ok=True)
             (path / name).write_text(content)
+        # Host git settings such as signing or template hooks cannot affect the fixture.
+        env = {**{k: v for k, v in os.environ.items() if not k.startswith('GIT_')},
+               'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1'}
         git = ['git', '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', '-C', str(path)]
-        subprocess.run(['git', 'init', '-q', '-b', 'main', str(path)], check=True)
-        subprocess.run([*git, 'add', '-A'], check=True)
-        subprocess.run([*git, 'commit', '-q', '-m', 'fixture'], check=True)
+        subprocess.run(['git', 'init', '-q', '--template=', '-b', 'main', str(path)], check=True, env=env)
+        subprocess.run([*git, 'add', '-A'], check=True, env=env)
+        subprocess.run([*git, 'commit', '-q', '-m', 'fixture'], check=True, env=env)
         return subprocess.check_output(['git', '-C', str(path), 'rev-parse', 'HEAD'], text=True).strip()
 
     def capture(self, recipe, agents_files, inherited=None):
