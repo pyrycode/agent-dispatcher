@@ -51,8 +51,11 @@ export function splitRequirements(body: string): string[] {
 /** Only review/gate/security constraints may bind more than one behaviour slice. */
 function sharedRequirements(body: string): Set<string> {
   const shared = new Set<string>();
-  let sectionDepth: number | undefined;
+  let sectionDepth: number | undefined, fence: string | undefined;
   for (const line of body.split('\n')) {
+    const boundary = line.match(/^\s{0,3}(`{3,}|~{3,})/);
+    if (boundary) {if (!fence) fence=boundary[1];else if (boundary[1][0]===fence[0] && boundary[1].length>=fence.length) fence=undefined;continue;}
+    if (fence) continue;
     const heading = line.match(/^(#{1,6})\s+(.+)/);
     if (heading) {
       if (sectionDepth === undefined || heading[1].length <= sectionDepth) sectionDepth = /security review|documentation handoff|required gates|common constraints/i.test(heading[2]) ? heading[1].length : undefined;
@@ -177,7 +180,7 @@ export class RecoverySplits {
     if (this.db.prepare('SELECT 1 FROM fleet_recovery_splits WHERE ticket=? OR (json_extract(plan,\'$.featureRoot\')=? AND scope=?)').get(ticket, plan.featureRoot, scope))
       throw new Error('This unchanged scope already has a recovery split');
     this.db.prepare("INSERT INTO fleet_recovery_splits VALUES (?,?,?,?,?,?,'preparing',?,?)")
-      .run(id, ticket, JSON.stringify(plan), scope, JSON.stringify(Object.fromEntries(affected.map(i => [`${i.url.match(/github\.com\/([^/]+\/[^/]+)\/issues\//)?.[1] ?? project}#${i.issueNumber}`, splitItemBasis(i)]))), '{}',JSON.stringify(affected.find(i => `${project}#${i.issueNumber}` === ticket)),JSON.stringify(owners));
+      .run(id, ticket, JSON.stringify(plan), scope, JSON.stringify(Object.fromEntries(affected.map(i => [`${i.url.match(/github\.com\/([^/]+\/[^/]+)\/issues\//)?.[1] ?? project}#${i.issueNumber}`, splitItemBasis(i)]))), '{}',JSON.stringify(affected.find(i => i.url === `https://github.com/${ticket.replace('#','/issues/')}`)),JSON.stringify(owners));
     return this.get(id)!;
   }
   child(id: string, key: string, ticket: string): void {
