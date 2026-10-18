@@ -36,7 +36,7 @@ function shutdownDeadline(seconds: unknown): number {
 }
 async function main(): Promise<void> {
   const [command, configPath, ...args] = process.argv.slice(2);
-  if (!configPath || !["handoff-verifier", "workflow", "control", "recovery-task", "claims", "manager", "status", "runner", "codex", "desired", "attention", "report-attention", "pause", "coordination", "recovery", "drain", "resume", "stop", "start", "desired-state", "drain-project", "resume-project", "free"].includes(command)) {
+  if (!configPath || !["machine-recovery", "handoff-verifier", "workflow", "control", "recovery-task", "claims", "manager", "status", "runner", "codex", "desired", "attention", "report-attention", "pause", "coordination", "recovery", "drain", "resume", "stop", "start", "desired-state", "drain-project", "resume-project", "free"].includes(command)) {
     throw new Error("Usage: fleet-bin.ts claims|manager|status|runner|codex|recovery|drain|resume|stop|start|desired-state|drain-project|resume-project|free CONFIG [claude|codex|local | PROJECT | --machine MACHINE|--all-machines [--project PROJECT] | TICKET GENERATION --confirmed-stopped]");
   }
   const config = JSON.parse(readFileSync(configPath, "utf8"));
@@ -90,6 +90,21 @@ async function main(): Promise<void> {
     }
     const claims = new JsonClient(config.claimsUrl,secret(config.claimsOperatorTokenEnv ?? config.claimsTokenEnv));
     console.log(JSON.stringify(await claims.call('/tasks/'+args[0],body)));
+    return;
+  }
+  if (command === 'machine-recovery') {
+    const action = args[0];
+    if (action === 'inspect-paths') {
+      if (args.length !== 2) throw new Error('Provide the saved local path list');
+      const paths: unknown = JSON.parse(readFileSync(args[1],'utf8'));
+      if (!Array.isArray(paths) || !paths.length || paths.some(p => typeof p !== 'string' || !p.startsWith('/'))) throw new Error('Invalid local path list');
+      const {processesUsingPath} = await import('./dispatch.js');
+      console.log(JSON.stringify({stopped:paths.every(p => processesUsingPath(p).length === 0)}));
+      return;
+    }
+    if (!['read','release','clear'].includes(action) || args.length !== (action === 'read' ? 1 : 2)) throw new Error('Usage: machine-recovery CONFIG read | release RECEIPT.json | clear DECISION.json');
+    const client = new JsonClient(config.claimsUrl,secret(config.claimsOperatorTokenEnv ?? config.claimsTokenEnv));
+    console.log(JSON.stringify(await client.call('/machine-recovery/'+action,action === 'read' ? {} : JSON.parse(readFileSync(args[1],'utf8')))));
     return;
   }
   if(command==='handoff-verifier') {

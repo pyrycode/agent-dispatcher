@@ -27,6 +27,7 @@ import {TestInvestigations} from './test-investigation.js';
 import {ApprovalStates, type ApprovalOutcome} from './approval-state.js';
 import {VerifierHandoffs, type VerifierHandoffRequest, type VerifierHandoff, type VerificationPin} from './verifier-handoff.js';
 import type {EvidenceStore} from './evidence-store.js';
+import {MachineRecoveries,validateMachineRecovery,type MachineRecoveryRequest,type MachineRecovery} from './machine-recovery.js';
 
 /** An operator choice, frozen into each new grant. Null restores local settings. */
 export interface RunnerPolicy { runner: AgentRunner | null; revision: number }
@@ -122,7 +123,7 @@ export interface StartRequest {
 }
 export interface Claim { ticket: string; machine: string; generation: string; created: number }
 export interface FleetRun extends StartRequest { generation: string; created: number; runnerPolicy?: RunnerPolicy }
-export interface FleetSnapshot { verifierHandoffs?: VerifierHandoff[]; workflowProjects?: string[]; claims: Claim[]; runs: FleetRun[]; runnerPolicy?: RunnerPolicy; idleRecoveryTickets?: string[]; priorityHighTickets?: string[]; releasedAssessmentClaims?: Claim[]; features?: {recoveryTasks:boolean; evidence?: boolean}; evidenceStore?: import("./evidence-store.js").EvidenceUsage; requiredRepairs?: Record<string,string[]>; codexPause?: CodexPauseState;
+export interface FleetSnapshot { machineRecoveries?: MachineRecovery[]; verifierHandoffs?: VerifierHandoff[]; workflowProjects?: string[]; claims: Claim[]; runs: FleetRun[]; runnerPolicy?: RunnerPolicy; idleRecoveryTickets?: string[]; priorityHighTickets?: string[]; releasedAssessmentClaims?: Claim[]; features?: {recoveryTasks:boolean; evidence?: boolean}; evidenceStore?: import("./evidence-store.js").EvidenceUsage; requiredRepairs?: Record<string,string[]>; codexPause?: CodexPauseState;
   /**
    * Open tickets of adopted projects waiting for review with nothing holding
    * them (see awaitsReview), whoever owns them. Present, possibly empty,
@@ -226,6 +227,7 @@ export class FleetStore {
   readonly flaky: FlakySightingLedger;
   readonly investigations: TestInvestigations;
   readonly approvals: ApprovalStates;
+  readonly machineRecoveries: MachineRecoveries;
   readonly verifierHandoffs: VerifierHandoffs;
   private readonly clock: () => number;
   constructor(path: string, private readonly limits: Readonly<Record<string, MachineLimits>>, options: FleetStoreOptions = {}) {
@@ -255,6 +257,7 @@ export class FleetStore {
       ) STRICT;
     `);
     this.workflow = new WorkflowStore(this.db);
+    this.machineRecoveries = new MachineRecoveries(this.db);
     this.recovery = new RecoveryLedger(this.db, Date.now, options);
     this.facts = new RecoveryFacts(this.db);
     this.approvals = new ApprovalStates(this.db,options.now ?? Date.now);
@@ -987,6 +990,7 @@ export class FleetStore {
         return previous.finished === null ? { ok: true, generation: String(previous.generation) } : { ok: false, reason: "finished" };
       }
     if (!req.verificationPin && this.activeVerifierHandoffs().some(h=>h.ticket===req.ticket)) return {ok:false,reason:'locked'};
+    if (this.machineRecoveries.blocked(req.machine,req.project)) return {ok:false,reason:'drained'};
     // The operator's central drain or stop holds new grants here even when
     // the computer's manager is older or has not fetched it yet. A retry of
     // a lost reply above still recovers its grant.
@@ -1261,6 +1265,53 @@ export class FleetStore {
     });
   }
 
+  clearMachineRecoveries(machine: string, project: string, ids: string[]): void {
+    this.transaction(() => this.machineRecoveries.clear(machine,project,ids,this.clock()));
+  }
+
+  /** The trusted source supervisor proves stoppage and retains its files before this call.
+   * No timeout, heartbeat or failed contact is accepted as process proof. */
+  recoverStoppedWorker(machine: string, input: MachineRecoveryRequest): MachineRecovery {
+    validateMachineRecovery(input);
+    if (input.machine !== machine) throw new Error('Recovery source mismatch');
+    return this.transaction(() => {
+      const replay = this.machineRecoveries.replay(input);
+      if (replay) return replay;
+      const run = this.snapshot().runs.find(r => r.id === input.runId);
+      if (!run || run.machine !== machine || run.session !== input.session || run.generation !== input.generation) throw new Error('Stopped run changed; inspect it again');
+      const roles = ['builder','developer','architect','refiner','po','verifier','code-review','qa','documentation'];
+      if (!roles.includes(run.role) || run.supportTaskId || run.verificationPin || !/#[1-9]\d*$/.test(run.ticket)) throw new Error('This reservation needs its existing specialised recovery');
+      const claim = this.snapshot().claims.find(c => c.ticket === run.ticket);
+      if (claim && (claim.machine !== machine || claim.generation !== input.generation)) throw new Error('Ticket ownership changed');
+      const controls = this.desired.document(machine).entries;
+      if (!controls.some(c => c.project === run.project && c.run === 'running') || this.desired.work(machine,run.project) !== 'taking') throw new Error('Source is deliberately stopped or drained, or its run policy is unknown');
+      if (!this.workflow.enabled(run.project) || this.workflow.preparing(run.project)) throw new Error('Workflow authority is unavailable or preparing');
+      const item = this.workflow.get(run.ticket);
+      const approval = this.approvals.get(run.ticket);
+      if (item.revision !== input.revision || item.state !== 'OPEN' || item.labels.includes('done:'+run.role) || item.status === 'Halted' ||
+          item.blockedBy.some(b => b.state === 'OPEN') || item.labels.some(l => /^(held:|pending-verdict:|pending-done:|error:)/.test(l) || l.startsWith('needs-human:') && l !== 'needs-human:sizing') ||
+          approval?.kind === 'rejected' && !approval.authorization || this.splits.pending(run.ticket) ||
+          this.activeVerifierHandoffs().some(h => h.ticket === run.ticket) ||
+          this.tasks.list(run.ticket).some(t => ['queued','running','publishing','attention'].includes(t.state))) throw new Error('Workflow changed or is held; recovery cannot override it');
+      const capable = Object.entries(this.machineCapabilities()).some(([target,report]) => target !== machine &&
+        this.clock() - report.updated <= CAPABILITY_REPORT_FRESH_MS && report.projects?.includes(run.project) &&
+        !missingCapabilities(this.requirementsOf(run.ticket),report.capabilities).length &&
+        !this.machineRecoveries.blocked(target,run.project) && this.desired.work(target,run.project) === 'taking' &&
+        this.desired.document(target).entries.some(c => c.project === run.project && c.run === 'running'));
+      if (!capable) throw new Error('No other configured computer is ready for this project and its requirements');
+      // Finish only this proven-stopped attempt. The source hold, workflow marker
+      // removal and release commit together. Admission chooses the replacement.
+      const record: MachineRecovery = {...input,ticket:run.ticket,project:run.project,role:run.role,created:this.clock()};
+      this.machineRecoveries.save(input,record);
+      this.finish(machine,run.session,run.id,false,false);
+      this.db.prepare('DELETE FROM fleet_claims WHERE ticket=? AND machine=? AND generation=?').run(run.ticket,machine,run.generation);
+      if (claim) this.db.prepare('INSERT OR IGNORE INTO fleet_assessment_releases VALUES(?,?,?,?)').run(run.ticket,machine,run.generation,this.clock());
+      this.workflow.change(run.ticket,{addLabels:['orchestrator:recovery-priority']},'stopped-worker-recovery',input.commandId);
+      this.workflow.comment(run.ticket,`The dispatcher on ${machine} and its child processes are confirmed stopped. Another capable computer may retry the interrupted ${run.role} stage through normal admission. Original working copies, commits, logs and captures remain retained on ${machine}. Recovery receipt: ${input.commandId}. Retention digest: ${input.retainedDigest}. The replacement uses the published branch and runs fresh checks. The source project is held until an operator reconciles retained work and clears the recovery hold.`,input.commandId+':evidence');
+      return record;
+    });
+  }
+
   // Operator recovery only. The caller must disable/stop the old worker first.
   // Matching the generation prevents an old confirmation from releasing a new owner.
   free(ticket: string, generation: string, stopped: boolean): void {
@@ -1332,7 +1383,9 @@ export class FleetStore {
     const claims = this.db.prepare("SELECT * FROM fleet_claims ORDER BY created,ticket").all() as unknown as Claim[];
     const unreportedOwners = claims.filter(c => ticketRequirements[c.ticket] && !Object.hasOwn(machineCapabilities, c.machine))
       .map(c => ({ ticket: c.ticket, machine: c.machine, requires: ticketRequirements[c.ticket] }));
+    const machineRecoveries = this.machineRecoveries.list();
     return {
+      ...(machineRecoveries.length ? {machineRecoveries} : {}),
       ...(verifierHandoffs.length ? { verifierHandoffs } : {}),
       ...(codexPause ? { codexPause } : {}),
       ...(codexSpacing ? { codexSpacing } : {}),

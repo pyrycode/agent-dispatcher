@@ -174,6 +174,9 @@ class Supervisor:
             state = self.adapter.status()
         except Exception:
             return 'unknown'
+        if any(r.get('machine') == state.get('machine') and r.get('project') == project and r.get('cleared') is None
+               for r in state.get('machineRecoveries', [])):
+            return 'stopped'
         desired = state.get('desiredState') if isinstance(state, dict) else None
         if not isinstance(desired, dict):
             return None

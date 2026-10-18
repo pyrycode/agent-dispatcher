@@ -93,6 +93,16 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
       if (req.method === "GET" && req.url === "/github/status" && isAdmin) return send(200, github?.status() ?? { enabled: false });
       if (req.method !== "POST") return send(404, { error: "Unknown operation" });
       const body = await readJson(req, req.url?.startsWith("/workflow/") ? 32*1024*1024 : req.url?.startsWith("/tasks/") ? 8*1024*1024 : 1024*1024);
+      if (req.url === '/machine-recovery/release') {
+        if (!machine && !isAdmin) return send(403,{error:'Source supervisor credential required'});
+        return send(200,store.recoverStoppedWorker(machine ?? body.machine,body));
+      }
+      if (req.url === '/machine-recovery/clear') {
+        if (!isAdmin) return send(403,{error:'Operator credential required'});
+        store.clearMachineRecoveries(body.machine,body.project,body.ids);
+        return send(200,{ok:true});
+      }
+      if (req.url === '/machine-recovery/read') return send(200,store.machineRecoveries.list());
       // Shared run evidence (evidence-store.ts). Any fleet credential reads;
       // only the computer that ran a run uploads its bundle. A service without
       // the store answers like one that predates it.

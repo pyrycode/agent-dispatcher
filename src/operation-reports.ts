@@ -4,7 +4,7 @@ import { scrubCredentials } from './agent-runtime.js';
 export const OPERATION_PHASES: readonly string[] = ['current','stopped','drain-requested','draining','start-requested','verifying','complete','attention','preflight-failed','changed-before-drain','waiting-for-native-task','signal-failed'];
 
 const AUTOMATIC_CHANGES = ['health-latch-cleared','operation-retired','native-task-unrecoverable','native-task-skipped','native-task-interrupted','native-task-deferred',
-  'native-task-finalized','watchdog-stalled','watchdog-starvation','watchdog-finalize-refused'];
+  'native-task-finalized','machine-worker-recovered','watchdog-stalled','watchdog-starvation','watchdog-finalize-refused'];
 
 /** Every kind scripts/fleet-watchdog.py reports. */
 export const WATCHDOG_KINDS: readonly string[] = ['stalled','starvation','finalize-refused','finalized','released','error'];
