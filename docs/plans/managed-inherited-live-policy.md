@@ -18,12 +18,21 @@ or permission boundary changes. Only newly admitted plans use the correction.
 
 Before implementation, exercise `runRealClaudeGateSuite` inside actual managed
 admission and inspect the plan frozen by the workflow authority for unset,
-enabled and disabled settings. Prove through the same frozen plan that tracked
+enabled and disabled settings. Prove through the same frozen plan that declared
 unrelated failures can follow the existing policy while a failed mandatory named
-test still cannot be accepted. Retain RED then GREEN results, run the relevant
+test still cannot be accepted. Authoritative OPEN-tracker validation remains a
+separate, unchanged FleetStore guard. Retain RED then GREEN results, run the relevant
 existing gate/stage tests and TypeScript checking. Independent review precedes
 publication; complete dispatcher checks and rollout remain separately owned.
 
 This reuses the existing boolean policy, never ticket text as authorisation.
 Required-test, evidence, candidate, ownership and original-failure guards remain.
 No credentials or private test contents enter the regression or diagnostics.
+
+## Verification record
+
+The real managed endpoint regression first failed for unset and `on`; the other
+three settings passed. After the one-expression correction all five passed
+(six test events including their parent, zero failed or skipped). Existing gate
+executor checks passed 56/56 and stage/inherited-ticket checks passed 65/65;
+TypeScript checking passed. These synthetic checks are not live product proof.

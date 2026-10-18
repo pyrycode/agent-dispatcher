@@ -122,6 +122,7 @@ import { formatGateEvidenceComment, gateRunFloor, gateRunRequiredTests } from ".
 import { decideGateVerdict } from "./pipeline-decisions.js";
 import { flakyMarker } from "./flaky-tickets.js";
 import { inheritedMarker } from "./inherited-tickets.js";
+import { decideStageResult } from "./stage-results.js";
 import { verifierInheritedAdvanceEnabled } from "./verifier-gate-baseline.js";
 import type { FlakySightingStore } from "./flaky-sightings.js";
 import { FINAL_MERGE_HANDOFF_MARKER, MERGE_RESOLUTION_NOTE_MARKER, mergeResolutionComment } from "./merge-handoff.js";
@@ -14406,3 +14407,61 @@ for (const decision of ["FAIL", "PASS"] as const) {
     }
   });
 }
+
+// Exercise the production managed-run boundary and its real workflow endpoint;
+// these synthetic reports are policy regressions, never live acceptance proof.
+test("managed live stage freezes canonical inherited defaults without waiving named failures", async t => {
+  const key = "PYRY_REAL_CLAUDE_GATE_INHERITED_ADVANCE", previous = process.env[key];
+  t.after(() => { if (previous === undefined) delete process.env[key]; else process.env[key] = previous; });
+  for (const [setting, enabled] of [[undefined, true], ["1", true], ["on", true], ["0", false], ["off", false]] as const) {
+    await t.test(setting ?? "unset", async t => {
+      if (setting === undefined) delete process.env[key]; else process.env[key] = setting;
+      const project = "org/core", ticket = project + "#1382", candidate = "a".repeat(40);
+      const store = new FleetStore(":memory:", { box: { heavyLimit: 1, combinedLimit: 2 } });
+      store.workflow.import({ project, projectId: "P", statusFieldId: "S", options: { Backlog: "b", Inbox: "i", "In Development": "d", "In Code Review": "v", "In Documentation": "doc", Done: "done" } }, [{
+        id: "item", issueId: "issue", issueNumber: 1382, title: "Inherited repair", body: inheritedMarker("p.TestCapture"),
+        url: "https://github.com/org/core/issues/1382", status: "Inbox", state: "OPEN", revision: 1, position: 1,
+        labels: ["needs-real-claude"], blockedBy: [], parentNumber: null, grandparentNumber: null,
+      }]);
+      const claims = await serveFleet(store, { box: "fixture-machine" }, "fixture-admin", 0);
+      const claimsAddress = claims.address(); assert.ok(claimsAddress && typeof claimsAddress !== "string");
+      const manager = new MachineManager({ machine: "box", heavyLimit: 1, combinedLimit: 2, projects: [project] }, new FleetClient(`http://127.0.0.1:${claimsAddress.port}`, "fixture-machine"));
+      const server = await serveManager(manager, { [project]: "fixture-project" }, "fixture-operator", 0);
+      const address = server.address(); assert.ok(address && typeof address !== "string");
+      const directory = mkdtempSync(join(tmpdir(), "managed-live-policy-"));
+      const managed = new ManagedDispatch(project, { PYRY_MANAGER_URL: `http://127.0.0.1:${address.port}`, PYRY_MANAGER_TOKEN: "fixture-project",
+        PYRY_SHARED_GITHUB: "1", GH_CONFIG_DIR: join(directory, "empty-gh"), PATH: process.env.PATH });
+      t.after(async () => {
+        await managed.stop(); await new Promise<void>(r => server.close(() => r())); await new Promise<void>(r => claims.close(() => r()));
+        store.close(); rmSync(directory, { recursive: true, force: true });
+      });
+      await managed.start(); managed.beginCycle();
+      const pending = managed.offer(1382, "real-claude-gate", "light");
+      await managed.endCycle();
+      for (let i = 0; i < 40 && !managed.ready(pending); i++) { await manager.tick(); await managed.sync(); if (!managed.ready(pending)) await new Promise(r => setTimeout(r, 50)); }
+      assert.equal(managed.ready(pending), true);
+      await managed.run(pending, async () => {
+        const harness = makeGateDeps({ gitOut: cmd => cmd.startsWith("gh pr list") ? "## Summary\nNo PR test declaration" : cmd === "git rev-parse origin/feature/1382" ? candidate : GATE_SHAS[cmd] ?? "" });
+        const report = await runRealClaudeGateSuite({ issueNumber: 1382, ticketBody: inheritedMarker("p.TestCapture"), command: "go test -json ./...",
+          format: "go-json", timeoutMs: 1000, minExecuted: 1, repoRoot: "/tmp/fake-repo", defaultBranch: "main", logsDir: "/tmp/fake-logs", deps: harness.deps });
+        assert.equal(report.runError, null);
+        const frozen = store.stages.records(ticket)[0];
+        assert.ok(frozen, "production beginManagedStage must freeze a real authoritative record");
+        assert.equal(frozen.plan.inheritedAdvance, enabled);
+        assert.deepEqual(frozen.plan.requiredTests, ["p.TestCapture"]);
+        // This is the declared policy decision; FleetStore separately validates
+        // that accepted inherited failures have current authoritative OPEN trackers.
+        for (const requiredFails of [false, true]) {
+          const failedNames = ["p.TestInherited", ...(requiredFails ? ["p.TestCapture"] : [])];
+          const retained = { ...report, exitCode: 1, rerunFailures: failedNames, baselineFailures: failedNames,
+            tally: { ...report.tally!, completeParse: true, executed: 2, passed: requiredFails ? 0 : 1, failed: failedNames.length,
+              passedNames: requiredFails ? [] : ["p.TestCapture"], failedNames, packageFailed: true, packageFailures: ["p"] } };
+          const acceptance = decideStageResult(frozen.plan, { version: 1, candidate, files: [], checks: [{ name: "live-acceptance", outcome: "passed",
+            evidence: JSON.stringify({ verdict: "inherited-pass", report: retained, acceptedInherited: failedNames.map(name => ({ name, issue: 999 })) }) }] }, false);
+          assert.equal(acceptance.state, enabled && !requiredFails ? "accepted" : "waiting", "only declared unrelated failure evidence can use the frozen inherited policy");
+        }
+        return false;
+      });
+    });
+  }
+});
