@@ -311,6 +311,22 @@ class StorageSupervisor:
                     continue
                 if not re.fullmatch(r'[a-f0-9]{40}', str(record.get('HEAD', ''))):
                     continue
+                item = closed[match[1]]
+                reason = None
+                if item.get('archived'):
+                    reason = 'Archived workflow items remain retained'
+                elif item.get('recoverySplit') or (item.get('subIssues') or {}).get('total', 0) > 0 or any(
+                        child.get('parentNumber') == item['issueNumber'] for child in workflow['items']):
+                    reason = 'Split parents remain retained; their closure does not complete the feature'
+                elif any(re.match(r'^(needs-human:|health-hold:|held:|error:|wip:|needs-rework:|pending-done:|pending-verdict:|orchestrator:escalated)', label)
+                         or 'permission_denied' in label for label in item.get('labels', [])):
+                    reason = 'Workflow holds and failed work remain retained'
+                elif (item.get('approvalState') or {}).get('kind') == 'rejected' and not item['approvalState'].get('authorization'):
+                    reason = 'Unresolved approval holds remain retained'
+                if reason:
+                    self.inventory_holds.append({'kind': 'closed-copy-storage', 'phase': 'held',
+                                                 'ticket': project + '#' + match[1], 'reason': reason})
+                    continue
                 candidates.append({'repository': str(target), 'path': str(path), 'head': record['HEAD'],
                                    'ticket': project + '#' + match[1]})
         return sorted(candidates, key=lambda value: value['path'])
@@ -325,7 +341,7 @@ class StorageSupervisor:
         cursor = progress.get('cursor', '')
         old = [item for item in old if item['path'] > cursor] + [item for item in old if item['path'] <= cursor]
         selected = (fresh + old)[:self.options.get('batch', 8)]
-        reports = self.inventory_holds[:1] if getattr(self, 'inventory_holds', None) else []
+        reports = self.inventory_holds[:20] if getattr(self, 'inventory_holds', None) else []
         for item in selected:
             journal = saved = None
             try:

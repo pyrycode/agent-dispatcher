@@ -154,6 +154,30 @@ class Tests(unittest.TestCase):
         self.supervisor.workflow += [{'issueNumber': number, 'state': 'CLOSED', 'status': 'Done'} for number in (456, 789)]
         self.assertEqual([item['ticket'] for item in self.supervisor.candidates()], ['org/app#123'])
 
+    def test_closed_parent_found_through_authoritative_named_child_is_held_without_a_lease(self):
+        repo, copy, graph, evidence = self.repository()
+        self.supervisor.workflow.append({'issueNumber': 124, 'parentNumber': 123, 'state': 'OPEN', 'status': 'Todo'})
+        reports = self.supervisor.run(apply=True, cache=False)
+        self.assertEqual(reports[0]['phase'], 'held')
+        self.assertIn('Split parents', reports[0]['reason'])
+        self.assertFalse(any(call[0] == 'acquire' for call in self.supervisor.calls))
+        self.assertFalse(list(self.supervisor.directory.glob('*.lease.json')))
+        self.assertTrue(graph.exists())
+        self.assertTrue(evidence.exists())
+
+    def test_explicit_closed_parent_workflow_hold_and_rejected_approval_create_no_lease_journals(self):
+        repo, copy, graph, evidence = self.repository()
+        for metadata in [{'subIssues': {'total': 1}}, {'recoverySplit': {'id': 'retained'}},
+                         {'labels': ['needs-human:operator-review']}, {'labels': ['error:failed-test']},
+                         {'approvalState': {'kind': 'rejected'}}]:
+            with self.subTest(metadata=metadata):
+                self.supervisor.workflow = [{'issueNumber': 123, 'state': 'CLOSED', 'status': 'Done', **metadata}]
+                result = self.supervisor.run(apply=True, cache=False)
+                self.assertEqual(result[0]['phase'], 'held')
+                self.assertTrue(graph.exists())
+        self.assertFalse(any(call[0] == 'acquire' for call in self.supervisor.calls))
+        self.assertFalse(list(self.supervisor.directory.glob('*.lease.json')))
+
     def test_exact_lease_scope_and_current_head_are_required(self):
         repo, copy, graph, evidence = self.repository()
         original = self.supervisor.verify
