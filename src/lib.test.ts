@@ -332,6 +332,12 @@ describe("isPipelineLabelForAgent", () => {
 });
 
 describe("shouldSkipDispatch", () => {
+  test("capture publication and protected custody holds block every normal stage", () => {
+    for (const label of ["held:unreviewed-capture", "held:operator"]) {
+      for (const agent of AGENTS) assert.equal(shouldSkipDispatch([label], agent.name), true, `${label}: ${agent.name}`);
+    }
+  });
+
   test("skips when ANY of the four prefixes is set for the same agent", () => {
     for (const prefix of PIPELINE_LABEL_PREFIXES) {
       assert.equal(

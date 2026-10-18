@@ -516,6 +516,9 @@ async function legacyWorktreeCases(t: import('node:test').TestContext, root: str
   await t.test('a removal that does not complete says so instead of claiming the tree was kept', async () => {
     const f = await fixture();
     const ctx = f.builder();
+    // This case injects a removal failure, not native process inventory. Keep
+    // unrelated host lsof rows from preventing the intended fault injection.
+    ctx.deps.processesUsingPath = () => [];
     const execute = ctx.deps.execSync;
     ctx.deps.execSync = ((cmd: string, o: any) => {
       if (cmd.startsWith('git worktree remove')) throw new Error('simulated timeout');
