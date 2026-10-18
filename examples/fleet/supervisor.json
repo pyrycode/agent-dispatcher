@@ -1,5 +1,9 @@
 {
   "platform": "mac",
+  "diskAdmission": {
+    "path": "/Users/operator",
+    "minFreeBytes": 21474836480
+  },
   "operator": "/Users/operator/.local/share/pyry-fleet/operator.sh",
   "python": "/usr/bin/python3",
   "stateDirectory": "/Users/operator/.local/share/pyry-fleet/supervisor",

@@ -1,5 +1,9 @@
 {
   "machine": "macbook",
+  "diskAdmission": {
+    "path": "/Users/operator",
+    "minFreeBytes": 21474836480
+  },
   "heavyLimit": 1,
   "claimsUrl": "http://127.0.0.1:7430",
   "claimsTokenEnv": "FLEET_MACBOOK_TOKEN",
