@@ -36,10 +36,17 @@ function shutdownDeadline(seconds: unknown): number {
 }
 async function main(): Promise<void> {
   const [command, configPath, ...args] = process.argv.slice(2);
-  if (!configPath || !["handoff-verifier", "workflow", "control", "recovery-task", "claims", "manager", "status", "runner", "codex", "desired", "attention", "report-attention", "pause", "coordination", "recovery", "drain", "resume", "stop", "start", "desired-state", "drain-project", "resume-project", "free"].includes(command)) {
+  if (!configPath || !["storage", "handoff-verifier", "workflow", "control", "recovery-task", "claims", "manager", "status", "runner", "codex", "desired", "attention", "report-attention", "pause", "coordination", "recovery", "drain", "resume", "stop", "start", "desired-state", "drain-project", "resume-project", "free"].includes(command)) {
     throw new Error("Usage: fleet-bin.ts claims|manager|status|runner|codex|recovery|drain|resume|stop|start|desired-state|drain-project|resume-project|free CONFIG [claude|codex|local | PROJECT | --machine MACHINE|--all-machines [--project PROJECT] | TICKET GENERATION --confirmed-stopped]");
   }
   const config = JSON.parse(readFileSync(configPath, "utf8"));
+  if(command==='storage') {
+    const [action,file]=args;
+    if(!['list','acquire','verify','finish','cancel'].includes(action)||action!=='list'&&!file)throw new Error('storage list|acquire|verify|finish|cancel [SAVED_JSON_FILE]');
+    const claims=new JsonClient(config.claimsUrl,secret(config.claimsOperatorTokenEnv??config.claimsTokenEnv));
+    const input=action==='list'?{}:JSON.parse(readFileSync(file,'utf8'));
+    console.log(JSON.stringify(await claims.call('/storage/'+action,input)));return;
+  }
   if(command==='workflow') {
     const [action,project,file,boardNumber]=args;
     if(!['read','export','import','change','file','prepare','activate','cancel-preparation','approval-authorize','recovery-split'].includes(action)||!project)throw new Error('workflow read|export|import|change|file|prepare|activate|cancel-preparation|approval-authorize|recovery-split PROJECT [JSON_FILE]');

@@ -46,6 +46,17 @@ function automaticChanges(value: unknown) {
     .slice(-20).map((h: any) => ({at:Number(h.at),kind:String(h.kind),subject:scrubCredentials(h.subject.slice(0,200)),reason:scrubCredentials(h.reason.slice(0,1000))}));
 }
 
+/** Storage refuses uncertainty locally; reporting it must not hide fleet controls. */
+function storageItems(value:unknown) {
+  if(!Array.isArray(value))return [];
+  return value.filter(v=>v&&typeof v==='object').slice(-20).map(v=>{
+    const item:Record<string,string|number>={};
+    for(const key of ['phase','state','subject','ticket','reason'])if(typeof v[key]==='string')item[key]=scrubCredentials(v[key].slice(0,key==='reason'?1000:200));
+    for(const key of ['reclaimedBytes','plannedBytes'])if(Number.isSafeInteger(v[key])&&v[key]>=0)item[key]=v[key];
+    return item;
+  });
+}
+
 export class OperationReports {
   constructor(private db: DatabaseSync, private machines: string[], private now = Date.now) {
     db.exec('CREATE TABLE IF NOT EXISTS fleet_operation_reports (machine TEXT PRIMARY KEY, received INTEGER NOT NULL, report TEXT NOT NULL) STRICT;');
@@ -62,7 +73,8 @@ export class OperationReports {
     const housekeeping = automaticChanges(value.housekeeping);
     const watchdog = watchdogItems(value.watchdog);
     const localTasks = localTaskIds(value.localTasks);
-    const report = {operations,...(localTasks ? {localTasks} : {}),...(housekeeping.length ? {housekeeping} : {}),...(watchdog.length ? {watchdog} : {}),...(value.service === 'attention' ? {service:'attention',reason:scrubCredentials(String(value.reason ?? 'Control service unavailable').slice(0,1000))} : {})};
+    const storageMaintenance=storageItems(value.storageMaintenance);
+    const report = {operations,...(localTasks ? {localTasks} : {}),...(housekeeping.length ? {housekeeping} : {}),...(watchdog.length ? {watchdog} : {}),...(storageMaintenance.length?{storageMaintenance}:{}),...(value.service === 'attention' ? {service:'attention',reason:scrubCredentials(String(value.reason ?? 'Control service unavailable').slice(0,1000))} : {})};
     this.db.prepare('INSERT INTO fleet_operation_reports VALUES (?,?,?) ON CONFLICT(machine) DO UPDATE SET received=excluded.received,report=excluded.report').run(machine,this.now(),JSON.stringify(report));
   }
   /** The receipt lists are for the orphaned task watch only, so the operator report leaves them out. */
