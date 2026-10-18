@@ -5988,6 +5988,24 @@ export async function handlePostRun(
     postLabels = [...new Set([...postLabels, ...appliedLabels])];
   }
 
+  // Contracted verifiers route FAIL centrally before legacy label checks.
+  // The authority also keeps PASS blocked when required checks are incomplete.
+  if(item.issueNumber>0 && !saferSalvaged && agent.name==="verifier" && client.completeStage) {
+    if(streamResult.isError || streamResult.hadPermissionDenial)throw new Error("Stage acceptance refused after failed or denied execution");
+    if(!ctx.stagePlan || !ctx.verdictHandoffPath)throw new Error("Managed verifier is missing its frozen requirements");
+    const parsed=parseVerdictHandoff(String(ctx.deps.readFileSync(ctx.verdictHandoffPath,"utf-8")));
+    if(!parsed.ok)throw new Error(`Incomplete structured verifier result: ${parsed.reason}`);
+    const prJson=execSync(`gh pr list --head ${branchName} --state open --json number,isDraft`,{cwd:agentCwd,stdio:"pipe"}).toString();
+    const pr=pickVerdictPr(prJson);
+    if(pr===null)throw new Error("Structured verifier result has no open pull request");
+    const result=await client.completeStage(item.issueNumber,{version:1,candidate:ctx.stagePlan.candidate,checks:ctx.stageChecks??[],files:[],verdict:parsed.handoff,pullRequest:pr});
+    ctx.deps.writeLog(logFile,"STAGE_RESULT",JSON.stringify(result.acceptance));
+    client.clearItemsCache();
+    if(result.acceptance?.state==="waiting")return {ok:false};
+    recordLastVerdict(ctx);
+    return {ok:true};
+  }
+
   if (ctx.failedPreSpawnGate && item.issueNumber > 0 && !saferSalvaged) {
     // The agent may already have applied its ready label. Remove it even
     // when the label read failed; failure to remove must stop this dispatch.
@@ -6110,22 +6128,6 @@ export async function handlePostRun(
       }
       return { ok: false };
     }
-  }
-
-  if(item.issueNumber>0 && !saferSalvaged && agent.name==="verifier" && client.completeStage) {
-    if(streamResult.isError || streamResult.hadPermissionDenial)throw new Error("Stage acceptance refused after failed or denied execution");
-    if(!ctx.stagePlan || !ctx.verdictHandoffPath)throw new Error("Managed verifier is missing its frozen requirements");
-    const parsed=parseVerdictHandoff(String(ctx.deps.readFileSync(ctx.verdictHandoffPath,"utf-8")));
-    if(!parsed.ok)throw new Error(`Incomplete structured verifier result: ${parsed.reason}`);
-    const prJson=execSync(`gh pr list --head ${branchName} --state open --json number,isDraft`,{cwd:agentCwd,stdio:"pipe"}).toString();
-    const pr=pickVerdictPr(prJson);
-    if(pr===null)throw new Error("Structured verifier result has no open pull request");
-    const result=await client.completeStage(item.issueNumber,{version:1,candidate:ctx.stagePlan.candidate,checks:ctx.stageChecks??[],files:[],verdict:parsed.handoff,pullRequest:pr});
-    ctx.deps.writeLog(logFile,"STAGE_RESULT",JSON.stringify(result.acceptance));
-    client.clearItemsCache();
-    if(result.acceptance?.state==="waiting")return {ok:false};
-    recordLastVerdict(ctx);
-    return {ok:true};
   }
 
   // Verdict guard: an agent that exists to rule on a pull request must have
