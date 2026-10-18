@@ -17,7 +17,9 @@ archives and native objects. A generated location containing an unexpected file
 is retained for inspection. The whole build directory is never a cleanup target.
 Failure reports, transcripts, logcat, test results, configuration and unknown
 files remain. Dirty source, hidden index flags, submodules, unfinished Git
-operations, symlinks and hardlinks prevent the affected cleanup.
+operations and symlinks prevent the affected cleanup. Removing a generated
+file's hardlink leaves its other links and their bytes intact. Cache budgeting
+retains hardlinked entries altogether.
 
 The central workflow must say both closed and Done. Any ticket hold, failed
 stage, pending publication, affected worker or unfinished support task prevents
