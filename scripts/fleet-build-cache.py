@@ -349,8 +349,8 @@ def manage_cache(config, guard, apply=False, *, run_command=None, process_invent
             if after['retainedFingerprint'] != before['retainedFingerprint']:
                 raise RuntimeError('Retained cache evidence changed; preserve the storage lease for inspection')
             receipt['budgetMet'] = after['compiledBytes'] <= config['maxBytes']
-            receipt.update(phase='complete' if result['returncode'] == 0 and receipt['budgetMet'] else 'failed', releaseSafe=True)
             receipt['reserveMet'] = after['freeBytes'] >= config['reserveBytes']
+            receipt.update(phase='complete' if result['returncode'] == 0 and receipt['budgetMet'] and receipt['reserveMet'] else 'failed', releaseSafe=True)
         _write(path, receipt)
     except Exception as error:
         receipt.update(phase='uncertain' if launched else 'refused', reason=f'{type(error).__name__}: {error}', releaseSafe=False)

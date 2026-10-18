@@ -255,6 +255,17 @@ class CacheTests(unittest.TestCase):
         self.assertTrue(corrupt.exists())
         self.assertTrue(payload.exists())
 
+    def test_unmet_free_space_reserve_is_not_reported_complete(self):
+        self.config['reserveBytes'] = 100
+        usage = type('Usage', (), {'free': 0})()
+        result = m.manage_cache(self.config, lambda: self.proof, apply=True,
+                                process_inventory=lambda: [], run_command=self.run_clean,
+                                disk_usage=lambda path: usage)
+        self.assertEqual(result['phase'], 'failed')
+        self.assertTrue(result['budgetMet'])
+        self.assertFalse(result['reserveMet'])
+        self.assertTrue(result['releaseSafe'])
+
 
 if __name__ == '__main__':
     unittest.main()
