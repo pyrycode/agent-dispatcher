@@ -5,13 +5,16 @@ configured byte budget is exceeded or free space falls below a configured
 reserve. This is periodic space management. It does not clear the cache after
 each ticket.
 
-Linux uses the supported `go clean -cache` command through an inherited directory
-descriptor. macOS cannot traverse a directory through `/dev/fd`. It trims the
-oldest verified ordinary cache entries through held directory descriptors until
-the budget and free-space reserve are met. It retains executable output
-directories and hardlinked artifacts. The next build may take longer because
-removed artifacts need rebuilding. Neither backend invokes `-modcache`,
-`-fuzzcache` or package cleanup.
+Linux and macOS use the same descriptor-relative trimming code. It removes
+only the oldest individually verified ordinary cache files until the budget and
+free-space reserve are met. It never runs `go clean` or recursively removes a
+cache bucket. A failure capture appearing after inspection therefore remains.
+
+Each data file must match the SHA-256 named in its filename. Action records must
+match Go's versioned format and their own action identity. Corrupt or unknown
+records, executable output directories and hardlinked artifacts remain. The
+next build may take longer because removed products need rebuilding. Source,
+module downloads and fuzz inputs are outside this cleanup.
 
 ## Exclusive authority
 
@@ -21,7 +24,7 @@ inspects a saved configuration.
 
 The supervisor must hold its durable machine storage lease and the existing
 shared native test-admission lock throughout the call. That lease blocks every
-new local admission. It has no expiry while a destructive command may run.
+new local admission. It has no expiry while cleanup may be changing cache files.
 An idle observation alone is insufficient.
 
 The guard callback returns these checked fields:
@@ -36,7 +39,7 @@ The guard callback returns these checked fields:
 
 Missing process records, active Go tools, running cached executables, an active
 worker or uncertain native descendants prevent cleanup. Old receipts with no
-confirmed drainage do not establish safety. The manager checks the guard,
+confirmed idle custody do not establish safety. The manager checks the guard,
 process inventory and cache inventory again immediately before execution.
 
 ## Configuration and receipts
@@ -46,40 +49,33 @@ All limits are explicit. There are no built-in byte budgets.
 | Field | Meaning |
 | --- | --- |
 | `cache` | Canonical absolute path to the approved Go build cache |
-| `go` | Absolute path to the approved Go executable |
 | `maxBytes` | Positive maximum for compiled cache bytes |
 | `reserveBytes` | Nonnegative minimum free bytes on that filesystem |
-| `timeoutSeconds` | Positive timeout passed to the durable command runner |
+| `timeoutSeconds` | Positive maximum duration of the synchronous trim |
 | `receipt` | Absolute receipt file outside the cache, required for apply |
 
 `manage_cache` receives the configuration, guard callback and `apply` flag.
-Its `run_command` callback receives the fixed argument list plus `cwd`, `env`,
-`timeout`, `journal` and `pass_fds`. The journal path is the receipt path followed by
-`.command.json`.
+It has no command-runner callback. No external cleaner or child process runs.
 
 The manager opens the inspected cache directory and checks its device and inode.
-The Linux runner inherits `pass_fds` through its launch barrier and into Go.
-Go receives the anchored descriptor path as `GOCACHE`. The macOS backend opens
-buckets relative to that same held root. It checks each ordinary file's inode
-and metadata before unlinking by its bucket descriptor. Output content must
-match its named SHA-256. Action records must match Go's versioned index format
-and named action hash. A later root rename or symlink replacement therefore
-cannot redirect deletion into another directory.
+A local directory lock prevents concurrent cache managers. Both platforms open
+buckets relative to the same held root. Each ordinary file's identity is checked
+before and after verifying its content. Deletion names only that file through
+its held bucket descriptor. A root rename or symlink replacement cannot redirect
+deletion into another directory. New files are never swept up by a recursive
+removal.
 
-The runner must save the child's process identity before permitting execution.
-It must reuse the existing custody machinery after a timeout or interrupted
-supervisor. It returns a numeric `returncode` and `custody: drained` only after
-all its descendants have exited. Its saved journal must prevent an uncertain
-command from being launched again.
-
-The manager saves a receipt before calling the runner. An exception or missing
-drainage produces an `uncertain` receipt with `releaseSafe: false`. An unfinished
-receipt blocks another apply at that path. The manager never releases a lease.
-The supervisor must reconcile the original command and recheck the lease before
-admitting any more work.
+The manager saves a `cleaning` receipt before changing files. Fresh authority,
+process checks and the configured duration bound are checked during a long trim.
+An exception or interruption produces an `uncertain` receipt with
+`releaseSafe: false`. An unfinished receipt blocks another apply at that path.
+The manager never releases a lease. The supervisor must verify that the original
+cleanup process is stopped and reassess retained custody before releasing the
+lease or allowing another attempt. A process restart never treats the old
+receipt as permission to repeat deletion.
 
 Receipts contain the observed cache bytes, free space, configured limits,
-trigger, fixed command and retained-file inventory fingerprints. `budgetMet`
+trigger, synchronous operation and retained-file inventory fingerprints. `budgetMet`
 and `reserveMet` remain separate. Preserved evidence can occupy space that this
 manager is not authorised to reclaim.
 
@@ -89,8 +85,7 @@ The manager preserves the fuzz corpus, source trees, module downloads and
 retained failed evidence. It recognises only Go's hexadecimal build-cache
 buckets. Unknown files or symlinks inside those buckets prevent cleanup.
 Cached executables use their own single-file output directories and count as
-active users while running. A legacy `log.txt` also prevents cleanup because the
-supported Go command would remove it.
+active users while running. A legacy `log.txt` remains as evidence and does not become a deletion target.
 
 The implementation was checked against the installed Go 1.26.2 source:
 
@@ -103,6 +98,7 @@ The implementation was checked against the installed Go 1.26.2 source:
 - `cmd/go/internal/cache/default.go` writes the build-cache README that the
   manager checks before accepting a configured directory.
 
-The focused tests use temporary caches. They include the installed Go cleaner,
-a real cached process, interrupted command receipts, changed cache inventories,
-symlinks and preservation of failed fuzz inputs and source files.
+The focused tests use temporary caches on both operating systems. They include
+late failure evidence inside a cache bucket, corrupt hash-named data, invalid
+action records, a real cached process, actual partial deletion interruption,
+restart receipts, changed inventories, symlinks and preserved fuzz inputs.

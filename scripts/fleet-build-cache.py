@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Budget Go's disposable build cache only under a supervisor's exclusive lease.
 
-There is no destructive CLI. The supervisor provides fresh authority and the
-existing durable command runner. This module never releases a storage lease.
+There is no destructive CLI. The supervisor provides fresh authority and holds
+its sticky lease while verified leaves are trimmed. This module never releases it.
 """
 import argparse
+import fcntl
 import hashlib
 import json
 import math
@@ -14,7 +15,6 @@ import re
 import shutil
 import stat
 import subprocess
-import sys
 import tempfile
 import time
 import uuid
@@ -58,8 +58,6 @@ def _config(value, apply):
     config['cache'] = _canonical(config['cache'])
     if config['cache'] == Path(config['cache'].anchor):
         raise ValueError('A filesystem root is not a build cache')
-    if not Path(config['go']).is_absolute():
-        raise ValueError('The approved Go executable must be absolute')
     for name, minimum in [('maxBytes', 1), ('reserveBytes', 0)]:
         if type(config.get(name)) is not int or config[name] < minimum:
             raise ValueError(name + ' must be explicitly configured in bytes')
@@ -95,10 +93,6 @@ def inspect_cache(cache, disk_usage=shutil.disk_usage):
     readme = cache / 'README'
     if not readme.is_file() or readme.is_symlink() or not readme.read_text().startswith(CACHE_README):
         raise ValueError('Configured directory has no Go build-cache identity')
-    # go clean -cache also removes this legacy access log. Its contents are not
-    # disposable build artifacts that this manager can classify with certainty.
-    if (cache / 'log.txt').exists() or (cache / 'log.txt').is_symlink():
-        raise ValueError('Legacy cache log is retained for separate evidence assessment')
     compiled = 0
     files = 0
     executables = []
@@ -190,12 +184,15 @@ def _write(path, receipt):
 
 
 def _trim_anchored(cache, cache_fd, config, before, guard, proof, inventory, disk_usage):
-    """macOS has no traversable directory-fd path for Go. Unlink typed entries by fd."""
+    """Both platforms unlink only content-verified leaves through held directory fds."""
     candidates = []
     preserved = []
     last_check = 0
+    deadline = time.monotonic() + config['timeoutSeconds']
     def pulse(force=False):
         nonlocal last_check
+        if time.monotonic() >= deadline:
+            raise TimeoutError('Synchronous cache trim exceeded its configured time limit')
         if force or time.monotonic() - last_check >= 2:
             _proof(guard, proof)
             _no_users(inventory, cache, before['executableNames'])
@@ -263,21 +260,21 @@ def _trim_anchored(cache, cache_fd, config, before, guard, proof, inventory, dis
                 os.close(fd)
             os.close(bucket_fd)
     pulse(True)
-    return {'returncode': 0, 'custody': 'drained', 'backend': 'descriptor-relative',
+    return {'backend': 'descriptor-relative',
             'filesRemoved': removed, 'reclaimedBytes': reclaimed, 'preservedEntries': preserved}
 
 
-def manage_cache(config, guard, apply=False, *, run_command=None, process_inventory=process_inventory,
+def manage_cache(config, guard, apply=False, *, process_inventory=process_inventory,
                  disk_usage=shutil.disk_usage):
-    """Use only with a sticky lease and a durable runner supplied by supervisor.
+    """Use only under the supervisor's sticky exclusive lease and admission lock.
 
-    run_command(argv, *, cwd, env, timeout, journal, pass_fds) must persist child identity
-    before execution. It returns returncode and custody='drained'. An exception,
-    unknown drainage or unfinished prior journal retains the lease for recovery.
+    Trimming is synchronous and never launches Go or another cleanup process.
+    The durable cleaning receipt precedes mutation. Any interruption retains the
+    lease and prevents replay until the supervisor reviews the original receipt.
     """
     receipt = {'version': 1, 'kind': 'go-build-cache', 'apply': apply, 'phase': 'refused', 'releaseSafe': False}
     path = None
-    launched = False
+    mutating = False
     cache_fd = None
     try:
         config = _config(config, apply)
@@ -287,10 +284,14 @@ def manage_cache(config, guard, apply=False, *, run_command=None, process_invent
             prior = json.loads(path.read_text())
             if prior.get('phase') in ('cleaning', 'uncertain'):
                 return {**prior, 'phase': 'uncertain', 'releaseSafe': False,
-                        'reason': 'Retained cleanup command requires custody reassessment before another attempt'}
+                        'reason': 'Retained cleanup receipt requires custody reassessment before another attempt'}
         proof = _proof(guard)
         receipt['proof'] = proof
         cache_fd = os.open(cache, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            fcntl.flock(cache_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ValueError('Another local cache cleanup holds this directory') from error
         approved_root = os.fstat(cache_fd)
         before = inspect_cache(cache, disk_usage)
         if before['rootIdentity'] != [approved_root.st_dev, approved_root.st_ino]:
@@ -308,12 +309,8 @@ def manage_cache(config, guard, apply=False, *, run_command=None, process_invent
         if not triggers:
             receipt.update(phase='within-budget', releaseSafe=True)
         elif not apply:
-            receipt.update(phase='planned', releaseSafe=True, command=[config['go'], 'clean', '-cache'])
+            receipt.update(phase='planned', releaseSafe=True, operation='descriptor-relative Go cache trim')
         else:
-            if run_command is None and sys.platform != 'darwin':
-                raise ValueError('Apply requires the supervisor durable command runner')
-            if sys.platform != 'darwin' and before['hardlinkedFiles']:
-                raise ValueError('Hardlinked cache artifacts require selective preservation')
             _proof(guard, proof)
             _no_users(process_inventory, cache, before['executableNames'])
             current = inspect_cache(cache, disk_usage)
@@ -322,26 +319,12 @@ def manage_cache(config, guard, apply=False, *, run_command=None, process_invent
             anchored = os.fstat(cache_fd)
             if [anchored.st_dev, anchored.st_ino] != before['rootIdentity']:
                 raise ValueError('Cache directory changed before it could be anchored')
-            anchored_path = '/proc/self/fd/' + str(cache_fd)
-            if sys.platform != 'darwin' and not os.path.samefile(anchored_path, cache):
-                raise ValueError('This host cannot anchor the Go cache directory')
-            receipt.update(phase='cleaning', command=[config['go'], 'clean', '-cache'])
-            receipt['cacheDescriptor'] = {'fd': cache_fd, 'device': anchored.st_dev, 'inode': anchored.st_ino}
+            receipt.update(phase='cleaning', operation='descriptor-relative Go cache trim')
+            receipt['cacheDescriptor'] = {'device': anchored.st_dev, 'inode': anchored.st_ino}
             _write(path, receipt)
-            env = {key: value for key, value in os.environ.items()
-                   if key in ('PATH', 'HOME', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'GOPATH', 'GOMODCACHE', 'GOROOT')}
-            env.update(GOCACHE=anchored_path, GOTOOLCHAIN='local', GOENV='off')
-            launched = True
-            if sys.platform == 'darwin':
-                receipt['command'] = ['descriptor-relative Go cache trim']
-                _write(path, receipt)
-                result = _trim_anchored(cache, cache_fd, config, before, guard, proof, process_inventory, disk_usage)
-            else:
-                result = run_command(receipt['command'], cwd=str(cache.parent), env=env,
-                                     timeout=config['timeoutSeconds'], journal=str(path) + '.command.json', pass_fds=(cache_fd,))
-            receipt['commandResult'] = result
-            if not isinstance(result, dict) or result.get('custody') != 'drained' or type(result.get('returncode')) is not int:
-                raise RuntimeError('Cleanup command drainage is unconfirmed')
+            mutating = True
+            result = _trim_anchored(cache, cache_fd, config, before, guard, proof, process_inventory, disk_usage)
+            receipt['trimResult'] = result
             _proof(guard, proof)
             after = inspect_cache(cache, disk_usage)
             _no_users(process_inventory, cache, after['executableNames'])
@@ -350,10 +333,10 @@ def manage_cache(config, guard, apply=False, *, run_command=None, process_invent
                 raise RuntimeError('Retained cache evidence changed; preserve the storage lease for inspection')
             receipt['budgetMet'] = after['compiledBytes'] <= config['maxBytes']
             receipt['reserveMet'] = after['freeBytes'] >= config['reserveBytes']
-            receipt.update(phase='complete' if result['returncode'] == 0 and receipt['budgetMet'] and receipt['reserveMet'] else 'failed', releaseSafe=True)
+            receipt.update(phase='complete' if receipt['budgetMet'] and receipt['reserveMet'] else 'failed', releaseSafe=True)
         _write(path, receipt)
     except Exception as error:
-        receipt.update(phase='uncertain' if launched else 'refused', reason=f'{type(error).__name__}: {error}', releaseSafe=False)
+        receipt.update(phase='uncertain' if mutating else 'refused', reason=f'{type(error).__name__}: {error}', releaseSafe=False)
         _write(path, receipt)
     finally:
         if cache_fd is not None:
@@ -369,7 +352,7 @@ def main():
     print(json.dumps({'version': 1, 'kind': 'go-build-cache', 'phase': 'read-only',
                       'cache': str(config['cache']), 'budgets': {key: config[key] for key in ('maxBytes', 'reserveBytes')},
                       'observed': inspect_cache(config['cache']),
-                      'authority': 'Apply is available only through the protected supervisor with its lease and command runner'}, sort_keys=True))
+                      'authority': 'Apply is available only through the protected supervisor with its lease and admission lock'}, sort_keys=True))
 
 
 if __name__ == '__main__':
