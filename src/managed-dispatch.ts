@@ -28,7 +28,7 @@ const DEFAULT_RESOURCE_CLASSES: Readonly<Record<string, ResourceClass>> = {
 export type CodexReportEvent = "rate-limited" | "clean";
 type CodexReporter = (event: CodexReportEvent) => Promise<CodexPauseState | null>;
 const currentRun = new AsyncLocalStorage<{ verificationAccepted?: string; run: FleetRun; groups: Set<number>; testContexts?:Map<string,()=>void>; goPath?:ReturnType<typeof managedGoPath>; taskSocket?: string; testContextSocket?:string; taskActions?: BridgeActions; githubEnv?:NodeJS.ProcessEnv; reportCodex?: CodexReporter;
-  requestedTasks?: () => string[]; ticketTasks?: () => Promise<NativeTaskView[]> }>();
+  beginStage?: (plan: import("./stage-results.js").StagePlan) => Promise<unknown>; requestedTasks?: () => string[]; ticketTasks?: () => Promise<NativeTaskView[]> }>();
 /**
  * Reports the current admitted run's Codex events to the fleet's Codex
  * throttle, or null outside a managed dispatcher run. The reporter resolves
@@ -63,6 +63,8 @@ export async function managedTicketTasks(): Promise<NativeTaskView[] | null> {
 }
 /** The admitted run this code runs inside, or undefined outside a managed run. */
 export function managedRun(): FleetRun | undefined { return currentRun.getStore()?.run; }
+export async function beginManagedStage(plan: import("./stage-results.js").StagePlan): Promise<void> { await currentRun.getStore()?.beginStage?.(plan); }
+
 /** Called only after the dispatcher accepted a fresh final verifier result. */
 export function acceptManagedVerification(candidate:string):void {
  const active=currentRun.getStore();
@@ -382,7 +384,8 @@ export class ManagedDispatch {
     if (!this.ready(pending)) throw new Error("No managed run grant");
     const run = pending.run!;
     this.running.add(run.id);
-    return withGitHubActor({session:this.session,runId:run.id},()=>currentRun.run({ run, groups: new Set(), reportCodex: this.codexReporter(run) }, async () => {
+    return withGitHubActor({session:this.session,runId:run.id},()=>currentRun.run({ run, groups: new Set(), reportCodex: this.codexReporter(run),
+      beginStage: this.state.workflowProjects?.includes(this.project) ? plan => this.connection.call("/workflow/stage-plan", { project: this.project, ticket: run.ticket, session: this.session, runId: run.id, plan }) : undefined }, async () => {
       let completed = false;
       let ghBridge:Awaited<ReturnType<typeof startGitHubBridge>>;
       let bridge:Awaited<ReturnType<typeof taskBridge>>|undefined;

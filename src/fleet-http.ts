@@ -328,7 +328,8 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
       if (req.url?.startsWith('/workflow/')) {
         const project=body.project;
         if(typeof project!=='string' || !/^[\w.-]+\/[\w.-]+$/.test(project)) throw new Error('Workflow project required');
-        if(req.url==='/workflow/read') return send(200,{enabled:store.workflow.enabled(project),preparing:store.workflow.preparing(project),config:store.workflow.config(project),items:store.workflow.list(project).map(item=>({...item,approvalState:store.approvals.get(`${project}#${item.issueNumber}`)})),pending:store.workflow.pending(10000,project).length});
+        if(req.url==='/workflow/read') return send(200,{enabled:store.workflow.enabled(project),preparing:store.workflow.preparing(project),config:store.workflow.config(project),items:store.workflow.list(project).map(item=>({...item,approvalState:store.approvals.get(`${project}#${item.issueNumber}`)})),stageResults:store.stages.summaries(project),pending:store.workflow.pending(10000,project).length});
+        if(req.url==='/workflow/stage-read') {if(body.ticket?.split('#')[0]!==project)throw new Error('Workflow project mismatch');return send(200,{records:store.stages.records(body.ticket)});}
         if(req.url==='/workflow/approval-outcome') {
           if(!machine) return send(403,{error:'Machine credential required'});
           return send(200,store.recordApprovalOutcome(machine,body.session,project,body.runId,body.ticket,body.outcome));
@@ -362,6 +363,23 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
         }
         if(!machine) return send(403,{error:'Machine credential required'});
         if(body.ticket?.split('#')[0]!==project) throw new Error('Workflow project mismatch');
+        if(req.url==='/workflow/stage-plan') return send(200,store.stagePlan(machine,body.session,body.ticket,body.runId,body.plan));
+        if(req.url==='/workflow/stage-result') {
+          if(store.stages.get(body.runId)?.result) return send(200,store.stageResult(machine,body.session,body.ticket,body.runId,body.result,evidence));
+          store.authorizeWorkflow(machine,body.session,body.ticket,body.runId);
+          if(!github) throw new Error('Stage acceptance requires published candidate verification');
+          const [repo,number]=[body.ticket.split('#')[0],body.ticket.split('#')[1]];
+          const response=await github.request(repo,{method:'GET',path:`/repos/${repo}/git/ref/heads/feature/${number}`,fresh:true});
+          if(response.status!==200 || JSON.parse(response.body).object?.sha!==body.result?.candidate) throw new Error('Published stage candidate changed or unavailable');
+          if(body.result?.verdict) {
+            const pr=body.result.pullRequest;
+            if(!Number.isSafeInteger(pr) || pr<1) throw new Error('Exact pull request required');
+            const view=await github.request(repo,{method:'GET',path:`/repos/${repo}/pulls/${pr}`,fresh:true});
+            const pull=view.status===200?JSON.parse(view.body):null;
+            if(!pull || pull.state!=='open' || pull.head?.sha!==body.result.candidate || pull.head?.ref!==`feature/${number}` || pull.head?.repo?.full_name!==repo) throw new Error('Review pull request does not match the stage candidate');
+          }
+          return send(200,store.stageResult(machine,body.session,body.ticket,body.runId,body.result,evidence));
+        }
         if(req.url==='/workflow/change') {
           store.authorizeWorkflow(machine,body.session,body.ticket,body.runId);
           if(body.change?.addLabels?.some((l:string)=>l.startsWith('done:')) || body.change?.labels?.some((l:string)=>l.startsWith('done:')) || ['In Documentation','Done'].includes(body.change?.status))await guardPinnedPublication(store,github,body.ticket);

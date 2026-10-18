@@ -14097,3 +14097,18 @@ test("a managed builder whose requested native task is open is held by handlePos
   assert.ok(settled.addLabelCalls.some(c => c.label === "done:builder"));
   assert.ok(!settled.addLabelCalls.some(c => c.label === NATIVE_TASK_HOLD_LABEL));
 });
+
+test("managed verifier uses its structured result even when its only PR comment predates the run", async () => {
+  const sha="a".repeat(40),path="/logs/structured-verdict.md";
+  const {ctx,client,calls}=makeTestContext({agent:{name:"verifier",column:"In Code Review",requiresVerdict:true,producesCommits:false},
+    item:{issueNumber:3584,status:"In Code Review"},mockOptions:{fsMap:{[path]:`decision: PASS\ncommit: ${sha}\nlabels:\n---\n## Verifier Review\nDecision: PASS`},execImpls:{"gh pr list":()=>JSON.stringify([{number:3590,isDraft:false}]),"git status --porcelain":()=>""}}});
+  ctx.verdictHandoffPath=path;
+  ctx.stagePlan={version:1,kind:"verifier",candidate:sha,checks:["unit"],artifacts:[]};
+  ctx.stageChecks=[{name:"unit",outcome:"passed",evidence:"unit tests executed"}];
+  let received:any;
+  ctx.client.completeStage=async (_number,submission)=>{received=submission;return {ticket:"org/core#3584",runId:"review",basis:"basis",artifactsRequired:false,liveGateRequired:false,plan:ctx.stagePlan!,result:submission,acceptance:{state:"accepted",reason:"Stored",change:{}}};};
+  assert.deepEqual(await handlePostRun(STREAM_OK(),ctx,false),{ok:true});
+  assert.equal(received.verdict.commit,sha);
+  assert.ok(!calls.exec.some(c=>c.cmd.includes("--json reviews,comments")),"comment timestamps are not read");
+  assert.ok(!client.addLabelCalls.some(c=>c.label==="done:verifier"),"only the authority accepts completion");
+});

@@ -1,3 +1,4 @@
+import { StageResults, type StagePlan, type StageSubmission } from "./stage-results.js";
 import { RecoverySplits, renderRecoverySlice, splitBodyHash, splitRequirements, splitItemBasis, validateSplitAgainstTicket, validateRecoverySplit, type RecoverySplitRecord } from './recovery-split.js';
 import {StorageMaintenance,type StorageRequest} from './storage-maintenance.js';
 import { parseFeatureRoot } from './feature-lineage.js';
@@ -16,7 +17,7 @@ import { OrphanedTaskWatch } from './orphaned-tasks.js';
 import {RecoveryTasks, assessmentTasks, recoveryTaskId, validateTaskRequest, type RecoveryTaskRequest, type RecoveryTaskResult} from './recovery-tasks.js';
 import { currentWorkflow, recordRepairWorkflow, dispatcherRepairCap } from './recovery-repair-cap.js';
 import {createHash} from 'node:crypto';
-import {manifestHash} from './recovery-artifacts.js';
+import {manifestHash, artifactManifest} from './recovery-artifacts.js';
 import type { AgentRunner } from './agent-runner.js';
 import { CAPABILITY_REPORT_FRESH_MS, missingCapabilities, ticketRequirements, validateCapabilityReport } from "./ticket-requirements.js";
 import { DesiredStateStore, workRefusal, type DesiredCommand, type DesiredDocument, type DesiredPoll } from './desired-state.js';
@@ -228,6 +229,7 @@ export class FleetStore {
   readonly flaky: FlakySightingLedger;
   readonly investigations: TestInvestigations;
   readonly approvals: ApprovalStates;
+  readonly stages: StageResults;
   readonly machineRecoveries: MachineRecoveries;
   readonly verifierHandoffs: VerifierHandoffs;
   readonly storage: StorageMaintenance;
@@ -259,6 +261,7 @@ export class FleetStore {
       ) STRICT;
     `);
     this.workflow = new WorkflowStore(this.db);
+    this.stages = new StageResults(this.db);
     this.machineRecoveries = new MachineRecoveries(this.db);
     this.recovery = new RecoveryLedger(this.db, Date.now, options);
     this.facts = new RecoveryFacts(this.db);
@@ -348,7 +351,9 @@ export class FleetStore {
   });}
   /** The authority's record of one run, finished or not. Evidence uploads are accepted only from its own computer. */
   runOwner(id: string): { machine: string; ticket: string; role: string } | undefined {
-    const run = this.db.prepare("SELECT machine,ticket,request FROM fleet_runs WHERE id=?").get(id);
+    const source=id.startsWith("acceptance:")?id.slice("acceptance:".length):id;
+    if(source!==id && !this.stages.get(source))return undefined;
+    const run = this.db.prepare("SELECT machine,ticket,request FROM fleet_runs WHERE id=?").get(source);
     if (!run) return undefined;
     let role = "unknown";
     try { role = String(JSON.parse(String(run.request)).role ?? "unknown"); } catch { /* an unreadable request still names its computer */ }
@@ -557,7 +562,50 @@ export class FleetStore {
   workflowChange(machine: string, session: string, runId: string | undefined, ticket: string, change: WorkflowChange, commandId: string, revision?: number) {
     return this.transaction(() => {
       this.authorizeWorkflow(machine, session, ticket, runId);
+      const accepted=runId && this.stages.get(runId)?.acceptance;
+      if(accepted && accepted.state!=="waiting" && (change.status!==undefined || change.state!==undefined || change.labels!==undefined || change.addLabels?.some(l=>/^(error:|done:|needs-rework:)/.test(l))))throw new Error("Accepted stage result cannot be overwritten by executor bookkeeping");
+      if(runId && this.stages.get(runId) && (change.addLabels?.some(l=>l.startsWith("done:")) || change.labels?.some(l=>l.startsWith("done:")) || ["In Documentation","Done"].includes(change.status??""))) throw new Error("Contracted stage completion requires its structured result");
       return this.workflow.change(ticket, change, machine + ':' + session, commandId, revision);
+    });
+  }
+  stagePlan(machine: string, session: string, ticket: string, runId: string, plan: StagePlan) {
+    return this.transaction(() => {
+      this.authorizeWorkflow(machine, session, ticket, runId);
+      const run = this.snapshot().runs.find(r => r.id === runId);
+      if (!run || run.ticket !== ticket || run.role !== (plan.kind === "verifier" ? "verifier" : "real-claude-gate")) throw new Error("Stage run does not match its plan");
+      return this.stages.begin(ticket, runId, this.workflow.get(ticket), plan);
+    });
+  }
+  stageResult(machine: string, session: string, ticket: string, runId: string, result: StageSubmission, evidence?: EvidenceStore) {
+    return this.transaction(() => {
+      const old = this.stages.get(runId);
+      // Exact retries remain readable after execution and its ownership have ended.
+      const owner = this.db.prepare("SELECT machine,session,ticket FROM fleet_runs WHERE id=?").get(runId);
+      if (!owner || owner.machine !== machine || owner.session !== session || owner.ticket !== ticket) throw new Error("Stage result owner mismatch");
+      if(old?.result)return this.stages.complete(runId,this.workflow.get(ticket),result,()=>{throw new Error("A saved result cannot be applied again");});
+      this.authorizeWorkflow(machine, session, ticket, runId);
+      const approval=this.approvals.get(ticket);
+      if(approval?.kind==='rejected' && !approval.authorization)throw new Error("Stage result cannot bypass the recorded approval refusal");
+      if(scrubCredentials(JSON.stringify(result))!==JSON.stringify(result))throw new Error("Stage result must be scrubbed before retention");
+      const item = this.workflow.get(ticket);
+      if(old?.plan.kind==="live-gate") {
+        const receipt=JSON.parse(result.checks.find(c=>c.name==="live-acceptance")?.evidence??"null");
+        for(const tracker of receipt?.acceptedInherited??[]) {
+          const tracked=this.workflow.get(`${ticket.split("#")[0]}#${tracker.issue}`);
+          if(tracked.state!=="OPEN" || !tracked.body.includes(inheritedMarker(tracker.name)))throw new Error("Accepted inherited failure has no current authoritative tracker");
+        }
+      }
+      return this.stages.complete(runId, item, result, change =>
+        this.workflow.change(ticket, change, "stage-result:" + runId, "stage-result:" + runId), files=>{
+          if(!evidence)throw new Error("Shared evidence storage is unavailable");
+          const id="acceptance:"+runId, contents=Object.fromEntries(files.map(f=>[f.name,f.text])), manifest=artifactManifest(contents);
+          evidence.pinAcceptance(ticket);
+          const upload=evidence.begin(machine,undefined,ticket,id,{kind:"gate",role:old!.plan.kind==="verifier"?"verifier":"real-claude-gate",outcome:"accepted-output",candidateRevision:result.candidate,startedAt:Date.now(),endedAt:Date.now()},manifest);
+          for(const f of manifest.files){const data=Buffer.from(contents[f.path]);for(const part of upload.missing[f.path]??[])
+            evidence.put(machine,undefined,ticket,id,upload.digest,f.path,part,data.subarray(part*manifest.chunkBytes,(part+1)*manifest.chunkBytes).toString("base64"));}
+          evidence.commit(machine,undefined,ticket,id,upload.digest);
+          return {runId:id,digest:upload.digest};
+        });
     });
   }
   authorizeWorkflow(machine:string,session:string,ticket:string,runId?:string):void {
@@ -1206,6 +1254,9 @@ export class FleetStore {
         if (released.changes) this.db.prepare("INSERT OR IGNORE INTO fleet_assessment_releases VALUES (?,?,?,?)")
           .run(run.ticket, run.machine, run.generation, Date.now());
       }
+      if(this.stages.get(id))this.stages.endWithoutResult(id,this.workflow.get(String(run.ticket)),change=>{
+        if(Object.keys(change).length)this.workflow.change(String(run.ticket),change,"stage-execution-ended:"+id,"stage-execution-ended:"+id);
+      });
       this.workflow.finish(String(run.ticket), request.role, id);
       // Shared maintenance jobs have no long-lived ticket owner.
       if (String(run.ticket).includes("#@")) {

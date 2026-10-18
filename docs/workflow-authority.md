@@ -11,6 +11,10 @@ Newly discovered issues enter Inbox. Existing ticket descriptions and family
 relationships are refreshed from GitHub. PR merge evidence records completion
 in the database. Authenticated operator commands are the way to change workflow.
 
+## Accepted stage results
+
+Managed verifier and live acceptance work now record requirements and results through the central authority. GitHub verdict comments display accepted results. They do not establish completion. See [accepted stage results](stage-results.md) for evidence requirements, worker reads and rollout order.
+
 ## Writes and publication
 
 A worker must own its active reservation to write. Each admitted worker gets a

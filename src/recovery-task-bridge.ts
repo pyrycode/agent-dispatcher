@@ -74,6 +74,10 @@ export async function taskBridge(connection:JsonClient,run:FleetRun,actions:Brid
     const body=await readJson(req);
     return send(200,await connection.call('/tasks/investigate',{request:body.request,project:run.project,session:run.session,runId:run.id}));
    }
+   if(req.method==='POST' && actions.evidence && url==='/stage-results') {
+    const body=await readJson(req),ticket=evidenceTicket(body.ticket,run.project);
+    return send(200,await connection.call('/workflow/stage-read',{project:run.project,ticket}));
+   }
    if(req.method==='POST' && actions.evidence && ['/evidence-list','/evidence-chunk'].includes(url)) {
     const body=await readJson(req);
     const ticket=evidenceTicket(body.ticket,run.project);

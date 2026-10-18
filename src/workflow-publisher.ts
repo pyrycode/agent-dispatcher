@@ -111,6 +111,25 @@ export class WorkflowPublisher {
       `Workflow display update failed for ${ticket} revision ${revision} (attempt ${attempts}, retry in ${Math.round(delay / 1000)}s): ${message}`,
     );
   }
+  async publishStageResults():Promise<void> {
+    const errors:unknown[]=[];
+    for (const publication of this.store.stages.publications()) {
+      const project=publication.ticket.split("#")[0], marker=`<!-- orchestrator-stage:${publication.runId} -->`;
+      try {
+        let exists=false;
+        for(let page=1;;page++) {
+          const comments=await this.call(project,{method:"GET",path:`/repos/${project}/issues/${publication.pr}/comments?per_page=100&page=${page}`,fresh:true});
+          if(!Array.isArray(comments))throw new Error("Cannot read stage publication history");
+          if(comments.some((c:any)=>typeof c.body==="string" && c.body.includes(marker))){exists=true;break;}
+          if(comments.length<100)break;
+          if(page>=100)throw new Error("Cannot establish stage publication history");
+        }
+        if(!exists)await this.call(project,{method:"POST",path:`/repos/${project}/issues/${publication.pr}/comments`,body:JSON.stringify({body:publication.body+"\n\n"+marker})});
+        this.store.stages.published(publication.runId);
+      } catch(error){errors.push(error);}
+    }
+    if(errors.length)throw new AggregateError(errors,"Stage result publication remains pending");
+  }
   private async publish(): Promise<void> {
     const configs = this.store.workflow
       .projects()
@@ -149,6 +168,7 @@ export class WorkflowPublisher {
         errors.push(error);
       }
     }
+    try { await this.publishStageResults(); } catch(error){errors.push(error);}
     for (const comment of this.store.workflow.pendingComments()) {
       if (this.store.workflow.preparing(comment.ticket.split("#")[0])) continue;
       try {

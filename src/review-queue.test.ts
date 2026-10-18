@@ -355,3 +355,30 @@ test("an older manager ignores the new list: the snapshot only adds a field", ()
     assert.equal(store.start(request("old", "fractal", `${MOBILE}#9`)).ok, true);
   } finally { store.close(); }
 });
+
+test("2089: centrally paused review does not count against another board's admission", async () => {
+  const {store,build}=fleet();try{
+    build("fractal",`${CORE}#1`);
+    const claims={snapshot:async()=>store.snapshot(),start:async(r:StartRequest)=>store.start(r),finish:async()=>{},
+      call:async<T>(path:string,body:any):Promise<T>=>{
+        if(path==="/machines/desired")return store.desiredPoll("fractal",body) as T;
+        if(path==="/machines/capabilities")return store.reportMachineCapabilities("fractal",body.capabilities,body.projects) as T;
+        throw new Error(path);
+      }};
+    const manager=new MachineManager({machine:"fractal",heavyLimit:1,combinedLimit:3,ticketLimit:1,projects:[CORE,MOBILE]},claims,Date.now,{persist:()=>{}});
+    await manager.refreshDesired();
+    store.reportMachineCapabilities("fractal",[],[CORE,MOBILE]);
+    store.setDesired({machines:["fractal"],project:CORE,change:{work:"drained"}});
+    await manager.refreshDesired();
+    manager.offer(CORE,"c",[{...offer(`${CORE}#1`,"verifier","heavy"),workflowVersion:1}]);
+    manager.offer(MOBILE,"m",[{...offer(`${MOBILE}#9`),workflowVersion:1}]);
+    const status=await manager.status();
+    assert.deepEqual(status.reviewQueue,{limit:1,tickets:[],full:false});
+    assert.equal(status.runnableTicketCount,0);
+    assert.equal(status.queue.find(q=>q.ticket===`${CORE}#1`)?.state,"drained");
+    assert.equal(status.queue.find(q=>q.ticket===`${MOBILE}#9`)?.state,"eligible");
+    await manager.tick();
+    assert.deepEqual(store.snapshot().runs.map(r=>r.ticket),[`${MOBILE}#9`]);
+    assert.ok(store.snapshot().claims.some(c=>c.ticket===`${CORE}#1`),"paused review ownership is preserved");
+  }finally{store.close();}
+});

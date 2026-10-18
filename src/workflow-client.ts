@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import { unknownOperation, type JsonClient } from "./fleet-http.js";
 import type { WorkflowItem, WorkflowChange } from "./workflow-store.js";
 import {
@@ -78,6 +78,21 @@ export function workflowClient<T extends object>(
     };
   };
   const methods: Record<string, (...args: any[]) => Promise<any>> = {
+    beginStage: (number: number, plan: import('./stage-results.js').StagePlan) => connection.call('/workflow/stage-plan', { project, ticket: `${project}#${number}`, plan, ...actor() }),
+    completeStage: async (number: number, result: import('./stage-results.js').StageSubmission) => {
+      const identity=actor(),ticket=`${project}#${number}`;
+      try { return await connection.call('/workflow/stage-result',{project,ticket,result,...identity}); }
+      catch(error) {
+        // Resolve an uncertain write by its immutable receipt before reporting failure.
+        try {
+          const saved=await connection.call<{records:import('./stage-results.js').StageRecord[]}>('/workflow/stage-read',{project,ticket});
+          const hash=createHash("sha256").update(JSON.stringify(result)).digest("hex");
+          const record=saved.records.find(r=>r.runId===identity.runId && r.submissionHash===hash);
+          if(record)return record;
+        } catch { /* An unavailable authority confirms neither success nor failure. */ }
+        throw error;
+      }
+    },
     recordApprovalOutcome:(number:number,outcome:import('./approval-state.js').ApprovalOutcome)=>connection.call('/workflow/approval-outcome',{
       project,ticket:`${project}#${number}`,outcome,...actor(),
     }),
