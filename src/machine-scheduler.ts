@@ -104,11 +104,25 @@ export const REVIEW_ROLES: ReadonlySet<string> = new Set(["verifier", "qa", "cod
  * Undefined when the claim service predates the report, so an older
  * authority holds nothing.
  */
-export function reviewQueue(machine: string, state: FleetSnapshot, offers: readonly WorkOffer[]): string[] | undefined {
+export interface EligibilityPolicy {
+  machine: string; projects: readonly string[]; drainingProjects?: readonly string[]; drainedProjects?: readonly string[]; capabilities?: readonly string[];
+}
+export function workEligibility(offer: WorkOffer, state: FleetSnapshot, policy: EligibilityPolicy): string | undefined {
+  const owned = state.claims.find(c => c.ticket === offer.ticket);
+  if (!policy.projects.includes(offer.project)) return "unserved";
+  if (owned && owned.machine !== policy.machine) return "owned-elsewhere";
+  if ((policy.drainedProjects ?? []).some(p => p === offer.project || p === offer.parentTicket?.split("#")[0])) return "drained";
+  if (!acceptsDuringProjectDrain(offer, policy.machine, policy.drainingProjects ?? [], state)) return "project-draining";
+  if ((state.machineRecoveries ?? []).some(r => r.machine === policy.machine && r.cleared === undefined && [offer.project, offer.parentTicket?.split("#")[0]].includes(r.project))) return "drained";
+  if (lackingCapabilities(offer, state, policy.capabilities).length) return "missing-capability";
+  if (offer.role !== "recovery" && !(state.requiredRepairs?.[offer.ticket] ?? []).every(sha => offer.readyRepairs?.includes(sha))) return "missing-repair";
+  return undefined;
+}
+export function reviewQueue(machine: string, state: FleetSnapshot, offers: readonly WorkOffer[], policy?: EligibilityPolicy): string[] | undefined {
   if (!state.reviewReadyTickets) return undefined;
   const owned = new Set(state.claims.filter(c => c.machine === machine).map(c => c.ticket));
   const running = new Set(state.runs.flatMap(r => r.parentTicket ? [r.ticket, r.parentTicket] : [r.ticket]));
-  const offered = new Set(offers.filter(o => REVIEW_ROLES.has(o.role)
+  const offered = new Set(offers.filter(o => REVIEW_ROLES.has(o.role) && (!policy || !workEligibility(o, state, policy))
     && (state.requiredRepairs?.[o.ticket] ?? []).every(sha => o.readyRepairs?.includes(sha))).map(o => o.ticket));
   return state.reviewReadyTickets.filter(t => owned.has(t) && !running.has(t) && offered.has(t));
 }
@@ -160,14 +174,11 @@ export function scheduleMachine(opts: {
   let ticketPlaces = Math.max(0, (opts.ticketLimit ?? Infinity) - runnable.size);
   const reviewLimit = effectiveReviewQueueLimit(opts);
   // A ticket leaves the queue once a run selected here takes it.
-  const waitingReview = new Set(reviewQueue(opts.machine, opts.state, opts.reviewOffers ?? opts.offers) ?? []);
+  const waitingReview = new Set(reviewQueue(opts.machine, opts.state, opts.reviewOffers ?? opts.offers, opts) ?? []);
   const reviewQueueFull = () => reviewLimit > 0 && opts.state.reviewReadyTickets !== undefined && waitingReview.size >= reviewLimit;
   const rank = new Map(opts.projects.map((p, i) => [p, i]));
   const priorityHigh = new Set(opts.state.priorityHighTickets ?? []);
-  const recoveryHeld = new Set((opts.state.machineRecoveries ?? []).filter(r => r.machine === opts.machine && r.cleared === undefined).map(r => r.project));
-  const ready = opts.offers.filter(o => !recoveryHeld.has(o.project) && !recoveryHeld.has(o.parentTicket?.split('#')[0] ?? '') && rank.has(o.project) && (!claims.has(o.ticket) || claims.get(o.ticket)!.machine === opts.machine)
-    && acceptsDuringProjectDrain(o, opts.machine, opts.drainingProjects ?? [], opts.state)
-    && !(opts.drainedProjects ?? []).some(p => o.project === p || o.parentTicket?.split("#")[0] === p));
+  const ready = opts.offers.filter(o => workEligibility(o, opts.state, opts) === undefined);
   ready.sort((a, b) => {
     const parentClaim=(o:WorkOffer)=>o.supportTaskId&&o.parentTicket?claims.get(o.parentTicket):undefined;
     const ac=claims.get(a.ticket)??parentClaim(a),bc=claims.get(b.ticket)??parentClaim(b);

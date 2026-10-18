@@ -4,7 +4,7 @@ import { createServer, type Server } from "node:http";
 import { listen, readJson, tokenMatches, ownershipRefusal, ServiceError, type FleetClient } from "./fleet-http.js";
 import { effectiveWork, desiredRun, stricter, validateDocument, workRefusal, MACHINE_SCOPE, type DesiredDocument, type DesiredPoll, type WorkState } from "./desired-state.js";
 import { validateStart, validateLimits, type MachineLimits, type FleetRun } from "./fleet-store.js";
-import { scheduleMachine, runnableTickets, codexPaused, codexSpaced, isNewTicket, reviewQueue, effectiveReviewQueueLimit, lackingCapabilities, type WorkOffer } from "./machine-scheduler.js";
+import { scheduleMachine, workEligibility, runnableTickets, codexPaused, codexSpaced, isNewTicket, reviewQueue, effectiveReviewQueueLimit, lackingCapabilities, type WorkOffer } from "./machine-scheduler.js";
 import { validateCapabilityReport } from "./ticket-requirements.js";
 
 /**
@@ -344,7 +344,7 @@ export class MachineManager {
     const eligible = new Set((this.desiredKnown() ? scheduleMachine({ ...this.config, ...this.schedulingDrains(), offers: runnableOffers, state }) : []).map(o => `${o.project}/${o.key}`));
     const desired = this.desiredStatus();
     const reviewLimit = effectiveReviewQueueLimit(this.config);
-    const waitingReview = reviewQueue(this.config.machine, state, runnableOffers);
+    const waitingReview = reviewQueue(this.config.machine, state, runnableOffers, { ...this.config, ...this.schedulingDrains() });
     const reviewFull = reviewLimit > 0 && waitingReview !== undefined && waitingReview.length >= reviewLimit;
     return { ...(this.config.controlRevision?{controlRevision:this.config.controlRevision}:{}), managerStartedAt: this.startedAt, machine: this.config.machine, heavyLimit: this.config.heavyLimit, combinedLimit: this.config.combinedLimit, ...(this.config.projectHeavyLimits ? { projectHeavyLimits: this.config.projectHeavyLimits } : {}), ticketLimit: this.config.ticketLimit ?? null,
       // tickets is null when the claim service predates the report; nothing is held then.
@@ -364,6 +364,7 @@ export class MachineManager {
           // No computer that reported recently can run it, or only another one can.
           : lackingCapabilities(o, state, this.config.capabilities).length
             ? (state.noCapableMachine?.some(g => g.ticket === o.ticket) ? "no-capable-machine" : "missing-capability")
+          : workEligibility(o, state, { ...this.config, ...this.schedulingDrains() }) ? workEligibility(o, state, { ...this.config, ...this.schedulingDrains() })!
           : codexPaused(o, state) ? "codex-paused"
           : codexSpaced(o, state) ? "codex-spaced"
           // A verifier selected in the same pass can shorten the queue, so an offer it frees is eligible.
@@ -436,7 +437,7 @@ export async function serveManager(manager: MachineManager, projectTokens: Recor
           ...(req.url === "/recovery/evidence" ? { records: body.records?.map((r: any) => ({ ...r, machine: manager.config.machine })) } : {}) }));
       }
       if(req.url?.startsWith('/workflow/')) {
-        if(!['/workflow/read','/workflow/change','/workflow/comments','/workflow/comment','/workflow/authorize','/workflow/approval-outcome'].includes(req.url) || !manager.claims.call) return send(403,{error:'Unsupported project workflow operation'});
+        if(!['/workflow/read','/workflow/change','/workflow/comments','/workflow/comment','/workflow/authorize','/workflow/approval-outcome','/workflow/stage-plan','/workflow/stage-result','/workflow/stage-read'].includes(req.url) || !manager.claims.call) return send(403,{error:'Unsupported project workflow operation'});
         if(body.ticket && body.ticket.split('#')[0]!==project) return send(403,{error:'Workflow project mismatch'});
         return send(200,await manager.claims.call(req.url,{...body,project}));
       }

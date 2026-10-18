@@ -181,6 +181,7 @@ export class EvidenceStore {
         PRIMARY KEY(ticket, run_id, path, part)
       ) STRICT;
       CREATE TABLE IF NOT EXISTS evidence_pins (ticket TEXT PRIMARY KEY, reason TEXT NOT NULL) STRICT;
+      CREATE TABLE IF NOT EXISTS evidence_acceptance_pins (ticket TEXT PRIMARY KEY) STRICT;
       CREATE TABLE IF NOT EXISTS evidence_done (ticket TEXT PRIMARY KEY, since INTEGER NOT NULL) STRICT;
       CREATE INDEX IF NOT EXISTS evidence_age ON evidence_bundles(committed, created);
     `);
@@ -192,7 +193,9 @@ export class EvidenceStore {
     if (!reason) throw new Error('Evidence preservation reason required');
     this.db.prepare('INSERT OR IGNORE INTO evidence_pins VALUES (?,?)').run(ticket, reason);
   }
-  private pinned(ticket: string): boolean { return !!this.db.prepare('SELECT 1 FROM evidence_pins WHERE ticket=?').get(ticket); }
+  pinAcceptance(ticket:string):void { validateEvidenceTicket(ticket);this.db.prepare("INSERT OR IGNORE INTO evidence_acceptance_pins VALUES (?)").run(ticket); }
+  private permanentPin(ticket:string):boolean {return !!this.db.prepare('SELECT 1 FROM evidence_pins WHERE ticket=?').get(ticket);}
+  private pinned(ticket: string): boolean { return this.permanentPin(ticket) || !!this.db.prepare('SELECT 1 FROM evidence_acceptance_pins WHERE ticket=?').get(ticket); }
   private protectCapacity(ticket: string, runId: string, bytes: number): void {
     if (this.pinned(ticket)) {
       const retained = Number(this.db.prepare("SELECT COALESCE(SUM(bytes),0) AS n FROM evidence_bundles WHERE ticket=? AND run_id!=?").get(ticket, runId)!.n);
@@ -200,7 +203,7 @@ export class EvidenceStore {
     }
     // Pending manifests reserve their complete declared size. Excluding this
     // run permits exact retries without charging its reservation twice.
-    const protectedBytes = Number(this.db.prepare("SELECT COALESCE(SUM(b.bytes),0) AS n FROM evidence_bundles b LEFT JOIN evidence_pins p ON p.ticket=b.ticket WHERE (p.ticket IS NOT NULL OR b.committed IS NULL) AND NOT (b.ticket=? AND b.run_id=?)").get(ticket, runId)!.n);
+    const protectedBytes = Number(this.db.prepare("SELECT COALESCE(SUM(b.bytes),0) AS n FROM evidence_bundles b LEFT JOIN evidence_pins p ON p.ticket=b.ticket LEFT JOIN evidence_acceptance_pins a ON a.ticket=b.ticket WHERE (p.ticket IS NOT NULL OR a.ticket IS NOT NULL OR b.committed IS NULL) AND NOT (b.ticket=? AND b.run_id=?)").get(ticket, runId)!.n);
     if (protectedBytes + bytes > this.limits.totalBytes) throw new Error("Protected evidence and pending uploads fill the total cap; retain this upload for retry");
   }
 
@@ -389,13 +392,15 @@ export class EvidenceStore {
       }
       for (const r of this.db.prepare("SELECT DISTINCT ticket FROM evidence_bundles").all()) {
         const ticket = String(r.ticket);
-        if (this.pinned(ticket)) continue;
+        if (this.permanentPin(ticket)) continue;
         let state: boolean | undefined;
         // A lookup that fails says nothing: the ticket keeps its Done clock and its bundles.
         try { state = done(ticket); } catch { continue; }
+        if(state===true)this.db.prepare("DELETE FROM evidence_acceptance_pins WHERE ticket=?").run(ticket);
         if (state === true) this.db.prepare("INSERT OR IGNORE INTO evidence_done VALUES (?,?)").run(ticket, now);
         else if (state === false) this.db.prepare("DELETE FROM evidence_done WHERE ticket=?").run(ticket);
         else {
+          if(this.pinned(ticket))continue;
           this.db.prepare("DELETE FROM evidence_done WHERE ticket=?").run(ticket);
           for (const old of this.db.prepare("SELECT run_id FROM evidence_bundles WHERE ticket=? AND created<?").all(ticket, now - this.limits.unknownRetentionMs)) {
             this.remove(ticket, String(old.run_id)); deleted++;

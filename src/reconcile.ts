@@ -1,3 +1,5 @@
+import type { StagePlan, StageSubmission, StageRecord } from "./stage-results.js";
+import { retainedStageFiles } from "./stage-result-files.js";
 // Cycle reconciliation: forward auto-advance and backward rework routing.
 //
 // Both functions share a structural invariant: they perform mutations
@@ -78,6 +80,8 @@ import type { InheritedTicketOptions, InheritedTicketResult } from "./inherited-
  * tests pass a mock without `as any` casting).
  */
 export interface ReconcileClient {
+  beginStage?: (issue: number, plan: StagePlan) => Promise<StageRecord>;
+  completeStage?: (issue: number, result: StageSubmission) => Promise<StageRecord>;
   getItemsByStatus(status: string): Promise<ProjectItem[]>;
   updateItemStatus(itemId: string, newStatus: string): Promise<void>;
   removeLabel(issueNumber: number, label: string): Promise<void>;
@@ -1017,6 +1021,15 @@ export async function runRealClaudeGateExecution(
       }
       const flakyTracking = flaky.length > 0 && options.recordFlakySightings
         ? describeFlakySightings(flaky, flakySightings, flakyShape) : undefined;
+      if(client.completeStage && (verdict==="pass" || verdict==="flaky-pass" || verdict==="inherited-pass")) {
+        const result=await client.completeStage(candidate.issueNumber,{version:1,candidate:report.headSha,
+          checks:[{name:"live-acceptance",outcome:"passed",evidence:JSON.stringify({verdict,reason,report,acceptedInherited:accepted??[]})}],
+          files:retainedStageFiles(report.evidenceDir,report.requiredArtifacts??[])});
+        await client.addComment(candidate.issueNumber,formatGateEvidenceComment({verdict,reason,report,minExecuted,
+          action:result.acceptance?.reason??"Stage result recorded",introduced,preExisting,flaky}));
+        client.clearItemsCache();
+        return;
+      }
       const artifactsPending = freshLabels.includes("needs-live-artifacts")
         && (verdict === "pass" || verdict === "flaky-pass" || verdict === "inherited-pass");
       const acceptedList = (accepted ?? []).map(t => `\`${t.name}\` (tracked on #${t.issue})`).join(", ");

@@ -147,7 +147,7 @@ def request(action,body):
     return data
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('action',choices=['request','read','await','evidence','investigate'])
+    p=argparse.ArgumentParser();p.add_argument('action',choices=['request','read','await','evidence','stages','investigate'])
     p.add_argument('value',nargs='?');p.add_argument('--request-file');p.add_argument('--out');p.add_argument('--timeout',type=int,default=3600)
     p.add_argument('--run');p.add_argument('--limit',type=int,default=5)
     a=p.parse_args()
@@ -157,6 +157,8 @@ def main():
         if receipt.get('status')!='assessment-queued' or receipt.get('executed')!=0 or not isinstance(receipt.get('id'),str) or not HASH.fullmatch(receipt['id']):raise RuntimeError('Invalid investigation acknowledgement')
         print(json.dumps(receipt));return
     if not a.value or a.request_file:p.error('provide the task or ticket value')
+    if a.action=='stages':
+        print(json.dumps(request('stage-results',{'ticket':a.value})));return
     if a.action=='evidence':
         print(json.dumps(evidence(a.value,a.out,a.run,a.limit)));return
     if a.action=='request':

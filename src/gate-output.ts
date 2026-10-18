@@ -1372,6 +1372,8 @@ export function buildBaselineCommand(template: string, filter: string, load = ""
  * read when auditing that decision.
  */
 export interface GateRunReport {
+  /** Exact capture outputs declared before this run. */
+  requiredArtifacts?: string[];
   /** Format needed to recover structured evidence from retained raw output. */
   outputFormat?: GateOutputFormat;
   /** Named live acceptance from the pull request and the fork, kept for full

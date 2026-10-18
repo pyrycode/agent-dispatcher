@@ -375,7 +375,7 @@ async function legacyWorktreeCases(t: import('node:test').TestContext, root: str
   };
   const accepted = async (f: Awaited<ReturnType<typeof fixture>>, force: boolean, ctx = f.builder()) => {
     const head = git('rev-parse', `feature/${f.number}`);
-    assert.deepEqual(await setupBranchAndWorktree(ctx), { ok: true });
+    assert.deepEqual(await setupBranchAndWorktree(ctx), { ok: true }, f.comments.join("\n"));
     assert.equal(ctx.worktreeDir, worktreePath(repo, `builder-${f.number}`));
     if (f.path !== ctx.worktreeDir) assert.equal(existsSync(f.path), false, 'the legacy tree is gone');
     assert.deepEqual(gitAt(ctx.worktreeDir, 'status', '--porcelain', '--untracked-files=all'), '', 'the new tree is fresh');
