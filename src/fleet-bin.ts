@@ -36,7 +36,7 @@ function shutdownDeadline(seconds: unknown): number {
 }
 async function main(): Promise<void> {
   const [command, configPath, ...args] = process.argv.slice(2);
-  if (!configPath || !["storage", "handoff-verifier", "workflow", "control", "recovery-task", "claims", "manager", "status", "runner", "codex", "desired", "attention", "report-attention", "pause", "coordination", "recovery", "drain", "resume", "stop", "start", "desired-state", "drain-project", "resume-project", "free"].includes(command)) {
+  if (!configPath || !["storage", "machine-recovery", "handoff-verifier", "workflow", "control", "recovery-task", "claims", "manager", "status", "runner", "codex", "desired", "attention", "report-attention", "pause", "coordination", "recovery", "drain", "resume", "stop", "start", "desired-state", "drain-project", "resume-project", "free"].includes(command)) {
     throw new Error("Usage: fleet-bin.ts claims|manager|status|runner|codex|recovery|drain|resume|stop|start|desired-state|drain-project|resume-project|free CONFIG [claude|codex|local | PROJECT | --machine MACHINE|--all-machines [--project PROJECT] | TICKET GENERATION --confirmed-stopped]");
   }
   const config = JSON.parse(readFileSync(configPath, "utf8"));
@@ -97,6 +97,30 @@ async function main(): Promise<void> {
     }
     const claims = new JsonClient(config.claimsUrl,secret(config.claimsOperatorTokenEnv ?? config.claimsTokenEnv));
     console.log(JSON.stringify(await claims.call('/tasks/'+args[0],body)));
+    return;
+  }
+  if (command === 'machine-recovery') {
+    const action = args[0];
+    if (action === 'inspect-paths') {
+      if (args.length !== 2) throw new Error('Provide the saved local path list');
+      const input = JSON.parse(readFileSync(args[1],'utf8'));
+      const paths: unknown = Array.isArray(input) ? input : input.paths;
+      const before = Array.isArray(input) ? undefined : input.dispatcherStarted;
+      if (before !== undefined && (typeof before !== 'number' || !Number.isFinite(before) || before <= 0 || before > Date.now())) throw new Error('Invalid dispatcher process identity');
+      if (!Array.isArray(paths) || !paths.length || paths.some(p => typeof p !== 'string' || !p.startsWith('/'))) throw new Error('Invalid local path list');
+      process.env.DOTENV_CONFIG_QUIET = 'true';
+      const {processesUsingPath} = await import('./dispatch.js');
+      const {stoppedPathUsers} = await import('./machine-recovery.js');
+      const stopped = stoppedPathUsers(paths as string[],before,processesUsingPath,pid => {
+        const text = execFileSync('ps',['-p',String(pid),'-o','lstart='],{encoding:'utf8'}).trim();
+        return Date.parse(text);
+      });
+      console.log(JSON.stringify({stopped}));
+      return;
+    }
+    if (!['read','release','clear'].includes(action) || args.length !== (action === 'read' ? 1 : 2)) throw new Error('Usage: machine-recovery CONFIG read | release RECEIPT.json | clear DECISION.json');
+    const client = new JsonClient(config.claimsUrl,secret(config.claimsOperatorTokenEnv ?? config.claimsTokenEnv));
+    console.log(JSON.stringify(await client.call('/machine-recovery/'+action,action === 'read' ? {} : JSON.parse(readFileSync(args[1],'utf8')))));
     return;
   }
   if(command==='handoff-verifier') {

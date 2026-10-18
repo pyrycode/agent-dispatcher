@@ -2,7 +2,7 @@
 
 Managed mode adds one manager per physical computer and one shared claim service. The existing project dispatchers still own their stages, blockers, tool environments and agent runs. This is opt-in. Do not run an independent dispatcher against a board that managed computers share.
 
-The claim service uses SQLite on its own local disk. It grants a ticket and the computer's capacity in one transaction. There is no distributed database, heartbeat expiry or automatic failover. A service outage prevents new starts. An existing run can finish, but its reservation remains until the finish is acknowledged.
+The claim service uses SQLite on its own local disk. It grants a ticket and the computer's capacity in one transaction. There is no distributed database or heartbeat expiry. Confirmed stopped dispatchers can recover through the supervisor, as described under Stopped-computer recovery. A service outage prevents new starts. An existing run can finish, but its reservation remains until the finish is acknowledged.
 
 ## Central fleet runner
 
@@ -643,9 +643,9 @@ Before central desired state, the project policy was saved atomically in the man
 
 The operator client can use a separate `managerUrl` configuration, or the manager configuration's `socketPath` when run from the manager's working directory. Only the operator credential can change a project policy. The manager must be able to write its own configuration directory. If saving fails, the command reports an error and leaves admission unchanged.
 
-Tickets remain owned between stages and while offline. Normal completion retains ownership too, so reopening a ticket keeps its previous computer. Use `free` to transfer it. The command requires the current generation from status and explicit confirmation that the old dispatcher, watcher and subprocesses are stopped or disabled. It does not delete working copies, clear error labels, move board items or kill remote processes. Freeing is deliberately manual.
+Tickets remain owned between stages and while offline. Normal completion retains ownership too, so reopening a ticket keeps its previous computer. Use `free` to transfer it. The command requires the current generation from status and explicit confirmation that the old dispatcher, watcher and subprocesses are stopped or disabled. It does not delete working copies, clear error labels, move board items or kill remote processes. Manual freeing remains available. The stopped-computer recovery path below can release an ordinary ticket after local process proof and retention checks.
 
-A dispatcher crash leaves all its active reservations occupied. After checking that its children have stopped, free those tickets individually and restart. A clean manager restart preserves grants for the same still-running dispatcher sessions. A new dispatcher session never adopts an old session's live grant. If a grant response is lost, retry uses the same identifier and recovers the existing reservation.
+A dispatcher crash leaves all its active reservations occupied. The local supervisor can recover eligible ordinary tickets after proving its children stopped. Otherwise, inspect and free those tickets individually before restarting. A clean manager restart preserves grants for the same still-running dispatcher sessions. A new dispatcher session never adopts an old session's live grant. If a grant response is lost, retry uses the same identifier and recovers the existing reservation.
 
 Back up SQLite using its online backup facilities, or stop the claim service and copy the database together with any WAL state. Restoring an older database requires stopping every worker and reconciling ownership before any start. Never bring up a second independent claim database against the same boards.
 
@@ -1000,3 +1000,86 @@ The fresh assessment uses current native execution capabilities. Classified huma
 ## Workflow authority
 
 Imported projects use the central database for workflow decisions. See [workflow authority](workflow-authority.md) for migration, operator commands, compatibility and display publication. Update controllers and consumers before import. Preserve existing project drains and ticket reservations.
+
+
+## Stopped-computer recovery
+
+The supervisor checks ordinary ticket reservations on every watchdog pass. It
+can release a stopped builder, refiner, verifier or other ordinary ticket role
+without waiting for the two-hour silence threshold. Silence still raises
+attention only. Failed contact and an old heartbeat never establish stopping.
+An entirely unreachable computer requires an operator to establish that its
+processes cannot continue before the existing manual recovery command is used.
+
+The local adapter must confirm that the dispatcher and child groups stopped.
+On Linux, a fresh successful container inspection must show a stopped container
+with no process. Inspection errors are uncertainty. On macOS, a private process
+environment census must find no process using the project, agents directory or
+retained ticket trees. The existing strict open-file observer must also find no
+process using those paths, apart from independent readers proven to predate
+the recorded dispatcher. Unknown process identities remain blocked. No worker
+is killed by recovery.
+
+Before release, a private receipt under the supervisor's
+`machine-recovery/` directory inventories the existing working copies, their
+commits, dirty-state digests and log directory. Source, uncommitted files,
+captures, branches and logs stay in their original directories. They are not
+copied or deleted. This works without duplicating build outputs on a full disk.
+An unreadable tree or failure to save the receipt prevents release.
+
+The authority checks the exact run, session, ownership generation and workflow
+revision. The source must be configured to run and take work. Holds, errors,
+pending verdicts, dependencies, actual safety rejections, open support tasks,
+pending splits and controlled verification handoffs prevent this release.
+Previously transferred pinned verification candidates use their existing
+specialised recovery. Another recently reporting computer must serve the
+project, satisfy its ticket requirements and be configured to run and take work.
+
+One transaction ends only the confirmed stopped attempt, removes its running
+marker and claim, records retention evidence and gives the ticket recovery
+priority. Stage, requirements, review counts, blockers and all other controls
+remain intact. Normal admission chooses a replacement under its usual capacity,
+role and runner limits. It retries the interrupted stage from the published
+branch, or main when no branch was published, and runs fresh checks. Unpublished
+source work stays on the original computer for reconciliation. No earlier
+passing check replaces verification on the replacement computer.
+
+The entire source project receives a separate recovery hold. It cannot acquire
+new work, and its supervisor does not restart its dispatcher. Saved operator
+run and drain settings do not change. This prevents a stale original attempt
+from resuming and protects its retained files. Other projects can continue.
+Receipts and holds survive service restarts. An uncertain release response is
+reconciled before another request is formed.
+
+Inspect recovery records through the protected operator:
+
+```sh
+operator.sh machine-recovery read
+operator.sh attention
+```
+
+After fixing the computer and reconciling its retained source and evidence,
+write a private decision naming every current recovery receipt for that source
+project. Clearing requires the central operator credential and refuses a
+superseded decision that omits a newer failure:
+
+```json
+{
+  "machine": "macbook",
+  "project": "pyrycode/pyrycode-mobile",
+  "ids": ["stopped-EXACT-RECEIPT-ID"]
+}
+```
+
+```sh
+operator.sh machine-recovery clear /absolute/path/decision.json
+```
+
+Clearing only this recovery hold preserves deliberate stops and drains. It does
+not restore an old ticket claim or delete retained files. The existing supervisor
+health latch can still require separate inspection before restart.
+
+Roll out the central service first, followed by all machine managers and
+supervisors. This feature lives in the controllers. Consumer pin updates are not
+required. An old controller reports the reservation for manual inspection until
+it is upgraded. Never clear real reservations as a deployment shortcut.

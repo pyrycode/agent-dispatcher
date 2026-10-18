@@ -11,6 +11,7 @@ holds the task as running or in attention, and keeps every file. Everything
 else becomes an attention item.
 """
 import copy
+import importlib.util
 import json
 import os
 import re
@@ -237,6 +238,11 @@ class Watchdog:
         machine = status.get('machine', '')
         runs = [r for r in status.get('runs', []) if isinstance(r, dict) and r.get('machine') == machine]
         items = []
+        recovery_source = Path(__file__).with_name('fleet-machine-recovery.py')
+        if recovery_source.is_file():
+            spec = importlib.util.spec_from_file_location('fleet_machine_recovery', recovery_source)
+            recovery = importlib.util.module_from_spec(spec); spec.loader.exec_module(recovery)
+            items.extend(recovery.tick(self.adapter, self.config, status, self.housekeeping))
         if self.rejected:
             items.append({'kind': 'error', 'subject': 'watchdog configuration', 'action': 'attention',
                           'reason': 'Watchdog settings ignored, defaults used instead: ' + ', '.join(sorted(map(str, self.rejected)))[:300] + '.'})

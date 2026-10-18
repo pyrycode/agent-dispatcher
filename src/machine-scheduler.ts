@@ -164,7 +164,8 @@ export function scheduleMachine(opts: {
   const reviewQueueFull = () => reviewLimit > 0 && opts.state.reviewReadyTickets !== undefined && waitingReview.size >= reviewLimit;
   const rank = new Map(opts.projects.map((p, i) => [p, i]));
   const priorityHigh = new Set(opts.state.priorityHighTickets ?? []);
-  const ready = opts.offers.filter(o => rank.has(o.project) && (!claims.has(o.ticket) || claims.get(o.ticket)!.machine === opts.machine)
+  const recoveryHeld = new Set((opts.state.machineRecoveries ?? []).filter(r => r.machine === opts.machine && r.cleared === undefined).map(r => r.project));
+  const ready = opts.offers.filter(o => !recoveryHeld.has(o.project) && !recoveryHeld.has(o.parentTicket?.split('#')[0] ?? '') && rank.has(o.project) && (!claims.has(o.ticket) || claims.get(o.ticket)!.machine === opts.machine)
     && acceptsDuringProjectDrain(o, opts.machine, opts.drainingProjects ?? [], opts.state)
     && !(opts.drainedProjects ?? []).some(p => o.project === p || o.parentTicket?.split("#")[0] === p));
   ready.sort((a, b) => {

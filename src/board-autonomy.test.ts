@@ -42,7 +42,10 @@ test('supervisor reports are machine-scoped and contain no executable or ownersh
 
 test('operation reports accept every phase the supervisor writes', async t => {
   const source = readFileSync(join(import.meta.dirname, '..', 'scripts', 'fleet-supervisor.py'), 'utf8');
-  const written = new Set([...source.matchAll(/'phase'\]?\s*[:=]\s*'([a-z-]+)'/g)].map(m => m[1]));
+  // Storage observations in main have their own schema. Operation phases
+  // are written by Supervisor, before the executable's main loop.
+  const operations = source.slice(source.indexOf('class Supervisor:'),source.indexOf('\ndef main('));
+  const written = new Set([...operations.matchAll(/'phase'\]?\s*[:=]\s*'([a-z-]+)'/g)].map(m => m[1]));
   assert.ok(written.has('waiting-for-native-task'));
   assert.deepEqual([...written].filter(phase => !OPERATION_PHASES.includes(phase)), []);
   const store = new FleetStore(':memory:', {linux:{heavyLimit:1,combinedLimit:2}});
