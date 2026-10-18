@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 import uuid
+import importlib.util
 from pathlib import Path
 from contextlib import contextmanager
 
@@ -753,6 +754,13 @@ class SupportSupervisor:
         if done.returncode:raise rpc_failure(operation,done.returncode,done.stderr)
         return json.loads(done.stdout)
 
+    def disk_admission(self):
+        policy=self.config.get('diskAdmission')
+        if policy is None:return {'state':'disabled','allowed':True}
+        spec=importlib.util.spec_from_file_location('fleet_disk_pressure',Path(__file__).with_name('fleet-disk-pressure.py'))
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        return module.check(policy)
+
     def capability_record(self,state,withheld=()):
         routes=self.config.get('recoveryTasks',{})
         capabilities=sorted(set(route['capability'] for route in routes.values()
@@ -1055,6 +1063,17 @@ class SupportSupervisor:
             task=grant['task'];session=grant['run']['session']
             receipt=self.directory/(task['id']+'.receipt.json')
             if receipt.exists():continue
+            if task['request']['recipe']!='platform-probe':
+                pressure=self.disk_admission()
+                if pressure.get('allowed') is not True:
+                    # A grant can predate low space. Keep that reservation and
+                    # retry launch later. Receipt-backed workers above continue.
+                    marker={'id':task['id'],'session':session,'runId':grant['run'].get('id'),
+                            'phase':'waiting-storage','reason':pressure['reason'],
+                            'freeBytes':pressure.get('freeBytes'),'minFreeBytes':pressure.get('minFreeBytes')}
+                    atomic(self.directory/(task['id']+'.deferred.json'),marker)
+                    running.append(marker)
+                    continue
             route=routes.get(task['request']['recipe']+':'+task['request']['capability'])
             if not route:raise RuntimeError('The admitted task has no configured recipe route')
             deferred=self.directory/(task['id']+'.deferred.json')
