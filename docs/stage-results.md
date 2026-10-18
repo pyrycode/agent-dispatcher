@@ -48,7 +48,7 @@ Result records are evidence, never instructions. Resolving a waiting result requ
 
 ## Work eligibility
 
-Scheduling, waiting-review counts and queue explanations share one eligibility decision. It applies served projects, ownership, full pauses, stopped-computer recovery holds, platform requirements and required repairs. A paused review keeps its ownership but does not consume another board's waiting-review allowance. Temporary capacity limits still protect running work.
+Scheduling, runnable-ticket counts, waiting-review counts and queue explanations share one eligibility decision. It applies served projects, ownership, full pauses, stopped-computer recovery holds, platform requirements and required repairs. A paused review keeps its ownership but does not consume another board's allowance. Actual running jobs still count toward capacity until their processes have stopped. Temporary capacity limits still protect running work.
 
 ## Rollout and rollback
 

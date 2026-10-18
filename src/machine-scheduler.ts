@@ -77,11 +77,11 @@ export function acceptsDuringProjectDrain(offer: WorkOffer, machine: string, dra
 }
 
 /** Count runnable ownership, not persistent claims for completed or blocked tickets. */
-export function runnableTickets(machine: string, offers: readonly WorkOffer[], state: FleetSnapshot): Set<string> {
+export function runnableTickets(machine: string, offers: readonly WorkOffer[], state: FleetSnapshot, policy?: EligibilityPolicy): Set<string> {
   const owned = new Set(state.claims.filter(c => c.machine === machine).map(c => c.ticket));
   return new Set([
     ...state.runs.filter(r => r.machine === machine).map(r => r.ticket),
-    ...offers.filter(o => owned.has(o.ticket) && !idleAssessment(o, state)).map(o => o.ticket),
+    ...offers.filter(o => owned.has(o.ticket) && !idleAssessment(o, state) && (!policy || !workEligibility(o, state, policy))).map(o => o.ticket),
   ].filter(ticket => /#[1-9]\d*$/.test(ticket)));
 }
 
@@ -170,7 +170,7 @@ export function scheduleMachine(opts: {
   // Heavy places a project may still take here, for projects with their own limit.
   const projectHeavy = new Map(Object.entries(opts.projectHeavyLimits ?? {}).map(([project, limit]) =>
     [project, Math.max(0, limit - localRuns.filter(r => r.resource === "heavy" && heavyProject(r) === project).length)]));
-  const runnable = runnableTickets(opts.machine, opts.offers, opts.state);
+  const runnable = runnableTickets(opts.machine, opts.offers, opts.state, opts);
   let ticketPlaces = Math.max(0, (opts.ticketLimit ?? Infinity) - runnable.size);
   const reviewLimit = effectiveReviewQueueLimit(opts);
   // A ticket leaves the queue once a run selected here takes it.
