@@ -2779,6 +2779,29 @@ describe("handleAgentResultErrors", () => {
     assert.ok(!calls.spawn.some(c => c.cmd === "gh" && c.args.includes("create")));
   });
 
+  test("capture created by a successful salvage gate remains local before automatic staging or push", async () => {
+    let gateRan = false;
+    const { ctx, client, calls } = makeTestContext({
+      agent: { name: "builder", producesCommits: true }, item: { issueNumber: 3583 },
+      mockOptions: { execImpls: {
+        "gh pr list --head": () => "[]",
+        "git status --porcelain": () => gateRan
+          ? " M source.go\0?? testdata/capture/generated.jsonl\0" : " M source.go\0",
+        "capture-producing-test-gate": () => { gateRan = true; return ""; },
+      } },
+    });
+    ctx.deps.salvageGates = ["capture-producing-test-gate"];
+    await assert.rejects(handleAgentResultErrors(
+      streamResult({ isError: true, terminalReason: "", timedOut: true }), ctx,
+    ), /Agent error/);
+    assert.equal(gateRan, true);
+    assert.equal(ctx.publicationHeld, true);
+    assert.ok(client.addLabelCalls.some(c => c.label === "held:unreviewed-capture"));
+    assert.ok(!calls.exec.some(c => c.cmd === AUTO_STAGE_COMMAND));
+    assert.ok(!calls.spawn.some(c => c.cmd === "git" && ["commit", "push"].includes(c.args[0]!)));
+    assert.ok(!calls.spawn.some(c => c.cmd === "gh" && c.args.includes("create")));
+  });
+
   test("isError=false → returns false (no salvage, success path runs)", async () => {
     const { ctx, client, calls } = makeTestContext({ item: { issueNumber: 300 } });
 
@@ -12005,6 +12028,29 @@ describe("partial-work salvage — stopped run with an existing PR (mobile #1430
       });
     }
   }
+
+  test("gate-created capture keeps the failed dispatch worktree without fallback publication", async () => {
+    let gateRan = false;
+    const { agent, item, client, deps, calls } = stoppedRun({
+      issue: 3583, agent: { name: "builder", column: "In Development", producesCommits: true },
+      stop: { result: streamResult({ isError: true, timedOut: true, terminalReason: "", sessionId: "" }) },
+      exec: {
+        "gh pr list --head": () => "[]",
+        "git status --porcelain": () => gateRan
+          ? " M source.go\0?? testdata/capture/generated.jsonl\0" : " M source.go\0",
+        "capture-producing-test-gate": () => { gateRan = true; return ""; },
+      },
+    });
+    deps.salvageGates = ["capture-producing-test-gate"];
+    await dispatchToAgent(agent, item, client, deps);
+    assert.equal(gateRan, true);
+    assert.equal(commitOf(calls), undefined);
+    assert.equal(pushOf(calls), undefined);
+    assert.ok(!calls.exec.some(c => c.cmd === AUTO_STAGE_COMMAND));
+    assert.ok(!cleanupRan(calls.exec));
+    assert.ok(client.addLabelCalls.some(c => c.label === "held:unreviewed-capture"));
+    assert.ok(!client.addLabelCalls.some(c => c.label === "done:builder"));
+  });
 
   for (const shape of ["untracked", "staged", "rename", "committed", "history-deleted"] as const) {
     test(`capture privacy: ${shape} fixture holds publication without relying on a ticket label`, async () => {
