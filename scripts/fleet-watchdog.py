@@ -471,15 +471,19 @@ class Watchdog:
                 continue
             key = task + ':deferred'
             seen.add(key)
-            since = self.phase_since(state, key, 'deferred', now)
+            phase = 'waiting-storage' if saved.get('phase') == 'waiting-storage' else 'deferred'
+            since = self.phase_since(state, key, phase, now)
             progress[task] = since
             limit = self.settings['deferredSeconds']
             if now - since > limit:
-                items.append({'kind': 'stalled', 'subject': task, 'ticket': str(run.get('parentTicket', '')), 'phase': 'deferred',
+                reason = ('Its grant is waiting for confirmed free disk space. It keeps its reservation until the storage check allows launch.'
+                          if phase == 'waiting-storage' else
+                          'Its grant was deferred while its container was updating and it has not started within '
+                          + str(int(limit // 60)) + ' min. It keeps its reservation until the update completes.')
+                items.append({'kind': 'stalled', 'subject': task, 'ticket': str(run.get('parentTicket', '')), 'phase': phase,
                               'since': since, 'lastProgress': since, 'limitSeconds': int(limit), 'worker': 'not-started',
                               'action': 'attention',
-                              'reason': 'Its grant was deferred while its container was updating and it has not started within '
-                                        + str(int(limit // 60)) + ' min. It keeps its reservation until the update completes.'})
+                              'reason': reason})
 
     def dispatcher_runs(self, now, runs, items, progress):
         projects = self.config.get('projects', {})

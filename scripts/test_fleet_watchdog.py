@@ -354,6 +354,30 @@ class DeadOrSilentWorkers(unittest.TestCase):
             self.assertEqual((item['phase'], item['worker'], item['ticket']), ('deferred', 'not-started', 'pyrycode/pyrycode-desktop#1809'))
 
 
+class StorageDeferredGrant(unittest.TestCase):
+    def test_low_space_wait_is_reported_without_releasing_its_existing_reservation(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Fleet(d)
+            marker = f.support.directory / (ORPHAN + '.deferred.json')
+            saved = {'id': ORPHAN, 'session': 'scheduler', 'runId': 'disk-wait', 'phase': 'waiting-storage'}
+            m.atomic(marker, saved)
+            reservation = {'id': 'disk-wait', 'machine': 'pyrybox', 'supportTaskId': ORPHAN,
+                           'parentTicket': 'pyrycode/pyrycode-desktop#1809', 'resource': 'heavy', 'created': FINISHED * 1000}
+            f.state['runs'].append(reservation.copy())
+            self.assertEqual(f.watchdog.tick({}), [])
+            f.now[0] += 3601
+            [item] = f.watchdog.tick({})
+            self.assertEqual((item['phase'], item['worker'], item['action']), ('waiting-storage', 'not-started', 'attention'))
+            self.assertIn('free disk space', item['reason'])
+            self.assertNotIn('container', item['reason'])
+            self.assertEqual(f.state['runs'], [reservation])
+            self.assertEqual(json.loads(marker.read_text()), saved)
+            self.assertEqual(f.ops('complete'), [])
+            # A genuine change of waiting cause starts its own observation window.
+            m.atomic(marker, {**saved, 'phase': 'deferred', 'container': 'core'})
+            self.assertEqual(f.watchdog.tick({}), [])
+
+
 class DispatcherRunsAndStarvation(unittest.TestCase):
     def dispatcher_run(self, f, ticket='pyrycode/pyrycode#3324', role='builder', created=FINISHED - 9000, log_at=None, project='pyrycode/pyrycode'):
         logs = Path(f.config['projects'][project]['agents']) / 'logs'; logs.mkdir(parents=True, exist_ok=True)
