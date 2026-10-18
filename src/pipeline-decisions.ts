@@ -1975,6 +1975,8 @@ export function isPipelineLabelForAgent(label: string, agentName: string): boole
   return PIPELINE_LABEL_PREFIXES.some((p) => label === p + agentName);
 }
 
+export const CAPTURE_PUBLICATION_HOLD_LABEL = "held:unreviewed-capture";
+
 /**
  * Pipeline labels that block dispatch for ALL agents (not scoped to a
  * specific agent's name). Until any of these is stripped, no agent should
@@ -2007,6 +2009,9 @@ export function isPipelineLabelForAgent(label: string, agentName: string): boole
  * developer on a ticket the architect had already specced.
  */
 export const GLOBAL_BLOCK_LABELS: ReadonlySet<string> = new Set([
+  CAPTURE_PUBLICATION_HOLD_LABEL,
+  // Protected task custody must stay out of normal stage selection.
+  "held:operator",
   "error:max_turns_salvaged",
   "error:merge-conflict",
   // Rework routing leaves the ticket in its current column at the threshold.

@@ -1120,7 +1120,7 @@ export class FleetStore {
       const recoveryFiling = item.body.match(/<!-- orchestrator-filing:recovery-split:([a-f0-9-]{36}):[a-z][a-z0-9-]* -->/);
       if (recoveryFiling && this.splits.get(recoveryFiling[1])?.state === 'preparing') return {ok:false,reason:'locked'};
       const columns:Record<string,string>={po:'Backlog',refiner:'Backlog',architect:'In Architecture',developer:'In Development',builder:'In Development',qa:'In QA','code-review':'In Code Review',verifier:'In Code Review',documentation:'In Documentation'};
-      if(columns[req.role] && (item.state!=='OPEN' || item.status!==columns[req.role] || item.labels.some(l=>l.startsWith('error:')||l.startsWith('needs-rework:')||(l.startsWith('wip:')&&!isRepairWip(l))||l.startsWith('needs-human:')&&l!=='needs-human:sizing') || item.blockedBy.some(b=>b.state==='OPEN'))) return {ok:false,reason:'locked'};
+      if(columns[req.role] && (item.state!=='OPEN' || item.status!==columns[req.role] || item.labels.some(l=>l.startsWith('held:')||l.startsWith('error:')||l.startsWith('needs-rework:')||(l.startsWith('wip:')&&!isRepairWip(l))||l.startsWith('needs-human:')&&l!=='needs-human:sizing') || item.blockedBy.some(b=>b.state==='OPEN'))) return {ok:false,reason:'locked'};
       // A ticket split off by a run that is still active waits for that run,
       // which may still be writing its labels, priority and board order.
       // Bounded, so a creator whose computer went away cannot hold its

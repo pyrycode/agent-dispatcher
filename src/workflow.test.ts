@@ -90,6 +90,21 @@ function fixture(t: TestContext) {
   });
   return { store, path };
 }
+for (const label of ["held:unreviewed-capture", "held:operator"]) {
+  for (const role of ["builder", "verifier"]) {
+    test(`authoritative ${label} blocks ${role}, permits inspection, and resumes only after protected release`, t => {
+      const {store}=fixture(t);
+      store.workflow.import(config,[{...item(),status:role==="builder"?"In Development":"In Code Review",labels:[label]}]);
+      assert.deepEqual(store.start({...run(role),id:"held-request"}),{ok:false,reason:"locked"});
+      assert.equal(store.start({...run("recovery"),resource:"heavy",id:"inspection"}).ok,true,"read-only recovery remains admitted");
+      store.finish("mac","s","inspection");
+      const current=store.workflow.get("org/mobile#1947");
+      store.workflowOperator("org/mobile#1947",{removeLabels:[label]},"reviewed-release",current.revision);
+      assert.equal(store.start({...run(role),id:"after-release"}).ok,true);
+    });
+  }
+}
+
 test("1947 completes and routes for rework while GitHub is unavailable", async (t) => {
   const { store } = fixture(t);
   store.workflow.import(config, [item()]);

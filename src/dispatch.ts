@@ -211,6 +211,7 @@ import {
   FAMILY_DISPATCH_COMMENT_MARKER,
   FAMILY_DISPATCH_COUNT_PREFIX,
   decideBaselineAdjustedVerdict,
+  CAPTURE_PUBLICATION_HOLD_LABEL,
 } from "./pipeline-decisions.js";
 import { isTestdataPath, snapshotTestdata, changedTestdata, restoreGateTestdata, gateTestdataComment, type TestdataSnapshot } from "./gate-fixtures.js";
 import {
@@ -5277,7 +5278,7 @@ async function holdUnreviewedCapturePublication(ctx: DispatchContext, cwd: strin
   ctx.publicationHeld = true;
   ctx.deps.writeLog(ctx.logFile, "PARTIAL_PUBLICATION_HELD", reason);
   console.warn(`   ⏸️ Partial work for #${ctx.item.issueNumber} retained locally for capture review`);
-  try { await ctx.client.addLabel(ctx.item.issueNumber, "held:unreviewed-capture"); }
+  try { await ctx.client.addLabel(ctx.item.issueNumber, CAPTURE_PUBLICATION_HOLD_LABEL); }
   catch { ctx.deps.writeLog(ctx.logFile, "PARTIAL_PUBLICATION_HOLD_FAILED", "The publication hold could not be recorded; local work is still preserved."); }
   try {
     await ctx.client.addComment(ctx.item.issueNumber,
