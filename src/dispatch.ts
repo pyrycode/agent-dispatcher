@@ -3176,7 +3176,7 @@ async function dispatchWithContext(ctx: DispatchContext, outcome: { value: strin
     // publish the saved verdict and carry on as a success, or hold the
     // ticket for the next cycle. Anything else falls through and parks as
     // before. See verdict-handoff.ts (agent-dispatcher#118).
-    const recovered = !ctx.client.completeStage && !ctx.deps.managedWorktree?.run.verificationPin && ctx.verdictHandoffPath && streamResult && !saferSalvaged
+    const recovered = !(ctx.agent.name === "verifier" && ctx.client.completeStage) && !ctx.deps.managedWorktree?.run.verificationPin && ctx.verdictHandoffPath && streamResult && !saferSalvaged
       ? await recoverSavedVerdict(ctx, error?.message ?? "", streamResult.hadPermissionDenial)
       : null;
     if (recovered?.kind === "posted") {
@@ -5383,7 +5383,7 @@ function prepareVerdictHandoff(ctx: DispatchContext): string {
   } catch (e) {
     console.warn(`   ⚠️  Could not prepare the verdict handoff file ${path}: ${e}`);
   }
-  return verdictHandoffNote(path) + (ctx.client.completeStage
+  return verdictHandoffNote(path) + (ctx.agent.name === "verifier" && ctx.client.completeStage
     ? "\n\nThe saved structured verdict is the authoritative result. The orchestrator validates it and publishes the PR comment. Do not post or edit a GitHub verdict comment or apply done labels in this run. Preserve the exact reviewed commit and any required rework labels in the handoff.\n" : "");
 }
 

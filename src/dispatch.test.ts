@@ -14112,3 +14112,21 @@ test("managed verifier uses its structured result even when its only PR comment 
   assert.ok(!calls.exec.some(c=>c.cmd.includes("--json reviews,comments")),"comment timestamps are not read");
   assert.ok(!client.addLabelCalls.some(c=>c.label==="done:verifier"),"only the authority accepts completion");
 });
+
+test("classic reviews retain their saved verdict publication when the workflow client supports stage results", async () => {
+  await withStageSet("classic",async()=>{
+    const issue=1677,pr=1680,sha="a".repeat(40);
+    const client=new MockGitHubClient({status:{[issue]:"In Code Review"}});
+    (client as DispatchClient).completeStage=async()=>{throw new Error("Classic reviews do not submit a stage result");};
+    const {deps,calls}=makeMockDeps({fsMap:{[claudeMdAbsPath("code-review/CLAUDE.md")]:"role",
+      [verdictHandoffPath("code-review",issue)]:`decision: PASS\ncommit: ${sha}\nlabels:\n---\n## Review\nDecision: PASS`},
+      execImpls:{...fullHappyExecImpls(`feature/${issue}`),"git rev-parse HEAD":()=>sha,
+        "gh pr list":()=>JSON.stringify([{number:pr,isDraft:false}]),
+        "gh pr view":()=>JSON.stringify({headRefOid:sha,state:"OPEN",reviews:[],comments:client.comments.filter(c=>c.issueNumber===pr).map(c=>({createdAt:c.postedAt.toISOString(),body:c.body}))})},
+      streamResult:()=>streamResult({runner:"codex",isError:true,terminalReason:"codex_blocked",output:"Review finished with PASS but publishing the verdict comment failed with GitHub HTTP 503. The verdict is saved in the handoff file."})});
+    await dispatchToAgent({name:"code-review",column:"In Code Review",claudeMdPath:"code-review/CLAUDE.md",usesWorktree:true,producesCommits:false,requiresVerdict:true},makeProjectItem({issueNumber:issue,status:"In Code Review"}),client,deps);
+    assert.equal(client.comments.filter(c=>c.issueNumber===pr).length,1);
+    const prompt=calls.fs.find(c=>c.kind==="write"&&c.path.endsWith(`.prompt-${issue}.txt`));
+    assert.ok(!prompt?.content?.includes("The saved structured verdict is the authoritative result"));
+  });
+});
