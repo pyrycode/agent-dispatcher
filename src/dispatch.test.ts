@@ -14124,7 +14124,7 @@ test("classic reviews retain their saved verdict publication when the workflow c
         "gh pr list":()=>JSON.stringify([{number:pr,isDraft:false}]),
         "gh pr view":()=>JSON.stringify({headRefOid:sha,state:"OPEN",reviews:[],comments:client.comments.filter(c=>c.issueNumber===pr).map(c=>({createdAt:c.postedAt.toISOString(),body:c.body}))})},
       streamResult:()=>streamResult({runner:"codex",isError:true,terminalReason:"codex_blocked",output:"Review finished with PASS but publishing the verdict comment failed with GitHub HTTP 503. The verdict is saved in the handoff file."})});
-    await dispatchToAgent({name:"code-review",column:"In Code Review",claudeMdPath:"code-review/CLAUDE.md",usesWorktree:true,producesCommits:false,requiresVerdict:true},makeProjectItem({issueNumber:issue,status:"In Code Review"}),client,deps);
+    await dispatchToAgent({name:"code-review",column:"In Code Review",claudeMdPath:"code-review/CLAUDE.md",description:"Classic source review",usesWorktree:true,producesCommits:false,requiresVerdict:true},makeProjectItem({issueNumber:issue,status:"In Code Review"}),client,deps);
     assert.equal(client.comments.filter(c=>c.issueNumber===pr).length,1);
     const prompt=calls.fs.find(c=>c.kind==="write"&&c.path.endsWith(`.prompt-${issue}.txt`));
     assert.ok(!prompt?.content?.includes("The saved structured verdict is the authoritative result"));
