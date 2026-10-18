@@ -1016,7 +1016,9 @@ On Linux, a fresh successful container inspection must show a stopped container
 with no process. Inspection errors are uncertainty. On macOS, a private process
 environment census must find no process using the project, agents directory or
 retained ticket trees. The existing strict open-file observer must also find no
-process using those paths. No worker is killed by recovery.
+process using those paths, apart from independent readers proven to predate
+the recorded dispatcher. Unknown process identities remain blocked. No worker
+is killed by recovery.
 
 Before release, a private receipt under the supervisor's
 `machine-recovery/` directory inventories the existing working copies, their

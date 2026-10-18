@@ -32,6 +32,7 @@ class Tests(unittest.TestCase):
         class Adapter:
             def observe(self,project):return {'stopped':True,'childrenStopped':True}
             def operator_command(self,*args):return list(args)
+            def identity_from_receipt(self,project):return {'pid':1,'start':'Sun Oct 18 01:00:00 2026'}
             def status(self):return state
         return root,tree,cfg,state,Adapter()
 
@@ -105,6 +106,23 @@ class Tests(unittest.TestCase):
             ]:
                 def run(args):return ps if args[0]=='ps' else json.dumps(answer)
                 with patch.object(m,'run',side_effect=run):
+                    self.assertEqual(m.stopped_proof(adapter,cfg,'org/mobile',[{'path':str(tree)}]),expected)
+
+    def test_process_census_distinguishes_older_readers_and_other_projects_from_surviving_workers(self):
+        with tempfile.TemporaryDirectory() as d:
+            root,tree,cfg,_,adapter=self.fixture(d)
+            cfg['projects']['org/desktop']={'agents':str(root/'desktop-agents'),'target':str(root/'desktop')}
+            for description,text,born,expected in [
+                ('older reader',str(root/'source'),'Sat Oct 17 12:00:00 2026','native-stopped'),
+                ('current worker','AGENTS_REPO_PATH='+str(root/'agents'),'Sun Oct 18 02:00:00 2026',None),
+                ('foreign project','AGENTS_REPO_PATH='+str(root/'desktop-agents')+' DEPENDENCY='+str(root/'source'),'Sun Oct 18 02:00:00 2026','native-stopped'),
+                ('prefix is another project',str(root/'source-mobile'),'Sun Oct 18 02:00:00 2026','native-stopped'),
+            ]:
+                def run(args):
+                    if args[:2]==['ps','eww']:return str(os.getuid())+' 9 '+text+'\n'
+                    if args[0]=='ps':return born
+                    return json.dumps({'stopped':True})
+                with self.subTest(description),patch.object(m,'run',side_effect=run):
                     self.assertEqual(m.stopped_proof(adapter,cfg,'org/mobile',[{'path':str(tree)}]),expected)
 
     def test_linux_inspect_error_running_and_stopping_are_uncertainty(self):

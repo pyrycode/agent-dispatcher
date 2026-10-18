@@ -9,6 +9,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 
 ROLES = {'builder', 'developer', 'architect', 'refiner', 'po', 'verifier', 'code-review', 'qa', 'documentation'}
@@ -24,7 +25,14 @@ def atomic(path, value):
     with temporary.open('w') as stream:
         os.chmod(temporary, 0o600)
         json.dump(value, stream, sort_keys=True)
+        stream.flush()
+        os.fsync(stream.fileno())
     temporary.replace(path)
+    descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def worktrees(target, number, container_target=None):
@@ -75,17 +83,36 @@ def stopped_proof(adapter, config, project, trees):
     # Inspect all local process environments privately and check every retained
     # tree for open paths through the existing strict filesystem observer.
     roots = [cfg['agents'], cfg['target'], *[t['path'] for t in trees]]
-    rows = run(['ps', 'eww', '-axo', 'uid=,pid=,command=']).splitlines()
-    if not rows:
+    identity = adapter.identity_from_receipt(project)
+    def birth(text):
+        return time.mktime(time.strptime(text.strip(), '%a %b %d %H:%M:%S %Y')) * 1000
+    try:
+        started = birth(identity.get('start', ''))
+        if not 0 < started <= time.time() * 1000:
+            return None
+        rows = run(['ps', 'eww', '-axo', 'uid=,pid=,command=']).splitlines()
+        if not rows:
+            return None
+        patterns = [re.compile(re.escape(root) + r'(?=/|\s|$)') for root in roots]
+        foreign = [re.compile(r'(?:^| )AGENTS_REPO_PATH=' + re.escape(other['agents']) + r'(?= |$)')
+                   for name, other in config['projects'].items() if name != project and other.get('agents')]
+        for row in rows:
+            fields = row.strip().split(None, 2)
+            if len(fields) < 3 or not fields[0].isdigit() or not fields[1].isdigit():
+                return None
+            if int(fields[0]) != os.getuid() or not any(p.search(fields[2]) for p in patterns):
+                continue
+            # Only processes born with this dispatcher can be its children.
+            # Other configured projects can carry shared dependency paths.
+            if birth(run(['ps', '-p', fields[1], '-o', 'lstart='])) < started:
+                continue
+            if any(p.search(fields[2]) for p in foreign):
+                continue
+            return None
+    except (ValueError, TypeError, OverflowError, subprocess.SubprocessError):
         return None
-    for row in rows:
-        fields = row.strip().split(None, 2)
-        if len(fields) < 3 or not fields[0].isdigit() or not fields[1].isdigit():
-            return None
-        if int(fields[0]) == os.getuid() and any(root in fields[2] for root in roots):
-            return None
     check = Path(config['stateDirectory']) / 'machine-recovery' / 'paths.json'
-    atomic(check, roots)
+    atomic(check, {'paths': roots, 'dispatcherStarted': started})
     answer = json.loads(run(adapter.operator_command('machine-recovery', 'inspect-paths', str(check))))
     return 'native-stopped' if answer == {'stopped': True} else None
 

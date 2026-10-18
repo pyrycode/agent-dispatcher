@@ -1327,10 +1327,10 @@ export class FleetStore {
       const item = this.workflow.get(run.ticket);
       const approval = this.approvals.get(run.ticket);
       if (item.revision !== input.revision || item.state !== 'OPEN' || item.labels.includes('done:'+run.role) || item.status === 'Halted' ||
-          item.blockedBy.some(b => b.state === 'OPEN') || item.labels.some(l => /^(held:|pending-verdict:|pending-done:|error:)/.test(l) || l.startsWith('needs-human:') && l !== 'needs-human:sizing') ||
+          item.blockedBy.some(b => b.state === 'OPEN') || item.labels.some(l => /^(held:|health-hold:|pending-verdict:|pending-done:|error:|orchestrator:escalated)/.test(l) || l.startsWith('needs-human:') && l !== 'needs-human:sizing') ||
           approval?.kind === 'rejected' && !approval.authorization || this.splits.pending(run.ticket) ||
           this.activeVerifierHandoffs().some(h => h.ticket === run.ticket) ||
-          this.tasks.list(run.ticket).some(t => ['queued','running','publishing','attention'].includes(t.state))) throw new Error('Workflow changed or is held; recovery cannot override it');
+          this.tasks.list(run.ticket).some(t => t.artifactsPending || ['queued','running','publishing','attention'].includes(t.state))) throw new Error('Workflow changed or is held; recovery cannot override it');
       const capable = Object.entries(this.machineCapabilities()).some(([target,report]) => target !== machine &&
         this.clock() - report.updated <= CAPABILITY_REPORT_FRESH_MS && report.projects?.includes(run.project) &&
         !missingCapabilities(this.requirementsOf(run.ticket),report.capabilities).length &&

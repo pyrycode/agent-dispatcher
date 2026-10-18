@@ -103,10 +103,19 @@ async function main(): Promise<void> {
     const action = args[0];
     if (action === 'inspect-paths') {
       if (args.length !== 2) throw new Error('Provide the saved local path list');
-      const paths: unknown = JSON.parse(readFileSync(args[1],'utf8'));
+      const input = JSON.parse(readFileSync(args[1],'utf8'));
+      const paths: unknown = Array.isArray(input) ? input : input.paths;
+      const before = Array.isArray(input) ? undefined : input.dispatcherStarted;
+      if (before !== undefined && (typeof before !== 'number' || !Number.isFinite(before) || before <= 0 || before > Date.now())) throw new Error('Invalid dispatcher process identity');
       if (!Array.isArray(paths) || !paths.length || paths.some(p => typeof p !== 'string' || !p.startsWith('/'))) throw new Error('Invalid local path list');
+      process.env.DOTENV_CONFIG_QUIET = 'true';
       const {processesUsingPath} = await import('./dispatch.js');
-      console.log(JSON.stringify({stopped:paths.every(p => processesUsingPath(p).length === 0)}));
+      const {stoppedPathUsers} = await import('./machine-recovery.js');
+      const stopped = stoppedPathUsers(paths as string[],before,processesUsingPath,pid => {
+        const text = execFileSync('ps',['-p',String(pid),'-o','lstart='],{encoding:'utf8'}).trim();
+        return Date.parse(text);
+      });
+      console.log(JSON.stringify({stopped}));
       return;
     }
     if (!['read','release','clear'].includes(action) || args.length !== (action === 'read' ? 1 : 2)) throw new Error('Usage: machine-recovery CONFIG read | release RECEIPT.json | clear DECISION.json');

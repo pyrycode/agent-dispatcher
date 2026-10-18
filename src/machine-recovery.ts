@@ -59,3 +59,16 @@ export class MachineRecoveries {
     }
   }
 }
+
+
+/** A process older than the recorded dispatcher cannot be its descendant.
+ * Independent file indexers can keep read-only handles in every repository.
+ * Unknown birth times and users born with/after this dispatcher still block. */
+export function stoppedPathUsers(paths: string[], dispatcherStarted: number | undefined,
+  users: (path: string) => number[], started: (pid: number) => number): boolean {
+  return paths.every(path => users(path).every(pid => {
+    if (!Number.isFinite(dispatcherStarted) || dispatcherStarted! <= 0) return false;
+    const birth = started(pid);
+    return Number.isFinite(birth) && birth > 0 && birth < dispatcherStarted!;
+  }));
+}

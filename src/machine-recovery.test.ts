@@ -7,6 +7,8 @@ import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {scheduleMachine} from './machine-scheduler.js';
+import {randomUUID} from 'node:crypto';
+import {stoppedPathUsers} from './machine-recovery.js';
 
 const project='org/core',ticket=project+'#1';
 function fixture(path=':memory:',role='builder') {
@@ -145,5 +147,27 @@ test('the scheduler never offers a recovery-held source project and continues un
    const other={...offer,key:'other',project:'org/other',ticket:'org/other#1'};
    const selected=scheduleMachine({machine:'source',projects:[project,'org/other'],heavyLimit:1,combinedLimit:2,offers:[offer,other],state:store.snapshot()});
    assert.deepEqual(selected.map(o=>o.ticket),[other.ticket]);
+ }finally{store.close();}
+});
+
+
+test('an older independent file indexer does not establish a surviving child, but current and unknown users block',()=>{
+ const users=()=>[43415,90226];
+ assert.equal(stoppedPathUsers(['/source'],200,users,()=>100),true);
+ assert.equal(stoppedPathUsers(['/source'],200,users,pid=>pid===43415?100:201),false);
+ assert.equal(stoppedPathUsers(['/source'],200,users,()=>200),false);
+ assert.equal(stoppedPathUsers(['/source'],200,users,()=>NaN),false);
+ assert.equal(stoppedPathUsers(['/source'],undefined,users,()=>100),false);
+ assert.equal(stoppedPathUsers(['/source'],200,()=>[],()=>NaN),true);
+});
+
+test('storage cleanup preserves source evidence after the replacement finishes and closes its ticket',()=>{
+ const {store,input,target}=fixture();const storageId=randomUUID();try{
+   store.recoverStoppedWorker('source',input);
+   assert.equal(store.start(target).ok,true);store.finish('target',target.session,target.id);
+   store.workflow.change(ticket,{state:'CLOSED',status:'Done'},'operator','finished');
+   assert.throws(()=>store.acquireStorage({id:storageId,machine:'source',kind:'ticket',ticket,path:'/retained/builder-1',head:'a'.repeat(40)}),/unreconciled/);
+   store.clearMachineRecoveries('source',project,[input.commandId]);
+   assert.equal(store.acquireStorage({id:storageId,machine:'source',kind:'ticket',ticket,path:'/retained/builder-1',head:'a'.repeat(40)}).machine,'source');
  }finally{store.close();}
 });
