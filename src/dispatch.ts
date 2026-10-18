@@ -212,7 +212,7 @@ import {
   FAMILY_DISPATCH_COUNT_PREFIX,
   decideBaselineAdjustedVerdict,
 } from "./pipeline-decisions.js";
-import { snapshotTestdata, changedTestdata, restoreGateTestdata, gateTestdataComment, type TestdataSnapshot } from "./gate-fixtures.js";
+import { isTestdataPath, snapshotTestdata, changedTestdata, restoreGateTestdata, gateTestdataComment, type TestdataSnapshot } from "./gate-fixtures.js";
 import {
   type BranchSetupAction,
   AUTO_STAGE_COMMAND,
@@ -2778,6 +2778,8 @@ export type DispatchContext = {
   /** `testdata/` paths the pre-spawn gates changed. No automatic commit of
    *  this run includes them, see gate-fixtures.ts. */
   gateTestdata?: ReadonlySet<string>;
+  /** A failed run must keep its complete local tree until capture publication is reviewed. */
+  publicationHeld?: boolean;
 };
 
 /**
@@ -3195,7 +3197,7 @@ async function dispatchWithContext(ctx: DispatchContext, outcome: { value: strin
       await cleanupAfterDispatch(ctx);
       return;
     }
-    const preserveBlockedWork = !!ctx.deps.managedWorktree?.run.verificationPin || streamResult?.runner === "codex"
+    const preserveBlockedWork = ctx.publicationHeld === true || !!ctx.deps.managedWorktree?.run.verificationPin || streamResult?.runner === "codex"
       && ["codex_blocked", "needs_refinement"].includes(streamResult.terminalReason) && ctx.useWorktree;
     if (preserveBlockedWork) error.message += `\nWorktree preserved for recovery: ${ctx.worktreeDir}`;
     // A run that failed (wall clock, idle stall, crash or error result):
@@ -4406,6 +4408,7 @@ function heldOperationInProgress(ctx: DispatchContext, worktreeDir: string, gitS
 // Returns false after parking the ticket when the commit fails. Nothing is
 // discarded either way; the worktree stays as it is.
 async function reuseOwnWorktree(ctx: DispatchContext, commitLeftovers: boolean): Promise<boolean> {
+  if (await holdUnreviewedCapturePublication(ctx, ctx.worktreeDir)) return false;
   const { agent, item, client, branchName, worktreeDir } = ctx;
   const { execSync, spawnSync } = ctx.deps;
   let sha = "";
@@ -5076,6 +5079,16 @@ export async function handleAgentResultErrors(
     throw new Error(`Codex task blocked: ${streamResult.output.slice(0, 2000)}`);
   }
 
+  // Every failed-run publication route shares the capture guard, including
+  // budget and permission salvage and the existing-PR success shortcut.
+  if (ctx.useWorktree && ctx.item.issueNumber > 0 && ctx.agent.producesCommits
+      && await holdUnreviewedCapturePublication(ctx, ctx.agentCwd)) {
+    if (streamResult.hadPermissionDenial) {
+      try { await ctx.client.addLabel(ctx.item.issueNumber, `error:${ctx.agent.name}:permission_denied`); } catch {}
+    }
+    throw new Error("Failed-run work retained locally for capture publication review.");
+  }
+
   // Salvage commits and pushes whatever the run left. A run that was
   // finishing a merge may have left conflict markers, so it is never
   // salvaged: the error path parks it for a human instead.
@@ -5230,6 +5243,53 @@ function openPrNumbersFor(ctx: DispatchContext): number[] | null {
 }
 
 /**
+ * A stopped capture run is not permission to publish its raw fixtures. Core
+ * #3583's error salvage committed account metadata before a safe pair review.
+ * Inspect dirty paths and every unpublished commit, including a capture later
+ * deleted from HEAD. Keep the complete tree and an eligibility hold until a
+ * protected operator has reviewed/corrected it; reuse must not auto-commit the
+ * same bytes on the next run. No file contents or Git stderr leave this guard.
+ */
+async function holdUnreviewedCapturePublication(ctx: DispatchContext, cwd: string): Promise<boolean> {
+  let reason: string | undefined;
+  try {
+    const options = { cwd, encoding: "utf-8" as const, stdio: "pipe" as const, timeout: 15_000 };
+    const status = String(ctx.deps.execSync("git status --porcelain -z --untracked-files=all", options));
+    // The feature ref commonly does not exist before a failed first push.
+    // Verify a known remote base, then enumerate all not-yet-published commits.
+    ctx.deps.execSync(`git show-ref --verify --quiet refs/remotes/origin/${defaultBranch}`, options);
+    const history = String(ctx.deps.execSync("git log --format= --name-only -z --no-renames --diff-merges=first-parent HEAD --not --remotes=origin", options));
+    if (history && !history.endsWith("\0")) throw new Error("Incomplete path inventory");
+    const paths = [
+      ...statusEntries(status).flatMap(entry => [entry.path, ...(entry.from === undefined ? [] : [entry.from])]).filter(path => !isRuntimeFile(path)),
+      // Already committed runtime files would be pushed too; staging exclusions
+      // cannot protect their capture bytes once they are in unpublished history.
+      ...history.split("\0").filter(Boolean),
+    ];
+    if (paths.length > 0 && (ctx.item.labels.includes("needs-live-artifacts")
+      || paths.some(path => isTestdataPath(path) || /(^|\/)(captures?|recordings?)(\/|$)|\.jsonl$/i.test(path)))) {
+      reason = "Capture fixtures or required live artifacts need review before publication.";
+    }
+  } catch {
+    reason = "Git publication inventory could not be verified.";
+  }
+  if (!reason) return false;
+  ctx.publicationHeld = true;
+  ctx.deps.writeLog(ctx.logFile, "PARTIAL_PUBLICATION_HELD", reason);
+  console.warn(`   ⏸️ Partial work for #${ctx.item.issueNumber} retained locally for capture review`);
+  try { await ctx.client.addLabel(ctx.item.issueNumber, "held:unreviewed-capture"); }
+  catch { ctx.deps.writeLog(ctx.logFile, "PARTIAL_PUBLICATION_HOLD_FAILED", "The publication hold could not be recorded; local work is still preserved."); }
+  try {
+    await ctx.client.addComment(ctx.item.issueNumber,
+      `## Partial work retained locally\n\n${reason} Nothing was automatically staged, committed or pushed. ` +
+      `The complete worktree remains at \`${cwd}\`. Inspect and correct the retained artifacts and unpublished history, ` +
+      `explicitly publish only reviewed safe history, then remove \`held:unreviewed-capture\` through the protected workflow. ` +
+      `The existing stage requirements remain pending.`);
+  } catch { /* The retained tree and guard do not depend on publication. */ }
+  return true;
+}
+
+/**
  * Commit and push what a failed run left in its worktree to its branch,
  * and say so on the ticket. Runs from `dispatchToAgent`'s catch, BEFORE
  * `handleDispatchError` and the worktree teardown, for a run that ended
@@ -5243,10 +5303,9 @@ function openPrNumbersFor(ctx: DispatchContext): number[] | null {
  * `error:<agent>`. The difference is that the work is on GitHub, and the
  * next run's worktree starts from it.
  *
- * Returns `keepWorktree: true` only when a commit was made and the push
- * failed. The worktree is then clean, so the teardown would remove it and
- * leave the work as an unpushed local commit; the caller skips the
- * teardown instead and the comment points at the path.
+ * Returns `keepWorktree: true` when capture publication needs review, Git
+ * inventory is unreadable, or the push failed. The caller skips teardown
+ * and the comment points at the complete retained worktree.
  */
 export async function salvagePartialWork(
   ctx: DispatchContext,
@@ -5257,6 +5316,7 @@ export async function salvagePartialWork(
   if (!canSalvagePartialWork({ stopKind, agent, useWorktree, issueNumber: item.issueNumber })) {
     return { keepWorktree: false };
   }
+  if (await holdUnreviewedCapturePublication(ctx, agentCwd)) return { keepWorktree: true };
   const stopped = stopKind === "timeout"
     ? "hit its wall-clock limit"
     : stopKind === "idle_stall"

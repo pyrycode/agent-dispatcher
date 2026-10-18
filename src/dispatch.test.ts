@@ -1598,6 +1598,30 @@ describe("setupBranchAndWorktree — reusing the agent's own preserved worktree"
   const errorComments = (client: MockGitHubClient) =>
     client.comments.filter(c => /Dispatch Error/.test(c.body));
 
+  for (const shape of ["untracked", "unpublished-commit", "inventory-failed"] as const) {
+    test(`capture privacy: unsafe reuse ${shape} preserves the tree before auto-commit or pre-run push`, async () => {
+      const own = probe(3583, builder);
+      const fixture = "internal/codexsup/testdata/capture/web_search.jsonl";
+      const { ctx, client, calls } = makeTestContext({
+        item: { issueNumber: 3583 }, agent: builder,
+        mockOptions: { execImpls: {
+          ...synced(3583), [`git worktree remove "${own}"`]: dirtyRefusal(own),
+          "git worktree list --porcelain": porcelainFor(own, "feature/3583"),
+          "git status --porcelain": () => shape === "untracked" ? `?? ${fixture}\0` : "?? .codegraph/runtime\0",
+          "git log --format= --name-only -z --no-renames --diff-merges=first-parent HEAD --not --remotes=origin": () => shape === "inventory-failed"
+            ? execError({ stderr: "private provider metadata" }) : shape === "unpublished-commit" ? fixture + "\0" : "",
+          "git worktree add": addRefused(own),
+        } },
+      });
+      assert.deepEqual(await setupBranchAndWorktree(ctx), { ok: false });
+      assert.equal(wipCommits(calls).length, 0);
+      assert.ok(!calls.exec.some(c => c.cmd === AUTO_STAGE_COMMAND || c.cmd.includes("merge main --no-edit") || c.cmd.startsWith("git push")));
+      assert.ok(client.addLabelCalls.some(c => c.label === "held:unreviewed-capture"));
+      assert.ok(!JSON.stringify(calls.logs).includes("private provider metadata"));
+      assert.ok(!JSON.stringify(client.comments).includes("private provider metadata"));
+    });
+  }
+
   test("own path, branch in sync, uncommitted changes → one wip commit before the pre-run merge, a comment names it, no error", async () => {
     const own = probe(1603, builder);
     const { ctx, client, calls } = makeTestContext({
@@ -2928,7 +2952,7 @@ describe("handleAgentResultErrors", () => {
     // Sanity: neither salvage path was probed (gh pr list runs only
     // for max_turns; same for safer-salvage).
     assert.equal(calls.exec.filter(c => c.cmd.includes("gh pr list")).length, 0);
-    assert.equal(calls.exec.filter(c => c.cmd.includes("git status")).length, 0);
+    assert.equal(calls.exec.filter(c => c.cmd.includes("git status")).length, 1, "publication inventory is checked without attempting salvage");
   });
 
   test("error_during_execution wedge → error surfaces subtype + api_error_status from rawResult, labels the narration", async () => {
@@ -11930,6 +11954,140 @@ describe("partial-work salvage — stopped run with an existing PR (mobile #1430
     assert.equal(pushOf(calls), undefined);
     assert.ok(!client.comments.some(c => /Partial work/.test(c.body)));
   });
+
+  for (const stopKind of ["timeout", "idle_stall", "error"] as const) {
+    test(`3583: ${stopKind} retains an unreviewed capture without staging, committing, publishing or teardown`, async () => {
+      const { agent, item, client, deps, calls } = stoppedRun({
+        issue: 3583,
+        agent: { name: "builder", column: "In Development", claudeMdPath: "builder/CLAUDE.md" },
+        stop: { reject: stopKind === "error" ? new AgentRunFailedError("CLI ended", "") : new AgentRunStoppedError("run stopped", stopKind) },
+        exec: { "git status --porcelain": () => " M docs/specs/architecture/3583.md\0?? internal/codexsup/testdata/capture/web_search.jsonl\0" },
+      });
+      item.labels.push("needs-live-artifacts");
+      await dispatchToAgent(agent, item, client, deps);
+      assert.equal(commitOf(calls), undefined);
+      assert.equal(pushOf(calls), undefined);
+      assert.ok(!calls.exec.some(c => c.cmd === AUTO_STAGE_COMMAND));
+      assert.ok(!cleanupRan(calls.exec), "all local work is retained");
+      assert.ok(client.addLabelCalls.some(c => c.label === "held:unreviewed-capture"));
+      assert.ok(client.comments.some(c => /retained locally/.test(c.body)));
+    });
+  }
+
+  test("required live artifacts outside fixture paths also stay local after an error", async () => {
+    const { ctx, client, calls } = makeTestContext({
+      agent: { name: "builder", producesCommits: true }, item: { issueNumber: 3583, labels: ["needs-live-artifacts"] },
+      mockOptions: { execImpls: { ...NO_MERGE, "git status --porcelain": () => "?? evidence/result.json\0" } },
+    });
+    assert.deepEqual(await salvagePartialWork(ctx, "error"), { keepWorktree: true });
+    assert.equal(commitOf(calls), undefined);
+    assert.equal(pushOf(calls), undefined);
+    assert.ok(client.addLabelCalls.some(c => c.label === "held:unreviewed-capture"));
+  });
+
+  for (const reason of ["max_turns", "permission_denied"] as const) {
+    for (const openPr of [false, true]) {
+      test(`capture privacy: failed ${reason} with ${openPr ? "existing" : "no"} PR cannot publish through budget or permission salvage`, async () => {
+        const { agent, item, client, deps, calls } = stoppedRun({
+          issue: 3583, agent: { name: "builder", column: "In Development", producesCommits: true },
+          stop: { result: streamResult({ isError: true, terminalReason: reason, sessionId: "", hadPermissionDenial: reason === "permission_denied" }) },
+          exec: { "git status --porcelain": () => "?? internal/codexsup/testdata/capture/web_search.jsonl\0",
+            "gh pr list --head": () => openPr ? '[{"number":3588,"isDraft":false}]' : "[]" },
+        });
+        await dispatchToAgent(agent, item, client, deps);
+        assert.equal(commitOf(calls), undefined);
+        assert.equal(pushOf(calls), undefined);
+        assert.ok(!calls.exec.some(c => c.cmd === AUTO_STAGE_COMMAND));
+        assert.ok(!cleanupRan(calls.exec));
+        assert.ok(client.addLabelCalls.some(c => c.label === "held:unreviewed-capture"));
+        assert.ok(!client.addLabelCalls.some(c => c.label === "done:builder"));
+        if (reason === "permission_denied") assert.ok(client.addLabelCalls.some(c => c.label === "error:builder:permission_denied"));
+      });
+    }
+  }
+
+  for (const shape of ["untracked", "staged", "rename", "committed", "history-deleted"] as const) {
+    test(`capture privacy: ${shape} fixture holds publication without relying on a ticket label`, async () => {
+      const fixture = "internal/stream/testdata/capture/live.jsonl";
+      const dirty = shape === "untracked" ? `?? ${fixture}\0` : shape === "staged" ? `A  ${fixture}\0`
+        : shape === "rename" ? `R  safe/source.go\0${fixture}\0` : "";
+      const history = shape === "committed" || shape === "history-deleted" ? fixture + "\0" : "";
+      const { ctx, client, calls } = makeTestContext({
+        agent: { name: "builder", producesCommits: true }, item: { issueNumber: 3583 },
+        mockOptions: { execImpls: { ...NO_MERGE, "git status --porcelain": () => dirty,
+          "git rev-list --count origin/": () => "1\n", "git log --format= --name-only -z --no-renames --diff-merges=first-parent HEAD --not --remotes=origin": () => history } },
+      });
+      assert.deepEqual(await salvagePartialWork(ctx, "error"), { keepWorktree: true });
+      assert.equal(commitOf(calls), undefined);
+      assert.equal(pushOf(calls), undefined);
+      assert.ok(client.addLabelCalls.some(c => c.label === "held:unreviewed-capture"));
+    });
+  }
+
+  for (const command of ["git status --porcelain", "git log --format= --name-only -z --no-renames --diff-merges=first-parent HEAD --not --remotes=origin"]) {
+    test(`unreadable publication inventory (${command}) retains work without publishing or leaking stderr`, async () => {
+      const { ctx, client, calls } = makeTestContext({
+        agent: { name: "builder", producesCommits: true }, item: { issueNumber: 3583 },
+        mockOptions: { execImpls: { ...NO_MERGE, [command]: () => execError({ stderr: "private capture account metadata" }) } },
+      });
+      assert.deepEqual(await salvagePartialWork(ctx, "error"), { keepWorktree: true });
+      assert.equal(commitOf(calls), undefined);
+      assert.equal(pushOf(calls), undefined);
+      assert.ok(client.addLabelCalls.some(c => c.label === "held:unreviewed-capture"));
+      assert.ok(!JSON.stringify(calls.logs).includes("private capture account metadata"));
+      assert.ok(!JSON.stringify(client.comments).includes("private capture account metadata"));
+    });
+  }
+
+  for (const shape of ["first-source-run", "quoted-capture", "merge-only-capture", "deleted-capture", "committed-runtime-capture"] as const) {
+    test(`real Git publication inventory: ${shape} with no remote feature ref`, async () => {
+      const directory = realpathSync(mkdtempSync(join(tmpdir(), "capture-publication-")));
+      const repo = join(directory, "repo"), remote = join(directory, "origin.git");
+      const git = (...args: string[]) => {
+        const result = spawnSync("git", args, { cwd: existsSync(join(repo, ".git")) ? repo : directory, encoding: "utf8" });
+        assert.equal(result.status, 0, result.stderr);
+        return result.stdout;
+      };
+      try {
+        git("init", "--bare", remote);
+        git("init", "--initial-branch=main", repo);
+        git("remote", "add", "origin", remote);
+        git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "--allow-empty", "-m", "published base");
+        git("push", "origin", "main");
+        git("switch", "-c", "feature/3583");
+        assert.notEqual(spawnSync("git", ["show-ref", "--verify", "--quiet", "refs/remotes/origin/feature/3583"], { cwd: repo }).status, 0);
+        const fixture = join(repo, shape === "committed-runtime-capture" ? ".codegraph/capture.jsonl" : 'internal/testdata/capture/live "quoted" fixture.jsonl');
+        const commit = (message: string) => {
+          git("add", ".");
+          git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", message);
+        };
+        if (shape === "merge-only-capture") {
+          git("switch", "-c", "other"); writeFileSync(join(repo, "other.ts"), "export const other = true;\n"); commit("other source");
+          git("switch", "feature/3583"); writeFileSync(join(repo, "source.ts"), "export const source = true;\n"); commit("feature source");
+          git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "merge", "--no-ff", "--no-commit", "other");
+        }
+        if (shape !== "first-source-run") {
+          mkdirSync(dirname(fixture), { recursive: true }); writeFileSync(fixture, '{"method":"account/updated","params":{"private":"synthetic"}}\n');
+          if (shape === "merge-only-capture" || shape === "deleted-capture" || shape === "committed-runtime-capture") commit("retain capture");
+          if (shape === "deleted-capture") { rmSync(fixture); commit("remove capture from current files"); }
+        } else writeFileSync(join(repo, "new source.ts"), "export const safe = true;\n");
+        const { ctx, client, calls } = makeTestContext({
+          agent: { name: "builder", producesCommits: true }, item: { issueNumber: 3583 },
+          mockOptions: { execImpls: { ...NO_MERGE, "git rev-list --count origin/": () => "1\n" } },
+        });
+        ctx.agentCwd = repo;
+        const mocked = ctx.deps.execSync;
+        ctx.deps.execSync = ((command: string, options: any) => {
+          if (/^git (status|show-ref|log) /.test(command)) return execSync(command, { ...options, cwd: repo });
+          return mocked(command, options);
+        }) as DispatchDeps["execSync"];
+        assert.deepEqual(await salvagePartialWork(ctx, "error"), { keepWorktree: shape !== "first-source-run" });
+        assert.equal(!!pushOf(calls), shape === "first-source-run");
+        assert.equal(client.addLabelCalls.some(c => c.label === "held:unreviewed-capture"), shape !== "first-source-run");
+        assert.ok(existsSync(join(repo, ".git")), "the complete source repository is retained");
+      } finally { rmSync(directory, { recursive: true, force: true }); }
+    });
+  }
 
   test("push failure → comment names the kept worktree, and the teardown is skipped", async () => {
     const { agent, item, client, deps, calls } = stoppedRun({
