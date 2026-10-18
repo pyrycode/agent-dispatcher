@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import unittest
 import uuid
+import hashlib
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location('build_cache', Path(__file__).with_name('fleet-build-cache.py'))
@@ -22,10 +23,12 @@ class CacheTests(unittest.TestCase):
         self.cache = self.root / 'cache'
         self.cache.mkdir()
         (self.cache / 'README').write_text(m.CACHE_README)
-        self.bucket = self.cache / 'aa'
+        data = b'compiled output'
+        digest = hashlib.sha256(data).hexdigest()
+        self.bucket = self.cache / digest[:2]
         self.bucket.mkdir()
-        self.entry = self.bucket / ('aa' + '1' * 62 + '-d')
-        self.entry.write_bytes(b'compiled output')
+        self.entry = self.bucket / (digest + '-d')
+        self.entry.write_bytes(data)
         self.fuzz = self.cache / 'fuzz/pkg/FuzzName'
         self.fuzz.mkdir(parents=True)
         (self.fuzz / 'failed-input').write_bytes(b'go test fuzz v1\nstring("failure")\n')
@@ -56,8 +59,12 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
         done = self.manage(apply=True)
         self.assertEqual(done['phase'], 'complete')
-        self.assertEqual(self.calls[0][0], ['/trusted/go', 'clean', '-cache'])
-        self.assertEqual(self.calls[0][1]['env']['GOCACHE'], str(self.cache))
+        if m.sys.platform == 'darwin':
+            self.assertEqual(done['commandResult']['backend'], 'descriptor-relative')
+        else:
+            self.assertEqual(self.calls[0][0], ['/trusted/go', 'clean', '-cache'])
+            self.assertTrue(self.calls[0][1]['env']['GOCACHE'].startswith('/proc/self/fd/'))
+            self.assertEqual(len(self.calls[0][1]['pass_fds']), 1)
         self.assertEqual((self.fuzz / 'failed-input').read_bytes(), before)
         self.assertEqual(self.source.read_text(), 'package main\n')
         self.assertEqual((self.cache / 'retained-evidence/failure.log').read_text(), 'original failed build')
@@ -70,7 +77,7 @@ class CacheTests(unittest.TestCase):
         self.config['maxBytes'] = 1
         self.assertEqual(self.manage(apply=True)['phase'], 'complete')
         self.assertEqual(self.manage(apply=True)['phase'], 'within-budget')
-        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(len(self.calls), 0 if m.sys.platform == 'darwin' else 1)
 
     def test_low_free_space_is_a_separate_explicit_trigger(self):
         self.config['maxBytes'] = 10**9
@@ -131,6 +138,8 @@ class CacheTests(unittest.TestCase):
         self.assertTrue(self.entry.exists())
 
     def test_runner_error_or_unconfirmed_drain_retains_uncertain_receipt(self):
+        if m.sys.platform == 'darwin':
+            self.skipTest('macOS trimming is synchronous and has no external runner')
         def broken(argv, **kwargs):
             raise TimeoutError('command may still have descendants')
         result = m.manage_cache(self.config, lambda: self.proof, apply=True,
@@ -142,6 +151,8 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
     def test_unconfirmed_runner_and_missing_runner_never_claim_safe_release(self):
+        if m.sys.platform == 'darwin':
+            self.skipTest('macOS trimming is synchronous and has no external runner')
         result = m.manage_cache(self.config, lambda: self.proof, apply=True, process_inventory=lambda: [])
         self.assertEqual(result['phase'], 'refused')
         self.assertTrue(self.entry.exists())
@@ -161,7 +172,7 @@ class CacheTests(unittest.TestCase):
             self.assertNotIn('FLEET_OPERATOR_TOKEN', options['env'])
             self.assertNotIn('GH_TOKEN', options['env'])
             result = subprocess.run(argv, cwd=options['cwd'], env=options['env'], timeout=options['timeout'],
-                                    capture_output=True, check=False)
+                                    pass_fds=options['pass_fds'], capture_output=True, check=False)
             return {'returncode': result.returncode, 'custody': 'drained'}
         before = (self.fuzz / 'failed-input').read_bytes()
         with patch.dict(os.environ, {'FLEET_OPERATOR_TOKEN': 'test-only', 'GH_TOKEN': 'test-only'}):
@@ -172,7 +183,39 @@ class CacheTests(unittest.TestCase):
         self.assertEqual((self.fuzz / 'failed-input').read_bytes(), before)
         self.assertEqual(self.source.read_text(), 'package main\n')
         self.assertEqual((self.cache / 'retained-evidence/failure.log').read_text(), 'original failed build')
-        self.assertEqual(len(seen), 1)
+        self.assertEqual(len(seen), 0 if m.sys.platform == 'darwin' else 1)
+
+    def test_cache_root_swap_cannot_redirect_real_go_to_outside_evidence(self):
+        executable = shutil.which('go')
+        if not executable:
+            self.skipTest('Go is unavailable')
+        self.config['go'] = executable
+        outside = self.root / 'outside'
+        (outside / 'bb').mkdir(parents=True)
+        evidence = outside / 'bb/unique-failure.log'
+        evidence.write_text('failed evidence must remain')
+        original = self.root / 'original-cache'
+        def swap_and_clean(argv, **options):
+            self.cache.rename(original)
+            self.cache.symlink_to(outside, target_is_directory=True)
+            result = subprocess.run(argv, cwd=options['cwd'], env=options['env'], timeout=options['timeout'],
+                                    pass_fds=options['pass_fds'], capture_output=True, check=False)
+            return {'returncode': result.returncode, 'custody': 'drained'}
+        guards = []
+        def guard():
+            guards.append(True)
+            if m.sys.platform == 'darwin' and len(guards) == 3:
+                self.cache.rename(original)
+                self.cache.symlink_to(outside, target_is_directory=True)
+            return self.proof
+        done = m.manage_cache(self.config, guard, apply=True,
+                              process_inventory=lambda: [], run_command=swap_and_clean)
+        self.assertEqual(done['phase'], 'uncertain')
+        self.assertFalse(done['releaseSafe'])
+        self.assertEqual(evidence.read_text(), 'failed evidence must remain')
+        self.assertEqual((original / 'fuzz/pkg/FuzzName/failed-input').read_bytes(),
+                         b'go test fuzz v1\nstring("failure")\n')
+        self.assertEqual((original / self.bucket.name).exists(), m.sys.platform == 'darwin')
 
     def test_real_cached_executable_process_prevents_cleanup(self):
         if m.process_inventory() is None:
@@ -191,6 +234,26 @@ class CacheTests(unittest.TestCase):
         finally:
             child.terminate()
             child.wait(timeout=5)
+
+    def test_mac_trim_preserves_hardlinks_corrupt_entries_and_executable_directories(self):
+        if m.sys.platform != 'darwin':
+            self.skipTest('descriptor-relative backend is selected on macOS')
+        linked = self.root / 'linked-source'
+        os.link(self.entry, linked)
+        corrupt = self.bucket / (self.bucket.name + '2' * 62 + '-d')
+        corrupt.write_bytes(b'unclassified content with a wrong hash')
+        binary = self.bucket / (self.bucket.name + '3' * 62 + '-d')
+        binary.mkdir()
+        payload = binary / 'dormant-binary'
+        payload.write_bytes(b'cached executable retained')
+        payload.chmod(0o700)
+        result = self.manage(apply=True)
+        self.assertEqual(result['phase'], 'failed')
+        self.assertFalse(result['budgetMet'])
+        self.assertEqual(linked.read_bytes(), b'compiled output')
+        self.assertTrue(self.entry.exists())
+        self.assertTrue(corrupt.exists())
+        self.assertTrue(payload.exists())
 
 
 if __name__ == '__main__':

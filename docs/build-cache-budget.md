@@ -5,9 +5,13 @@ configured byte budget is exceeded or free space falls below a configured
 reserve. This is periodic space management. It does not clear the cache after
 each ticket.
 
-The manager uses the supported `go clean -cache` command. The next build may
-take longer because its compiled artifacts need rebuilding. It never invokes
-`-modcache`, `-fuzzcache` or package cleanup.
+Linux uses the supported `go clean -cache` command through an inherited directory
+descriptor. macOS cannot traverse a directory through `/dev/fd`. It trims the
+oldest verified ordinary cache entries through held directory descriptors until
+the budget and free-space reserve are met. It retains executable output
+directories and hardlinked artifacts. The next build may take longer because
+removed artifacts need rebuilding. Neither backend invokes `-modcache`,
+`-fuzzcache` or package cleanup.
 
 ## Exclusive authority
 
@@ -50,8 +54,17 @@ All limits are explicit. There are no built-in byte budgets.
 
 `manage_cache` receives the configuration, guard callback and `apply` flag.
 Its `run_command` callback receives the fixed argument list plus `cwd`, `env`,
-`timeout` and `journal`. The journal path is the receipt path followed by
+`timeout`, `journal` and `pass_fds`. The journal path is the receipt path followed by
 `.command.json`.
+
+The manager opens the inspected cache directory and checks its device and inode.
+The Linux runner inherits `pass_fds` through its launch barrier and into Go.
+Go receives the anchored descriptor path as `GOCACHE`. The macOS backend opens
+buckets relative to that same held root. It checks each ordinary file's inode
+and metadata before unlinking by its bucket descriptor. Output content must
+match its named SHA-256. Action records must match Go's versioned index format
+and named action hash. A later root rename or symlink replacement therefore
+cannot redirect deletion into another directory.
 
 The runner must save the child's process identity before permitting execution.
 It must reuse the existing custody machinery after a timeout or interrupted
