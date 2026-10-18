@@ -86,6 +86,119 @@ class Tests(unittest.TestCase):
         self.supervisor.workflow = [{'issueNumber': 123, 'state': 'CLOSED', 'status': 'Done'}]
         return repo, copy, graph, evidence
 
+    def native_capture(self):
+        repo=self.root/'desktop-repository';repo.mkdir()
+        self.git(repo,'init','-b','main');self.git(repo,'config','user.name','Native fixture');self.git(repo,'config','user.email','native@example.invalid')
+        (repo/'.gitignore').write_text('node_modules/\ntest-results/\n')
+        (repo/'package-lock.json').write_text('{"lockfileVersion":3}')
+        (repo/'source.txt').write_text('all native source retained')
+        self.git(repo,'add','.');self.git(repo,'commit','-m','native source')
+        identity='a'*64;directory=self.state/'desktop-captures'/identity;work=directory/'desktop'
+        self.git(repo,'worktree','add','--detach',str(work),'HEAD')
+        revision=self.git(work,'rev-parse','HEAD')
+        (work/'node_modules/pkg').mkdir(parents=True)
+        (work/'node_modules/pkg/a.js').write_bytes(b'locked rebuildable A')
+        (work/'node_modules/pkg/b.js').write_bytes(b'locked rebuildable B')
+        (work/'test-results').mkdir();(work/'test-results/failure.log').write_text('full native failure evidence')
+        task={'id':identity,'ticket':'pyrycode/pyrycode-desktop#1975','machine':'test-host','session':'native-session','runId':'native-run','admission':{'run':{'id':'native-run'}},'request':{'recipe':'desktop-fake-suite','revision':revision}}
+        installed=m.load('fleet-native-storage').installation(task,work)
+        m.atomic(directory/'task.json',task);m.atomic(directory/'result.json',{'outcome':'completed','candidateRevision':revision,'summary':'complete positive evidence','files':{'desktop/capture.json':json.dumps({'dependencyReferenceDigest':installed['referenceDigest']}),'desktop/failure.log':'all original results'}})
+        receipt=self.state/'tasks'/(identity+'.receipt.json');receipt.parent.mkdir(exist_ok=True)
+        manifest=m.load('fleet-support').artifact_manifest(m.read(directory/'result.json')['files'])
+        artifact_digest=hashlib.sha256(json.dumps(manifest,separators=(',',':')).encode()).hexdigest()
+        record={'id':identity,'session':'native-session','directory':str(directory),'result':str(directory/'result.json'),'phase':'complete','drainConfirmed':True,'artifactDigest':artifact_digest,'custody':{'phase':'drained','root':{'pid':123,'identity':'proved-start'}}}
+        m.atomic(receipt,record)
+        m.atomic(directory/'dependency-install.json',installed)
+        self.config.update(platform='mac',projects={'pyrycode/pyrycode-desktop':{'target':str(repo)}})
+        return directory,work,receipt,record
+
+    def test_native_catchup_reclaims_only_installed_dependencies_and_keeps_receipts_evidence_sources_refs(self):
+        directory,work,receipt,record=self.native_capture()
+        retained={str(p):p.read_bytes() for p in [directory/'task.json',directory/'result.json',receipt,work/'source.txt',work/'test-results/failure.log']}
+        unknown=work/'node_modules/pkg/failed-attachment.log';unknown.write_text('unique later capture')
+        refs=self.git(work,'show-ref');registration=self.git(work,'worktree','list','--porcelain')
+        with patch.object(m,'processes_using_path',return_value=[]):
+            report=self.supervisor.native_pass('test-host',True)[0]
+            again=self.supervisor.native_pass('test-host',True)[0]
+        self.assertEqual(report['filesRemoved'],2);self.assertEqual(again['filesRemoved'],0)
+        self.assertEqual(unknown.read_text(),'unique later capture')
+        self.assertEqual({p:Path(p).read_bytes() for p in retained},retained)
+        self.assertEqual(self.git(work,'show-ref'),refs);self.assertEqual(self.git(work,'worktree','list','--porcelain'),registration)
+        self.assertFalse(self.supervisor.leases)
+
+    def test_native_active_missing_positive_drain_failed_and_changed_receipt_are_held(self):
+        directory,work,receipt,record=self.native_capture()
+        for change in [{'phase':'attention'},{'drainConfirmed':False},{'artifactDigest':None},{'custody':{}},{'directory':'/wrong/path'}]:
+            m.atomic(receipt,{**record,**change})
+            with patch.object(m,'processes_using_path',return_value=[]):report=self.supervisor.native_pass('test-host',True)[0]
+            self.assertEqual(report['phase'],'held');self.assertTrue((work/'node_modules/pkg/a.js').exists())
+        m.atomic(receipt,record)
+        with patch.object(m,'processes_using_path',return_value=[456]):report=self.supervisor.native_pass('test-host',True)[0]
+        self.assertEqual(report['filesRemoved'],0);self.assertFalse(any(op=='acquire' for op,_,_ in self.supervisor.calls))
+
+    def test_native_durable_plan_precedes_partial_unlink_and_restart_retries_remaining_reference(self):
+        directory,work,receipt,record=self.native_capture();unlink=os.unlink;count=[0]
+        def fail_second(path,*args,**kwargs):
+            if path in ('a.js','b.js'):
+                journals=list(self.supervisor.directory.glob('*.lease.json'))
+                saved=m.read(journals[0]);self.assertEqual(saved['phase'],'synchronous-cleanup')
+                self.assertEqual(saved['request']['kind'],'native-task');self.assertIn('nativeBasisSha256',saved)
+                count[0]+=1
+                if count[0]==2:raise PermissionError('injected native interruption')
+            return unlink(path,*args,**kwargs)
+        with patch.object(m,'processes_using_path',return_value=[]),patch.object(os,'unlink',side_effect=fail_second):
+            report=self.supervisor.native_pass('test-host',True)[0]
+        self.assertEqual(report['filesRemoved'],1);self.assertTrue(report['held'])
+        restarted=Supervisor(self.config,self.config_path)
+        with patch.object(m,'processes_using_path',return_value=[]):retry=restarted.native_pass('test-host',True)[0]
+        self.assertEqual(retry['filesRemoved'],1);self.assertEqual((work/'test-results/failure.log').read_text(),'full native failure evidence')
+
+    def test_native_task_record_swap_between_plan_and_lease_blocks_deletion(self):
+        directory,work,receipt,record=self.native_capture();original=self.supervisor.rpc
+        def change(action,value=None,**kwargs):
+            response=original(action,value,**kwargs)
+            if action=='acquire':
+                task=m.read(directory/'task.json');task['request']['revision']='f'*40;m.atomic(directory/'task.json',task)
+            return response
+        self.supervisor.rpc=change
+        with patch.object(m,'processes_using_path',return_value=[]):report=self.supervisor.native_pass('test-host',True)[0]
+        self.assertEqual(report['filesRemoved'],0);self.assertTrue(report['held']);self.assertTrue((work/'node_modules/pkg/a.js').exists());self.assertFalse(self.supervisor.leases)
+
+    def test_native_failed_closed_cleanup_leaves_exact_failed_result_log_and_source_bytes(self):
+        directory,work,receipt,record=self.native_capture()
+        result=m.read(directory/'result.json');result['outcome']='failed';result['summary']='Original complete failed diagnostics remain failed'
+        m.atomic(directory/'result.json',result)
+        retained={p:p.read_bytes() for p in [directory/'result.json',work/'test-results/failure.log',work/'source.txt',receipt]}
+        with patch.object(m,'processes_using_path',return_value=[]):report=self.supervisor.native_pass('test-host',True)[0]
+        # The real central authority separately requires CLOSED+Done for failed
+        # tasks. This driver must never turn the original result into a pass.
+        self.assertEqual(report['filesRemoved'],2)
+        self.assertEqual({p:p.read_bytes() for p in retained},retained)
+
+    def test_native_forged_npm_install_reference_is_not_blessed_by_an_automatic_lease(self):
+        directory,work,receipt,record=self.native_capture()
+        unknown=work/'node_modules/pkg/new-failure.log';unknown.write_bytes(b'unique later evidence')
+        forged=m.load('fleet-native-storage').installation(m.read(directory/'task.json'),work)
+        m.atomic(directory/'dependency-install.json',forged)
+        with patch.object(m,'processes_using_path',return_value=[]):report=self.supervisor.native_pass('test-host',True)[0]
+        self.assertEqual(report['phase'],'held');self.assertIn('published',report['reason'])
+        self.assertEqual(unknown.read_bytes(),b'unique later evidence');self.assertFalse(any(op=='acquire' for op,_,_ in self.supervisor.calls))
+
+    def test_native_catchup_is_bounded_round_robin_and_prioritizes_a_fresh_completion_once(self):
+        self.config.update(platform='mac',projects={'pyrycode/pyrycode-desktop':{'target':'/unused/reference/repository'}})
+        self.supervisor.options['batch']=2
+        root=self.state/'desktop-captures';root.mkdir()
+        ids=[format(n,'064x') for n in range(1,11)]
+        for identity in ids:(root/identity).mkdir()
+        # Missing input records stay held, but cannot monopolize the bounded
+        # sweep or prevent later captures from being inspected.
+        first=self.supervisor.native_pass('test-host',True);second=self.supervisor.native_pass('test-host',True)
+        self.assertEqual([r['taskId'] for r in first],ids[:2]);self.assertEqual([r['taskId'] for r in second],ids[2:4])
+        m.atomic(self.supervisor.directory/'native-completion.json',{'id':ids[8],'time':time.time()})
+        fresh=self.supervisor.native_pass('test-host',True);later=self.supervisor.native_pass('test-host',True)
+        self.assertEqual([r['taskId'] for r in fresh],[ids[8],ids[4]])
+        self.assertEqual([r['taskId'] for r in later],ids[5:7]);self.assertFalse(self.supervisor.leases)
+
     def test_launchd_path_without_sbin_uses_system_lsof_and_preserves_evidence(self):
         if m.sys.platform != 'darwin' or not os.access('/usr/sbin/lsof', os.X_OK):
             self.skipTest('Apple system lsof is unavailable')
