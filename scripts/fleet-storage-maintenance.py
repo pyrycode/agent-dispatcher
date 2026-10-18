@@ -109,13 +109,14 @@ def processes_using_path(path):
         return None
 
 
-def native_drained(directory):
+def native_drained(directory, machine=None):
     """Legacy completion alone never proves that local native children exited."""
     support = load('fleet-support')
     for path in sorted(Path(directory).glob('*.receipt.json')):
         record = read(path)
         if record.get('drainConfirmed') is not True:
-            return False
+            if not load('fleet-boot-proof').check(path, machine, prepare=False):
+                return False
         # A positive final receipt is the existing native supervisor's durable
         # root plus descendant proof. Do not reinterpret older complete records.
     return True
@@ -405,7 +406,7 @@ class StorageSupervisor:
         # Match the existing test-admission daemon's exact configured inode.
         admission = self.options.get('testAdmissionLock') or os.environ.get('PYRY_TEST_ADMISSION_LOCK') or str(Path.home() / '.local/share/pyry-fleet/test-admission.lock')
         with locked(admission, existing=True) as admission_fd:
-            if not native_drained(Path(self.config['stateDirectory']) / 'tasks'):
+            if not native_drained(Path(self.config['stateDirectory']) / 'tasks', machine):
                 return {'kind': 'go-build-cache', 'phase': 'held', 'reason': 'Native descendant drainage is unconfirmed'}
             request = {'id': str(uuid.uuid4()), 'machine': machine, 'kind': 'cache', 'path': config['cache']}
             path, saved = self.acquire(request)
@@ -418,7 +419,7 @@ class StorageSupervisor:
                         raise RuntimeError('Test-admission lock identity changed')
                 check_lock()
                 self.verify(saved)
-                if not native_drained(Path(self.config['stateDirectory']) / 'tasks'):
+                if not native_drained(Path(self.config['stateDirectory']) / 'tasks', machine):
                     raise RuntimeError('Native descendant drainage is unconfirmed')
                 check_lock()
                 return {'allowed': True, 'exclusive': True, 'lease': request['id'],
