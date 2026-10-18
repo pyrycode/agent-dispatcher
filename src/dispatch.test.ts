@@ -14334,3 +14334,49 @@ test("classic reviews retain their saved verdict publication when the workflow c
     assert.ok(!prompt?.content?.includes("The saved structured verdict is the authoritative result"));
   });
 });
+
+
+for (const decision of ["FAIL", "PASS"] as const) {
+  test(`2245: managed verifier submits ${decision} with failed checks before legacy label routing`, async () => {
+    const sha = "a".repeat(40), path = "/logs/verifier-2245.md";
+    const project = "org/core", ticket = `${project}#2245`, runId = "verifier-2245";
+    const labels = decision === "FAIL" ? ["needs-rework:builder"] : [];
+    const store = new FleetStore(":memory:", { mac: { heavyLimit: 1, combinedLimit: 2 } });
+    store.workflow.import({ project, projectId: "P", statusFieldId: "S", options: {
+      Backlog: "b", Inbox: "i", "In Code Review": "v", "In Development": "d", "In Documentation": "doc", Done: "done",
+    } }, [{ id: "P2245", issueId: "I2245", issueNumber: 2245, title: "Activate threads",
+      body: "Required production activation", url: "https://github.com/org/core/issues/2245",
+      status: "In Code Review", state: "OPEN", revision: 1, position: 1,
+      labels: [], blockedBy: [], parentNumber: null, grandparentNumber: null }]);
+    assert.equal(store.start({ workflowVersion: 1, id: runId, machine: "mac", session: "s",
+      project, ticket, role: "verifier", resource: "light", locks: [] }).ok, true);
+    const { ctx, client } = makeTestContext({
+      agent: { name: "verifier", column: "In Code Review", requiresVerdict: true, producesCommits: false },
+      item: { issueNumber: 2245, status: "In Code Review" },
+      mockOptions: { fsMap: { [path]: `decision: ${decision}\ncommit: ${sha}\nlabels: ${labels.join(" ")}\n---\n## Verifier Review\nDecision: ${decision}` },
+        execImpls: { "gh pr list": () => JSON.stringify([{ number: 2264, isDraft: false }]),
+          "git status --porcelain": () => "" } },
+    });
+    ctx.verdictHandoffPath = path;
+    ctx.failedPreSpawnGate = "unit";
+    ctx.stagePlan = { version: 1, kind: "verifier", candidate: sha, checks: ["unit", "ui"], artifacts: [] };
+    ctx.stageChecks = [{ name: "unit", outcome: "failed", evidence: "Two assertions failed; later UI checks did not run" }];
+    store.stagePlan("mac", "s", ticket, runId, ctx.stagePlan);
+    ctx.client.completeStage = async (_number, submission) => store.stageResult("mac", "s", ticket, runId, submission);
+    try {
+      assert.deepEqual(await handlePostRun(STREAM_OK(), ctx, false), { ok: decision === "FAIL" });
+      const record = store.stages.get(runId)!;
+      assert.equal(record.result?.verdict?.decision, decision, "the saved verdict reaches the authority");
+      assert.deepEqual(record.result?.checks, ctx.stageChecks, "failed and unexecuted checks are not rewritten as passing");
+      assert.equal(record.acceptance?.state, decision === "FAIL" ? "rework" : "waiting");
+      assert.equal(store.workflow.get(ticket).status, "In Code Review", "failed checks never advance to documentation");
+      assert.equal(store.workflow.get(ticket).labels.includes("needs-rework:builder"), decision === "FAIL");
+      assert.equal(store.workflow.get(ticket).labels.includes("held:stage-result"), decision === "PASS");
+      assert.equal(store.stages.publications().length, decision === "FAIL" ? 1 : 0);
+      assert.ok(!client.addLabelCalls.some(c => c.label === "error:verifier"), "legacy routing cannot intercept central acceptance");
+      assert.ok(!client.addLabelCalls.some(c => c.label === "done:verifier"));
+    } finally {
+      store.close();
+    }
+  });
+}
