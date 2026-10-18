@@ -13,6 +13,23 @@ spec.loader.exec_module(policy)
 
 
 class SelectionTests(unittest.TestCase):
+    def test_desktop_unit_selection_is_exact_and_bounded(self):
+        for args in [
+            ['--files-json', '["src/main/store.test.ts"]'],
+            ['--tests-json', '["src/main/store.test.ts#outer comma, apostrophe\u0027s case"]'],
+        ]:
+            policy.selection('desktop-unit', args)
+        for args in [[], ['--files-json', '["src"]'],
+                     ['--files-json', '["../other.test.ts"]'],
+                     ['--files-json', '["src/*.test.ts"]'],
+                     ['--files-json', '["src/a.test.ts", "src/b.test.ts"]'],
+                     ['--tests-json', '["src/a.test.ts#"]'],
+                     ['--files-json', '["src/a.test.ts"]', '--all'],
+                     ['--files-json', '["src/a.test.ts"]', ';', 'npm', 'test'],
+                     ['--files-json', '["src/a.test.ts"]', '--files-json', '["src/b.test.ts"]']]:
+            with self.subTest(args=args), self.assertRaises(policy.PolicyError):
+                policy.selection('desktop-unit', args)
+
     def test_managed_emulator_setup_is_an_exact_non_test_task(self):
         policy.gradle_selection([':app:pixel2Api33AtdSetup', '--rerun', '--console=plain'])
         for args in [
@@ -114,8 +131,12 @@ class SelectionTests(unittest.TestCase):
                 policy.check(root, 'gradle', [':app:pixel2Api33AtdSetup', '--rerun', '--console=plain'])
                 with self.assertRaises(policy.PolicyError):
                     policy.check(root, 'gradle', [':app:pixel2Api33AtdDebugAndroidTest'])
+                with self.assertRaises(policy.PolicyError):
+                    policy.check(root, 'desktop-unit', [])
+                policy.check(root, 'desktop-unit', ['--files-json', '["src/a.test.ts"]'])
             with patch.object(policy, 'socket_context', return_value={**reply, 'role': 'verifier'}):
                 policy.check(root, 'go', ['test', './...'])
+                policy.check(root, 'desktop-unit', [])
             with patch.object(policy, 'socket_context', side_effect=OSError('gone')):
                 with self.assertRaises(policy.PolicyError):
                     policy.check(root, 'go', ['test', './internal/thread'])
