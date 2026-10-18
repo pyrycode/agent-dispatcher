@@ -93,7 +93,9 @@ def processes_using_path(path):
         return None
     result = subprocess.run([executable, '-nP', '-F0p', '+D', str(path)],
                             capture_output=True, timeout=60)
-    if result.returncode not in (0, 1) or result.stderr.strip():
+    if result.returncode not in (0, 1):
+        return None
+    if result.stderr.strip() and not load('fleet-path-custody').scoped_lsof_warning(result.stderr, path):
         return None
     try:
         fields = result.stdout.replace(b'\n', b'').split(b'\0')
