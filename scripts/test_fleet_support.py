@@ -76,7 +76,7 @@ class SupportTests(unittest.TestCase):
     if op=='artifacts-commit':commits.append(body);return {}
     self.fail('Unexpected operation '+op)
    s.rpc=rpc
-   with patch.object(s,'route_ready',return_value=False),patch.object(m,'execute') as execute,patch.object(m,'clone') as clone,patch.object(m.subprocess,'Popen') as spawn:
+   with patch.object(s,'route_ready',return_value=False),patch.object(s,'boot_proof',return_value=None),patch.object(m,'execute') as execute,patch.object(m,'clone') as clone,patch.object(m.subprocess,'Popen') as spawn:
     skipped=[e for e in s.tick() if e.get('phase')=='error']
     self.assertEqual([e['id'] for e in skipped],[task_id]);self.assertIn('Lost connection',skipped[0]['reason'])
     self.assertNotIn('artifactUnrecoverable',json.loads(receipt.read_text()))
