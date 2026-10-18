@@ -86,6 +86,18 @@ class Tests(unittest.TestCase):
         self.supervisor.workflow = [{'issueNumber': 123, 'state': 'CLOSED', 'status': 'Done'}]
         return repo, copy, graph, evidence
 
+    def test_launchd_path_without_sbin_uses_system_lsof_and_preserves_evidence(self):
+        if m.sys.platform != 'darwin' or not os.access('/usr/sbin/lsof', os.X_OK):
+            self.skipTest('Apple system lsof is unavailable')
+        repo, copy, graph, evidence = self.repository()
+        with patch.dict(os.environ, {'PATH': '/usr/bin:/bin'}):
+            self.assertIsNone(shutil.which('lsof'))
+            self.assertEqual(m.processes_using_path(str(copy)), [])
+            reports = self.supervisor.run(apply=True, cache=False)
+        self.assertEqual(reports[0]['state'], 'reclaimed', reports)
+        self.assertFalse(graph.exists())
+        self.assertEqual(evidence.read_bytes(), b'unique failure evidence')
+
     def test_real_git_and_lsof_reclaim_generated_graph_and_preserve_source_evidence_refs(self):
         if not shutil.which('lsof') or m.load('fleet-support').process_snapshot() is None:
             self.skipTest('Complete native process inspection unavailable')

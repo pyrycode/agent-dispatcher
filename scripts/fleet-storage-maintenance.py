@@ -90,6 +90,10 @@ def processes_using_path(path):
     if support.process_snapshot() is None:
         return None
     executable = shutil.which('lsof')
+    # launchd's protected environment omits /usr/sbin. Use Apple's system
+    # binary there without changing the supervisor's or workers' environment.
+    if executable is None and sys.platform == 'darwin' and os.access('/usr/sbin/lsof', os.X_OK):
+        executable = '/usr/sbin/lsof'
     if executable is None:
         return None
     result = subprocess.run([executable, '-nP', '-F0p', '+D', str(path)],
