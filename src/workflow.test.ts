@@ -1175,3 +1175,59 @@ test("the publisher settles repair markers and creates the recovery labels with 
     { name: LEGACY, color: "0B6E65" },
   ]);
 });
+
+// Read the persisted rows, including publication state and command receipts.
+function dependencyState(path: string) {
+  const db = new DatabaseSync(path);
+  try {
+    return ["workflow_tickets", "workflow_events", "workflow_commands"].map(table =>
+      db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all());
+  } finally { db.close(); }
+}
+const dependency = (number: number, project = config.project) =>
+  ({ number, state: "OPEN" as const, url: `https://github.com/${project}/issues/${number}` });
+
+test("new workflow dependency cycles reject the 3602/3603 aggregate loop atomically", t => {
+  const { store, path } = fixture(t), ticket = "org/mobile#3603";
+  store.workflow.import(config, [
+    { ...item(3602), blockedBy: [dependency(3603), dependency(3604)] }, item(3603), item(3604),
+  ]);
+  const before = dependencyState(path);
+  for (const blocker of [3602, 3603]) {
+    assert.throws(() => store.workflowOperator(ticket, {
+      blockedBy: [dependency(blocker)], status: "Halted", addLabels: ["error:real-claude-gate"], top: true,
+    }, "reject-" + blocker, 1), /cycle/);
+    assert.deepEqual(dependencyState(path), before, "rejection must retain rows, revisions, publication, events and receipts");
+  }
+  const valid = store.workflowOperator(ticket, { blockedBy: [dependency(3604)] }, "reject-3602", 1);
+  assert.equal(valid.revision, 2, "a rejected command did not retain a receipt");
+  assert.deepEqual(valid.blockedBy, [dependency(3604)]);
+  assert.equal(events(path, ticket).length, 1);
+  assert.deepEqual(store.workflowOperator(ticket, { blockedBy: [dependency(3604)] }, "reject-3602", 1), valid);
+});
+
+test("new workflow dependency cycles use known cross-repository paths and closed structural edges", t => {
+  const { store } = fixture(t), foreign = "org/core";
+  store.workflow.import(config, [item(3603), { ...item(3604), blockedBy: [dependency(3603, foreign)] }]);
+  store.workflow.import({ ...config, project: foreign }, [{ ...item(3603), url: `https://github.com/${foreign}/issues/3603`,
+    state: "CLOSED", blockedBy: [dependency(3603)] }]);
+  assert.throws(() => store.workflowOperator("org/mobile#3603", { blockedBy: [dependency(3604)] }, "long-cycle", 1), /cycle/);
+  // The same number in another repository is a different endpoint. An unknown
+  // endpoint ends the known path, rather than becoming a fabricated self edge.
+  const independent = store.workflowOperator("org/mobile#3603", { blockedBy: [dependency(3603, "org/unknown")] }, "unknown", 1);
+  assert.equal(independent.blockedBy[0].url, "https://github.com/org/unknown/issues/3603");
+});
+
+test("new workflow dependency cycles preserve legacy updates, removals and exact receipts", t => {
+  const { store } = fixture(t), ticket = "org/mobile#3603";
+  store.workflow.import(config, [{ ...item(3602), blockedBy: [dependency(3603)] },
+    { ...item(3603), blockedBy: [dependency(3602), dependency(3603)] }, item(3604)]);
+  const changed = store.workflowOperator(ticket, { addLabels: ["error:real-claude-gate"] }, "legacy-label", 1);
+  assert.equal(changed.revision, 2);
+  const unchanged = store.workflowOperator(ticket, { blockedBy: changed.blockedBy }, "legacy-edges", 2);
+  // A visited set terminates a known legacy loop unrelated to this new source.
+  assert.equal(store.workflowOperator("org/mobile#3604", { blockedBy: [dependency(3602)] }, "valid-legacy-path", 1).revision, 2);
+  const removed = store.workflowOperator(ticket, { blockedBy: [] }, "remove-legacy", unchanged.revision);
+  assert.deepEqual(removed.blockedBy, []);
+  assert.deepEqual(store.workflowOperator(ticket, { blockedBy: changed.blockedBy }, "legacy-edges", 2), unchanged);
+});

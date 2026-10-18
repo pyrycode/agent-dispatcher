@@ -639,6 +639,28 @@ export class WorkflowStore {
           ))
       )
         throw new Error("Invalid blockers");
+      if (change.blockedBy !== undefined) {
+        const reference = (project: string, blocker: ProjectItem["blockedBy"][number]) =>
+          `${blocker.url?.match(/github\.com\/([^/]+\/[^/]+)\/issues\//)?.[1] ?? project}#${blocker.number}`;
+        const previous = new Set(item.blockedBy.map(b => reference(config.project, b)));
+        const known = this.db.prepare("SELECT project,item FROM workflow_tickets WHERE ticket=?");
+        for (const blocker of change.blockedBy) {
+          const target = reference(config.project, blocker);
+          if (previous.has(target)) continue;
+          const pending = [target], visited = new Set<string>();
+          while (pending.length) {
+            const current = pending.pop()!;
+            if (current === ticket) throw new Error("Workflow dependency would create a cycle");
+            if (visited.has(current)) continue;
+            visited.add(current);
+            const row = known.get(current);
+            if (!row) continue;
+            const dependencies: ProjectItem["blockedBy"] = JSON.parse(String(row.item)).blockedBy;
+            for (const dependency of dependencies)
+              pending.push(reference(String(row.project), dependency));
+          }
+        }
+      }
       const labels = new Set(change.labels ?? item.labels);
       for (const label of change.removeLabels ?? []) labels.delete(label);
       for (const label of change.addLabels ?? []) labels.add(label);

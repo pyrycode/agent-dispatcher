@@ -30,7 +30,8 @@ import { join } from "node:path";
 import { GATE_PARSER_VERSION, parseGateOutput, type GateRunReport, type GateTally } from "./gate-output.js";
 import { gateRunMetaPath, liveGateLines, parseGateRunMeta, serializeGateRunMeta } from "./gate-report.js";
 import { recordInheritedTests, type InheritedTicketClient } from "./inherited-tickets.js";
-import { requiredLiveTestNames } from "./live-tests.js";
+import { requiredLiveTestNames, inheritedMarker } from "./live-tests.js";
+import { FleetStore } from "./fleet-store.js";
 import { parseTestEvidenceRules } from "./gate-test-evidence.js";
 
 // Desktop's rule file, as shipped in its agents repo.
@@ -2733,5 +2734,46 @@ describe("runRealClaudeGateExecution: advancing past tracked inherited failures"
       assert.deepEqual(tracker.blockers, [{ parent: 1809, blocker: 1947 }]);
       assert.doesNotMatch(client.addCommentCalls[0].body, /did not advance/);
     });
+  });
+});
+
+
+test("inherited aggregate cycle rejection keeps owned live failures in rework", async t => {
+  await withStageSet("builder", async () => {
+    const own = "pkg.TestCodex", shared = "pkg.TestComposer", project = "org/core";
+    const candidate = parkedItem({ id: "item-3603", issueNumber: 3603, body: inheritedMarker(own),
+      labels: ["done:verifier", "needs-real-claude", "bug"] });
+    const store = new FleetStore(":memory:", { mac: { heavyLimit: 2, combinedLimit: 2 } });
+    t.after(() => store.close());
+    const node = (number: number, body: string) => ({ ...candidate, id: "item-" + number, issueId: "issue-" + number,
+      issueNumber: number, url: `https://github.com/${project}/issues/${number}`, body, state: "OPEN" as const, revision: 1, position: number });
+    store.workflow.import({ project, projectId: "P", statusFieldId: "S", options: { Inbox: "i", "In Development": "d", Done: "done" } }, [
+      { ...node(3602, inheritedMarker(shared)), blockedBy: [{ number: 3603, state: "OPEN" }, { number: 3604, state: "OPEN" }] },
+      node(3603, inheritedMarker(own)), node(3604, inheritedMarker(shared)),
+    ]);
+    const client = new MockClient([candidate]), tracker = new TrackerClient();
+    tracker.open = store.workflow.list(project).map(i => ({ number: i.issueNumber, nodeId: i.issueId, body: i.body }));
+    tracker.statuses = new Map(tracker.open.map(i => [i.number, "In Development"]));
+    const attempted: number[] = [];
+    tracker.addBlocker = async (parent, blocker) => {
+      attempted.push(blocker);
+      const target = `${project}#${parent}`;
+      store.workflow.change(target, { blockedBy: [{ number: blocker, state: "OPEN" }] }, "test-caller", "caller-link");
+      tracker.blockers.push({ parent, blocker });
+    };
+    let tracking: Awaited<ReturnType<typeof recordInheritedTests>> | undefined;
+    const r = report({ exitCode: 1, requiredTests: [own],
+      tally: tally({ executed: 176, passed: 174, failed: 2, failedNames: [own, shared], packageFailed: true, packageFailures: ["pkg"] }),
+      rerunFailures: [own, shared], rerunSkipReason: null, baselineFailures: [own, shared] });
+    await runRealClaudeGateExecution(client, async () => r, 150, async () => {}, 0, undefined, undefined,
+      async (failures, ctx, opts) => tracking = await recordInheritedTests(tracker, failures, ctx, opts), { inheritedAdvance: true });
+    assert.deepEqual(attempted, [3602], "existing lowest-numbered exact-marker selection is unchanged");
+    assert.deepEqual(store.workflow.get(`${project}#3603`).blockedBy, []);
+    assert.deepEqual(tracking?.untracked, [shared]);
+    assert.deepEqual(tracking?.owned, [own]);
+    assert.deepEqual(tracker.blockers, []);
+    assert.ok(candidate.labels.includes("needs-rework:builder"));
+    assert.ok(!candidate.labels.includes("done:real-claude-gate"));
+    assert.match(client.addCommentCalls.at(-1)!.body, /owns the fix/);
   });
 });
