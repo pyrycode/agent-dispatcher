@@ -33,6 +33,9 @@ class DesktopCaptureTests(unittest.TestCase):
             if 'worktree' in argv:
                 worktree = directory / 'desktop'; worktree.mkdir()
                 (worktree / 'playwright.config.ts').write_text(config)
+                (worktree / 'package-lock.json').write_text('{"lockfileVersion":3}')
+                (worktree / 'node_modules').mkdir()
+                (worktree / 'node_modules/fixture.js').write_text('locked dependency fixture')
             if argv == ['npm', 'run', 'rebuild:electron']:
                 with log.open('a') as output: output.write('rebuild stdout diagnostic\nrebuild stderr diagnostic\n')
                 return rebuild_code
@@ -43,7 +46,7 @@ class DesktopCaptureTests(unittest.TestCase):
                 return exit_code
             return setup_code if argv[0] == 'npm' else 0
         with patch.object(m, 'execute', side_effect=execute), patch.object(m, 'clone') as clone:
-            result = m.native_recipe({'ticket': 'pyrycode/pyrycode-desktop#1983', 'request': {
+            result = m.native_recipe({'id':'a'*64,'ticket': 'pyrycode/pyrycode-desktop#1983', 'request': {
                 'recipe': 'desktop-fake-suite', 'capability': 'desktop-fake-suite', 'revision': SHA}}, paths, directory)
             clone.assert_not_called()
         return result, calls, config
@@ -64,6 +67,10 @@ class DesktopCaptureTests(unittest.TestCase):
             self.assertEqual(evidence['configuration']['workers'], 4)
             self.assertEqual(evidence['configuration']['projects'][0]['workers'], 1)
             self.assertEqual(evidence['counts'], {'executed': 1, 'passed': 1, 'failed': 0, 'skipped': 0, 'retries': 0})
+            installed=json.loads((directory/'dependency-install.json').read_text())
+            self.assertEqual(installed['taskId'],'a'*64)
+            self.assertEqual(evidence['dependencyReferenceDigest'],installed['referenceDigest'])
+            self.assertEqual(installed['reference']['entries'][0]['path'],'node_modules/fixture.js')
             self.assertIn('fresh full-suite', result['files']['desktop/playwright.list.log'])
             wrapper = (directory/'desktop/playwright.config.ts').read_text()
             self.assertIn('...config', wrapper)
@@ -81,13 +88,14 @@ class DesktopCaptureTests(unittest.TestCase):
 
     def test_real_git_keeps_source_checkout_and_uses_only_a_pushed_revision(self):
         with tempfile.TemporaryDirectory() as d:
-            root=Path(d);remote=root/'remote.git';source=root/'source';directory=root/'capture';directory.mkdir()
+            root=Path(d).resolve();remote=root/'remote.git';source=root/'source';directory=root/'capture';directory.mkdir()
             env={k:v for k,v in os.environ.items() if not k.startswith('GIT_')}
             def git(*args):
                 return subprocess.check_output(['git',*map(str,args)],env=env,stderr=subprocess.DEVNULL,text=True).strip()
             git('init','--bare',remote);git('init',source)
             git('-C',source,'config','user.name','Fixture');git('-C',source,'config','user.email','fixture@example.test')
             (source/'playwright.config.ts').write_text('export default {workers:4}\n')
+            (source/'package-lock.json').write_text('{"lockfileVersion":3}')
             git('-C',source,'add','.');git('-C',source,'commit','-m','configured suite')
             revision=git('-C',source,'rev-parse','HEAD');git('-C',source,'remote','add','origin',remote);git('-C',source,'push','origin','HEAD')
             branch=git('-C',source,'branch','--show-current');calls=[]
@@ -98,9 +106,12 @@ class DesktopCaptureTests(unittest.TestCase):
                     worktree=Path(argv[1]);self.assertEqual(git('-C',worktree,'rev-parse','HEAD'),revision)
                     self.assertEqual(git('-C',worktree,'rev-parse','--path-format=absolute','--git-common-dir'),str(source/'.git'))
                     (directory/'playwright.json').write_text(json.dumps(report()))
+                if argv==['npm','ci']:
+                    (Path(cwd)/'node_modules').mkdir()
+                    (Path(cwd)/'node_modules/fixture.js').write_text('installed dependency')
                 with log.open('a') as output:output.write('fresh diagnostic\n')
                 return 0
-            task={'ticket':'pyrycode/pyrycode-desktop#1983','request':{'recipe':'desktop-fake-suite','revision':revision}}
+            task={'id':'b'*64,'ticket':'pyrycode/pyrycode-desktop#1983','request':{'recipe':'desktop-fake-suite','revision':revision}}
             paths={'desktop':str(source),'desktopLauncher':'launcher'}
             with patch.object(m,'execute',side_effect=execute):result=m.native_recipe(task,paths,directory)
             self.assertEqual(result['outcome'],'completed')

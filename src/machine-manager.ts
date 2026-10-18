@@ -6,6 +6,7 @@ import { effectiveWork, desiredRun, stricter, validateDocument, workRefusal, MAC
 import { validateStart, validateLimits, type MachineLimits, type FleetRun } from "./fleet-store.js";
 import { scheduleMachine, workEligibility, runnableTickets, codexPaused, codexSpaced, isNewTicket, reviewQueue, effectiveReviewQueueLimit, lackingCapabilities, type WorkOffer } from "./machine-scheduler.js";
 import { validateCapabilityReport } from "./ticket-requirements.js";
+import { diskAdmission, validateDiskAdmission, availableDiskBytes, type DiskAdmissionConfig, type DiskSpaceProbe } from './disk-admission.js';
 
 /**
  * An operator drain or resume, kept so a supervisor can tell it from an
@@ -33,6 +34,8 @@ export interface DesiredStateOptions {
  */
 export type DesiredMode = "central" | "cached" | "unknown" | "unsupported";
 export interface MachineConfig extends MachineLimits { machine: string; projects: string[]; drainingProjects?: string[]; projectDrainChanges?: ProjectDrainChange[]; ticketLimit?: number;
+  /** Automatic start floor. Never changes desired state, holds or existing grants. */
+  diskAdmission?:DiskAdmissionConfig;
   /** New tickets wait while this many owned tickets wait for review. Absent: heavyLimit. 0: no hold. */
   reviewQueueLimit?: number; controlRevision?: string;
   /**
@@ -44,6 +47,11 @@ export interface MachineConfig extends MachineLimits { machine: string; projects
   capabilities?: string[] }
 type ClaimService = Pick<FleetClient, "snapshot" | "start" | "finish"> & Partial<Pick<FleetClient, "authorize" | "github" | "call">>;
 interface Offers { session: string; work: WorkOffer[]; at: number }
+// These stages can compile or test even if an older dispatcher labels them
+// light. Native support's sole light recipe is the fixed platform probe.
+function needsStorage(offer:WorkOffer):boolean {
+  return offer.resource!=='light'||['builder','developer','verifier','qa','code-review'].includes(offer.role);
+}
 export function offerId(machine: string, session: string, offer: WorkOffer): string {
   return createHash("sha256").update(JSON.stringify([machine, session, offer.project, offer.key])).digest("hex");
 }
@@ -71,7 +79,7 @@ export class MachineManager {
   /** The same drains, still applied here until a document that holds them is saved. */
   private localFloor: Set<string>;
   private refreshing: Promise<void> | undefined;
-  constructor(readonly config: MachineConfig, readonly claims: ClaimService, private readonly now = Date.now, private readonly desired?: DesiredStateOptions) {
+  constructor(readonly config: MachineConfig, readonly claims: ClaimService, private readonly now = Date.now, private readonly desired?: DesiredStateOptions, private readonly diskProbe:DiskSpaceProbe=availableDiskBytes) {
     this.startedAt = now();
     if (desired) {
       if (!claims.call) throw new Error("Desired state requires the claim service");
@@ -86,6 +94,7 @@ export class MachineManager {
     this.pendingImports = new Set(desired ? saved.filter(p => !this.desiredDoc || effectiveWork(this.desiredDoc.entries, p) === "taking") : []);
     this.localFloor = new Set(this.pendingImports);
     validateLimits(config);
+    validateDiskAdmission(config.diskAdmission);
     if (config.ticketLimit !== undefined && (!Number.isSafeInteger(config.ticketLimit) || config.ticketLimit < 1)) throw new Error("Invalid ticket limit");
     if (config.reviewQueueLimit !== undefined && (!Number.isSafeInteger(config.reviewQueueLimit) || config.reviewQueueLimit < 0)) throw new Error("Invalid review queue limit");
     if (!config.machine || new Set(config.projects).size !== config.projects.length) throw new Error("Invalid machine configuration");
@@ -271,6 +280,12 @@ export class MachineManager {
       if (this.held(job, state)) continue;
       const current=job.supportTaskId?this.supportOffers:this.offers.get(job.project);
       if (!current || !current.work.some(w => w.key === job.key) || this.now() - current.at >= 180_000) continue;
+      // Probe for each prospective grant. Do not reserve first or reuse one
+      // free-space snapshot across several simultaneous heavy starts.
+      if(needsStorage(job) && !(await diskAdmission(this.config.diskAdmission,this.diskProbe)).allowed)continue;
+      // Desired state or offers can change while the filesystem probe waits.
+      if(this.draining || this.held(job,state) || (job.supportTaskId?this.supportOffers:this.offers.get(job.project))!==current
+        || !current.work.some(w=>w.key===job.key) || this.now()-current.at>=180_000)continue;
       // A lost reply leaves a durable reservation. grants() recovers that exact
       // run from the server; it never guesses that a timed-out start failed.
       const { key: _key, order: _order, recovery: _recovery, recoveryError: _error, ...request } = job;
@@ -328,8 +343,14 @@ export class MachineManager {
     if(this.config.machine!==h.target)throw new Error('Wrong handoff target');
     // Target is a new owner. Apply ticket/review limits and every local drain before moving anything.
     const hypothetical={...state,claims:state.claims.filter(c=>c.ticket!==h.ticket)};
-    const available=[...this.offers.values()].filter(o=>this.now()-o.at<180_000).flatMap(o=>o.work).filter(o=>!this.finished.has(`${o.project}/${o.key}`));
-    if(!scheduleMachine({...this.config,...this.schedulingDrains(),offers:available,state:hypothetical}).some(o=>o.key===verifier.key))throw new Error('Handoff target held by manager scheduling controls');
+    const ready=()=>{
+      if(this.draining||!this.desiredKnown()||this.offers.get(project)!==current||this.now()-current.at>=180_000||!current.work.includes(verifier))throw new Error('Handoff target held after dispatcher or manager state changed');
+      const available=[...this.offers.values()].filter(o=>this.now()-o.at<180_000).flatMap(o=>o.work).filter(o=>!this.finished.has(`${o.project}/${o.key}`));
+      if(!scheduleMachine({...this.config,...this.schedulingDrains(),offers:available,state:hypothetical}).some(o=>o.key===verifier.key))throw new Error('Handoff target held by manager scheduling controls');
+    };
+    ready();
+    if(needsStorage(verifier) && !(await diskAdmission(this.config.diskAdmission,this.diskProbe)).allowed)throw new Error('Handoff target waiting-storage: new heavy work requires available disk space');
+    ready();
     const {key:_key,order:_order,recovery:_recovery,recoveryError:_error,...request}=verifier;
     return {h,target:{...request,id:offerId(this.config.machine,session,verifier),machine:this.config.machine,session}};
   }
@@ -341,12 +362,13 @@ export class MachineManager {
     const state = await this.claims.snapshot();
     const available = [...this.offers.values(),...(this.supportOffers?[this.supportOffers]:[])].filter(o => this.now() - o.at < 180_000).flatMap(o => o.work);
     const runnableOffers = available.filter(o => !this.finished.has(`${o.project}/${o.key}`));
-    const eligible = new Set((this.desiredKnown() ? scheduleMachine({ ...this.config, ...this.schedulingDrains(), offers: runnableOffers, state }) : []).map(o => `${o.project}/${o.key}`));
+    const storage=await diskAdmission(this.config.diskAdmission,this.diskProbe);
+    const eligible = new Set((this.desiredKnown() ? scheduleMachine({ ...this.config, ...this.schedulingDrains(), offers: runnableOffers.filter(o=>storage.allowed||!needsStorage(o)), reviewOffers:runnableOffers, state }) : []).map(o => `${o.project}/${o.key}`));
     const desired = this.desiredStatus();
     const reviewLimit = effectiveReviewQueueLimit(this.config);
     const waitingReview = reviewQueue(this.config.machine, state, runnableOffers, { ...this.config, ...this.schedulingDrains() });
     const reviewFull = reviewLimit > 0 && waitingReview !== undefined && waitingReview.length >= reviewLimit;
-    return { ...(this.config.controlRevision?{controlRevision:this.config.controlRevision}:{}), managerStartedAt: this.startedAt, machine: this.config.machine, heavyLimit: this.config.heavyLimit, combinedLimit: this.config.combinedLimit, ...(this.config.projectHeavyLimits ? { projectHeavyLimits: this.config.projectHeavyLimits } : {}), ticketLimit: this.config.ticketLimit ?? null,
+    return { ...(this.config.controlRevision?{controlRevision:this.config.controlRevision}:{}), ...(this.config.diskAdmission?{diskAdmission:storage}:{}), managerStartedAt: this.startedAt, machine: this.config.machine, heavyLimit: this.config.heavyLimit, combinedLimit: this.config.combinedLimit, ...(this.config.projectHeavyLimits ? { projectHeavyLimits: this.config.projectHeavyLimits } : {}), ticketLimit: this.config.ticketLimit ?? null,
       // tickets is null when the claim service predates the report; nothing is held then.
       reviewQueue: { limit: reviewLimit, tickets: waitingReview ?? null, full: reviewFull }, capabilities: this.config.capabilities ?? [], runnableTicketCount: runnableTickets(this.config.machine, runnableOffers, state).size, draining: this.draining,
       // Every board that is not taking work, so a supervisor sees a central drain as a policy change it can explain.
@@ -365,6 +387,7 @@ export class MachineManager {
           : lackingCapabilities(o, state, this.config.capabilities).length
             ? (state.noCapableMachine?.some(g => g.ticket === o.ticket) ? "no-capable-machine" : "missing-capability")
           : workEligibility(o, state, { ...this.config, ...this.schedulingDrains() }) ? workEligibility(o, state, { ...this.config, ...this.schedulingDrains() })!
+          : needsStorage(o) && !storage.allowed ? 'waiting-storage'
           : codexPaused(o, state) ? "codex-paused"
           : codexSpaced(o, state) ? "codex-spaced"
           // A verifier selected in the same pass can shorten the queue, so an offer it frees is eligible.

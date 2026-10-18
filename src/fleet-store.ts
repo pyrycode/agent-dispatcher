@@ -287,10 +287,38 @@ export class FleetStore {
     this.flaky = new FlakySightingLedger(this.db, clock);
   }
   close(): void { this.db.close(); }
-  private storageBasis(request:StorageRequest):string {
+  private storageBasis(request:StorageRequest,attesting=false):string {
     if(!Object.hasOwn(this.limits,request.machine))throw new Error('Unknown storage machine');
     const desired=this.desired.document(request.machine);
     const machine=desired.entries.find(e=>e.project==='*');
+    if(request.kind==='native-task') {
+      const task=this.tasks.get(request.taskId!);
+      if(task.machine!==request.machine || task.ticket!==request.ticket || task.request.recipe!=='desktop-fake-suite'
+        || !(task.state==='complete'&&task.result?.outcome==='completed' || task.state==='failed'&&task.result?.outcome==='failed') || task.artifactsPending || !task.artifacts
+        || task.request.revision!==request.head || task.result.candidateRevision!==request.head
+        || !request.path.endsWith('/'+task.id+'/desktop'))throw new Error('Native cleanup requires its exact completed published task and revision');
+      if(manifestHash(task.artifacts)!==request.artifactDigest)throw new Error('Native cleanup published evidence differs');
+      if(!attesting && !this.storage.attested(request)) {
+        const file=task.artifacts.files.find(f=>f.path==='desktop/capture.json');
+        if(!file)throw new Error('Native cleanup dependency reference has no published provenance');
+        const data=Buffer.concat(file.chunks.map((_,part)=>Buffer.from(this.tasks.artifact(task.id,request.artifactDigest!,'desktop/capture.json',part).data,'base64')));
+        if(JSON.parse(data.toString('utf8')).dependencyReferenceDigest!==request.referenceDigest)throw new Error('Native cleanup dependency reference requires a protected attestation');
+      }
+      if(this.snapshot().runs.some(r=>r.id===task.runId || r.supportTaskId===task.id))throw new Error('Native cleanup has active task custody');
+      const project=task.ticket.split('#')[0];
+      if(this.machineRecoveries.blocked(request.machine,project))throw new Error('Native cleanup preserves unreconciled stopped-worker evidence');
+      if(!this.workflow.enabled(project)||this.workflow.preparing(project))throw new Error('Native cleanup requires active workflow authority');
+      const item=this.workflow.get(task.ticket),approval=this.approvals.get(task.ticket);
+      if(task.state==='failed' && (item.state!=='CLOSED'||item.status!=='Done'))throw new Error('Native cleanup retains failed evidence while its source remains unresolved');
+      const incident=this.db.prepare('SELECT reason,decision,state FROM fleet_recovery WHERE ticket=? AND present=1').get(task.ticket);
+      if(item.status==='Halted' || item.labels.some(l=>/^(needs-human:|health-hold:|held:|error:|wip:|needs-rework:|pending-done:|pending-verdict:|orchestrator:escalated)/.test(l)||l.includes('permission_denied'))
+        || approval?.kind==='rejected'&&!approval.authorization
+        || incident && (/Explicit operator hold|Denied permission|Pause origin unknown/.test(String(incident.reason)) || incident.state==='escalated' && incident.decision && JSON.parse(String(incident.decision)).category==='human')) throw new Error('Native cleanup preserves source holds and recovery attention');
+      const owner=this.db.prepare('SELECT machine,generation FROM fleet_claims WHERE ticket=?').get(task.ticket)??null;
+      // Drains stop admission. They do not prohibit reclaiming dependencies from
+      // this published, drained task. They are still immutable in the basis.
+      return JSON.stringify({desired,revision:item.revision,owner,task,incident:incident??null});
+    }
     if(machine?.work && machine.work!=='taking')throw new Error('Storage maintenance respects machine drains');
     const runs=this.snapshot().runs;
     if(request.kind==='cache') {
@@ -314,6 +342,7 @@ export class FleetStore {
     return JSON.stringify({revision:item.revision,owner,desired});
   }
   acquireStorage(request:StorageRequest) {return this.transaction(()=>this.storage.acquire(request,()=>this.storageBasis(request)));}
+  attestStorage(request:StorageRequest) {return this.transaction(()=>this.storage.attest(request,()=>this.storageBasis(request,true)));}
   verifyStorage(id:string,machine:string) {return this.transaction(()=>{const lease=this.storage.get(id);return this.storage.verify(id,machine,()=>this.storageBasis(lease));});}
   finishStorage(id:string,machine:string,drained:unknown,result:unknown) {return this.transaction(()=>this.storage.finish(id,machine,drained,result));}
   cancelStorage(request:StorageRequest,drained:unknown) {return this.transaction(()=>{
@@ -1073,7 +1102,7 @@ export class FleetStore {
         if (JSON.stringify(original) !== request) throw new Error("Request ID reused with different contents");
         return previous.finished === null ? { ok: true, generation: String(previous.generation) } : { ok: false, reason: "finished" };
       }
-    if(this.storage.blocks(req.machine,req.ticket,req.parentTicket))return {ok:false,reason:'locked'};
+    if(this.storage.blocks(req.machine,req.ticket,req.parentTicket,req.supportTaskId))return {ok:false,reason:'locked'};
     if (!req.verificationPin && this.activeVerifierHandoffs().some(h=>h.ticket===req.ticket)) return {ok:false,reason:'locked'};
     if (this.machineRecoveries.blocked(req.machine,req.project)) return {ok:false,reason:'drained'};
     // The operator's central drain or stop holds new grants here even when
