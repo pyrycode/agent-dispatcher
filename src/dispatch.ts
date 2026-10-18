@@ -1922,6 +1922,7 @@ async function attemptSaferSalvage(opts: {
   client: DispatchClient;
   logFile: string;
   deps: DispatchDeps;
+  publicationHeld: () => Promise<boolean>;
 }): Promise<boolean> {
   const { execSync, spawnSync, notifyDiscord } = opts.deps;
   const gates = opts.deps.salvageGates ?? salvageGates;
@@ -1973,6 +1974,10 @@ async function attemptSaferSalvage(opts: {
         `${gateSummary} dirty=${hasUncommittedChanges} committedChanges=${hasCommittedChanges}`);
       return false;
     }
+
+    // Configured gates can generate captures after the initial failed-run
+    // inventory. Inspect again before staging files or publishing commits.
+    if (await opts.publicationHeld()) return false;
 
     if (hasUncommittedChanges) {
       stageAutomaticChanges(opts.agentCwd, opts.deps);
@@ -5187,6 +5192,7 @@ export async function handleAgentResultErrors(
       agentCwd, branchName, agent, item,
       streamResult, client, logFile,
       deps: ctx.deps,
+      publicationHeld: () => holdUnreviewedCapturePublication(ctx, agentCwd),
     });
     if (ok) {
       saferSalvaged = true;
