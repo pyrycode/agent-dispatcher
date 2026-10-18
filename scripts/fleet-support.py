@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Existing fleet supervisor's admitted native work. Requests cannot supply shell commands."""
 import hashlib
+import importlib.util
 import base64
 import json
 import os
@@ -409,6 +410,12 @@ def desktop_capture(task,paths,directory):
         config.write_text("import config from './playwright.fleet-original.config'\nexport default { ...config, reporter: [['list'], ['json', { outputFile: "+json.dumps(str(report))+" }]] }\n")
         for argv,timeout in ((['npm','ci'],600),(['npm','run','build'],600)):
             if run(argv,worktree,timeout=timeout)!=0:raise RuntimeError('Desktop install/build failed; inspect execution.log')
+            if argv==['npm','ci']:
+                spec=importlib.util.spec_from_file_location('native_dependency_manifest',Path(__file__).with_name('fleet-native-storage.py'))
+                storage=importlib.util.module_from_spec(spec);spec.loader.exec_module(storage)
+                installed=storage.installation(task,worktree.resolve(strict=True))
+                atomic(directory/'dependency-install.json',installed)
+                evidence['dependencyReferenceDigest']=installed['referenceDigest']
         # Prepare the Electron ABI only after host-Node install/build preparation.
         if run(['npm','run','rebuild:electron'],worktree,timeout=600)!=0:
             raise RuntimeError('Desktop Electron rebuild failed; inspect execution.log')
@@ -842,7 +849,9 @@ class SupportSupervisor:
     def receipt_pass(self,machine,receipt,running):
         old=json.loads(receipt.read_text())
         if old['phase']=='complete' and (old.get('artifactDigest') or old.get('artifactUnrecoverable') or old.get('interrupted')
-                                         or old.get('publicationRefused') or (old.get('finalized') or {}).get('released')):return
+                                         or old.get('publicationRefused') or (old.get('finalized') or {}).get('released')):
+            self.schedule_dependency_cleanup(receipt,old)
+            return
         result=Path(old['result'])
         if old['phase']=='complete' and not result.is_file():return
         if old['phase']=='complete':
@@ -926,6 +935,7 @@ class SupportSupervisor:
                 old['artifactResult']=str(artifact_result);atomic(receipt,old)
             old['artifactDigest']=self.return_artifacts(machine,old,value)
             old['phase']='complete';atomic(receipt,old)
+            self.schedule_dependency_cleanup(receipt,old)
         elif old['phase'] in {'running','attention'} and not alive and not result.is_file() and (old.get('interrupted') or (proof:=worker_gone_with_container(old))):
             self.interrupt(machine,receipt,old,proof)
         elif old['phase']=='attention':
@@ -936,6 +946,19 @@ class SupportSupervisor:
             self.rpc('uncertain',{'machine':machine,'id':old['id'],'session':old['session'],'reason':old['reason']})
             running.append(old)
         else:running.append(old)
+
+    def schedule_dependency_cleanup(self,receipt,old):
+        """Signal the separate storage worker. Never hash or delete in watchdog."""
+        if old.get('phase')!='complete' or old.get('dependencyCleanupScheduled') or not old.get('drainConfirmed') or not old.get('artifactDigest') or old.get('interrupted') or old.get('artifactUnrecoverable'):return
+        try:
+            directory=Path(old.get('directory') or Path(old['result']).parent)
+            task=json.loads((directory/'task.json').read_text())
+            value=json.loads(Path(old['result']).read_text())
+            if task['id']!=old['id'] or task['request']['recipe']!='desktop-fake-suite' or value['outcome']!='completed':return
+            storage=Path(self.config['stateDirectory'])/'storage';storage.mkdir(mode=0o700,exist_ok=True)
+            atomic(storage/'native-completion.json',{'id':old['id'],'time':time.time()})
+            old['dependencyCleanupScheduled']=True;atomic(receipt,old)
+        except (OSError,ValueError,KeyError,TypeError):return
 
     def publication_retry(self,receipt,old,error):
         """Wait before the next attempt at a temporary publication failure.
@@ -1076,6 +1099,9 @@ class SupportSupervisor:
             result=folder/'result.json';task['admission']=admitted
             atomic(folder/'task.json',task);atomic(folder/'paths.json',route['paths'])
             program=folder/'worker.py';program.write_text(Path(__file__).read_text());program.chmod(0o700)
+            if task['request']['recipe']=='desktop-fake-suite':
+                for name in ('fleet-native-storage.py','fleet-storage.py'):
+                    (folder/name).write_bytes(Path(__file__).with_name(name).read_bytes())
             if route.get('container'):
                 root=route['containerDirectory'].rstrip('/')+'/'+task['id']
                 command=['podman','exec',route['container'],'python3',root+'/worker.py','--worker',root]
