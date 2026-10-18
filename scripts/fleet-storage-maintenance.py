@@ -8,6 +8,7 @@ leases are released only after synchronous cleanup or proven command drainage.
 import argparse
 import contextlib
 import fcntl
+import hashlib
 import importlib.util
 import json
 import os
@@ -252,10 +253,18 @@ class StorageSupervisor:
             if saved.get('phase') == 'finished':
                 continue
             request = saved['request']
-            if saved.get('command'):
+            if 'command' in saved or saved.get('phase') in ('command-pending', 'command-running'):
                 # Never reinterpret a journal from an older external-command
                 # implementation as synchronous work.
                 raise RuntimeError('Retained external cleanup command needs independent custody proof')
+            if request['kind'] == 'cache' and saved.get('receipt'):
+                try:
+                    receipt = read(saved['receipt'], {})
+                    uncertain = receipt.get('phase') in ('cleaning', 'uncertain')
+                except Exception:
+                    uncertain = True
+                if uncertain:
+                    self.assessment_hold(request['path'], saved['receipt'])
             # Caller holds maintenance.lock. Both backends only unlink in this
             # process and never delegate deletion. Acquiring that lock proves an
             # earlier cleaner cannot still mutate, even after a crash.
@@ -266,6 +275,16 @@ class StorageSupervisor:
             self.matches(request, lease, finished=True)
             saved.update(phase='finished', result='held')
             atomic(path, saved)
+
+    def assessment_path(self, cache):
+        return self.directory / (hashlib.sha256(cache.encode()).hexdigest() + '.cache-hold.json')
+
+    def assessment_hold(self, cache, receipt):
+        path = self.assessment_path(cache)
+        if not path.exists():
+            atomic(path, {'cache': cache, 'receipt': receipt, 'created': time.time(),
+                'reason': 'An interrupted or uncertain cache change requires independent operator assessment'})
+        return path
 
     def candidates(self):
         core = load('fleet-storage')
@@ -353,10 +372,16 @@ class StorageSupervisor:
                   'timeoutSeconds': 600, **options}
         config['cache'] = str(canonical(config['cache']))
         config['receipt'] = str(self.directory / (str(uuid.uuid4()) + '.cache.json'))
+        hold_path = self.assessment_path(config['cache'])
+        hold = read(hold_path)
+        if hold is not None and apply:
+            return {'kind': 'go-build-cache', 'phase': 'held', 'reason': hold['reason'],
+                    'assessmentHold': str(hold_path), 'receipt': hold['receipt']}
         if not apply:
             return {'kind': 'go-build-cache', 'phase': 'audit', 'cache': config['cache'],
                     'budgets': {key: config[key] for key in ('maxBytes', 'reserveBytes')},
-                    'observed': load('fleet-build-cache').inspect_cache(Path(config['cache']))}
+                    'observed': load('fleet-build-cache').inspect_cache(Path(config['cache'])),
+                    **({'assessmentHold': str(hold_path), 'assessment': hold} if hold else {})}
         # Match the existing test-admission daemon's exact configured inode.
         admission = self.options.get('testAdmissionLock') or os.environ.get('PYRY_TEST_ADMISSION_LOCK') or str(Path.home() / '.local/share/pyry-fleet/test-admission.lock')
         with locked(admission, existing=True) as admission_fd:
@@ -379,6 +404,8 @@ class StorageSupervisor:
                 return {'allowed': True, 'exclusive': True, 'lease': request['id'],
                         'custody': 'drained', 'admissionHeld': True}
             report = load('fleet-build-cache').manage_cache(config, guard, apply=True)
+            if report.get('phase') == 'uncertain':
+                report['assessmentHold'] = str(self.assessment_hold(config['cache'], config['receipt']))
             # All mutation is synchronous descriptor-relative unlink. Even an
             # uncertain filesystem receipt has no surviving deletion process.
             self.finish(path, saved, 'complete' if report['phase'] in ('complete', 'within-budget') else 'held')

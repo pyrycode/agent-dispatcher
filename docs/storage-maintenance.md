@@ -80,3 +80,12 @@ The main supervisor receives at most 20 bounded summaries from the latest pass.
 Successful repeated clean audits reuse their progress and latest receipts.
 Per-lease authority request files are reused across repeated guard checks.
 Failed attempts and durable lease records are preserved for investigation.
+
+An uncertain or interrupted cache change creates a persistent local assessment
+hold before the machine lease is released. Its file is
+`stateDirectory/storage/SHA256_OF_CANONICAL_CACHE_PATH.cache-hold.json` and points
+to the unique retained receipt. Subsequent cache passes report held and do not
+acquire a lease or attempt deletion. Normal jobs and copy cleanup can continue.
+An independent operator must audit the exact receipt and cache, then explicitly
+move the hold record aside after deciding that a fresh attempt is justified.
+The read-only audit command shows this hold and never clears it automatically.

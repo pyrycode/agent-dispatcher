@@ -416,6 +416,49 @@ class Tests(unittest.TestCase):
         self.assertTrue(evidence.exists())
         self.assertFalse(self.supervisor.leases)
 
+    def test_uncertain_cache_attempt_has_local_hold_before_lease_release_and_no_automatic_retry(self):
+        cache, target, evidence, admission = self.cache()
+        invoked = []
+        def uncertain(config, guard, **options):
+            guard()
+            invoked.append(config['receipt'])
+            result = {'phase': 'uncertain', 'releaseSafe': False}
+            m.atomic(config['receipt'], result)
+            return result
+        module = type('Cache', (), {'manage_cache': uncertain})
+        original = m.load
+        def load(name):
+            return module if name == 'fleet-build-cache' else original(name)
+        original_finish = self.supervisor.finish
+        def finish(path, saved, result):
+            self.assertTrue(self.supervisor.assessment_path(str(cache)).exists())
+            return original_finish(path, saved, result)
+        with patch.object(m, 'load', side_effect=load), patch.object(self.supervisor, 'finish', side_effect=finish):
+            first = self.supervisor.cache_pass('test-host', True)
+            second = self.supervisor.cache_pass('test-host', True)
+        self.assertEqual(first['phase'], 'uncertain')
+        self.assertEqual(second['phase'], 'held')
+        self.assertEqual(len(invoked), 1)
+        self.assertEqual(second['receipt'], invoked[0])
+        self.assertFalse(self.supervisor.leases)
+        self.assertTrue(target.exists())
+        self.assertTrue(evidence.exists())
+
+    def test_restart_preserves_interrupted_cache_receipt_as_local_hold_before_cancel(self):
+        cache, target, evidence, admission = self.cache()
+        request = {'id': str(uuid.uuid4()), 'machine': 'test-host', 'kind': 'cache', 'path': str(cache)}
+        path, saved = self.supervisor.acquire(request)
+        receipt = self.supervisor.directory / 'interrupted.cache.json'
+        m.atomic(receipt, {'phase': 'cleaning'})
+        saved.update(phase='synchronous-cleanup', receipt=str(receipt))
+        m.atomic(path, saved)
+        with m.locked(self.supervisor.directory / 'maintenance.lock'):
+            self.supervisor.reconcile()
+        self.assertFalse(self.supervisor.leases)
+        held = self.supervisor.cache_pass('test-host', True)
+        self.assertEqual(held['phase'], 'held')
+        self.assertEqual(held['receipt'], str(receipt))
+
 
 if __name__ == '__main__':
     unittest.main()
