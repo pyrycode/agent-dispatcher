@@ -56,6 +56,7 @@ operator.sh storage list
 operator.sh storage acquire /absolute/path/request.json
 operator.sh storage verify /absolute/path/verification.json
 operator.sh storage finish /absolute/path/completion.json
+operator.sh storage cancel /absolute/path/cancellation.json
 ```
 
 A ticket request contains `id`, `machine`, `kind: "ticket"`, `ticket`, `path`
@@ -71,6 +72,12 @@ apparently absent parent process. Prove its saved child identity and descendants
 have exited first. Retrying the same acquisition is safe. Changed request
 contents are rejected. A completed identifier cannot acquire again. Retrying an
 old completion cannot release a newer lease.
+
+Interrupted acquisition uses `cancel` after the same local maintenance lock
+proves the earlier cleaner stopped. Its request contains `request`, the complete
+original acquisition object, and `drained: true`. Cancellation saves a finished
+record even if acquisition has not arrived yet. A delayed request therefore
+cannot create an orphaned active lease. The exact saved scope must match.
 
 Machine-wide Go cache budgeting follows a stricter protocol documented in
 [Go build-cache disk budget](build-cache-budget.md). It requires no active or

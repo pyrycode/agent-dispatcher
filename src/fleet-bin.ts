@@ -42,7 +42,7 @@ async function main(): Promise<void> {
   const config = JSON.parse(readFileSync(configPath, "utf8"));
   if(command==='storage') {
     const [action,file]=args;
-    if(!['list','acquire','verify','finish'].includes(action)||action!=='list'&&!file)throw new Error('storage list|acquire|verify|finish [SAVED_JSON_FILE]');
+    if(!['list','acquire','verify','finish','cancel'].includes(action)||action!=='list'&&!file)throw new Error('storage list|acquire|verify|finish|cancel [SAVED_JSON_FILE]');
     const claims=new JsonClient(config.claimsUrl,secret(config.claimsOperatorTokenEnv??config.claimsTokenEnv));
     const input=action==='list'?{}:JSON.parse(readFileSync(file,'utf8'));
     console.log(JSON.stringify(await claims.call('/storage/'+action,input)));return;

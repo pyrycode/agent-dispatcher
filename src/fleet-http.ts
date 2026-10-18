@@ -99,6 +99,7 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
         if(req.url==='/storage/acquire')return send(200,store.acquireStorage(body));
         if(req.url==='/storage/verify')return send(200,store.verifyStorage(body.id,body.machine));
         if(req.url==='/storage/finish')return send(200,store.finishStorage(body.id,body.machine,body.drained,body.result));
+        if(req.url==='/storage/cancel')return send(200,store.cancelStorage(body.request,body.drained));
         return send(404,{error:'Unknown storage operation'});
       }
       // Shared run evidence (evidence-store.ts). Any fleet credential reads;

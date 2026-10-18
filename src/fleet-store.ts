@@ -309,6 +309,10 @@ export class FleetStore {
   acquireStorage(request:StorageRequest) {return this.transaction(()=>this.storage.acquire(request,()=>this.storageBasis(request)));}
   verifyStorage(id:string,machine:string) {return this.transaction(()=>{const lease=this.storage.get(id);return this.storage.verify(id,machine,()=>this.storageBasis(lease));});}
   finishStorage(id:string,machine:string,drained:unknown,result:unknown) {return this.transaction(()=>this.storage.finish(id,machine,drained,result));}
+  cancelStorage(request:StorageRequest,drained:unknown) {return this.transaction(()=>{
+    if(!request||!Object.hasOwn(this.limits,request.machine))throw new Error('Unknown storage machine');
+    return this.storage.cancel(request,drained);
+  });}
   /** The authority's record of one run, finished or not. Evidence uploads are accepted only from its own computer. */
   runOwner(id: string): { machine: string; ticket: string; role: string } | undefined {
     const run = this.db.prepare("SELECT machine,ticket,request FROM fleet_runs WHERE id=?").get(id);

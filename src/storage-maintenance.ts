@@ -59,4 +59,18 @@ export class StorageMaintenance {
     this.db.prepare('UPDATE fleet_storage_maintenance SET finished=?,result=? WHERE id=? AND finished IS NULL').run(this.now(),String(result),id);
     return this.get(id);
   }
+  /** Persist cancellation even before a delayed acquisition reaches authority. */
+  cancel(request:StorageRequest,drained:unknown):StorageLease {
+    this.validate(request);
+    if(drained!==true)throw new Error('Storage cancellation requires confirmed command drainage');
+    request={id:request.id,machine:request.machine,kind:request.kind,path:request.path,...(request.ticket!==undefined?{ticket:request.ticket,head:request.head}:{})};
+    const prior=this.db.prepare('SELECT request FROM fleet_storage_maintenance WHERE id=?').get(request.id);
+    if(prior) {
+      if(String(prior.request)!==JSON.stringify(request))throw new Error('Storage cancellation identity differs from acquisition');
+      return this.finish(request.id,request.machine,true,'aborted');
+    }
+    const at=this.now();
+    this.db.prepare('INSERT INTO fleet_storage_maintenance VALUES (?,?,?,?,?,?,?,?)').run(request.id,request.machine,request.ticket??null,JSON.stringify(request),'cancelled-before-acquisition',at,at,'aborted');
+    return this.get(request.id);
+  }
 }

@@ -143,5 +143,30 @@ test('actual HTTP authority rejects worker credentials and accepts only protecte
     await assert.rejects(()=>worker.call('/storage/finish',{id:l.id,machine:'mac',drained:true,result:'complete'}),/403/);
     await operator.call('/storage/verify',{id:l.id,machine:'mac'});
     await operator.call('/storage/finish',{id:l.id,machine:'mac',drained:true,result:'complete'});
+    const delayed=lease();
+    await assert.rejects(()=>worker.call('/storage/cancel',{request:delayed,drained:true}),/403/);
+    await operator.call('/storage/cancel',{request:delayed,drained:true});
+    await assert.rejects(()=>operator.call('/storage/acquire',delayed),/not active/);
   }finally{await new Promise<void>(resolve=>server.close(()=>resolve()));s.close();}
+});
+
+test('cancellation tombstones settle delayed acquisitions and lost completion replies without touching newer scopes',()=>{
+  const s=fixture();try {
+    const delayed=lease();
+    assert.throws(()=>s.cancelStorage(delayed,false),/drainage/);
+    assert.equal(s.storage.active().length,0);
+    const cancelled=s.cancelStorage(delayed,true);
+    assert.notEqual(cancelled.finished,null);
+    assert.throws(()=>s.acquireStorage(delayed),/not active/);
+    assert.deepEqual(s.cancelStorage(delayed,true),cancelled);
+    assert.throws(()=>s.cancelStorage({...delayed,path:'/tmp/different'},true),/differs/);
+    const active=lease();s.acquireStorage(active);
+    s.finishStorage(active.id,'mac',true,'complete');
+    s.cancelStorage(active,true); // The completion reply was lost.
+    const newer=lease();s.acquireStorage(newer);
+    s.cancelStorage(delayed,true);
+    assert.equal(s.storage.active()[0].id,newer.id);
+    assert.throws(()=>s.cancelStorage({...newer,machine:'linux'},true),/differs/);
+    assert.equal(s.storage.active()[0].id,newer.id);
+  }finally{s.close();}
 });
