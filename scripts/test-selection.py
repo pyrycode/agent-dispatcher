@@ -215,8 +215,33 @@ def gradle_selection(args):
         refuse('Gradle task ' + task + ' is not an explicit focused test or ordinary build/static task')
 
 
+def desktop_unit_selection(args):
+    if len(args) != 2 or args[0] not in {'--files-json', '--tests-json'}:
+        refuse('select one exact Desktop unit file or its named tests')
+    try:
+        values = json.loads(args[1])
+    except (TypeError, ValueError):
+        refuse('malformed Desktop unit selection')
+    if not isinstance(values, list) or not 1 <= len(values) <= 64 or len(args[1]) > 32768:
+        refuse('empty or unbounded Desktop unit selection')
+    files = set()
+    for value in values:
+        if not isinstance(value, str) or len(value) > 2048 or re.search(r'[\x00-\x1f\x7f]', value):
+            refuse('invalid Desktop unit name')
+        file, separator, name = value.partition('#')
+        if (not re.fullmatch(r'(?:src|e2e|scripts)/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_.-]+\.(?:test|spec)\.tsx?', file)
+                or '..' in file.split('/') or file.startswith('e2e/') and '.spec.' in file):
+            refuse('Desktop unit files must be exact repository-relative test paths')
+        if (args[0] == '--tests-json') != bool(separator) or separator and not name.strip():
+            refuse('Desktop named tests require file#full test title')
+        files.add(file)
+    if len(files) != 1:
+        refuse('select one affected Desktop unit file per builder invocation')
+
+
 def selection(kind, args):
-    validators = {'go': go_selection, 'android': android_selection, 'jvm': jvm_selection, 'gradle': gradle_selection}
+    validators = {'go': go_selection, 'android': android_selection, 'jvm': jvm_selection, 'gradle': gradle_selection,
+                  'desktop-unit': desktop_unit_selection}
     if kind not in validators:
         raise PolicyError('Unknown managed test entry point')
     if list(args) == ['--help'] and kind in {'android', 'jvm'}:
