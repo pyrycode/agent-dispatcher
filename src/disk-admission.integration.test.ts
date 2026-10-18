@@ -4,12 +4,14 @@ import {spawn} from 'node:child_process';
 import {once} from 'node:events';
 import {mkdtempSync,writeFileSync,readFileSync,rmSync} from 'node:fs';
 import {join} from 'node:path';
+import {tmpdir} from 'node:os';
 import {fileURLToPath} from 'node:url';
 import {FleetStore} from './fleet-store.js';
 import {JsonClient,serveFleet} from './fleet-http.js';
 
 test('saved production manager configuration reaches actual CLI admission and preserves existing grants',async t=>{
-  const directory=mkdtempSync('/private/tmp/disk-admission-cli-');
+  // Keep Darwin's Unix socket paths short without assuming its temp root on Linux.
+  const directory=mkdtempSync(join(process.platform==='darwin'?'/private/tmp':tmpdir(),'disk-admission-cli-'));
   const store=new FleetStore(':memory:',{mac:{heavyLimit:3,combinedLimit:5}});
   const authority=await serveFleet(store,{mac:'fixture-machine'},'fixture-central',0);
   const address=authority.address();assert.ok(address&&typeof address!=='string');
