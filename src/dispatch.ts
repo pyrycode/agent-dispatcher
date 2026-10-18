@@ -8632,7 +8632,7 @@ export async function runRealClaudeGateSuite(opts: {
   }
   if(managedRun()?.role==="real-claude-gate")await beginManagedStage({version:1,kind:"live-gate",candidate:report.headSha,
     checks:["live-acceptance"],artifacts:capturePaths,requiredTests:report.requiredTests??[],minExecuted:Math.max(1,opts.minExecuted??1),
-    testEvidence:[...(opts.testEvidence??[])],inheritedAdvance:process.env.PYRY_REAL_CLAUDE_GATE_INHERITED_ADVANCE==="1"});
+    testEvidence:[...(opts.testEvidence??[])],inheritedAdvance:inheritedAdvanceEnabled(process.env)});
 
   if (opts.selection) {
     let changedPaths: string[] | null = null;
