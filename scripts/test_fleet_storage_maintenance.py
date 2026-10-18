@@ -129,6 +129,24 @@ class Tests(unittest.TestCase):
         self.assertFalse(any(call[0] in ('acquire', 'verify', 'finish') for call in self.supervisor.calls))
         self.assertFalse(list(self.supervisor.directory.glob('*.lease.json')))
 
+    def test_a_held_compiler_target_does_not_block_independently_safe_graph_cleanup(self):
+        repo, copy, graph, evidence = self.repository()
+        (copy / 'app').mkdir()
+        (copy / 'app/build.gradle.kts').write_text('// tracked build configuration\n')
+        (copy / '.gitignore').write_text('/.codegraph/*.db\n/evidence/\n/app/build/\n')
+        self.git(copy, 'add', 'app/build.gradle.kts', '.gitignore')
+        self.git(copy, 'commit', '-m', 'android fixture')
+        unknown = copy / 'app/build/tmp/kotlin-classes/debug/failed-evidence.txt'
+        unknown.parent.mkdir(parents=True)
+        unknown.write_bytes(b'preserve unknown evidence')
+        with patch.object(m, 'processes_using_path', return_value=[]):
+            result = self.supervisor.run(apply=True, cache=False)
+        self.assertEqual(result[0]['state'], 'reclaimed', result)
+        self.assertTrue(result[0]['held'])
+        self.assertFalse(graph.exists())
+        self.assertEqual(unknown.read_bytes(), b'preserve unknown evidence')
+        self.assertTrue(evidence.exists())
+
     def test_registered_manual_and_wrong_branch_copies_are_excluded(self):
         repo, copy, graph, evidence = self.repository()
         self.git(repo, 'worktree', 'add', '-b', 'feature/456', str(self.root / 'manual-456'))
@@ -294,6 +312,16 @@ class Tests(unittest.TestCase):
         actions = [action for action, value, workflow in self.supervisor.calls]
         self.assertEqual(actions, ['cancel'])
         self.assertEqual(m.read(path)['phase'], 'finished')
+
+    def test_old_external_command_journal_is_not_cancelled_by_synchronous_recovery(self):
+        request = {'id': str(uuid.uuid4()), 'machine': 'test-host', 'kind': 'cache', 'path': str(self.root / 'cache')}
+        path = self.supervisor.directory / (request['id'] + '.lease.json')
+        m.atomic(path, {'request': request, 'phase': 'command-pending', 'command': '/retained/unknown-command.json'})
+        with m.locked(self.supervisor.directory / 'maintenance.lock'):
+            with self.assertRaises(RuntimeError):
+                self.supervisor.reconcile()
+        self.assertFalse(self.supervisor.calls)
+        self.assertEqual(m.read(path)['phase'], 'command-pending')
 
     def test_lost_finish_reply_reconciles_without_reacquiring_finished_scope(self):
         request = {'id': str(uuid.uuid4()), 'machine': 'test-host', 'kind': 'cache', 'path': str(self.root / 'cache')}

@@ -114,12 +114,11 @@ def native_drained(directory):
     return True
 
 
-def launch(mode, request, journal, *, env=None, pass_fds=()):
+def launch(mode, request, journal):
     """Child persists its own start identity before accepting the launch byte."""
     argv = [sys.executable, str(Path(__file__).resolve()), mode, str(request), str(journal)]
     child = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, start_new_session=True,
-                             env=env, pass_fds=pass_fds)
+                             stderr=subprocess.DEVNULL, start_new_session=True)
     try:
         child.stdin.write(b'1')
         child.stdin.close()
@@ -320,7 +319,7 @@ class StorageSupervisor:
                 report = cleaner.cleanup(item['repository'], item['path'], item['ticket'])
                 # A repeated clean audit creates no central lease or UUID files.
                 # Apply recomputes the complete inventory under fresh authority.
-                if apply and report['plannedBytes'] > 0 and not report['held']:
+                if apply and report['plannedBytes'] > 0 and report['state'] == 'planned':
                     request = {'id': str(uuid.uuid4()), 'machine': machine, 'kind': 'ticket',
                                **{key: item[key] for key in ('path', 'ticket', 'head')}}
                     journal, saved = self.acquire(request)
