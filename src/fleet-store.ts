@@ -298,7 +298,7 @@ export class FleetStore {
     const item=this.workflow.get(ticket);
     if(item.state!=='CLOSED'||item.status!=='Done'||item.archived)throw new Error('Storage cleanup requires a completed known ticket');
     if(item.recoverySplit || (item.subIssues?.total??0)>0 || this.workflow.list(project).some(i=>i.parentNumber===item.issueNumber))throw new Error('Split parents are retained; closure does not complete their feature');
-    if(item.labels.some(l=>/^(needs-human:|error:|wip:|needs-rework:|orchestrator:escalated)/.test(l)))throw new Error('Storage cleanup preserves ticket holds and failed work');
+    if(item.labels.some(l=>/^(needs-human:|health-hold:|held:|error:|wip:|needs-rework:|pending-done:|pending-verdict:|orchestrator:escalated)/.test(l)||l.includes('permission_denied')))throw new Error('Storage cleanup preserves ticket holds and failed work');
     const approval=this.approvals.get(ticket);
     if(approval?.kind==='rejected'&&!approval.authorization)throw new Error('Storage cleanup preserves approval holds');
     if(runs.some(r=>r.ticket===ticket||r.parentTicket===ticket))throw new Error('Storage cleanup has an affected active worker');

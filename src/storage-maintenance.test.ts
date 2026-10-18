@@ -70,6 +70,10 @@ test('old completion retries cannot release a newer lease and reordered JSON is 
 test('closed split parents and held or failed tickets cannot authorise filesystem cleanup',()=>{
   for(const change of [
     {addLabels:['needs-human:operator-hold']},
+    {addLabels:['health-hold:github']},
+    {addLabels:['held:design']},
+    {addLabels:['permission_denied:builder']},
+    {addLabels:['pending-verdict:verifier']},
     {addLabels:['error:builder']},
     {addLabels:['wip:builder']},
     {state:'OPEN' as const},
