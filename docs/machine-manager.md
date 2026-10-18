@@ -1055,6 +1055,7 @@ Inspect recovery records through the protected operator:
 
 ```sh
 operator.sh machine-recovery read
+operator.sh attention
 ```
 
 After fixing the computer and reconciling its retained source and evidence,

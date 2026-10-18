@@ -1,9 +1,10 @@
+import type {MachineRecovery} from './machine-recovery.js';
 import type { RecoveryIncident } from "./fleet-recovery.js";
 import { scrubCredentials } from "./agent-runtime.js";
 import { REPAIR_CAP_REASON } from "./recovery-repair-cap.js";
 
 /** One fleet-wide decision list, independent of board columns or historical resolved alerts. */
-export function recoveryReport(incidents: RecoveryIncident[], machine: { projects?: Array<{ project: string; health: string }>; attention?: unknown[] }) {
+export function recoveryReport(incidents: RecoveryIncident[], machine: { machineRecoveries?: MachineRecovery[]; projects?: Array<{ project: string; health: string }>; attention?: unknown[] }) {
   const current = incidents.filter(i => i.current !== false && !["resolved", "complete"].includes(i.state));
   const decisions = current.filter(i => i.state === "escalated" && i.reason !== "Explicit operator hold").map(i => ({
     id: i.id, ticket: i.ticket, url: `https://github.com/${i.ticket.replace("#", "/issues/")}`,
@@ -15,7 +16,11 @@ export function recoveryReport(incidents: RecoveryIncident[], machine: { project
       : (i.decision?.reason ?? "").startsWith(REPAIR_CAP_REASON) ? "Two dispatcher repairs failed and none more is ordered. Read the attempts above, then fix the defect by hand, change the ticket's approach, or close it."
       : "Resolve the specific missing permission, evidence or policy described above.",
   }));
-  return { generatedAt: new Date().toISOString(), decisions,
+  const sourceHolds = (machine.machineRecoveries ?? []).filter(r => r.cleared === undefined).map(r => ({
+    machine:r.machine,project:r.project,ticket:r.ticket,receipt:r.commandId,
+    nextAction:'Fix the source computer and reconcile its retained files before clearing the recovery hold.',
+  }));
+  return { ...(sourceHolds.length ? {machineRecoveryHolds:sourceHolds} : {}), generatedAt: new Date().toISOString(), decisions,
     recovering: current.filter(i => ["queued", "assessing", "applying", "waiting"].includes(i.state)).map(i => ({ ticket: i.ticket, state: i.state, reason: i.reason })),
     humanHolds: current.filter(i => i.reason === "Explicit operator hold").map(i => i.ticket),
     computers: (machine.projects ?? []).filter(p => p.health !== "reporting"), reservations: machine.attention ?? [] };

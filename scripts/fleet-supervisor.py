@@ -146,6 +146,7 @@ class Supervisor:
         # Consecutive stop signals that were certainly not sent, per board. In
         # memory: a supervisor restart allows another few tries.
         self.signal_failures = {}
+        self.recovery_holds = set()
         # Optional callable(project). Withdraws native task admission for the
         # project's container before a drain signal. Set by the service.
         self.withhold = None
@@ -153,6 +154,8 @@ class Supervisor:
     def tick(self, project, desired):
         self.notices[project] = []
         result = self.step(project, desired)
+        if project in self.recovery_holds:
+            result = {**result, 'reason': 'Source project held after stopped-worker recovery. Retained files await operator reconciliation.'}
         notes = self.notices.pop(project, [])
         if notes:
             result = {**result, 'reason': ' '.join(([result['reason']] if result.get('reason') else []) + notes)}
@@ -174,8 +177,10 @@ class Supervisor:
             state = self.adapter.status()
         except Exception:
             return 'unknown'
+        self.recovery_holds.discard(project)
         if any(r.get('machine') == state.get('machine') and r.get('project') == project and r.get('cleared') is None
                for r in state.get('machineRecoveries', [])):
+            self.recovery_holds.add(project)
             return 'stopped'
         desired = state.get('desiredState') if isinstance(state, dict) else None
         if not isinstance(desired, dict):

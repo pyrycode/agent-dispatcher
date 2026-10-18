@@ -64,7 +64,7 @@ class Tests(unittest.TestCase):
                 self.assertEqual(m.tick(adapter,cfg,state),[])
 
     def test_live_uncertain_deliberately_stopped_and_drained_workers_are_never_released(self):
-        for kind in ['alive','children alive','stopped','drained','unknown','manager drained']:
+        for kind in ['alive','children alive','stopped','drained','unknown','manager drained','reporting']:
             with self.subTest(kind),tempfile.TemporaryDirectory() as d:
                 _,_,cfg,state,adapter=self.fixture(d)
                 if kind=='alive':adapter.observe=lambda _: {'stopped':False,'childrenStopped':False}
@@ -73,6 +73,9 @@ class Tests(unittest.TestCase):
                 if kind=='drained':state['desiredState']['projects']['org/mobile']['effectiveWork']='drained'
                 if kind=='unknown':state['desiredState']['known']=False
                 if kind=='manager drained':state['draining']=True
+                if kind=='reporting':
+                    state['projects']=[{'project':'org/mobile','health':'reporting'}]
+                    adapter.observe=lambda _: self.fail('must not repeat a reporting dispatcher health probe')
                 with patch.object(m,'run',side_effect=AssertionError('no recovery commands')):
                     self.assertEqual(m.tick(adapter,cfg,state),[])
 

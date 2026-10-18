@@ -6,6 +6,7 @@ import {serveFleet,JsonClient} from './fleet-http.js';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+import {recoveryReport} from './recovery-report.js';
 import {scheduleMachine} from './machine-scheduler.js';
 import {randomUUID} from 'node:crypto';
 import {stoppedPathUsers} from './machine-recovery.js';
@@ -76,6 +77,7 @@ test('holds, approvals, stale authority and unavailable destinations never relea
    'target drained':f=>{f.store.desired.set({machines:['target'],project,change:{work:'tickets-drained'}});},
    'target stale':f=>{f.advance(180001);},
    'required device missing':f=>{f.store.workflow.change(ticket,{addLabels:['requires:android-device']},'operator','device');f.input.revision=f.store.workflow.get(ticket).revision;},
+   'pending native task':f=>{f.store.tasks.request(ticket,{recipe:'platform-probe',capability:'macos-arm64',reason:'existing native evidence'},'existing');},
    'pending verdict':f=>{f.store.workflow.change(ticket,{addLabels:['pending-verdict:builder']},'operator','verdict');f.input.revision=f.store.workflow.get(ticket).revision;},
  };
  for(const [name,change] of Object.entries(cases)) {
@@ -169,5 +171,15 @@ test('storage cleanup preserves source evidence after the replacement finishes a
    assert.throws(()=>store.acquireStorage({id:storageId,machine:'source',kind:'ticket',ticket,path:'/retained/builder-1',head:'a'.repeat(40)}),/unreconciled/);
    store.clearMachineRecoveries('source',project,[input.commandId]);
    assert.equal(store.acquireStorage({id:storageId,machine:'source',kind:'ticket',ticket,path:'/retained/builder-1',head:'a'.repeat(40)}).machine,'source');
+ }finally{store.close();}
+});
+
+
+test('the ordinary attention report exposes active source holds and drops reconciled ones',()=>{
+ const {store,input}=fixture();try{
+   store.recoverStoppedWorker('source',input);
+   assert.equal(recoveryReport([],store.snapshot()).machineRecoveryHolds?.[0].receipt,input.commandId);
+   store.clearMachineRecoveries('source',project,[input.commandId]);
+   assert.equal(recoveryReport([],store.snapshot()).machineRecoveryHolds,undefined);
  }finally{store.close();}
 });

@@ -144,6 +144,10 @@ def tick(adapter, config, status, housekeeping=None):
         project = worker.get('project')
         if worker.get('machine') != machine or worker.get('role') not in ROLES or worker.get('supportTaskId'):
             continue
+        # The manager already knows live reporting dispatchers. Do not repeat
+        # their credential and process health probes for every active ticket.
+        if any(p.get('project') == project and p.get('health') == 'reporting' for p in status.get('projects', [])):
+            continue
         policy = desired.get('projects', {}).get(project, {})
         if policy.get('run') != 'running' or policy.get('effectiveWork', policy.get('work')) != 'taking':
             continue
