@@ -1,4 +1,5 @@
 import { RecoverySplits, renderRecoverySlice, splitBodyHash, splitRequirements, splitItemBasis, validateSplitAgainstTicket, validateRecoverySplit, type RecoverySplitRecord } from './recovery-split.js';
+import {StorageMaintenance,type StorageRequest} from './storage-maintenance.js';
 import { parseFeatureRoot } from './feature-lineage.js';
 import {scrubCredentials} from './agent-runtime.js';
 import { isRepairWip } from "./recovery-labels.js";
@@ -229,6 +230,7 @@ export class FleetStore {
   readonly approvals: ApprovalStates;
   readonly machineRecoveries: MachineRecoveries;
   readonly verifierHandoffs: VerifierHandoffs;
+  readonly storage: StorageMaintenance;
   private readonly clock: () => number;
   constructor(path: string, private readonly limits: Readonly<Record<string, MachineLimits>>, options: FleetStoreOptions = {}) {
     for (const value of Object.values(limits)) validateLimits(value);
@@ -275,12 +277,46 @@ export class FleetStore {
     this.orphans = new OrphanedTaskWatch(this.db, this.tasks, this.operations, clock, options.orphanedTaskMs);
     this.clock = clock;
     this.verifierHandoffs = new VerifierHandoffs(this.db, this.clock);
+    this.storage = new StorageMaintenance(this.db,this.clock);
     this.splits = new RecoverySplits(this.db);
     this.codex = new CodexThrottle(this.db, clock, options.codexThrottle ?? DEFAULT_CODEX_THROTTLE, options.log);
     this.desired = new DesiredStateStore(this.db, Object.keys(limits), clock, machine => this.machineCapabilities()[machine]?.projects);
     this.flaky = new FlakySightingLedger(this.db, clock);
   }
   close(): void { this.db.close(); }
+  private storageBasis(request:StorageRequest):string {
+    if(!Object.hasOwn(this.limits,request.machine))throw new Error('Unknown storage machine');
+    const desired=this.desired.document(request.machine);
+    const machine=desired.entries.find(e=>e.project==='*');
+    if(machine?.work && machine.work!=='taking')throw new Error('Storage maintenance respects machine drains');
+    const runs=this.snapshot().runs;
+    if(request.kind==='cache') {
+      if(runs.some(r=>r.machine===request.machine))throw new Error('Cache maintenance requires an idle machine');
+      if(this.tasks.list().some(t=>t.machine===request.machine && ['queued','running','publishing','attention'].includes(t.state)))throw new Error('Cache maintenance has unresolved support custody');
+      return JSON.stringify({desired});
+    }
+    const ticket=request.ticket!,project=ticket.split('#')[0];
+    if(this.machineRecoveries.blocked(request.machine,project))throw new Error('Storage cleanup preserves unreconciled stopped-worker evidence');
+    if(!this.workflow.enabled(project)||this.workflow.preparing(project))throw new Error('Storage cleanup requires active workflow authority');
+    if(this.desired.work(request.machine,project)!=='taking')throw new Error('Storage cleanup respects project controls');
+    const item=this.workflow.get(ticket);
+    if(item.state!=='CLOSED'||item.status!=='Done'||item.archived)throw new Error('Storage cleanup requires a completed known ticket');
+    if(item.recoverySplit || (item.subIssues?.total??0)>0 || this.workflow.list(project).some(i=>i.parentNumber===item.issueNumber))throw new Error('Split parents are retained; closure does not complete their feature');
+    if(item.labels.some(l=>/^(needs-human:|health-hold:|held:|error:|wip:|needs-rework:|pending-done:|pending-verdict:|orchestrator:escalated)/.test(l)||l.includes('permission_denied')))throw new Error('Storage cleanup preserves ticket holds and failed work');
+    const approval=this.approvals.get(ticket);
+    if(approval?.kind==='rejected'&&!approval.authorization)throw new Error('Storage cleanup preserves approval holds');
+    if(runs.some(r=>r.ticket===ticket||r.parentTicket===ticket))throw new Error('Storage cleanup has an affected active worker');
+    if(this.openTaskTickets().includes(ticket))throw new Error('Storage cleanup has unfinished support work');
+    const owner=this.db.prepare('SELECT machine,generation FROM fleet_claims WHERE ticket=?').get(ticket)??null;
+    return JSON.stringify({revision:item.revision,owner,desired});
+  }
+  acquireStorage(request:StorageRequest) {return this.transaction(()=>this.storage.acquire(request,()=>this.storageBasis(request)));}
+  verifyStorage(id:string,machine:string) {return this.transaction(()=>{const lease=this.storage.get(id);return this.storage.verify(id,machine,()=>this.storageBasis(lease));});}
+  finishStorage(id:string,machine:string,drained:unknown,result:unknown) {return this.transaction(()=>this.storage.finish(id,machine,drained,result));}
+  cancelStorage(request:StorageRequest,drained:unknown) {return this.transaction(()=>{
+    if(!request||!Object.hasOwn(this.limits,request.machine))throw new Error('Unknown storage machine');
+    return this.storage.cancel(request,drained);
+  });}
   /** The authority's record of one run, finished or not. Evidence uploads are accepted only from its own computer. */
   runOwner(id: string): { machine: string; ticket: string; role: string } | undefined {
     const run = this.db.prepare("SELECT machine,ticket,request FROM fleet_runs WHERE id=?").get(id);
@@ -989,6 +1025,7 @@ export class FleetStore {
         if (JSON.stringify(original) !== request) throw new Error("Request ID reused with different contents");
         return previous.finished === null ? { ok: true, generation: String(previous.generation) } : { ok: false, reason: "finished" };
       }
+    if(this.storage.blocks(req.machine,req.ticket,req.parentTicket))return {ok:false,reason:'locked'};
     if (!req.verificationPin && this.activeVerifierHandoffs().some(h=>h.ticket===req.ticket)) return {ok:false,reason:'locked'};
     if (this.machineRecoveries.blocked(req.machine,req.project)) return {ok:false,reason:'drained'};
     // The operator's central drain or stop holds new grants here even when
@@ -1281,6 +1318,7 @@ export class FleetStore {
       if (!run || run.machine !== machine || run.session !== input.session || run.generation !== input.generation) throw new Error('Stopped run changed; inspect it again');
       const roles = ['builder','developer','architect','refiner','po','verifier','code-review','qa','documentation'];
       if (!roles.includes(run.role) || run.supportTaskId || run.verificationPin || !/#[1-9]\d*$/.test(run.ticket)) throw new Error('This reservation needs its existing specialised recovery');
+      if (this.storage.blocks(machine,run.ticket)) throw new Error('Storage maintenance still has custody on the source');
       const claim = this.snapshot().claims.find(c => c.ticket === run.ticket);
       if (claim && (claim.machine !== machine || claim.generation !== input.generation)) throw new Error('Ticket ownership changed');
       const controls = this.desired.document(machine).entries;

@@ -652,7 +652,7 @@ SupportSupervisor.rpc = rpc
                     self.assertEqual(published['localTasks'], [])
                     self.assertNotIn('service', published)
 
-    def run_once(self,support_source):
+    def run_once(self,support_source,storage_source=None):
         with tempfile.TemporaryDirectory() as folder:
             root=Path(folder)
             (root/'fleet-supervisor.py').write_bytes(Path(__file__).with_name('fleet-supervisor.py').read_bytes())
@@ -663,6 +663,8 @@ SupportSupervisor.rpc = rpc
     def publish_attention(self): pass
 ''')
             (root/'fleet-support.py').write_text(support_source)
+            if storage_source is not None:
+                (root/'fleet-storage-maintenance.py').write_text(storage_source)
             state=root/'state';state.mkdir()
             report=root/'report.json';config=root/'config.json'
             config.write_text(json.dumps({'stateDirectory':str(state),'reportFile':str(report),'projects':{},'recoveryTasks':{'probe':{}}}))
@@ -686,6 +688,27 @@ SupportSupervisor.rpc = rpc
     def local_task_ids(self): '''+body+'\n')
             self.assertNotIn('localTasks',published)
             self.assertNotIn('service',published)
+
+    def test_storage_initialisation_and_tick_failures_preserve_native_and_control_reports(self):
+        support='''class SupportSupervisor:
+    def __init__(self, adapter, config): pass
+    def tick(self): return []
+    def local_task_ids(self): return ['a'*64]
+'''
+        for storage in [
+            'raise RuntimeError("fixture storage import failed")\n',
+            '''class StorageSupervisor:
+    def __init__(self, adapter, config, path): pass
+    def tick(self): raise RuntimeError("fixture storage observation failed")
+''',
+        ]:
+            with self.subTest(storage=storage):
+                published=self.run_once(support,storage)
+                self.assertEqual(published['operations'],[])
+                self.assertEqual(published['localTasks'],['a'*64])
+                self.assertNotIn('service',published)
+                self.assertEqual(published['storageMaintenance'][0]['phase'],'held')
+                self.assertNotIn('fixture',published['storageMaintenance'][0]['reason'])
 
 NEW={'consumer':'c2','dispatcher':'d2','credential':'cred'}
 

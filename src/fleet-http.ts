@@ -103,6 +103,15 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
         return send(200,{ok:true});
       }
       if (req.url === '/machine-recovery/read') return send(200,store.machineRecoveries.list());
+      if(req.url?.startsWith('/storage/')) {
+        if(!isAdmin)return send(403,{error:'Protected operator credential required'});
+        if(req.url==='/storage/list')return send(200,store.storage.active());
+        if(req.url==='/storage/acquire')return send(200,store.acquireStorage(body));
+        if(req.url==='/storage/verify')return send(200,store.verifyStorage(body.id,body.machine));
+        if(req.url==='/storage/finish')return send(200,store.finishStorage(body.id,body.machine,body.drained,body.result));
+        if(req.url==='/storage/cancel')return send(200,store.cancelStorage(body.request,body.drained));
+        return send(404,{error:'Unknown storage operation'});
+      }
       // Shared run evidence (evidence-store.ts). Any fleet credential reads;
       // only the computer that ran a run uploads its bundle. A service without
       // the store answers like one that predates it.

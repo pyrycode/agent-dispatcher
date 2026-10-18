@@ -705,6 +705,17 @@ def main():
         adapter = module.NativeAdapter(config)
         housekeeping = Housekeeping(state)
         supervisor = Supervisor(state, adapter, settings=config, housekeeping=housekeeping)
+        storage = None
+        storage_failure = None
+        storage_source = Path(__file__).with_name('fleet-storage-maintenance.py')
+        if storage_source.is_file():
+            try:
+                storage_spec = importlib.util.spec_from_file_location('fleet_storage_maintenance', storage_source)
+                storage_module = importlib.util.module_from_spec(storage_spec)
+                storage_spec.loader.exec_module(storage_module)
+                storage = storage_module.StorageSupervisor(adapter, config, str(path))
+            except Exception as error:
+                storage_failure = 'Storage maintenance could not initialise. ' + type(error).__name__
         support = None
         support_module = None
         control_module = None
@@ -779,6 +790,15 @@ def main():
                 if watch is not None:
                     attention['watchdog'] = [{k: redact_paths(v) if isinstance(v, str) else v for k, v in item.items()} for item in watch]
                 attention['operations'] = results
+                # A bounded background pass owns storage leases. Never make
+                # filesystem traversal delay native custody or watchdog checks.
+                if storage_failure:
+                    attention['storageMaintenance'] = [{'phase': 'held', 'reason': storage_failure}]
+                elif storage:
+                    try:
+                        attention['storageMaintenance'] = storage.tick()
+                    except Exception as error:
+                        attention['storageMaintenance'] = [{'phase': 'held', 'reason': 'Storage observation failed. ' + type(error).__name__}]
                 if support and hasattr(support, 'local_task_ids'):
                     # What this computer still holds, so the control service can tell a
                     # task nobody holds from one whose machine is only quiet. It must
