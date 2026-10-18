@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -40,6 +41,10 @@ class Supervisor(m.StorageSupervisor):
             return self.leases[value['id']]
         if action == 'finish':
             lease = self.leases.pop(value['id'])
+            return {**lease, 'finished': 2}
+        if action == 'cancel':
+            request = value['request']
+            lease = self.leases.pop(request['id'], request)
             return {**lease, 'finished': 2}
         raise AssertionError(action)
 
@@ -287,8 +292,101 @@ class Tests(unittest.TestCase):
         with m.locked(self.supervisor.directory / 'maintenance.lock'):
             self.supervisor.reconcile()
         actions = [action for action, value, workflow in self.supervisor.calls]
-        self.assertEqual(actions, ['list', 'acquire', 'finish'])
+        self.assertEqual(actions, ['cancel'])
         self.assertEqual(m.read(path)['phase'], 'finished')
+
+    def test_lost_finish_reply_reconciles_without_reacquiring_finished_scope(self):
+        request = {'id': str(uuid.uuid4()), 'machine': 'test-host', 'kind': 'cache', 'path': str(self.root / 'cache')}
+        path, saved = self.supervisor.acquire(request)
+        rpc = self.supervisor.rpc
+        def lose_finish(action, value=None, **options):
+            result = rpc(action, value, **options)
+            if action == 'finish':
+                raise RuntimeError('finish reply lost')
+            return result
+        with patch.object(self.supervisor, 'rpc', side_effect=lose_finish):
+            with self.assertRaises(RuntimeError):
+                self.supervisor.finish(path, saved, 'held')
+        self.assertFalse(self.supervisor.leases)
+        with m.locked(self.supervisor.directory / 'maintenance.lock'):
+            self.supervisor.reconcile()
+        self.assertEqual(m.read(path)['phase'], 'finished')
+        self.assertEqual(self.supervisor.calls[-1][0], 'cancel')
+
+    def test_definitively_refused_acquire_can_be_cancelled_without_new_authorisation(self):
+        request = {'id': str(uuid.uuid4()), 'machine': 'test-host', 'kind': 'ticket',
+                   'path': str(self.root / 'copy'), 'head': 'a' * 40, 'ticket': 'org/app#123'}
+        rpc = self.supervisor.rpc
+        def refuse(action, value=None, **options):
+            if action == 'acquire':
+                raise RuntimeError('closed parent is held')
+            return rpc(action, value, **options)
+        with patch.object(self.supervisor, 'rpc', side_effect=refuse):
+            with self.assertRaises(RuntimeError):
+                self.supervisor.acquire(request)
+            with m.locked(self.supervisor.directory / 'maintenance.lock'):
+                self.supervisor.reconcile()
+        self.assertEqual(m.read(self.supervisor.directory / (request['id'] + '.lease.json'))['phase'], 'finished')
+
+    def cache(self):
+        cache = self.root / 'go-cache'
+        cache.mkdir()
+        (cache / 'README').write_text(m.load('fleet-build-cache').CACHE_README)
+        data = b'reproducible compiled cache output'
+        digest = hashlib.sha256(data).hexdigest()
+        target = cache / digest[:2] / (digest + '-d')
+        target.parent.mkdir()
+        target.write_bytes(data)
+        evidence = cache / 'fuzz/FuzzName/failed-case'
+        evidence.parent.mkdir(parents=True)
+        evidence.write_bytes(b'go test fuzz v1\nstring("failure")\n')
+        admission = self.root / 'admission.lock'
+        admission.touch()
+        self.config['storageMaintenance'].update(goCache={'cache': str(cache), 'maxBytes': 1,
+            'reserveBytes': 0, 'timeoutSeconds': 30}, testAdmissionLock=str(admission))
+        return cache, target, evidence, admission
+
+    def test_real_synchronous_cache_apply_holds_admission_and_preserves_fuzz_evidence(self):
+        if m.load('fleet-support').process_snapshot() is None:
+            self.skipTest('Complete native process census unavailable')
+        cache, target, evidence, admission = self.cache()
+        original = self.supervisor.verify
+        def verify(saved):
+            with self.assertRaises(BlockingIOError):
+                with m.locked(admission):
+                    pass
+            return original(saved)
+        with patch.object(self.supervisor, 'verify', side_effect=verify):
+            report = self.supervisor.cache_pass('test-host', True)
+        self.assertEqual(report['phase'], 'complete', report)
+        self.assertFalse(target.exists())
+        self.assertEqual(evidence.read_bytes(), b'go test fuzz v1\nstring("failure")\n')
+        self.assertFalse(self.supervisor.leases)
+        self.assertEqual([value['result'] for action, value, workflow in self.supervisor.calls if action == 'finish'], ['complete'])
+
+    def test_cache_audit_needs_no_lease_or_native_completion_claim(self):
+        cache, target, evidence, admission = self.cache()
+        report = self.supervisor.cache_pass('test-host', False)
+        self.assertEqual(report['phase'], 'audit')
+        self.assertGreater(report['observed']['compiledBytes'], 0)
+        self.assertTrue(target.exists())
+        self.assertFalse(self.supervisor.calls)
+
+    def test_replaced_admission_lock_refuses_before_cache_mutation(self):
+        if m.load('fleet-support').process_snapshot() is None:
+            self.skipTest('Complete native process census unavailable')
+        cache, target, evidence, admission = self.cache()
+        original = self.supervisor.verify
+        def replace(saved):
+            admission.rename(admission.with_suffix('.original'))
+            admission.touch()
+            return original(saved)
+        with patch.object(self.supervisor, 'verify', side_effect=replace):
+            report = self.supervisor.cache_pass('test-host', True)
+        self.assertEqual(report['phase'], 'refused', report)
+        self.assertTrue(target.exists())
+        self.assertTrue(evidence.exists())
+        self.assertFalse(self.supervisor.leases)
 
 
 if __name__ == '__main__':

@@ -33,7 +33,11 @@ There is no full cache clear and no cleanup after each ticket.
 
 All deletion is synchronous in the maintenance process. After a crash, a new
 worker must acquire the same local lock before reconciling durable lease UUIDs
-with the authority. Lost replies retain their journal. An old external-command
+with the protected cancellation operation. This finishes the exact saved lease
+or records a finished tombstone before a delayed acquisition can arrive. Lost
+acquire and finish replies retain their journal until this settlement succeeds.
+The operation never reacquires a different or newly unauthorised scope.
+An old external-command
 journal remains held for independent custody proof. Leases never expire while
 deletion could still run. Releasing a storage lease does not alter operator holds,
 worker reservations or project drains.
@@ -51,7 +55,6 @@ Optional supervisor configuration:
     "goCache": {
       "enabled": true,
       "cache": "/home/operator/.cache/go-build",
-      "go": "/usr/local/go/bin/go",
       "maxBytes": 17179869184,
       "reserveBytes": 21474836480,
       "timeoutSeconds": 600

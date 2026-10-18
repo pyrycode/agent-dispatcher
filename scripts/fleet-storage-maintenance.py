@@ -153,7 +153,7 @@ class StorageSupervisor:
         elif value is None:
             command = self.adapter.operator_command('storage', action)
         else:
-            identity = value.get('id')
+            identity = value.get('id') or value.get('request', {}).get('id')
             if not isinstance(identity, str) or not re.fullmatch(r'[a-f0-9-]{36}', identity):
                 raise ValueError('Storage operation requires a durable lease UUID')
             request = self.directory / ('operator-' + identity + '-' + action + '.json')
@@ -227,9 +227,9 @@ class StorageSupervisor:
         return path, saved
 
     @staticmethod
-    def matches(request, lease):
+    def matches(request, lease, *, finished=False):
         keys = ('id', 'machine', 'kind', 'path', 'ticket', 'head')
-        if not isinstance(lease, dict) or any(lease.get(key) != request.get(key) for key in keys) or lease.get('finished') is not None:
+        if not isinstance(lease, dict) or any(lease.get(key) != request.get(key) for key in keys) or (lease.get('finished') is None) == finished:
             raise RuntimeError('Protected storage lease identity differs from the local request')
 
     def verify(self, saved):
@@ -240,28 +240,17 @@ class StorageSupervisor:
 
     def finish(self, path, saved, result):
         request = saved['request']
-        self.rpc('finish', {key: request[key] for key in ('id', 'machine')} | {'drained': True, 'result': result})
+        lease = self.rpc('finish', {key: request[key] for key in ('id', 'machine')} | {'drained': True, 'result': result})
+        self.matches(request, lease, finished=True)
         saved.update(phase='finished', result=result)
         atomic(path, saved)
 
     def reconcile(self):
-        active = None
         for path in sorted(self.directory.glob('*.lease.json')):
             saved = read(path)
             if saved.get('phase') == 'finished':
                 continue
             request = saved['request']
-            if active is None:
-                active = self.rpc('list')
-                if not isinstance(active, list):
-                    raise RuntimeError('Storage lease census is unavailable')
-            lease = next((item for item in active if item.get('id') == request['id']), None)
-            if lease is None:
-                # A timed-out request can reach authority after this census.
-                # Settle the exact UUID with acquire then finish, so late retries
-                # see a finished idempotency record and cannot orphan a lease.
-                lease = self.rpc('acquire', request)
-            self.matches(request, lease)
             if saved.get('command'):
                 # Never reinterpret a journal from an older external-command
                 # implementation as synchronous work.
@@ -269,7 +258,13 @@ class StorageSupervisor:
             # Caller holds maintenance.lock. Both backends only unlink in this
             # process and never delegate deletion. Acquiring that lock proves an
             # earlier cleaner cannot still mutate, even after a crash.
-            self.finish(path, saved, 'held')
+            # cancel atomically finishes an existing lease or records a finished
+            # tombstone for an acquire request that has not arrived yet. It also
+            # handles a successful finish whose reply was lost.
+            lease = self.rpc('cancel', {'request': request, 'drained': True})
+            self.matches(request, lease, finished=True)
+            saved.update(phase='finished', result='held')
+            atomic(path, saved)
 
     def candidates(self):
         core = load('fleet-storage')
@@ -371,12 +366,15 @@ class StorageSupervisor:
             saved.update(phase='synchronous-cleanup', receipt=config['receipt'])
             atomic(path, saved)
             def guard():
-                actual, held = os.stat(admission, follow_symlinks=False), os.fstat(admission_fd)
-                if (actual.st_dev, actual.st_ino) != (held.st_dev, held.st_ino):
-                    raise RuntimeError('Test-admission lock identity changed')
+                def check_lock():
+                    actual, held = os.stat(admission, follow_symlinks=False), os.fstat(admission_fd)
+                    if (actual.st_dev, actual.st_ino) != (held.st_dev, held.st_ino):
+                        raise RuntimeError('Test-admission lock identity changed')
+                check_lock()
                 self.verify(saved)
                 if not native_drained(Path(self.config['stateDirectory']) / 'tasks'):
                     raise RuntimeError('Native descendant drainage is unconfirmed')
+                check_lock()
                 return {'allowed': True, 'exclusive': True, 'lease': request['id'],
                         'custody': 'drained', 'admissionHeld': True}
             report = load('fleet-build-cache').manage_cache(config, guard, apply=True)
