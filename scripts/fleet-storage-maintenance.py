@@ -492,6 +492,10 @@ class StorageSupervisor:
                     atomic(journal,saved)
                     atomic(directory/'dependency-cleanup.json',{'phase':'cleaning','request':request,'planned':report,'nativeBasisSha256':saved['nativeBasisSha256']})
                     report=cleaner.cleanup(settings['target'],worktree,task,attestation,apply=True)
+                    # Each attempt has its own durable journal. Keep partial
+                    # failures there when a retry replaces the per-copy summary.
+                    saved['nativeReport']=report
+                    atomic(journal,saved)
                     atomic(directory/'dependency-cleanup.json',report)
                     self.finish(journal,saved,'held' if report['held'] else 'complete')
                 reports.append(report)

@@ -149,9 +149,14 @@ class Tests(unittest.TestCase):
         with patch.object(m,'processes_using_path',return_value=[]),patch.object(os,'unlink',side_effect=fail_second):
             report=self.supervisor.native_pass('test-host',True)[0]
         self.assertEqual(report['filesRemoved'],1);self.assertTrue(report['held'])
+        first_journal=next(self.supervisor.directory.glob('*.lease.json'))
+        self.assertEqual(m.read(first_journal).get('nativeReport'),report)
+        failed_history=first_journal.read_bytes()
         restarted=Supervisor(self.config,self.config_path)
         with patch.object(m,'processes_using_path',return_value=[]):retry=restarted.native_pass('test-host',True)[0]
         self.assertEqual(retry['filesRemoved'],1);self.assertEqual((work/'test-results/failure.log').read_text(),'full native failure evidence')
+        self.assertEqual(first_journal.read_bytes(),failed_history,'Retry must retain the original partial failure and accounting')
+        self.assertEqual(sorted(m.read(p)['nativeReport']['filesRemoved'] for p in self.supervisor.directory.glob('*.lease.json')),[1,1])
 
     def test_native_task_record_swap_between_plan_and_lease_blocks_deletion(self):
         directory,work,receipt,record=self.native_capture();original=self.supervisor.rpc
