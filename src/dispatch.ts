@@ -271,7 +271,7 @@ import {
   type GateSelectionConfig,
   type LiveTestsSection,
 } from "./gate-selection.js";
-import { liveTestsSectionError, requiredLiveTestNames } from "./live-tests.js";
+import { inheritedLiveTestNames, liveTestsSectionError, requiredLiveTestNames } from "./live-tests.js";
 import { loadTestEvidenceRules, type TestEvidenceRule } from "./gate-test-evidence.js";
 import {
   trimMemoryIndexFile,
@@ -8489,6 +8489,8 @@ export const DEFAULT_GATE_RUNNER_DEPS: GateRunnerDeps = {
  */
 export async function runRealClaudeGateSuite(opts: {
   issueNumber: number;
+  /** Current ticket body, independent of a builder-rewritten PR description. */
+  ticketBody?: string;
   command: string;
   /** Base-commit re-run template with a `{{TESTS}}` placeholder. Empty
    *  disables the comparison. */
@@ -8533,9 +8535,10 @@ export async function runRealClaudeGateSuite(opts: {
   const stderrPath = resolve(logsDir, `${stamp}_real-claude-gate_#${opts.issueNumber}.stderr.log`);
 
   const started = deps.now();
+  const inherited = inheritedLiveTestNames(opts.ticketBody ?? "");
   const report: GateRunReport = {
     outputFormat: opts.format,
-    requiredTests: [...new Set([...(opts.requiredTests ?? []), ...(opts.selection?.alwaysTests ?? [])])],
+    requiredTests: [...new Set([...(opts.requiredTests ?? []), ...(opts.selection?.alwaysTests ?? []), ...inherited])],
     runError: null,
     timedOut: false,
     exitCode: null,
@@ -8601,8 +8604,8 @@ export async function runRealClaudeGateSuite(opts: {
   // 2b. The whole suite, or the tests the pull request names. Decided before
   // any worktree exists; every input that cannot be read resolves to full.
   // The pull request's named tests are also required for a full run. When
-  // GitHub cannot be read, the full suite runs with the fork's own required
-  // names only: a hiccup must not park the ticket.
+  // GitHub cannot be read, the full suite keeps the known fork and ticket
+  // requirements: an unmanaged hiccup must not park the ticket.
   let command = opts.command;
   let section: LiveTestsSection = { kind: "missing" };
   let capturePaths: string[] = [];
@@ -8618,7 +8621,7 @@ export async function runRealClaudeGateSuite(opts: {
     report.requiredTests = [...new Set([...(report.requiredTests ?? []), ...requiredLiveTestNames(body)])];
   } catch (e: any) {
     if(managedRun()?.role==="real-claude-gate")return finish("Cannot freeze live acceptance requirements because the pull request could not be read");
-    console.warn(`   ⚠️  Real-claude gate: could not read the pull request's live tests (${e?.message ?? e}); running the full suite with the fork's required tests only`);
+    console.warn(`   ⚠️  Real-claude gate: could not read the pull request's live tests (${e?.message ?? e}); running the full suite with the known fork and ticket requirements`);
   }
   const required = judgeableRequiredTests(report.requiredTests ?? [], opts.format);
   report.requiredTests = required.kept;
@@ -8645,7 +8648,7 @@ export async function runRealClaudeGateSuite(opts: {
       } catch {}
     }
     let selection = decideGateSelection({
-      config: opts.selection, section, changedPaths, mergesSinceFull, format: opts.format,
+      config: { ...opts.selection, alwaysTests: [...new Set([...opts.selection.alwaysTests, ...inherited])] }, section, changedPaths, mergesSinceFull, format: opts.format,
     });
     if (selection.mode === "selected") {
       const selected = opts.baselineCommand ? buildBaselineCommand(opts.baselineCommand, selection.filter) : null;
@@ -9227,9 +9230,9 @@ export function makeRealClaudeGateRunner(): RealClaudeGateRunner | null {
   if (REAL_CLAUDE_GATE_FORMAT === null) return null; // bad format, already reported
   if (REAL_CLAUDE_GATE_TEST_EVIDENCE === null) return null; // bad evidence rules, already reported
   const format = REAL_CLAUDE_GATE_FORMAT;
-  return async ({ issueNumber }) => {
+  return async ({ issueNumber, ticketBody }) => {
     const report = await runRealClaudeGateSuite({
-      issueNumber,
+      issueNumber, ticketBody,
       command: REAL_CLAUDE_GATE_CMD,
       baselineCommand: REAL_CLAUDE_GATE_BASELINE_CMD,
       format,

@@ -13,6 +13,8 @@ import {
   shortTestName, failureTicketLabels, dropStaleOsRequirement, reopenTracker, trackerKey, FLAKY_REOPEN_WINDOW_DAYS, FLAKY_REOPEN_WINDOW_MS,
   type ClosedTracker, type FlakyRunContext, type FlakyTicketClient,
 } from "./flaky-tickets.js";
+import { inheritedMarker } from "./live-tests.js";
+export { inheritedMarker } from "./live-tests.js";
 import { osName } from "./ticket-requirements.js";
 
 export interface InheritedTicketClient extends InheritedTrackingClient {
@@ -84,9 +86,6 @@ export interface InheritedTicketOptions {
 }
 type OpenIssue = { number: number; nodeId: string; title?: string; body: string; labels?: string[] };
 
-export function inheritedMarker(name: string): string {
-  return `<!-- inherited-live-test: ${name} -->`;
-}
 function hasMarker(issue: { body: string }, name: string): boolean {
   return issue.body.split("\n").some(line => line.trim() === inheritedMarker(name));
 }

@@ -1102,3 +1102,7 @@ Linux supervisors derive these fixed routes from their configured Android runtim
 For a manually reviewed dispatcher release, the protected operator accepts `control target FULL_REVISION`. Only the central operator credential can select it. The service checks that the revision belongs to upstream main before saving the existing controller target. Supervisors then use their existing backup, fast-forward, graceful restart and readiness procedure. This does not change ticket state or loosen drains. The central authority must first load the new source so it recognises the command and capability.
 
 An operator can withdraw a superseded request that never started with `recovery-task cancel-queued REQUEST.json`. The saved JSON contains `id` and `reason`. The service retains the request and withdrawal reason and refuses tasks with a worker or active reservation. Repeating the identical request returns the same result.
+
+### Inherited live repair requirements
+
+An exact `<!-- inherited-live-test: fully.qualified.TestName -->` marker in a ticket declares mandatory LIVE acceptance independently of its PR's `## Live tests` section. The worker retains these names for full runs and includes them in selected live commands. The authority separately freezes the ticket names and refuses missing or skipped named evidence, including when an older executor omits them. Ordinary verifier unit gates keep their existing requirements. Exact saved results remain historical results; a changed ticket basis still refuses unfinished execution.

@@ -7723,6 +7723,7 @@ describe("runRealClaudeGateSuite — per-ticket selection", () => {
     fileContents?: string;
     selection?: Parameters<typeof runRealClaudeGateSuite>[0]["selection"];
     requiredTests?: string[];
+    ticketBody?: string;
     prFail?: boolean;
   } = {}) {
     const writes: string[] = [];
@@ -7751,6 +7752,7 @@ describe("runRealClaudeGateSuite — per-ticket selection", () => {
           ? { alwaysTests: ["p.TestPing"], fullPaths: ["net/"], fullEvery: 10 }
           : over.selection,
         requiredTests: over.requiredTests,
+        ticketBody: over.ticketBody,
         minExecuted: 1,
         repoRoot: "/tmp/fake-repo",
         defaultBranch: "main",
@@ -7810,6 +7812,30 @@ describe("runRealClaudeGateSuite — per-ticket selection", () => {
     assert.ok(calls.some(c => c.startsWith("gh pr list")));
     assert.deepEqual(report.requiredTests, ["p.TestRename"]);
     assert.deepEqual(writes, []);
+  });
+
+  for (const prBody of ["## Summary\nRewritten builder body", "## Live tests\n- p.TestRename\ninvalid prose about review"]) {
+  test("ticket inherited-live marker remains mandatory when the PR Live tests section disappears", async () => {
+    const { run, spawnRequests } = selectionRun({
+      prBody, ticketBody: inheritedMarker("p.TestCapture"),
+    });
+    const report = await run();
+    assert.equal(report.selection?.mode, "full", "missing PR selection retains the full-suite fallback");
+    assert.deepEqual(report.requiredTests, ["p.TestPing", "p.TestCapture"]);
+    assert.equal(spawnRequests[0].command, "go test -json ./...");
+  });
+
+  }
+
+  test("ticket inherited-live names join selected commands and deduplicate canonical declarations", async () => {
+    const { run, spawnRequests } = selectionRun({
+      ticketBody: inheritedMarker("p.TestCapture") + "\n  " + inheritedMarker("p.TestCapture") + "  ",
+      prBody: "## Live tests\n- ` p.TestCapture `\n- p.TestRename",
+    });
+    const report = await run();
+    assert.deepEqual(report.requiredTests, ["p.TestPing", "p.TestCapture", "p.TestRename"]);
+    assert.deepEqual(report.selection?.mode === "selected" && report.selection.tests, ["p.TestPing", "p.TestCapture", "p.TestRename"]);
+    assert.match(spawnRequests[0].command, /TestCapture/);
   });
 
   test("a full run missing required names cannot record a passing backstop", async () => {

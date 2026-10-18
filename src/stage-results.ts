@@ -4,6 +4,7 @@ import type { TestEvidenceRule } from "./gate-test-evidence.js";
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { WorkflowItem, WorkflowChange } from "./workflow-store.js";
+import { inheritedLiveTestNames } from "./live-tests.js";
 import { parseVerdictHandoff, type VerdictHandoff } from "./verdict-handoff.js";
 /** Requirements are frozen before execution. Results and display publication are independent. */
 export interface StagePlan {
@@ -46,6 +47,8 @@ export interface StageRecord {
     artifactsRequired: boolean;
     liveGateRequired: boolean;
     plan: StagePlan;
+    /** Authoritative ticket markers, separate from the executor's claimed plan. */
+    inheritedRequiredTests?: string[];
     result?: StageSubmission;
     submissionHash?: string;
     evidence?: {
@@ -135,10 +138,11 @@ export class StageResults {
     }
     begin(ticket: string, runId: string, item: WorkflowItem, plan: StagePlan): StageRecord {
         validateStagePlan(plan);
-        const record: StageRecord = { ticket, runId, basis: stageBasis(item), artifactsRequired: item.labels.includes("needs-live-artifacts"), liveGateRequired: item.labels.includes("needs-real-claude"), plan };
+        const inherited = plan.kind === "live-gate" ? inheritedLiveTestNames(item.body) : [];
+        const record: StageRecord = { ...(inherited.length ? { inheritedRequiredTests: inherited } : {}), ticket, runId, basis: stageBasis(item), artifactsRequired: item.labels.includes("needs-live-artifacts"), liveGateRequired: item.labels.includes("needs-real-claude"), plan };
         const old = this.get(runId);
         if (old) {
-            if (JSON.stringify({ ...old, result: undefined, submissionHash: undefined, evidence: undefined, acceptance: undefined }) !== JSON.stringify(record))
+            if (JSON.stringify({ ...old, inheritedRequiredTests: undefined, result: undefined, submissionHash: undefined, evidence: undefined, acceptance: undefined }) !== JSON.stringify({ ...record, inheritedRequiredTests: undefined }))
                 throw new Error("Stage plan identity reused with different requirements");
             return old;
         }
@@ -162,11 +166,16 @@ export class StageResults {
         const pass = result.verdict?.decision !== "FAIL";
         if (pass && (item.blockedBy.some(b => b.state === "OPEN") || item.labels.some(l => /^(error:|needs-rework:|held:|needs-human:)/.test(l) && l !== "needs-human:sizing")))
             throw new Error("Current stage holds forbid acceptance");
-        const acceptance = decideStageResult(old.plan, result, old.artifactsRequired, old.liveGateRequired);
+        // Older authorities froze executor plans without the ticket backstop.
+        // The unchanged basis above proves this is still the same ticket body;
+        // enforce its live requirements without rewriting the claimed plan.
+        const inherited = old.plan.kind === "live-gate" ? old.inheritedRequiredTests ?? inheritedLiveTestNames(item.body) : [];
+        const effective = inherited.length ? { ...old.plan, requiredTests: [...new Set([...(old.plan.requiredTests ?? []), ...inherited])] } : old.plan;
+        const acceptance = decideStageResult(effective, result, old.artifactsRequired, old.liveGateRequired);
         if (result.files.length && !retain)
             throw new Error("Durable shared evidence storage is required for capture acceptance");
         const evidence = result.files.length ? retain!(result.files) : undefined;
-        const record: StageRecord = { ...old, result: { ...result, files: [] }, submissionHash: createHash("sha256").update(JSON.stringify(result)).digest("hex"), ...(evidence ? { evidence } : {}), acceptance };
+        const record: StageRecord = { ...old, ...(inherited.length ? { inheritedRequiredTests: inherited } : {}), result: { ...result, files: [] }, submissionHash: createHash("sha256").update(JSON.stringify(result)).digest("hex"), ...(evidence ? { evidence } : {}), acceptance };
         apply(acceptance.change);
         this.db.prepare("UPDATE fleet_stage_results SET record=? WHERE run_id=?").run(JSON.stringify(record), runId);
         if (old.plan.kind === "verifier" && result.verdict && acceptance.state !== "waiting") {
