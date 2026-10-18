@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { gateRunFloor, gateRunRequiredTests, parseGateOutput, type GateRunReport } from "./gate-output.js";
-import { liveTestsSectionError, parseLiveTestEntries, requiredLiveTestNames } from "./live-tests.js";
+import { inheritedLiveTestNames, inheritedMarker, liveTestsSectionError, parseLiveTestEntries, requiredLiveTestNames } from "./live-tests.js";
 import { parseLiveTestsSection } from "./gate-selection.js";
 import { decideGateOutcome, decideGateVerdict } from "./pipeline-decisions.js";
 import { liveGateLines, parseGateRunMeta, serializeGateRunMeta } from "./gate-report.js";
@@ -165,4 +165,10 @@ test("the documentation report says when a required test is missing", () => {
     meta: parseGateRunMeta(serializeGateRunMeta(report(raw, undefined, [effort]), {}, new Date()))! }, "").join("\n");
   assert.match(fine, /Required live tests/);
   assert.doesNotMatch(fine, /Live acceptance remains missing/);
+});
+
+test("inherited live identities reuse canonical name parsing without interpreting prose or sentinel words", () => {
+  const names = ["pkg.TestCapture", "a.B#method", "file.spec.ts › title, literal `code`", "all"];
+  assert.deepEqual(inheritedLiveTestNames("prose pkg.TestOther\n" + names.map(inheritedMarker).join("\r\n") + "\n  " + inheritedMarker(" pkg.TestCapture ") + "  "), names);
+  assert.deepEqual(inheritedLiveTestNames("## Live tests\n- pkg.TestOther\n<!-- inherited-live-test: -->"), []);
 });

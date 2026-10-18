@@ -684,7 +684,7 @@ export async function runRealClaudeGate(client: ReconcileClient): Promise<void> 
  * dispatch.ts; null when `PYRY_REAL_CLAUDE_GATE_CMD` is unset, which is
  * the feature's off switch.
  */
-export type RealClaudeGateRunner = (opts: { issueNumber: number }) => Promise<GateRunReport>;
+export type RealClaudeGateRunner = (opts: { issueNumber: number; ticketBody?: string }) => Promise<GateRunReport>;
 
 /**
  * Hands a started run to the caller instead of awaiting it. The caller keeps
@@ -811,7 +811,7 @@ export async function runRealClaudeGateExecution(
     try {
       let report: GateRunReport;
       try {
-        report = await runner({ issueNumber: candidate.issueNumber });
+        report = await runner({ issueNumber: candidate.issueNumber, ticketBody: parked.find(i => i.issueNumber === candidate.issueNumber)?.body });
       } catch (error: any) {
         // A runner that throws must still park the ticket. Letting the
         // exception escape would leave the card sitting in Inbox with no

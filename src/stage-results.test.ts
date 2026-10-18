@@ -7,7 +7,8 @@ import { FleetStore, type StartRequest } from "./fleet-store.js";
 import type { WorkflowItem } from "./workflow-store.js";
 import { decideStageResult, type StagePlan, type StageSubmission } from "./stage-results.js";
 import { retainedStageFiles, declaredStageArtifacts } from "./stage-result-files.js";
-import { GATE_PARSER_VERSION } from "./gate-output.js";
+import { inheritedMarker } from "./inherited-tickets.js";
+import { GATE_PARSER_VERSION, parseGateOutput } from "./gate-output.js";
 const project = "org/core", ticket = project + "#3584", sha = "a".repeat(40);
 const config = { project, projectId: "P", statusFieldId: "S", options: { Backlog: "b", Inbox: "i", "In Development": "d", "In Code Review": "v", "In Documentation": "doc", Done: "done" } };
 const item = (labels: string[] = []): WorkflowItem => ({ id: "P3584", issueId: "I3584", issueNumber: 3584, title: "Review", body: "Required behaviour", url: "https://github.com/org/core/issues/3584", status: "In Code Review", state: "OPEN", revision: 1, position: 1, labels, blockedBy: [], parentNumber: null, grandparentNumber: null });
@@ -268,4 +269,88 @@ test("a lost acceptance response is recovered by immutable identity before execu
     finally {
         store.close();
     }
+});
+
+// Synthetic protocol records exercise central acceptance, not a live execution claim.
+for (const named of ["passed", "missing", "skipped"] as const) {
+  for (const legacy of [false, true]) {
+    test(`central inherited-live marker requires actual named ${named} evidence despite ${legacy ? "pre-upgrade" : "worker-omitted"} plan`, () => {
+      const store = new FleetStore(":memory:", { mac: { heavyLimit: 1, combinedLimit: 2 } });
+      try {
+        store.workflow.import(config, [{ ...item(["needs-real-claude"]), status: "Inbox", body: inheritedMarker("pkg.TestCapture") }]);
+        assert.equal(store.start({ ...run("live"), role: "real-claude-gate" }).ok, true);
+        const omitted: StagePlan = { version: 1, kind: "live-gate", candidate: sha, checks: ["live-acceptance"], artifacts: [], requiredTests: [], minExecuted: 1 };
+        store.stagePlan("mac", "s", ticket, "live", omitted);
+        if (legacy) {
+          const record = store.stages.get("live")!;
+          delete record.inheritedRequiredTests;
+          // A disposable fixture models a frozen record from an old authority.
+          (store as any).db.prepare("UPDATE fleet_stage_results SET record=? WHERE run_id='live'").run(JSON.stringify(record));
+          assert.deepEqual(store.stagePlan("mac", "s", ticket, "live", omitted), record, "legacy begin retry preserves the frozen record");
+          assert.equal(store.stages.get("live")?.inheritedRequiredTests, undefined);
+        } else {
+          assert.deepEqual(store.stages.get("live")?.inheritedRequiredTests, ["pkg.TestCapture"]);
+          assert.deepEqual(store.stages.get("live")?.plan, omitted, "the submitted plan is preserved");
+          assert.deepEqual(store.stagePlan("mac", "s", ticket, "live", omitted), store.stages.get("live"), "old worker retry normalizes idempotently");
+        }
+        const events = [
+          { Action: "run", Package: "pkg", Test: "TestUnrelated" }, { Action: "pass", Package: "pkg", Test: "TestUnrelated" },
+          ...(named === "missing" ? [] : [{ Action: "run", Package: "pkg", Test: "TestCapture" }, { Action: named === "passed" ? "pass" : "skip", Package: "pkg", Test: "TestCapture" }]),
+          { Action: "pass", Package: "pkg" },
+        ].map(e => JSON.stringify(e)).join("\n") + "\n";
+        const submission = liveResult();
+        const evidence = JSON.parse(submission.checks[0].evidence);
+        evidence.report.tally = parseGateOutput(events, "go-json");
+        submission.checks[0].evidence = JSON.stringify(evidence);
+        assert.throws(() => store.stageResult("mac", "s", ticket, "live", { ...submission, candidate: "b".repeat(40) }), /Invalid stage result/);
+        assert.equal(store.stages.get("live")?.result, undefined, "wrong candidate cannot retain a result");
+        const accepted = store.stageResult("mac", "s", ticket, "live", submission);
+        assert.equal(accepted.acceptance?.state, named === "passed" ? "accepted" : "waiting");
+        assert.deepEqual(accepted.inheritedRequiredTests, ["pkg.TestCapture"]);
+        assert.deepEqual(accepted.plan, omitted, "central enforcement does not rewrite the claimed plan");
+        store.workflow.observe(project, [{ ...store.workflow.get(ticket), body: inheritedMarker("pkg.TestNewRequirement") }]);
+        assert.deepEqual(store.stageResult("mac", "s", ticket, "live", submission), accepted, "saved exact-result retry is never reinterpreted after ticket edits");
+      } finally { store.close(); }
+    });
+  }
+}
+
+test("ordinary verifier plans do not acquire inherited live test requirements", () => {
+  const store = new FleetStore(":memory:", { mac: { heavyLimit: 1, combinedLimit: 2 } });
+  try {
+    store.workflow.import(config, [{ ...item(["needs-real-claude"]), body: inheritedMarker("pkg.TestCapture") }]);
+    assert.equal(store.start(run()).ok, true);
+    const saved = store.stagePlan("mac", "s", ticket, "review", plan);
+    assert.deepEqual(saved.plan, plan);
+    assert.equal(store.stageResult("mac", "s", ticket, "review", result()).acceptance?.state, "accepted");
+  } finally { store.close(); }
+});
+
+test("a changed ticket basis still refuses a legacy live result rather than reinterpreting requirements", () => {
+  const store = new FleetStore(":memory:", { mac: { heavyLimit: 1, combinedLimit: 2 } });
+  try {
+    const original = { ...item(["needs-real-claude"]), status: "Inbox", body: inheritedMarker("pkg.TestCapture") };
+    store.workflow.import(config, [original]);
+    assert.equal(store.start({ ...run("live"), role: "real-claude-gate" }).ok, true);
+    store.stagePlan("mac", "s", ticket, "live", { version: 1, kind: "live-gate", candidate: sha, checks: ["live-acceptance"], artifacts: [] });
+    const legacy = store.stages.get("live")!;
+    delete legacy.inheritedRequiredTests;
+    (store as any).db.prepare("UPDATE fleet_stage_results SET record=? WHERE run_id='live'").run(JSON.stringify(legacy));
+    store.workflow.observe(project, [{ ...store.workflow.get(ticket), body: inheritedMarker("pkg.TestOther") }]);
+    assert.throws(() => store.stageResult("mac", "s", ticket, "live", liveResult()), /requirements changed/);
+    assert.equal(store.stages.get("live")?.result, undefined);
+  } finally { store.close(); }
+});
+
+test("live plans without inherited markers preserve their existing requirements and acceptance", () => {
+  const store = new FleetStore(":memory:", { mac: { heavyLimit: 1, combinedLimit: 2 } });
+  try {
+    store.workflow.import(config, [{ ...item(["needs-real-claude"]), status: "Inbox" }]);
+    assert.equal(store.start({ ...run("live"), role: "real-claude-gate" }).ok, true);
+    const declared: StagePlan = { version: 1, kind: "live-gate", candidate: sha, checks: ["live-acceptance"], artifacts: [], requiredTests: ["pkg.TestCapture"] };
+    const saved = store.stagePlan("mac", "s", ticket, "live", declared);
+    assert.deepEqual(saved.plan, declared);
+    assert.equal(saved.inheritedRequiredTests, undefined);
+    assert.equal(store.stageResult("mac", "s", ticket, "live", liveResult()).acceptance?.state, "accepted");
+  } finally { store.close(); }
 });

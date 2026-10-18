@@ -108,3 +108,25 @@ export function liveTestsSectionError(body: string): string | null {
     "\nList one test name per line (backtick a title with spaces or commas), or write `all`. " +
     "Move prose out of the section, below another heading.";
 }
+
+/** The existing inherited-failure ticket identity, shared by tracking and acceptance. */
+export function inheritedMarker(name: string): string {
+  return `<!-- inherited-live-test: ${name} -->`;
+}
+
+/** Only exact inherited markers declare mandatory live acceptance, never prose. */
+export function inheritedLiveTestNames(body: string): string[] {
+  const names: string[] = [];
+  for (const line of body.split(/\r?\n/)) {
+    const match = /^<!-- inherited-live-test: (.+) -->$/.exec(line.trim());
+    if (!match) continue;
+    const name = match[1].trim();
+    // Reuse the live-test parser's code-span identity rules, including titles
+    // with commas or backticks. A marker's literal "all" is a name, not a waiver.
+    const fence = "`".repeat(1 + Math.max(0, ...(name.match(/`+/g) ?? []).map(run => run.length)));
+    for (const parsed of parseLiveTestEntries(`## Live tests\n${fence} ${name} ${fence}`).names) {
+      if (!names.includes(parsed)) names.push(parsed);
+    }
+  }
+  return names;
+}
