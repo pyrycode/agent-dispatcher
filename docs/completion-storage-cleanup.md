@@ -82,6 +82,11 @@ Malformed or unavailable storage observations cannot suppress existing control
 and worker-custody reports. A maintenance failure is reported as held and does
 not restart, release or resume a worker.
 
+Container paths need their own proven route. A Git registration that names a
+container path cannot be translated into a host path and then treated as an
+ordinary local working copy. The initial driver reports those copies as held.
+It leaves their source, evidence and container work untouched.
+
 ## Deployment
 
 Deploy through the existing protected controller target. The supervisor and
