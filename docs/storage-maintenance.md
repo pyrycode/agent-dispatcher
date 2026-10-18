@@ -89,3 +89,30 @@ acquire a lease or attempt deletion. Normal jobs and copy cleanup can continue.
 An independent operator must audit the exact receipt and cache, then explicitly
 move the hold record aside after deciding that a fresh attempt is justified.
 The read-only audit command shows this hold and never clears it automatically.
+# Native Desktop dependency retention
+
+Each native Desktop capture keeps its source copy, Git registration, result,
+logs, reports and attachments. Installed dependencies can be reclaimed after the
+exact task has published a terminal result and its supervisor has confirmed all
+native descendants drained. A failed task also requires its source ticket to be
+closed and Done. Attention, missing results, operator holds and unresolved
+stopped-worker reconciliation prevent this cleanup.
+
+New captures save a content manifest immediately after `npm ci`. Its digest is
+included in published `desktop/capture.json`. Cleanup verifies that published
+digest and the exact artifact manifest before touching dependencies. Historical
+captures require an independent locked installation and an explicit protected
+`storage attest` request for that task, reference digest and published artifact
+digest. An automatically supplied local manifest cannot authorize itself.
+
+Cleanup acquires a durable `native-task` storage lease. It excludes only that
+task's new admissions. Existing machine and project drains remain unchanged and
+do not prohibit reclaiming a terminal task's redundant installed dependencies.
+Ticket and shared-cache storage policies retain their stricter drain checks.
+
+Only content-matching reference leaves under `node_modules` are unlinked through
+held directory descriptors. Unknown or modified leaves, hardlinks and all source
+and evidence outside that tree remain. Source copies and directories are never
+removed. The plan and reference are journalled before the first unlink. Partial
+failures retain accurate progress, and retry treats already missing leaves as
+finished work. A fresh authority refusal ends that cleanup attempt.

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Existing fleet supervisor's admitted native work. Requests cannot supply shell commands."""
 import hashlib
+import importlib.util
 import base64
 import json
 import os
@@ -409,6 +410,12 @@ def desktop_capture(task,paths,directory):
         config.write_text("import config from './playwright.fleet-original.config'\nexport default { ...config, reporter: [['list'], ['json', { outputFile: "+json.dumps(str(report))+" }]] }\n")
         for argv,timeout in ((['npm','ci'],600),(['npm','run','build'],600)):
             if run(argv,worktree,timeout=timeout)!=0:raise RuntimeError('Desktop install/build failed; inspect execution.log')
+            if argv==['npm','ci']:
+                spec=importlib.util.spec_from_file_location('native_dependency_manifest',Path(__file__).with_name('fleet-native-storage.py'))
+                storage=importlib.util.module_from_spec(spec);spec.loader.exec_module(storage)
+                installed=storage.installation(task,worktree.resolve(strict=True))
+                atomic(directory/'dependency-install.json',installed)
+                evidence['dependencyReferenceDigest']=installed['referenceDigest']
         # Prepare the Electron ABI only after host-Node install/build preparation.
         if run(['npm','run','rebuild:electron'],worktree,timeout=600)!=0:
             raise RuntimeError('Desktop Electron rebuild failed; inspect execution.log')
@@ -753,6 +760,13 @@ class SupportSupervisor:
         if done.returncode:raise rpc_failure(operation,done.returncode,done.stderr)
         return json.loads(done.stdout)
 
+    def disk_admission(self):
+        policy=self.config.get('diskAdmission')
+        if policy is None:return {'state':'disabled','allowed':True}
+        spec=importlib.util.spec_from_file_location('fleet_disk_pressure',Path(__file__).with_name('fleet-disk-pressure.py'))
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        return module.check(policy)
+
     def capability_record(self,state,withheld=()):
         routes=self.config.get('recoveryTasks',{})
         capabilities=sorted(set(route['capability'] for route in routes.values()
@@ -784,8 +798,17 @@ class SupportSupervisor:
                 if receipt.exists() and operation_open(json.loads(receipt.read_text())):return False
         return route_available(route)
 
-    def drained(self,old,receipt):
+    def boot_proof(self,machine,receipt,*,prepare=False):
+        # Lazy loading keeps copied native workers independent of this host-only helper.
+        spec=importlib.util.spec_from_file_location('fleet_boot_proof',Path(__file__).with_name('fleet-boot-proof.py'))
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        return module.check(receipt,machine,prepare=prepare)
+
+    def drained(self,old,receipt,boot_proof=None):
         if old.get('drainConfirmed'):return True
+        if boot_proof:
+            old['drainConfirmed']=True;old['drainProof']=boot_proof;atomic(receipt,old)
+            return True
         custody=old.get('custody')
         if not custody:return False
         custody['phase']=observe_custody(custody,process_snapshot())
@@ -841,36 +864,44 @@ class SupportSupervisor:
 
     def receipt_pass(self,machine,receipt,running):
         old=json.loads(receipt.read_text())
-        if old['phase']=='complete' and (old.get('artifactDigest') or old.get('artifactUnrecoverable') or old.get('interrupted')
-                                         or old.get('publicationRefused') or (old.get('finalized') or {}).get('released')):return
+        # Consumption is read-only. Prepare a witness only after this pass has
+        # finished any ordinary receipt updates, so it binds the retained bytes.
+        boot_proof=self.boot_proof(machine,receipt,prepare=False) if not old.get('drainConfirmed') else None
         result=Path(old['result'])
-        if old['phase']=='complete' and not result.is_file():return
         if old['phase']=='complete':
-            # This trusted supervisor receipt records the prior terminal
-            # acknowledgement. Recover bytes only, without launching or
-            # signalling workers or changing the already released outcome.
             try:
-                value=json.loads(Path(old.get('artifactResult',str(result))).read_text())
-                if 'publication.json' in value.get('files',{}):return
-                files=self.artifact_files(old,value)
-            except Exception as error:
-                if not artifacts_unrecoverable(error):raise ArtifactPassError(error) from error
-                # The retained inputs are gone or invalid, for example a capture
-                # folder in a recreated container's temporary space. The outcome
-                # was already acknowledged, so only the artifacts are lost.
-                reason='Retained artifacts unrecoverable. '+type(error).__name__+': '+str(error)[:300]
-                old['artifactUnrecoverable']={'at':time.time(),'reason':reason};atomic(receipt,old)
-                if self.housekeeping:self.housekeeping('native-task-unrecoverable',old['id'],reason)
+                if (old.get('artifactDigest') or old.get('artifactUnrecoverable') or old.get('interrupted')
+                        or old.get('publicationRefused') or (old.get('finalized') or {}).get('released') or not result.is_file()):return
+                # This trusted supervisor receipt records the prior terminal
+                # acknowledgement. Recover bytes only, without launching or
+                # signalling workers or changing the already released outcome.
+                try:
+                    value=json.loads(Path(old.get('artifactResult',str(result))).read_text())
+                    if 'publication.json' in value.get('files',{}):return
+                    files=self.artifact_files(old,value)
+                except Exception as error:
+                    if not artifacts_unrecoverable(error):raise ArtifactPassError(error) from error
+                    # The retained inputs are gone or invalid, for example a capture
+                    # folder in a recreated container's temporary space. The outcome
+                    # was already acknowledged, so only the artifacts are lost.
+                    reason='Retained artifacts unrecoverable. '+type(error).__name__+': '+str(error)[:300]
+                    old['artifactUnrecoverable']={'at':time.time(),'reason':reason};atomic(receipt,old)
+                    if self.housekeeping:self.housekeeping('native-task-unrecoverable',old['id'],reason)
+                    return
+                try:old['artifactDigest']=self.return_artifacts(machine,old,value,files)
+                except Exception as error:raise ArtifactPassError(error) from error
+                atomic(receipt,old)
                 return
-            try:old['artifactDigest']=self.return_artifacts(machine,old,value,files)
-            except Exception as error:raise ArtifactPassError(error) from error
-            atomic(receipt,old)
-            return
+            finally:
+                # A failed artifact pass will retry and may still change this record.
+                if sys.exc_info()[0] is None:
+                    self.schedule_dependency_cleanup(receipt,old)
+                    if not old.get('drainConfirmed'):self.boot_proof(machine,receipt,prepare=True)
         child=self.children.get(old.get('pid'))
         custody=old.get('custody')
         def observe_worker():
             nonlocal snapshot,custody_state
-            if old.get('drainConfirmed'):
+            if old.get('drainConfirmed') or boot_proof:
                 custody_state='drained';return
             snapshot=process_snapshot()
             custody_state=observe_custody(custody,snapshot) if custody else 'uncertain'
@@ -887,7 +918,7 @@ class SupportSupervisor:
         worker_alive=root_alive or bool(child is None and root and observed and
             observed['identity']==root['identity'] and not observed['state'].startswith(('Z','X')))
         alive=root_alive or custody_state!='drained'
-        if result.is_file() and not alive and self.drained(old,receipt):
+        if result.is_file() and not alive and self.drained(old,receipt,boot_proof):
             value=json.loads(Path(old.get('artifactResult',str(result))).read_text())
             publication=value.get('files',{}).pop('publication.json',None)
             if publication:
@@ -926,9 +957,20 @@ class SupportSupervisor:
                 old['artifactResult']=str(artifact_result);atomic(receipt,old)
             old['artifactDigest']=self.return_artifacts(machine,old,value)
             old['phase']='complete';atomic(receipt,old)
-        elif old['phase'] in {'running','attention'} and not alive and not result.is_file() and (old.get('interrupted') or (proof:=worker_gone_with_container(old))):
-            self.interrupt(machine,receipt,old,proof)
+            self.schedule_dependency_cleanup(receipt,old)
+        elif old['phase'] in {'running','attention'} and not alive and not result.is_file():
+            proof=(old.get('interrupted') or {}).get('reason') or worker_gone_with_container(old)
+            if not proof and self.drained(old,receipt,boot_proof):
+                proof=boot_proof or 'The native worker and every recorded command group are confirmed drained.'
+            if proof:self.interrupt(machine,receipt,old,proof)
+            else:
+                if old['phase']!='attention':
+                    old['phase']='attention';old['reason']='Task worker or descendants have no confirmed drainage; inspect the retained process and reservation';atomic(receipt,old)
+                    self.rpc('uncertain',{'machine':machine,'id':old['id'],'session':old['session'],'reason':old['reason']})
+                self.boot_proof(machine,receipt,prepare=True)
+                running.append(old)
         elif old['phase']=='attention':
+            if not result.is_file():self.boot_proof(machine,receipt,prepare=True)
             running.append(old)
         elif old['phase']=='launch-requested' or not worker_alive:
             # Delivery could have happened before a crash. Never create another worker.
@@ -936,6 +978,19 @@ class SupportSupervisor:
             self.rpc('uncertain',{'machine':machine,'id':old['id'],'session':old['session'],'reason':old['reason']})
             running.append(old)
         else:running.append(old)
+
+    def schedule_dependency_cleanup(self,receipt,old):
+        """Signal the separate storage worker. Never hash or delete in watchdog."""
+        if old.get('phase')!='complete' or old.get('dependencyCleanupScheduled') or not old.get('drainConfirmed') or not old.get('artifactDigest') or old.get('interrupted') or old.get('artifactUnrecoverable'):return
+        try:
+            directory=Path(old.get('directory') or Path(old['result']).parent)
+            task=json.loads((directory/'task.json').read_text())
+            value=json.loads(Path(old['result']).read_text())
+            if task['id']!=old['id'] or task['request']['recipe']!='desktop-fake-suite' or value['outcome']!='completed':return
+            storage=Path(self.config['stateDirectory'])/'storage';storage.mkdir(mode=0o700,exist_ok=True)
+            atomic(storage/'native-completion.json',{'id':old['id'],'time':time.time()})
+            old['dependencyCleanupScheduled']=True;atomic(receipt,old)
+        except (OSError,ValueError,KeyError,TypeError):return
 
     def publication_retry(self,receipt,old,error):
         """Wait before the next attempt at a temporary publication failure.
@@ -1055,6 +1110,17 @@ class SupportSupervisor:
             task=grant['task'];session=grant['run']['session']
             receipt=self.directory/(task['id']+'.receipt.json')
             if receipt.exists():continue
+            if task['request']['recipe']!='platform-probe':
+                pressure=self.disk_admission()
+                if pressure.get('allowed') is not True:
+                    # A grant can predate low space. Keep that reservation and
+                    # retry launch later. Receipt-backed workers above continue.
+                    marker={'id':task['id'],'session':session,'runId':grant['run'].get('id'),
+                            'phase':'waiting-storage','reason':pressure['reason'],
+                            'freeBytes':pressure.get('freeBytes'),'minFreeBytes':pressure.get('minFreeBytes')}
+                    atomic(self.directory/(task['id']+'.deferred.json'),marker)
+                    running.append(marker)
+                    continue
             route=routes.get(task['request']['recipe']+':'+task['request']['capability'])
             if not route:raise RuntimeError('The admitted task has no configured recipe route')
             deferred=self.directory/(task['id']+'.deferred.json')
@@ -1076,6 +1142,9 @@ class SupportSupervisor:
             result=folder/'result.json';task['admission']=admitted
             atomic(folder/'task.json',task);atomic(folder/'paths.json',route['paths'])
             program=folder/'worker.py';program.write_text(Path(__file__).read_text());program.chmod(0o700)
+            if task['request']['recipe']=='desktop-fake-suite':
+                for name in ('fleet-native-storage.py','fleet-storage.py'):
+                    (folder/name).write_bytes(Path(__file__).with_name(name).read_bytes())
             if route.get('container'):
                 root=route['containerDirectory'].rstrip('/')+'/'+task['id']
                 command=['podman','exec',route['container'],'python3',root+'/worker.py','--worker',root]

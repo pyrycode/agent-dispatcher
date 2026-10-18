@@ -8,6 +8,7 @@ import {DatabaseSync} from 'node:sqlite';
 import {FleetStore,type StartRequest} from './fleet-store.js';
 import {serveFleet,JsonClient} from './fleet-http.js';
 import type {StorageRequest} from './storage-maintenance.js';
+import {artifactManifest,manifestHash} from './recovery-artifacts.js';
 
 const project='org/product',ticket=project+'#7';
 const limits={mac:{heavyLimit:1,combinedLimit:2},linux:{heavyLimit:1,combinedLimit:2}};
@@ -168,5 +169,98 @@ test('cancellation tombstones settle delayed acquisitions and lost completion re
     assert.equal(s.storage.active()[0].id,newer.id);
     assert.throws(()=>s.cancelStorage({...newer,machine:'linux'},true),/differs/);
     assert.equal(s.storage.active()[0].id,newer.id);
+  }finally{s.close();}
+});
+
+const desktop='pyrycode/pyrycode-desktop',nativeTicket=desktop+'#1975';
+function publishedNative(s:FleetStore,attest=true) {
+  s.workflow.import({project:desktop,projectId:'PD',statusFieldId:'SD',options:{Inbox:'inbox',Done:'done','In Development':'dev',Backlog:'backlog',Halted:'halted'}},[
+    {id:'ID',issueId:'ISSUED',issueNumber:1975,title:'Desktop behaviour',body:'Retain all acceptance requirements',url:'https://example.test/1975',state:'OPEN',status:'In Development',labels:[],blockedBy:[],parentNumber:null,grandparentNumber:null,revision:1,position:0},
+  ]);
+  const task=s.tasks.request(nativeTicket,{recipe:'desktop-fake-suite',capability:'desktop-fake-suite',revision:'a'.repeat(40),reason:'Pinned native acceptance'});
+  const db=(s as unknown as {db:DatabaseSync}).db;
+  const result={outcome:'completed',summary:'Published passing native evidence',candidateRevision:'a'.repeat(40),files:{}};
+  db.prepare("UPDATE fleet_recovery_tasks SET state='complete',machine='mac',session='native-session',run_id='native-run',result=? WHERE id=?").run(JSON.stringify(result),task.id);
+  const capture=JSON.stringify({dependencyReferenceDigest:'b'.repeat(64)});
+  const manifest=artifactManifest({'desktop/capture.json':capture});
+  db.prepare('INSERT INTO fleet_task_artifacts VALUES (?,?,?,1)').run(task.id,JSON.stringify(manifest),manifestHash(manifest));
+  db.prepare('INSERT INTO fleet_task_chunks VALUES (?,?,0,?)').run(task.id,'desktop/capture.json',Buffer.from(capture));
+  const request:StorageRequest={id:randomUUID(),machine:'mac',kind:'native-task',taskId:task.id,ticket:nativeTicket,head:'a'.repeat(40),path:'/retained/desktop-captures/'+task.id+'/desktop',referenceDigest:'b'.repeat(64),artifactDigest:manifestHash(manifest)};
+  if(attest)s.attestStorage(request);
+  return {task,db,request};
+}
+
+test('native dependency scope preserves project drains and excludes only its exact task',()=>{
+  const s=fixture();try {
+    const {task,request}=publishedNative(s);
+    s.reportMachineCapabilities('mac',['macos'],[project,desktop]);
+    s.setDesired({machines:['mac'],project:desktop,change:{work:'drained'}});
+    const controls=s.desired.document('mac'),claims=s.snapshot().claims;
+    const held=s.acquireStorage(request);
+    assert.equal(s.storage.blocks('mac',nativeTicket,undefined,task.id),true);
+    assert.equal(s.storage.blocks('linux',nativeTicket,undefined,'other-native-task'),false);
+    assert.equal(s.start(run('unrelated-native-scope')).ok,true);
+    assert.deepEqual(s.desired.document('mac'),controls);
+    assert.deepEqual(s.snapshot().claims.filter(c=>c.ticket===nativeTicket),claims.filter(c=>c.ticket===nativeTicket));
+    s.workflow.change(nativeTicket,{addLabels:['held:operator']},'operator',randomUUID());
+    assert.throws(()=>s.verifyStorage(held.id,'mac'),/holds/);
+    assert.equal(s.storage.active().length,1);
+    s.cancelStorage(request,true);
+  }finally{s.close();}
+});
+
+test('native cleanup refuses failed attention unpublished mismatched or currently running tasks',()=>{
+  for(const variation of ['failed','attention','publishing','unpublished','revision','run','hold']) {
+    const s=fixture();try {
+      const {task,db,request}=publishedNative(s);
+      if(['failed','attention','publishing'].includes(variation))db.prepare('UPDATE fleet_recovery_tasks SET state=? WHERE id=?').run(variation,task.id);
+      if(variation==='unpublished')db.prepare('UPDATE fleet_task_artifacts SET committed=0 WHERE task=?').run(task.id);
+      if(variation==='revision')request.head='c'.repeat(40);
+      if(variation==='run')assert.equal(s.start(run('native-run',{project:desktop,ticket:desktop+'#@task-'+task.id,role:'native-task',resource:'heavy'})).ok,true);
+      if(variation==='hold')s.workflow.change(nativeTicket,{status:'Halted'},'operator',randomUUID());
+      assert.throws(()=>s.acquireStorage(request),/Native cleanup/);
+      assert.equal(s.storage.active().length,0);
+    }finally{s.close();}
+  }
+});
+
+test('native reference identity survives restart and cannot be changed by cancellation or retry',()=>{
+  const directory=mkdtempSync(join(tmpdir(),'native-storage-restart-')),file=join(directory,'claims.sqlite');
+  let s=fixture(file);try {
+    const {request}=publishedNative(s);s.acquireStorage(request);s.close();s=new FleetStore(file,limits);
+    assert.equal(s.acquireStorage({...request}).taskId,request.taskId);
+    assert.throws(()=>s.acquireStorage({...request,referenceDigest:'d'.repeat(64)}),/different contents/);
+    assert.throws(()=>s.cancelStorage({...request,taskId:'e'.repeat(64)},true),/differs/);
+    assert.equal(s.storage.active().length,1);
+    s.cancelStorage(request,true);assert.equal(s.storage.active().length,0);
+  }finally{s.close();rmSync(directory,{recursive:true,force:true});}
+});
+
+test('published reference binding rejects invented leaves until explicit protected attestation',async()=>{
+  const s=fixture(),server=await serveFleet(s,{mac:'worker',linux:'linux'},'protected',0);try {
+    const {request}=publishedNative(s,false);
+    const initial=s.acquireStorage(request);s.finishStorage(initial.id,'mac',true,'complete');
+    const changed={...request,id:randomUUID(),referenceDigest:'e'.repeat(64)};
+    assert.throws(()=>s.acquireStorage(changed),/protected attestation/);
+    const address=server.address();assert.ok(address&&typeof address!=='string');
+    const worker=new JsonClient(`http://127.0.0.1:${address.port}`,'worker'),operator=new JsonClient(`http://127.0.0.1:${address.port}`,'protected');
+    await assert.rejects(()=>worker.call('/storage/attest',changed),/403/);
+    await operator.call('/storage/attest',changed);
+    assert.equal(s.acquireStorage(changed).referenceDigest,changed.referenceDigest);
+    s.finishStorage(changed.id,'mac',true,'complete');
+    assert.throws(()=>s.acquireStorage({...changed,id:randomUUID(),artifactDigest:'f'.repeat(64)}),/published evidence differs/);
+  }finally{await new Promise<void>(resolve=>server.close(()=>resolve()));s.close();}
+});
+
+test('failed native dependencies require resolved source and retain original failed result and published artifacts',()=>{
+  const s=fixture();try {
+    const {task,db,request}=publishedNative(s);
+    const result={...s.tasks.get(task.id).result!,outcome:'failed',summary:'The original full failed execution remains retained'};
+    db.prepare("UPDATE fleet_recovery_tasks SET state='failed',result=? WHERE id=?").run(JSON.stringify(result),task.id);
+    assert.throws(()=>s.acquireStorage(request),/source remains unresolved/);
+    s.workflow.change(nativeTicket,{state:'CLOSED',status:'Done'},'operator',randomUUID());
+    const before=s.tasks.get(task.id),controls=s.desired.document('mac');
+    const lease=s.acquireStorage(request);s.finishStorage(lease.id,'mac',true,'complete');
+    assert.deepEqual(s.tasks.get(task.id),before);assert.deepEqual(s.desired.document('mac'),controls);
   }finally{s.close();}
 });

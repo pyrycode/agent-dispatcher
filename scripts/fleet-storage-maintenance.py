@@ -109,13 +109,14 @@ def processes_using_path(path):
         return None
 
 
-def native_drained(directory):
+def native_drained(directory, machine=None):
     """Legacy completion alone never proves that local native children exited."""
     support = load('fleet-support')
     for path in sorted(Path(directory).glob('*.receipt.json')):
         record = read(path)
         if record.get('drainConfirmed') is not True:
-            return False
+            if not load('fleet-boot-proof').check(path, machine, prepare=False):
+                return False
         # A positive final receipt is the existing native supervisor's durable
         # root plus descendant proof. Do not reinterpret older complete records.
     return True
@@ -181,6 +182,8 @@ class StorageSupervisor:
                 saved = read(self.schedule, {})
                 now = time.time()
                 copies = now - saved.get('copies', 0) >= self.options.get('copyIntervalSeconds', 300)
+                native=read(self.directory/'native-completion.json',{}).get('time',0)
+                copies=copies or native>saved.get('native',0)
                 cache = now - saved.get('cache', 0) >= self.options.get('cacheIntervalSeconds', 3600)
                 if not copies and not cache:
                     return reports
@@ -192,6 +195,7 @@ class StorageSupervisor:
                     journal = self.directory / (identity + '.worker-custody.json')
                     atomic(request, {'config': self.config_path, 'copies': copies, 'cache': cache, 'apply': True})
                     saved.update({key: now for key, due in [('copies', copies), ('cache', cache)] if due})
+                    saved['native']=native
                     atomic(self.schedule, saved)
                 child = launch('--worker', request, journal)
                 self.children.append(child)
@@ -211,7 +215,7 @@ class StorageSupervisor:
             saved = json.loads(content)
             result = []
             for item in saved.get('reports', [])[:20]:
-                summary = {key: item[key] for key in ('kind', 'phase', 'state', 'ticket', 'reclaimedBytes', 'plannedBytes', 'reason') if key in item}
+                summary = {key: item[key] for key in ('kind', 'phase', 'state', 'ticket', 'taskId', 'reclaimedBytes', 'plannedBytes', 'reason') if key in item}
                 summary['kind'] = summary.get('kind', 'closed-copy-storage')
                 if item.get('held') and not summary.get('reason'):
                     summary['reason'] = str(item['held'][0].get('reason', 'Local evidence or process holds cleanup'))[:300]
@@ -234,7 +238,7 @@ class StorageSupervisor:
 
     @staticmethod
     def matches(request, lease, *, finished=False):
-        keys = ('id', 'machine', 'kind', 'path', 'ticket', 'head')
+        keys = ('id', 'machine', 'kind', 'path', 'ticket', 'head', 'taskId', 'referenceDigest', 'artifactDigest')
         if not isinstance(lease, dict) or any(lease.get(key) != request.get(key) for key in keys) or (lease.get('finished') is None) == finished:
             raise RuntimeError('Protected storage lease identity differs from the local request')
 
@@ -405,7 +409,7 @@ class StorageSupervisor:
         # Match the existing test-admission daemon's exact configured inode.
         admission = self.options.get('testAdmissionLock') or os.environ.get('PYRY_TEST_ADMISSION_LOCK') or str(Path.home() / '.local/share/pyry-fleet/test-admission.lock')
         with locked(admission, existing=True) as admission_fd:
-            if not native_drained(Path(self.config['stateDirectory']) / 'tasks'):
+            if not native_drained(Path(self.config['stateDirectory']) / 'tasks', machine):
                 return {'kind': 'go-build-cache', 'phase': 'held', 'reason': 'Native descendant drainage is unconfirmed'}
             request = {'id': str(uuid.uuid4()), 'machine': machine, 'kind': 'cache', 'path': config['cache']}
             path, saved = self.acquire(request)
@@ -418,7 +422,7 @@ class StorageSupervisor:
                         raise RuntimeError('Test-admission lock identity changed')
                 check_lock()
                 self.verify(saved)
-                if not native_drained(Path(self.config['stateDirectory']) / 'tasks'):
+                if not native_drained(Path(self.config['stateDirectory']) / 'tasks', machine):
                     raise RuntimeError('Native descendant drainage is unconfirmed')
                 check_lock()
                 return {'allowed': True, 'exclusive': True, 'lease': request['id'],
@@ -431,6 +435,82 @@ class StorageSupervisor:
             self.finish(path, saved, 'complete' if report['phase'] in ('complete', 'within-budget') else 'held')
             return report
 
+    def native_pass(self, machine, apply):
+        settings=self.config.get('projects',{}).get('pyrycode/pyrycode-desktop')
+        if self.config.get('platform')!='mac' or not settings:return []
+        reports=[];root=canonical(Path(self.config['stateDirectory'])/'desktop-captures')
+        progress_path=self.directory/'native-copies.json';progress=read(progress_path,{'cursor':''})
+        directories=sorted(p for p in root.glob('*') if re.fullmatch('[a-f0-9]{64}',p.name))
+        cursor=progress.get('cursor','')
+        directories=[p for p in directories if p.name>cursor]+[p for p in directories if p.name<=cursor]
+        completion=read(self.directory/'native-completion.json',{})
+        if completion.get('time',0)>progress.get('completionAt',0):
+            directories=[p for p in directories if p.name==completion.get('id')]+[p for p in directories if p.name!=completion.get('id')]
+        for directory in directories[:self.options.get('batch',8)]:
+            journal=saved=None
+            try:
+                canonical(directory)
+                canonical(directory/'task.json');canonical(directory/'result.json');canonical(directory/'dependency-install.json')
+                task=read(directory/'task.json');receipt_path=Path(self.config['stateDirectory'])/'tasks'/(directory.name+'.receipt.json')
+                canonical(receipt_path)
+                local_basis=None;artifact_digest=None
+                def local_proof():
+                    nonlocal local_basis,artifact_digest
+                    receipt=read(receipt_path,{})
+                    if receipt.get('id')!=directory.name or receipt.get('phase')!='complete' or receipt.get('drainConfirmed') is not True or not receipt.get('artifactDigest') or receipt.get('interrupted') or receipt.get('artifactUnrecoverable') or not receipt.get('custody',{}).get('root') or receipt.get('custody',{}).get('phase')!='drained':
+                        raise RuntimeError('This native task has no complete published positive drainage receipt')
+                    if Path(receipt.get('directory',''))!=directory or Path(receipt.get('result',''))!=directory/'result.json':raise RuntimeError('Native task custody path differs')
+                    if task.get('machine')!=machine or task.get('session')!=receipt.get('session') or not task.get('runId') or task.get('admission',{}).get('run',{}).get('id')!=task['runId']:raise RuntimeError('Native task admission and custody identities differ')
+                    value=read(directory/'result.json',{})
+                    if value.get('outcome') not in ('completed','failed') or value.get('candidateRevision')!=task['request']['revision']:raise RuntimeError('Native evidence has no published outcome for this revision')
+                    manifest=load('fleet-support').artifact_manifest(value['files'])
+                    artifact_digest=hashlib.sha256(json.dumps(manifest,separators=(',',':')).encode()).hexdigest()
+                    if artifact_digest!=receipt['artifactDigest']:raise RuntimeError('Native published artifact bytes changed')
+                    if read(directory/'task.json')!=task:raise RuntimeError('Native task source record changed')
+                    basis=json.dumps({'receipt':{k:receipt.get(k) for k in ('id','session','directory','result','phase','drainConfirmed','custody','artifactDigest')},'result':value},sort_keys=True)
+                    if local_basis is not None and local_basis!=basis:raise RuntimeError('Native custody or published evidence changed')
+                    local_basis=basis
+                if task['id']!=directory.name or task['ticket'].split('#')[0]!='pyrycode/pyrycode-desktop' or task['request']['recipe']!='desktop-fake-suite':raise RuntimeError('Native capture task identity differs')
+                local_proof()
+                attestation=read(directory/'dependency-install.json')
+                if not attestation:raise RuntimeError('Retained dependency installation needs a locked-reference attestation')
+                if attestation.get('origin')=='npm-ci':
+                    published=json.loads(read(directory/'result.json')['files']['desktop/capture.json'])
+                    if published.get('dependencyReferenceDigest')!=attestation.get('referenceDigest'):raise RuntimeError('Dependency install differs from the published native evidence')
+                worktree=canonical(directory/'desktop')
+                request={'id':str(uuid.uuid4()),'machine':machine,'kind':'native-task','taskId':task['id'],'ticket':task['ticket'],'path':str(worktree),'head':task['request']['revision'],'referenceDigest':attestation['referenceDigest'],'artifactDigest':artifact_digest}
+                def authority(current):
+                    local_proof()
+                    if any(current.get(k)!=request.get(k) for k in ('taskId','ticket','path','head','referenceDigest')):raise RuntimeError('Native cleanup identity changed')
+                    if saved is not None:self.verify(saved)
+                    return {'allowed':True,'exclusive':saved is not None,'lease':request['id']}
+                cleaner=load('fleet-native-storage').NativeDependencies(authority,processes_using_path)
+                report=cleaner.cleanup(settings['target'],worktree,task,attestation)
+                if apply and report['plannedBytes']:
+                    journal,saved=self.acquire(request)
+                    saved.update(phase='synchronous-cleanup',nativeBasisSha256=hashlib.sha256(local_basis.encode()).hexdigest(),planned=report)
+                    atomic(journal,saved)
+                    atomic(directory/'dependency-cleanup.json',{'phase':'cleaning','request':request,'planned':report,'nativeBasisSha256':saved['nativeBasisSha256']})
+                    report=cleaner.cleanup(settings['target'],worktree,task,attestation,apply=True)
+                    # Each attempt has its own durable journal. Keep partial
+                    # failures there when a retry replaces the per-copy summary.
+                    saved['nativeReport']=report
+                    atomic(journal,saved)
+                    atomic(directory/'dependency-cleanup.json',report)
+                    self.finish(journal,saved,'held' if report['held'] else 'complete')
+                reports.append(report)
+            except Exception as error:
+                reports.append({'kind':'native-task-storage','taskId':directory.name,'phase':'held','reason':str(error)})
+                if saved is not None:
+                    try:self.finish(journal,saved,'held')
+                    except Exception:pass
+            finally:
+                if apply:
+                    progress['cursor']=directory.name
+                    if directory.name==completion.get('id'):progress['completionAt']=completion.get('time',0)
+                    atomic(progress_path,progress)
+        return reports
+
     def run(self, *, apply=False, copies=True, cache=True):
         with locked(self.directory / 'maintenance.lock'):
             if apply:
@@ -440,6 +520,7 @@ class StorageSupervisor:
             if not isinstance(machine, str) or not machine or not isinstance(status.get('runs'), list):
                 raise RuntimeError('Authoritative machine status is unavailable')
             reports = self.copy_pass(machine, apply) if copies else []
+            if copies:reports.extend(self.native_pass(machine,apply))
             if cache:
                 try:
                     reports.append(self.cache_pass(machine, apply))

@@ -42,7 +42,7 @@ async function main(): Promise<void> {
   const config = JSON.parse(readFileSync(configPath, "utf8"));
   if(command==='storage') {
     const [action,file]=args;
-    if(!['list','acquire','verify','finish','cancel'].includes(action)||action!=='list'&&!file)throw new Error('storage list|acquire|verify|finish|cancel [SAVED_JSON_FILE]');
+    if(!['list','acquire','verify','finish','cancel','attest'].includes(action)||action!=='list'&&!file)throw new Error('storage list|acquire|verify|finish|cancel|attest [SAVED_JSON_FILE]');
     const claims=new JsonClient(config.claimsUrl,secret(config.claimsOperatorTokenEnv??config.claimsTokenEnv));
     const input=action==='list'?{}:JSON.parse(readFileSync(file,'utf8'));
     console.log(JSON.stringify(await claims.call('/storage/'+action,input)));return;
@@ -222,7 +222,7 @@ async function main(): Promise<void> {
   }
   if (command === "manager") {
     const claims = new FleetClient(config.claimsUrl, secret(config.claimsTokenEnv));
-    const manager = new MachineManager({ machine: config.machine, heavyLimit: config.heavyLimit, combinedLimit: config.combinedLimit, ...(config.projectHeavyLimits !== undefined ? { projectHeavyLimits: config.projectHeavyLimits } : {}), ticketLimit: config.ticketLimit ?? 2, ...(config.reviewQueueLimit != null ? { reviewQueueLimit: config.reviewQueueLimit } : {}), controlRevision: execFileSync("git",["rev-parse","HEAD"],{cwd:resolve(fileURLToPath(new URL("..",import.meta.url))),encoding:"utf8"}).trim(), capabilities: machineCapabilities(config.capabilities), projects: config.projects.map((p: any) => p.repo), drainingProjects: config.drainingProjects, projectDrainChanges: config.projectDrainChanges }, claims, Date.now,
+    const manager = new MachineManager({ machine: config.machine, heavyLimit: config.heavyLimit, combinedLimit: config.combinedLimit, ...(config.diskAdmission!==undefined?{diskAdmission:config.diskAdmission}:{}), ...(config.projectHeavyLimits !== undefined ? { projectHeavyLimits: config.projectHeavyLimits } : {}), ticketLimit: config.ticketLimit ?? 2, ...(config.reviewQueueLimit != null ? { reviewQueueLimit: config.reviewQueueLimit } : {}), controlRevision: execFileSync("git",["rev-parse","HEAD"],{cwd:resolve(fileURLToPath(new URL("..",import.meta.url))),encoding:"utf8"}).trim(), capabilities: machineCapabilities(config.capabilities), projects: config.projects.map((p: any) => p.repo), drainingProjects: config.drainingProjects, projectDrainChanges: config.projectDrainChanges }, claims, Date.now,
       // Central desired state: the saved copy applies from the start, and with
       // none nothing is granted until the claim service has answered.
       { ...(config.desiredState ? { cached: config.desiredState } : {}), persist: update => persistDesiredState(configPath, update) });
