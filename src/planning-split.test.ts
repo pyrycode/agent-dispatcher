@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { FleetStore } from './fleet-store.js';
+import { FleetStore, OwnershipRefusal } from './fleet-store.js';
 import type { WorkflowItem } from './workflow-store.js';
 import { WorkflowGitHub } from './workflow-github.js';
 import { GitHubBroker } from './github-broker.js';
@@ -241,4 +241,12 @@ test('finalization refuses to overwrite an existing child feature root', t => {
   assert.throws(() => finish(store), /feature root|lineage/);
   assert.equal(store.workflow.get(ref).featureRoot, `${project}#1000`);
   assert.equal(store.workflow.get(parent).state, 'OPEN');
+});
+
+test('a stale split is an explicit workflow refusal, not a masked GitHub service outage', async t => {
+  const f = bridgeFixture(t), inspected = JSON.parse((await f.call('GET')).body);
+  const request = { ...inspected, commandId: 'stale-bridge', summary: 'Preserve acceptance.', revision: inspected.revision + 1 };
+  request.dependents[0].children = [2106];
+  await assert.rejects(f.call('POST', request), error => error instanceof OwnershipRefusal && /changed/.test(error.message));
+  assert.equal(f.store.workflow.get(parent).state, 'OPEN');
 });
