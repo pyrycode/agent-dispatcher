@@ -37,7 +37,8 @@ def install_helpers(targets, home, dest):
     if not dest.is_dir():
         sys.exit(str(dest) + ' not found. Is Codex set up on this machine?')
     tests = subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s', str(HERE),
-                            '-p', 'test_*.py'], cwd=HERE)
+                            '-p', 'test_*.py'], cwd=HERE,
+                           env={**os.environ, 'PYRY_PIPELINE_HELPER_TEST_HOME': str(home)})
     if tests.returncode != 0:
         sys.exit('Helper tests failed; nothing installed.')
     for pipeline in targets:

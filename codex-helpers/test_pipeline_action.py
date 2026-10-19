@@ -9,9 +9,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
-HOME = Path.home()
-CODEX = HOME / '.local/bin/codex'
-RULES = HOME / '.codex/rules'
+HOST_HOME = Path.home()
+HOME = Path(os.environ.get('PYRY_PIPELINE_HELPER_TEST_HOME', str(HOST_HOME)))
+CODEX = HOST_HOME / '.local/bin/codex'
+RULES = HOST_HOME / '.codex/rules'
 
 
 def load(path, name):
@@ -65,8 +66,9 @@ class Helper:
             other = dest / 'unrelated-helper'
             other.write_text('preserved')
             compat = Path('/Users/juhanailmoniemi')
-            with patch.object(install.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)):
+            with patch.object(install.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)) as check:
                 install.install_helpers([self.P], compat, dest)
+            self.assertEqual(check.call_args.kwargs['env']['PYRY_PIPELINE_HELPER_TEST_HOME'], str(compat))
             result = dest / (self.P + '-pipeline-action')
             self.assertEqual(result.read_text(), install.render(self.P, compat))
             self.assertEqual(result.stat().st_mode & 0o777, 0o755)
