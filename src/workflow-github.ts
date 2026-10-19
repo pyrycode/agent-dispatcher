@@ -707,16 +707,16 @@ export class WorkflowGitHub {
     const family = payload.data?.node;
     if (payload.errors?.length || family?.id !== source.issueId || !Array.isArray(family.subIssues?.nodes)
         || !Array.isArray(family.blocking?.nodes) || family.subIssues.pageInfo?.hasNextPage !== false || family.blocking.pageInfo?.hasNextPage !== false)
-      throw new Error('Cannot finalize an incomplete split family or dependent inventory');
+      throw new OwnershipRefusal('Cannot finalize an incomplete split family or dependent inventory');
     for (const child of family.subIssues.nodes) await this.adoptIssue(project, child.id, true);
     for (const dependent of family.blocking.nodes.filter((d: any) => d.state === 'OPEN')) {
       const targetProject = dependent.repository?.nameWithOwner;
-      if (!this.store.workflow.enabled(targetProject)) throw new Error('Split dependent must have imported workflow authority');
+      if (!this.store.workflow.enabled(targetProject)) throw new OwnershipRefusal('Split dependent must have imported workflow authority');
       await this.adoptIssue(targetProject, dependent.id, true);
     }
     const actual = this.store.planningSplits.inspect(ticket).children.map(c => c.issueNumber).sort();
     const linked = family.subIssues.nodes.map((c: any) => c.number).sort();
-    if (JSON.stringify(actual) !== JSON.stringify(linked)) throw new Error('Split child links changed; inspect the complete family again');
+    if (JSON.stringify(actual) !== JSON.stringify(linked)) throw new OwnershipRefusal('Split child links changed; inspect the complete family again');
   }
   /** One durable split, including safe continuation after an HTTP or process failure. */
   async recoverySplit(id: string, evidence: EvidenceStore, actor?: {machine:string;session:string;runId:string}) {

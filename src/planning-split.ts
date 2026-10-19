@@ -1,5 +1,5 @@
 import type { DatabaseSync } from 'node:sqlite';
-import type { FleetStore } from './fleet-store.js';
+import { OwnershipRefusal, type FleetStore } from './fleet-store.js';
 import type { WorkflowItem } from './workflow-store.js';
 import { scrubCredentials } from './agent-runtime.js';
 
@@ -14,23 +14,23 @@ const reference = /^[\w.-]+\/[\w.-]+#[1-9]\d*$/;
 const positive = (n: unknown): n is number => Number.isSafeInteger(n) && Number(n) > 0;
 function shape(value: any, fields: string[]) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(k => !fields.includes(k)))
-    throw new Error('Invalid split request fields');
+    throw new OwnershipRefusal('Invalid split request fields');
 }
 export function planningSplitRequest(value: unknown): PlanningSplit {
   const v = value as PlanningSplit;
   shape(v, ['commandId', 'revision', 'summary', 'children', 'dependents']);
   if (typeof v.commandId !== 'string' || !/^[\w.:@-]{1,128}$/.test(v.commandId) || !positive(v.revision)
       || typeof v.summary !== 'string' || !v.summary.trim() || v.summary.length > 4000 || scrubCredentials(v.summary) !== v.summary)
-    throw new Error('Split requires a command identity, revision and content-free summary');
+    throw new OwnershipRefusal('Split requires a command identity, revision and content-free summary');
   if (!Array.isArray(v.children) || v.children.length < 2 || v.children.length > 100
       || !Array.isArray(v.dependents) || v.dependents.length > 100)
-    throw new Error('Split requires all children and dependents (at most 100 each)');
+    throw new OwnershipRefusal('Split requires all children and dependents (at most 100 each)');
   const earlier = new Set<number>();
   for (const child of v.children) {
     shape(child, ['number', 'revision', 'dependsOn']);
     if (!positive(child.number) || !positive(child.revision) || earlier.has(child.number)
         || !Array.isArray(child.dependsOn) || new Set(child.dependsOn).size !== child.dependsOn.length
-        || child.dependsOn.some(n => !earlier.has(n))) throw new Error('Children must be unique and depend only on earlier children');
+        || child.dependsOn.some(n => !earlier.has(n))) throw new OwnershipRefusal('Children must be unique and depend only on earlier children');
     earlier.add(child.number);
   }
   const dependents = new Set<string>();
@@ -39,7 +39,7 @@ export function planningSplitRequest(value: unknown): PlanningSplit {
     if (!reference.test(dependent.ticket) || !positive(dependent.revision) || dependents.has(dependent.ticket)
         || !Array.isArray(dependent.children) || !dependent.children.length
         || new Set(dependent.children).size !== dependent.children.length || dependent.children.some(n => !earlier.has(n)))
-      throw new Error('Every dependent needs its existing ticket, revision and required children');
+      throw new OwnershipRefusal('Every dependent needs its existing ticket, revision and required children');
     dependents.add(dependent.ticket);
   }
   // Stable request identity independent of JSON property order.
@@ -61,14 +61,14 @@ export class PlanningSplits {
     const row = this.db.prepare('SELECT * FROM fleet_planning_splits WHERE id=?').get(request.commandId);
     if (!row) return;
     if (row.ticket !== ticket || row.actor !== JSON.stringify(actor) || row.request !== JSON.stringify(request))
-      throw new Error('Split command identity reused or owner changed');
+      throw new OwnershipRefusal('Split command identity reused or owner changed');
     return JSON.parse(String(row.result));
   }
   authorize(actor: PlanningActor, ticket: string): void {
     this.store.authorizeWorkflow(actor.machine, actor.session, ticket, actor.runId);
     const run = this.store.snapshot().runs.find(r => r.id === actor.runId);
     if (!run || run.ticket !== ticket || !['refiner', 'po'].includes(run.role))
-      throw new Error('Split finalization requires the active parent planning run');
+      throw new OwnershipRefusal('Split finalization requires the active parent planning run');
   }
   inspect(ticket: string) {
     const parent = this.store.workflow.get(ticket), project = ticket.split('#')[0];
@@ -103,32 +103,32 @@ export class PlanningSplits {
     this.authorize(actor, ticket);
     const { parent, children, dependents } = this.inspect(ticket), project = ticket.split('#')[0];
     if (parent.state !== 'OPEN' || parent.status !== 'Backlog' || parent.grandparentNumber)
-      throw new Error('Split requires an open planning parent within the split depth limit');
+      throw new OwnershipRefusal('Split requires an open planning parent within the split depth limit');
     const equal = (a: Array<string | number>, b: Array<string | number>) => JSON.stringify([...a].sort()) === JSON.stringify([...b].sort());
-    if (!equal(children.map(c => c.issueNumber), request.children.map(c => c.number))) throw new Error('Split child inventory changed or is incomplete');
-    if (!equal(dependents.map(d => d.ticket), request.dependents.map(d => d.ticket))) throw new Error('Split dependent inventory changed or is incomplete');
+    if (!equal(children.map(c => c.issueNumber), request.children.map(c => c.number))) throw new OwnershipRefusal('Split child inventory changed or is incomplete');
+    if (!equal(dependents.map(d => d.ticket), request.dependents.map(d => d.ticket))) throw new OwnershipRefusal('Split dependent inventory changed or is incomplete');
     if (children.some(c => c.state !== 'OPEN' || !['Inbox', 'Backlog'].includes(c.status) || !c.body.trim()))
-      throw new Error('Every split child must be an open, unstarted issue with its own scope');
+      throw new OwnershipRefusal('Every split child must be an open, unstarted issue with its own scope');
     const affected = new Map([[ticket, parent], ...children.map(c => [`${project}#${c.issueNumber}`, c] as const), ...dependents.map(d => [d.ticket, d.item] as const)]);
     const revisions = new Map([[ticket, request.revision], ...request.children.map(c => [`${project}#${c.number}`, c.revision] as const), ...request.dependents.map(d => [d.ticket, d.revision] as const)]);
     const runs = this.store.snapshot().runs;
     if (runs.some(r => r.id !== actor.runId && (affected.has(r.ticket) || !!r.parentTicket && affected.has(r.parentTicket))))
-      throw new Error('An affected ticket has an active run');
-    if (this.store.verifierHandoffs.pending().some(h => affected.has(h.ticket))) throw new Error('An affected verifier handoff is pending');
+      throw new OwnershipRefusal('An affected ticket has an active run');
+    if (this.store.verifierHandoffs.pending().some(h => affected.has(h.ticket))) throw new OwnershipRefusal('An affected verifier handoff is pending');
     for (const [ref, item] of affected) {
-      if (item.revision !== revisions.get(ref)) throw new Error('Split workflow changed; inspect revisions again');
+      if (item.revision !== revisions.get(ref)) throw new OwnershipRefusal('Split workflow changed; inspect revisions again');
       const approval = this.store.approvals.get(ref);
-      if (approval?.kind === 'rejected' && !approval.authorization) throw new Error('Split cannot override an approval rejection');
+      if (approval?.kind === 'rejected' && !approval.authorization) throw new OwnershipRefusal('Split cannot override an approval rejection');
       if (item.status === 'Halted' || item.labels.some(l => /^(held:|health-hold:|needs-human:|error:|needs-rework:|orchestrator:escalated)/.test(l)))
-        throw new Error('Split preserves existing workflow holds');
+        throw new OwnershipRefusal('Split preserves existing workflow holds');
       if (this.store.tasks.list(ref).some(t => ['queued', 'running', 'publishing', 'attention'].includes(t.state)))
-        throw new Error('An affected support task is pending');
+        throw new OwnershipRefusal('An affected support task is pending');
     }
     // A declared handoff only adds prerequisites to an existing dependent. Its claim is unchanged.
     for (const child of children) this.store.authorizeWorkflow(actor.machine, actor.session, `${project}#${child.issueNumber}`, actor.runId);
     const root = this.store.recoveryFeatureRoot(ticket), actorId = `planning-split:${request.commandId}`;
     if (children.some(c => this.store.recoveryFeatureRoot(`${project}#${c.issueNumber}`) !== root))
-      throw new Error('Split cannot overwrite an existing child feature root or lineage');
+      throw new OwnershipRefusal('Split cannot overwrite an existing child feature root or lineage');
     const byNumber = new Map(children.map(c => [c.issueNumber, c]));
     const blocker = (n: number) => { const c = byNumber.get(n)!; return { number: n, state: c.state, url: c.url }; };
     const inherit = parent.labels.filter(l => /^(priority:|requires:)/.test(l) || ['security-sensitive', 'bug', 'enhancement'].includes(l));

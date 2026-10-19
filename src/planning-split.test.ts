@@ -1,12 +1,16 @@
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { FleetStore } from './fleet-store.js';
+import { FleetStore, OwnershipRefusal } from './fleet-store.js';
 import type { WorkflowItem } from './workflow-store.js';
 import { WorkflowGitHub } from './workflow-github.js';
 import { GitHubBroker } from './github-broker.js';
+import { serveGitHubBridge } from './github-bridge.js';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { serveFleet, FleetClient } from './fleet-http.js';
 
 const project = 'org/desktop';
 const parent = `${project}#2098`;
@@ -164,11 +168,12 @@ function bridgeFixture(t: TestContext) {
       projectItems: { nodes: [{ id: i.id, project: { id: 'P' }, fieldValueByName: { name: i.status } }], pageInfo: { hasNextPage: false } },
     } } });
   };
-  const api = new WorkflowGitHub(f.store, new GitHubBroker({ token: 'central', projects: [project], fetcher }));
+  const upstream = new GitHubBroker({ token: 'central', projects: [project], fetcher });
+  const api = new WorkflowGitHub(f.store, upstream);
   const call = (method: string, body?: unknown, who = actor, target = project) => api.request(target, {
     method, path: `/repos/${project}/issues/2098/split`, ...(body ? { body: JSON.stringify(body) } : {}),
   }, who);
-  return { ...f, api, call, get reads() { return reads; }, truncate() { incomplete = true; }, disconnect() { unavailable = true; } };
+  return { ...f, api, upstream, call, get reads() { return reads; }, truncate() { incomplete = true; }, disconnect() { unavailable = true; } };
 }
 
 test('the managed bridge inspects fresh family links and retries a committed finalizer without GitHub', async t => {
@@ -241,4 +246,48 @@ test('finalization refuses to overwrite an existing child feature root', t => {
   assert.throws(() => finish(store), /feature root|lineage/);
   assert.equal(store.workflow.get(ref).featureRoot, `${project}#1000`);
   assert.equal(store.workflow.get(parent).state, 'OPEN');
+});
+
+test('a stale split is an explicit workflow refusal, not a masked GitHub service outage', async t => {
+  const f = bridgeFixture(t), inspected = JSON.parse((await f.call('GET')).body);
+  const request = { ...inspected, commandId: 'stale-bridge', summary: 'Preserve acceptance.', revision: inspected.revision + 1 };
+  request.dependents[0].children = [2106];
+  await assert.rejects(f.call('POST', request), error => error instanceof OwnershipRefusal && /changed/.test(error.message));
+  assert.equal(f.store.workflow.get(parent).state, 'OPEN');
+});
+
+test('real gh inspects, receives a specific stale-request refusal, finalizes and recovers the exact reply', async t => {
+  const run = promisify(execFile);
+  try { await run('gh', ['--version']); }
+  catch (error: any) { if (error.code === 'ENOENT') { t.skip('gh is not installed'); return; } throw error; }
+  const f = bridgeFixture(t), dir = mkdtempSync(join(tmpdir(), 'split-cli-'));
+  const socket = join(dir, 'api.sock'), cliConfig = join(dir, 'gh');
+  mkdirSync(cliConfig);
+  writeFileSync(join(cliConfig, 'config.yml'), `http_unix_socket: ${JSON.stringify(socket)}\n`);
+  const fleet = await serveFleet(f.store, { box: 'machine-test' }, 'operator-test', 0, '127.0.0.1', f.upstream);
+  const address = fleet.address(); assert.ok(address && typeof address !== 'string');
+  const client = new FleetClient(`http://127.0.0.1:${address.port}`, 'machine-test');
+  const server = await serveGitHubBridge(socket, request => client.github(project, { ...request, actor: { session: actor.session, runId: actor.runId } }));
+  t.after(async () => {
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    await new Promise<void>(resolve => fleet.close(() => resolve()));
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const endpoint = `repos/${project}/issues/2098/split`;
+  const env = { PATH: process.env.PATH, GH_CONFIG_DIR: cliConfig, GH_TOKEN: 'isolated-test-only', GH_HOST: 'github.com', GH_PROMPT_DISABLED: '1' };
+  const cli = (...args: string[]) => run('gh', ['api', endpoint, ...args], { env, timeout: 20_000 });
+  const inspected = JSON.parse((await cli()).stdout);
+  const request = { ...inspected, commandId: 'real-cli', summary: 'Preserve acceptance across the replacement.' };
+  request.dependents[0].children = [2106];
+  const file = join(dir, 'request.json');
+  writeFileSync(file, JSON.stringify({ ...request, revision: request.revision + 1 }));
+  await assert.rejects(cli('--method', 'POST', '--input', file), (error: any) => /HTTP 409/.test(error.stderr) && /changed/.test(error.stderr));
+  assert.equal(f.store.workflow.get(parent).state, 'OPEN');
+  writeFileSync(file, JSON.stringify(request));
+  const first = JSON.parse((await cli('--method', 'POST', '--input', file)).stdout);
+  assert.equal(first.parent.state, 'CLOSED');
+  f.store.finish(actor.machine, actor.session, actor.runId);
+  f.disconnect();
+  assert.deepEqual(JSON.parse((await cli('--method', 'POST', '--input', file)).stdout), first);
+  assert.equal(f.store.workflow.comments(parent).length, 1);
 });
