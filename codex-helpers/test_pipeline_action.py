@@ -59,6 +59,23 @@ class Helper:
             gh.assert_not_called()
             gql.assert_not_called()
 
+    def test_trusted_container_install_preserves_the_fixed_home_and_replaces_only_selected_helpers(self):
+        with tempfile.TemporaryDirectory() as folder:
+            dest = Path(folder)
+            other = dest / 'unrelated-helper'
+            other.write_text('preserved')
+            compat = Path('/Users/juhanailmoniemi')
+            with patch.object(install.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)):
+                install.install_helpers([self.P], compat, dest)
+            result = dest / (self.P + '-pipeline-action')
+            self.assertEqual(result.read_text(), install.render(self.P, compat))
+            self.assertEqual(result.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(other.read_text(), 'preserved')
+            with patch.object(install.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1)):
+                with self.assertRaises(SystemExit):
+                    install.install_helpers([self.P], compat, dest)
+            self.assertEqual(result.read_text(), install.render(self.P, compat))
+
     def test_split_inspection_and_finalization_stay_on_the_managed_fixed_destination(self):
         m = self.m
         endpoint = 'repos/pyrycode/' + self.P + '/issues/2098/split'

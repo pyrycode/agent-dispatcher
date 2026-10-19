@@ -28,6 +28,11 @@ edit an approved helper. The install runs the tests first and installs nothing
 if they fail. It replaces each file in one step, so a running agent never reads
 a half-written helper.
 
+Trusted container provisioning can call `install_helpers(pipelines, compat_home,
+destination)` from this installer to retain the fixed documented home while
+installing into `/opt/codex-helpers`. It runs the same tests and atomic replacement
+as the ordinary CLI. Workers still cannot edit their installed helpers.
+
 Edit `pipeline-action` here, never the installed copies; the next install
 overwrites them. The source copy refuses to run.
 
