@@ -292,8 +292,14 @@ class Helper:
 
     @unittest.skipUnless(CODEX.exists() and RULES.is_dir(), 'Codex is not installed on this machine')
     def test_installed_rules_allow_only_the_helper(self):
+        helper = str(HOME / '.codex/bin' / (self.P + '-pipeline-action'))
+        files = sorted(RULES.glob('*.rules'))
+        # Build/controller hosts can have Codex and unrelated board-watch rules
+        # without a pipeline runner policy. That is not a helper-policy fixture.
+        if not any(helper in file.read_text() for file in files):
+            self.skipTest('Pipeline helper rules for this configured home are not installed on this host')
         opts = []
-        for file in sorted(RULES.glob('*.rules')):
+        for file in files:
             opts += ['--rules', str(file)]
 
         def decision(argv):
@@ -306,7 +312,6 @@ class Helper:
                 for tail in [[], ['--repo', 'other/repo'], ['--repo=other/repo'], ['-R', 'other/repo']]:
                     argv = [binary, *verb, '--repo', 'pyrycode/' + self.P, '1', *tail]
                     self.assertNotEqual(decision(argv), 'allow', argv)
-        helper = str(HOME / '.codex/bin' / (self.P + '-pipeline-action'))
         body = str(HOME / '.codex/publish' / self.P / 'task/body.md')
         self.assertEqual(decision([helper, 'issue-comment', '1', body]), 'allow')
 

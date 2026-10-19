@@ -54,8 +54,10 @@ pnpm test:helpers
 ```
 
 The tests run against a rendered copy of each pipeline. The last test checks
-Codex's installed rules: direct comment and label-edit commands stay unapproved
-while the helper is allowed. It is skipped on a machine without Codex.
+Codex's installed pipeline rules, when present for the configured helper home:
+direct comment and label-edit commands stay unapproved while the helper is
+allowed. It is skipped without Codex or without that pipeline's rules. A build
+host's unrelated board-watch policy is not a pipeline runner policy.
 
 ## GitHub budget
 
