@@ -29,13 +29,11 @@ def render(pipeline, home):
     return text.replace(MARKER, f'PIPELINE = {pipeline!r}\nHOME = {str(home)!r}\n')
 
 
-def main(args):
-    targets = args or list(PIPELINES)
+def install_helpers(targets, home, dest):
+    """Trusted provisioning may name the container's fixed compatibility home."""
     for pipeline in targets:
         if pipeline not in PIPELINES:
             sys.exit('Unknown pipeline: ' + pipeline + '. Known: ' + ', '.join(PIPELINES))
-    home = Path.home()
-    dest = home / '.codex' / 'bin'
     if not dest.is_dir():
         sys.exit(str(dest) + ' not found. Is Codex set up on this machine?')
     tests = subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s', str(HERE),
@@ -55,6 +53,11 @@ def main(args):
             os.unlink(tmp)
             raise
         print('installed', final)
+
+
+def main(args):
+    home = Path.home()
+    install_helpers(args or list(PIPELINES), home, home / '.codex' / 'bin')
 
 
 if __name__ == '__main__':

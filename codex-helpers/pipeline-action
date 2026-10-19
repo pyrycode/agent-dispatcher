@@ -38,7 +38,7 @@ COMMENT_ACTIONS = {kind + suffix for kind in ('issue', 'pr')
                    for suffix in ('-comment', '-comment-edit-last', '-comment-delete-last')}
 ACTIONS = COMMENT_ACTIONS | {'label-edit', 'push', 'issue-create', 'issue-edit', 'pr-create', 'pr-edit',
            'pr-review', 'board-add', 'board-status', 'board-after',
-           'relations', 'add-child', 'remove-child', 'add-blocker', 'remove-blocker'}
+           'relations', 'add-child', 'remove-child', 'add-blocker', 'remove-blocker', 'split-inspect', 'split-finalize'}
 
 # Workflow state (column, order, dependencies) belongs to the orchestrator.
 # These actions reach it only through the managed GitHub bridge an admitted
@@ -46,7 +46,7 @@ ACTIONS = COMMENT_ACTIONS | {'label-edit', 'push', 'issue-create', 'issue-edit',
 # display directly, and reconciliation would silently overwrite them.
 # Sub-issue links are GitHub content the orchestrator reads back, so
 # add-child and remove-child work anywhere.
-WORKFLOW_ACTIONS = {'board-add', 'board-status', 'board-after', 'add-blocker', 'remove-blocker'}
+WORKFLOW_ACTIONS = {'board-add', 'board-status', 'board-after', 'add-blocker', 'remove-blocker', 'split-inspect', 'split-finalize'}
 
 
 def bridged():
@@ -179,7 +179,8 @@ def perform(args):
     action, *values = args
     counts = {'push':1,'issue-create':2,'issue-edit':3,'pr-create':3,'pr-edit':3,
               'pr-review':3,'board-add':1,'board-status':2,'board-after':2,
-              'relations':1,'add-child':2,'remove-child':2,'add-blocker':2,'remove-blocker':2}
+              'relations':1,'add-child':2,'remove-child':2,'add-blocker':2,'remove-blocker':2,
+              'split-inspect':1,'split-finalize':2}
     counts['label-edit'] = 4
     counts.update({a: 1 if a.endswith('-delete-last') else 2 for a in COMMENT_ACTIONS})
     if len(values) != counts[action]:
@@ -188,6 +189,16 @@ def perform(args):
         raise ValueError(action + ' changes orchestrator workflow and needs the managed GitHub bridge, '
                          'which this process does not have. Run it from an admitted pipeline worker; '
                          'an operator uses the protected operator command instead.')
+    if action in {'split-inspect', 'split-finalize'}:
+        endpoint = 'repos/pyrycode/' + PIPELINE + '/issues/' + number(values[0]) + '/split'
+        if action == 'split-inspect':
+            return json.loads(gh('api', '--hostname', 'github.com', endpoint))
+        content = body(values[1])
+        # Validate JSON before sending; the authority validates scope and ownership.
+        if not isinstance(json.loads(content), dict):
+            raise ValueError('Split request must be a JSON object')
+        return json.loads(run([GH, 'api', '--hostname', 'github.com', endpoint,
+                               '--method', 'POST', '--input', '-'], content))
     if action in COMMENT_ACTIONS:
         n = number(values[0])
         kind = action.split('-')[0]

@@ -28,6 +28,11 @@ edit an approved helper. The install runs the tests first and installs nothing
 if they fail. It replaces each file in one step, so a running agent never reads
 a half-written helper.
 
+Trusted container provisioning can call `install_helpers(pipelines, compat_home,
+destination)` from this installer to retain the fixed documented home while
+installing into `/opt/codex-helpers`. It runs the same tests and atomic replacement
+as the ordinary CLI. Workers still cannot edit their installed helpers.
+
 Edit `pipeline-action` here, never the installed copies; the next install
 overwrites them. The source copy refuses to run.
 
@@ -58,3 +63,15 @@ A column move reads the board and its Status options in one query costing 1
 GraphQL point. Before 2026-09-22 each move listed every field on the board,
 about 100 points, which made column moves the largest drain on the shared
 hourly budget.
+
+## Replacement split finalization
+
+`split-inspect PARENT` returns a fresh complete family/revision template through
+the managed bridge. Save it in the approved publishing directory, add a unique
+`commandId` and `summary`, declare each child's earlier `dependsOn` prerequisites
+and each existing dependent's required `children`, then run
+`split-finalize PARENT ABSOLUTE_JSON_FILE`. Children stay in Inbox until that
+single transaction activates them and closes the replaced parent. Retain the
+same file/identity for an uncertain retry. A new inspection is required after
+scope or workflow changes. These actions refuse an absent bridge, foreign run,
+missing/truncated inventory, active affected work or an unresolved approval hold.

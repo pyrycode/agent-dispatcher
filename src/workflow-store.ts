@@ -792,11 +792,11 @@ export class WorkflowStore {
     });
   }
   /** Lineage and scope are claim-authority metadata, never an arbitrary workflow command. */
-  recoveryMetadata(ticket: string, fields: Record<string, unknown>): void {
+  recoveryMetadata(ticket: string, fields: Record<string, unknown>, actor = 'recovery-split'): void {
     const item = this.get(ticket);
     this.db.prepare("UPDATE workflow_tickets SET item=?,revision=revision+1 WHERE ticket=?")
       .run(JSON.stringify({...item,...fields}), ticket);
-    this.event(ticket, "recovery-split", JSON.stringify(fields));
+    this.event(ticket, actor, JSON.stringify(fields));
   }
   finish(ticket: string, role: string, runId: string): void {
     if (

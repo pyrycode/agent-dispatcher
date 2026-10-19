@@ -443,3 +443,45 @@ plan, child filings and authoritative workflow before using ordinary protected
 operator commands to resolve the change. Restore only the reviewed intended
 scope when appropriate. Do not delete a requirement, dependent, hold or branch
 to obtain a successful retry. Do not start another split under a new identity.
+
+## Ordinary planning split finalization
+
+An admitted parent `refiner` or `po` finalizes a replacement split through its
+managed GitHub bridge, rather than issuing separate board/dependency/close
+commands. `GET /repos/OWNER/REPO/issues/N/split` freshly verifies the complete
+GitHub child and open-dependent inventories and returns a revision template.
+The installed pipeline helper exposes this as `split-inspect N`. Children are
+created and linked with self-contained acceptance bodies but remain in Inbox.
+
+Add a unique `commandId` and `summary` to the template; order the child entries
+by dependency and fill `dependsOn` with earlier child numbers. For every open
+dependent fill `children` with the child numbers that now own its prerequisite.
+Submit the file with `split-finalize N JSON_FILE` (POST to the same bridge path).
+Only existing parent dependents are eligible for a handoff, including imported
+foreign projects. No arbitrary cross-project workflow authority is granted.
+Shared-file coordination is not a required prerequisite.
+
+One SQLite transaction verifies revisions, exact inventories, parent ownership,
+planning role, depth, child readiness, approval state, active reservations,
+pending handoffs and support work. It activates and orders children in Backlog,
+inherits priority/security/platform labels and original prerequisites, adds
+reviewed dependency transfers without removing existing blockers, records the
+comments and closes the replaced parent in Done. Cycles or any failed write
+roll back all these effects. An identical committed request returns its saved
+answer after process restart or the original run ending, without GitHub access
+or repeated mutations. Changed request identities or actors are refused.
+
+Fresh reads import changed family/content metadata; an unchanged lagging GitHub
+workflow display does not invalidate the revision template. A changed source
+or control revision still requires a new inspection and scope review. Unknown
+or truncated relationships refuse finalization rather than guessing.
+
+A durable admission hold applies to newly created issues linked as children of
+their admitted planning creator. It lasts until the parent closes, even if the
+creator ends or its short general creator hold expires. Unrelated follow-ups
+retain their existing bounded hold. Readiness/implementation advancement of an
+unfinished split parent is refused. No historical creator rows are backfilled;
+existing owners, branches, artifacts and approval decisions are preserved.
+Closing records replacement, never delivery of the feature. Child gates remain
+required. Existing recovery splits keep their stronger retained-evidence plan
+and their existing transactional finalizer.

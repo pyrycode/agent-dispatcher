@@ -1,5 +1,6 @@
 import {guardPinnedPublication} from './verifier-handoff-publication.js';
 import { renderRecoverySlice } from "./recovery-split.js";
+import { planningSplitRequest, type PlanningActor } from './planning-split.js';
 import type { EvidenceStore } from "./evidence-store.js";
 import {
   parse,
@@ -199,6 +200,9 @@ export class WorkflowGitHub {
     request: GitHubRequest,
     actor?: Actor,
   ): Promise<GitHubResponse> {
+    const split = request.path.match(/^\/repos\/([^/]+\/[^/]+)\/issues\/([1-9]\d*)\/split$/);
+    if (split && (!this.store.workflow.enabled(project) || split[1] !== project))
+      throw new OwnershipRefusal('Split finalization requires this project\'s workflow authority');
     if (!this.store.workflow.enabled(project))
       return this.upstream.request(project, request);
     const path = request.path.split("?")[0],
@@ -207,6 +211,22 @@ export class WorkflowGitHub {
     if(mutating && actor?.runId) {
       const run=this.store.snapshot().runs.find(r=>r.id===actor.runId && r.machine===actor.machine && r.session===actor.session);
       if(run)await guardPinnedPublication(this.store,this.upstream,run.ticket);
+    }
+    if (split) {
+      if (!actor?.runId) throw new OwnershipRefusal('Split requires an admitted planning run');
+      const planner = actor as PlanningActor, ticket = `${project}#${split[2]}`;
+      if (request.method === 'POST') {
+        const input = planningSplitRequest(body), saved = this.store.planningSplits.result(planner, ticket, input);
+        if (saved) return response(saved);
+        await this.refreshPlanningSplit(planner, ticket);
+        return response(this.store.finalizePlanningSplit(planner, ticket, input));
+      }
+      if (request.method !== 'GET') throw new Error('Split supports only inspection and finalization');
+      await this.refreshPlanningSplit(planner, ticket);
+      const inventory = this.store.planningSplits.inspect(ticket);
+      return response({ revision: inventory.parent.revision,
+        children: inventory.children.map(c => ({ number: c.issueNumber, revision: c.revision, dependsOn: [] })),
+        dependents: inventory.dependents.map(d => ({ ticket: d.ticket, revision: d.item.revision, children: [] })) });
     }
     const match = path.match(
       /^\/repos\/([^/]+\/[^/]+)\/issues\/(\d+)(?:\/(labels|comments)(?:\/(.*))?)?$/,
@@ -647,6 +667,11 @@ export class WorkflowGitHub {
           input.projectId === this.store.workflow.config(project)!.projectId
         )
           await this.adoptIssue(project, input.contentId);
+        // Observe the link before the creator can end. Otherwise a new child
+        // could be admitted with stale null parentage after its short hold ends.
+        if (['addSubIssue', 'removeSubIssue'].includes(field) &&
+            this.store.workflow.find(input.subIssueId)?.ticket.startsWith(`${project}#`))
+          await this.adoptIssue(project, input.subIssueId, true);
       }
     }
     return response({ data: output });
@@ -670,6 +695,28 @@ export class WorkflowGitHub {
     );
     this.filings.set(request.commandId, { key, work });
     return work;
+  }
+  /** Require fresh, complete GitHub family links before the single workflow commit. */
+  private async refreshPlanningSplit(actor: PlanningActor, ticket: string) {
+    this.store.planningSplits.authorize(actor, ticket);
+    const project = ticket.split('#')[0], source = this.store.workflow.get(ticket);
+    await this.adoptIssue(project, source.issueId, true);
+    const payload = JSON.parse((await this.checked(project, { method: 'POST', path: '/graphql', fresh: true,
+      body: JSON.stringify({ query: 'query($id:ID!){node(id:$id){... on Issue{id subIssues(first:100){nodes{id number} pageInfo{hasNextPage}} blocking(first:100){nodes{id number state repository{nameWithOwner}} pageInfo{hasNextPage}}}}}',
+        variables: { id: source.issueId } }) })).body);
+    const family = payload.data?.node;
+    if (payload.errors?.length || family?.id !== source.issueId || !Array.isArray(family.subIssues?.nodes)
+        || !Array.isArray(family.blocking?.nodes) || family.subIssues.pageInfo?.hasNextPage !== false || family.blocking.pageInfo?.hasNextPage !== false)
+      throw new Error('Cannot finalize an incomplete split family or dependent inventory');
+    for (const child of family.subIssues.nodes) await this.adoptIssue(project, child.id, true);
+    for (const dependent of family.blocking.nodes.filter((d: any) => d.state === 'OPEN')) {
+      const targetProject = dependent.repository?.nameWithOwner;
+      if (!this.store.workflow.enabled(targetProject)) throw new Error('Split dependent must have imported workflow authority');
+      await this.adoptIssue(targetProject, dependent.id, true);
+    }
+    const actual = this.store.planningSplits.inspect(ticket).children.map(c => c.issueNumber).sort();
+    const linked = family.subIssues.nodes.map((c: any) => c.number).sort();
+    if (JSON.stringify(actual) !== JSON.stringify(linked)) throw new Error('Split child links changed; inspect the complete family again');
   }
   /** One durable split, including safe continuation after an HTTP or process failure. */
   async recoverySplit(id: string, evidence: EvidenceStore, actor?: {machine:string;session:string;runId:string}) {
@@ -828,7 +875,7 @@ export class WorkflowGitHub {
     }
     throw new Error("Cannot confirm whether an earlier attempt created the issue");
   }
-  async adoptIssue(project: string, id: string): Promise<void> {
+  async adoptIssue(project: string, id: string, contentOnly = false): Promise<void> {
     if (!id)
       throw new Error("Issue identity required for workflow registration");
     const config = this.store.workflow.config(project)!;
@@ -875,8 +922,7 @@ export class WorkflowGitHub {
         throw new Error("Could not register workflow board item");
       board = { id: added.data.addProjectV2ItemById.item.id };
     }
-    this.store.workflow.observe(project, [
-      {
+    const observed: WorkflowItem = {
         id: board.id,
         issueId: issue.id,
         issueNumber: issue.number,
@@ -892,8 +938,13 @@ export class WorkflowGitHub {
         subIssues: issue.subIssuesSummary,
         revision: 1,
         position: 0,
-      },
-    ]);
+      };
+    // Split revision fences describe authority and family content. An unchanged,
+    // lagging GitHub display must not invalidate every inspection/finalize pair.
+    const current = this.store.workflow.find(issue.id)?.item;
+    const contentFields = ['id', 'issueId', 'title', 'body', 'url', 'parentNumber', 'grandparentNumber', 'subIssues'] as const;
+    if (contentOnly && current && contentFields.every(k => JSON.stringify(current[k]) === JSON.stringify(observed[k]))) return;
+    this.store.workflow.observe(project, [observed]);
   }
   private async checked(project: string, request: GitHubRequest) {
     const r = await this.upstream.request(project, request);
