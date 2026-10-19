@@ -58,3 +58,15 @@ A column move reads the board and its Status options in one query costing 1
 GraphQL point. Before 2026-09-22 each move listed every field on the board,
 about 100 points, which made column moves the largest drain on the shared
 hourly budget.
+
+## Replacement split finalization
+
+`split-inspect PARENT` returns a fresh complete family/revision template through
+the managed bridge. Save it in the approved publishing directory, add a unique
+`commandId` and `summary`, declare each child's earlier `dependsOn` prerequisites
+and each existing dependent's required `children`, then run
+`split-finalize PARENT ABSOLUTE_JSON_FILE`. Children stay in Inbox until that
+single transaction activates them and closes the replaced parent. Retain the
+same file/identity for an uncertain retry. A new inspection is required after
+scope or workflow changes. These actions refuse an absent bridge, foreign run,
+missing/truncated inventory, active affected work or an unresolved approval hold.

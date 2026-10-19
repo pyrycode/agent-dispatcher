@@ -1,4 +1,5 @@
 import { StageResults, type StagePlan, type StageSubmission } from "./stage-results.js";
+import { PlanningSplits, type PlanningActor } from './planning-split.js';
 import { RecoverySplits, renderRecoverySlice, splitBodyHash, splitRequirements, splitItemBasis, validateSplitAgainstTicket, validateRecoverySplit, type RecoverySplitRecord } from './recovery-split.js';
 import {StorageMaintenance,type StorageRequest} from './storage-maintenance.js';
 import { parseFeatureRoot } from './feature-lineage.js';
@@ -217,6 +218,7 @@ export class FleetStore {
   private readonly db: DatabaseSync;
   readonly recovery: RecoveryLedger;
   readonly splits: RecoverySplits;
+  readonly planningSplits: PlanningSplits;
   readonly workflow: WorkflowStore;
   readonly facts: RecoveryFacts;
   readonly operations: OperationReports;
@@ -282,6 +284,7 @@ export class FleetStore {
     this.verifierHandoffs = new VerifierHandoffs(this.db, this.clock);
     this.storage = new StorageMaintenance(this.db,this.clock);
     this.splits = new RecoverySplits(this.db);
+    this.planningSplits = new PlanningSplits(this.db, this);
     this.codex = new CodexThrottle(this.db, clock, options.codexThrottle ?? DEFAULT_CODEX_THROTTLE, options.log);
     this.desired = new DesiredStateStore(this.db, Object.keys(limits), clock, machine => this.machineCapabilities()[machine]?.projects);
     this.flaky = new FlakySightingLedger(this.db, clock);
@@ -559,9 +562,16 @@ export class FleetStore {
     });
   }
 
+  finalizePlanningSplit(actor: PlanningActor, ticket: string, input: unknown) {
+    return this.transaction(() => this.planningSplits.finalize(actor, ticket, input));
+  }
   workflowChange(machine: string, session: string, runId: string | undefined, ticket: string, change: WorkflowChange, commandId: string, revision?: number) {
     return this.transaction(() => {
       this.authorizeWorkflow(machine, session, ticket, runId);
+      if ((change.addLabels?.some(l => l === 'done:refiner' || l === 'done:po')
+          || change.labels?.some(l => l === 'done:refiner' || l === 'done:po')
+          || ['In Architecture', 'In Development'].includes(change.status ?? '')) && this.planningSplits.parentPending(ticket))
+        throw new OwnershipRefusal('Unfinished planning split must finalize before the parent advances');
       const accepted=runId && this.stages.get(runId)?.acceptance;
       if(accepted && accepted.state!=="waiting" && (change.status!==undefined || change.state!==undefined || change.labels!==undefined || change.addLabels?.some(l=>/^(error:|done:|needs-rework:)/.test(l))))throw new Error("Accepted stage result cannot be overwritten by executor bookkeeping");
       if(runId && this.stages.get(runId) && (change.addLabels?.some(l=>l.startsWith("done:")) || change.labels?.some(l=>l.startsWith("done:")) || ["In Documentation","Done"].includes(change.status??""))) throw new Error("Contracted stage completion requires its structured result");
@@ -984,6 +994,8 @@ export class FleetStore {
     this.db.prepare("DELETE FROM fleet_ticket_creators WHERE created<?").run(now - CREATOR_HOLD_MS);
     this.db.prepare("INSERT OR IGNORE INTO fleet_ticket_creators SELECT ?,id,? FROM fleet_runs WHERE id=? AND machine=? AND session=? AND finished IS NULL")
       .run(issueId, now, runId, machine, session);
+    const run = this.snapshot().runs.find(r => r.id === runId && r.machine === machine && r.session === session);
+    if (run && ['refiner', 'po'].includes(run.role)) this.planningSplits.holdChild(issueId, run.ticket);
   }
 
   private transactionDepth = 0;
@@ -1117,6 +1129,7 @@ export class FleetStore {
     if(this.workflow.enabled(req.project) && !req.supportTaskId && req.workflowVersion!==1) return {ok:false,reason:"locked"};
     if(this.workflow.enabled(req.project) && /#[1-9]\d*$/.test(req.ticket)) {
       const item=this.workflow.get(req.ticket);
+      if (this.planningSplits.childPending(item, req.project)) return {ok:false,reason:'locked'};
       const recoveryFiling = item.body.match(/<!-- orchestrator-filing:recovery-split:([a-f0-9-]{36}):[a-z][a-z0-9-]* -->/);
       if (recoveryFiling && this.splits.get(recoveryFiling[1])?.state === 'preparing') return {ok:false,reason:'locked'};
       const columns:Record<string,string>={po:'Backlog',refiner:'Backlog',architect:'In Architecture',developer:'In Development',builder:'In Development',qa:'In QA','code-review':'In Code Review',verifier:'In Code Review',documentation:'In Documentation'};
@@ -1219,7 +1232,8 @@ export class FleetStore {
         }
       }
       this.db.prepare("DELETE FROM fleet_locks WHERE run_id=?").run(id);
-      // Its split children are admissible from now on.
+      // Generic creator holds end here. Linked split children additionally
+      // require parent replacement, which survives this run and process.
       this.db.prepare("DELETE FROM fleet_ticket_creators WHERE run_id=?").run(id);
       this.db.prepare("UPDATE fleet_runs SET finished=?,outcome=? WHERE id=? AND finished IS NULL").run(Date.now(), unused ? "unused" : completed ? "completed" : "cancelled", id);
       if(unused && request.verificationPin && !this.db.prepare("SELECT 1 FROM fleet_runs WHERE ticket=? AND generation=? AND id!=? AND (finished IS NULL OR outcome IS NULL OR outcome!='unused')").get(run.ticket,run.generation,id)) {

@@ -52,11 +52,26 @@ class Helper:
         with patch.object(m, 'bridged', return_value=False), patch.object(m, 'gh') as gh, \
                 patch.object(m, 'graphql') as gql:
             for args in [['board-add', '2266'], ['board-status', '2266', 'Backlog'], ['board-after', '2266', 'top'],
-                         ['add-blocker', '2149', '2148'], ['remove-blocker', '2149', '2148']]:
+                         ['add-blocker', '2149', '2148'], ['remove-blocker', '2149', '2148'],
+                         ['split-inspect', '2098'], ['split-finalize', '2098', '/tmp/plan.json']]:
                 with self.subTest(args=args), self.assertRaisesRegex(ValueError, 'bridge'):
                     m.perform(args)
             gh.assert_not_called()
             gql.assert_not_called()
+
+    def test_split_inspection_and_finalization_stay_on_the_managed_fixed_destination(self):
+        m = self.m
+        endpoint = 'repos/pyrycode/' + self.P + '/issues/2098/split'
+        with patch.object(m, 'gh', return_value='{"revision":4}') as gh:
+            self.assertEqual(m.perform(['split-inspect', '2098']), {'revision': 4})
+            gh.assert_called_once_with('api', '--hostname', 'github.com', endpoint)
+        content = '{"commandId":"split-2098","summary":"Preserve all acceptance."}'
+        with patch.object(m, 'body', return_value=content), patch.object(m, 'run', return_value='{"parent":{"state":"CLOSED"}}') as run:
+            self.assertEqual(m.perform(['split-finalize', '2098', '/approved/plan.json'])['parent']['state'], 'CLOSED')
+            self.assertEqual(run.call_args.args, ([m.GH, 'api', '--hostname', 'github.com', endpoint,
+                                                 '--method', 'POST', '--input', '-'], content))
+        with patch.object(m, 'body', return_value='[]'), self.assertRaisesRegex(ValueError, 'JSON object'):
+            m.perform(['split-finalize', '2098', '/approved/plan.json'])
 
     def test_sub_issue_links_do_not_need_the_bridge(self):
         m = self.m

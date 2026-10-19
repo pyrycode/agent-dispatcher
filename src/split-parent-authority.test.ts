@@ -148,8 +148,10 @@ test("Core #3361: split children wait for the parent refiner, whose later writes
   store.workflowChange("pyrybox", "s", parent.id, `${project}#3430`, { afterItemId: "P3429" }, "board-after-3430");
   store.workflowChange("pyrybox", "s", parent.id, `${project}#3431`, { afterItemId: "P3430" }, "board-after-3431");
   assert.deepEqual(store.workflow.get(`${project}#3430`).labels, ["priority:low", "security-sensitive"]);
-  // The parent finishing releases every child; ownership protection resumes.
+  // Finishing alone must not release a split that never closed its parent.
   store.finish("pyrybox", "s", parent.id);
+  assert.deepEqual(store.start(start("fractal", 3429, "refiner")), { ok: false, reason: "locked" });
+  store.workflowOperator(`${project}#3361`, { state: 'CLOSED', status: 'Done' }, 'replace-parent', store.workflow.get(`${project}#3361`).revision);
   assert.equal(store.start(start("fractal", 3429, "refiner")).ok, true);
   assert.equal(store.start(start("pyrybox", 3428, "builder")).ok, true);
   assert.throws(() => store.workflowChange("pyrybox", "s", parent.id, `${project}#3430`, { addLabels: ["late"] }, "late"), /finished or lost ownership/);
@@ -199,6 +201,8 @@ test("Core #3247: a child created through the bridge is held, and a refused writ
   assert.match(active.body.message, /Ticket has an active run/);
   // After the parent finishes, its own grant is refused as finished.
   store.finish("pyrybox", "s", parent.id);
+  assert.deepEqual(store.start(start("hp", 3315, "refiner")), { ok: false, reason: "locked" });
+  store.workflowOperator(`${project}#3247`, { state: 'CLOSED', status: 'Done' }, 'replace-parent', store.workflow.get(`${project}#3247`).revision);
   assert.equal(store.start(start("hp", 3315, "refiner")).ok, true);
   const late = await gh(socket, "POST", `/repos/${project}/issues/3315/labels`, { labels: ["late"] });
   assert.equal(late.status, 409);
