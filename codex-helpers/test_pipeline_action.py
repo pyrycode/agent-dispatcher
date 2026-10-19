@@ -78,6 +78,26 @@ class Helper:
                     install.install_helpers([self.P], compat, dest)
             self.assertEqual(result.read_text(), install.render(self.P, compat))
 
+    def test_rule_probe_skips_unconfigured_hosts_but_stays_strict_for_a_configured_helper(self):
+        with tempfile.TemporaryDirectory() as folder:
+            rules = Path(folder)
+            codex = rules / 'codex'
+            codex.touch()
+            (rules / 'board-watch.rules').write_text('unrelated board-watch policy')
+            helper = str(HOME / '.codex/bin' / (self.P + '-pipeline-action'))
+            with patch.dict(globals(), {'CODEX': codex, 'RULES': rules}):
+                with self.assertRaises(unittest.SkipTest):
+                    Helper.test_installed_rules_allow_only_the_helper(self)
+                (rules / 'pipeline.rules').write_text('prefix_rule(pattern=[' + repr(helper) + '], decision="allow")')
+                with patch.object(subprocess, 'check_output', return_value='{"matchedRules":[]}'):
+                    with self.assertRaises(AssertionError):
+                        Helper.test_installed_rules_allow_only_the_helper(self)
+                def policy(argv, **kwargs):
+                    target = argv[argv.index('--') + 1]
+                    return json.dumps({'decision': 'allow'} if target == helper else {})
+                with patch.object(subprocess, 'check_output', side_effect=policy):
+                    Helper.test_installed_rules_allow_only_the_helper(self)
+
     def test_split_inspection_and_finalization_stay_on_the_managed_fixed_destination(self):
         m = self.m
         endpoint = 'repos/pyrycode/' + self.P + '/issues/2098/split'
@@ -290,8 +310,9 @@ class Helper:
                         m.perform(args + tail)
             gh.assert_not_called()
 
-    @unittest.skipUnless(CODEX.exists() and RULES.is_dir(), 'Codex is not installed on this machine')
     def test_installed_rules_allow_only_the_helper(self):
+        if not CODEX.exists() or not RULES.is_dir():
+            self.skipTest('Codex is not installed on this machine')
         helper = str(HOME / '.codex/bin' / (self.P + '-pipeline-action'))
         files = sorted(RULES.glob('*.rules'))
         # Build/controller hosts can have Codex and unrelated board-watch rules
