@@ -149,12 +149,15 @@ def android_selection(args):
         refuse('an Android mode and focused selection are required')
     if args[0] == 'scripted' and len(args) >= 2 and re.fullmatch(r'[a-z][a-z-]*', args[1]) and args[1] not in {'all', 'full'}:
         return
-    if args[0] not in {'ui', 'live'}:
+    if args[0] not in {'ui', 'live', 'scripted-all'}:
         refuse('complete scripted or device suites are dispatcher-owned')
     tests = option(args, ['--tests'])
     if tests is None:
         refuse('an unselected Android suite')
-    mobile_names(tests.split(','), methods=args[0] == 'live')
+    if args[0] == 'scripted-all' and (len(tests) > 8192 or any(
+            not re.fullmatch(CLASS + r'#[A-Za-z_][A-Za-z0-9_]*', name) for name in tests.split(','))):
+        refuse('scripted subsets require bounded exact Class#method names')
+    mobile_names(tests.split(','), methods=args[0] in {'live', 'scripted-all'})
 
 
 def jvm_selection(args):
