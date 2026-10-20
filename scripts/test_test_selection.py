@@ -113,6 +113,28 @@ class SelectionTests(unittest.TestCase):
             with self.subTest(kind=kind, args=args), self.assertRaises(policy.PolicyError):
                 policy.selection(kind, args)
 
+    def test_scripted_subset_uses_exact_methods_without_opening_the_full_suite(self):
+        first = 'de.pyryco.mobile.e2e.DeterministicInteractiveStreamE2ETest#interactiveTurn_directShareShortcut_stagesBeforeExplicitSend'
+        second = 'de.pyryco.mobile.e2e.DeterministicInteractiveStreamE2ETest#interactiveTurn_seededChannel_streamsScriptedPingReplyIntoThread'
+        for args in [['scripted-all', '--tests', first + ',' + second],
+                     ['scripted-all', '--tests=' + first]]:
+            policy.selection('android', args)
+        for args in [
+            ['scripted-all'], ['scripted-all', '--tests', ''],
+            ['scripted-all', '--tests', first.split('#')[0]],
+            ['scripted-all', '--tests', first + '*'],
+            ['scripted-all', '--tests', first + '#extra'],
+            ['scripted-all', '--tests', first + ' invalid'],
+            ['scripted-all', '--tests', first + 'x' * 8192],
+            ['scripted-all', '--tests', first + ',de.pyryco.mobile.OtherTest#method'],
+            ['scripted-all', '--tests', first, '--tests', second],
+            ['scripted-all', '--tests=' + first, '--tests=' + second],
+            ['scripted-all', '--tests', first + ','],
+            ['scripted-all', '--tests', ','.join([first] * 65)],
+        ]:
+            with self.subTest(args=args), self.assertRaises(policy.PolicyError):
+                policy.selection('android', args)
+
     def test_frozen_context_overrides_role_env_and_verifier_keeps_full_coverage(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -128,6 +150,9 @@ class SelectionTests(unittest.TestCase):
                 with self.assertRaises(policy.PolicyError):
                     policy.check(root, 'go', ['test', './...'])
                 policy.check(root, 'go', ['test', './internal/thread'])
+                policy.check(root, 'android', ['scripted-all', '--tests', 'de.pyryco.mobile.e2e.DeterministicInteractiveStreamE2ETest#interactiveTurn_directShareShortcut_stagesBeforeExplicitSend,de.pyryco.mobile.e2e.DeterministicInteractiveStreamE2ETest#interactiveTurn_seededChannel_streamsScriptedPingReplyIntoThread'])
+                with self.assertRaises(policy.PolicyError):
+                    policy.check(root, 'android', ['scripted-all'])
                 policy.check(root, 'gradle', [':app:pixel2Api33AtdSetup', '--rerun', '--console=plain'])
                 with self.assertRaises(policy.PolicyError):
                     policy.check(root, 'gradle', [':app:pixel2Api33AtdDebugAndroidTest'])
@@ -137,6 +162,7 @@ class SelectionTests(unittest.TestCase):
             with patch.object(policy, 'socket_context', return_value={**reply, 'role': 'verifier'}):
                 policy.check(root, 'go', ['test', './...'])
                 policy.check(root, 'desktop-unit', [])
+                policy.check(root, 'android', ['scripted-all'])
             with patch.object(policy, 'socket_context', side_effect=OSError('gone')):
                 with self.assertRaises(policy.PolicyError):
                     policy.check(root, 'go', ['test', './internal/thread'])
