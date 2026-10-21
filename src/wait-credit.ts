@@ -17,8 +17,8 @@
 // proves, and when a run's clock is really spent. The spawn code in
 // dispatch.ts only feeds it lines and events and acts on its answers.
 //
-// Everything here is bounded by a hard ceiling (twice the normal budget by
-// default), so a hung run still ends.
+// Output-based credit and grace are bounded by a hard ceiling. Direct shared
+// admission reports move that ceiling too, so queue time is never active time.
 
 /** A closed time span, [start, end), in epoch milliseconds. */
 export type Interval = readonly [number, number];
@@ -266,6 +266,9 @@ export interface RunClock {
   readonly ran: readonly Interval[];
   /** Waiting time credited back to the run. */
   readonly credited: readonly Interval[];
+  /** Direct reports from this spawn's shared-admission waiters. These also
+   * move the wall ceiling: queued time is never charged as active work. */
+  readonly admissionCredited?: readonly Interval[];
   /** Queue lines already credited. */
   readonly seenWaitLines: ReadonlySet<string>;
 }
@@ -305,6 +308,9 @@ function finishCommand(clock: RunClock, id: string, output: string, now: number)
   let totalMs = 0;
   let seen: Set<string> | null = null;
   for (const wait of finishedWaits(output)) {
+    // Direct reports contain exact wait placement. Reconstructing the same
+    // admission wait from delayed output would credit later execution again.
+    if(wait.queue==='admission' && clock.admissionCredited?.length)continue;
     if (seenWaitLines.has(wait.line) || seen?.has(wait.line)) continue;
     seen ??= new Set(seenWaitLines);
     seen.add(wait.line);
@@ -384,7 +390,11 @@ export function runClockCreditMs(clock: RunClock): number {
 
 /** The run's deadline: budget plus credited waiting, never past the ceiling. */
 export function runClockDeadline(clock: RunClock): number {
-  return Math.min(clock.ceilingAt, clock.startedAt + clock.budgetMs + runClockCreditMs(clock));
+  return Math.min(runClockCeiling(clock), clock.startedAt + clock.budgetMs + runClockCreditMs(clock));
+}
+
+export function runClockCeiling(clock: RunClock): number {
+  return clock.ceilingAt + unionLengthMs(clock.admissionCredited ?? []);
 }
 
 export type RunClockDecision =
@@ -403,12 +413,13 @@ export type RunClockDecision =
  */
 export function decideRunClock(clock: RunClock, now: number): RunClockDecision {
   const extendable = clock.ceilingAt > clock.startedAt + clock.budgetMs;
-  if (now >= clock.ceilingAt) return { kind: "stop", reason: extendable ? "ceiling" : "deadline" };
+  const ceiling = runClockCeiling(clock);
+  if (now >= ceiling) return { kind: "stop", reason: extendable ? "ceiling" : "deadline" };
   const deadline = runClockDeadline(clock);
   if (now < deadline) return { kind: "run", checkAt: deadline, grace: false };
   const holding = [...clock.running.values()].some((began) => began < deadline);
   if (clock.graceMs <= 0 || !holding) return { kind: "stop", reason: "deadline" };
-  const graceEnd = Math.min(clock.ceilingAt, deadline + clock.graceMs);
+  const graceEnd = Math.min(ceiling, deadline + clock.graceMs);
   return now < graceEnd ? { kind: "run", checkAt: graceEnd, grace: true } : { kind: "stop", reason: "grace_ended" };
 }
 
