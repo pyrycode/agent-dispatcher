@@ -1,4 +1,5 @@
 import { declaredStageArtifacts } from "./stage-result-files.js";
+import {createAdmissionWaitTracker} from './admission-wait.js';
 import type { StagePlan, StageSubmission, StageRecord, StageCheck } from "./stage-results.js";
 import { beginManagedStage } from "./managed-dispatch.js";
 import {acceptManagedVerification} from './managed-dispatch.js';
@@ -13,7 +14,7 @@ import { createHash } from "node:crypto";
 import type { FleetRun, FleetSnapshot } from "./fleet-store.js";
 import { readFileSync, realpathSync, lstatSync, readlinkSync, existsSync, writeFileSync, mkdirSync, mkdtempSync, rmdirSync, appendFileSync, readdirSync, createWriteStream, statSync, symlinkSync, unlinkSync, openSync, closeSync } from "node:fs";
 import { homedir, hostname, tmpdir } from "node:os";
-import { resolve, dirname, basename } from "node:path";
+import { resolve, dirname, basename, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { config } from "dotenv";
@@ -994,6 +995,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
     const reportCodex = isCodex ? managedCodexReporter() : null;
     let codexCleanReported = false;
     const startedAt = Date.now();
+    const budgetNote = `\n\n## Working time budget\nThe dispatcher excludes shared test-admission waiting from this run's working time limit. This replaces role guidance that describes the limit as elapsed wall time. Do not stop or cancel queued tests merely because that much wall time has passed. Check the current remainingMs and waitCreditMs with python3 \"$AGENTS_REPO_PATH/dispatcher/scripts/test-wait.py\" before declaring budget exhaustion. Only dispatcher-observed waits earn time; test execution, implementation and review still consume the budget.\n`;
     // Phase C cutover (2026-05-14, pyrycode/pyrycode#329): default-spawn
     // `pyry agent-run` instead of `claude -p`. Both produce stream-json on
     // stdout consumed identically by the parser below. Pyry agent-run reads
@@ -1016,7 +1018,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
     let bin: string;
     let args: string[];
     if (isCodex) {
-      ({ bin, args } = buildCodexInvocation({ cwd: opts.cwd, role: readFileSync(opts.systemPromptFile, "utf8") + (opts.sourceReview ? "" : CODEX_ROLE_GUIDANCE), model: opts.model, effort: opts.effort, bin: opts.env.PYRY_CODEX_BIN, agentsRepoPath: opts.env.AGENTS_REPO_PATH, sourceReview: opts.sourceReview,
+      ({ bin, args } = buildCodexInvocation({ cwd: opts.cwd, role: readFileSync(opts.systemPromptFile, "utf8") + (opts.sourceReview ? "" : CODEX_ROLE_GUIDANCE + budgetNote), model: opts.model, effort: opts.effort, bin: opts.env.PYRY_CODEX_BIN, agentsRepoPath: opts.env.AGENTS_REPO_PATH, sourceReview: opts.sourceReview,
         // Resolved from the env Codex itself gets, so nothing withheld from
         // Codex can come back through the allowlist.
         shellEnv: resolveAgentShellEnv(codexChildEnv(opts.env)),
@@ -1100,14 +1102,24 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
     // before when the pipe was closed at once.
     const readsPromptOnStdin = isCodex || claudeReadsStdin;
     const promptFd = readsPromptOnStdin ? openSync(opts.promptFile, "r") : null;
+    const admissionWaits=createAdmissionWaitTracker();
+    const runEnv={...opts.env,PYRY_TEST_WAIT_DIRECTORY:admissionWaits.directory};
+    if(isCodex && !opts.sourceReview)args.splice(1,0,'-c',`shell_environment_policy.set.PYRY_TEST_WAIT_DIRECTORY=${JSON.stringify(admissionWaits.directory)}`);
+    if(!isCodex && !opts.sourceReview) {
+      const roleFile=join(admissionWaits.directory,'role.txt');
+      writeFileSync(roleFile,readFileSync(opts.systemPromptFile,'utf8')+budgetNote,{mode:0o600});
+      args=args.map(arg=>arg===opts.systemPromptFile?roleFile:arg);
+    }
     let child: ReturnType<typeof spawn>;
     try {
       child = spawn(bin, args, {
         cwd: opts.cwd,
-        env: isCodex ? codexChildEnv(opts.env) : opts.env,
+        env: isCodex ? codexChildEnv(runEnv) : runEnv,
         stdio: [promptFd ?? "ignore", "pipe", "pipe"],
         detached: true,
       });
+    } catch(error) {
+      admissionWaits.close();throw error;
     } finally {
       // The child holds its own copy from the moment spawn returns.
       if (promptFd !== null) closeSync(promptFd);
@@ -1141,7 +1153,9 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
     let agentOutput: readonly string[] = [];
     const agentOutputTail = () => agentOutputForMessage(agentOutput);
 
-    // Agent wall clock (wait-credit.ts), both runners. Time a command spent
+    // Agent work clock (wait-credit.ts), both runners. Shared admission waits
+    // arrive directly through the per-spawn reporter, even with hidden output.
+    // Time a command spent
     // waiting for the Android device hold or a Gradle build place is credited
     // back once its output shows it: a Codex command execution's output, or a
     // Claude Bash call's tool result. A command still running when the budget
@@ -1155,6 +1169,9 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
       graceMs: parseTimeoutGraceMs(process.env.PYRY_TIMEOUT_GRACE_MINUTES),
     });
     let graceNoted = false;
+    const syncAdmissionClock=()=>{clock=admissionWaits.advance(clock,Date.now());};
+    syncAdmissionClock();
+    const admissionTimer=setInterval(syncAdmissionClock,1000);
     const killForTimeout = (detail: string) => {
       timedOut = true;
       appendFileSync(opts.logFile, `\n⏰ TIMEOUT — killing agent after ${Math.round((Date.now() - startedAt) / 1000)}s${detail}\n`);
@@ -1165,6 +1182,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
     };
     const checkClock = () => {
       if (timedOut) return;
+      syncAdmissionClock();
       const now = Date.now();
       const decision = decideRunClock(clock, now);
       if (decision.kind === "stop") {
@@ -1189,6 +1207,7 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
      *  earned more time, or the grace it was given is over. */
     const advanceClock = (msg: unknown, commandFinished: boolean) => {
       if (timedOut) return;
+      syncAdmissionClock();
       const before = runClockCreditMs(clock);
       clock = isCodex ? advanceRunClock(clock, msg, Date.now()) : advanceClaudeRunClock(clock, msg, Date.now());
       const credit = runClockCreditMs(clock);
@@ -1226,6 +1245,8 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
     // first assistant frame (pyrycode/pyrycode#3563).
     let claudeTurnEnded = false;
     const idleTimer = idleMs > 0 ? setInterval(() => {
+      syncAdmissionClock();
+      if(admissionWaits.waiting){idleState={...idleState,lastLineAt:Date.now()};return;}
       if (idleStalled || timedOut || codexTurnEnded || claudeTurnEnded || !shouldFireIdleWatchdog(idleState, Date.now(), idleMs)) return;
       idleStalled = true;
       if (idleTimer) clearInterval(idleTimer);
@@ -1328,6 +1349,8 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
     };
 
     child.on("close", (code) => {
+      clearInterval(admissionTimer);
+      syncAdmissionClock();admissionWaits.close();
       clearTimeout(timer);
       if (idleTimer) clearInterval(idleTimer);
       if (forceExitTimer) clearTimeout(forceExitTimer);
@@ -1463,6 +1486,8 @@ function runClaudeStreamingOnce(opts: RunClaudeOpts): Promise<StreamResult> {
     });
 
     child.on("error", (err) => {
+      clearInterval(admissionTimer);
+      admissionWaits.close();
       clearTimeout(timer);
       if (idleTimer) clearInterval(idleTimer);
       // Same probe-before-delete as the close handler — `error` can

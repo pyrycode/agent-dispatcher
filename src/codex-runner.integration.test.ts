@@ -184,7 +184,8 @@ test("PYRY_AGENT_SHELL_ENV reaches Codex as named overrides, never secrets or wi
   });
   assert.equal(result.isError, false, result.output);
   const argv: string[] = JSON.parse(readFileSync(join(f.dir, "observed.json"), "utf8")).argv;
-  const sets = argv.filter(arg => arg.startsWith("shell_environment_policy.set."));
+  assert.equal(argv.filter(arg=>arg.startsWith('shell_environment_policy.set.PYRY_TEST_WAIT_DIRECTORY=')).length,1);
+  const sets = argv.filter(arg => arg.startsWith("shell_environment_policy.set.") && !arg.startsWith('shell_environment_policy.set.PYRY_TEST_WAIT_DIRECTORY='));
   assert.deepEqual(sets, ['shell_environment_policy.set.ANDROID_HOME="/fixture/sdk"', 'shell_environment_policy.set.JAVA_HOME="/fixture/jbr home"']);
   assert.ok(!argv.some(arg => arg.includes("fixture-secret")));
 });

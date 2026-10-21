@@ -806,6 +806,22 @@ a capture ticket. This workflow does not give agents Claude credentials.
 
 ## Time limits and waiting
 
+**Shared test admission.** Updated Core admission launchers report queue entry,
+one-second heartbeats and acquisition directly into a private directory created
+for each agent spawn. This works for Codex and Claude, redirected output and
+background shell commands. The dispatcher excludes the union of those waits
+from both the working-time budget and the outer wall ceiling. Test execution
+still consumes the budget. Reports from another spawn cannot contribute.
+An unfinished report stops earning time once its heartbeat is stale. The idle
+watchdog also stands down while a current admission waiter is reporting.
+
+Each normal agent receives runtime guidance that replaces the old elapsed-time
+rule. It can read `remainingMs` and `waitCreditMs` with
+`python3 "$AGENTS_REPO_PATH/dispatcher/scripts/test-wait.py"`. The report is
+refreshed once a second and includes `updatedAt`. Deploy this shared dispatcher
+before the Core admission-launcher update. Older launchers keep the output-based
+credit below until their source is updated.
+
 A time limit should stop work that has stalled, not work that is queued behind
 another ticket or slowed by a busy host. Two host-wide queues sit in front of
 pipeline work on the mobile host: the Android device hold in the product's
@@ -858,8 +874,9 @@ retried a slow model stream and then finished. The default catches the first 20
 minutes sooner and would have stopped the second 16 seconds early. That run
 would have retried, which is cheap next to a run that never comes back.
 
-**Hard ceiling.** Nothing runs past `PYRY_TIMEOUT_CEILING_FACTOR` times its
-normal budget, twice by default, so a hung run still ends. With mobile's
+**Hard ceiling for output-based credit.** The ceiling remains
+`PYRY_TIMEOUT_CEILING_FACTOR` times the normal budget, twice by default.
+Directly reported shared-admission waits move that ceiling too. With mobile's
 settings, a 60-minute verifier gate can wait the full 45 minutes for the device
 and still have its hour, inside a 120-minute ceiling.
 
