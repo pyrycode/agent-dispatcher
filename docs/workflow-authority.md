@@ -103,6 +103,19 @@ there is none. Archived neighbours do not prevent dependency publication.
 
 ## Migration
 
+Normal claims-service startup adds non-unique ticket indexes to `fleet_runs`
+and `workflow_commands`, including databases created by earlier versions.
+Repeated startup does not rebuild existing indexes. Finished-run history can
+use the same ticket lookup as active history. The separate unique index for
+unfinished runs remains unchanged. This migration does not remove saved
+commands or ownership records.
+
+Use `EXPLAIN QUERY PLAN` on a ticket lookup and the historical handoff query to
+confirm indexed searches. An index plan proves lookup behaviour. It does not
+establish a production CPU or disk-read improvement under a different workload.
+Deployment and comparable runtime measurements remain separate operations.
+
+
 Use the existing protected operator and GitHub logins. Never place credentials in
 request files or command arguments.
 
