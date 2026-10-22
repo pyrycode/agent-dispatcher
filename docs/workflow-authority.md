@@ -163,6 +163,15 @@ resolve the actual state. Reuse the same command identity only for the exact sam
 request. The controls also support `state`, `labels`, `blockedBy`, `top` and `afterItemId`.
 Changing a status does not bypass dependency, review, ownership or admission checks.
 
+### Capture declaration repair
+
+For a completed live run held only because required capture outputs were not
+declared, use `operator.sh workflow declaration-repair owner/repo request.json`.
+The request and refusal rules are documented in
+[Recovering undeclared capture outputs](stage-results.md#recovering-undeclared-capture-outputs).
+It returns the ticket to ordinary builder work and preserves the waiting result.
+It does not accept the live stage.
+
 ### Approval review continuation
 
 Approval outcomes belong to the claim database, separately from ticket prose and

@@ -1,4 +1,5 @@
-import { StageResults, type StagePlan, type StageSubmission } from "./stage-results.js";
+import { DeclarationRepairs, declarationRepairRequest, declarationCaptureFiles, type DeclarationRepairRequest } from './stage-declaration-repair.js';
+import { StageResults, stageBasis, type StagePlan, type StageSubmission } from "./stage-results.js";
 import { PlanningSplits, type PlanningActor } from './planning-split.js';
 import { RecoverySplits, renderRecoverySlice, splitBodyHash, splitRequirements, splitItemBasis, validateSplitAgainstTicket, validateRecoverySplit, type RecoverySplitRecord } from './recovery-split.js';
 import {StorageMaintenance,type StorageRequest} from './storage-maintenance.js';
@@ -232,6 +233,7 @@ export class FleetStore {
   readonly investigations: TestInvestigations;
   readonly approvals: ApprovalStates;
   readonly stages: StageResults;
+  readonly declarationRepairs: DeclarationRepairs;
   readonly machineRecoveries: MachineRecoveries;
   readonly verifierHandoffs: VerifierHandoffs;
   readonly storage: StorageMaintenance;
@@ -264,6 +266,7 @@ export class FleetStore {
     `);
     this.workflow = new WorkflowStore(this.db);
     this.stages = new StageResults(this.db);
+    this.declarationRepairs = new DeclarationRepairs(this.db);
     this.machineRecoveries = new MachineRecoveries(this.db);
     this.recovery = new RecoveryLedger(this.db, Date.now, options);
     this.facts = new RecoveryFacts(this.db);
@@ -616,6 +619,38 @@ export class FleetStore {
           evidence.commit(machine,undefined,ticket,id,upload.digest);
           return {runId:id,digest:upload.digest};
         });
+    });
+  }
+  repairStageDeclaration(value: DeclarationRepairRequest, evidence?: EvidenceStore) {
+    const input = declarationRepairRequest(value);
+    return this.transaction(() => {
+      const replay = this.declarationRepairs.saved(input);
+      if (replay) return replay;
+      const item = this.workflow.get(input.ticket), stage = this.stages.records(input.ticket)[0];
+      if (item.revision !== input.revision || item.state !== 'OPEN'
+        || !item.labels.includes('held:stage-result') || !item.labels.includes('needs-live-artifacts'))
+        throw new Error('Declaration repair requires the current open declaration hold');
+      if (!stage || stage.runId !== input.runId || stage.plan.kind !== 'live-gate' || stage.plan.candidate !== input.candidate
+        || !stage.artifactsRequired || stage.plan.artifacts.length || !stage.result
+        || stage.acceptance?.state !== 'waiting' || stage.acceptance.reason !== 'Required capture outputs have not been declared in the stage plan')
+        throw new Error('Latest stage is not a terminal undeclared-capture wait');
+      if (stage.basis !== stageBasis({ ...item, labels: item.labels.filter(l => !/^(held:|needs-human:)/.test(l)) }))
+        throw new Error('Stage requirements changed before declaration repair');
+      const source = this.db.prepare('SELECT request,machine,generation,finished,outcome FROM fleet_runs WHERE id=? AND ticket=?').get(input.runId, input.ticket);
+      const claim = this.db.prepare('SELECT machine,generation FROM fleet_claims WHERE ticket=?').get(input.ticket);
+      if (!source || source.finished == null || source.outcome !== 'completed' || JSON.parse(String(source.request)).role !== 'real-claude-gate'
+        || !claim || claim.machine !== source.machine || claim.generation !== source.generation)
+        throw new Error('Source execution has not ended with unchanged ownership');
+      if (this.snapshot().runs.some(r => r.ticket === input.ticket || r.parentTicket === input.ticket)
+        || this.openTaskTickets().includes(input.ticket)) throw new Error('Declaration repair has active or uncertain work');
+      const approval = this.approvals.get(input.ticket);
+      if (approval?.kind === 'rejected' && !approval.authorization) throw new Error('Recorded approval rejection forbids declaration repair');
+      declarationCaptureFiles(input, stage, String(source.machine), evidence);
+      const changed = this.workflow.change(input.ticket, { status: 'In Development',
+        removeLabels: ['held:stage-result', 'done:builder', 'done:verifier'] }, 'declaration-repair:' + input.runId,
+        'declaration-repair:' + input.commandId, input.revision);
+      evidence!.pinAcceptance(input.ticket);
+      return this.declarationRepairs.save(input, changed);
     });
   }
   authorizeWorkflow(machine:string,session:string,ticket:string,runId?:string):void {

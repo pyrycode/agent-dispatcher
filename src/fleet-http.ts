@@ -1,3 +1,4 @@
+import { declarationRepairRequest } from './stage-declaration-repair.js';
 import {guardPinnedPublication,PublishedCandidateChanged} from './verifier-handoff-publication.js';
 import {WorkflowGitHub} from "./workflow-github.js";
 import { createServer, request, type IncomingMessage, type Server } from "node:http";
@@ -350,6 +351,23 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
           if(!isAdmin) return send(403,{error:'Operator credential required'});
           if(body.config?.project!==project) throw new Error('Import project mismatch');
           store.workflow.import(body.config,body.items,body.comments);return send(200,{ok:true});
+        }
+        if(req.url==='/workflow/declaration-repair') {
+          if(!isAdmin) return send(403,{error:'Operator credential required'});
+          const {project: _project,...request}=body;
+          const input=declarationRepairRequest(request);
+          if(input.ticket.split('#')[0]!==project) throw new Error('Workflow project mismatch');
+          const replay=store.declarationRepairs.saved(input);
+          if(replay)return send(200,replay);
+          if(!github) throw new Error('Published candidate verification is unavailable');
+          const number=input.ticket.split('#')[1];
+          const ref=await github.request(project,{method:'GET',path:`/repos/${project}/git/ref/heads/feature/${number}`,fresh:true});
+          const pr=await github.request(project,{method:'GET',path:`/repos/${project}/pulls/${input.pullRequest}`,fresh:true});
+          const pull=pr.status===200?JSON.parse(pr.body):null;
+          if(ref.status!==200 || JSON.parse(ref.body).object?.sha!==input.candidate || !pull || pull.state!=='open'
+            || pull.head?.sha!==input.candidate || pull.head?.ref!==`feature/${number}` || pull.head?.repo?.full_name!==project)
+            throw new Error('Published declaration repair candidate changed or unavailable');
+          return send(200,store.repairStageDeclaration(input,evidence));
         }
         if(req.url==='/workflow/operator') {
           if(!isAdmin) return send(403,{error:'Operator credential required'});

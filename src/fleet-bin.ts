@@ -68,6 +68,9 @@ async function main(): Promise<void> {
       if(Object.keys(input).length!==1 || typeof input.id!=='string' || !/^[a-f0-9-]{36}$/.test(input.id)) throw new Error('Recovery split retry accepts only its retained incident id');
       console.log(JSON.stringify(await claims.call('/recovery/split',{id:input.id,project})));return;
     }
+    if(action==='declaration-repair') {
+      console.log(JSON.stringify(await claims.call('/workflow/declaration-repair',{...input,project})));return;
+    }
     if(action==='approval-authorize') {
       if(!input.commandId) throw new Error('Approval decision requires a commandId kept for retries');
       console.log(JSON.stringify(await claims.call('/workflow/approval-authorize',{...input,project})));return;
