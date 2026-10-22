@@ -74,6 +74,11 @@ export class WorkflowStore {
   private readonly labelTickets = new Map<string, { version: number; tickets: string[] }>();
   private reviewTickets: { version: number; tickets: string[] } | undefined;
   private requirementTickets: { version: number; tickets: Record<string, string[]> } | undefined;
+  // Publisher-local incidents need freshness even when accepted metadata is unchanged.
+  private readonly archiveObservations = new Map<string, { archived: boolean }>();
+  archiveObservation(ticket: string): { readonly archived: boolean } | undefined {
+    return this.archiveObservations.get(ticket);
+  }
   constructor(private readonly db: DatabaseSync) {
     db.exec(`CREATE TABLE IF NOT EXISTS workflow_projects (project TEXT PRIMARY KEY, config TEXT NOT NULL) STRICT;
       CREATE TABLE IF NOT EXISTS workflow_migrations (project TEXT PRIMARY KEY) STRICT;
@@ -566,6 +571,11 @@ export class WorkflowStore {
         }
       }
     });
+    // Publish freshness only after the entire observation transaction succeeded.
+    for (const item of items)
+      this.archiveObservations.set(`${project}#${item.issueNumber}`, {
+        archived: item.archived === true,
+      });
   }
   change(
     ticket: string,

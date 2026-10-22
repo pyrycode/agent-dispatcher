@@ -1231,3 +1231,51 @@ test("new workflow dependency cycles preserve legacy updates, removals and exact
   assert.deepEqual(removed.blockedBy, []);
   assert.deepEqual(store.workflowOperator(ticket, { blockedBy: changed.blockedBy }, "legacy-edges", 2), unchanged);
 });
+
+test("a fresh normalized unarchived refresh releases an attributed refusal without a revision change", async (t) => {
+  const { store } = fixture(t);
+  store.workflow.import(config, [item()]);
+  let refuse = true;
+  let writes = 0;
+  const github = new GitHubBroker({
+    token: "test", projects: [config.project],
+    fetcher: async (input, init) => {
+      const body = init?.body ? JSON.parse(String(init.body)) : {};
+      const query: string = body.query ?? "";
+      if (String(input).includes("/labels")) return new Response("[]");
+      if (query.startsWith("mutation {")) {
+        writes++;
+        if (refuse) return Response.json({
+          data: { i0: { issue: { id: "I1947" } }, s0: null },
+          errors: [{ path: ["s0"], message: "The item is archived and cannot be updated" }],
+        });
+        return Response.json({ data: {
+          i0: { issue: { id: "I1947" } }, s0: { projectV2Item: { id: "P1947" } },
+        } });
+      }
+      if (query.startsWith("query($ids:")) {
+        const observed = remoteMetadata(store.workflow.get("org/mobile#1947"));
+        Object.assign(observed.projectItems.nodes[0], { isArchived: false });
+        return Response.json({ data: { nodes: [observed] } });
+      }
+      if (query.startsWith("query($id:ID!)"))
+        return Response.json({ data: { node: { blockedBy: { nodes: [], pageInfo: { hasNextPage: false } } } } });
+      if (query.includes("repository"))
+        return Response.json({ data: { repository: { issues: { nodes: [], pageInfo: { hasNextPage: false } } } } });
+      throw new Error("Unexpected request: " + query);
+    },
+  });
+  const publisher = new WorkflowPublisher(store, github, { now: () => 1000 });
+  await publisher.refresh(config);
+  const revision = store.workflow.get("org/mobile#1947").revision;
+  await assert.rejects(publisher.tick(), /archived target/);
+  refuse = false;
+  await publisher.tick();
+  assert.equal(writes, 1, "stale unarchived metadata cannot release the incident");
+  await publisher.refresh(config);
+  assert.equal(store.workflow.get("org/mobile#1947").archived, undefined);
+  assert.equal(store.workflow.get("org/mobile#1947").revision, revision);
+  await publisher.tick();
+  assert.equal(writes, 2);
+  assert.equal(store.workflow.pending().length, 0);
+});

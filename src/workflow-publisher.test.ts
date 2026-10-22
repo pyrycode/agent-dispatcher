@@ -58,6 +58,9 @@ function fakeGitHub(
     unavailable?: { match: string; status: number };
     /** Answer addBlockedBy with "already been taken" without linking. */
     falselyTaken?: boolean;
+    archived?: boolean;
+    positionError?: string;
+    issueError?: string;
   } = {},
 ) {
   const edges = new Map<string, Set<string>>(
@@ -100,7 +103,7 @@ function fakeGitHub(
             data[`i${m[1]}`] = null;
             errors.push({
               path: [`i${m[1]}`],
-              message: "Could not resolve to a node",
+              message: options.issueError ?? "Could not resolve to a node",
             });
           } else data[`i${m[1]}`] = { issue: { id: m[2] } };
         }
@@ -120,6 +123,8 @@ function fakeGitHub(
       if (query.includes("updateProjectV2ItemPosition")) {
         calls.push(`position ${v.input.itemId}`);
         calls.push(`after ${v.input.itemId} ${v.input.afterId ?? "top"}`);
+        if (options.positionError)
+          return validation("updateProjectV2ItemPosition", options.positionError);
         if (
           v.input.afterId &&
           store.workflow.find(v.input.afterId)?.item.archived
@@ -206,6 +211,7 @@ function fakeGitHub(
                   nodes: [
                     {
                       id: i.id,
+                      isArchived: options.archived && i.issueNumber === 1,
                       project: { id: "P" },
                       fieldValueByName: { name: i.status },
                     },
@@ -435,4 +441,124 @@ test("an already-linked answer is only accepted when a re-read shows the link", 
   );
   assert.deepEqual(pendingTickets(store), ["org/relay#1"]);
   assert.ok(calls.includes("add I1<-I2"));
+});
+
+
+test("archived target waits for restoration across time, revisions and a full queue", async (t) => {
+  const store = fixture(t);
+  store.workflow.import(config, Array.from({ length: 12 }, (_, i) => item(i + 1)));
+  store.workflow.observe(config.project, [store.workflow.get("org/relay#1")]);
+  let now = 1000;
+  const options = { failAlias: new Set(["s0"]), archived: false };
+  const { github, calls } = fakeGitHub(store, options);
+  const publisher = new WorkflowPublisher(store, github, { now: () => now });
+  await publisher.refresh(config);
+  options.archived = true;
+  await assert.rejects(publisher.tick(), (error: Error) => {
+    assert.match(error.message, /org\/relay#1 .*s0: The item is archived/);
+    assert.doesNotMatch(error.message, /retry in/);
+    return true;
+  });
+  options.failAlias.clear();
+  calls.length = 0;
+  now += 20 * 60_000;
+  await publisher.tick();
+  assert.deepEqual(pendingTickets(store), ["org/relay#1"]);
+  assert.ok(calls.includes("issue I11"));
+  assert.ok(calls.includes("issue I12"));
+  assert.ok(!calls.includes("issue I1"));
+  store.workflow.change("org/relay#1", { status: "Done" }, "operator", "new-desired");
+  calls.length = 0;
+  await publisher.tick();
+  assert.deepEqual(calls, []);
+  assert.deepEqual(pendingTickets(store), ["org/relay#1"]);
+  options.archived = false;
+  await publisher.refresh(config);
+  await publisher.tick();
+  assert.deepEqual(pendingTickets(store), []);
+  assert.deepEqual(publisher.retrying(), []);
+  assert.equal(store.workflow.get("org/relay#1").status, "Done");
+  // A later archive refusal is a new incident and warns once again.
+  options.failAlias.add("s0");
+  store.workflow.change("org/relay#1", { status: "Backlog" }, "operator", "again");
+  await assert.rejects(publisher.tick(), /The item is archived/);
+  calls.length = 0;
+  await publisher.tick();
+  assert.deepEqual(calls, []);
+});
+
+test("an unchanged unarchived observation releases suppression without a revision change", async (t) => {
+  const store = fixture(t);
+  store.workflow.import(config, [item(1)]);
+  store.workflow.observe(config.project, [store.workflow.get("org/relay#1")]);
+  const revision = store.workflow.get("org/relay#1").revision;
+  const options = { failAlias: new Set(["s0"]) };
+  const { github, calls } = fakeGitHub(store, options);
+  const publisher = new WorkflowPublisher(store, github, { now: () => 1000 });
+  await assert.rejects(publisher.tick(), /The item is archived/);
+  options.failAlias.clear();
+  calls.length = 0;
+  await publisher.tick();
+  assert.deepEqual(calls, [], "the pre-error unarchived value is stale");
+  // A rolled-back observation must not release the hold either.
+  assert.throws(() => store.workflow.observe(config.project, [
+    store.workflow.get("org/relay#1"), item(2, { issueId: "" }),
+  ]));
+  await publisher.tick();
+  assert.deepEqual(calls, []);
+  store.workflow.observe(config.project, [store.workflow.get("org/relay#1")]);
+  assert.equal(store.workflow.get("org/relay#1").revision, revision);
+  await publisher.tick();
+  assert.deepEqual(pendingTickets(store), []);
+});
+
+for (const [message, suppressed] of [
+  ["The item is archived and cannot be updated", true],
+  ["The item is archived and cannot be used as a position anchor", false],
+] as const)
+  test(`position refusal classification: ${message}`, async (t) => {
+    const store = fixture(t);
+    store.workflow.import(config, [item(1, { positioned: true }), item(2)]);
+    const { github, calls } = fakeGitHub(store, { positionError: message });
+    const publisher = new WorkflowPublisher(store, github, { now: () => 1000 });
+    await assert.rejects(publisher.tick(), (error: Error) => {
+      assert.equal(error.message.includes("retry in"), !suppressed);
+      return true;
+    });
+    assert.deepEqual(pendingTickets(store), ["org/relay#1"]);
+    store.workflow.change("org/relay#1", { status: "Done" }, "operator", "newer");
+    calls.length = 0;
+    if (suppressed) {
+      await publisher.tick();
+      assert.deepEqual(calls, []);
+    } else {
+      await assert.rejects(publisher.tick(), /retry in/);
+      assert.ok(calls.includes("issue I1"));
+    }
+  });
+
+test("archive text on an issue mutation retains ordinary backoff and newer-revision eligibility", async (t) => {
+  const store = fixture(t);
+  store.workflow.import(config, [item(1)]);
+  const { github, calls } = fakeGitHub(store, {
+    failAlias: new Set(["i0"]), issueError: "The item is archived and cannot be updated",
+  });
+  const publisher = new WorkflowPublisher(store, github, { now: () => 1000 });
+  await assert.rejects(publisher.tick(), /retry in 30s/);
+  store.workflow.change("org/relay#1", { status: "Done" }, "operator", "newer");
+  calls.length = 0;
+  await assert.rejects(publisher.tick(), /retry in 60s/);
+  assert.ok(calls.includes("issue I1"));
+});
+
+
+test("an ambiguous archive refusal with a position anchor keeps ordinary retry handling", async (t) => {
+  const store = fixture(t);
+  store.workflow.import(config, [item(1), item(2, { positioned: true })]);
+  const { github } = fakeGitHub(store, {
+    positionError: "The item is archived and cannot be updated",
+  });
+  const publisher = new WorkflowPublisher(store, github, { now: () => 1000 });
+  await assert.rejects(publisher.tick(), /org\/relay#2 .*retry in 30s/);
+  assert.deepEqual(pendingTickets(store), ["org/relay#2"]);
 });
