@@ -1,3 +1,4 @@
+import { ClaimsHistory, historyHash } from "./claims-history.js";
 import { StageResults, type StagePlan, type StageSubmission } from "./stage-results.js";
 import { PlanningSplits, type PlanningActor } from './planning-split.js';
 import { RecoverySplits, renderRecoverySlice, splitBodyHash, splitRequirements, splitItemBasis, validateSplitAgainstTicket, validateRecoverySplit, type RecoverySplitRecord } from './recovery-split.js';
@@ -235,11 +236,13 @@ export class FleetStore {
   readonly machineRecoveries: MachineRecoveries;
   readonly verifierHandoffs: VerifierHandoffs;
   readonly storage: StorageMaintenance;
+  readonly history: ClaimsHistory;
   private readonly clock: () => number;
   constructor(path: string, private readonly limits: Readonly<Record<string, MachineLimits>>, options: FleetStoreOptions = {}) {
     for (const value of Object.values(limits)) validateLimits(value);
     this.db = new DatabaseSync(path);
     this.db.exec(`
+      PRAGMA auto_vacuum=INCREMENTAL;
       PRAGMA busy_timeout=5000;
       PRAGMA journal_mode=WAL;
       PRAGMA synchronous=FULL;
@@ -262,7 +265,7 @@ export class FleetStore {
         revision INTEGER NOT NULL CHECK(revision>0)
       ) STRICT;
     `);
-    this.workflow = new WorkflowStore(this.db);
+    this.workflow = new WorkflowStore(this.db, options.now ?? Date.now);
     this.stages = new StageResults(this.db);
     this.machineRecoveries = new MachineRecoveries(this.db);
     this.recovery = new RecoveryLedger(this.db, Date.now, options);
@@ -288,6 +291,7 @@ export class FleetStore {
     this.codex = new CodexThrottle(this.db, clock, options.codexThrottle ?? DEFAULT_CODEX_THROTTLE, options.log);
     this.desired = new DesiredStateStore(this.db, Object.keys(limits), clock, machine => this.machineCapabilities()[machine]?.projects);
     this.flaky = new FlakySightingLedger(this.db, clock);
+    this.history = new ClaimsHistory(this.db, ticket => this.ticketDone(ticket), clock);
   }
   close(): void { this.db.close(); }
   private storageBasis(request:StorageRequest,attesting=false):string {
@@ -357,7 +361,10 @@ export class FleetStore {
     const source=id.startsWith("acceptance:")?id.slice("acceptance:".length):id;
     if(source!==id && !this.stages.get(source))return undefined;
     const run = this.db.prepare("SELECT machine,ticket,request FROM fleet_runs WHERE id=?").get(source);
-    if (!run) return undefined;
+    if (!run) {
+      const retired = this.db.prepare('SELECT machine,ticket,role FROM fleet_retired_runs WHERE id=?').get(source);
+      return retired ? {machine: String(retired.machine), ticket: String(retired.ticket), role: String(retired.role)} : undefined;
+    }
     let role = "unknown";
     try { role = String(JSON.parse(String(run.request)).role ?? "unknown"); } catch { /* an unreadable request still names its computer */ }
     return { machine: String(run.machine), ticket: String(run.ticket), role };
@@ -1084,6 +1091,12 @@ export class FleetStore {
   start(req: StartRequest): StartResult {
     return this.transaction(() => {
       const prior=this.db.prepare('SELECT id FROM fleet_runs WHERE id=?').get(req.id);
+      const retired = !prior && this.db.prepare('SELECT verification_pin FROM fleet_retired_runs WHERE id=?').get(req.id);
+      if (retired) {
+        if (!req.verificationPin && req.role === 'verifier' && retired.verification_pin)
+          req = {...req, verificationPin: JSON.parse(String(retired.verification_pin))};
+        return this.startAdmitted(req);
+      }
       if(req.verificationPin && !prior) throw new Error('Verification pins require operator handoff admission');
       if(!req.verificationPin && req.role==='verifier') {
         const saved=prior ? this.db.prepare('SELECT request FROM fleet_runs WHERE id=?').get(req.id) : undefined;
@@ -1108,6 +1121,11 @@ export class FleetStore {
     validateStart(req);
     if (!Object.hasOwn(this.limits, req.machine)) throw new Error("Unknown machine");
     const request = JSON.stringify({ ...req, locks: [...new Set(req.locks)].sort() });
+    const retired = this.db.prepare('SELECT request_hash FROM fleet_retired_runs WHERE id=?').get(req.id);
+    if (retired) {
+      if (retired.request_hash !== historyHash(request)) throw new Error('Request ID reused with different contents');
+      return {ok: false, reason: 'finished'};
+    }
       const previous = this.db.prepare("SELECT request,generation,finished FROM fleet_runs WHERE id=?").get(req.id);
       if (previous) {
         const { runnerPolicy: _policy, ...original } = JSON.parse(String(previous.request));

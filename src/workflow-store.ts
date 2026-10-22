@@ -1,3 +1,4 @@
+import { initializeCommandHistory, historyHash } from "./claims-history.js";
 import { parseFeatureRoot } from "./feature-lineage.js";
 import type { EvidenceSeen } from "./evidence-revision.js";
 import type { DatabaseSync } from "node:sqlite";
@@ -74,7 +75,7 @@ export class WorkflowStore {
   private readonly labelTickets = new Map<string, { version: number; tickets: string[] }>();
   private reviewTickets: { version: number; tickets: string[] } | undefined;
   private requirementTickets: { version: number; tickets: Record<string, string[]> } | undefined;
-  constructor(private readonly db: DatabaseSync) {
+  constructor(private readonly db: DatabaseSync, private readonly now = Date.now) {
     db.exec(`CREATE TABLE IF NOT EXISTS workflow_projects (project TEXT PRIMARY KEY, config TEXT NOT NULL) STRICT;
       CREATE TABLE IF NOT EXISTS workflow_migrations (project TEXT PRIMARY KEY) STRICT;
       CREATE TABLE IF NOT EXISTS workflow_tickets (
@@ -91,6 +92,7 @@ export class WorkflowStore {
       CREATE INDEX IF NOT EXISTS workflow_parent ON workflow_tickets(project,json_extract(item,'$.parentNumber'));
       CREATE INDEX IF NOT EXISTS workflow_order ON workflow_tickets(project,position);
       CREATE INDEX IF NOT EXISTS workflow_status ON workflow_tickets(json_extract(item,'$.status'));`);
+    initializeCommandHistory(db, this.now());
     this.migrateRecoveryPriority();
     this.migrateRepairing();
   }
@@ -595,6 +597,9 @@ export class WorkflowStore {
       throw new Error("Invalid workflow command");
     const request = JSON.stringify({ ticket, change, actor, expectedRevision });
     return this.transaction(() => {
+      const retired = this.db.prepare('SELECT request_hash FROM fleet_retired_commands WHERE id=?').get(commandId);
+      if (retired) throw new Error(retired.request_hash === historyHash(request)
+        ? 'Workflow command expired; retained identity cannot be applied again' : 'Workflow command identity reused');
       const replay = this.db
         .prepare("SELECT * FROM workflow_commands WHERE id=?")
         .get(commandId);
@@ -713,6 +718,7 @@ export class WorkflowStore {
       this.db
         .prepare("INSERT INTO workflow_commands VALUES (?,?,?,?)")
         .run(commandId, ticket, request, JSON.stringify(updated));
+      this.db.prepare('INSERT INTO workflow_command_ages VALUES (?,?)').run(commandId, this.now());
       return updated;
     });
   }
