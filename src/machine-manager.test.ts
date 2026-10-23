@@ -110,3 +110,22 @@ test("a restarted manager reports its start time so supervisors can tell a repor
   assert.equal(status.managerStartedAt, 5_000);
   assert.equal(status.projects[0].health, "not-registered");
 });
+
+// pyrycode-mobile #2442, 2026-10-23: a queued support task no computer could
+// run held the ticket at admission, while the queue showed it eligible.
+test("the queue reports support-task-open for exactly the stages admission refuses", async () => {
+  const store = new FleetStore(":memory:", { mac: { heavyLimit: 2, combinedLimit: 2 } });
+  const client = { snapshot: async () => ({ ...store.snapshot(), openTaskTickets: store.openTaskTickets() }),
+    start: async (r: any) => store.start(r), finish: async (s: string, id: string) => store.finish("mac", s, id) };
+  const manager = new MachineManager({ machine: "mac", heavyLimit: 2, combinedLimit: 2, projects: ["org/core"] }, client);
+  const work = (n: number, role: string): WorkOffer => ({ project: "org/core", ticket: `org/core#${n}`, role, resource: "heavy", key: `${n}-${role}`, order: n, locks: [] });
+  store.tasks.request("org/core#1", { recipe: "platform-probe", capability: "linux-amd64", reason: "Native check" });
+  manager.offer("org/core", "s", [work(1, "builder"), work(2, "builder")]);
+  const queue = Object.fromEntries((await manager.status()).queue.map(q => [q.ticket, q.state]));
+  assert.deepEqual(queue, { "org/core#1": "support-task-open", "org/core#2": "eligible" });
+  // The same predicate holds at admission.
+  assert.deepEqual(store.start({ id: "direct", machine: "mac", session: "x", project: "org/core", ticket: "org/core#1", role: "builder", resource: "heavy", locks: [] }), { ok: false, reason: "locked" });
+  await manager.tick(); await manager.tick();
+  assert.deepEqual(store.snapshot().runs.map(r => r.ticket), ["org/core#2"]);
+  store.close();
+});

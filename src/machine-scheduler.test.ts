@@ -324,3 +324,23 @@ test("an unclaimed priority:high verifier goes ahead of another computer's owned
   const owned: FleetSnapshot = { ...empty, claims: [claimOf(ownBuilder, 1, "hp")] };
   assert.deepEqual(hp([verifier(3354), offer("org/core", 1), ownBuilder], urgent(owned, offer("org/core", 1))), [ownBuilder.ticket]);
 });
+
+// pyrycode-mobile #2442, 2026-10-23: admission refused every stage while a
+// support task sat queued, but the queue showed the ticket eligible.
+test("a ticket with an open support task is held as support-task-open, except its recovery assessment", async () => {
+  const { workEligibility } = await import("./machine-scheduler.js");
+  const policy = { machine: "mac", projects: ["org/core", "org/mobile"] };
+  const state: FleetSnapshot = { ...empty, openTaskTickets: ["org/mobile#2"] };
+  assert.equal(workEligibility(offer("org/mobile", 2), state, policy), "support-task-open");
+  assert.equal(workEligibility({ ...offer("org/mobile", 2), role: "verifier" }, state, policy), "support-task-open");
+  assert.equal(workEligibility({ ...offer("org/mobile", 2), role: "recovery" }, state, policy), undefined);
+  assert.equal(workEligibility(offer("org/core", 1), state, policy), undefined);
+  // The support task itself serves the ticket and is not held by it.
+  const task: WorkOffer = { ...offer("org/mobile", 3), ticket: `org/mobile#@task-${"a".repeat(64)}`, role: "recovery-task",
+    supportTaskId: "a".repeat(64), parentTicket: "org/mobile#2" };
+  assert.equal(workEligibility(task, state, policy), undefined);
+  // An older claim service leaves the list out, which holds nothing.
+  assert.equal(workEligibility(offer("org/mobile", 2), empty, policy), undefined);
+  // The scheduler passes over it for work that can start.
+  assert.deepEqual(select([offer("org/mobile", 2), offer("org/core", 1)], state).map(o => o.ticket), ["org/core#1"]);
+});
