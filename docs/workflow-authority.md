@@ -546,6 +546,32 @@ parent blockers remain as history. Closing the replaced parent records that
 the original feature is incomplete. Feature completion requires the named leaf
 results to merge and pass the full acceptance contract.
 
+### Builder scope discovery before review
+
+A builder can request assessment during planning, implementation or repair.
+Codex returns `needs_scope_review` with the original estimate, newly discovered
+work, completed and remaining work, preserved source references and proposed
+independently testable parts. Claude posts that assessment through the managed
+bridge and adds `error:builder:scope`. The dispatcher preserves the worktree
+without auto-committing or pushing. No completion is recorded. The error marker
+blocks ordinary advancement and stale rework routing until recovery assesses it.
+An unchanged `retry` cannot clear it. A justified bounded repair uses `rework`.
+
+Recovery may use the existing split transaction with classification
+`discovered-scope`. This requires the scope marker and substantive retained
+builder evidence from this ticket. The current recovery decision records its
+assessment. Earlier verifier and recovery evidence must be inspected when
+available, but their absence before implementation is not a reason to wait for
+failures. The ordinary `accumulating-behaviours` path still requires repeated
+rework and builder, verifier and recovery evidence.
+
+Both paths retain exact acceptance requirements, useful child results, regressions,
+feature lineage, prior behaviour allocation, work and evidence references,
+ordered dependencies, ownership, holds and normal acceptance. The same guards
+prevent changes while affected workers are active and resume interrupted splits
+without creating duplicate children. Depth alone cannot force the builder to
+continue an oversized migration. A bug and its regression stay together.
+
 ### Retrying a stopped recovery split
 
 Use the protected operator wrapper with the original incident identity:

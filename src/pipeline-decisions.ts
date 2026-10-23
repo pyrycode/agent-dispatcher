@@ -398,6 +398,9 @@ export function decideReworkRoutes(
       // label from routing, and this route strips it with the other wip:
       // labels, so a failed marker removal cannot deadlock the ticket.
       if (hasRunningWip(item.labels)) continue;
+      // Scope handoffs belong to recovery. A stale rework label must not erase
+      // the assessment request and send the same oversized work back to a builder.
+      if (item.labels.includes("error:builder:scope")) continue;
 
       // First valid rework label wins. Iterate in array order for
       // determinism — same order GitHub returns from the labels query.

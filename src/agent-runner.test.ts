@@ -665,3 +665,10 @@ describe("Codex rate limit detection", () => {
     assert.equal(s.responded, true);
   });
 });
+
+test("Codex builder can request scope assessment after discovering additional work", () => {
+  const adapter = new CodexStreamAdapter();
+  adapter.accept({type:"item.completed",item:{type:"agent_message",text:JSON.stringify({status:"needs_scope_review",summary:"Migrate supported consumers before enforcing admission"})}});
+  adapter.accept({type:"turn.completed",usage:{input_tokens:1,output_tokens:1}});
+  assert.equal(adapter.finish(0, false, 1).terminalReason,"needs_scope_review");
+});

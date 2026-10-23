@@ -745,6 +745,13 @@ A Codex turn that fails with "Selected model is at capacity. Please try a differ
 model." takes the capped API retry, like "Unable to verify model access right
 now". Five mobile tickets parked on it on 2026-10-05.
 
+A builder that discovers unexpected oversized work during planning, implementation
+or repair returns `status: needs_scope_review`. The dispatcher preserves partial
+work and requests orchestrator assessment instead of advancing the ticket.
+Claude builders use the equivalent `error:builder:scope` workflow label.
+Recovery can split at any depth from retained builder evidence without waiting
+for failed reviews. See [builder scope discovery](docs/workflow-authority.md#builder-scope-discovery-before-review).
+
 A builder may instead return `status: needs_refinement` for a planning problem.
 The dispatcher posts its explanation on the assigned issue and adds
 `needs-rework:refiner`. The existing rework router moves it back to refinement.
