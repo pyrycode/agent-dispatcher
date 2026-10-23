@@ -101,6 +101,22 @@ choice and does not change the database workflow or pause scheduling.
 Position updates use the nearest preceding unarchived card, or the top when
 there is none. Archived neighbours do not prevent dependency publication.
 
+If GitHub attributes a Project-field or position refusal to the target being
+archived, the publisher warns once for that incident and leaves the revision
+pending. It suppresses further writes for the ticket during that publisher's
+lifetime. Elapsed backoff and newer desired revisions do not release it. Other
+tickets continue, including those beyond the first pending batch. A newer accepted
+GitHub observation confirming the target is unarchived releases suppression,
+even when its metadata is unchanged. A content-only refresh without archive
+metadata preserves the known archive state and cannot release suppression.
+Only an archived card stores a flag. Observing an unarchived card stores no
+value, so it does not change the ticket revision.
+A failed observation transaction does not.
+An archived position anchor, issue or dependency error, HTTP deferral or
+unattributed batch error retains the ordinary failure handling. Suppression does
+not change workflow authority or the stored archive flag. It is not durable
+across publisher restarts.
+
 ## Migration
 
 Normal claims-service startup adds non-unique ticket indexes to `fleet_runs`

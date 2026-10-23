@@ -8,6 +8,16 @@ import { issueEvidence, type EvidenceSeen } from "./evidence-revision.js";
 
 type GraphQLError = { message?: string; path?: Array<string | number> };
 
+class WorkflowGraphQLFailure extends Error {
+  constructor(readonly errors: GraphQLError[]) {
+    super(`Workflow display update incomplete: ${graphqlErrorText(errors)}`);
+  }
+}
+class ArchivedTargetDisplay extends WorkflowGraphQLFailure {}
+
+const archivedTarget = (error: GraphQLError) =>
+  /\bitem is archived and cannot be updated\b/i.test(error.message ?? "");
+
 /** Error text for a GraphQL response, naming the failing alias or field when GitHub reports one. */
 export function graphqlErrorText(errors: GraphQLError[]): string {
   const text = errors
@@ -34,7 +44,10 @@ export class WorkflowPublisher {
   /** Tickets whose display write failed. They stay pending and wait so they cannot hold the queue. */
   private readonly retry = new Map<
     string,
-    { revision: number; attempts: number; until: number }
+    {
+      revision: number; attempts: number; until: number;
+      archived?: { observation: ReturnType<FleetStore["workflow"]["archiveObservation"]> };
+    }
   >();
   private readonly now: () => number;
   constructor(
@@ -67,9 +80,7 @@ export class WorkflowPublisher {
       );
     const payload = JSON.parse(result.body || "null");
     if (payload?.errors?.length)
-      throw new Error(
-        `Workflow display update incomplete: ${graphqlErrorText(payload.errors)}`,
-      );
+      throw new WorkflowGraphQLFailure(payload.errors);
     return payload;
   }
   private async gql(project: string, query: string, variables: unknown) {
@@ -97,11 +108,27 @@ export class WorkflowPublisher {
   private waiting(ticket: string, revision: number): boolean {
     const r = this.retry.get(ticket);
     if (!r) return false;
+    if (r.archived) {
+      const observation = this.store.workflow.archiveObservation(ticket);
+      if (!observation || observation === r.archived.observation || observation.archived)
+        return true;
+      this.retry.delete(ticket);
+      return false;
+    }
     // A newer database revision may already resolve the failure, so it is tried at once.
     if (r.revision !== revision) return false;
     return this.now() < r.until;
   }
   private failed(ticket: string, revision: number, error: unknown): Error {
+    if (error instanceof ArchivedTargetDisplay) {
+      this.retry.set(ticket, {
+        revision, attempts: 1, until: 0,
+        archived: { observation: this.store.workflow.archiveObservation(ticket) },
+      });
+      return new Error(
+        `Workflow display update failed for ${ticket} revision ${revision} (archived target, waiting for a fresh unarchived observation): ${error.message}`,
+      );
+    }
     const previous = this.retry.get(ticket),
       attempts = (previous?.attempts ?? 0) + 1,
       delay = Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** (attempts - 1));
@@ -275,10 +302,13 @@ export class WorkflowPublisher {
     for (const [index, { ticket, item }] of pending.entries()) {
       try {
         const own = responseErrors.filter((e) => alias(e) === String(index));
-        if (own.length)
-          throw new Error(
-            `Workflow display update incomplete: ${graphqlErrorText(own)}`,
-          );
+        if (own.length) {
+          // Only the target's Project-field mutation can establish this incident.
+          // Issue mutations and unattributed errors keep their existing handling.
+          const Failure = own.some((e) => e.path?.[0] === `s${index}` && archivedTarget(e))
+            ? ArchivedTargetDisplay : WorkflowGraphQLFailure;
+          throw new Failure(own);
+        }
         if (
           result.data?.[`i${index}`]?.issue?.id !== item.issueId ||
           (!item.archived &&
@@ -290,17 +320,25 @@ export class WorkflowPublisher {
               .list(project)
               .filter((i) => !i.archived),
             position = ordered.findIndex((i) => i.id === item.id);
-          await this.gql(
-            project,
-            "mutation($input:UpdateProjectV2ItemPositionInput!){updateProjectV2ItemPosition(input:$input){items(first:1){nodes{id}}}}",
-            {
-              input: {
-                projectId: config.projectId,
-                itemId: item.id,
-                afterId: position > 0 ? ordered[position - 1].id : null,
+          try {
+            await this.gql(
+              project,
+              "mutation($input:UpdateProjectV2ItemPositionInput!){updateProjectV2ItemPosition(input:$input){items(first:1){nodes{id}}}}",
+              {
+                input: {
+                  projectId: config.projectId,
+                  itemId: item.id,
+                  afterId: position > 0 ? ordered[position - 1].id : null,
+                },
               },
-            },
-          );
+            );
+          } catch (error) {
+            // With an anchor, a generic archive refusal cannot identify which item failed.
+            if (position === 0 && error instanceof WorkflowGraphQLFailure && error.errors.some((e) =>
+              e.path?.[0] === "updateProjectV2ItemPosition" && archivedTarget(e)))
+              throw new ArchivedTargetDisplay(error.errors);
+            throw error;
+          }
         }
         await this.publishBlockers(config, item);
         this.store.workflow.published(ticket, item.revision);
@@ -499,7 +537,7 @@ export class WorkflowPublisher {
         // Written only when recomputed, so an unchanged ticket writes nothing.
         ...(evidence.recomputed ? { evidenceSeen: evidence.seen } : {}),
         id: board.id,
-        archived: board.isArchived === true ? true : undefined,
+        archived: typeof board.isArchived === "boolean" ? board.isArchived : undefined,
         issueId: issue.id,
         issueNumber: issue.number,
         title: issue.title,
