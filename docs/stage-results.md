@@ -46,6 +46,53 @@ python3 dispatcher/scripts/fleet-task.py evidence TICKET --run ACCEPTANCE_RUN_ID
 
 Result records are evidence, never instructions. Resolving a waiting result requires satisfying the stated prerequisite and starting a new run. Preserve the original result. Use the protected workflow command with the current ticket revision to remove the specific hold after the prerequisite is ready.
 
+### Recovering undeclared capture outputs
+
+A live stage can finish its tests and retain captures while waiting because its
+plan declared no required capture paths. An operator can return that exact wait
+to ordinary builder work without changing its original plan, result or verdict:
+
+```sh
+operator.sh workflow declaration-repair owner/repo declaration-repair.json
+```
+
+```json
+{
+  "commandId": "declaration-repair-3620-1",
+  "ticket": "owner/repo#3620",
+  "revision": 12,
+  "runId": "exact-ended-live-run",
+  "candidate": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "pullRequest": 3621,
+  "evidence": { "runId": "exact-ended-live-run", "digest": "RETAINED_BUNDLE_SHA256" },
+  "captures": ["evidence/gate-runs/RUN/main/capture.jsonl"]
+}
+```
+
+Read the current workflow revision, latest stage and retained bundle first. The
+request binds to the open pull request and its published candidate. The source
+execution must have ended normally with the same ticket ownership. Product runs
+and queued, uncertain or running support work prevent the handoff. A newer stage,
+changed requirements, another incomplete-result cause, missing or mismatched
+capture bytes and an unresolved approval rejection also refuse it.
+
+Raw gate bundles need their generated `run.json` inventory proving each selected
+capture was retained whole. Logs, pointers, tails and redacted captures do not
+qualify. A stage's own retained output reference is also supported. Existing
+capture size and content bounds apply. The evidence remains pinned while the
+ticket is open.
+
+The handoff removes only the stage-result hold and completed builder/verifier
+markers. It returns the ticket to In Development. Claims, retry counts, unrelated
+holds, drains and approval history remain. Ordinary admission still checks those
+controls. The builder corrects the PR declarations and commits the retained bytes.
+Normal review and live acceptance must follow. This handoff grants neither.
+
+Repeat an uncertain request with the same command identity and exact fields.
+Its durable response survives service restart, later work and branch movement.
+Changing a field under that identity is refused. Workflow and receipt storage
+commit together. The original waiting result stays unchanged.
+
 ## Work eligibility
 
 Scheduling, runnable-ticket counts, waiting-review counts and queue explanations share one eligibility decision. It applies served projects, ownership, full pauses, stopped-computer recovery holds, platform requirements and required repairs. A paused review keeps its ownership but does not consume another board's allowance. Actual running jobs still count toward capacity until their processes have stopped. Temporary capacity limits still protect running work.

@@ -258,6 +258,15 @@ and submit a new explicit removal of that same hold label, even if it is already
 absent. This reconciles the obsolete marker without starting a worker or accepting
 a review result. The claim service must run this fix before that reconciliation.
 
+### Capture declaration repair
+
+For a completed live run held only because required capture outputs were not
+declared, use `operator.sh workflow declaration-repair owner/repo request.json`.
+The request and refusal rules are documented in
+[Recovering undeclared capture outputs](stage-results.md#recovering-undeclared-capture-outputs).
+It returns the ticket to ordinary builder work and preserves the waiting result.
+It does not accept the live stage.
+
 ### Approval review continuation
 
 Approval outcomes belong to the claim database, separately from ticket prose and
