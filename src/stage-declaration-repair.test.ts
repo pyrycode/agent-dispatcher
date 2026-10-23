@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { FleetStore, type StartRequest } from './fleet-store.js';
@@ -188,4 +191,34 @@ test('changed ticket requirements cannot reuse the old declaration wait',()=>{
   assert.throws(()=>store.repairStageDeclaration({...input,revision:current.revision},evidence),/requirements changed/);
   assert.deepEqual(store.workflow.get(ticket),current);
  }finally{evidence.close();store.close();}
+});
+
+test('protected declaration repair CLI reaches the authority and replays the saved handoff',async t=>{
+ const {serveFleet}=await import('./fleet-http.js');
+ const {GitHubBroker}=await import('./github-broker.js');
+ const {store,evidence,input,waiting}=fixture();
+ const directory=mkdtempSync(join(tmpdir(),'declaration-cli-'));
+ let head=sha;
+ const github=new GitHubBroker({token:'test',projects:[project],fetcher:async url=>new Response(JSON.stringify(
+  String(url).includes('/pulls/')?{state:'open',head:{sha:head,ref:'feature/3620',repo:{full_name:project}}}:{object:{sha:head}}
+ ))});
+ const server=await serveFleet(store,{linux:'linux-fixture'},'operator-fixture',0,'127.0.0.1',github,undefined,undefined,undefined,undefined,evidence);
+ t.after(async()=>{await new Promise<void>(resolve=>server.close(()=>resolve()));evidence.close();store.close();rmSync(directory,{recursive:true});});
+ const address=server.address();assert.ok(address&&typeof address!=='string');
+ const configPath=join(directory,'operator.json'),requestPath=join(directory,'request.json');
+ writeFileSync(configPath,JSON.stringify({claimsUrl:`http://127.0.0.1:${address.port}`,claimsOperatorTokenEnv:'DECLARATION_TEST_OPERATOR_TOKEN'}));
+ writeFileSync(requestPath,JSON.stringify(input));
+ const invoke=async()=>{
+  const result=await promisify(execFile)(process.execPath,['--import','tsx','src/fleet-bin.ts','workflow',configPath,'declaration-repair',project,requestPath],{
+   cwd:fileURLToPath(new URL('../',import.meta.url)),timeout:15000,
+   env:{PATH:process.env.PATH,HOME:process.env.HOME,DECLARATION_TEST_OPERATOR_TOKEN:'operator-fixture'}
+  });
+  return JSON.parse(result.stdout);
+ };
+ const accepted=await invoke();
+ assert.equal(accepted.status,'In Development');
+ assert.deepEqual(store.stages.get('capture'),waiting);
+ head='b'.repeat(40);
+ assert.deepEqual(await invoke(),accepted,'retry uses the saved outcome after publication moves');
+ assert.equal(Buffer.from(evidence.read(ticket,'capture',input.evidence.digest,capture,0).data,'base64').toString(),text);
 });
