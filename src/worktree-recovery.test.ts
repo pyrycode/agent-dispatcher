@@ -44,7 +44,7 @@ import { managedPredecessorFinished, IN_PROGRESS_GIT_PATHS } from './worktree.js
 import type { DispatchDeps, DispatchClient } from './dispatch.js';
 import type { AgentConfig, ProjectItem } from './types.js';
 
-test('only an admitted successor in the same ownership generation confirms shutdown', () => {
+test('only the exact finished predecessor and an admitted sole successor confirm shutdown', () => {
   const prior: FleetRun = { id: 'prior', session: 's1', generation: 'g1', machine: 'local', project: 'org/desktop',
     ticket: 'org/desktop#1936', role: 'verifier', created: 1, resource: 'medium', locks: [] };
   const current = { ...prior, id: 'next', session: 's2', role: 'builder', created: 2 };
@@ -59,6 +59,73 @@ test('only an admitted successor in the same ownership generation confirms shutd
   ]) assert.equal(managedPredecessorFinished(prior, current, snapshot, prior), false);
   assert.equal(managedPredecessorFinished({ ...prior, ticket: 'org/desktop#9999' }, current, state, prior), false);
   assert.equal(managedPredecessorFinished({ ...prior, generation: 'old-owner' }, current, state, prior), false);
+});
+
+// pyrycode-mobile #2338 and #2442, 2026-10-23: completed, clean, pushed
+// predecessors were refused because later runs had moved the ownership on.
+test('a predecessor from an earlier ownership generation confirms shutdown only after a normal completion', () => {
+  const prior: FleetRun = { id: 'prior', session: 's1', generation: 'g1', machine: 'local', project: 'org/mobile',
+    ticket: 'org/mobile#2338', role: 'builder', created: 1, resource: 'heavy', locks: [] };
+  const current = { ...prior, id: 'next', session: 's2', generation: 'g3', created: 5 };
+  const state: FleetSnapshot = { runs: [current], claims: [{ ticket: prior.ticket, machine: 'local', generation: 'g3', created: 4 }] };
+  assert.equal(managedPredecessorFinished(prior, current, state, { ...prior, outcome: 'completed' }), true);
+  // Stopped-worker recovery cancels and releases; an older authority reports no outcome.
+  assert.equal(managedPredecessorFinished(prior, current, state, { ...prior, outcome: 'cancelled' }), false);
+  assert.equal(managedPredecessorFinished(prior, current, state, prior), false);
+  // Unknown predecessor, or the authority does not show it finished.
+  assert.equal(managedPredecessorFinished(prior, current, state, null), false);
+  assert.equal(managedPredecessorFinished(prior, current, state, { ...prior, id: 'unknown', outcome: 'completed' }), false);
+  assert.equal(managedPredecessorFinished(prior, current, state, { ...prior, session: 'other', outcome: 'completed' }), false);
+  // A different machine, another live run, or the successor no longer holding the claim.
+  const done = { ...prior, outcome: 'completed' as const };
+  assert.equal(managedPredecessorFinished({ ...prior, machine: 'other' }, current, state, { ...done, machine: 'other' }), false);
+  assert.equal(managedPredecessorFinished(prior, current, { ...state, runs: [current, { ...current, id: 'another', session: 's3' }] }, done), false);
+  assert.equal(managedPredecessorFinished(prior, current, { ...state, runs: [current, prior] }, done), false);
+  assert.equal(managedPredecessorFinished(prior, current, { ...state, claims: [{ ...state.claims[0]!, generation: 'g4' }] }, done), false);
+});
+
+test('the authority confirms an earlier generation\'s predecessor only by its exact normal completion on this machine', () => {
+  const store = new FleetStore(':memory:', { local: { heavyLimit: 9, combinedLimit: 9 }, other: { heavyLimit: 9, combinedLimit: 9 } });
+  try {
+    const project = 'org/mobile';
+    const run = (id: string, ticket: number, role: string, machine = 'local') => {
+      const req = { id, session: `${id}-session`, machine, project, ticket: `${project}#${ticket}`, role, resource: 'heavy' as const, locks: [] };
+      assert.equal(store.start(req).ok, true, id);
+      return store.snapshot().runs.find(r => r.id === id)!;
+    };
+    const release = (ticket: number) => {
+      const claim = store.snapshot().claims.find(c => c.ticket === `${project}#${ticket}`)!;
+      store.free(claim.ticket, claim.generation, true);
+    };
+    // Completed, then ownership moved on through a later completed run.
+    const prior = run('prior', 1, 'builder');
+    store.finish('local', prior.session, prior.id, true);
+    release(1);
+    const between = run('between', 1, 'verifier');
+    store.finish('local', between.session, between.id, true);
+    release(1);
+    const next = run('next', 1, 'builder');
+    assert.notEqual(next.generation, prior.generation);
+    assert.deepEqual(store.worktreePredecessor('local', next.session, next.id, prior.id), { ...prior, outcome: 'completed' });
+    assert.equal(store.worktreePredecessor('local', next.session, next.id, 'never-admitted'), null);
+    // Cancelled, as stopped-worker recovery finishes a run, then released.
+    const cancelled = run('cancelled', 2, 'builder');
+    store.finish('local', cancelled.session, cancelled.id, false);
+    release(2);
+    const after = run('after-cancel', 2, 'builder');
+    assert.equal(store.worktreePredecessor('local', after.session, after.id, cancelled.id), null);
+    // Operator release without a normal outcome.
+    const freed = run('freed', 3, 'builder');
+    release(3);
+    const afterFree = run('after-free', 3, 'builder');
+    assert.equal(store.worktreePredecessor('local', afterFree.session, afterFree.id, freed.id), null);
+    // A completed predecessor on another machine.
+    const remote = run('remote', 4, 'builder', 'other');
+    store.finish('other', remote.session, remote.id, true);
+    release(4);
+    const local = run('local', 4, 'builder');
+    assert.equal(store.worktreePredecessor('local', local.session, local.id, remote.id), null);
+  } finally { store.close(); }
 });
 
 // Real Git repos and a real authority ledger; no network, pipeline writes,
@@ -195,6 +262,75 @@ test('managed verifier FAIL hands its entire retained tree to builder safely', a
     assert.equal(readFileSync(join(f.path, '.codegraph', 'codegraph.db-wal'), 'utf8'), 'retained WAL bytes\n');
     f.finish();
   });
+  // pyrycode-mobile #2338 and #2442, 2026-10-23: the ownership generation
+  // moved on through later completed runs after a clean predecessor finished.
+  const laterGeneration = (f: Awaited<ReturnType<typeof fixture>>, finishPrior: 'completed' | 'cancelled' | 'freed' = 'completed') => {
+    if (finishPrior !== 'freed') store.finish('local', f.prior.session, f.prior.id, finishPrior === 'completed');
+    const release = () => {
+      const claim = store.snapshot().claims.find(c => c.ticket === f.prior.ticket)!;
+      store.free(claim.ticket, claim.generation, true);
+    };
+    release();
+    const between = { id: `${f.number}-qa`, session: `${f.number}-qa-session`, machine: 'local', project: 'org/desktop',
+      ticket: f.prior.ticket, role: 'qa', resource: 'medium' as const, locks: [] };
+    assert.equal(store.start(between).ok, true);
+    store.finish('local', between.session, between.id, true);
+  };
+  await t.test('a completed predecessor from an earlier ownership generation hands over its tree', async () => {
+    const f = await fixture();
+    laterGeneration(f);
+    const claims = store.snapshot().claims;
+    const ctx = f.builder();
+    assert.notEqual(ctx.deps.managedWorktree!.run.generation, f.prior.generation);
+    const checked: string[] = [];
+    ctx.deps.processesUsingPath = path => { checked.push(path); return []; };
+    assert.deepEqual(await setupBranchAndWorktree(ctx), { ok: true });
+    assert.equal(ctx.worktreeDir, f.path);
+    assert.ok(checked.includes(f.path), 'nothing may still use the tree');
+    assert.equal(JSON.parse(readFileSync(managedWorktreeRecordPath(f.path), 'utf8')).run.id, ctx.deps.managedWorktree!.run.id);
+    assert.deepEqual(store.snapshot().claims, claims);
+    assert.match(readFileSync(join(f.path, 'FAIL-evidence.txt'), 'utf8'), /gate FAIL/);
+    assert.ok(!f.commands.some(cmd => /worktree (add|remove|move)|branch -f|reset|git push/.test(cmd)));
+  });
+  for (const condition of ['process using the path', 'process check failed', 'predecessor still running', 'predecessor freed by the operator', 'predecessor cancelled and released', 'unknown predecessor', 'another live run', 'different machine']) {
+    await t.test(`after an ownership change, refuses ${condition} without touching the tree`, async () => {
+      const f = await fixture();
+      const recordPath = managedWorktreeRecordPath(f.path);
+      if (condition === 'unknown predecessor' || condition === 'different machine') {
+        const record = JSON.parse(readFileSync(recordPath, 'utf8'));
+        if (condition === 'unknown predecessor') record.run.id = 'never-admitted'; else record.run.machine = 'other';
+        writeFileSync(recordPath, JSON.stringify(record));
+      }
+      laterGeneration(f, condition === 'predecessor freed by the operator' ? 'freed' : condition === 'predecessor cancelled and released' ? 'cancelled' : 'completed');
+      const ctx = f.builder();
+      const managed = ctx.deps.managedWorktree!;
+      const authority = managed.snapshot;
+      if (condition === 'predecessor still running') {
+        managed.snapshot = async () => { const state = await authority(); return { ...state, runs: [...state.runs, f.prior] }; };
+        managed.predecessor = async () => null;
+      }
+      if (condition === 'another live run') managed.snapshot = async () => {
+        const state = await authority();
+        return { ...state, runs: [...state.runs, { ...managed.run, id: 'another', session: 'another-session', role: 'qa' }] };
+      };
+      ctx.deps.processesUsingPath = () => {
+        if (condition === 'process check failed') throw new Error('lsof output incomplete');
+        return condition === 'process using the path' ? [4242] : [];
+      };
+      const comments: string[] = [];
+      ctx.client = { addComment: async (_n: number, body: string) => { comments.push(body); }, addLabel: async () => {} } as unknown as DispatchClient;
+      const beforeHead = git('rev-parse', `feature/${f.number}`);
+      const record = readFileSync(recordPath, 'utf8');
+      assert.deepEqual(await setupBranchAndWorktree(ctx), { ok: false });
+      assert.match(comments.join('\n'), condition === 'process using the path' ? /4242 still use/ : condition === 'process check failed' ? /could not be checked/ : /not confirmed the prior worker/);
+      assert.equal(git('rev-parse', `feature/${f.number}`), beforeHead);
+      assert.equal(readFileSync(recordPath, 'utf8'), record);
+      assert.equal(existsSync(worktreePath(repo, `builder-${f.number}`)), false);
+      assert.match(readFileSync(join(f.path, 'FAIL-evidence.txt'), 'utf8'), /gate FAIL/);
+      assert.equal(readFileSync(join(f.path, '.codegraph', 'codegraph.db-wal'), 'utf8'), 'retained WAL bytes\n');
+      assert.ok(!f.commands.some(cmd => /worktree (add|remove|move)|git add|git push|branch -f/.test(cmd)));
+    });
+  }
   for (const condition of ['clean', 'ignored collision', 'merge failure', 'authority lost before merge']) {
     await t.test(`remote advance of a retained managed tree: ${condition}`, async () => {
       const f = await fixture();

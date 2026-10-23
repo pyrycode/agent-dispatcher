@@ -222,6 +222,7 @@ import {
   isRuntimeFile,
   statusEntries,
   managedPredecessorFinished,
+  type FinishedPredecessor,
   type ManagedWorktreeRecord,
   decideBranchSetup,
   decideCodegraphIndexCopy,
@@ -2458,7 +2459,7 @@ export type DispatchDeps = {
   /** Processes using a path; see processesUsingPath. */
   processesUsingPath?: (path: string) => number[];
   /** Only supplied inside an admitted ManagedDispatch.run. */
-  managedWorktree?: { run: FleetRun; snapshot: () => Promise<FleetSnapshot>; predecessor: (id: string) => Promise<FleetRun | null> };
+  managedWorktree?: { run: FleetRun; snapshot: () => Promise<FleetSnapshot>; predecessor: (id: string) => Promise<FinishedPredecessor | null> };
   /** Records the run's shared evidence when it ends (run-evidence.ts). Defaults to the managed dispatcher's sink. */
   recordEvidence?: (input: RunEvidenceInput) => Promise<void>;
   /** Whether a finished builder or developer run holds its handover for its native tasks (native-task-hold.ts). `waited`: this handover already waited once. Defaults to the admitted run's own check. */
@@ -4372,7 +4373,14 @@ async function confirmManagedWorktree(ctx: DispatchContext, path: string): Promi
   if (record.repository !== identity.repository || record.commonGitDir !== identity.commonGitDir) throw new Error("Recorded repository identity changed");
   const state = await managed.snapshot();
   const finishedPrior = await managed.predecessor(record.run.id);
-  if (!managedPredecessorFinished(record.run, managed.run, state, finishedPrior)) throw new Error("Authority has not confirmed the prior worker and tracked children finished in this ownership generation");
+  if (!managedPredecessorFinished(record.run, managed.run, state, finishedPrior)) throw new Error("Authority has not confirmed the prior worker and tracked children finished");
+  // Across an ownership change, also require that nothing still uses the tree.
+  if (record.run.generation !== managed.run.generation) {
+    let pids: number[];
+    try { pids = (ctx.deps.processesUsingPath ?? processesUsingPath)(path); }
+    catch (e) { throw new Error(`The processes using the retained worktree could not be checked (${(e as Error)?.message ?? e})`); }
+    if (pids.length) throw new Error(`Process(es) ${pids.slice(0, 5).join(", ")} still use the retained worktree`);
+  }
 }
 
 function recordManagedWorktree(ctx: DispatchContext): void {
@@ -11803,7 +11811,7 @@ export async function pollLoop(): Promise<void> {
           await runConcurrentDispatches([c], client, {
             ...DEFAULT_DEPS,
             managedWorktree: { run: admittedRun, snapshot: () => managed.connection.call<FleetSnapshot>("/state"),
-              predecessor: priorId => managed.connection.call<FleetRun | null>("/worktree/predecessor", { session: admittedRun.session, runId: admittedRun.id, priorId }) },
+              predecessor: priorId => managed.connection.call<FinishedPredecessor | null>("/worktree/predecessor", { session: admittedRun.session, runId: admittedRun.id, priorId }) },
           }, managed.machine ?? hostname());
         }, recoveryEnabled ? {
           observe: async () => {

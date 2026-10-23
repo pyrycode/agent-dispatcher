@@ -1564,19 +1564,25 @@ export class FleetStore {
 
   /** Read-only custody proof. A missing active reservation alone cannot
    * establish that a recorded predecessor ever ran or finished normally. */
-  worktreePredecessor(machine: string, session: string, runId: string, priorId: string): FleetRun | null {
+  worktreePredecessor(machine: string, session: string, runId: string, priorId: string): (FleetRun & { outcome: "completed" | "cancelled" }) | null {
     const state = this.snapshot();
     const current = state.runs.find(run => run.id === runId && run.machine === machine && run.session === session);
     if (!current) throw new Error("Run owner mismatch");
     const row = this.db.prepare("SELECT request,generation,created,finished,outcome FROM fleet_runs WHERE id=?").get(priorId);
     if (!row || row.finished === null || !["completed", "cancelled"].includes(String(row.outcome))) return null;
+    const outcome = String(row.outcome) as "completed" | "cancelled";
     const prior = { ...JSON.parse(String(row.request)), generation: String(row.generation), created: Number(row.created) } as FleetRun;
     if (prior.id === current.id || prior.machine !== machine || prior.project !== current.project ||
-        prior.ticket !== current.ticket || prior.generation !== current.generation || prior.created > current.created ||
+        prior.ticket !== current.ticket || prior.created > current.created ||
+        state.runs.some(run => run.ticket === current.ticket && run.id !== current.id) ||
         !state.claims.some(claim => claim.ticket === current.ticket && claim.machine === machine && claim.generation === current.generation)) return null;
     // Normal ManagedDispatch completion waits for tracked process groups
-    // before /finish. Operator /free leaves no normal outcome and changes ownership.
-    return prior;
+    // before /finish. Operator /free leaves no normal outcome at all.
+    // Stopped-worker recovery finishes the run as cancelled and releases the
+    // claim, leaving its files for an operator: across an ownership change
+    // only a normal completion confirms the predecessor.
+    if (prior.generation !== current.generation && outcome !== "completed") return null;
+    return { ...prior, outcome };
   }
 
   snapshot(): FleetSnapshot {
