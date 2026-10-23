@@ -1,3 +1,4 @@
+import {decideReworkRoutes} from './pipeline-decisions.js';
 import { coordinationReceipts } from './recovery-receipts.js';
 import { execFileSync } from 'node:child_process';
 import { writeRuntimeReceipt } from './runtime-receipt.js';
@@ -250,4 +251,19 @@ test('the 3071 shape requests evidence refinement without bypassing a causal dep
   const planner={...agents[0],name:'refiner',column:'Backlog'};
   assert.equal(recoveryPlan(inbox,{action:'refine',reason:'Collect portable authenticated queue proof'},[planner,...agents]).status,'Backlog');
   assert.throws(()=>recoveryPlan({...inbox,blockedBy:[{number:2,state:'OPEN'}]},{action:'refine',reason:'Skip dependency'},[planner,...agents]));
+});
+
+test('builder scope discovery enters recovery immediately and cannot retry unchanged',()=>{
+ const scoped={...item,status:'In Development',labels:['error:builder:scope','needs-real-claude']};
+ assert.equal(recoveryTrigger(observationFor(project,scoped))?.manual,false);
+ assert.throws(()=>recoveryPlan(scoped,{action:'retry',reason:'Continue the larger estimate'},agents),/reassessment/);
+ const plan=recoveryPlan(scoped,{action:'rework',reason:'Inspection establishes one bounded defect; retain its regression and repair the shared completion boundary'},agents);
+ assert.equal(plan.status,'In Development');
+ assert.deepEqual(plan.remove,['error:builder:scope']);
+ assert.throws(()=>recoveryPlan({...scoped,labels:[...scoped.labels,'needs-human:approval']},{action:'rework',reason:'Ignore hold'},agents));
+});
+
+test('stale rework routing cannot erase a builder scope request',()=>{
+ const scoped={...item,status:'In Development',labels:['error:builder:scope','needs-rework:builder']};
+ assert.deepEqual(decideReworkRoutes(new Map([['builder','In Development']]),new Map([['In Development',[scoped]]])),[]);
 });

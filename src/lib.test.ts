@@ -6401,7 +6401,7 @@ describe("partial-work salvage decisions (mobile #1430, #1332)", () => {
 
   test("runFailureKind: policy stops, a spawn that never ran and a finished run are never salvaged", () => {
     assert.equal(runFailureKind(new Error("x"), result({ hadPermissionDenial: true })), null, "a denial is a policy stop");
-    for (const reason of ["codex_blocked", "needs_refinement", "waiting_on_blocker"]) {
+    for (const reason of ["codex_blocked", "needs_refinement", "needs_scope_review", "waiting_on_blocker"]) {
       assert.equal(runFailureKind(new Error("x"), result({ terminalReason: reason })), null, reason);
     }
     assert.equal(runFailureKind(new ResourceExhaustedError("EAGAIN", 3), null), null, "the agent never started");

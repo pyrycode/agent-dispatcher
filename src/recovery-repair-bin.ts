@@ -38,7 +38,7 @@ await withManagedTaskRun(task.admission.run,async()=>{
   writeFileSync(join(directory,'builder.result.txt'),built.lastAssistantText??built.output,{mode:0o600});
   writeFileSync(join(directory,'builder.output.txt'),built.output,{mode:0o600});
   if(built.isError||built.timedOut||built.hadPermissionDenial) throw new Error('Implementation did not complete or permission was denied');
-  if(['needs_refinement','waiting_on_blocker'].includes(built.terminalReason??'')) throw new Error('Implementation returned an unfinished handoff');
+  if(['needs_refinement','needs_scope_review','waiting_on_blocker'].includes(built.terminalReason??'')) throw new Error('Implementation returned an unfinished handoff');
   if(git('branch','--show-current')!==branch) throw new Error('Implementation changed the task branch');
   if(git('status','--porcelain')) {git('add','--all');git('commit','-m','Fix dispatcher recovery for '+task.ticket);}
   candidateRevision=git('rev-parse','HEAD');
@@ -55,7 +55,7 @@ await withManagedTaskRun(task.admission.run,async()=>{
   writeFileSync(join(directory,'reviewer.result.txt'),reviewed.lastAssistantText??reviewed.output,{mode:0o600});
   writeFileSync(join(directory,'reviewer.output.txt'),reviewed.output,{mode:0o600});
   if(reviewed.isError||reviewed.timedOut||reviewed.hadPermissionDenial||git('rev-parse','HEAD')!==head||git('status','--porcelain')) throw new Error('Independent review did not complete on the checked tree');
-  if(['needs_refinement','waiting_on_blocker'].includes(reviewed.terminalReason??'')) throw new Error('Independent review returned an unfinished handoff');
+  if(['needs_refinement','needs_scope_review','waiting_on_blocker'].includes(reviewed.terminalReason??'')) throw new Error('Independent review returned an unfinished handoff');
   let output=JSON.parse(reviewed.output);if(output.status!==undefined) output=JSON.parse(output.summary);
   if(output.decision!=='PASS') throw new Error('Independent review found an unresolved defect');
   const names=git('diff','--name-only',task.request.revision,head).split('\n').filter(Boolean);

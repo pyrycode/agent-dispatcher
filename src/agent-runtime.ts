@@ -1374,7 +1374,7 @@ export class AgentRunStoppedError extends AgentRunFailedError {
 }
 
 /** Terminal reasons that are policy stops, never salvaged automatically. */
-const POLICY_STOP_REASONS = ["codex_blocked", "needs_refinement", "waiting_on_blocker"];
+const POLICY_STOP_REASONS = ["codex_blocked", "needs_refinement", "needs_scope_review", "waiting_on_blocker"];
 
 /**
  * Which stop, if any, ended this run. Both doors count: the runner's
