@@ -1317,3 +1317,157 @@ test("new workflow dependency cycles preserve legacy updates, removals and exact
   assert.deepEqual(removed.blockedBy, []);
   assert.deepEqual(store.workflowOperator(ticket, { blockedBy: changed.blockedBy }, "legacy-edges", 2), unchanged);
 });
+
+test("a fresh normalized unarchived refresh releases an attributed refusal without a revision change", async (t) => {
+  const { store } = fixture(t);
+  store.workflow.import(config, [item()]);
+  let refuse = true;
+  let writes = 0;
+  const github = new GitHubBroker({
+    token: "test", projects: [config.project],
+    fetcher: async (input, init) => {
+      const body = init?.body ? JSON.parse(String(init.body)) : {};
+      const query: string = body.query ?? "";
+      if (String(input).includes("/labels")) return new Response("[]");
+      if (query.startsWith("mutation {")) {
+        writes++;
+        if (refuse) return Response.json({
+          data: { i0: { issue: { id: "I1947" } }, s0: null },
+          errors: [{ path: ["s0"], message: "The item is archived and cannot be updated" }],
+        });
+        return Response.json({ data: {
+          i0: { issue: { id: "I1947" } }, s0: { projectV2Item: { id: "P1947" } },
+        } });
+      }
+      if (query.startsWith("query($ids:")) {
+        const observed = remoteMetadata(store.workflow.get("org/mobile#1947"));
+        Object.assign(observed.projectItems.nodes[0], { isArchived: false });
+        return Response.json({ data: { nodes: [observed] } });
+      }
+      if (query.startsWith("query($id:ID!)"))
+        return Response.json({ data: { node: { blockedBy: { nodes: [], pageInfo: { hasNextPage: false } } } } });
+      if (query.includes("repository"))
+        return Response.json({ data: { repository: { issues: { nodes: [], pageInfo: { hasNextPage: false } } } } });
+      throw new Error("Unexpected request: " + query);
+    },
+  });
+  const publisher = new WorkflowPublisher(store, github, { now: () => 1000 });
+  await publisher.refresh(config);
+  const revision = store.workflow.get("org/mobile#1947").revision;
+  await assert.rejects(publisher.tick(), /archived target/);
+  refuse = false;
+  await publisher.tick();
+  assert.equal(writes, 1, "stale unarchived metadata cannot release the incident");
+  await publisher.refresh(config);
+  assert.equal(store.workflow.get("org/mobile#1947").archived, undefined);
+  assert.equal(store.workflow.get("org/mobile#1947").revision, revision);
+  await publisher.tick();
+  assert.equal(writes, 2);
+  assert.equal(store.workflow.pending().length, 0);
+});
+
+test("a fully published unarchived ticket keeps its revision when GitHub reports it unarchived", async (t) => {
+  const { store } = fixture(t);
+  const ticket = "org/mobile#1947";
+  store.workflow.import(config, [item()]);
+  let isArchived: boolean | undefined;
+  const github = new GitHubBroker({
+    token: "test", projects: [config.project],
+    fetcher: async (input, init) => {
+      const body = init?.body ? JSON.parse(String(init.body)) : {};
+      const query: string = body.query ?? "";
+      if (query.startsWith("query($ids:")) {
+        const observed = remoteMetadata(store.workflow.get(ticket));
+        if (isArchived !== undefined) Object.assign(observed.projectItems.nodes[0], { isArchived });
+        return Response.json({ data: { nodes: [observed] } });
+      }
+      if (query.includes("repository"))
+        return Response.json({ data: { repository: { issues: { nodes: [], pageInfo: { hasNextPage: false } } } } });
+      throw new Error("Unexpected request: " + String(input) + " " + query);
+    },
+  });
+  const publisher = new WorkflowPublisher(store, github, { now: () => 1000 });
+  // The state an earlier release left behind: refreshed, published, no stored archive value.
+  await publisher.refresh(config);
+  const revision = store.workflow.get(ticket).revision;
+  store.workflow.published(ticket, revision);
+  assert.equal(store.workflow.pending().length, 0);
+  isArchived = false;
+  await publisher.refresh(config);
+  await publisher.refresh(config);
+  assert.equal(store.workflow.get(ticket).revision, revision, "unarchived observation is not a content change");
+  assert.equal(store.workflow.get(ticket).archived, undefined, "false is stored as no value");
+  assert.deepEqual(store.workflow.archiveObservation(ticket), { archived: false }, "the raw observation stays available in memory");
+  assert.equal(store.workflow.pending().length, 0);
+});
+
+test("issue body refresh without archive metadata cannot release an archived target", async (t) => {
+  const { store } = fixture(t);
+  const ticket = "org/mobile#1947";
+  store.workflow.import(config, [item()]);
+  let writes = 0;
+  let archived = true;
+  let edited = false;
+  const github = new GitHubBroker({
+    token: "test", projects: [config.project],
+    fetcher: async (input, init) => {
+      const body = init?.body ? JSON.parse(String(init.body)) : {};
+      const query: string = body.query ?? "";
+      if (String(input).includes("/labels")) return new Response("[]");
+      if (init?.method === "PATCH") {
+        edited = true;
+        return Response.json({ body: body.body });
+      }
+      if (query.startsWith("mutation {")) {
+        writes++;
+        if (archived) return Response.json({
+          data: { i0: { issue: { id: "I1947" } }, s0: null },
+          errors: [{ path: ["s0"], message: "The item is archived and cannot be updated" }],
+        });
+        return Response.json({ data: {
+          i0: { issue: { id: "I1947" } }, s0: { projectV2Item: { id: "P1947" } },
+        } });
+      }
+      if (query.startsWith("query($ids:")) {
+        const observed = remoteMetadata(store.workflow.get(ticket));
+        Object.assign(observed.projectItems.nodes[0], { isArchived: archived });
+        return Response.json({ data: { nodes: [observed] } });
+      }
+      if (query.includes("... on Issue")) {
+        assert.equal(query.includes("isArchived"), false, "the content bridge supplies no archive evidence");
+        return Response.json({ data: { node: {
+          ...remoteMetadata({ ...store.workflow.get(ticket), body: edited ? "Updated content" : item().body }),
+          repository: { nameWithOwner: config.project },
+        } } });
+      }
+      if (query.startsWith("query($id:ID!)"))
+        return Response.json({ data: { node: { blockedBy: { nodes: [], pageInfo: { hasNextPage: false } } } } });
+      if (query.includes("repository"))
+        return Response.json({ data: { repository: { issues: { nodes: [], pageInfo: { hasNextPage: false } } } } });
+      throw new Error("Unexpected request: " + query);
+    },
+  });
+  const publisher = new WorkflowPublisher(store, github, { now: () => 1000 });
+  await assert.rejects(publisher.tick(), /archived target/);
+  await publisher.tick();
+  assert.equal(writes, 1);
+  const observation = store.workflow.archiveObservation(ticket);
+  await new WorkflowGitHub(store, github).request(config.project, {
+    method: "PATCH", path: "/repos/org/mobile/issues/1947", body: JSON.stringify({ body: "Updated content" }),
+  });
+  assert.equal(store.workflow.get(ticket).body, "Updated content");
+  assert.equal(store.workflow.archiveObservation(ticket), observation, "content alone supplies no fresh archive evidence");
+  await publisher.tick();
+  assert.equal(writes, 1, "content refresh cannot restart archived writes or warnings");
+  await publisher.refresh(config);
+  assert.equal(store.workflow.get(ticket).archived, true);
+  await new WorkflowGitHub(store, github).adoptIssue(config.project, "I1947");
+  assert.equal(store.workflow.get(ticket).archived, true, "partial content refresh preserves known archive state");
+  await publisher.tick();
+  assert.equal(writes, 1);
+  archived = false;
+  await publisher.refresh(config);
+  await publisher.tick();
+  assert.equal(writes, 2, "confirmed restoration releases the pending write");
+  assert.equal(store.workflow.pending().length, 0);
+});

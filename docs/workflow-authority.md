@@ -101,6 +101,79 @@ choice and does not change the database workflow or pause scheduling.
 Position updates use the nearest preceding unarchived card, or the top when
 there is none. Archived neighbours do not prevent dependency publication.
 
+If GitHub attributes a Project-field or position refusal to the target being
+archived, the publisher warns once for that incident and leaves the revision
+pending. It suppresses further writes for the ticket during that publisher's
+lifetime. Elapsed backoff and newer desired revisions do not release it. Other
+tickets continue, including those beyond the first pending batch. A newer accepted
+GitHub observation confirming the target is unarchived releases suppression,
+even when its metadata is unchanged. A content-only refresh without archive
+metadata preserves the known archive state and cannot release suppression.
+A failed observation transaction does not.
+Only an archived card stores a flag. Observing an unarchived card stores no
+value, so it does not change the ticket revision.
+An archived position anchor, issue or dependency error, HTTP deferral or
+unattributed batch error retains the ordinary failure handling. Suppression does
+not change workflow authority or the stored archive flag. It is not durable
+across publisher restarts.
+
+## Claims history retention
+
+The claim service sweeps finished-ticket history at startup and hourly, independently
+of whether the separate evidence store is enabled. `claimsHistory.retentionDays`
+defaults to 30. It must be a positive duration. Only records older than the cutoff
+and explicitly completed by the workflow authority are eligible. Unknown, open,
+reopened and recovery-replacement tickets retain their history. Records needed by
+reservations, locks, current operations, recovery incidents, pending stage results,
+publication, verifier handoffs, support work, open descendants or approval records
+remain. A durable ownership claim survives completed-ticket retirement. The claim
+alone does not pin expired payloads. Held tickets still retain their history.
+Operator decisions and approval history are never pruned.
+
+Legacy workflow commands have no reliable creation time. Migration records the
+first upgraded startup as their age and gives them the full retention window.
+Later startups preserve that age. Retiring command payloads and recording their
+compact IDs, request hashes and audit metadata is one transaction. An identical retired command
+receives an explicit expired response. Conflicting reuse is refused. Neither can
+apply a second mutation. Finished run IDs remain non-admissible. Their dates and original outcomes remain as compact history. Their recorded
+computer, ticket, role and ownership generation remain available for upload and
+later ownership-release checks, including
+after a ticket reopens and the service restarts. These compact identities do not
+expire. Retention bounds payload history, not the number of durable identities.
+
+Every minute the service returns at most 4096 free SQLite pages and attempts a
+non-waiting WAL truncation. Busy readers leave reclamation for another step.
+Shutdown clears both timers before closing the database. No service tick performs
+a full database rewrite. Fresh databases use incremental vacuum. Existing databases
+created without it report that offline conversion is required.
+
+### Existing claims database conversion
+
+Use the normal operator procedure to drain the claim service's workers, establish
+that all workers and children have settled, and stop the service. Preserve unknown
+or deliberately held reservations. Do not release them to make conversion proceed.
+The conversion refuses a database with unfinished run records. Do not run it on
+a live service. This repair does not authorise a deployment or service stop.
+
+With the service stopped, run the reviewed offline tool from the dispatcher checkout:
+
+```sh
+python3 scripts/claims-vacuum.py /absolute/path/claims.sqlite /absolute/path/unused-backup.sqlite --service-stopped
+```
+
+The destination must be unused. The tool takes a consistent SQLite backup,
+including committed WAL data, and checks it before converting the original to
+incremental vacuum with one full rewrite. It verifies integrity and reports actual
+main-file plus WAL sizes. Keep the backup. If conversion or later validation fails,
+keep the service stopped, preserve the failed database and its WAL together, and
+restore the verified backup to a separate recovery path through the normal operator
+recovery procedure. Never overwrite the only copy. Start the service against the
+verified result only through the normal deployment procedure.
+
+Regression measurements use a disposable populated legacy database. They do not
+claim the filed 290 MB production database has shrunk. Production measurements,
+backup location and the loaded candidate remain a separate deployment record.
+
 ## Migration
 
 Normal claims-service startup adds non-unique ticket indexes to `fleet_runs`
@@ -184,6 +257,15 @@ For a label release performed by an older claim service, read the current revisi
 and submit a new explicit removal of that same hold label, even if it is already
 absent. This reconciles the obsolete marker without starting a worker or accepting
 a review result. The claim service must run this fix before that reconciliation.
+
+### Capture declaration repair
+
+For a completed live run held only because required capture outputs were not
+declared, use `operator.sh workflow declaration-repair owner/repo request.json`.
+The request and refusal rules are documented in
+[Recovering undeclared capture outputs](stage-results.md#recovering-undeclared-capture-outputs).
+It returns the ticket to ordinary builder work and preserves the waiting result.
+It does not accept the live stage.
 
 ### Approval review continuation
 
