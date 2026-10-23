@@ -81,7 +81,7 @@ test('unresolved references and approval provenance pin completed-ticket records
   const store = new FleetStore(':memory:',{box:{heavyLimit:2,combinedLimit:3}}, {now: () => now});
   t.after(() => store.close());
   const db = (store as any).db as DatabaseSync;
-  store.workflow.import(config,Array.from({length:12},(_,i)=>item(i+1)));
+  store.workflow.import(config,Array.from({length:12},(_,i)=>item(i+1,i===0?{labels:['held:operator']}:{})));
   for(let n=1;n<=12;n++){seedCommand(store,db,'c'+n,n);seedRun(db,'r'+n,n);}
   db.prepare('INSERT INTO fleet_claims VALUES (?,?,?,?)').run('org/core#1','box','held',1);
   db.prepare('INSERT INTO fleet_locks VALUES (?,?)').run('retained','r2');
@@ -170,4 +170,30 @@ test('offline conversion refuses unsettled reservations before creating a backup
   const script=new URL('../scripts/claims-vacuum.py',import.meta.url).pathname;
   assert.throws(()=>execFileSync('python3',[script,path,backup,'--service-stopped'],{stdio:'pipe'}),/Unsettled run records/);
   const saved=new DatabaseSync(path);assert.equal(saved.prepare('SELECT count(*) AS n FROM fleet_runs WHERE finished IS NULL').get()!.n,1);saved.close();
+});
+
+
+test('normal completed builder history expires while durable ownership and replay protections remain', t => {
+  let clock = Date.now();
+  const store = new FleetStore(':memory:', {box:{heavyLimit:2,combinedLimit:3}}, {now:()=>clock});
+  t.after(()=>store.close());
+  const db = (store as any).db as DatabaseSync;
+  const ticket = 'org/core#1', req = {...request('normal-builder',1),workflowVersion:1 as const};
+  store.workflow.import({...config,options:{...config.options,'In Development':'dev'}}, [item(1,{state:'OPEN',status:'In Development'})]);
+  assert.equal(store.start(req).ok,true);
+  store.workflowChange('box','source',req.id,ticket,{addLabels:['done:builder']},'normal-built');
+  store.finish('box','source',req.id);
+  store.workflowOperator(ticket,{status:'Done',state:'CLOSED'},'normal-close',store.workflow.get(ticket).revision);
+  const claim = {...db.prepare('SELECT * FROM fleet_claims WHERE ticket=?').get(ticket)};
+  assert.equal(claim.machine,'box');
+  assert.equal(db.prepare('SELECT count(*) AS n FROM fleet_runs WHERE finished IS NULL').get()!.n,0);
+  clock += 31*86400_000 + 1000;
+  assert.deepEqual(store.history.sweep(30*86400_000),{commands:2,runs:1});
+  assert.deepEqual({...db.prepare('SELECT * FROM fleet_claims WHERE ticket=?').get(ticket)},claim,'ownership must not be released to retire payloads');
+  assert.equal(db.prepare('SELECT count(*) AS n FROM fleet_runs').get()!.n,0);
+  assert.ok(db.prepare("SELECT 1 FROM workflow_commands WHERE id='normal-close'").get(),'operator closure remains audit history');
+  assert.deepEqual(store.runOwner(req.id),{machine:'box',ticket,role:'builder'});
+  assert.deepEqual(store.start(req),{ok:false,reason:'finished'});
+  assert.throws(()=>store.workflow.change(ticket,{addLabels:['done:builder']},'box:source','normal-built'),/expired/);
+  assert.deepEqual(store.history.sweep(30*86400_000),{commands:0,runs:0});
 });

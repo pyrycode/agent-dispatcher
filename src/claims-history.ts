@@ -45,7 +45,8 @@ export class ClaimsHistory {
             if (value.startsWith('{') || value.startsWith('[')) collect(JSON.parse(value));
           }
       };
-      records('SELECT ticket FROM fleet_claims');
+      // Durable ownership survives completion. Its claim alone does not pin
+      // payloads; active work and unresolved references below still do.
       records('SELECT run_id FROM fleet_locks');
       records('SELECT report FROM fleet_operation_reports');
       records('SELECT id,ticket,request FROM fleet_runs WHERE finished IS NULL');

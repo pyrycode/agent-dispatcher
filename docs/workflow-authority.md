@@ -110,7 +110,9 @@ and explicitly completed by the workflow authority are eligible. Unknown, open,
 reopened and recovery-replacement tickets retain their history. Records needed by
 reservations, locks, current operations, recovery incidents, pending stage results,
 publication, verifier handoffs, support work, open descendants or approval records
-remain. Operator decisions and approval history are never pruned.
+remain. A durable ownership claim survives completed-ticket retirement. The claim
+alone does not pin expired payloads. Held tickets still retain their history.
+Operator decisions and approval history are never pruned.
 
 Legacy workflow commands have no reliable creation time. Migration records the
 first upgraded startup as their age and gives them the full retention window.
