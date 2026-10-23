@@ -109,9 +109,9 @@ tickets continue, including those beyond the first pending batch. A newer accept
 GitHub observation confirming the target is unarchived releases suppression,
 even when its metadata is unchanged. A content-only refresh without archive
 metadata preserves the known archive state and cannot release suppression.
+A failed observation transaction does not.
 Only an archived card stores a flag. Observing an unarchived card stores no
 value, so it does not change the ticket revision.
-A failed observation transaction does not.
 An archived position anchor, issue or dependency error, HTTP deferral or
 unattributed batch error retains the ordinary failure handling. Suppression does
 not change workflow authority or the stored archive flag. It is not durable
