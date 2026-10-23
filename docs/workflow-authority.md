@@ -119,6 +119,18 @@ across publisher restarts.
 
 ## Migration
 
+Normal claims-service startup adds non-unique ticket indexes to `fleet_runs`
+and `workflow_commands`, including databases created by earlier versions.
+Repeated startup does not rebuild existing indexes. Finished-run history can
+use the same ticket lookup as active history. The separate unique index for
+unfinished runs remains unchanged. This migration does not remove saved
+commands or ownership records.
+
+Use `EXPLAIN QUERY PLAN` on a ticket lookup and the historical handoff query to
+confirm indexed searches. An index plan proves lookup behaviour. It does not
+establish a production CPU or disk-read improvement under a different workload.
+Deployment and comparable runtime measurements remain separate operations.
+
 Use the existing protected operator and GitHub logins. Never place credentials in
 request files or command arguments.
 
@@ -178,6 +190,16 @@ A stale revision or active reservation rejects the command. Read again and
 resolve the actual state. Reuse the same command identity only for the exact same
 request. The controls also support `state`, `labels`, `blockedBy`, `top` and `afterItemId`.
 Changing a status does not bypass dependency, review, ownership or admission checks.
+
+An explicit protected release of a `needs-human:` label also resolves that ticket's
+automatic `Explicit operator hold` recovery marker when the resulting authoritative
+workflow has no remaining recovery trigger. The marker remains in recovery history.
+Other tickets, unresolved blockers or errors, Halted states and human assessment
+decisions are preserved. Replaying an old command cannot retire a later hold.
+For a label release performed by an older claim service, read the current revision
+and submit a new explicit removal of that same hold label, even if it is already
+absent. This reconciles the obsolete marker without starting a worker or accepting
+a review result. The claim service must run this fix before that reconciliation.
 
 ### Approval review continuation
 

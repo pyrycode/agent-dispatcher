@@ -150,6 +150,7 @@ import {
   type VerifierGatePass,
 } from "./verifier-gate-reuse.js";
 import { outOfTimeComment, ReviewBudgetExhaustedError, reviewBudgetStop, type ReviewProgress } from "./verifier-out-of-time.js";
+import { describeSupportSource, prepareSupportSource, removeSupportSource, supportSourceEnabled, supportSourceEnv, SupportSourceError, type SupportSource } from "./support-source.js";
 import { gatePrefixKey, retainedGatePrefix, retainableGateEvidence, type GatePrefix, type PassedGate } from "./verifier-gate-prefix.js";
 import { BASELINE_TESTS_JSON_PLACEHOLDER, buildBaselineJSONFilter } from "./gate-output.js";
 import {
@@ -2805,7 +2806,11 @@ export type DispatchContext = {
   failedPreSpawnGate?: string;
   /** Set when a pre-spawn gate failed on the host, not the change (a
    *  toolchain mismatch). The dispatch halts with `error:infra`. */
-  infraGateFailure?: { gate: string; reason: string; samples: string[] };
+  infraGateFailure?: { gate: string; reason: string; samples: string[]; advice?: string };
+  /** This run's own checkout of the supporting core source, which its gates
+   *  and agent get as `PYRYCODE_SRC`. Removed when the dispatch ends. See
+   *  support-source.ts. */
+  supportSource?: SupportSource;
   /** `testdata/` paths the pre-spawn gates changed. No automatic commit of
    *  this run includes them, see gate-fixtures.ts. */
   gateTestdata?: ReadonlySet<string>;
@@ -3117,6 +3122,7 @@ export async function dispatchToAgent(
     outcome.value = "failed";
     throw error;
   } finally {
+    if (ctx.supportSource) removeSupportSource(ctx.supportSource, deps.spawnSync);
     // Pass or fail, the run's evidence goes to the shared store, so a later
     // stage or a recovery check on another computer can read it.
     const run = deps.managedWorktree?.run ?? managedRun();
@@ -3135,6 +3141,12 @@ async function dispatchWithContext(ctx: DispatchContext, outcome: { value: strin
   const setup = await setupBranchAndWorktree(ctx);
   if (!setup.ok) return;
   if(ctx.useWorktree)bindManagedTestWorktree(ctx.agentCwd);
+  if (!prepareRunSupportSource(ctx)) {
+    outcome.value = "infra-halted";
+    await haltForInfraGate(ctx);
+    await cleanupAfterDispatch(ctx);
+    return;
+  }
 
   // Builder-set pre-verifier gates: deterministic gate commands run in the
   // ticket's worktree BEFORE the model spawns, but they only decide green
@@ -3164,7 +3176,7 @@ async function dispatchWithContext(ctx: DispatchContext, outcome: { value: strin
   const reReview = prepareReReviewNote(ctx);
   const handoffNote = prepareVerdictHandoff(ctx);
   const findingsNote = prepareReworkFindingsNote(ctx);
-  const spawn = await prepareAgentSpawn(ctx, gates.promptNote + baseNote + mergeNote + reReview + handoffNote + findingsNote + await nativeTaskNote());
+  const spawn = await prepareAgentSpawn(ctx, gates.promptNote + baseNote + supportSourceNote(ctx) + mergeNote + reReview + handoffNote + findingsNote + await nativeTaskNote());
   if (!spawn.ok) return;
   // The gates ran before the agent's clock started, so the review gets its
   // whole budget. The overlapped review keeps its own record below.
@@ -4587,6 +4599,51 @@ function refreshBaseBeforeGates(ctx: DispatchContext): string {
   return baseCurrencyNote(defaultBranch, mainSha);
 }
 
+/**
+ * Give a builder or gated verifier run its own checkout of the current core
+ * source before anything builds the daemon (support-source.ts,
+ * agent-dispatcher#327). A no-op for forks without `PYRYCODE_SRC` and for
+ * other agents. False when the source cannot be prepared: the run halts as
+ * an infrastructure failure rather than test against a stale daemon.
+ */
+function prepareRunSupportSource(ctx: DispatchContext): boolean {
+  const { agent, item } = ctx;
+  if (!supportSourceEnabled(process.env)) return true;
+  if (agent.name !== "builder" && activeStageSet().preSpawnGate?.agentNames.has(agent.name) !== true) return true;
+  try {
+    ctx.supportSource = prepareSupportSource({
+      env: process.env, spawnSync: ctx.deps.spawnSync,
+      label: `${item.issueNumber}-${agent.name}`,
+    });
+  } catch (e: any) {
+    const reason = e instanceof SupportSourceError ? e.message : `could not prepare the supporting core source: ${e?.message ?? e}`;
+    console.log(`   🧯 Supporting core source unavailable; not starting ${agent.name}: ${reason}`);
+    ctx.deps.writeLog(ctx.logFile, "SUPPORTING SOURCE", `unavailable: ${reason}`);
+    ctx.infraGateFailure = {
+      gate: "supporting core source (PYRYCODE_SRC)", reason, samples: [reason],
+      advice: "The dispatcher builds the test daemon from a fresh checkout of current core for every builder and verifier run, " +
+        "and never falls back to the configured copy, which may be stale. Check that PYRYCODE_SRC names a git checkout of core " +
+        "and that origin can be fetched from this host, then remove `" + INFRA_FAILURE_LABEL + "` to run again.",
+    };
+    return false;
+  }
+  const line = describeSupportSource(ctx.supportSource);
+  console.log(`   🧬 ${line}`);
+  ctx.deps.writeLog(ctx.logFile, "SUPPORTING SOURCE", line);
+  return true;
+}
+
+/** The agent's note naming the core revision its daemon builds from. */
+function supportSourceNote(ctx: DispatchContext): string {
+  const source = ctx.supportSource;
+  if (!source) return "";
+  return [
+    "", "", "## Supporting core source", "",
+    `\`${source.variable}\` points at a fresh checkout of core commit \`${source.revision}\` made for this run, so any daemon a gate ` +
+    `builds reflects that commit. Use it as given. Do not edit it, and do not point \`${source.variable}\` elsewhere.`,
+  ].join("\n");
+}
+
 /** The verifier's note that main is merged as of a named commit. */
 export function baseCurrencyNote(branch: string, mainSha: string): string {
   return [
@@ -4815,7 +4872,7 @@ export async function prepareAgentSpawn(
       // before handing the env to the spawned agent — claude has its own
       // gh-auth credential store and doesn't need ours. See
       // `SPAWN_ENV_DENYLIST` in lib.ts for the full list + rationale.
-      env: {...agentSpawnEnv(process.env, agent.name),...managedAgentEnv()},
+      env: {...agentSpawnEnv(process.env, agent.name),...managedAgentEnv(),...supportSourceEnv(ctx.supportSource)},
     },
   };
 }
@@ -6492,6 +6549,8 @@ export async function runVerifierGates(opts: {
   onPassed?: (pass: PassedGate, index: number) => void;
   /** Preserve every raw red before a rerun or baseline assessment can excuse it. */
   onFailed?: (logs: [string, string]) => void;
+  /** Set over the gate environment, e.g. the run's own `PYRYCODE_SRC`. */
+  env?: Readonly<Record<string, string>>;
   deps: Pick<DispatchDeps, "spawnGate" | "readFileSync">;
 }): Promise<VerifierGatesOutcome> {
   const logsDir = opts.logsDir ?? LOGS_DIR;
@@ -6510,7 +6569,7 @@ export async function runVerifierGates(opts: {
       cwd: opts.cwd,
       // Same env discipline as the real-claude gate: dispatcher secrets
       // scrubbed, ANTHROPIC_API_KEY removed (see buildGateSpawnEnv).
-      env: {...buildGateSpawnEnv(process.env),...managedTaskEnv()},
+      env: {...buildGateSpawnEnv(process.env),...managedTaskEnv(),...opts.env},
       timeoutMs: VERIFIER_GATE_TIMEOUT_MS,
       stdoutPath,
       stderrPath,
@@ -6669,7 +6728,7 @@ async function rerunVerifierGateFailures(
     const outcome = await ctx.deps.spawnGate({
       command,
       cwd: ctx.agentCwd,
-      env: {...buildGateSpawnEnv(process.env),...managedTaskEnv()},
+      env: {...buildGateSpawnEnv(process.env),...managedTaskEnv(),...supportSourceEnv(ctx.supportSource)},
       timeoutMs: VERIFIER_GATE_TIMEOUT_MS,
       stdoutPath: outputPath,
       stderrPath: outputPath.replace(/\.log$/, ".stderr.log"),
@@ -6793,6 +6852,7 @@ async function assessVerifierGateRed(
         label: "verifier-gate-base",
         who: "Verifier gate",
         load: rerunLoad(spec.format, tally, remaining),
+        env: supportSourceEnv(ctx.supportSource),
         deps: ctx.deps,
       });
       // Same partition as the real-claude gate: null base failures excuse nothing.
@@ -7090,6 +7150,13 @@ function mergedWorktreeHead(ctx: DispatchContext): { commit: string; tree: strin
 
 /** Partial reuse is opt-in: the consumer must describe its external inputs.
  * An unreadable snapshot or any worktree change disables it. */
+/** The gate list's reuse key. A recorded pass made against another core
+ *  revision is not reused, since its daemon was built from other code. */
+function verifierGatesHash(ctx: DispatchContext, gates: readonly string[]): string {
+  const source = ctx.supportSource;
+  return hashGateList(source ? [...gates, `${source.variable}@${source.revision}`] : gates);
+}
+
 function verifierPrefixInputs(ctx: DispatchContext, gates: readonly string[], tree: string): string | null {
   const command = process.env.PYRY_VERIFIER_GATE_INPUTS_CMD?.trim();
   if (!command || !verifierGateReuseEnabled(process.env) || ctx.pendingMerge) return null;
@@ -7099,7 +7166,10 @@ function verifierPrefixInputs(ctx: DispatchContext, gates: readonly string[], tr
     const current = ctx.deps.spawnSync("git", ["rev-parse", "HEAD^{tree}"], { cwd: ctx.agentCwd, encoding: "utf8", timeout: 15_000 });
     if (current.error || current.status !== 0 || current.stdout.toString().trim() !== tree) return null;
     const env = buildGateSpawnEnv(process.env);
-    const snapshot = ctx.deps.spawnSync("sh", ["-c", command], { cwd: ctx.agentCwd, env, encoding: "utf8", timeout: 15_000 });
+    // The command reads the run's own core checkout. The key keeps the
+    // configured path, since the run's path is new every run and the
+    // command's output already names the checkout's contents.
+    const snapshot = ctx.deps.spawnSync("sh", ["-c", command], { cwd: ctx.agentCwd, env: {...env,...supportSourceEnv(ctx.supportSource)}, encoding: "utf8", timeout: 15_000 });
     if (snapshot.error || snapshot.status !== 0 || !snapshot.stdout.toString().trim()) return null;
     return gatePrefixKey(tree, gates, env, command + "\n" + process.execPath + "\n" + process.version + "\n" + snapshot.stdout.toString());
   } catch { return null; }
@@ -7176,7 +7246,7 @@ function reusableGatesForNextRun(ctx: DispatchContext): { commit: string; untilM
   if (inputsHash === null) return null;
   const pass = readRecordedGatePass(ctx, resolve(LOGS_DIR, verifierGatePassFileName(ctx.item.issueNumber)));
   if (pass === null) return null;
-  const reused = readReusableGatePass(ctx, pass, head.tree, hashGateList(gates), inputsHash);
+  const reused = readReusableGatePass(ctx, pass, head.tree, verifierGatesHash(ctx, gates), inputsHash);
   if (reused === null) return null;
   const passedAtMs = Date.parse(reused.passedAt);
   return Number.isNaN(passedAtMs) ? null : { commit: reused.commit, untilMs: passedAtMs + VERIFIER_GATE_REUSE_MAX_AGE_MS };
@@ -7302,11 +7372,13 @@ export async function haltForInfraGate(ctx: DispatchContext): Promise<void> {
       ...failure.samples,
       "```",
       "",
-      `This looks like a host problem rather than the change: the branch does not touch go.mod, package engines or ` +
-      `other toolchain files. ${agent.name} was not started, no rework is requested or counted, and the check was not ` +
-      `re-run, since the same host fails the same way. Fix the toolchain on the dispatcher host, then remove ` +
-      `\`${INFRA_FAILURE_LABEL}\` to run the checks again. If the change does need the newer toolchain, say so here ` +
-      `and route it to the builder instead.`,
+      failure.advice !== undefined
+        ? `${agent.name} was not started, and no rework is requested or counted. ${failure.advice}`
+        : `This looks like a host problem rather than the change: the branch does not touch go.mod, package engines or ` +
+          `other toolchain files. ${agent.name} was not started, no rework is requested or counted, and the check was not ` +
+          `re-run, since the same host fails the same way. Fix the toolchain on the dispatcher host, then remove ` +
+          `\`${INFRA_FAILURE_LABEL}\` to run the checks again. If the change does need the newer toolchain, say so here ` +
+          `and route it to the builder instead.`,
     ].join("\n"));
   } catch (e) {
     console.warn(`   ⚠️  Failed to explain the infrastructure halt on #${item.issueNumber}: ${e}`);
@@ -7443,7 +7515,7 @@ async function runConfiguredPreSpawnGates(
   // commit, which gets a new SHA each time it is re-made. With reuse off, or
   // HEAD unknown, nothing is read or recorded and the gates run as before.
   const passFile = resolve(LOGS_DIR, verifierGatePassFileName(item.issueNumber));
-  const gatesHash = hashGateList(gates);
+  const gatesHash = verifierGatesHash(ctx, gates);
   let head = verifierGateReuseEnabled(process.env) ? mergedWorktreeHead(ctx) : null;
   const strictInputs = !!process.env.PYRY_VERIFIER_GATE_INPUTS_CMD?.trim();
   const inputsHash = strictInputs && head !== null ? verifierPrefixInputs(ctx, gates, head.tree) : undefined;
@@ -7569,6 +7641,7 @@ async function runConfiguredPreSpawnGates(
     // A rerun gate keeps its number in the full list, so the reused gates'
     // logs, the evidence the pass rests on, are not overwritten.
     logNumbers: docsOnly !== null ? toRun.map((g) => gates.indexOf(g) + 1) : undefined,
+    env: supportSourceEnv(ctx.supportSource),
     deps: ctx.deps,
   });
   if (testdataBefore !== null) await guardGateTestdata(ctx, testdataBefore);
@@ -7583,10 +7656,10 @@ async function runConfiguredPreSpawnGates(
     `Reused the pass recorded at ${docsOnly.pass.passedAt} on commit ${docsOnly.pass.commit} (tree ${docsOnly.pass.tree}) for every gate except the documentation gates; only documentation changed since: ${docsOnly.files.join(", ")}`,
     ...gates.flatMap((g, i) => (docsOnly!.rerun.includes(g) ? [] : [docsOnly!.pass.summary[i] ?? `✓ ${g}`])),
   ];
-  ctx.deps.writeLog(logFile, "GATES", [...(reusedPrefixCount ? [`${reusedPrefixCount} completed green step(s) retained from a matching input snapshot; original logs preserved. Failed and unfinished steps ran again.`] : []), ...docsOnlyLog, ...result.summary, ...baselineLog].join("\n"));
+  ctx.deps.writeLog(logFile, "GATES", [...(ctx.supportSource ? [describeSupportSource(ctx.supportSource)] : []), ...(reusedPrefixCount ? [`${reusedPrefixCount} completed green step(s) retained from a matching input snapshot; original logs preserved. Failed and unfinished steps ran again.`] : []), ...docsOnlyLog, ...result.summary, ...baselineLog].join("\n"));
   const baselineTicket = await recordBaselineOnMainFailureTicket(ctx, result.baseline);
 
-  if(ctx.stagePlan)ctx.stageChecks=gates.map(name=>({name,outcome:result.ok?"passed":"failed",evidence:JSON.stringify({summary:result.summary,baseline:result.baseline,logPaths:result.logPaths,reusedFrom:docsOnly?.pass.commit})}));
+  if(ctx.stagePlan)ctx.stageChecks=gates.map(name=>({name,outcome:result.ok?"passed":"failed",evidence:JSON.stringify({summary:result.summary,baseline:result.baseline,logPaths:result.logPaths,reusedFrom:docsOnly?.pass.commit,...(ctx.supportSource?{supportingSource:{variable:ctx.supportSource.variable,ref:ctx.supportSource.ref,revision:ctx.supportSource.revision}}:{})})}));
   if (result.ok && result.baseline.length > 0) {
     // Every red failure was flaky or also fails on main: green for the
     // verdict, but not a full pass, so nothing is recorded for reuse.
@@ -9062,6 +9135,8 @@ async function runFailuresOnBase(opts: {
   live?: boolean;
   /** The gate's own load (`rerunLoad`), so the base meets what the branch's re-run met. */
   load?: RerunLoad | null;
+  /** Set over the gate environment, e.g. the verifier run's own `PYRYCODE_SRC`. */
+  env?: Readonly<Record<string, string>>;
   deps: Pick<GateRunnerDeps, "execSync" | "spawnGate" | "readFileSync"> & { mkdirSync?: GateRunnerDeps["mkdirSync"] };
 }): Promise<{ failures: string[] | null; skipReason: string | null; outputPath: string | null }> {
   const { deps, targetRepo } = opts;
@@ -9100,7 +9175,7 @@ async function runFailuresOnBase(opts: {
       command,
       cwd: worktreeDir,
       env: {...(opts.live ? buildLiveGateSpawnEnv(process.env) : buildGateSpawnEnv(process.env)),...managedTaskEnv(),
-        ...gateEvidenceEnv(opts.evidence?.runDir, opts.evidence?.part ?? "base", deps.mkdirSync ?? mkdirSync)},
+        ...gateEvidenceEnv(opts.evidence?.runDir, opts.evidence?.part ?? "base", deps.mkdirSync ?? mkdirSync),...opts.env},
       timeoutMs: opts.timeoutMs,
       stdoutPath,
       stderrPath,

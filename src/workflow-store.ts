@@ -91,7 +91,8 @@ export class WorkflowStore {
       CREATE TABLE IF NOT EXISTS workflow_comments (id TEXT PRIMARY KEY, ticket TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL, published INTEGER NOT NULL DEFAULT 0) STRICT;
       CREATE TABLE IF NOT EXISTS workflow_filings (id TEXT PRIMARY KEY, project TEXT NOT NULL, request TEXT NOT NULL, started_at INTEGER NOT NULL, issue_id TEXT, result TEXT) STRICT;
       CREATE TABLE IF NOT EXISTS workflow_evidence_seen (ticket TEXT PRIMARY KEY, seen TEXT NOT NULL) STRICT;`);
-    db.exec(`CREATE INDEX IF NOT EXISTS workflow_item_id ON workflow_tickets(json_extract(item,'$.id'));
+    db.exec(`CREATE INDEX IF NOT EXISTS workflow_commands_ticket ON workflow_commands(ticket);
+      CREATE INDEX IF NOT EXISTS workflow_item_id ON workflow_tickets(json_extract(item,'$.id'));
       CREATE INDEX IF NOT EXISTS workflow_issue_id ON workflow_tickets(json_extract(item,'$.issueId'));
       CREATE INDEX IF NOT EXISTS workflow_parent ON workflow_tickets(project,json_extract(item,'$.parentNumber'));
       CREATE INDEX IF NOT EXISTS workflow_order ON workflow_tickets(project,position);
