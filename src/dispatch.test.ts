@@ -25,7 +25,7 @@ import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { execFile, execSync, spawnSync } from "node:child_process";
+import { execFile, execFileSync, execSync, spawnSync } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
 import { FleetStore } from './fleet-store.js';
 import { MachineManager, serveManager } from './machine-manager.js';
@@ -9954,6 +9954,85 @@ describe("pre-verifier gates — dispatchToAgent wiring", () => {
       assert.equal(calls.discord.length, 1);
       assert.match(calls.discord[0]!, /verifier not started on #167: infrastructure failure in `make check`/);
     }));
+  });
+
+  // agent-dispatcher#327: mobile #2442's verifier built its daemon from a core
+  // copy two days behind main. Each gated run now gets its own fresh checkout.
+  async function withSupportSource<T>(base: string, fn: () => Promise<T>): Promise<T> {
+    const prior = process.env.PYRYCODE_SRC;
+    process.env.PYRYCODE_SRC = base;
+    try { return await fn(); } finally {
+      if (prior === undefined) delete process.env.PYRYCODE_SRC; else process.env.PYRYCODE_SRC = prior;
+    }
+  }
+  const sourceGit = (cwd: string, ...args: string[]) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf-8", stdio: "pipe",
+    env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } }).trim();
+  /** Real git for the core copy, the mock for everything else. */
+  const routeSourceGit = (deps: DispatchDeps, base: string) => {
+    const mock = deps.spawnSync;
+    deps.spawnSync = ((cmd: string, args: any, opts: any) =>
+      cmd === "git" && Array.isArray(args) && args[0] === "-C" && !String(args[1]).startsWith(TEST_AGENTS_REPO_ROOT)
+        ? spawnSync(cmd, args, opts) : (mock as any)(cmd, args, opts)) as typeof deps.spawnSync;
+  };
+
+  test("#327: the verifier's gates and agent build from a fresh checkout of current core main, removed afterwards", async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), "support-source-dispatch-"));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const upstream = join(dir, "upstream");
+    execFileSync("git", ["init", "-q", "-b", "main", upstream]);
+    writeFileSync(join(upstream, "a.txt"), "one"); sourceGit(upstream, "add", "a.txt"); sourceGit(upstream, "commit", "-qm", "one");
+    const base = join(dir, "pyrycode");
+    execFileSync("git", ["clone", "-q", upstream, base]);
+    writeFileSync(join(upstream, "a.txt"), "two"); sourceGit(upstream, "commit", "-qam", "two");
+    const current = sourceGit(upstream, "rev-parse", "HEAD");
+
+    await withSupportSource(base, () => withStageSet("builder", () => withVerifierGates("make check", async () => {
+      const claudeMd = claudeMdAbsPath("verifier/CLAUDE.md");
+      const client = new MockGitHubClient({ status: { 2442: "In Code Review" }, labels: { 2442: [] } });
+      const seen: { path?: string; head?: string } = {};
+      let agentSrc: string | undefined;
+      const { deps, calls } = makeMockDeps({
+        execImpls: fullHappyExecImpls("feature/2442"),
+        fsMap: { [claudeMd]: "verifier system prompt" },
+        gateImpl: (req) => {
+          seen.path = req.env?.PYRYCODE_SRC;
+          seen.head = sourceGit(seen.path!, "rev-parse", "HEAD");
+          return { exitCode: 0, timedOut: false, spawnError: null };
+        },
+      });
+      routeSourceGit(deps, base);
+      const run = deps.runClaudeStreaming;
+      deps.runClaudeStreaming = ((config: any) => { agentSrc = config?.env?.PYRYCODE_SRC; return run(config); }) as typeof run;
+
+      await dispatchToAgent(builderAgent("verifier"), makeProjectItem({ issueNumber: 2442 }), client, deps);
+
+      assert.ok(seen.path && seen.path !== base, "the gate gets the run's own checkout");
+      assert.equal(seen.head, current, "at current origin main, not the stale copy");
+      assert.equal(agentSrc, seen.path, "the verifier agent sees the same checkout");
+      assert.equal(existsSync(seen.path!), false, "removed when the run ends");
+      assert.ok(!sourceGit(base, "worktree", "list").includes(seen.path!));
+      const prompt = calls.fs.find((f) => f.kind === "write" && f.path.endsWith(".prompt-2442.txt"));
+      assert.match(prompt!.content!, new RegExp(`## Supporting core source[\\s\\S]*${current}`));
+      assert.ok(calls.logs.some((l: any) => JSON.stringify(l).includes(current)), "the revision is in the run log");
+    })));
+  });
+
+  test("#327: a core copy that cannot be refreshed halts with error:infra before any gate runs", async (t) => {
+    const notGit = mkdtempSync(join(tmpdir(), "support-source-dispatch-"));
+    t.after(() => rmSync(notGit, { recursive: true, force: true }));
+    await withSupportSource(notGit, () => withStageSet("builder", () => withVerifierGates("make check", async () => {
+      const claudeMd = claudeMdAbsPath("verifier/CLAUDE.md");
+      const client = new MockGitHubClient({ status: { 2442: "In Code Review" }, labels: { 2442: [] } });
+      const { deps, calls } = makeMockDeps({ execImpls: fullHappyExecImpls("feature/2442"), fsMap: { [claudeMd]: "verifier system prompt" } });
+      routeSourceGit(deps, notGit);
+
+      await dispatchToAgent(builderAgent("verifier"), makeProjectItem({ issueNumber: 2442 }), client, deps);
+
+      assert.equal(calls.gates.length, 0, "no gate runs against an unknown source");
+      assert.equal(calls.claudeStreams, 0);
+      assert.ok(client.addLabelCalls.some((c) => c.label === "error:infra"));
+      assert.ok(client.comments.some((c) => c.body.includes("is not a git checkout") && c.body.includes("never falls back")));
+    })));
   });
 
   test("builder set, a toolchain mismatch the branch asked for → verifier spawned in TRIAGE MODE, no error:infra (review finding 3)", async () => {

@@ -175,6 +175,16 @@ resolve the actual state. Reuse the same command identity only for the exact sam
 request. The controls also support `state`, `labels`, `blockedBy`, `top` and `afterItemId`.
 Changing a status does not bypass dependency, review, ownership or admission checks.
 
+An explicit protected release of a `needs-human:` label also resolves that ticket's
+automatic `Explicit operator hold` recovery marker when the resulting authoritative
+workflow has no remaining recovery trigger. The marker remains in recovery history.
+Other tickets, unresolved blockers or errors, Halted states and human assessment
+decisions are preserved. Replaying an old command cannot retire a later hold.
+For a label release performed by an older claim service, read the current revision
+and submit a new explicit removal of that same hold label, even if it is already
+absent. This reconciles the obsolete marker without starting a worker or accepting
+a review result. The claim service must run this fix before that reconciliation.
+
 ### Approval review continuation
 
 Approval outcomes belong to the claim database, separately from ticket prose and
