@@ -304,6 +304,14 @@ export class RecoveryLedger {
   escalatedTickets():string[] {
     return this.db.prepare("SELECT ticket FROM fleet_recovery WHERE present=1 AND state='escalated' ORDER BY ticket").all().map(r=>String(r.ticket));
   }
+  /** Protected release retires the automatic hold marker, never a human assessment. */
+  releaseOperatorHold(observation: RecoveryObservation): void {
+    if (recoveryTrigger(observation)) return;
+    this.db.prepare(`UPDATE fleet_recovery SET present=0,state='resolved',updated=?
+      WHERE ticket=? AND present=1 AND reason='Explicit operator hold'
+        AND state='escalated' AND run_id IS NULL AND decision IS NULL`)
+      .run(this.now(), observation.ticket);
+  }
   list(project?: string): RecoveryIncident[] {
     const rows = project ? this.db.prepare("SELECT * FROM fleet_recovery WHERE ticket LIKE ? ORDER BY created DESC LIMIT 500").all(`${project}#%`)
       : this.db.prepare("SELECT * FROM fleet_recovery ORDER BY created DESC LIMIT 500").all();

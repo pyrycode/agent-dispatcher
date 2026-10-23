@@ -105,6 +105,92 @@ for (const label of ["held:unreviewed-capture", "held:operator"]) {
   }
 }
 
+test("protected operator release retires only its obsolete recovery hold", t => {
+  const { store } = fixture(t);
+  const held = { ...item(), labels: ["needs-human:manual-takeover", "orchestrator:escalated"] };
+  const other = { ...item(1948), labels: ["needs-human:decision"] };
+  store.workflow.import(config, [held, other]);
+  const observe = (i: WorkflowItem) => ({ ticket: `${config.project}#${i.issueNumber}`, status: i.status,
+    labels: i.labels, blocked: false });
+  store.recoveryReport("mac", config.project, [observe(held), observe(other)]);
+  const incident = store.recovery.list().find(i => i.ticket === "org/mobile#1947")!;
+  const unrelated = store.recovery.list().find(i => i.ticket === "org/mobile#1948")!;
+  assert.equal(incident.reason, "Explicit operator hold");
+  assert.equal(incident.current, true);
+
+  const change = { status: "In Code Review", addLabels: ["done:builder"],
+    removeLabels: ["needs-human:manual-takeover", "orchestrator:escalated"] };
+  const released = store.workflowOperator("org/mobile#1947", change, "manual-release", held.revision);
+  const history = store.recovery.list().find(i => i.id === incident.id)!;
+  assert.equal(history.current, false, "the released hold must not be projected back onto the ticket");
+  assert.equal(history.state, "resolved");
+  assert.equal(history.reason, incident.reason, "retain the original hold evidence");
+  assert.deepEqual(store.recovery.list().find(i => i.id === unrelated.id), unrelated);
+  assert.deepEqual(store.recovery.escalatedTickets(), ["org/mobile#1948"]);
+  assert.equal(store.start(run("verifier")).ok, true, "normal independent review remains required");
+  store.finish("mac", "s", "verifier");
+
+  const heldAgain = store.workflowOperator("org/mobile#1947", { addLabels: ["needs-human:decision"] },
+    "new-human-hold", store.workflow.get("org/mobile#1947").revision);
+  store.recoveryReport("mac", config.project, [observe(heldAgain), observe(other)]);
+  const newIncident = store.recovery.list().find(i => i.ticket === "org/mobile#1947" && i.current)!;
+  store.workflowOperator("org/mobile#1947", change, "manual-release", held.revision);
+  assert.deepEqual(store.recovery.list().find(i => i.id === newIncident.id), newIncident,
+    "replaying the old release must not clear a later human hold");
+});
+
+test("operator hold release preserves remaining blockers and rejects stale revisions", t => {
+  for (const remaining of ["needs-human:decision", "error:builder:permission_denied", "error:builder", "halted", "dependency"]) {
+    const { store } = fixture(t);
+    const held = { ...item(), status: remaining === "halted" ? "Halted" : "In Code Review",
+      labels: ["needs-human:manual-takeover", ...(!["halted", "dependency"].includes(remaining) ? [remaining] : [])],
+      blockedBy: remaining === "dependency" ? [{ number: 1948, state: "OPEN" as const }] : [] };
+    store.workflow.import(config, [held]);
+    store.recoveryReport("mac", config.project, [{ ticket: "org/mobile#1947", status: held.status,
+      labels: held.labels, blocked: remaining === "dependency" }]);
+    const incident = store.recovery.list()[0];
+    assert.throws(() => store.workflowOperator("org/mobile#1947", { removeLabels: ["needs-human:manual-takeover"] },
+      `stale-${remaining}`, 0), /Workflow changed/);
+    assert.deepEqual(store.recovery.list()[0], incident, "a rejected release changes no recovery evidence");
+    store.workflowOperator("org/mobile#1947", { removeLabels: ["needs-human:manual-takeover"] },
+      `release-${remaining}`, held.revision);
+    assert.deepEqual(store.recovery.list()[0], incident, `preserve unresolved ${remaining}`);
+    assert.equal(store.start(run("verifier")).ok, false);
+  }
+});
+
+test("protected release reconciles a hold retained by an older workflow command", t => {
+  const { store } = fixture(t);
+  const held = { ...item(), status: "In Code Review", labels: ["needs-human:manual-takeover"] };
+  store.workflow.import(config, [held]);
+  store.recoveryReport("mac", config.project, [{ ticket: "org/mobile#1947", status: held.status,
+    labels: held.labels, blocked: false }]);
+  const incident = store.recovery.list()[0];
+  // Reproduce the durable state left by the old operator path: the label is
+  // already absent, but the separate recovery marker is still current.
+  const legacy = store.workflow.change("org/mobile#1947", { labels: [] }, "operator", "legacy-release", 1);
+  assert.equal(store.recovery.list()[0].current, true);
+  store.workflowOperator("org/mobile#1947", { removeLabels: ["needs-human:manual-takeover"] },
+    "confirmed-release", legacy.revision);
+  assert.equal(store.recovery.list().find(i => i.id === incident.id)!.current, false);
+});
+
+test("full-label protected release preserves a human recovery decision", t => {
+  const { store } = fixture(t);
+  const failed = { ...item(), labels: ["error:builder"] };
+  store.workflow.import(config, [failed]);
+  const [incident] = store.recoveryReport("mac", config.project, [{ ticket: "org/mobile#1947",
+    status: failed.status, labels: failed.labels, blocked: false }]);
+  store.recovery.begin(incident.id, "assessment");
+  store.recovery.decide(incident.id, "assessment", { action: "escalate", category: "human",
+    reason: "A separate approval refusal remains unresolved" });
+  const held = store.workflowOperator("org/mobile#1947", { labels: ["needs-human:manual-takeover"] },
+    "manual-custody", failed.revision);
+  const assessed = store.recovery.list().find(i => i.id === incident.id)!;
+  store.workflowOperator("org/mobile#1947", { labels: [] }, "release-labels", held.revision);
+  assert.deepEqual(store.recovery.list().find(i => i.id === incident.id), assessed);
+});
+
 test("1947 completes and routes for rework while GitHub is unavailable", async (t) => {
   const { store } = fixture(t);
   store.workflow.import(config, [item()]);
