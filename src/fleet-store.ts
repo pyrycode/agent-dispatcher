@@ -1,4 +1,5 @@
 import { DeclarationRepairs, declarationRepairRequest, declarationCaptureFiles, type DeclarationRepairRequest } from './stage-declaration-repair.js';
+import { ClaimsHistory, historyHash } from "./claims-history.js";
 import { StageResults, stageBasis, type StagePlan, type StageSubmission } from "./stage-results.js";
 import { PlanningSplits, type PlanningActor } from './planning-split.js';
 import { RecoverySplits, renderRecoverySlice, splitBodyHash, splitRequirements, splitItemBasis, validateSplitAgainstTicket, validateRecoverySplit, type RecoverySplitRecord } from './recovery-split.js';
@@ -13,7 +14,7 @@ import { WorkflowStore, type WorkflowChange } from "./workflow-store.js";
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { RecoveryFacts, type PauseRecord, type EvidenceRecord, type CoordinationRecord } from "./recovery-facts.js";
-import { RecoveryLedger, recoveryFingerprint, validateObservations, IDLE_RECOVERY_REASONS, RECOVERY_UNKNOWN_PAUSE_REASON, type RecoveryObservation, type RecoveryDecision, type RecoveryIncident, type RecoveryLedgerOptions } from "./fleet-recovery.js";
+import { RecoveryLedger, recoveryFingerprint, hasOperatorHold, validateObservations, IDLE_RECOVERY_REASONS, RECOVERY_UNKNOWN_PAUSE_REASON, type RecoveryObservation, type RecoveryDecision, type RecoveryIncident, type RecoveryLedgerOptions } from "./fleet-recovery.js";
 import { OperationReports } from './operation-reports.js';
 import { OrphanedTaskWatch } from './orphaned-tasks.js';
 import {RecoveryTasks, assessmentTasks, recoveryTaskId, validateTaskRequest, type RecoveryTaskRequest, type RecoveryTaskResult} from './recovery-tasks.js';
@@ -237,11 +238,13 @@ export class FleetStore {
   readonly machineRecoveries: MachineRecoveries;
   readonly verifierHandoffs: VerifierHandoffs;
   readonly storage: StorageMaintenance;
+  readonly history: ClaimsHistory;
   private readonly clock: () => number;
   constructor(path: string, private readonly limits: Readonly<Record<string, MachineLimits>>, options: FleetStoreOptions = {}) {
     for (const value of Object.values(limits)) validateLimits(value);
     this.db = new DatabaseSync(path);
     this.db.exec(`
+      PRAGMA auto_vacuum=INCREMENTAL;
       PRAGMA busy_timeout=5000;
       PRAGMA journal_mode=WAL;
       PRAGMA synchronous=FULL;
@@ -255,6 +258,7 @@ export class FleetStore {
         request TEXT NOT NULL, created INTEGER NOT NULL, finished INTEGER, outcome TEXT
       ) STRICT;
       CREATE UNIQUE INDEX IF NOT EXISTS fleet_ticket_running ON fleet_runs(ticket) WHERE finished IS NULL;
+      CREATE INDEX IF NOT EXISTS fleet_runs_ticket ON fleet_runs(ticket);
       CREATE TABLE IF NOT EXISTS fleet_locks (
         name TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES fleet_runs(id)
       ) STRICT;
@@ -264,7 +268,7 @@ export class FleetStore {
         revision INTEGER NOT NULL CHECK(revision>0)
       ) STRICT;
     `);
-    this.workflow = new WorkflowStore(this.db);
+    this.workflow = new WorkflowStore(this.db, options.now ?? Date.now);
     this.stages = new StageResults(this.db);
     this.declarationRepairs = new DeclarationRepairs(this.db);
     this.machineRecoveries = new MachineRecoveries(this.db);
@@ -291,6 +295,7 @@ export class FleetStore {
     this.codex = new CodexThrottle(this.db, clock, options.codexThrottle ?? DEFAULT_CODEX_THROTTLE, options.log);
     this.desired = new DesiredStateStore(this.db, Object.keys(limits), clock, machine => this.machineCapabilities()[machine]?.projects);
     this.flaky = new FlakySightingLedger(this.db, clock);
+    this.history = new ClaimsHistory(this.db, ticket => this.ticketDone(ticket), clock);
   }
   close(): void { this.db.close(); }
   private storageBasis(request:StorageRequest,attesting=false):string {
@@ -360,7 +365,10 @@ export class FleetStore {
     const source=id.startsWith("acceptance:")?id.slice("acceptance:".length):id;
     if(source!==id && !this.stages.get(source))return undefined;
     const run = this.db.prepare("SELECT machine,ticket,request FROM fleet_runs WHERE id=?").get(source);
-    if (!run) return undefined;
+    if (!run) {
+      const retired = this.db.prepare('SELECT machine,ticket,role FROM fleet_retired_runs WHERE id=?').get(source);
+      return retired ? {machine: String(retired.machine), ticket: String(retired.ticket), role: String(retired.role)} : undefined;
+    }
     let role = "unknown";
     try { role = String(JSON.parse(String(run.request)).role ?? "unknown"); } catch { /* an unreadable request still names its computer */ }
     return { machine: String(run.machine), ticket: String(run.ticket), role };
@@ -767,7 +775,18 @@ export class FleetStore {
     return this.transaction(() => {
       if (!Number.isSafeInteger(revision)) throw new Error('Expected workflow revision required');
       if (this.snapshot().runs.some(r=>r.ticket===ticket)) throw new Error('Ticket has an active reservation; drain it before changing workflow');
-      return this.workflow.change(ticket, change, 'operator', commandId, revision);
+      const before = this.workflow.get(ticket);
+      const result = this.workflow.change(ticket, change, 'operator', commandId, revision);
+      const current = this.workflow.get(ticket);
+      const releasesHold = hasOperatorHold(change.removeLabels ?? [])
+        || change.labels !== undefined && hasOperatorHold(before.labels) && !hasOperatorHold(current.labels);
+      // A saved command replay must not retire a later hold. Reconcile only
+      // this exact ticket after an effective, revision-checked operator release.
+      if (releasesHold && current.revision !== before.revision) {
+        this.recovery.releaseOperatorHold({ ticket, status: current.status, labels: current.labels,
+          blocked: current.blockedBy.some(b => b.state === 'OPEN'), pause: this.facts.getPause(ticket) });
+      }
+      return result;
     });
   }
   recordApprovalOutcome(machine:string,session:string,project:string,runId:string,ticket:string,outcome:ApprovalOutcome) {
@@ -1119,6 +1138,12 @@ export class FleetStore {
   start(req: StartRequest): StartResult {
     return this.transaction(() => {
       const prior=this.db.prepare('SELECT id FROM fleet_runs WHERE id=?').get(req.id);
+      const retired = !prior && this.db.prepare('SELECT verification_pin FROM fleet_retired_runs WHERE id=?').get(req.id);
+      if (retired) {
+        if (!req.verificationPin && req.role === 'verifier' && retired.verification_pin)
+          req = {...req, verificationPin: JSON.parse(String(retired.verification_pin))};
+        return this.startAdmitted(req);
+      }
       if(req.verificationPin && !prior) throw new Error('Verification pins require operator handoff admission');
       if(!req.verificationPin && req.role==='verifier') {
         const saved=prior ? this.db.prepare('SELECT request FROM fleet_runs WHERE id=?').get(req.id) : undefined;
@@ -1143,6 +1168,11 @@ export class FleetStore {
     validateStart(req);
     if (!Object.hasOwn(this.limits, req.machine)) throw new Error("Unknown machine");
     const request = JSON.stringify({ ...req, locks: [...new Set(req.locks)].sort() });
+    const retired = this.db.prepare('SELECT request_hash FROM fleet_retired_runs WHERE id=?').get(req.id);
+    if (retired) {
+      if (retired.request_hash !== historyHash(request)) throw new Error('Request ID reused with different contents');
+      return {ok: false, reason: 'finished'};
+    }
       const previous = this.db.prepare("SELECT request,generation,finished FROM fleet_runs WHERE id=?").get(req.id);
       if (previous) {
         const { runnerPolicy: _policy, ...original } = JSON.parse(String(previous.request));
@@ -1271,7 +1301,7 @@ export class FleetStore {
       // require parent replacement, which survives this run and process.
       this.db.prepare("DELETE FROM fleet_ticket_creators WHERE run_id=?").run(id);
       this.db.prepare("UPDATE fleet_runs SET finished=?,outcome=? WHERE id=? AND finished IS NULL").run(Date.now(), unused ? "unused" : completed ? "completed" : "cancelled", id);
-      if(unused && request.verificationPin && !this.db.prepare("SELECT 1 FROM fleet_runs WHERE ticket=? AND generation=? AND id!=? AND (finished IS NULL OR outcome IS NULL OR outcome!='unused')").get(run.ticket,run.generation,id)) {
+      if(unused && request.verificationPin && !this.db.prepare("SELECT 1 FROM fleet_run_history WHERE ticket=? AND generation=? AND id!=? AND (finished IS NULL OR outcome IS NULL OR outcome!='unused')").get(run.ticket,run.generation,id)) {
         const h=this.verifierHandoffs.get(request.verificationPin.handoff);
         this.db.prepare('UPDATE fleet_claims SET machine=?,generation=? WHERE ticket=? AND generation=?').run(h.source,h.generation,h.ticket,run.generation);
         this.verifierHandoffs.save({...h,state:'cancelled',reason:'Target confirmed admission was unused; source ownership restored'});
@@ -1281,7 +1311,7 @@ export class FleetStore {
       // particular, blocked/failed work and offline reservations remain owned.
       if (unused) {
         this.db.prepare(`DELETE FROM fleet_claims WHERE ticket=? AND generation=?
-          AND NOT EXISTS (SELECT 1 FROM fleet_runs WHERE ticket=? AND generation=?
+          AND NOT EXISTS (SELECT 1 FROM fleet_run_history WHERE ticket=? AND generation=?
             AND (finished IS NULL OR outcome IS NULL OR outcome!='unused'))`)
           .run(run.ticket, run.generation, run.ticket, run.generation);
       }
@@ -1291,10 +1321,10 @@ export class FleetStore {
         WHERE run_id=? AND ((state='complete' AND json_extract(decision,'$.action')='wait')
           OR (reason=? AND state='escalated' AND json_extract(decision,'$.action') IN ('escalate','propose-close')))`).get(id, RECOVERY_UNKNOWN_PAUSE_REASON)) {
         const released = this.db.prepare(`DELETE FROM fleet_claims WHERE ticket=? AND generation=?
-          AND NOT EXISTS (SELECT 1 FROM fleet_runs WHERE ticket=? AND generation=?
+          AND NOT EXISTS (SELECT 1 FROM fleet_run_history WHERE ticket=? AND generation=?
             AND (finished IS NULL OR outcome IS NULL OR outcome NOT IN ('completed','unused')
-              OR (json_extract(request,'$.role')!='recovery' AND outcome!='unused')))
-          AND NOT EXISTS (SELECT 1 FROM fleet_recovery AS recovery JOIN fleet_runs AS history ON history.id=recovery.run_id
+              OR (role!='recovery' AND outcome!='unused')))
+          AND NOT EXISTS (SELECT 1 FROM fleet_recovery AS recovery JOIN fleet_run_history AS history ON history.id=recovery.run_id
             WHERE history.ticket=? AND history.generation=?
             AND json_extract(recovery.decision,'$.action') IN ('retry','rework','resume','refine','unblock','coordinate'))
           AND NOT EXISTS (SELECT 1 FROM fleet_recovery_tasks AS tasks WHERE tasks.ticket=fleet_claims.ticket

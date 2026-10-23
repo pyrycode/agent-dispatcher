@@ -1,3 +1,4 @@
+import { initializeCommandHistory, historyHash } from "./claims-history.js";
 import { parseFeatureRoot } from "./feature-lineage.js";
 import type { EvidenceSeen } from "./evidence-revision.js";
 import type { DatabaseSync } from "node:sqlite";
@@ -74,7 +75,12 @@ export class WorkflowStore {
   private readonly labelTickets = new Map<string, { version: number; tickets: string[] }>();
   private reviewTickets: { version: number; tickets: string[] } | undefined;
   private requirementTickets: { version: number; tickets: Record<string, string[]> } | undefined;
-  constructor(private readonly db: DatabaseSync) {
+  // Publisher-local incidents need freshness even when accepted metadata is unchanged.
+  private readonly archiveObservations = new Map<string, { archived: boolean }>();
+  archiveObservation(ticket: string): { readonly archived: boolean } | undefined {
+    return this.archiveObservations.get(ticket);
+  }
+  constructor(private readonly db: DatabaseSync, private readonly now = Date.now) {
     db.exec(`CREATE TABLE IF NOT EXISTS workflow_projects (project TEXT PRIMARY KEY, config TEXT NOT NULL) STRICT;
       CREATE TABLE IF NOT EXISTS workflow_migrations (project TEXT PRIMARY KEY) STRICT;
       CREATE TABLE IF NOT EXISTS workflow_tickets (
@@ -86,11 +92,13 @@ export class WorkflowStore {
       CREATE TABLE IF NOT EXISTS workflow_comments (id TEXT PRIMARY KEY, ticket TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL, published INTEGER NOT NULL DEFAULT 0) STRICT;
       CREATE TABLE IF NOT EXISTS workflow_filings (id TEXT PRIMARY KEY, project TEXT NOT NULL, request TEXT NOT NULL, started_at INTEGER NOT NULL, issue_id TEXT, result TEXT) STRICT;
       CREATE TABLE IF NOT EXISTS workflow_evidence_seen (ticket TEXT PRIMARY KEY, seen TEXT NOT NULL) STRICT;`);
-    db.exec(`CREATE INDEX IF NOT EXISTS workflow_item_id ON workflow_tickets(json_extract(item,'$.id'));
+    db.exec(`CREATE INDEX IF NOT EXISTS workflow_commands_ticket ON workflow_commands(ticket);
+      CREATE INDEX IF NOT EXISTS workflow_item_id ON workflow_tickets(json_extract(item,'$.id'));
       CREATE INDEX IF NOT EXISTS workflow_issue_id ON workflow_tickets(json_extract(item,'$.issueId'));
       CREATE INDEX IF NOT EXISTS workflow_parent ON workflow_tickets(project,json_extract(item,'$.parentNumber'));
       CREATE INDEX IF NOT EXISTS workflow_order ON workflow_tickets(project,position);
       CREATE INDEX IF NOT EXISTS workflow_status ON workflow_tickets(json_extract(item,'$.status'));`);
+    initializeCommandHistory(db, this.now());
     this.migrateRecoveryPriority();
     this.migrateRepairing();
   }
@@ -508,6 +516,7 @@ export class WorkflowStore {
           // A newly discovered closed issue is history, not a new job.
           const item = {
             ...observed,
+            archived: observed.archived || undefined,
             featureRoot: parseFeatureRoot(observed.body, project),
             status: observed.state === "CLOSED" ? "Done" : "Inbox",
             labels: observed.labels.filter(
@@ -544,7 +553,11 @@ export class WorkflowStore {
             subIssues: observed.subIssues,
             evidenceRevision:
               observed.evidenceRevision ?? current.evidenceRevision,
-            archived: observed.archived,
+            // Only true is persisted. An unarchived card stores no value, so a
+            // fresh unarchived observation of an unarchived ticket changes nothing.
+            archived: observed.archived === undefined
+              ? current.archived
+              : observed.archived || undefined,
           };
           const changed = JSON.stringify(content) !== JSON.stringify(current);
           // A human edited the display. Republish authority; never import that edit.
@@ -553,7 +566,7 @@ export class WorkflowStore {
           const drift =
             JSON.stringify(dependencies(observed.blockedBy)) !==
               JSON.stringify(dependencies(current.blockedBy)) ||
-            (!observed.archived && observed.status !== current.status) ||
+            (!content.archived && observed.status !== current.status) ||
             observed.state !== current.state ||
             JSON.stringify([...observed.labels].sort()) !==
               JSON.stringify([...current.labels].sort());
@@ -566,6 +579,12 @@ export class WorkflowStore {
         }
       }
     });
+    // Publish freshness only after the entire observation transaction succeeded.
+    for (const item of items)
+      if (typeof item.archived === "boolean")
+        this.archiveObservations.set(`${project}#${item.issueNumber}`, {
+          archived: item.archived,
+        });
   }
   change(
     ticket: string,
@@ -595,6 +614,9 @@ export class WorkflowStore {
       throw new Error("Invalid workflow command");
     const request = JSON.stringify({ ticket, change, actor, expectedRevision });
     return this.transaction(() => {
+      const retired = this.db.prepare('SELECT request_hash FROM fleet_retired_commands WHERE id=?').get(commandId);
+      if (retired) throw new Error(retired.request_hash === historyHash(request)
+        ? 'Workflow command expired; retained identity cannot be applied again' : 'Workflow command identity reused');
       const replay = this.db
         .prepare("SELECT * FROM workflow_commands WHERE id=?")
         .get(commandId);
@@ -713,6 +735,7 @@ export class WorkflowStore {
       this.db
         .prepare("INSERT INTO workflow_commands VALUES (?,?,?,?)")
         .run(commandId, ticket, request, JSON.stringify(updated));
+      this.db.prepare('INSERT INTO workflow_command_ages VALUES (?,?)').run(commandId, this.now());
       return updated;
     });
   }
