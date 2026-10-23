@@ -341,17 +341,32 @@ export interface ManagedWorktreeRecord {
   run: FleetRun;
 }
 
-/** Require the authority's exact normal-completion record and an active
- * successor reservation in the SAME ownership generation. ManagedDispatch
- * waits for tracked children before that release. Absence
- * alone, a PID probe, a FAIL verdict or a new ownership generation proves
- * nothing: operator release changes the generation, and is refused here. */
-export function managedPredecessorFinished(prior: FleetRun, current: FleetRun, state: FleetSnapshot, finishedPrior: FleetRun | null): boolean {
+/** The authority's record of a finished predecessor. `outcome` is absent
+ * from an older claim service, which never confirms across generations. */
+export type FinishedPredecessor = FleetRun & { outcome?: "completed" | "cancelled" };
+
+/** Require the authority's exact finished record for the recorded worker,
+ * on this machine, and this run as the ticket's only live run, holding the
+ * current claim. ManagedDispatch waits for tracked children before it
+ * finishes a run. Absence alone, a PID probe or a FAIL verdict proves
+ * nothing.
+ *
+ * Why the generation once had to match: operator release (free) changes the
+ * generation without proving the old worker stopped. That run never gets a
+ * normal outcome, so the authority does not confirm it at all, in any
+ * generation. Stopped-worker recovery finishes the run as cancelled and then
+ * releases the claim, keeping its files for an operator to reconcile. So in
+ * a later generation only a normal completion is accepted. The caller also
+ * checks that no process uses the path. pyrycode-mobile #2338 and #2442,
+ * 2026-10-23: completed, clean, pushed predecessors were refused only
+ * because later runs had moved the ownership on. */
+export function managedPredecessorFinished(prior: FleetRun, current: FleetRun, state: FleetSnapshot, finishedPrior: FinishedPredecessor | null): boolean {
   if (!finishedPrior || (["id", "session", "generation", "machine", "project", "ticket", "role", "created"] as const)
     .some(key => prior[key] !== finishedPrior[key])) return false;
   if (![prior.id, prior.session, prior.generation].every(value => typeof value === "string" && value.length > 0)) return false;
+  if (prior.generation !== current.generation && finishedPrior.outcome !== "completed") return false;
   if (prior.id === current.id || prior.machine !== current.machine || prior.project !== current.project ||
-      prior.ticket !== current.ticket || prior.generation !== current.generation || !Number.isFinite(prior.created) ||
+      prior.ticket !== current.ticket || !Number.isFinite(prior.created) ||
       !Number.isFinite(current.created) || prior.created > current.created) return false;
   const runs = state.runs.filter(run => run.ticket === current.ticket);
   return runs.length === 1 && runs[0]!.id === current.id && runs[0]!.session === current.session &&
@@ -375,7 +390,7 @@ export function managedPredecessorFinished(prior: FleetRun, current: FleetRun, s
  * Reuse only when all hold:
  * - the one worktree still holding the branch is this agent's own path,
  *   or its recorded managed predecessor has been authoritatively confirmed
- *   finished (including its tracked children) in this ownership generation.
+ *   finished (including its tracked children); see managedPredecessorFinished.
  * - it is not locked, its status could be read, and no merge, rebase,
  *   cherry-pick or revert is unfinished in it.
  * - there is something to continue from: retained local files, or local
