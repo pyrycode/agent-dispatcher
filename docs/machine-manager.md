@@ -762,6 +762,15 @@ workers and reservations still require proof of stopping before release.
 
 ## Executable recovery work
 
+A manual repair can use a separate checkout when no configured repair executor
+is available. Inspect existing support assignments first. Preserve and reuse an
+assignment's work, or cancel a queued assignment through the supported operator
+control before replacing it. A withdrawn assignment with no worker or artifacts
+needs no further queue reconciliation. Do not launch a second implementation
+beside active or uncertain work. Capture declaration recovery uses the protected
+[declaration repair handoff](stage-results.md#recovering-undeclared-capture-outputs).
+
+
 An admitted recovery can return `coordinate` with a fixed `task` request instead
 of escalating an available platform to a person. Admitted builders and developers
 can request the same native checks through `scripts/fleet-task.py`. Each run gets

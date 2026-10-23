@@ -1,3 +1,4 @@
+import { readClaimsRetention, startClaimsMaintenance } from "./claims-history.js";
 import {WorkflowGitHub} from "./workflow-github.js";
 import {WorkflowPublisher} from "./workflow-publisher.js";
 import {GitHubProjectClient} from "./github.js";
@@ -49,7 +50,7 @@ async function main(): Promise<void> {
   }
   if(command==='workflow') {
     const [action,project,file,boardNumber]=args;
-    if(!['read','export','import','change','file','prepare','activate','cancel-preparation','approval-authorize','recovery-split'].includes(action)||!project)throw new Error('workflow read|export|import|change|file|prepare|activate|cancel-preparation|approval-authorize|recovery-split PROJECT [JSON_FILE]');
+    if(!['read','export','import','change','file','prepare','activate','cancel-preparation','approval-authorize','declaration-repair','recovery-split'].includes(action)||!project)throw new Error('workflow read|export|import|change|file|prepare|activate|cancel-preparation|approval-authorize|declaration-repair|recovery-split PROJECT [JSON_FILE]');
     if(action==='export') {
       if(!file)throw new Error('Export output path required');
       const entry=config.projects?.find((p:any)=>p.repo===project);
@@ -67,6 +68,9 @@ async function main(): Promise<void> {
     if(action==='recovery-split') {
       if(Object.keys(input).length!==1 || typeof input.id!=='string' || !/^[a-f0-9-]{36}$/.test(input.id)) throw new Error('Recovery split retry accepts only its retained incident id');
       console.log(JSON.stringify(await claims.call('/recovery/split',{id:input.id,project})));return;
+    }
+    if(action==='declaration-repair') {
+      console.log(JSON.stringify(await claims.call('/workflow/declaration-repair',{...input,project})));return;
     }
     if(action==='approval-authorize') {
       if(!input.commandId) throw new Error('Approval decision requires a commandId kept for retries');
@@ -158,11 +162,13 @@ async function main(): Promise<void> {
     const reassessMinutes = config.recovery?.reassessBaseMinutes, reassessHours = config.recovery?.reassessCeilingHours;
     if (reassessMinutes !== undefined && (typeof reassessMinutes !== "number" || !Number.isFinite(reassessMinutes))) throw new Error("recovery.reassessBaseMinutes must be a number");
     if (reassessHours !== undefined && (typeof reassessHours !== "number" || !Number.isFinite(reassessHours))) throw new Error("recovery.reassessCeilingHours must be a number");
+    const claimsRetention = readClaimsRetention(config.claimsHistory);
     const store = new FleetStore(database, limits, { ...(safetyHours === undefined ? {} : { safetyRecheckMs: Math.round(safetyHours * 3600_000) }),
       ...(orphanMinutes === undefined ? {} : { orphanedTaskMs: Math.round(orphanMinutes * 60_000) }),
       ...(reassessMinutes === undefined ? {} : { reassessBaseMs: Math.round(reassessMinutes * 60_000) }),
       ...(reassessHours === undefined ? {} : { reassessCeilingMs: Math.round(reassessHours * 3600_000) }),
       codexThrottle: readCodexThrottleConfig(config.codexThrottle) });
+    const stopClaimsMaintenance = startClaimsMaintenance(store.history, claimsRetention);
     // Logs a Codex pause's end once, when it runs out, rather than at the next report.
     const codexTimer = setInterval(() => { try { store.codexTick(); } catch (e) { console.warn("Codex throttle tick failed:", (e as Error).message); } }, 5_000);
     // A claim held by a computer that cannot run its ticket's requirement is released, so a capable one can take the next stage.
@@ -214,7 +220,7 @@ async function main(): Promise<void> {
     const stopLabels = startClaimLabelSync(config.githubLabels, () => store.snapshot().claims, process.env, labelFetch, () => store.recovery.escalatedTickets(), project=>store.workflow.enabled(project));
     // A display pass writes the database after its GitHub calls, so it may finish.
     const shutdown = new ServiceShutdown({ servers: cli ? [server, cli] : [server],
-      stop: [() => clearInterval(updateTimer), () => clearInterval(workflowTimer), () => clearInterval(codexTimer), () => clearInterval(capabilityTimer), () => clearInterval(evidenceTimer), () => clearInterval(vacuumTimer), stopLabels],
+      stop: [stopClaimsMaintenance, () => clearInterval(updateTimer), () => clearInterval(workflowTimer), () => clearInterval(codexTimer), () => clearInterval(capabilityTimer), () => clearInterval(evidenceTimer), () => clearInterval(vacuumTimer), stopLabels],
       pending: () => publishing, close: () => { store.close(); evidence?.close(); }, deadlineMs: stopDeadline });
     process.on("SIGTERM", () => void shutdown.stop("SIGTERM")); process.on("SIGINT", () => void shutdown.stop("SIGINT"));
     console.log("Claim service listening", server.address());
