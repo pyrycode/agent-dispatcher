@@ -1,4 +1,4 @@
-import { countsForRoleLimit, heavyProject, type FleetSnapshot, type MachineLimits, type ResourceClass, type RoleLimitScope } from "./fleet-store.js";
+import { countsForRoleLimit, heavyProject, supportTaskHolds, type FleetSnapshot, type MachineLimits, type ResourceClass, type RoleLimitScope } from "./fleet-store.js";
 import type { AgentRunner } from "./agent-runner.js";
 import { startsCodex } from "./codex-throttle.js";
 import { missingCapabilities } from "./ticket-requirements.js";
@@ -116,6 +116,9 @@ export function workEligibility(offer: WorkOffer, state: FleetSnapshot, policy: 
   if ((state.machineRecoveries ?? []).some(r => r.machine === policy.machine && r.cleared === undefined && [offer.project, offer.parentTicket?.split("#")[0]].includes(r.project))) return "drained";
   if (lackingCapabilities(offer, state, policy.capabilities).length) return "missing-capability";
   if (offer.role !== "recovery" && !(state.requiredRepairs?.[offer.ticket] ?? []).every(sha => offer.readyRepairs?.includes(sha))) return "missing-repair";
+  // The authority refuses it until the ticket's support task ends. An older
+  // claim service leaves the list out, which holds nothing here.
+  if (supportTaskHolds(offer.ticket, offer.role, state.openTaskTickets ?? [])) return "support-task-open";
   return undefined;
 }
 export function reviewQueue(machine: string, state: FleetSnapshot, offers: readonly WorkOffer[], policy?: EligibilityPolicy): string[] | undefined {

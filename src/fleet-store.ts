@@ -105,6 +105,20 @@ export function startsOwnership(role: string): boolean {
   return !NON_OWNING_ROLES.has(role);
 }
 
+/** Support task states that hold their ticket's own stages. */
+export const OPEN_SUPPORT_TASK_STATES = ["queued", "running", "publishing", "attention"] as const;
+/**
+ * Admission refuses every stage of a numbered ticket except a recovery
+ * assessment while a support task is open on it. The scheduler and the
+ * manager's queue use this same test on the snapshot's openTaskTickets, so
+ * they do not offer or report as eligible work the authority would refuse.
+ * pyrycode-mobile #2442, 2026-10-23: shown eligible on two computers for a
+ * day behind a queued support task no computer could run.
+ */
+export function supportTaskHolds(ticket: string, role: string, openTaskTickets: readonly string[]): boolean {
+  return /#[1-9]\d*$/.test(ticket) && role !== "recovery" && openTaskTickets.includes(ticket);
+}
+
 export interface StartRequest {
   /** Issued only by atomic operator handoff admission. */
   verificationPin?: VerificationPin;
@@ -1211,8 +1225,8 @@ export class FleetStore {
     if(/#[1-9]\d*$/.test(req.ticket) && req.role!=='recovery') {
       const required=this.requiredRepairs()[req.ticket]??[];
       if(required.some(sha=>!req.readyRepairs?.includes(sha))) return {ok:false,reason:'locked'};
-      if(this.tasks.list(req.ticket).some(t=>['queued','running','publishing','attention'].includes(t.state))) return {ok:false,reason:'locked'};
     }
+    if(supportTaskHolds(req.ticket, req.role, this.openTaskTickets([req.ticket]))) return {ok:false,reason:'locked'};
       if (req.ticket.includes("#@main-sweep-") && this.db.prepare("SELECT 1 FROM fleet_runs WHERE ticket=? AND finished IS NOT NULL AND outcome='completed'").get(req.ticket)) return { ok: false, reason: "finished" };
       if (req.role === "reconcile" && (req.ticket !== `${req.project}#@reconcile` || !req.locks.includes(`${req.project}:reconcile`))) throw new Error("Housekeeping requires the project lock");
       if (req.role === "recovery") {
@@ -1540,9 +1554,12 @@ export class FleetStore {
     return ready.filter(t => !tasked.has(t));
   }
 
-  /** Tickets with an open support task, in the states start() refuses. */
-  openTaskTickets(): string[] {
-    return this.db.prepare("SELECT DISTINCT ticket FROM fleet_recovery_tasks WHERE state IN ('queued','running','publishing','attention') ORDER BY ticket").all().map(r => String(r.ticket));
+  /** Tickets with an open support task, in the states start() refuses. `among` narrows the read to those tickets. */
+  openTaskTickets(among?: readonly string[]): string[] {
+    const states = OPEN_SUPPORT_TASK_STATES.map(() => "?").join(",");
+    const only = among ? ` AND ticket IN (${among.map(() => "?").join(",") || "NULL"})` : "";
+    return this.db.prepare(`SELECT DISTINCT ticket FROM fleet_recovery_tasks WHERE state IN (${states})${only} ORDER BY ticket`)
+      .all(...OPEN_SUPPORT_TASK_STATES, ...(among ?? [])).map(r => String(r.ticket));
   }
 
   /** Read-only custody proof. A missing active reservation alone cannot
