@@ -115,7 +115,6 @@ confirm indexed searches. An index plan proves lookup behaviour. It does not
 establish a production CPU or disk-read improvement under a different workload.
 Deployment and comparable runtime measurements remain separate operations.
 
-
 Use the existing protected operator and GitHub logins. Never place credentials in
 request files or command arguments.
 
