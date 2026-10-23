@@ -152,7 +152,7 @@ test("real manager grants cover workflow writes and handoff waits until the chil
   await managed.run(successor, async () => {
     assert.deepEqual(await managed.connection.call("/worktree/predecessor", {
       session: successor.run!.session, runId: successor.run!.id, priorId: prior.id,
-    }), prior, "the authority confirms the exact finished verifier through the manager");
+    }), { ...prior, outcome: "completed" }, "the authority confirms the exact finished verifier through the manager");
     await assert.rejects(managed.connection.call("/worktree/predecessor", {
       session: "unknown", runId: successor.run!.id, priorId: prior.id,
     }), /403/);
