@@ -443,7 +443,6 @@ test("an already-linked answer is only accepted when a re-read shows the link", 
   assert.ok(calls.includes("add I1<-I2"));
 });
 
-
 test("archived target waits for restoration across time, revisions and a full queue", async (t) => {
   const store = fixture(t);
   store.workflow.import(config, Array.from({ length: 12 }, (_, i) => item(i + 1)));
@@ -490,7 +489,9 @@ test("archived target waits for restoration across time, revisions and a full qu
 test("an unchanged unarchived observation releases suppression without a revision change", async (t) => {
   const store = fixture(t);
   store.workflow.import(config, [item(1, { archived: false })]);
-  store.workflow.observe(config.project, [store.workflow.get("org/relay#1")]);
+  // GitHub always reports the archive flag; the stored item keeps only true.
+  const unarchived = () => ({ ...store.workflow.get("org/relay#1"), archived: false });
+  store.workflow.observe(config.project, [unarchived()]);
   const revision = store.workflow.get("org/relay#1").revision;
   const options = { failAlias: new Set(["s0"]) };
   const { github, calls } = fakeGitHub(store, options);
@@ -502,11 +503,11 @@ test("an unchanged unarchived observation releases suppression without a revisio
   assert.deepEqual(calls, [], "the pre-error unarchived value is stale");
   // A rolled-back observation must not release the hold either.
   assert.throws(() => store.workflow.observe(config.project, [
-    store.workflow.get("org/relay#1"), item(2, { issueId: "" }),
+    unarchived(), item(2, { issueId: "" }),
   ]));
   await publisher.tick();
   assert.deepEqual(calls, []);
-  store.workflow.observe(config.project, [store.workflow.get("org/relay#1")]);
+  store.workflow.observe(config.project, [unarchived()]);
   assert.equal(store.workflow.get("org/relay#1").revision, revision);
   await publisher.tick();
   assert.deepEqual(pendingTickets(store), []);
