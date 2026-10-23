@@ -28,13 +28,19 @@ export function recoverySplitFixturePlan():RecoverySplitPlan {
     behaviours:[{id:'history',description:'Selected host history stays isolated',child:'host-history',verification:'Cross-host history regression'},{id:'menu',description:'Background task menu updates independently',child:'task-menu',verification:'Background menu completion regression'}],
     requirements:[{text:'Selected host history stays isolated',child:'host-history'},{text:'Background task menu updates independently',child:'task-menu'},{text:'Authentication checks remain required',child:'host-history'},{text:'Authentication checks remain required',child:'task-menu'}],children};
 }
-async function fixture(t:TestContext, options:{metadata?:boolean;causal?:boolean;oversized?:boolean;database?:string;evidenceDatabase?:string}={}) {
+async function fixture(t:TestContext, options:{metadata?:boolean;causal?:boolean;oversized?:boolean;database?:string;evidenceDatabase?:string;discovered?:boolean}={}) {
   const store = new FleetStore(options.database ?? ':memory:',{mac:{heavyLimit:4,combinedLimit:4},linux:{heavyLimit:4,combinedLimit:4}});
   store.reportMachineCapabilities('mac',[],[project]);
   const parent = item(3,{blockedBy:options.causal?[{number:5,state:'OPEN',url:'https://github.com/org/app/issues/5'}]:[],parentNumber:2,grandparentNumber:1,status:'In Code Review',body,labels:['rework-count:3','error:rework-loop','security-sensitive','needs-real-claude','priority:high']});
   store.workflow.import(config,[item(1,{state:'CLOSED',status:'Done'}),item(2,{parentNumber:1,state:'CLOSED',status:'Done'}),parent,item(4,{blockedBy:[{number:3,state:'OPEN',url:parent.url}]}),...(options.causal?[item(5)]:[])]);
   const evidence = new EvidenceStore(options.evidenceDatabase ?? ':memory:',{...DEFAULT_EVIDENCE_LIMITS,totalBytes:1024*1024,ticketBytes:512*1024,bundleBytes:256*1024},id=>store.runOwner(id));
   const plan = recoverySplitFixturePlan();
+  if(options.discovered) {
+    plan.classification = 'discovered-scope';
+    plan.evidence = plan.evidence.filter(e=>e.role==='builder');
+    plan.evidence.find(e=>e.role==='builder')!.findings=['host-scope','menu-state'];
+    store.workflow.change(ticket,{status:'In Development',labels:['error:builder:scope','security-sensitive','needs-real-claude']},'operator','scope-handoff');
+  }
   for (const reference of plan.evidence) {
     // Historical runs remain intact. The test uses ordinary authority run records and real hashed bundles.
     const role = reference.role;
@@ -285,4 +291,40 @@ test('a fresh authority resumes a persisted partial split without recreating chi
   assert.deepEqual(reopened.snapshot().claims,claims);assert.equal(retained.list(ticket).length,3);
   assert.equal(reopened.splits.get(f.incident.id)?.source.body,body);
   assert.equal(reopened.workflow.get('org/app#100').featureRoot,'org/app#1');
+});
+
+test('builder discovery can split a grandchild before any verifier or rework cycle',async t=>{
+  const f=await fixture(t,{discovered:true});
+  assert.equal(f.evidence.list(ticket).length,1);
+  assert.equal(f.store.workflow.get(ticket).labels.some(l=>l.startsWith('rework-count:')),false);
+  const result:any=await f.bridge.recoverySplit(f.incident.id,f.evidence,f.actor);
+  assert.equal(result.state,'complete');
+  assert.equal(f.store.workflow.get('org/app#100').status,'Backlog');
+  assert(f.store.workflow.get('org/app#100').labels.includes('needs-real-claude'));
+});
+
+test('discovered scope still requires retained builder evidence',()=>{
+  const p=recoverySplitFixturePlan();p.classification='discovered-scope';
+  p.evidence=p.evidence.filter(e=>e.role!=='builder');
+  assert.throws(()=>validateRecoverySplit(p),/builder/);
+});
+
+test('early split evidence cannot bypass the repeated-rework rule without a builder handoff',()=>{
+ const p=recoverySplitFixturePlan();p.classification='discovered-scope';
+ assert.throws(()=>validateSplitAgainstTicket(p,item(3,{body,labels:[]}),p.featureRoot),/builder scope handoff/);
+ p.classification='accumulating-behaviours';
+ assert.throws(()=>validateSplitAgainstTicket(p,item(3,{body,labels:['error:builder:scope']}),p.featureRoot),/repeated rework/);
+});
+
+test('early split rejects metadata-only discovery and retains the parent',async t=>{
+ const f=await fixture(t,{discovered:true,metadata:true});
+ await assert.rejects(f.bridge.recoverySplit(f.incident.id,f.evidence,f.actor),/substantive retained/);
+ assert.equal(f.store.workflow.get(ticket).state,'OPEN');assert.equal(f.issues.size,0);
+});
+
+test('early split preserves an operator hold',async t=>{
+ const f=await fixture(t,{discovered:true});
+ f.store.workflow.change(ticket,{addLabels:['needs-human:approval']},'operator','retain-approval');
+ await assert.rejects(f.bridge.recoverySplit(f.incident.id,f.evidence,f.actor),/changed|hold/);
+ assert.equal(f.store.workflow.get(ticket).state,'OPEN');assert.equal(f.issues.size,0);
 });

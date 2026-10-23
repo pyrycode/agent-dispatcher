@@ -75,6 +75,7 @@ process.stdin.on('end', async () => {
     {type:'error',message:'exceeded retry limit, last status: 429 Too Many Requests'},
     {type:'turn.failed',error:{message:'exceeded retry limit, last status: 429 Too Many Requests'}});
   if (process.env.TEST_MODE === 'failed-command') events.splice(2, 0, {type:'item.completed',item:{id:'red-test',type:'command_execution',status:'failed',exit_code:1,aggregated_output:'Expected red test'}});
+  if (process.env.TEST_MODE === 'scope') events[2].item.text = JSON.stringify({status:'needs_scope_review', summary:'Unexpected consumer migration'});
   if (process.env.TEST_MODE === 'refinement') events[2].item.text = JSON.stringify({status:'needs_refinement', summary:'Scope conflict requires refinement'});
   if (process.env.TEST_MODE === 'blocked') events[2].item.text = JSON.stringify({status:'blocked', summary:'Required action rejected by review'});
   if (process.env.TEST_MODE === 'unicode') events[2].item.text = JSON.stringify({status:'completed', summary:'Fixture café finished'});
@@ -155,7 +156,7 @@ test("Codex subprocess receives literal stdin, additive role, schema and reviewe
   assert.ok(args.includes('model_reasoning_effort="high"'));
   assert.ok(args.includes('project_doc_fallback_filenames=["CLAUDE.md"]'));
   const schema = JSON.parse(readFileSync(args[args.indexOf("--output-schema") + 1], "utf8"));
-  assert.deepEqual(schema.properties.status.enum, ["completed", "blocked", "needs_refinement", "waiting_on_blocker"]);
+  assert.deepEqual(schema.properties.status.enum, ["completed", "blocked", "needs_refinement", "needs_scope_review", "waiting_on_blocker"]);
   for (const forbidden of ["--max-turns", "--allowedTools", "--disallowedTools", "--dangerously-bypass-approvals-and-sandbox"]) assert.ok(!args.includes(forbidden));
 });
 
@@ -430,4 +431,9 @@ test("after a dispatcher restart the first Codex start waits its random spread, 
   const g = fixture(t, "normal");
   await runClaudeStreaming(g.options);
   assert.doesNotMatch(readFileSync(g.options.logFile, "utf8"), /Codex start spread/, "later starts do not wait");
+});
+
+test("Codex subprocess preserves the builder scope review outcome",async t=>{
+ const result=await runClaudeStreaming(fixture(t,"scope").options);
+ assert.equal(result.isError,false);assert.equal(result.terminalReason,"needs_scope_review");
 });

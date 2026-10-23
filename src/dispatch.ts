@@ -2817,6 +2817,8 @@ export type DispatchContext = {
   gateTestdata?: ReadonlySet<string>;
   /** A failed run must keep its complete local tree until capture publication is reviewed. */
   publicationHeld?: boolean;
+  /** A scope handoff keeps partial files even if publishing its receipt fails. */
+  scopeHandoff?: boolean;
 };
 
 /**
@@ -3241,8 +3243,8 @@ async function dispatchWithContext(ctx: DispatchContext, outcome: { value: strin
       await cleanupAfterDispatch(ctx);
       return;
     }
-    const preserveBlockedWork = ctx.publicationHeld === true || !!ctx.deps.managedWorktree?.run.verificationPin || streamResult?.runner === "codex"
-      && ["codex_blocked", "needs_refinement"].includes(streamResult.terminalReason) && ctx.useWorktree;
+    const preserveBlockedWork = ctx.scopeHandoff === true || ctx.publicationHeld === true || !!ctx.deps.managedWorktree?.run.verificationPin || streamResult?.runner === "codex"
+      && ["codex_blocked", "needs_refinement", "needs_scope_review"].includes(streamResult.terminalReason) && ctx.useWorktree;
     if (preserveBlockedWork) error.message += `\nWorktree preserved for recovery: ${ctx.worktreeDir}`;
     // A run that failed (wall clock, idle stall, crash or error result):
     // push its leftovers BEFORE the error path and the worktree teardown,
@@ -3493,7 +3495,7 @@ export async function handleDispatchError(
         approvalReviewFailed: streamResult?.approvalReviewFailed === true,
       })
       // A missing tool was already retried inside the run.
-      : terminalReason === "needs_refinement" || terminalReason === TOOL_UNAVAILABLE_REASON
+      : terminalReason === "needs_refinement" || terminalReason === "needs_scope_review" || terminalReason === TOOL_UNAVAILABLE_REASON
         ? { transient: false, signature: "" }
         : classifyAgentError(classifyText, { terminalReason: streamResult?.terminalReason });
     if (transient) {
@@ -5897,6 +5899,24 @@ export async function handlePostRun(
     ctx.deps.writeLog(logFile, "BLOCKER WAIT", streamResult.output);
     console.log(`   ⏸️  #${item.issueNumber} waits on ${blockers.map(n => `#${n}`).join(", ")}; worktree retained`);
     return { ok: false };
+  }
+
+  // Scope discovery is a recovery assessment, including after implementation
+  // has started. Never publish, auto-commit or clean up the preserved work.
+  const scopeOutcome = streamResult.terminalReason === "needs_scope_review";
+  const claudeScope = streamResult.runner === "claude" && agent.name === "builder"
+    && item.issueNumber > 0 && (await client.getIssueLabels(item.issueNumber)).includes("error:builder:scope");
+  if (scopeOutcome || claudeScope) {
+    ctx.scopeHandoff = true;
+    if (agent.name !== "builder" || item.issueNumber <= 0 || streamResult.isError
+        || streamResult.hadPermissionDenial || saferSalvaged || scopeOutcome && streamResult.runner !== "codex") {
+      throw new Error("Invalid scope handoff; operator review required");
+    }
+    await client.addComment(item.issueNumber,
+      `## Builder requests scope reassessment\n\n${streamResult.output}\n\nWorktree retained for recovery: ${agentCwd}\nNo implementation completion or acceptance is claimed.`);
+    await client.addLabel(item.issueNumber, "error:builder:scope");
+    ctx.deps.writeLog(logFile, "SCOPE HANDOFF", streamResult.output);
+    return {ok:false};
   }
 
   // A builder planning handoff is neither completed implementation nor an

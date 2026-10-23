@@ -11399,6 +11399,41 @@ describe("Codex builder refinement handoff", () => {
   });
 });
 
+describe("Builder scope reassessment handoff", () => {
+  const request = () => streamResult({runner:"codex", isError:false, terminalReason:"needs_scope_review", output:"Thread admission also requires migrating reply, permission and reset behaviour. Preserve feature/100 and split migration before enforcement."});
+  test("retains partial implementation and requests recovery without publishing or advancing", async () => {
+    const {ctx, client, calls} = makeTestContext({agent:{name:"builder"}});
+    assert.deepEqual(await handlePostRun(request(), ctx, false), {ok:false});
+    assert.deepEqual(client.addLabelCalls, [{issueNumber:100,label:"error:builder:scope"}]);
+    assert.match(client.comments[0].body, /Thread admission/);
+    assert.match(client.comments[0].body, /Worktree retained/);
+    assert.equal(calls.exec.length, 0);
+    assert.equal(calls.spawn.length, 0);
+  });
+  test("Claude uses the same retained-work handoff through its workflow label", async () => {
+    const {ctx,client,calls}=makeTestContext({agent:{name:"builder"},client:new MockGitHubClient({labels:{100:["error:builder:scope"]}})});
+    assert.deepEqual(await handlePostRun({...request(),runner:"claude",terminalReason:"stop"},ctx,false),{ok:false});
+    assert.match(client.comments[0].body,/scope reassessment/);
+    assert.equal(calls.exec.length,0);
+  });
+  test("a failed handoff retains work and cannot claim completion", async () => {
+    const {ctx, client, calls} = makeTestContext({agent:{name:"builder"}});
+    client.failures.addComment = new Error("offline");
+    await assert.rejects(handlePostRun(request(), ctx, false), /offline/);
+    assert.equal(client.addLabelCalls.length, 0);
+    assert.equal(calls.exec.length, 0);
+  });
+  test("denied, failed and non-builder outcomes cannot use a scope handoff", async () => {
+    for (const patch of [{hadPermissionDenial:true}, {isError:true}, {runner:"claude" as const}]) {
+      const {ctx, client} = makeTestContext({agent:{name:"builder"}});
+      await assert.rejects(handlePostRun({...request(),...patch},ctx,false), /Invalid scope handoff/);
+      assert.equal(client.addLabelCalls.length,0);
+    }
+    const {ctx} = makeTestContext({agent:{name:"verifier"}});
+    await assert.rejects(handlePostRun(request(),ctx,false), /Invalid scope handoff/);
+  });
+});
+
 describe("Codex builder blocker wait", () => {
   const request = () => streamResult({runner:"codex", isError:false, terminalReason:"waiting_on_blocker", output:"Baseline format fix is #1280"});
   test("a fresh open dependency routes to the existing wait path", async () => {

@@ -13,7 +13,7 @@ export interface RecoverySlice {
   kind: 'bug' | 'behaviour'; regression?: string; dependsOn: string[]; reuse: string[];
 }
 export interface RecoverySplitPlan {
-  featureRoot: string; bodyHash: string; classification: 'accumulating-behaviours';
+  featureRoot: string; bodyHash: string; classification: 'accumulating-behaviours' | 'discovered-scope';
   justification: string; smallerResult: string; evidence: RecoverySplitEvidence[];
   findings: Array<{ id: string; description: string; child: string }>;
   requirements: Array<{ text: string; child: string }>;
@@ -77,9 +77,9 @@ export function recoverySplitScope(plan: RecoverySplitPlan): string {
 }
 export function validateRecoverySplit(value: unknown): RecoverySplitPlan {
   const p = value as RecoverySplitPlan;
-  if (!p || JSON.stringify(p).length > 80000 || !ref.test(p.featureRoot) || !digest.test(p.bodyHash) || p.classification !== 'accumulating-behaviours'
+  if (!p || JSON.stringify(p).length > 80000 || !ref.test(p.featureRoot) || !digest.test(p.bodyHash) || !['accumulating-behaviours', 'discovered-scope'].includes(p.classification)
     || !text(p.justification) || !text(p.smallerResult) || !Array.isArray(p.children) || p.children.length < 2 || p.children.length > 8
-    || !Array.isArray(p.evidence) || p.evidence.length < 3 || p.evidence.length > 30
+    || !Array.isArray(p.evidence) || p.evidence.length < 1 || p.evidence.length > 30
     || !Array.isArray(p.findings) || !p.findings.length || p.findings.length > 100
     || !Array.isArray(p.requirements) || !p.requirements.length || p.requirements.length > 100
     || !Array.isArray(p.behaviours) || p.behaviours.length < 2 || p.behaviours.length > 100) throw new Error('Invalid recovery split plan');
@@ -132,7 +132,9 @@ export function validateRecoverySplit(value: unknown): RecoverySplitPlan {
       || !text(e.conclusion) || !Array.isArray(e.inspectedPaths) || !e.inspectedPaths.length || e.inspectedPaths.some(p => !text(p, 500)) || !Array.isArray(e.findings) || e.findings.some(id => !ids.has(id))) throw new Error('Invalid retained recovery split evidence');
     roles.add(e.role);
   }
-  if (roles.size !== 3 || p.findings.some(f => !p.evidence.some(e => e.findings.includes(f.id)))) throw new Error('Inspect retained builder, verifier and recovery evidence and account for every finding');
+  const requiredRoles = p.classification === 'discovered-scope' ? ['builder'] : ['builder', 'verifier', 'recovery'];
+  if (requiredRoles.some(role => !roles.has(role)) || p.findings.some(f => !p.evidence.some(e => e.findings.includes(f.id))))
+    throw new Error(`Inspect retained ${requiredRoles.join(', ')} evidence and account for every finding`);
   return structuredClone(p);
 }
 export function validateSplitAgainstTicket(plan: RecoverySplitPlan, item: ProjectItem, root: string): void {
@@ -150,7 +152,9 @@ export function validateSplitAgainstTicket(plan: RecoverySplitPlan, item: Projec
   if (prior && JSON.stringify([...prior.behaviours].sort()) !== JSON.stringify(plan.behaviours.map(b => normal(b.description)).sort()))
     throw new Error('A further recovery split must partition the immutable previously assigned behaviour scope');
   if (item.labels.some(l => l === 'error:infra' || /^(?:flaky-test|inherited-test-failure)$/.test(l))) throw new Error('Infrastructure and flaky-test failures require their own recovery');
-  if (!item.labels.some(l => /^rework-count:\d+$/.test(l) && Number(l.split(':')[1]) >= 2)) throw new Error('Recovery splitting requires repeated rework evidence');
+  if (plan.classification === 'discovered-scope') {
+    if (!item.labels.includes('error:builder:scope')) throw new Error('Discovered-scope split requires a retained builder scope handoff');
+  } else if (!item.labels.some(l => /^rework-count:\d+$/.test(l) && Number(l.split(':')[1]) >= 2)) throw new Error('Recovery splitting requires repeated rework evidence');
 }
 
 /** Only used by the claim authority, in the same transactions as workflow writes. */
