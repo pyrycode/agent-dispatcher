@@ -253,6 +253,7 @@ export class FleetStore {
         request TEXT NOT NULL, created INTEGER NOT NULL, finished INTEGER, outcome TEXT
       ) STRICT;
       CREATE UNIQUE INDEX IF NOT EXISTS fleet_ticket_running ON fleet_runs(ticket) WHERE finished IS NULL;
+      CREATE INDEX IF NOT EXISTS fleet_runs_ticket ON fleet_runs(ticket);
       CREATE TABLE IF NOT EXISTS fleet_locks (
         name TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES fleet_runs(id)
       ) STRICT;
