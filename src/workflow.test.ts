@@ -1273,13 +1273,47 @@ test("a fresh normalized unarchived refresh releases an attributed refusal witho
   await publisher.tick();
   assert.equal(writes, 1, "stale unarchived metadata cannot release the incident");
   await publisher.refresh(config);
-  assert.equal(store.workflow.get("org/mobile#1947").archived, false);
+  assert.equal(store.workflow.get("org/mobile#1947").archived, undefined);
   assert.equal(store.workflow.get("org/mobile#1947").revision, revision);
   await publisher.tick();
   assert.equal(writes, 2);
   assert.equal(store.workflow.pending().length, 0);
 });
 
+test("a fully published unarchived ticket keeps its revision when GitHub reports it unarchived", async (t) => {
+  const { store } = fixture(t);
+  const ticket = "org/mobile#1947";
+  store.workflow.import(config, [item()]);
+  let isArchived: boolean | undefined;
+  const github = new GitHubBroker({
+    token: "test", projects: [config.project],
+    fetcher: async (input, init) => {
+      const body = init?.body ? JSON.parse(String(init.body)) : {};
+      const query: string = body.query ?? "";
+      if (query.startsWith("query($ids:")) {
+        const observed = remoteMetadata(store.workflow.get(ticket));
+        if (isArchived !== undefined) Object.assign(observed.projectItems.nodes[0], { isArchived });
+        return Response.json({ data: { nodes: [observed] } });
+      }
+      if (query.includes("repository"))
+        return Response.json({ data: { repository: { issues: { nodes: [], pageInfo: { hasNextPage: false } } } } });
+      throw new Error("Unexpected request: " + String(input) + " " + query);
+    },
+  });
+  const publisher = new WorkflowPublisher(store, github, { now: () => 1000 });
+  // The state an earlier release left behind: refreshed, published, no stored archive value.
+  await publisher.refresh(config);
+  const revision = store.workflow.get(ticket).revision;
+  store.workflow.published(ticket, revision);
+  assert.equal(store.workflow.pending().length, 0);
+  isArchived = false;
+  await publisher.refresh(config);
+  await publisher.refresh(config);
+  assert.equal(store.workflow.get(ticket).revision, revision, "unarchived observation is not a content change");
+  assert.equal(store.workflow.get(ticket).archived, undefined, "false is stored as no value");
+  assert.deepEqual(store.workflow.archiveObservation(ticket), { archived: false }, "the raw observation stays available in memory");
+  assert.equal(store.workflow.pending().length, 0);
+});
 
 test("issue body refresh without archive metadata cannot release an archived target", async (t) => {
   const { store } = fixture(t);
