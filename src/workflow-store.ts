@@ -549,7 +549,7 @@ export class WorkflowStore {
             subIssues: observed.subIssues,
             evidenceRevision:
               observed.evidenceRevision ?? current.evidenceRevision,
-            archived: observed.archived,
+            archived: observed.archived ?? current.archived,
           };
           const changed = JSON.stringify(content) !== JSON.stringify(current);
           // A human edited the display. Republish authority; never import that edit.
@@ -558,7 +558,7 @@ export class WorkflowStore {
           const drift =
             JSON.stringify(dependencies(observed.blockedBy)) !==
               JSON.stringify(dependencies(current.blockedBy)) ||
-            (!observed.archived && observed.status !== current.status) ||
+            (!content.archived && observed.status !== current.status) ||
             observed.state !== current.state ||
             JSON.stringify([...observed.labels].sort()) !==
               JSON.stringify([...current.labels].sort());
@@ -573,9 +573,10 @@ export class WorkflowStore {
     });
     // Publish freshness only after the entire observation transaction succeeded.
     for (const item of items)
-      this.archiveObservations.set(`${project}#${item.issueNumber}`, {
-        archived: item.archived === true,
-      });
+      if (typeof item.archived === "boolean")
+        this.archiveObservations.set(`${project}#${item.issueNumber}`, {
+          archived: item.archived,
+        });
   }
   change(
     ticket: string,

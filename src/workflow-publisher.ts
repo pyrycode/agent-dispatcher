@@ -537,7 +537,7 @@ export class WorkflowPublisher {
         // Written only when recomputed, so an unchanged ticket writes nothing.
         ...(evidence.recomputed ? { evidenceSeen: evidence.seen } : {}),
         id: board.id,
-        archived: board.isArchived === true ? true : undefined,
+        archived: typeof board.isArchived === "boolean" ? board.isArchived : undefined,
         issueId: issue.id,
         issueNumber: issue.number,
         title: issue.title,

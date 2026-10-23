@@ -489,7 +489,7 @@ test("archived target waits for restoration across time, revisions and a full qu
 
 test("an unchanged unarchived observation releases suppression without a revision change", async (t) => {
   const store = fixture(t);
-  store.workflow.import(config, [item(1)]);
+  store.workflow.import(config, [item(1, { archived: false })]);
   store.workflow.observe(config.project, [store.workflow.get("org/relay#1")]);
   const revision = store.workflow.get("org/relay#1").revision;
   const options = { failAlias: new Set(["s0"]) };
