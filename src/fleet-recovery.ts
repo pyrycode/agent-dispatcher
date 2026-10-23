@@ -312,6 +312,14 @@ export class RecoveryLedger {
         AND state='escalated' AND run_id IS NULL AND decision IS NULL`)
       .run(this.now(), observation.ticket);
   }
+  /** Only the protected review-retry transaction calls this after explicit operator approval. */
+  retireReviewRetry(id:string):void {
+    const incident=this.incident(id);
+    if(!this.db.prepare('SELECT 1 FROM fleet_recovery WHERE id=? AND present=1').get(id) || incident.state!=='escalated' || incident.reason!=='Repeated review rework'
+      || incident.decision?.action!=='escalate' || incident.decision.category!=='human'
+      || !incident.decision.reason.startsWith('Retry must target the failed current stage. '))throw new Error('Review handback incident changed');
+    this.db.prepare('UPDATE fleet_recovery SET present=0 WHERE id=?').run(id);
+  }
   list(project?: string): RecoveryIncident[] {
     const rows = project ? this.db.prepare("SELECT * FROM fleet_recovery WHERE ticket LIKE ? ORDER BY created DESC LIMIT 500").all(`${project}#%`)
       : this.db.prepare("SELECT * FROM fleet_recovery ORDER BY created DESC LIMIT 500").all();

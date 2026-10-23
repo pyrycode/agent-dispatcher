@@ -1,3 +1,4 @@
+import {ReviewRetries,reviewRetryRequest,type ReviewRetryRequest} from './review-retry.js';
 import { DeclarationRepairs, declarationRepairRequest, declarationCaptureFiles, type DeclarationRepairRequest } from './stage-declaration-repair.js';
 import { ClaimsHistory, historyHash } from "./claims-history.js";
 import { StageResults, stageBasis, type StagePlan, type StageSubmission } from "./stage-results.js";
@@ -6,7 +7,7 @@ import { RecoverySplits, renderRecoverySlice, splitBodyHash, splitRequirements, 
 import {StorageMaintenance,type StorageRequest} from './storage-maintenance.js';
 import { parseFeatureRoot } from './feature-lineage.js';
 import {scrubCredentials} from './agent-runtime.js';
-import { isRepairWip } from "./recovery-labels.js";
+import { isRepairWip, recoveryAssignmentLabels } from "./recovery-labels.js";
 import { PRIORITY_HIGH } from "./ticket-priority.js";
 import { WorkflowStore, type WorkflowChange } from "./workflow-store.js";
 // The one authority for fleet ownership. No heartbeat expires a claim or run.
@@ -249,6 +250,7 @@ export class FleetStore {
   readonly approvals: ApprovalStates;
   readonly stages: StageResults;
   readonly declarationRepairs: DeclarationRepairs;
+  readonly reviewRetries: ReviewRetries;
   readonly machineRecoveries: MachineRecoveries;
   readonly verifierHandoffs: VerifierHandoffs;
   readonly storage: StorageMaintenance;
@@ -285,6 +287,7 @@ export class FleetStore {
     this.workflow = new WorkflowStore(this.db, options.now ?? Date.now);
     this.stages = new StageResults(this.db);
     this.declarationRepairs = new DeclarationRepairs(this.db);
+    this.reviewRetries = new ReviewRetries(this.db);
     this.machineRecoveries = new MachineRecoveries(this.db);
     this.recovery = new RecoveryLedger(this.db, Date.now, options);
     this.facts = new RecoveryFacts(this.db);
@@ -641,6 +644,50 @@ export class FleetStore {
           evidence.commit(machine,undefined,ticket,id,upload.digest);
           return {runId:id,digest:upload.digest};
         });
+    });
+  }
+  /** Operator-only: request a fresh verifier after the known failed-review retry refusal. */
+  retryReview(value:ReviewRetryRequest) {
+    const input=reviewRetryRequest(value);
+    return this.transaction(()=>{
+      const replay=this.reviewRetries.saved(input);
+      if(replay)return replay;
+      const item=this.workflow.get(input.ticket),stage=this.stages.records(input.ticket)[0];
+      if(item.revision!==input.revision || item.state!=='OPEN' || item.status!=='In Code Review'
+        || !item.labels.some(l=>l==='done:builder'||l==='done:developer')
+        || item.labels.some(l=>/^(needs-human:|health-hold:|held:|error:|wip:|needs-rework:|pending-done:|pending-verdict:)/.test(l)
+          || l.includes('permission_denied') || ['done:verifier','done:code-review','done:documentation'].includes(l))
+        || item.blockedBy.some(b=>b.state==='OPEN'))throw new Error('Review retry requires the current unheld review-ready ticket');
+      const approval=this.approvals.get(input.ticket);
+      if(approval?.kind==='rejected' && !approval.authorization)throw new Error('Recorded approval rejection forbids review retry');
+      if(!stage || stage.runId!==input.runId || stage.plan.kind!=='verifier' || stage.plan.candidate!==input.candidate
+        || stage.result?.candidate!==input.candidate || stage.result.pullRequest!==input.pullRequest
+        || stage.result.verdict?.decision!=='FAIL' || stage.acceptance?.state!=='rework'
+        || stage.basis!==stageBasis(item))throw new Error('Latest failed review or its requirements changed');
+      const incident=this.recovery.list(input.ticket.split("#")[0]).find(i=>i.id===input.incidentId);
+      if(!incident || incident.ticket!==input.ticket || !incident.current || incident.state!=='escalated'
+        || incident.reason!=='Repeated review rework' || incident.decision?.action!=='escalate'
+        || incident.decision.category!=='human' || !incident.decision.reason.startsWith('Retry must target the failed current stage. '))
+        throw new Error('Review retry requires the exact refused review handback incident');
+      const source=this.db.prepare('SELECT request,machine,generation,finished,outcome FROM fleet_runs WHERE id=? AND ticket=?').get(input.runId,input.ticket);
+      const assessment=this.db.prepare('SELECT request,finished,outcome FROM fleet_runs WHERE id=? AND ticket=?').get(incident.runId,input.ticket);
+      const claim=this.db.prepare('SELECT machine,generation FROM fleet_claims WHERE ticket=?').get(input.ticket);
+      if(!source || source.finished==null || source.outcome!=='completed' || JSON.parse(String(source.request)).role!=='verifier'
+        || !assessment || assessment.finished==null || assessment.outcome!=='completed' || JSON.parse(String(assessment.request)).role!=='recovery'
+        || !claim || claim.machine!==source.machine || claim.generation!==source.generation)
+        throw new Error('Review and assessment must be finished with unchanged source ownership');
+      if(this.snapshot().runs.some(r=>r.ticket===input.ticket || r.parentTicket===input.ticket)
+        || this.openTaskTickets().includes(input.ticket))throw new Error('Review retry has active or uncertain work');
+      const changed=this.workflow.change(input.ticket,{addLabels:recoveryAssignmentLabels('retry'),removeLabels:['orchestrator:escalated']},
+        'review-retry:'+input.runId,'review-retry:'+input.commandId,input.revision);
+      this.workflow.comment(input.ticket,`## Operator review retry
+
+${input.reason}
+
+Request a fresh independent verifier of candidate ${input.candidate} after failed review ${input.runId}. The previous FAIL and its evidence remain unchanged. Normal approval, admission and configured acceptance checks remain required.`,
+        'review-retry-comment:'+input.commandId);
+      this.recovery.retireReviewRetry(input.incidentId);
+      return this.reviewRetries.save(input,changed);
     });
   }
   repairStageDeclaration(value: DeclarationRepairRequest, evidence?: EvidenceStore) {

@@ -258,6 +258,41 @@ and submit a new explicit removal of that same hold label, even if it is already
 absent. This reconciles the obsolete marker without starting a worker or accepting
 a review result. The claim service must run this fix before that reconciliation.
 
+### Retrying a completed failed review
+
+Automatic recovery `retry` still requires an error on the current unfinished
+stage. A completed FAIL review has no such error. After the operator has
+reviewed a repaired comparison-tooling blocker, use the separate protected
+handback for the resulting `Retry must target the failed current stage`
+escalation:
+
+```sh
+operator.sh workflow retry-review owner/repo /absolute/path/retry.json
+```
+
+The saved request contains `commandId`, `ticket`, current workflow `revision`,
+current recovery `incidentId`, latest failed verifier `runId`, exact published
+`candidate`, open `pullRequest` number and an operator `reason`. Read all
+identities afresh. The route verifies the current feature branch and PR head
+against GitHub without cached reads. It requires the latest structured verifier
+FAIL on that candidate, unchanged acceptance requirements and source ownership,
+finished review and assessment runs, and no active or uncertain support work.
+Other human decisions, source holds, errors, pending rework, open dependencies,
+passed reviews and unresolved approval rejection remain blocked. Machine
+credentials cannot use this route.
+
+The transaction retains the previous FAIL, original evidence, human decision,
+rework history, claims and retry budgets. It retires only the named refused
+handback incident and assigns a normal verifier through recovery priority and
+`wip:repair`, recording the reason on the ticket. It starts no worker and
+accepts no tests. Normal capacity, approvals, review and configured acceptance
+remain required; focused comparisons do not replace red configured gates.
+
+Reuse exactly the same request after an uncertain response. The saved receipt
+makes replay harmless even after another hold or branch change; a changed
+request with the same `commandId` is refused. This is an operator action, not
+permission for recovery workers to erase an escalation or invent an error label.
+
 ### Capture declaration repair
 
 For a completed live run held only because required capture outputs were not
