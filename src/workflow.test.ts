@@ -105,6 +105,92 @@ for (const label of ["held:unreviewed-capture", "held:operator"]) {
   }
 }
 
+test("protected operator release retires only its obsolete recovery hold", t => {
+  const { store } = fixture(t);
+  const held = { ...item(), labels: ["needs-human:manual-takeover", "orchestrator:escalated"] };
+  const other = { ...item(1948), labels: ["needs-human:decision"] };
+  store.workflow.import(config, [held, other]);
+  const observe = (i: WorkflowItem) => ({ ticket: `${config.project}#${i.issueNumber}`, status: i.status,
+    labels: i.labels, blocked: false });
+  store.recoveryReport("mac", config.project, [observe(held), observe(other)]);
+  const incident = store.recovery.list().find(i => i.ticket === "org/mobile#1947")!;
+  const unrelated = store.recovery.list().find(i => i.ticket === "org/mobile#1948")!;
+  assert.equal(incident.reason, "Explicit operator hold");
+  assert.equal(incident.current, true);
+
+  const change = { status: "In Code Review", addLabels: ["done:builder"],
+    removeLabels: ["needs-human:manual-takeover", "orchestrator:escalated"] };
+  const released = store.workflowOperator("org/mobile#1947", change, "manual-release", held.revision);
+  const history = store.recovery.list().find(i => i.id === incident.id)!;
+  assert.equal(history.current, false, "the released hold must not be projected back onto the ticket");
+  assert.equal(history.state, "resolved");
+  assert.equal(history.reason, incident.reason, "retain the original hold evidence");
+  assert.deepEqual(store.recovery.list().find(i => i.id === unrelated.id), unrelated);
+  assert.deepEqual(store.recovery.escalatedTickets(), ["org/mobile#1948"]);
+  assert.equal(store.start(run("verifier")).ok, true, "normal independent review remains required");
+  store.finish("mac", "s", "verifier");
+
+  const heldAgain = store.workflowOperator("org/mobile#1947", { addLabels: ["needs-human:decision"] },
+    "new-human-hold", store.workflow.get("org/mobile#1947").revision);
+  store.recoveryReport("mac", config.project, [observe(heldAgain), observe(other)]);
+  const newIncident = store.recovery.list().find(i => i.ticket === "org/mobile#1947" && i.current)!;
+  store.workflowOperator("org/mobile#1947", change, "manual-release", held.revision);
+  assert.deepEqual(store.recovery.list().find(i => i.id === newIncident.id), newIncident,
+    "replaying the old release must not clear a later human hold");
+});
+
+test("operator hold release preserves remaining blockers and rejects stale revisions", t => {
+  for (const remaining of ["needs-human:decision", "error:builder:permission_denied", "error:builder", "halted", "dependency"]) {
+    const { store } = fixture(t);
+    const held = { ...item(), status: remaining === "halted" ? "Halted" : "In Code Review",
+      labels: ["needs-human:manual-takeover", ...(!["halted", "dependency"].includes(remaining) ? [remaining] : [])],
+      blockedBy: remaining === "dependency" ? [{ number: 1948, state: "OPEN" as const }] : [] };
+    store.workflow.import(config, [held]);
+    store.recoveryReport("mac", config.project, [{ ticket: "org/mobile#1947", status: held.status,
+      labels: held.labels, blocked: remaining === "dependency" }]);
+    const incident = store.recovery.list()[0];
+    assert.throws(() => store.workflowOperator("org/mobile#1947", { removeLabels: ["needs-human:manual-takeover"] },
+      `stale-${remaining}`, 0), /Workflow changed/);
+    assert.deepEqual(store.recovery.list()[0], incident, "a rejected release changes no recovery evidence");
+    store.workflowOperator("org/mobile#1947", { removeLabels: ["needs-human:manual-takeover"] },
+      `release-${remaining}`, held.revision);
+    assert.deepEqual(store.recovery.list()[0], incident, `preserve unresolved ${remaining}`);
+    assert.equal(store.start(run("verifier")).ok, false);
+  }
+});
+
+test("protected release reconciles a hold retained by an older workflow command", t => {
+  const { store } = fixture(t);
+  const held = { ...item(), status: "In Code Review", labels: ["needs-human:manual-takeover"] };
+  store.workflow.import(config, [held]);
+  store.recoveryReport("mac", config.project, [{ ticket: "org/mobile#1947", status: held.status,
+    labels: held.labels, blocked: false }]);
+  const incident = store.recovery.list()[0];
+  // Reproduce the durable state left by the old operator path: the label is
+  // already absent, but the separate recovery marker is still current.
+  const legacy = store.workflow.change("org/mobile#1947", { labels: [] }, "operator", "legacy-release", 1);
+  assert.equal(store.recovery.list()[0].current, true);
+  store.workflowOperator("org/mobile#1947", { removeLabels: ["needs-human:manual-takeover"] },
+    "confirmed-release", legacy.revision);
+  assert.equal(store.recovery.list().find(i => i.id === incident.id)!.current, false);
+});
+
+test("full-label protected release preserves a human recovery decision", t => {
+  const { store } = fixture(t);
+  const failed = { ...item(), labels: ["error:builder"] };
+  store.workflow.import(config, [failed]);
+  const [incident] = store.recoveryReport("mac", config.project, [{ ticket: "org/mobile#1947",
+    status: failed.status, labels: failed.labels, blocked: false }]);
+  store.recovery.begin(incident.id, "assessment");
+  store.recovery.decide(incident.id, "assessment", { action: "escalate", category: "human",
+    reason: "A separate approval refusal remains unresolved" });
+  const held = store.workflowOperator("org/mobile#1947", { labels: ["needs-human:manual-takeover"] },
+    "manual-custody", failed.revision);
+  const assessed = store.recovery.list().find(i => i.id === incident.id)!;
+  store.workflowOperator("org/mobile#1947", { labels: [] }, "release-labels", held.revision);
+  assert.deepEqual(store.recovery.list().find(i => i.id === incident.id), assessed);
+});
+
 test("1947 completes and routes for rework while GitHub is unavailable", async (t) => {
   const { store } = fixture(t);
   store.workflow.import(config, [item()]);
@@ -1230,4 +1316,158 @@ test("new workflow dependency cycles preserve legacy updates, removals and exact
   const removed = store.workflowOperator(ticket, { blockedBy: [] }, "remove-legacy", unchanged.revision);
   assert.deepEqual(removed.blockedBy, []);
   assert.deepEqual(store.workflowOperator(ticket, { blockedBy: changed.blockedBy }, "legacy-edges", 2), unchanged);
+});
+
+test("a fresh normalized unarchived refresh releases an attributed refusal without a revision change", async (t) => {
+  const { store } = fixture(t);
+  store.workflow.import(config, [item()]);
+  let refuse = true;
+  let writes = 0;
+  const github = new GitHubBroker({
+    token: "test", projects: [config.project],
+    fetcher: async (input, init) => {
+      const body = init?.body ? JSON.parse(String(init.body)) : {};
+      const query: string = body.query ?? "";
+      if (String(input).includes("/labels")) return new Response("[]");
+      if (query.startsWith("mutation {")) {
+        writes++;
+        if (refuse) return Response.json({
+          data: { i0: { issue: { id: "I1947" } }, s0: null },
+          errors: [{ path: ["s0"], message: "The item is archived and cannot be updated" }],
+        });
+        return Response.json({ data: {
+          i0: { issue: { id: "I1947" } }, s0: { projectV2Item: { id: "P1947" } },
+        } });
+      }
+      if (query.startsWith("query($ids:")) {
+        const observed = remoteMetadata(store.workflow.get("org/mobile#1947"));
+        Object.assign(observed.projectItems.nodes[0], { isArchived: false });
+        return Response.json({ data: { nodes: [observed] } });
+      }
+      if (query.startsWith("query($id:ID!)"))
+        return Response.json({ data: { node: { blockedBy: { nodes: [], pageInfo: { hasNextPage: false } } } } });
+      if (query.includes("repository"))
+        return Response.json({ data: { repository: { issues: { nodes: [], pageInfo: { hasNextPage: false } } } } });
+      throw new Error("Unexpected request: " + query);
+    },
+  });
+  const publisher = new WorkflowPublisher(store, github, { now: () => 1000 });
+  await publisher.refresh(config);
+  const revision = store.workflow.get("org/mobile#1947").revision;
+  await assert.rejects(publisher.tick(), /archived target/);
+  refuse = false;
+  await publisher.tick();
+  assert.equal(writes, 1, "stale unarchived metadata cannot release the incident");
+  await publisher.refresh(config);
+  assert.equal(store.workflow.get("org/mobile#1947").archived, undefined);
+  assert.equal(store.workflow.get("org/mobile#1947").revision, revision);
+  await publisher.tick();
+  assert.equal(writes, 2);
+  assert.equal(store.workflow.pending().length, 0);
+});
+
+test("a fully published unarchived ticket keeps its revision when GitHub reports it unarchived", async (t) => {
+  const { store } = fixture(t);
+  const ticket = "org/mobile#1947";
+  store.workflow.import(config, [item()]);
+  let isArchived: boolean | undefined;
+  const github = new GitHubBroker({
+    token: "test", projects: [config.project],
+    fetcher: async (input, init) => {
+      const body = init?.body ? JSON.parse(String(init.body)) : {};
+      const query: string = body.query ?? "";
+      if (query.startsWith("query($ids:")) {
+        const observed = remoteMetadata(store.workflow.get(ticket));
+        if (isArchived !== undefined) Object.assign(observed.projectItems.nodes[0], { isArchived });
+        return Response.json({ data: { nodes: [observed] } });
+      }
+      if (query.includes("repository"))
+        return Response.json({ data: { repository: { issues: { nodes: [], pageInfo: { hasNextPage: false } } } } });
+      throw new Error("Unexpected request: " + String(input) + " " + query);
+    },
+  });
+  const publisher = new WorkflowPublisher(store, github, { now: () => 1000 });
+  // The state an earlier release left behind: refreshed, published, no stored archive value.
+  await publisher.refresh(config);
+  const revision = store.workflow.get(ticket).revision;
+  store.workflow.published(ticket, revision);
+  assert.equal(store.workflow.pending().length, 0);
+  isArchived = false;
+  await publisher.refresh(config);
+  await publisher.refresh(config);
+  assert.equal(store.workflow.get(ticket).revision, revision, "unarchived observation is not a content change");
+  assert.equal(store.workflow.get(ticket).archived, undefined, "false is stored as no value");
+  assert.deepEqual(store.workflow.archiveObservation(ticket), { archived: false }, "the raw observation stays available in memory");
+  assert.equal(store.workflow.pending().length, 0);
+});
+
+test("issue body refresh without archive metadata cannot release an archived target", async (t) => {
+  const { store } = fixture(t);
+  const ticket = "org/mobile#1947";
+  store.workflow.import(config, [item()]);
+  let writes = 0;
+  let archived = true;
+  let edited = false;
+  const github = new GitHubBroker({
+    token: "test", projects: [config.project],
+    fetcher: async (input, init) => {
+      const body = init?.body ? JSON.parse(String(init.body)) : {};
+      const query: string = body.query ?? "";
+      if (String(input).includes("/labels")) return new Response("[]");
+      if (init?.method === "PATCH") {
+        edited = true;
+        return Response.json({ body: body.body });
+      }
+      if (query.startsWith("mutation {")) {
+        writes++;
+        if (archived) return Response.json({
+          data: { i0: { issue: { id: "I1947" } }, s0: null },
+          errors: [{ path: ["s0"], message: "The item is archived and cannot be updated" }],
+        });
+        return Response.json({ data: {
+          i0: { issue: { id: "I1947" } }, s0: { projectV2Item: { id: "P1947" } },
+        } });
+      }
+      if (query.startsWith("query($ids:")) {
+        const observed = remoteMetadata(store.workflow.get(ticket));
+        Object.assign(observed.projectItems.nodes[0], { isArchived: archived });
+        return Response.json({ data: { nodes: [observed] } });
+      }
+      if (query.includes("... on Issue")) {
+        assert.equal(query.includes("isArchived"), false, "the content bridge supplies no archive evidence");
+        return Response.json({ data: { node: {
+          ...remoteMetadata({ ...store.workflow.get(ticket), body: edited ? "Updated content" : item().body }),
+          repository: { nameWithOwner: config.project },
+        } } });
+      }
+      if (query.startsWith("query($id:ID!)"))
+        return Response.json({ data: { node: { blockedBy: { nodes: [], pageInfo: { hasNextPage: false } } } } });
+      if (query.includes("repository"))
+        return Response.json({ data: { repository: { issues: { nodes: [], pageInfo: { hasNextPage: false } } } } });
+      throw new Error("Unexpected request: " + query);
+    },
+  });
+  const publisher = new WorkflowPublisher(store, github, { now: () => 1000 });
+  await assert.rejects(publisher.tick(), /archived target/);
+  await publisher.tick();
+  assert.equal(writes, 1);
+  const observation = store.workflow.archiveObservation(ticket);
+  await new WorkflowGitHub(store, github).request(config.project, {
+    method: "PATCH", path: "/repos/org/mobile/issues/1947", body: JSON.stringify({ body: "Updated content" }),
+  });
+  assert.equal(store.workflow.get(ticket).body, "Updated content");
+  assert.equal(store.workflow.archiveObservation(ticket), observation, "content alone supplies no fresh archive evidence");
+  await publisher.tick();
+  assert.equal(writes, 1, "content refresh cannot restart archived writes or warnings");
+  await publisher.refresh(config);
+  assert.equal(store.workflow.get(ticket).archived, true);
+  await new WorkflowGitHub(store, github).adoptIssue(config.project, "I1947");
+  assert.equal(store.workflow.get(ticket).archived, true, "partial content refresh preserves known archive state");
+  await publisher.tick();
+  assert.equal(writes, 1);
+  archived = false;
+  await publisher.refresh(config);
+  await publisher.tick();
+  assert.equal(writes, 2, "confirmed restoration releases the pending write");
+  assert.equal(store.workflow.pending().length, 0);
 });

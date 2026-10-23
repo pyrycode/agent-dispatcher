@@ -101,6 +101,22 @@ choice and does not change the database workflow or pause scheduling.
 Position updates use the nearest preceding unarchived card, or the top when
 there is none. Archived neighbours do not prevent dependency publication.
 
+If GitHub attributes a Project-field or position refusal to the target being
+archived, the publisher warns once for that incident and leaves the revision
+pending. It suppresses further writes for the ticket during that publisher's
+lifetime. Elapsed backoff and newer desired revisions do not release it. Other
+tickets continue, including those beyond the first pending batch. A newer accepted
+GitHub observation confirming the target is unarchived releases suppression,
+even when its metadata is unchanged. A content-only refresh without archive
+metadata preserves the known archive state and cannot release suppression.
+Only an archived card stores a flag. Observing an unarchived card stores no
+value, so it does not change the ticket revision.
+A failed observation transaction does not.
+An archived position anchor, issue or dependency error, HTTP deferral or
+unattributed batch error retains the ordinary failure handling. Suppression does
+not change workflow authority or the stored archive flag. It is not durable
+across publisher restarts.
+
 ## Claims history retention
 
 The claim service sweeps finished-ticket history at startup and hourly, independently
@@ -159,6 +175,18 @@ claim the filed 290 MB production database has shrunk. Production measurements,
 backup location and the loaded candidate remain a separate deployment record.
 
 ## Migration
+
+Normal claims-service startup adds non-unique ticket indexes to `fleet_runs`
+and `workflow_commands`, including databases created by earlier versions.
+Repeated startup does not rebuild existing indexes. Finished-run history can
+use the same ticket lookup as active history. The separate unique index for
+unfinished runs remains unchanged. This migration does not remove saved
+commands or ownership records.
+
+Use `EXPLAIN QUERY PLAN` on a ticket lookup and the historical handoff query to
+confirm indexed searches. An index plan proves lookup behaviour. It does not
+establish a production CPU or disk-read improvement under a different workload.
+Deployment and comparable runtime measurements remain separate operations.
 
 Use the existing protected operator and GitHub logins. Never place credentials in
 request files or command arguments.
@@ -219,6 +247,16 @@ A stale revision or active reservation rejects the command. Read again and
 resolve the actual state. Reuse the same command identity only for the exact same
 request. The controls also support `state`, `labels`, `blockedBy`, `top` and `afterItemId`.
 Changing a status does not bypass dependency, review, ownership or admission checks.
+
+An explicit protected release of a `needs-human:` label also resolves that ticket's
+automatic `Explicit operator hold` recovery marker when the resulting authoritative
+workflow has no remaining recovery trigger. The marker remains in recovery history.
+Other tickets, unresolved blockers or errors, Halted states and human assessment
+decisions are preserved. Replaying an old command cannot retire a later hold.
+For a label release performed by an older claim service, read the current revision
+and submit a new explicit removal of that same hold label, even if it is already
+absent. This reconciles the obsolete marker without starting a worker or accepting
+a review result. The claim service must run this fix before that reconciliation.
 
 ### Approval review continuation
 

@@ -13,7 +13,7 @@ import { WorkflowStore, type WorkflowChange } from "./workflow-store.js";
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { RecoveryFacts, type PauseRecord, type EvidenceRecord, type CoordinationRecord } from "./recovery-facts.js";
-import { RecoveryLedger, recoveryFingerprint, validateObservations, IDLE_RECOVERY_REASONS, RECOVERY_UNKNOWN_PAUSE_REASON, type RecoveryObservation, type RecoveryDecision, type RecoveryIncident, type RecoveryLedgerOptions } from "./fleet-recovery.js";
+import { RecoveryLedger, recoveryFingerprint, hasOperatorHold, validateObservations, IDLE_RECOVERY_REASONS, RECOVERY_UNKNOWN_PAUSE_REASON, type RecoveryObservation, type RecoveryDecision, type RecoveryIncident, type RecoveryLedgerOptions } from "./fleet-recovery.js";
 import { OperationReports } from './operation-reports.js';
 import { OrphanedTaskWatch } from './orphaned-tasks.js';
 import {RecoveryTasks, assessmentTasks, recoveryTaskId, validateTaskRequest, type RecoveryTaskRequest, type RecoveryTaskResult} from './recovery-tasks.js';
@@ -256,6 +256,7 @@ export class FleetStore {
         request TEXT NOT NULL, created INTEGER NOT NULL, finished INTEGER, outcome TEXT
       ) STRICT;
       CREATE UNIQUE INDEX IF NOT EXISTS fleet_ticket_running ON fleet_runs(ticket) WHERE finished IS NULL;
+      CREATE INDEX IF NOT EXISTS fleet_runs_ticket ON fleet_runs(ticket);
       CREATE TABLE IF NOT EXISTS fleet_locks (
         name TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES fleet_runs(id)
       ) STRICT;
@@ -739,7 +740,18 @@ export class FleetStore {
     return this.transaction(() => {
       if (!Number.isSafeInteger(revision)) throw new Error('Expected workflow revision required');
       if (this.snapshot().runs.some(r=>r.ticket===ticket)) throw new Error('Ticket has an active reservation; drain it before changing workflow');
-      return this.workflow.change(ticket, change, 'operator', commandId, revision);
+      const before = this.workflow.get(ticket);
+      const result = this.workflow.change(ticket, change, 'operator', commandId, revision);
+      const current = this.workflow.get(ticket);
+      const releasesHold = hasOperatorHold(change.removeLabels ?? [])
+        || change.labels !== undefined && hasOperatorHold(before.labels) && !hasOperatorHold(current.labels);
+      // A saved command replay must not retire a later hold. Reconcile only
+      // this exact ticket after an effective, revision-checked operator release.
+      if (releasesHold && current.revision !== before.revision) {
+        this.recovery.releaseOperatorHold({ ticket, status: current.status, labels: current.labels,
+          blocked: current.blockedBy.some(b => b.state === 'OPEN'), pause: this.facts.getPause(ticket) });
+      }
+      return result;
     });
   }
   recordApprovalOutcome(machine:string,session:string,project:string,runId:string,ticket:string,outcome:ApprovalOutcome) {
