@@ -191,9 +191,41 @@ test('normal completed builder history expires while durable ownership and repla
   assert.deepEqual(store.history.sweep(30*86400_000),{commands:2,runs:1});
   assert.deepEqual({...db.prepare('SELECT * FROM fleet_claims WHERE ticket=?').get(ticket)},claim,'ownership must not be released to retire payloads');
   assert.equal(db.prepare('SELECT count(*) AS n FROM fleet_runs').get()!.n,0);
+  assert.equal(db.prepare('SELECT generation FROM fleet_retired_runs WHERE id=?').get(req.id)!.generation,claim.generation);
   assert.ok(db.prepare("SELECT 1 FROM workflow_commands WHERE id='normal-close'").get(),'operator closure remains audit history');
   assert.deepEqual(store.runOwner(req.id),{machine:'box',ticket,role:'builder'});
   assert.deepEqual(store.start(req),{ok:false,reason:'finished'});
   assert.throws(()=>store.workflow.change(ticket,{addLabels:['done:builder']},'box:source','normal-built'),/expired/);
   assert.deepEqual(store.history.sweep(30*86400_000),{commands:0,runs:0});
 });
+
+
+for (const retire of [false,true]) for (const followup of ['unused','recovery'] as const)
+  test(`completed ownership survives ${followup} after reopen, retired=${retire}`, t => {
+    let clock = Date.now();
+    const store = new FleetStore(':memory:',{box:{heavyLimit:2,combinedLimit:3}},{now:()=>clock});
+    t.after(()=>store.close());
+    const db = (store as any).db as DatabaseSync, ticket='org/core#1';
+    const req = {...request('original-builder',1),workflowVersion:1 as const};
+    store.workflow.import({...config,options:{...config.options,'In Development':'dev'}},[item(1,{state:'OPEN',status:'In Development'})]);
+    assert.equal(store.start(req).ok,true);
+    store.workflowChange('box','source',req.id,ticket,{addLabels:['done:builder']},'built');
+    store.finish('box','source',req.id);
+    store.workflowOperator(ticket,{status:'Done',state:'CLOSED'},'close',store.workflow.get(ticket).revision);
+    const claim={...db.prepare('SELECT * FROM fleet_claims WHERE ticket=?').get(ticket)};
+    clock+=31*86400_000+1000;
+    if(retire) assert.equal(store.history.sweep(30*86400_000).runs,1);
+    store.workflowOperator(ticket,{state:'OPEN',status:'In Development',removeLabels:['done:builder']},'reopen',store.workflow.get(ticket).revision);
+    if(followup==='unused') {
+      assert.equal(store.start({...req,id:'unused-next-builder'}).ok,true);
+      store.finish('box','source','unused-next-builder',false,true);
+    } else {
+      const [incident]=store.recoveryReport('box',config.project,[{ticket,status:'In Development',labels:[],blocked:true}]);
+      assert.equal(store.start({...req,id:'recovery',role:'recovery'}).ok,true);
+      store.recoveryStep('box','source',config.project,incident.id,'recovery','begin');
+      store.recoveryStep('box','source',config.project,incident.id,'recovery','decide',{action:'wait',reason:'The prerequisite is still being built'});
+      store.recoveryStep('box','source',config.project,incident.id,'recovery','complete');
+      store.finish('box','source','recovery');
+    }
+    assert.deepEqual({...db.prepare('SELECT * FROM fleet_claims WHERE ticket=?').get(ticket)},claim);
+  });

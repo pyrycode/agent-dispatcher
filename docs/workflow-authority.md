@@ -120,7 +120,8 @@ Later startups preserve that age. Retiring command payloads and recording their
 compact IDs, request hashes and audit metadata is one transaction. An identical retired command
 receives an explicit expired response. Conflicting reuse is refused. Neither can
 apply a second mutation. Finished run IDs remain non-admissible. Their dates and original outcomes remain as compact history. Their recorded
-computer, ticket and role remain available for upload ownership checks, including
+computer, ticket, role and ownership generation remain available for upload and
+later ownership-release checks, including
 after a ticket reopens and the service restarts. These compact identities do not
 expire. Retention bounds payload history, not the number of durable identities.
 

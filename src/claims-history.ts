@@ -17,7 +17,11 @@ export function initializeCommandHistory(db: DatabaseSync, now: number): void {
   db.exec(`CREATE TABLE IF NOT EXISTS workflow_command_ages (id TEXT PRIMARY KEY, created INTEGER NOT NULL) STRICT;
     CREATE INDEX IF NOT EXISTS workflow_command_age ON workflow_command_ages(created);
     CREATE TABLE IF NOT EXISTS fleet_retired_commands (id TEXT PRIMARY KEY, ticket TEXT NOT NULL, request_hash TEXT NOT NULL, actor TEXT NOT NULL, created INTEGER NOT NULL, retired INTEGER NOT NULL) STRICT;
-    CREATE TABLE IF NOT EXISTS fleet_retired_runs (id TEXT PRIMARY KEY, machine TEXT NOT NULL, ticket TEXT NOT NULL, role TEXT NOT NULL, request_hash TEXT NOT NULL, verification_pin TEXT, created INTEGER NOT NULL, finished INTEGER NOT NULL, outcome TEXT, retired INTEGER NOT NULL) STRICT;`);
+    CREATE TABLE IF NOT EXISTS fleet_retired_runs (id TEXT PRIMARY KEY, machine TEXT NOT NULL, ticket TEXT NOT NULL, role TEXT NOT NULL, request_hash TEXT NOT NULL, verification_pin TEXT, created INTEGER NOT NULL, finished INTEGER NOT NULL, outcome TEXT, retired INTEGER NOT NULL, generation TEXT NOT NULL) STRICT;
+    CREATE INDEX IF NOT EXISTS fleet_retired_run_generation ON fleet_retired_runs(ticket,generation);
+    CREATE VIEW IF NOT EXISTS fleet_run_history AS
+      SELECT id,ticket,generation,finished,outcome,json_extract(request,'$.role') AS role FROM fleet_runs
+      UNION ALL SELECT id,ticket,generation,finished,outcome,role FROM fleet_retired_runs;`);
   db.prepare('INSERT OR IGNORE INTO workflow_command_ages SELECT id,? FROM workflow_commands').run(now);
 }
 
@@ -93,7 +97,7 @@ export class ClaimsHistory {
         if (pins.has(ticket) || pins.has(String(row.id)) || !isDone(ticket)
           || request.parentTicket && (!isDone(request.parentTicket) || pins.has(request.parentTicket))) continue;
         const { runnerPolicy: _policy, ...original } = request;
-        this.db.prepare('INSERT INTO fleet_retired_runs VALUES (?,?,?,?,?,?,?,?,?,?)').run(row.id, row.machine, ticket, String(request.role ?? 'unknown'), historyHash(JSON.stringify(original)), request.verificationPin ? JSON.stringify(request.verificationPin) : null, row.created, row.finished, row.outcome, this.now());
+        this.db.prepare('INSERT INTO fleet_retired_runs VALUES (?,?,?,?,?,?,?,?,?,?,?)').run(row.id, row.machine, ticket, String(request.role ?? 'unknown'), historyHash(JSON.stringify(original)), request.verificationPin ? JSON.stringify(request.verificationPin) : null, row.created, row.finished, row.outcome, this.now(), row.generation);
         this.db.prepare('DELETE FROM fleet_runs WHERE id=?').run(row.id);
         runs++;
       }

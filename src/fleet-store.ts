@@ -1254,7 +1254,7 @@ export class FleetStore {
       // require parent replacement, which survives this run and process.
       this.db.prepare("DELETE FROM fleet_ticket_creators WHERE run_id=?").run(id);
       this.db.prepare("UPDATE fleet_runs SET finished=?,outcome=? WHERE id=? AND finished IS NULL").run(Date.now(), unused ? "unused" : completed ? "completed" : "cancelled", id);
-      if(unused && request.verificationPin && !this.db.prepare("SELECT 1 FROM fleet_runs WHERE ticket=? AND generation=? AND id!=? AND (finished IS NULL OR outcome IS NULL OR outcome!='unused')").get(run.ticket,run.generation,id)) {
+      if(unused && request.verificationPin && !this.db.prepare("SELECT 1 FROM fleet_run_history WHERE ticket=? AND generation=? AND id!=? AND (finished IS NULL OR outcome IS NULL OR outcome!='unused')").get(run.ticket,run.generation,id)) {
         const h=this.verifierHandoffs.get(request.verificationPin.handoff);
         this.db.prepare('UPDATE fleet_claims SET machine=?,generation=? WHERE ticket=? AND generation=?').run(h.source,h.generation,h.ticket,run.generation);
         this.verifierHandoffs.save({...h,state:'cancelled',reason:'Target confirmed admission was unused; source ownership restored'});
@@ -1264,7 +1264,7 @@ export class FleetStore {
       // particular, blocked/failed work and offline reservations remain owned.
       if (unused) {
         this.db.prepare(`DELETE FROM fleet_claims WHERE ticket=? AND generation=?
-          AND NOT EXISTS (SELECT 1 FROM fleet_runs WHERE ticket=? AND generation=?
+          AND NOT EXISTS (SELECT 1 FROM fleet_run_history WHERE ticket=? AND generation=?
             AND (finished IS NULL OR outcome IS NULL OR outcome!='unused'))`)
           .run(run.ticket, run.generation, run.ticket, run.generation);
       }
@@ -1274,10 +1274,10 @@ export class FleetStore {
         WHERE run_id=? AND ((state='complete' AND json_extract(decision,'$.action')='wait')
           OR (reason=? AND state='escalated' AND json_extract(decision,'$.action') IN ('escalate','propose-close')))`).get(id, RECOVERY_UNKNOWN_PAUSE_REASON)) {
         const released = this.db.prepare(`DELETE FROM fleet_claims WHERE ticket=? AND generation=?
-          AND NOT EXISTS (SELECT 1 FROM fleet_runs WHERE ticket=? AND generation=?
+          AND NOT EXISTS (SELECT 1 FROM fleet_run_history WHERE ticket=? AND generation=?
             AND (finished IS NULL OR outcome IS NULL OR outcome NOT IN ('completed','unused')
-              OR (json_extract(request,'$.role')!='recovery' AND outcome!='unused')))
-          AND NOT EXISTS (SELECT 1 FROM fleet_recovery AS recovery JOIN fleet_runs AS history ON history.id=recovery.run_id
+              OR (role!='recovery' AND outcome!='unused')))
+          AND NOT EXISTS (SELECT 1 FROM fleet_recovery AS recovery JOIN fleet_run_history AS history ON history.id=recovery.run_id
             WHERE history.ticket=? AND history.generation=?
             AND json_extract(recovery.decision,'$.action') IN ('retry','rework','resume','refine','unblock','coordinate'))
           AND NOT EXISTS (SELECT 1 FROM fleet_recovery_tasks AS tasks WHERE tasks.ticket=fleet_claims.ticket
