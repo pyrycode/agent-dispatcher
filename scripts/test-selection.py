@@ -212,7 +212,7 @@ def gradle_selection(args):
                 names.append(match[1] + ('#' + match[2] if match[2] is not None else ''))
             mobile_names(names)
             continue
-        if re.fullmatch(r'(?:pixel2Api33AtdDebugAndroidTest|connectedDebugAndroidTest|connectedAndroidTest)', task) and instrumentation is not None:
+        if re.fullmatch(r'(?:pixel2Api33AtdDebugAndroidTest|pixel8Api35DebugAndroidTest|connectedDebugAndroidTest|connectedAndroidTest)', task) and instrumentation is not None:
             mobile_names(instrumentation.split(','))
             continue
         refuse('Gradle task ' + task + ' is not an explicit focused test or ordinary build/static task')
