@@ -460,7 +460,7 @@ The assessor must inspect substantive retained builder, verifier and recovery
 artifacts. Bundle metadata and pointers alone cannot authorise a split.
 
 The claim service owns the split. It can exceed the ordinary refiner depth
-limit. The ordinary refiner limit remains unchanged. Each new child carries the `behaviour-slices-v1` policy marker and starts in
+limit. The ordinary refiner limit is three child levels. Builders have no nesting-depth limit. Each new child carries the `behaviour-slices-v1` policy marker and starts in
 Backlog without completion labels and receives ordinary refinement, building,
 security review, verification and required live gates.
 
@@ -548,6 +548,20 @@ results to merge and pass the full acceptance contract.
 
 ### Builder scope discovery before review
 
+When a builder identifies a safe partition, it creates and links the children
+and finalizes the replacement itself through the managed split operation below.
+There is no builder nesting-depth cap. Each child must preserve its assigned
+requirements, useful result, meaningful checks and retained-work references.
+The split transaction closes the parent only after activating the complete child
+inventory and transferring every existing dependent. A receipt tied to that exact
+builder run makes post-run handling retain the parent worktree without committing,
+pushing, adding implementation completion labels or sending it to verification.
+Closing records replacement, not feature delivery.
+
+Use the assessment route below only when the builder cannot establish a safe
+partition. Existing scope errors and interrupted recovery splits keep their
+retained evidence and existing recovery route.
+
 A builder can request assessment during planning, implementation or repair.
 Codex returns `needs_scope_review` with the original estimate, newly discovered
 work, completed and remaining work, preserved source references and proposed
@@ -611,12 +625,16 @@ to obtain a successful retry. Do not start another split under a new identity.
 
 ## Ordinary planning split finalization
 
-An admitted parent `refiner` or `po` finalizes a replacement split through its
+An admitted parent `refiner`, `po` or `builder` finalizes a replacement split through its
 managed GitHub bridge, rather than issuing separate board/dependency/close
 commands. `GET /repos/OWNER/REPO/issues/N/split` freshly verifies the complete
 GitHub child and open-dependent inventories and returns a revision template.
 The installed pipeline helper exposes this as `split-inspect N`. Children are
 created and linked with self-contained acceptance bodies but remain in Inbox.
+Refiners may create three child levels. A grandchild can split once more; a
+great-grandchild cannot. Builders have no nesting-depth limit. The authority
+refreshes native ancestry for the refiner boundary and refuses an unavailable
+ancestor instead of inferring depth from feature-root prose.
 
 Add a unique `commandId` and `summary` to the template; order the child entries
 by dependency and fill `dependsOn` with earlier child numbers. For every open
@@ -627,7 +645,7 @@ foreign projects. No arbitrary cross-project workflow authority is granted.
 Shared-file coordination is not a required prerequisite.
 
 One SQLite transaction verifies revisions, exact inventories, parent ownership,
-planning role, depth, child readiness, approval state, active reservations,
+admitted role and stage, refiner depth, child readiness, approval state, active reservations,
 pending handoffs and support work. It activates and orders children in Backlog,
 inherits priority/security/platform labels and original prerequisites, adds
 reviewed dependency transfers without removing existing blockers, records the

@@ -11,6 +11,7 @@ import { serveGitHubBridge } from './github-bridge.js';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { serveFleet, FleetClient } from './fleet-http.js';
+import { workflowClient } from './workflow-client.js';
 
 const project = 'org/desktop';
 const parent = `${project}#2098`;
@@ -20,18 +21,18 @@ const item = (n: number, extra: Partial<WorkflowItem> = {}): WorkflowItem => ({
   url: `https://github.com/${project}/issues/${n}`, state: 'OPEN', status: 'Inbox', labels: [],
   blockedBy: [], parentNumber: null, grandparentNumber: null, revision: 1, position: n, ...extra,
 });
-function fixture(t: TestContext) {
+function fixture(t: TestContext, role = 'refiner') {
   const dir = mkdtempSync(join(tmpdir(), 'planning-split-'));
   const path = join(dir, 'claims.sqlite');
   let store = new FleetStore(path, { box: { heavyLimit: 4, combinedLimit: 4 } });
-  const config = { project, projectId: 'P', statusFieldId: 'S', options: { Inbox: 'inbox', Backlog: 'backlog', Done: 'done', Halted: 'halted' } };
+  const config = { project, projectId: 'P', statusFieldId: 'S', options: { Inbox: 'inbox', Backlog: 'backlog', 'In Development': 'dev', Done: 'done', Halted: 'halted' } };
   store.workflow.import(config, [
-    item(2098, { status: 'Backlog', labels: ['enhancement', 'priority:normal', 'security-sensitive'], subIssues: { total: 2, completed: 0 } }),
+    item(2098, { status: role === 'builder' ? 'In Development' : 'Backlog', labels: ['enhancement', 'priority:normal', 'security-sensitive'], subIssues: { total: 2, completed: 0 } }),
     item(2106, { parentNumber: 2098 }), item(2107, { parentNumber: 2098 }),
     item(2100, { status: 'Backlog', blockedBy: [{ number: 2098, state: 'OPEN', url: item(2098).url }] }),
   ]);
   assert.equal(store.start({ workflowVersion: 1, id: actor.runId, machine: actor.machine, session: actor.session,
-    project, ticket: parent, role: 'refiner', resource: 'heavy', locks: [] }).ok, true);
+    project, ticket: parent, role, resource: 'heavy', locks: [] }).ok, true);
   t.after(() => { store.close(); rmSync(dir, { recursive: true, force: true }); });
   return { get store() { return store; }, reopen() { store.close(); store = new FleetStore(path, { box: { heavyLimit: 4, combinedLimit: 4 } }); } };
 }
@@ -147,8 +148,8 @@ test('provisional parent blockers on children are replaced, not mistaken for ext
   assert.equal(store.workflow.get(`${project}#2106`).blockedBy.length, 0);
 });
 
-function bridgeFixture(t: TestContext) {
-  const f = fixture(t);
+function bridgeFixture(t: TestContext, role = 'refiner') {
+  const f = fixture(t, role);
   let incomplete = false, unavailable = false, reads = 0;
   const fetcher: typeof fetch = async (_url, init) => {
     reads++;
@@ -256,11 +257,11 @@ test('a stale split is an explicit workflow refusal, not a masked GitHub service
   assert.equal(f.store.workflow.get(parent).state, 'OPEN');
 });
 
-test('real gh inspects, receives a specific stale-request refusal, finalizes and recovers the exact reply', async t => {
+for (const role of ['refiner','builder']) test(`${role}: real gh inspects, refuses stale requests, finalizes and recovers the exact reply`, async t => {
   const run = promisify(execFile);
   try { await run('gh', ['--version']); }
   catch (error: any) { if (error.code === 'ENOENT') { t.skip('gh is not installed'); return; } throw error; }
-  const f = bridgeFixture(t), dir = mkdtempSync(join(tmpdir(), 'split-cli-'));
+  const f = bridgeFixture(t, role), dir = mkdtempSync(join(tmpdir(), 'split-cli-'));
   const socket = join(dir, 'api.sock'), cliConfig = join(dir, 'gh');
   mkdirSync(cliConfig);
   writeFileSync(join(cliConfig, 'config.yml'), `http_unix_socket: ${JSON.stringify(socket)}\n`);
@@ -290,4 +291,119 @@ test('real gh inspects, receives a specific stale-request refusal, finalizes and
   f.disconnect();
   assert.deepEqual(JSON.parse((await cli('--method', 'POST', '--input', file)).stdout), first);
   assert.equal(f.store.workflow.comments(parent).length, 1);
+});
+
+test('grandchild planning can split once more, but great-grandchildren cannot', t => {
+  const { store } = fixture(t);
+  store.workflow.observe(project, [item(2000, {state:'CLOSED',status:'Done'}), item(2050, {state:'CLOSED',status:'Done',parentNumber:2000}),
+    {...store.workflow.get(parent),parentNumber:2050,grandparentNumber:2000}]);
+  assert.equal(finish(store).parent.state,'CLOSED');
+});
+
+test('the third nesting boundary is enforced from retained native ancestry', t => {
+  const { store } = fixture(t);
+  store.workflow.observe(project, [item(1900, {state:'CLOSED',status:'Done'}),item(2000,{state:'CLOSED',status:'Done',parentNumber:1900}),
+    item(2050,{state:'CLOSED',status:'Done',parentNumber:2000,grandparentNumber:1900}),
+    {...store.workflow.get(parent),parentNumber:2050,grandparentNumber:2000}]);
+  assert.throws(()=>finish(store),/depth/);
+  assert.equal(store.workflow.get(parent).state,'OPEN');
+  assert.equal(store.workflow.get(`${project}#2106`).status,'Inbox');
+});
+
+test('an admitted builder splits its development ticket and transfers acceptance without a scope error', t => {
+  const { store } = fixture(t,'builder');
+  store.workflow.change(parent,{addLabels:['needs-human:sizing','needs-rework:builder']},'operator','retained-sizing');
+  const originalClaim=store.snapshot().claims.find(c=>c.ticket===parent);
+  const result=finish(store);
+  assert.equal(result.parent.state,'CLOSED');
+  assert.deepEqual(result.parent.builderSplit,{runId:actor.runId,children:[`${project}#2106`,`${project}#2107`]});
+  assert.deepEqual(store.snapshot().claims.find(c=>c.ticket===parent),originalClaim);
+  assert.equal(store.workflow.get(`${project}#2106`).status,'Backlog');
+  assert.deepEqual(store.workflow.get(`${project}#2100`).blockedBy.map(b=>b.number),[2098,2106,2107]);
+  assert.ok(!result.parent.labels.includes('error:builder:scope'));
+});
+
+for(const hold of ['held:manual','needs-human:manual','error:builder:permission_denied'])test(`builder split preserves ${hold}`,t=>{
+  const {store}=fixture(t,'builder');
+  store.workflow.change(parent,{addLabels:[hold]},'operator','hold');
+  assert.throws(()=>finish(store),/holds/);
+  assert.equal(store.workflow.get(parent).state,'OPEN');
+});
+
+test('builder split cannot override an operator drain',t=>{
+  const {store}=fixture(t,'builder');
+  store.desired.set({machines:['box'],change:{work:'drained'}});
+  assert.throws(()=>finish(store),/drain|stopped/);
+});
+
+test('builder-created children remain held after the source run finishes without finalizing',t=>{
+  const {store}=fixture(t,'builder');
+  store.recordTicketCreator(actor.machine,actor.session,actor.runId,'I2106');
+  store.workflow.change(`${project}#2106`,{status:'Backlog'},'operator','early-child');
+  store.finish(actor.machine,actor.session,actor.runId,false);
+  assert.deepEqual(store.start({workflowVersion:1,id:'early-child',machine:'box',session:'s',project,ticket:`${project}#2106`,role:'refiner',resource:'heavy',locks:[]}),{ok:false,reason:'locked'});
+});
+
+test('builder split is available through the real bridge without granting required-repair declarations',async t=>{
+  const f=bridgeFixture(t,'builder');
+  const inspection=JSON.parse((await f.call('GET')).body);
+  inspection.commandId='builder-split';inspection.summary='Two useful outcomes replace this work.';
+  inspection.dependents[0].children=[2106,2107];
+  const result=JSON.parse((await f.call('POST',inspection)).body);
+  assert.equal(result.parent.state,'CLOSED');
+  assert.deepEqual(result.parent.builderSplit.children,[`${project}#2106`,`${project}#2107`]);
+  assert.throws(()=>f.store.planningSplits.authorize(actor,parent),/planning/);
+});
+
+
+test('builder receipt is visible only to the builder run that finalized replacement',async t=>{
+  const {store}=fixture(t,'builder');
+  finish(store);
+  const connection={call:async()=>({items:store.workflow.list(project)})};
+  const source=workflowClient({completedBuilderSplit:async(_n:number):Promise<string[]|null>=>null},connection as any,project,()=>true,()=>actor);
+  assert.deepEqual(await source.completedBuilderSplit(2098),[`${project}#2106`,`${project}#2107`]);
+  const foreign=workflowClient({completedBuilderSplit:async(_n:number):Promise<string[]|null>=>null},connection as any,project,()=>true,()=>({...actor,runId:'other'}));
+  assert.equal(await foreign.completedBuilderSplit(2098),null);
+  store.workflow.change(parent,{state:'OPEN',status:'In Development'},'operator','reopened');
+  assert.equal(await source.completedBuilderSplit(2098),null);
+});
+
+test('builder split preserves an active dependent and a recorded approval rejection',t=>{
+  const {store}=fixture(t,'builder');
+  assert.equal(store.start({workflowVersion:1,id:'dependent-recovery',machine:'box',session:'s',project,ticket:`${project}#2100`,role:'recovery',resource:'heavy',locks:[]}).ok,true);
+  assert.throws(()=>finish(store),/active/);
+  store.finish('box','s','dependent-recovery');
+  store.approvals.record(parent,actor.runId,'builder',{approvalReviewFailed:false,hadPermissionDenial:true});
+  assert.throws(()=>finish(store),/approval|rejection/);
+  assert.equal(store.workflow.get(parent).state,'OPEN');
+});
+
+
+test('builder replacement splits are not limited by native ancestry depth',t=>{
+  const {store}=fixture(t,'builder');
+  store.workflow.observe(project,[item(1900,{state:'CLOSED',status:'Done'}),item(1950,{state:'CLOSED',status:'Done',parentNumber:1900}),
+    item(2000,{state:'CLOSED',status:'Done',parentNumber:1950,grandparentNumber:1900}),
+    item(2050,{state:'CLOSED',status:'Done',parentNumber:2000,grandparentNumber:1950}),
+    {...store.workflow.get(parent),parentNumber:2050,grandparentNumber:2000,featureRoot:`${project}#1900`}]);
+  const result=finish(store);
+  assert.equal(result.parent.state,'CLOSED');
+  for(const child of result.children)assert.equal(store.workflow.get(child).featureRoot,`${project}#1900`);
+});
+
+
+test('a later builder can split an already split child again without completing the original feature',t=>{
+  const {store}=fixture(t,'builder');
+  finish(store);
+  store.finish(actor.machine,actor.session,actor.runId);
+  const child=`${project}#2106`, nextActor={...actor,runId:'builder-2106'};
+  store.workflow.observe(project,[item(2110,{parentNumber:2106}),item(2111,{parentNumber:2106})]);
+  store.workflow.change(child,{status:'In Development'},'operator','child-ready');
+  assert.equal(store.start({workflowVersion:1,id:nextActor.runId,machine:'box',session:'s',project,ticket:child,role:'builder',resource:'heavy',locks:[]}).ok,true);
+  const result=store.finalizePlanningSplit(nextActor,child,{commandId:'split-2106',revision:store.workflow.get(child).revision,summary:'Two smaller useful results preserve the original acceptance.',
+    children:[2110,2111].map(number=>({number,revision:store.workflow.get(`${project}#${number}`).revision,dependsOn:[]})),
+    dependents:[{ticket:`${project}#2100`,revision:store.workflow.get(`${project}#2100`).revision,children:[2110,2111]}]});
+  assert.equal(result.parent.state,'CLOSED');
+  assert.equal(store.workflow.get(`${project}#2110`).featureRoot,parent);
+  assert.equal(store.workflow.get(`${project}#2111`).state,'OPEN');
+  assert.deepEqual(store.workflow.get(`${project}#2100`).blockedBy.map(b=>b.number),[2098,2106,2107,2110,2111]);
 });

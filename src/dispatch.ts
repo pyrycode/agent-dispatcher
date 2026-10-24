@@ -2335,6 +2335,7 @@ async function attemptPermissionDenialSalvage(opts: {
 // `dispatch.test.ts` pass a hand-rolled mock without `as any` casting.
 // Mirrors the `ReconcileClient` pattern in `reconcile.ts`.
 export interface DispatchClient {
+  completedBuilderSplit?: (issue: number) => Promise<string[] | null>;
   beginStage?: (issue: number, plan: StagePlan) => Promise<StageRecord>;
   completeStage?: (issue: number, result: StageSubmission) => Promise<StageRecord>;
   /** Dispatcher-only observation, persisted before scheduling a replacement run. */
@@ -5878,6 +5879,21 @@ export async function handlePostRun(
 ): Promise<{ ok: true } | { ok: false }> {
   const { agent, item, client, agentCwd, useWorktree, branchName, logFile, startTime } = ctx;
   const { execSync, spawnSync, notifyDiscord } = ctx.deps;
+
+  // Only the authority's receipt for this exact builder run proves replacement.
+  // Keep partial work; a split is neither implementation acceptance nor a PR to publish.
+  if (agent.name === 'builder' && item.issueNumber > 0 && client.completedBuilderSplit) {
+    let children: string[] | null;
+    try { children = await client.completedBuilderSplit(item.issueNumber); }
+    catch (error) { ctx.scopeHandoff = true; throw error; }
+    if (children) {
+      ctx.scopeHandoff = true;
+      if (streamResult.isError || streamResult.hadPermissionDenial || saferSalvaged || streamResult.terminalReason === 'codex_blocked')
+        throw new Error('Builder split does not override a failed or denied run');
+      ctx.deps.writeLog(logFile, 'BUILDER SPLIT', `Replaced by ${children.join(', ')}. Work retained at ${agentCwd}`);
+      return {ok:false};
+    }
+  }
 
   if (process.env.PYRY_RECOVERY === "1" && ["refiner", "po"].includes(agent.name) && item.issueNumber > 0 && client.recordCoordination && !streamResult.isError) {
     const project = `${process.env.GITHUB_OWNER}/${process.env.GITHUB_REPO}`;

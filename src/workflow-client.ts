@@ -78,6 +78,12 @@ export function workflowClient<T extends object>(
     };
   };
   const methods: Record<string, (...args: any[]) => Promise<any>> = {
+    completedBuilderSplit: async (number: number) => {
+      const item = (await read()).find(i => i.issueNumber === number);
+      const split = item?.builderSplit;
+      return item?.state === 'CLOSED' && item.status === 'Done' && split && split.runId === actor().runId
+        ? split.children : null;
+    },
     beginStage: (number: number, plan: import('./stage-results.js').StagePlan) => connection.call('/workflow/stage-plan', { project, ticket: `${project}#${number}`, plan, ...actor() }),
     completeStage: async (number: number, result: import('./stage-results.js').StageSubmission) => {
       const identity=actor(),ticket=`${project}#${number}`;

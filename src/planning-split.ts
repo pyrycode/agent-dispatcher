@@ -64,10 +64,10 @@ export class PlanningSplits {
       throw new OwnershipRefusal('Split command identity reused or owner changed');
     return JSON.parse(String(row.result));
   }
-  authorize(actor: PlanningActor, ticket: string): void {
+  authorize(actor: PlanningActor, ticket: string, allowBuilder = false): void {
     this.store.authorizeWorkflow(actor.machine, actor.session, ticket, actor.runId);
     const run = this.store.snapshot().runs.find(r => r.id === actor.runId);
-    if (!run || run.ticket !== ticket || !['refiner', 'po'].includes(run.role))
+    if (!run || run.ticket !== ticket || !['refiner', 'po', ...(allowBuilder ? ['builder'] : [])].includes(run.role))
       throw new OwnershipRefusal('Split finalization requires the active parent planning run');
   }
   inspect(ticket: string) {
@@ -104,11 +104,21 @@ export class PlanningSplits {
   finalize(actor: PlanningActor, ticket: string, input: unknown): PlanningSplitResult {
     const request = planningSplitRequest(input), saved = this.result(actor, ticket, request);
     if (saved) return saved;
-    this.authorize(actor, ticket);
+    this.authorize(actor, ticket, true);
     if (this.store.requiredRepairChildren.hasParent(ticket)) throw new OwnershipRefusal('Required repair parent retains acceptance and cannot be replaced by this split');
     const { parent, children, dependents } = this.inspect(ticket), project = ticket.split('#')[0];
-    if (parent.state !== 'OPEN' || parent.status !== 'Backlog' || parent.grandparentNumber)
-      throw new OwnershipRefusal('Split requires an open planning parent within the split depth limit');
+    const builder = this.store.snapshot().runs.find(r => r.id === actor.runId)?.role === 'builder';
+    if (parent.state !== 'OPEN' || parent.status !== (builder ? 'In Development' : 'Backlog'))
+      throw new OwnershipRefusal('Split requires an open parent in its admitted planning or builder stage');
+    // Refiners allow three child levels. Builders have no nesting-depth cap.
+    if (!builder && parent.grandparentNumber) {
+      let ancestor: WorkflowItem;
+      try { ancestor = this.store.workflow.get(`${project}#${parent.grandparentNumber}`); }
+      catch { throw new OwnershipRefusal('Cannot verify the split depth: grandparent is unavailable'); }
+      if (ancestor.parentNumber) throw new OwnershipRefusal('Split depth limit is three child levels');
+    }
+    if (builder && this.store.desired.work(actor.machine, project) !== 'taking')
+      throw new OwnershipRefusal('Builder split preserves operator drains and stopped boards');
     const equal = (a: Array<string | number>, b: Array<string | number>) => JSON.stringify([...a].sort()) === JSON.stringify([...b].sort());
     if (!equal(children.map(c => c.issueNumber), request.children.map(c => c.number))) throw new OwnershipRefusal('Split child inventory changed or is incomplete');
     if (!equal(dependents.map(d => d.ticket), request.dependents.map(d => d.ticket))) throw new OwnershipRefusal('Split dependent inventory changed or is incomplete');
@@ -124,7 +134,8 @@ export class PlanningSplits {
       if (item.revision !== revisions.get(ref)) throw new OwnershipRefusal('Split workflow changed; inspect revisions again');
       const approval = this.store.approvals.get(ref);
       if (approval?.kind === 'rejected' && !approval.authorization) throw new OwnershipRefusal('Split cannot override an approval rejection');
-      if (item.status === 'Halted' || item.labels.some(l => /^(held:|health-hold:|needs-human:|error:|needs-rework:|orchestrator:escalated)/.test(l)))
+      if (item.status === 'Halted' || item.labels.some(l => !(ref === ticket && (l === 'needs-human:sizing' || builder && l === 'needs-rework:builder'))
+          && /^(held:|health-hold:|needs-human:|error:|needs-rework:|orchestrator:escalated)/.test(l)))
         throw new OwnershipRefusal('Split preserves existing workflow holds');
       if (this.store.tasks.list(ref).some(t => ['queued', 'running', 'publishing', 'attention'].includes(t.state)))
         throw new OwnershipRefusal('An affected support task is pending');
@@ -154,7 +165,9 @@ export class PlanningSplits {
         actorId, `${actorId}:dependent:${dependent.ticket}`);
       this.store.workflow.comment(dependent.ticket, `Re-pointed from ${ticket} to ${dependent.children.map(n => `${project}#${n}`).join(', ')} as part of the parent's split. The original prerequisite now lives in those children.`, `${actorId}:handoff:${dependent.ticket}`);
     }
-    this.store.workflow.recoveryMetadata(ticket, { featureRoot: root }, actorId);
+    const childRefs = request.children.map(c => `${project}#${c.number}`);
+    this.store.workflow.recoveryMetadata(ticket, { featureRoot: root,
+      ...(builder ? { builderSplit: { runId: actor.runId, children: childRefs } } : {}) }, actorId);
     this.store.workflow.comment(ticket, `Replaced by ${request.children.map(c => `${project}#${c.number}`).join(', ')}.\n\n${request.summary}\n\nClosing records replacement, not feature delivery. All child acceptance and normal review remain required.`, `${actorId}:replacement`);
     const closed = this.store.workflow.change(ticket, { state: 'CLOSED', status: 'Done' }, actorId, `${actorId}:parent`);
     const result = { parent: closed, children: request.children.map(c => `${project}#${c.number}`) };

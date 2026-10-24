@@ -39,6 +39,8 @@ export interface ProjectItem {
   /** Original owner/repository#issue reference from the feature-root marker.
    *  Preserve it through recovery splits even when ancestors are closed. */
   featureRoot?: string;
+  /** Authority-owned receipt for a builder's replacement split, never implementation acceptance. */
+  builderSplit?: { runId: string; children: string[] };
   /** A closed replacement records required work, never feature completion. */
   recoverySplit?: { id: string; featureRoot: string; children: string[]; state: 'replaced' };
   recoverySlice?: { id: string; featureRoot: string; behaviours: string[] };
