@@ -639,7 +639,7 @@ export class FleetStore {
           if(tracked.state!=="OPEN" || !tracked.body.includes(inheritedMarker(tracker.name)))throw new Error("Accepted inherited failure has no current authoritative tracker");
         }
       }
-      return this.stages.complete(runId, item, result, change =>
+      const record = this.stages.complete(runId, item, result, change =>
         this.workflow.change(ticket, change, "stage-result:" + runId, "stage-result:" + runId), files=>{
           if(!evidence)throw new Error("Shared evidence storage is unavailable");
           const id="acceptance:"+runId, contents=Object.fromEntries(files.map(f=>[f.name,f.text])), manifest=artifactManifest(contents);
@@ -650,6 +650,12 @@ export class FleetStore {
           evidence.commit(machine,undefined,ticket,id,upload.digest);
           return {runId:id,digest:upload.digest};
         });
+      // An accepted PASS settles only the pending investigations it names
+      // (Mobile #2526: an unsettled one diverted documentation into recovery).
+      const named = record.plan.kind === "verifier" && record.acceptance?.state === "accepted" ? result.verdict?.investigations ?? [] : [];
+      if (named.length) this.investigations.reconcile(ticket, { stageRunId: runId, candidate: record.plan.candidate, pullRequest: result.pullRequest!, decision: "PASS",
+        verdictDigest: createHash("sha256").update(result.verdict!.body).digest("hex") }, named);
+      return record;
     });
   }
   /** Operator-only: request a fresh verifier after the known failed-review retry refusal. */

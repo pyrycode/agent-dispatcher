@@ -88,7 +88,8 @@ export function decideStageResult(plan: StagePlan, result: StageSubmission, arti
     const missing = plan.checks.filter(n => !result.checks.some(c => c.name === n && c.outcome === "passed"));
     if (plan.kind === "verifier") {
         const v = result.verdict;
-        const parsed = v && parseVerdictHandoff(`decision: ${v.decision}\ncommit: ${v.commit}\nlabels: ${v.labels?.join(" ")}\n---\n${v.body}`);
+        const named = v?.investigations === undefined || Array.isArray(v.investigations) && v.investigations.length > 0 && v.investigations.every(i => typeof i === "string" && /^[a-f0-9]{64}$/.test(i));
+        const parsed = v && named && parseVerdictHandoff(`decision: ${v.decision}\ncommit: ${v.commit}\nlabels: ${v.labels?.join(" ")}\ninvestigations: ${v.investigations?.join(" ") ?? ""}\n---\n${v.body}`);
         if (!parsed || !parsed.ok || parsed.handoff.commit !== plan.candidate || !Number.isSafeInteger(result.pullRequest) || result.pullRequest! < 1)
             return waiting("A complete verdict for the exact candidate is required");
         if (v!.decision === "FAIL")

@@ -5543,7 +5543,7 @@ function prepareVerdictHandoff(ctx: DispatchContext): string {
     console.warn(`   ⚠️  Could not prepare the verdict handoff file ${path}: ${e}`);
   }
   return verdictHandoffNote(path) + (ctx.agent.name === "verifier" && ctx.client.completeStage
-    ? "\n\nThe saved structured verdict is the authoritative result. The orchestrator validates it and publishes the PR comment. Do not post or edit a GitHub verdict comment or apply done labels in this run. Preserve the exact reviewed commit and any required rework labels in the handoff.\n" : "");
+    ? "\n\nThe saved structured verdict is the authoritative result. The orchestrator validates it and publishes the PR comment. Do not post or edit a GitHub verdict comment or apply done labels in this run. Preserve the exact reviewed commit and any required rework labels in the handoff. A pending retained-evidence investigation stays pending and is assessed by recovery after this stage. Only when your PASS resolves it, or explicitly accepts its remaining evidence limits, add the header line `investigations: <its 64-character identity>`; never name one you have not judged.\n" : "");
 }
 
 /** Keep a complete verdict as the ticket's last one (#135). A failure only

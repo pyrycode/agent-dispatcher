@@ -51,6 +51,19 @@ describe("parseVerdictHandoff", () => {
     }
   });
 
+  test("a PASS names the investigations it accepts; a malformed list or a FAIL that names one is incomplete", () => {
+    const id = "7".repeat(64);
+    const withId = (decision: string, value: string, labels = "") => parseVerdictHandoff(`decision: ${decision}\ncommit: ${SHA}\nlabels: ${labels}\ninvestigations: ${value}\n---\nbody`);
+    const r = withId("PASS", id);
+    assert.ok(r.ok);
+    assert.deepEqual(r.handoff.investigations, [id]);
+    const none = parseVerdictHandoff(handoffText());
+    assert.ok(none.ok);
+    assert.equal(none.handoff.investigations, undefined, "an unnamed investigation is not accepted");
+    for (const value of ["short", `${id} ${id}`, "A".repeat(64)]) assert.equal(withId("PASS", value).ok, false, value);
+    assert.equal(withId("FAIL", id, "needs-rework:builder").ok, false);
+  });
+
   test("decision is case-insensitive and the commit is normalised to lower case", () => {
     const r = parseVerdictHandoff(handoffText({ decision: "pass", commit: SHA.toUpperCase() }));
     assert.ok(r.ok);
