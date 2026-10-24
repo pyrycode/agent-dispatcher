@@ -112,6 +112,20 @@ class Helper:
         with patch.object(m, 'body', return_value='[]'), self.assertRaisesRegex(ValueError, 'JSON object'):
             m.perform(['split-finalize', '2098', '/approved/plan.json'])
 
+    def test_required_repairs_use_separate_managed_endpoint(self):
+        m = self.m
+        endpoint = 'repos/pyrycode/' + m.PIPELINE + '/issues/2338/required-repairs'
+        with patch.object(m, 'gh', return_value='{"revision": 4}') as gh:
+            self.assertEqual(m.perform(['required-repairs-inspect', '2338']), {'revision': 4})
+            self.assertEqual(gh.call_args.args, ('api', '--hostname', 'github.com', endpoint))
+        content = '{"commandId":"repair-2338","repairs":[2522]}'
+        with patch.object(m, 'body', return_value=content), patch.object(m, 'run', return_value='{"acceptance":"parent-remains-open"}') as run:
+            self.assertEqual(m.perform(['required-repairs-finalize', '2338', '/approved/plan.json'])['acceptance'], 'parent-remains-open')
+            self.assertEqual(run.call_args.args, ([m.GH, 'api', '--hostname', 'github.com', endpoint,
+                                                  '--method', 'POST', '--input', '-'], content))
+        with patch.object(m, 'bridged', return_value=False), self.assertRaisesRegex(ValueError, 'managed GitHub bridge'):
+            m.perform(['required-repairs-finalize', '2338', '/approved/plan.json'])
+
     def test_sub_issue_links_do_not_need_the_bridge(self):
         m = self.m
         with patch.object(m, 'bridged', return_value=False), \

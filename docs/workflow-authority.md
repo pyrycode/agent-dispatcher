@@ -642,7 +642,8 @@ or control revision still requires a new inspection and scope review. Unknown
 or truncated relationships refuse finalization rather than guessing.
 
 A durable admission hold applies to newly created issues linked as children of
-their admitted planning creator. It lasts until the parent closes, even if the
+their admitted planning creator. It lasts until replacement finalization or an
+explicit required-repair declaration below (or parent closure), even if the
 creator ends or its short general creator hold expires. Unrelated follow-ups
 retain their existing bounded hold. Readiness/implementation advancement of an
 unfinished split parent is refused. No historical creator rows are backfilled;
@@ -650,3 +651,55 @@ existing owners, branches, artifacts and approval decisions are preserved.
 Closing records replacement, never delivery of the feature. Child gates remain
 required. Existing recovery splits keep their stronger retained-evidence plan
 and their existing transactional finalizer.
+
+## Required repair children that retain the acceptance parent
+
+A refiner-created child can be a required repair while the open parent retains
+integration and acceptance, as in Mobile #2338 / #2522. Readiness labels and
+status changes do not distinguish that case from an unfinished replacement.
+Use an explicit declaration after reviewing the child scope and parent blocker.
+The declaration releases only the named children's planning holds. It does not
+advance stages, close tickets, change claims, remove blockers or accept work.
+
+An admitted parent `refiner` or `po` uses `required-repairs-inspect PARENT` and
+`required-repairs-finalize PARENT ABSOLUTE_JSON_FILE` through the managed helper.
+These call GET/POST `/repos/OWNER/REPO/issues/N/required-repairs`. Inspection
+freshly verifies the complete GitHub child and open-dependent inventories and
+returns the parent revision/ownership and every child's revision/ownership.
+Keep the complete `children` array, set `repairs` to the reviewed repair numbers,
+and add a unique `commandId` and a content-free `summary`. Each repair must
+remain an open blocker of the open parent, have its own scope, and be in Inbox,
+Backlog, or In Development with `done:refiner`. A child cannot also wait on the
+parent. Other inventoried children retain their replacement holds.
+
+For a finished creator, the protected operator command provides the same
+inspection and declaration without starting a worker on a blocked parent:
+
+```sh
+operator.sh workflow required-repairs owner/repo inspect.json
+operator.sh workflow required-repairs owner/repo declaration.json
+```
+
+`inspect.json` contains only `{"ticket":"owner/repo#2338"}`. The second file
+contains `ticket` and `declaration`; `declaration` is the returned inspection
+object plus the reviewed `commandId`, `summary` and `repairs`. The underlying
+route is `POST /workflow/required-repairs`; machine credentials cannot use it.
+This command is a workflow mutation requiring separate operational authority.
+Implementing or merging dispatcher code does not authorize its live use.
+
+The transaction fences the complete local inventory and exact claims/revisions.
+Incomplete upstream inventories, unlinked creator children, active workers or
+creators (except the declaring parent planner), pending verifier handoffs,
+support custody, recovery splits, approval rejections, operator holds, or a
+conflicting feature lineage refuse declaration. It never frees workers or
+changes ownership. A declaring planner continues to hold its children until
+its run ends, even beyond the general creator hold timeout. Finished-creator
+operator requests have no active-run exception. Lost acknowledgements replay
+the exact saved actor/request result, including after restart or GitHub outage.
+
+A declared parent's acceptance cannot be silently replaced by the ordinary
+split finalizer. Removing its required-child blocker reinstates the child's
+planning hold while the parent is open. Admission, independent review and
+normal documentation remain required. Snapshots and manager queues now expose
+`planning-child-pending` and `creator-active`; the scheduler passes over those
+offers while central admission remains authoritative.

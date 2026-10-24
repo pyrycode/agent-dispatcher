@@ -3,6 +3,7 @@ import { DeclarationRepairs, declarationRepairRequest, declarationCaptureFiles, 
 import { ClaimsHistory, historyHash } from "./claims-history.js";
 import { StageResults, stageBasis, type StagePlan, type StageSubmission } from "./stage-results.js";
 import { PlanningSplits, type PlanningActor } from './planning-split.js';
+import { RequiredRepairChildren, type RepairActor } from './required-repair-children.js';
 import { RecoverySplits, renderRecoverySlice, splitBodyHash, splitRequirements, splitItemBasis, validateSplitAgainstTicket, validateRecoverySplit, type RecoverySplitRecord } from './recovery-split.js';
 import {StorageMaintenance,type StorageRequest} from './storage-maintenance.js';
 import { parseFeatureRoot } from './feature-lineage.js';
@@ -143,7 +144,7 @@ export interface StartRequest {
 }
 export interface Claim { ticket: string; machine: string; generation: string; created: number }
 export interface FleetRun extends StartRequest { generation: string; created: number; runnerPolicy?: RunnerPolicy }
-export interface FleetSnapshot { machineRecoveries?: MachineRecovery[]; verifierHandoffs?: VerifierHandoff[]; workflowProjects?: string[]; claims: Claim[]; runs: FleetRun[]; runnerPolicy?: RunnerPolicy; idleRecoveryTickets?: string[]; priorityHighTickets?: string[]; releasedAssessmentClaims?: Claim[]; features?: {recoveryTasks:boolean; evidence?: boolean}; evidenceStore?: import("./evidence-store.js").EvidenceUsage; requiredRepairs?: Record<string,string[]>; codexPause?: CodexPauseState;
+export interface FleetSnapshot { planningChildHolds?: Record<string, "planning-child-pending" | "creator-active">; machineRecoveries?: MachineRecovery[]; verifierHandoffs?: VerifierHandoff[]; workflowProjects?: string[]; claims: Claim[]; runs: FleetRun[]; runnerPolicy?: RunnerPolicy; idleRecoveryTickets?: string[]; priorityHighTickets?: string[]; releasedAssessmentClaims?: Claim[]; features?: {recoveryTasks:boolean; evidence?: boolean}; evidenceStore?: import("./evidence-store.js").EvidenceUsage; requiredRepairs?: Record<string,string[]>; codexPause?: CodexPauseState;
   /**
    * Open tickets of adopted projects waiting for review with nothing holding
    * them (see awaitsReview), whoever owns them. Present, possibly empty,
@@ -236,6 +237,7 @@ export class FleetStore {
   readonly recovery: RecoveryLedger;
   readonly splits: RecoverySplits;
   readonly planningSplits: PlanningSplits;
+  readonly requiredRepairChildren: RequiredRepairChildren;
   readonly workflow: WorkflowStore;
   readonly facts: RecoveryFacts;
   readonly operations: OperationReports;
@@ -309,6 +311,7 @@ export class FleetStore {
     this.storage = new StorageMaintenance(this.db,this.clock);
     this.splits = new RecoverySplits(this.db);
     this.planningSplits = new PlanningSplits(this.db, this);
+    this.requiredRepairChildren = new RequiredRepairChildren(this.db, this);
     this.codex = new CodexThrottle(this.db, clock, options.codexThrottle ?? DEFAULT_CODEX_THROTTLE, options.log);
     this.desired = new DesiredStateStore(this.db, Object.keys(limits), clock, machine => this.machineCapabilities()[machine]?.projects);
     this.flaky = new FlakySightingLedger(this.db, clock);
@@ -590,6 +593,9 @@ export class FleetStore {
     });
   }
 
+  declareRequiredRepairChildren(actor: RepairActor, ticket: string, input: unknown) {
+    return this.transaction(() => this.requiredRepairChildren.finalize(actor, ticket, input));
+  }
   finalizePlanningSplit(actor: PlanningActor, ticket: string, input: unknown) {
     return this.transaction(() => this.planningSplits.finalize(actor, ticket, input));
   }
@@ -1262,9 +1268,9 @@ Request a fresh independent verifier of candidate ${input.candidate} after faile
       if(columns[req.role] && (item.state!=='OPEN' || item.status!==columns[req.role] || item.labels.some(l=>l.startsWith('held:')||l.startsWith('error:')||l.startsWith('needs-rework:')||(l.startsWith('wip:')&&!isRepairWip(l))||l.startsWith('needs-human:')&&l!=='needs-human:sizing') || item.blockedBy.some(b=>b.state==='OPEN'))) return {ok:false,reason:'locked'};
       // A ticket split off by a run that is still active waits for that run,
       // which may still be writing its labels, priority and board order.
-      // Bounded, so a creator whose computer went away cannot hold its
-      // children past the point where its reservation is reported as stale.
-      if(this.db.prepare('SELECT 1 FROM fleet_ticket_creators AS c JOIN fleet_runs AS r ON r.id=c.run_id WHERE c.issue_id=? AND r.finished IS NULL AND c.created>?').get(item.issueId,this.clock()-CREATOR_HOLD_MS)) return {ok:false,reason:'locked'};
+      // Generic creator holds are bounded. An explicitly declared repair also
+      // waits for its declaring planning run to end.
+      if(this.creatorActive(item.issueId)) return {ok:false,reason:'locked'};
     }
     // Every stage of a ticket with a requirement runs only where it can.
     const needs = this.requirementsOf(req.ticket);
@@ -1358,8 +1364,8 @@ Request a fresh independent verifier of candidate ${input.candidate} after faile
         }
       }
       this.db.prepare("DELETE FROM fleet_locks WHERE run_id=?").run(id);
-      // Generic creator holds end here. Linked split children additionally
-      // require parent replacement, which survives this run and process.
+      // Generic creator holds end here. Linked planning children additionally
+      // require explicit classification or replacement, surviving this run and process.
       this.db.prepare("DELETE FROM fleet_ticket_creators WHERE run_id=?").run(id);
       this.db.prepare("UPDATE fleet_runs SET finished=?,outcome=? WHERE id=? AND finished IS NULL").run(Date.now(), unused ? "unused" : completed ? "completed" : "cancelled", id);
       if(unused && request.verificationPin && !this.db.prepare("SELECT 1 FROM fleet_run_history WHERE ticket=? AND generation=? AND id!=? AND (finished IS NULL OR outcome IS NULL OR outcome!='unused')").get(run.ticket,run.generation,id)) {
@@ -1632,6 +1638,26 @@ Request a fresh independent verifier of candidate ${input.candidate} after faile
     return { ...prior, outcome };
   }
 
+  private creatorActive(issueId: string): boolean {
+    return this.requiredRepairChildren.creatorActive(issueId) || !!this.db.prepare('SELECT 1 FROM fleet_ticket_creators AS c JOIN fleet_runs AS r ON r.id=c.run_id WHERE c.issue_id=? AND r.finished IS NULL AND c.created>?').get(issueId,this.clock()-CREATOR_HOLD_MS);
+  }
+  private planningChildHolds(): NonNullable<FleetSnapshot['planningChildHolds']> {
+    const holds: NonNullable<FleetSnapshot['planningChildHolds']> = {};
+    // Scan the workflow once, then use ticket primary keys; historical creator
+    // rows must not each trigger a full issue-ID lookup on every manager poll.
+    const rows = this.db.prepare(`SELECT w.ticket FROM workflow_tickets w
+      WHERE json_extract(w.item,'$.state')='OPEN' AND (
+        EXISTS (SELECT 1 FROM fleet_split_children c WHERE c.issue_id=json_extract(w.item,'$.issueId')) OR
+        EXISTS (SELECT 1 FROM fleet_ticket_creators c WHERE c.issue_id=json_extract(w.item,'$.issueId')))
+    `).all();
+    for (const row of rows) {
+      const ticket = String(row.ticket), item = this.workflow.get(ticket), project = ticket.split('#')[0];
+      if (this.planningSplits.childPending(item, project)) holds[ticket] = 'planning-child-pending';
+      else if (this.creatorActive(item.issueId)) holds[ticket] = 'creator-active';
+    }
+    return holds;
+  }
+
   snapshot(): FleetSnapshot {
     const verifierHandoffs = this.activeVerifierHandoffs();
     const runnerPolicy = this.runnerPolicy();
@@ -1651,7 +1677,9 @@ Request a fresh independent verifier of candidate ${input.candidate} after faile
     const unreportedOwners = claims.filter(c => ticketRequirements[c.ticket] && !Object.hasOwn(machineCapabilities, c.machine))
       .map(c => ({ ticket: c.ticket, machine: c.machine, requires: ticketRequirements[c.ticket] }));
     const machineRecoveries = this.machineRecoveries.list();
+    const planningChildHolds = this.planningChildHolds();
     return {
+      ...(Object.keys(planningChildHolds).length ? { planningChildHolds } : {}),
       ...(machineRecoveries.length ? {machineRecoveries} : {}),
       ...(verifierHandoffs.length ? { verifierHandoffs } : {}),
       ...(codexPause ? { codexPause } : {}),

@@ -1,6 +1,7 @@
 import {guardPinnedPublication} from './verifier-handoff-publication.js';
 import { renderRecoverySlice } from "./recovery-split.js";
 import { planningSplitRequest, type PlanningActor } from './planning-split.js';
+import { requiredRepairDeclaration, type RepairActor } from './required-repair-children.js';
 import type { EvidenceStore } from "./evidence-store.js";
 import {
   parse,
@@ -200,6 +201,14 @@ export class WorkflowGitHub {
     request: GitHubRequest,
     actor?: Actor,
   ): Promise<GitHubResponse> {
+    const repairs = request.path.match(/^\/repos\/([^/]+\/[^/]+)\/issues\/([1-9]\d*)\/required-repairs$/);
+    if (repairs) {
+      if (!this.store.workflow.enabled(project) || repairs[1] !== project || !actor?.runId)
+        throw new OwnershipRefusal('Required repairs require this project authority and an admitted planning run');
+      if (!['GET', 'POST'].includes(request.method)) throw new OwnershipRefusal('Required repairs support inspection and declaration');
+      return response(await this.requiredRepairs(actor as PlanningActor, `${project}#${repairs[2]}`,
+        request.method === 'POST' ? JSON.parse(request.body ?? '{}') : undefined));
+    }
     const split = request.path.match(/^\/repos\/([^/]+\/[^/]+)\/issues\/([1-9]\d*)\/split$/);
     if (split && (!this.store.workflow.enabled(project) || split[1] !== project))
       throw new OwnershipRefusal('Split finalization requires this project\'s workflow authority');
@@ -696,9 +705,26 @@ export class WorkflowGitHub {
     this.filings.set(request.commandId, { key, work });
     return work;
   }
+  /** Also used by the protected operator route for a finished creator. */
+  async requiredRepairs(actor: RepairActor, ticket: string, input?: unknown) {
+    const project = ticket.split('#')[0];
+    if (!/^[\w.-]+\/[\w.-]+#[1-9]\d*$/.test(ticket) || !this.store.workflow.enabled(project))
+      throw new OwnershipRefusal('Required repairs require imported workflow authority');
+    const request = input === undefined ? undefined : requiredRepairDeclaration(input);
+    if (request) {
+      const saved = this.store.requiredRepairChildren.saved(actor, ticket, request);
+      if (saved) return saved;
+    }
+    if (request && actor !== 'operator') {
+      this.store.planningSplits.authorize(actor, ticket);
+      await guardPinnedPublication(this.store, this.upstream, ticket);
+    }
+    await this.refreshPlanningSplit(actor, ticket);
+    return request ? this.store.declareRequiredRepairChildren(actor, ticket, request) : this.store.requiredRepairChildren.inspect(ticket);
+  }
   /** Require fresh, complete GitHub family links before the single workflow commit. */
-  private async refreshPlanningSplit(actor: PlanningActor, ticket: string) {
-    this.store.planningSplits.authorize(actor, ticket);
+  private async refreshPlanningSplit(actor: RepairActor, ticket: string) {
+    if (actor !== 'operator') this.store.planningSplits.authorize(actor, ticket);
     const project = ticket.split('#')[0], source = this.store.workflow.get(ticket);
     await this.adoptIssue(project, source.issueId, true);
     const payload = JSON.parse((await this.checked(project, { method: 'POST', path: '/graphql', fresh: true,
