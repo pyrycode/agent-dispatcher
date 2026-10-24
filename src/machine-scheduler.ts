@@ -114,6 +114,7 @@ export function workEligibility(offer: WorkOffer, state: FleetSnapshot, policy: 
   if ((policy.drainedProjects ?? []).some(p => p === offer.project || p === offer.parentTicket?.split("#")[0])) return "drained";
   if (!acceptsDuringProjectDrain(offer, policy.machine, policy.drainingProjects ?? [], state)) return "project-draining";
   if ((state.machineRecoveries ?? []).some(r => r.machine === policy.machine && r.cleared === undefined && [offer.project, offer.parentTicket?.split("#")[0]].includes(r.project))) return "drained";
+  if (state.planningChildHolds?.[offer.ticket]) return state.planningChildHolds[offer.ticket];
   if (lackingCapabilities(offer, state, policy.capabilities).length) return "missing-capability";
   if (offer.role !== "recovery" && !(state.requiredRepairs?.[offer.ticket] ?? []).every(sha => offer.readyRepairs?.includes(sha))) return "missing-repair";
   // The authority refuses it until the ticket's support task ends. An older

@@ -387,6 +387,13 @@ export async function serveFleet(store: FleetStore, machines: Record<string, str
             throw new Error('Published declaration repair candidate changed or unavailable');
           return send(200,store.repairStageDeclaration(input,evidence));
         }
+        if(req.url==='/workflow/required-repairs') {
+          if(!isAdmin) return send(403,{error:'Operator credential required'});
+          if(body.ticket?.split('#')[0]!==project) throw new Error('Workflow project mismatch');
+          if(!workflowGitHub) throw new Error('Fresh family verification is unavailable');
+          if(Object.keys(body).some(k => !['project','ticket','declaration'].includes(k))) throw new Error('Invalid required repair request fields');
+          return send(200,await workflowGitHub.requiredRepairs('operator',body.ticket,body.declaration));
+        }
         if(req.url==='/workflow/operator') {
           if(!isAdmin) return send(403,{error:'Operator credential required'});
           if(body.ticket?.split('#')[0]!==project) throw new Error('Workflow project mismatch');
@@ -499,7 +506,7 @@ export class JsonClient {
   }
   async call<T>(path: string, body?: unknown): Promise<T> {
     // Preparation reads the repair's base from GitHub and scans it twice.
-    const timeoutMs = path === "/tasks/publish-repair" || path === "/tasks/prepare-repair" ? 120_000 : path === "/github" || path === "/workflow/file" || path === "/recovery/split" ? 60_000 : 10_000;
+    const timeoutMs = path === "/tasks/publish-repair" || path === "/tasks/prepare-repair" ? 120_000 : path === "/github" || path === "/workflow/file" || path === "/workflow/required-repairs" || path === "/recovery/split" ? 60_000 : 10_000;
     if (this.socketPath) return new Promise<T>((resolve, reject) => {
       const req = request({ socketPath: this.socketPath, path, method: body === undefined ? "GET" : "POST",
         headers: { Authorization: `Bearer ${this.token}`, "Content-Type": "application/json" },

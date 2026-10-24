@@ -50,7 +50,7 @@ async function main(): Promise<void> {
   }
   if(command==='workflow') {
     const [action,project,file,boardNumber]=args;
-    if(!['read','export','import','change','file','prepare','activate','cancel-preparation','approval-authorize','declaration-repair','retry-review','recovery-split'].includes(action)||!project)throw new Error('workflow read|export|import|change|file|prepare|activate|cancel-preparation|approval-authorize|declaration-repair|retry-review|recovery-split PROJECT [JSON_FILE]');
+    if(!['read','export','import','change','file','prepare','activate','cancel-preparation','approval-authorize','declaration-repair','required-repairs','retry-review','recovery-split'].includes(action)||!project)throw new Error('workflow read|export|import|change|file|prepare|activate|cancel-preparation|approval-authorize|declaration-repair|required-repairs|retry-review|recovery-split PROJECT [JSON_FILE]');
     if(action==='export') {
       if(!file)throw new Error('Export output path required');
       const entry=config.projects?.find((p:any)=>p.repo===project);
@@ -65,6 +65,9 @@ async function main(): Promise<void> {
     if(action==='read') {console.log(JSON.stringify(await claims.call('/workflow/read',{project})));return;}
     if(!file)throw new Error('Saved workflow request required');
     const input=JSON.parse(readFileSync(file,'utf8'));
+    if(action==='required-repairs') {
+      console.log(JSON.stringify(await claims.call('/workflow/required-repairs',{...input,project})));return;
+    }
     if(action==='recovery-split') {
       if(Object.keys(input).length!==1 || typeof input.id!=='string' || !/^[a-f0-9-]{36}$/.test(input.id)) throw new Error('Recovery split retry accepts only its retained incident id');
       console.log(JSON.stringify(await claims.call('/recovery/split',{id:input.id,project})));return;

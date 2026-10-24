@@ -86,7 +86,10 @@ export class PlanningSplits {
   childPending(item: WorkflowItem, project: string): boolean {
     const row = this.db.prepare('SELECT parent FROM fleet_split_children WHERE issue_id=? AND NOT EXISTS (SELECT 1 FROM fleet_planning_splits WHERE ticket=parent)').get(item.issueId);
     if (!row || `${project}#${item.parentNumber}` !== row.parent) return false;
-    return this.store.workflow.get(String(row.parent)).state === 'OPEN';
+    const parent = this.store.workflow.get(String(row.parent));
+    if (this.store.requiredRepairChildren.declared(item.issueId, String(row.parent))
+        && parent.blockedBy.some(b => b.state === 'OPEN' && (b.url ? b.url === item.url : b.number === item.issueNumber))) return false;
+    return parent.state === 'OPEN';
   }
   parentPending(ticket: string): boolean {
     const rows = this.db.prepare('SELECT issue_id FROM fleet_split_children WHERE parent=?').all(ticket);
@@ -101,6 +104,7 @@ export class PlanningSplits {
     const request = planningSplitRequest(input), saved = this.result(actor, ticket, request);
     if (saved) return saved;
     this.authorize(actor, ticket);
+    if (this.store.requiredRepairChildren.hasParent(ticket)) throw new OwnershipRefusal('Required repair parent retains acceptance and cannot be replaced by this split');
     const { parent, children, dependents } = this.inspect(ticket), project = ticket.split('#')[0];
     if (parent.state !== 'OPEN' || parent.status !== 'Backlog' || parent.grandparentNumber)
       throw new OwnershipRefusal('Split requires an open planning parent within the split depth limit');

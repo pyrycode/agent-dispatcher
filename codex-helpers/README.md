@@ -77,3 +77,12 @@ single transaction activates them and closes the replaced parent. Retain the
 same file/identity for an uncertain retry. A new inspection is required after
 scope or workflow changes. These actions refuse an absent bridge, foreign run,
 missing/truncated inventory, active affected work or an unresolved approval hold.
+
+For a required repair that leaves its acceptance parent open, use
+`required-repairs-inspect PARENT` and
+`required-repairs-finalize PARENT ABSOLUTE_JSON_FILE`. Retain the complete
+inspection inventory and ownership/revision fences, add `commandId` and
+`summary`, and set `repairs` to the reviewed child numbers. Every named child
+must remain an open blocker of its parent. The declaration only classifies the
+planning hold; the creator must finish and all normal stage gates still apply.
+See `docs/workflow-authority.md` for the protected finished-creator operator path.
