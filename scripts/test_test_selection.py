@@ -11,8 +11,111 @@ spec = importlib.util.spec_from_file_location('test_selection', Path(__file__).w
 policy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(policy)
 
+DESIGN_CAPTURE_TESTS = ('de.pyryco.mobile.design.ListDesignCaptureTest#listFramesAt412By892,'
+                        'de.pyryco.mobile.design.ListDesignCaptureTest#listFramesAt320By700LargeText')
+INSTRUMENTATION_CLASS = '-Pandroid.testInstrumentationRunnerArguments.class'
+
 
 class SelectionTests(unittest.TestCase):
+    def test_api35_design_capture_and_existing_instrumentation_routes_are_focused(self):
+        policy.selection('android', ['ui', '--tests', DESIGN_CAPTURE_TESTS])
+        for task in ['pixel8Api35DebugAndroidTest', 'pixel2Api33AtdDebugAndroidTest',
+                     'connectedDebugAndroidTest', 'connectedAndroidTest']:
+            with self.subTest(task=task):
+                policy.selection('gradle', [':app:' + task, INSTRUMENTATION_CLASS + '=' + DESIGN_CAPTURE_TESTS])
+
+    def test_api35_design_capture_rejects_unbounded_or_overridden_selections(self):
+        task = ':app:pixel8Api35DebugAndroidTest'
+        invalid = ['', '*', 'de.pyryco.mobile.design.*',
+                   'de.pyryco.mobile.design.ListDesignCaptureTest#*',
+                   'de.pyryco.mobile.design.ListDesignCaptureTest#',
+                   DESIGN_CAPTURE_TESTS + ',de.pyryco.mobile.OtherTest#other',
+                   DESIGN_CAPTURE_TESTS + ',',
+                   'ListDesignCaptureTest#listFramesAt412By892']
+        for selector in invalid:
+            for kind, args in [('android', ['ui', '--tests', selector]),
+                               ('gradle', [task, INSTRUMENTATION_CLASS + '=' + selector])]:
+                with self.subTest(kind=kind, selector=selector), self.assertRaises(policy.PolicyError):
+                    policy.selection(kind, args)
+        for kind, args in [
+            ('android', ['ui']), ('android', ['ui', '--tests']),
+            ('android', ['ui', '--tests', DESIGN_CAPTURE_TESTS, '--tests=*']),
+            ('android', ['ui', '--tests=' + DESIGN_CAPTURE_TESTS, '--tests', '*']),
+            ('gradle', [task]), ('gradle', [task, INSTRUMENTATION_CLASS]),
+            ('gradle', [task, INSTRUMENTATION_CLASS + '=' + DESIGN_CAPTURE_TESTS, INSTRUMENTATION_CLASS + '=*']),
+            ('gradle', [task, INSTRUMENTATION_CLASS + '=' + DESIGN_CAPTURE_TESTS, INSTRUMENTATION_CLASS, '*']),
+            ('gradle', [task, INSTRUMENTATION_CLASS + '=' + DESIGN_CAPTURE_TESTS, '-P', INSTRUMENTATION_CLASS[2:] + '=*']),
+            ('gradle', [task, '-P', INSTRUMENTATION_CLASS[2:] + '=' + DESIGN_CAPTURE_TESTS, INSTRUMENTATION_CLASS + '=*']),
+            ('gradle', [task, INSTRUMENTATION_CLASS + '=' + DESIGN_CAPTURE_TESTS, '--project-prop', INSTRUMENTATION_CLASS[2:] + '=*']),
+            ('gradle', [task, INSTRUMENTATION_CLASS + '=' + DESIGN_CAPTURE_TESTS, '--project-prop=' + INSTRUMENTATION_CLASS[2:] + '=*']),
+            ('gradle', [task, INSTRUMENTATION_CLASS + '=' + DESIGN_CAPTURE_TESTS, ':app:check']),
+            ('gradle', [task, INSTRUMENTATION_CLASS + '=' + DESIGN_CAPTURE_TESTS, ':app:testDebugUnitTest']),
+            ('gradle', [task, INSTRUMENTATION_CLASS + '=' + DESIGN_CAPTURE_TESTS, ':app:allDevicesDebugAndroidTest']),
+            ('gradle', [':app:pixel8Api35Setup']),
+            ('gradle', [':app:pixel8Api35DebugAndroidTestAll', INSTRUMENTATION_CLASS + '=' + DESIGN_CAPTURE_TESTS]),
+        ]:
+            with self.subTest(kind=kind, args=args), self.assertRaises(policy.PolicyError):
+                policy.selection(kind, args)
+
+    def test_api35_launcher_arguments_use_frozen_builder_context(self):
+        # pyrycode-mobile-agents android-test-gate.py emits assembly, then this
+        # UI command; managed_ui_environment skips ATD image setup for API35.
+        nested = [':app:pixel8Api35DebugAndroidTest', '--rerun',
+                  INSTRUMENTATION_CLASS + '=' + DESIGN_CAPTURE_TESTS,
+                  '-Pandroid.testInstrumentationRunnerArguments.notPackage=de.pyryco.mobile.e2e',
+                  '-Pandroid.experimental.androidTest.numManagedDeviceShards=1',
+                  '-Pandroid.testInstrumentationRunnerArguments.disableAnimations=true', '--console=plain']
+        commands = [('android', ['ui', '--tests', DESIGN_CAPTURE_TESTS]),
+                    ('gradle', [':app:assembleDebug', ':app:assembleDebugAndroidTest', '--console=plain']),
+                    ('gradle', nested)]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            folder = root / '.git/pyry-test-context'
+            folder.mkdir(parents=True)
+            record = {'version': 1, 'root': str(root), 'runId': 'capture-run',
+                      'project': 'pyrycode/pyrycode-mobile', 'socket': '/owned/context.sock'}
+            (folder / 'context.json').write_text(json.dumps(record))
+            reply = {'version': 1, 'runId': record['runId'], 'project': record['project'],
+                     'role': 'builder', 'origin': 'agent'}
+            with patch.object(policy.Path, 'cwd', return_value=root), \
+                 patch.dict(os.environ, {'CLAUDE_CODE_ENTRYPOINT': 'verifier', 'PYRY_TASK_SOCKET': '/forged/socket'}):
+                with patch.object(policy, 'socket_context', return_value=reply) as context:
+                    for kind, args in commands:
+                        with self.subTest(kind=kind, args=args):
+                            policy.check(root, kind, args)
+                    self.assertEqual(context.call_count, len(commands))
+                    context.assert_called_with(record['socket'])
+                    for kind, args in [('android', ['ui']), ('gradle', [nested[0]]),
+                                       ('gradle', [*nested, ':app:check']),
+                                       ('gradle', [*nested, '-P', INSTRUMENTATION_CLASS[2:] + '=*'])]:
+                        with self.subTest(kind=kind, args=args), self.assertRaises(policy.PolicyError):
+                            policy.check(root, kind, args)
+                for response in [{'return_value': {**reply, 'runId': 'foreign-run'}},
+                                 {'side_effect': OSError('context unavailable')}]:
+                    with patch.object(policy, 'socket_context', **response):
+                        for kind, args in commands:
+                            with self.subTest(kind=kind, response=response), self.assertRaises(policy.PolicyError):
+                                policy.check(root, kind, args)
+
+    def test_instrumentation_property_spellings_share_validation_and_duplicate_detection(self):
+        def spellings(value):
+            property_value = INSTRUMENTATION_CLASS[2:] + '=' + value
+            return [['-P' + property_value], ['-P', property_value],
+                    ['--project-prop', property_value], ['--project-prop=' + property_value]]
+
+        for task in ['pixel8Api35DebugAndroidTest', 'pixel2Api33AtdDebugAndroidTest',
+                     'connectedDebugAndroidTest', 'connectedAndroidTest']:
+            for flags in spellings(DESIGN_CAPTURE_TESTS):
+                with self.subTest(task=task, flags=flags):
+                    policy.selection('gradle', [':app:' + task, *flags])
+                for override in spellings('*') + spellings(DESIGN_CAPTURE_TESTS):
+                    with self.subTest(task=task, flags=flags, override=override), self.assertRaises(policy.PolicyError):
+                        policy.selection('gradle', [':app:' + task, *flags, *override])
+            for value in ['', '*', DESIGN_CAPTURE_TESTS + ',de.pyryco.mobile.OtherTest#other']:
+                for flags in spellings(value):
+                    with self.subTest(task=task, flags=flags), self.assertRaises(policy.PolicyError):
+                        policy.selection('gradle', [':app:' + task, *flags])
+
     def test_desktop_unit_selection_is_exact_and_bounded(self):
         for args in [
             ['--files-json', '["src/main/store.test.ts"]'],
