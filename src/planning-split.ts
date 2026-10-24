@@ -88,7 +88,8 @@ export class PlanningSplits {
     if (!row || `${project}#${item.parentNumber}` !== row.parent) return false;
     const parent = this.store.workflow.get(String(row.parent));
     if (this.store.requiredRepairChildren.declared(item.issueId, String(row.parent))
-        && parent.blockedBy.some(b => b.state === 'OPEN' && (b.url ? b.url === item.url : b.number === item.issueNumber))) return false;
+        && (item.state === 'CLOSED' || parent.blockedBy.some(b => b.state === 'OPEN'
+          && (b.url ? b.url === item.url : b.number === item.issueNumber)))) return false;
     return parent.state === 'OPEN';
   }
   parentPending(ticket: string): boolean {

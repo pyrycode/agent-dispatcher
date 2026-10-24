@@ -207,3 +207,31 @@ test('declaration cannot take active child custody, waive later refusals, or clo
   await assert.rejects(f.api.requiredRepairs('operator',parent,{...f.plan(),commandId:'second-declaration'}),/active/);
   assert.deepEqual(f.store.snapshot().runs,runs);assert.deepEqual(f.store.snapshot().claims,claims);
 });
+
+test('completed declared repairs release parent refinement; reopened repairs still require their blocker',async t=>{
+  const f=await fixture(t);await f.inspect();await f.declare(f.plan());f.end();
+  assert.equal(f.start().ok,true);
+  f.store.finish('box','builder','builder-2522');
+  // Simulate the normal accepted child completion; declaration itself accepts no work.
+  f.store.workflow.change(child,{state:'CLOSED',status:'Done'},'accepted-child-completion','complete-repair');
+  assert.equal(f.store.workflow.get(parent).blockedBy[0].state,'CLOSED');
+  assert.equal(f.store.planningSplits.parentPending(parent),false);
+  assert.equal(f.store.start({workflowVersion:1,id:'parent-acceptance-refiner',machine:'box',session:'parent',
+    project,ticket:parent,role:'refiner',resource:'light',locks:[]}).ok,true);
+  f.store.workflowChange('box','parent','parent-acceptance-refiner',parent,
+    {status:'In Development',addLabels:['done:refiner']},'advance-acceptance-parent');
+  assert.equal(f.store.workflow.get(parent).state,'OPEN');
+  assert.equal(f.store.workflow.get(parent).status,'In Development');
+  f.store.finish('box','parent','parent-acceptance-refiner');
+  // Completion must not make the exemption unconditional if the child reopens.
+  f.store.workflow.change(parent,{blockedBy:[]},'fixture','remove-completed-blocker');
+  assert.equal(f.store.planningSplits.parentPending(parent),false);
+  f.store.workflow.change(child,{state:'OPEN',status:'In Development'},'fixture','reopen-repair');
+  assert.equal(f.store.planningSplits.childPending(f.store.workflow.get(child),project),true);
+  assert.equal(f.store.planningSplits.parentPending(parent),true);
+  const again={...offer,id:'reopened-builder',machine:'box',session:'builder'};
+  assert.deepEqual(f.store.start(again),{ok:false,reason:'locked'});
+  f.store.workflow.change(parent,{blockedBy:[{number:2522,state:'OPEN',url:item(2522).url}]},'fixture','restore-blocker');
+  assert.equal(f.store.planningSplits.parentPending(parent),false);
+  assert.equal(f.store.start(again).ok,true);
+});
