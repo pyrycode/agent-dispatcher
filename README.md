@@ -674,6 +674,8 @@ nonzero exit or dispatcher timeout cannot advance a ticket. A blocked outcome
 preserves its worktree for recovery and is never salvaged. This avoids deleting
 edits after a required commit or external action is rejected.
 
+An ordinary refusal of an optional workflow action does not require a blocked outcome. If another worker owns a foreign ticket, leave its refused label write unchanged and continue independently authorised work on the assigned ticket. Never bypass the restriction through another tool or method. Lost own-ticket authority, actual safety rejection and necessary work with no authorised route still stop the run. This applies to Claude and Codex.
+
 Most blocked outcomes park the ticket at once, and the operator must inspect that
 worktree before re-queueing it. One kind retries instead: a summary saying a
 required tool, MCP server or environment variable was missing or unavailable.
