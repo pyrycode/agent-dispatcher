@@ -39,6 +39,11 @@ export interface VerdictHandoff {
   labels: string[];
   /** The verdict comment body. */
   body: string;
+  /**
+   * Retained-evidence investigations this PASS resolves, or whose remaining
+   * evidence limits it explicitly accepts. Present only when named.
+   */
+  investigations?: string[];
 }
 
 export type HandoffParse = { ok: true; handoff: VerdictHandoff } | { ok: false; reason: string };
@@ -87,10 +92,15 @@ export function parseVerdictHandoff(text: string): HandoffParse {
   if (decision === "FAIL" && reworks.length === 0) return { ok: false, reason: "a FAIL names no needs-rework label" };
   if (decision === "PASS" && reworks.length > 0) return { ok: false, reason: "a PASS names a needs-rework label" };
 
+  const investigations = (header.get("investigations") ?? "").split(/[\s,]+/).filter((i) => i !== "");
+  if (investigations.length > 16 || new Set(investigations).size !== investigations.length
+    || investigations.some((i) => !/^[0-9a-f]{64}$/.test(i))) return { ok: false, reason: "investigations is not a list of distinct 64-character identities" };
+  if (decision === "FAIL" && investigations.length > 0) return { ok: false, reason: "a FAIL cannot accept an investigation" };
+
   const body = lines.slice(sep + 1).join("\n").trim();
   if (body === "") return { ok: false, reason: "the body is empty" };
 
-  return { ok: true, handoff: { decision, commit, labels, body } };
+  return { ok: true, handoff: { decision, commit, labels, body, ...(investigations.length ? { investigations } : {}) } };
 }
 
 /**

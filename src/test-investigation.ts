@@ -14,6 +14,10 @@ export interface TestInvestigationRequest {
 export interface TestInvestigation {
  id:string;ticket:string;runId:string;machine:string;created:number;request:TestInvestigationRequest;
 }
+/** An accepted exact-candidate verdict that settled a pending request. The request and verdict stay retained. */
+export interface InvestigationReconciliation {
+ investigation:string;ticket:string;stageRunId:string;candidate:string;pullRequest:number;decision:'PASS';verdictDigest:string;reason:string;reconciled:number;
+}
 const HASH=/^[a-f0-9]{64}$/;
 function keys(value:unknown, names:string[]):value is Record<string,any> {
  return !!value && typeof value==='object' && !Array.isArray(value)
@@ -51,6 +55,9 @@ export class TestInvestigations {
   db.exec(`CREATE TABLE IF NOT EXISTS fleet_test_investigations (
    id TEXT PRIMARY KEY, ticket TEXT NOT NULL, run_id TEXT NOT NULL, created INTEGER NOT NULL,
    record TEXT NOT NULL, incident TEXT, assessed INTEGER
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS fleet_test_investigation_reconciliations (
+   investigation TEXT PRIMARY KEY, ticket TEXT NOT NULL, record TEXT NOT NULL
   ) STRICT;`);
  }
  request(ticket:string,runId:string,machine:string,value:unknown,evidence?:Pick<EvidenceStore,'list'>) {
@@ -79,5 +86,29 @@ export class TestInvestigations {
  }
  complete(incident:string):void {
   this.db.prepare('UPDATE fleet_test_investigations SET assessed=? WHERE incident=? AND assessed IS NULL').run(this.now(),incident);
+ }
+ /**
+  * Settles each pending request the accepted verdict names. A request it does
+  * not name stays pending for its ordinary assessment. The caller supplies
+  * only an accepted verifier PASS for the exact candidate; admission already
+  * refuses a verifier while an assessment or its diagnostic holds the ticket.
+  */
+ reconcile(ticket:string,accepted:Omit<InvestigationReconciliation,'investigation'|'ticket'|'reason'|'reconciled'>,named:readonly string[]):string[] {
+  const settled:string[]=[];
+  for(const row of this.db.prepare('SELECT id FROM fleet_test_investigations WHERE ticket=? AND assessed IS NULL ORDER BY created,id').all(ticket)) {
+   const id=String(row.id);
+   if(!named.includes(id)) continue;
+   const record:InvestigationReconciliation={investigation:id,ticket,...accepted,
+    reason:`Independent verifier PASS for exact candidate ${accepted.candidate} named this investigation as resolved or its remaining evidence limits accepted; its request and failures stay retained as evidence, not passing coverage.`,reconciled:this.now()};
+   this.db.prepare('INSERT INTO fleet_test_investigation_reconciliations VALUES (?,?,?)').run(id,ticket,JSON.stringify(record));
+   this.db.prepare('UPDATE fleet_test_investigations SET assessed=? WHERE id=? AND assessed IS NULL').run(record.reconciled,id);
+   settled.push(id);
+  }
+  return settled;
+ }
+ reconciliations(ticket:string):Array<{investigation:TestInvestigation;reconciliation:InvestigationReconciliation}> {
+  return this.db.prepare(`SELECT i.record AS investigation,r.record AS reconciliation FROM fleet_test_investigation_reconciliations r
+   JOIN fleet_test_investigations i ON i.id=r.investigation WHERE r.ticket=? ORDER BY i.created,i.id`).all(ticket)
+   .map(r=>({investigation:JSON.parse(String(r.investigation)),reconciliation:JSON.parse(String(r.reconciliation))}));
  }
 }
