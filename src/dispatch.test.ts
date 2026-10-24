@@ -11399,6 +11399,38 @@ describe("Codex builder refinement handoff", () => {
   });
 });
 
+describe("Builder replacement split completion",()=>{
+  for(const runner of ['codex','claude'] as const)test(`${runner}: retain partial work and bypass implementation publication after the authority confirms a split`,async()=>{
+    const {ctx,client,calls}=makeTestContext({agent:{name:'builder'}});
+    ctx.client.completedBuilderSplit=async()=>['test/repo#101','test/repo#102'];
+    assert.deepEqual(await handlePostRun(streamResult({runner,isError:false,terminalReason:'stop'}),ctx,false),{ok:false});
+    assert.equal(ctx.scopeHandoff,true);
+    assert.equal(calls.exec.length,0);
+    assert.equal(calls.spawn.length,0);
+    assert.equal(client.addLabelCalls.length,0);
+    assert.equal(client.comments.length,0);
+  });
+  test('a successful split does not erase a later safety rejection or failed worker',async()=>{
+    for(const patch of [{hadPermissionDenial:true},{isError:true},{terminalReason:'codex_blocked' as const}]){
+      const {ctx,client,calls}=makeTestContext({agent:{name:'builder'}});
+      ctx.client.completedBuilderSplit=async()=>['test/repo#101','test/repo#102'];
+      await assert.rejects(handlePostRun(streamResult({runner:'codex',...patch}),ctx,false),/does not override/);
+      assert.equal(ctx.scopeHandoff,true);
+      assert.equal(client.addLabelCalls.length,0);
+      assert.equal(calls.exec.length,0);
+    }
+  });
+});
+
+test('an unavailable builder split receipt preserves work instead of attempting publication',async()=>{
+  const {ctx,client,calls}=makeTestContext({agent:{name:'builder'}});
+  ctx.client.completedBuilderSplit=async()=>{throw new Error('authority unavailable')};
+  await assert.rejects(handlePostRun(streamResult({runner:'codex',isError:false}),ctx,false),/authority unavailable/);
+  assert.equal(ctx.scopeHandoff,true);
+  assert.equal(calls.exec.length,0);
+  assert.equal(client.addLabelCalls.length,0);
+});
+
 describe("Builder scope reassessment handoff", () => {
   const request = () => streamResult({runner:"codex", isError:false, terminalReason:"needs_scope_review", output:"Thread admission also requires migrating reply, permission and reset behaviour. Preserve feature/100 and split migration before enforcement."});
   test("retains partial implementation and requests recovery without publishing or advancing", async () => {

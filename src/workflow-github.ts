@@ -227,11 +227,11 @@ export class WorkflowGitHub {
       if (request.method === 'POST') {
         const input = planningSplitRequest(body), saved = this.store.planningSplits.result(planner, ticket, input);
         if (saved) return response(saved);
-        await this.refreshPlanningSplit(planner, ticket);
+        await this.refreshPlanningSplit(planner, ticket, true);
         return response(this.store.finalizePlanningSplit(planner, ticket, input));
       }
       if (request.method !== 'GET') throw new Error('Split supports only inspection and finalization');
-      await this.refreshPlanningSplit(planner, ticket);
+      await this.refreshPlanningSplit(planner, ticket, true);
       const inventory = this.store.planningSplits.inspect(ticket);
       return response({ revision: inventory.parent.revision,
         children: inventory.children.map(c => ({ number: c.issueNumber, revision: c.revision, dependsOn: [] })),
@@ -723,10 +723,17 @@ export class WorkflowGitHub {
     return request ? this.store.declareRequiredRepairChildren(actor, ticket, request) : this.store.requiredRepairChildren.inspect(ticket);
   }
   /** Require fresh, complete GitHub family links before the single workflow commit. */
-  private async refreshPlanningSplit(actor: RepairActor, ticket: string) {
-    if (actor !== 'operator') this.store.planningSplits.authorize(actor, ticket);
+  private async refreshPlanningSplit(actor: RepairActor, ticket: string, allowBuilder = false) {
+    if (actor !== 'operator') this.store.planningSplits.authorize(actor, ticket, allowBuilder);
     const project = ticket.split('#')[0], source = this.store.workflow.get(ticket);
     await this.adoptIssue(project, source.issueId, true);
+    if (allowBuilder && this.store.snapshot().runs.find(r => r.id === (actor === 'operator' ? undefined : actor.runId))?.role !== 'builder') {
+      const grandparent = this.store.workflow.get(ticket).grandparentNumber;
+      if (grandparent) {
+        const ancestor = this.store.workflow.get(`${project}#${grandparent}`);
+        await this.adoptIssue(project, ancestor.issueId, true);
+      }
+    }
     const payload = JSON.parse((await this.checked(project, { method: 'POST', path: '/graphql', fresh: true,
       body: JSON.stringify({ query: 'query($id:ID!){node(id:$id){... on Issue{id subIssues(first:100){nodes{id number} pageInfo{hasNextPage}} blocking(first:100){nodes{id number state repository{nameWithOwner}} pageInfo{hasNextPage}}}}}',
         variables: { id: source.issueId } }) })).body);

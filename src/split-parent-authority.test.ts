@@ -112,10 +112,10 @@ async function stack(t: TestContext, store: FleetStore, fetcher: typeof fetch, d
   return { bridge, manager: (machine: string) => new JsonClient(`unix://${managers[machine]}`, `${machine}-core`) };
 }
 
-test("Core #3361: split children wait for the parent refiner, whose later writes all land", async t => {
+for (const role of ["refiner", "builder"]) test(`Core #3361: ${role} split children wait while later parent writes land`, async t => {
   const { store } = fixture(t);
-  store.workflow.import(config, [item(3361), item(3500)]);
-  const parent = start("pyrybox", 3361, "refiner");
+  store.workflow.import(config, [item(3361, role === "builder" ? "In Development" : "Backlog"), item(3500)]);
+  const parent = start("pyrybox", 3361, role);
   assert.equal(store.start(parent).ok, true);
   const github = fakeGitHub(3361);
   github.creations.push(3428, 3429, 3430, 3431);

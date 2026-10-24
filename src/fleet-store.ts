@@ -1122,7 +1122,7 @@ Request a fresh independent verifier of candidate ${input.candidate} after faile
     this.db.prepare("INSERT OR IGNORE INTO fleet_ticket_creators SELECT ?,id,? FROM fleet_runs WHERE id=? AND machine=? AND session=? AND finished IS NULL")
       .run(issueId, now, runId, machine, session);
     const run = this.snapshot().runs.find(r => r.id === runId && r.machine === machine && r.session === session);
-    if (run && ['refiner', 'po'].includes(run.role)) this.planningSplits.holdChild(issueId, run.ticket);
+    if (run && ['refiner', 'po', 'builder'].includes(run.role)) this.planningSplits.holdChild(issueId, run.ticket);
   }
 
   private transactionDepth = 0;
