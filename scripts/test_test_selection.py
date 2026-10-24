@@ -44,6 +44,10 @@ class SelectionTests(unittest.TestCase):
             ('gradle', [task]), ('gradle', [task, INSTRUMENTATION_CLASS]),
             ('gradle', [task, INSTRUMENTATION_CLASS + '=' + DESIGN_CAPTURE_TESTS, INSTRUMENTATION_CLASS + '=*']),
             ('gradle', [task, INSTRUMENTATION_CLASS + '=' + DESIGN_CAPTURE_TESTS, INSTRUMENTATION_CLASS, '*']),
+            ('gradle', [task, INSTRUMENTATION_CLASS + '=' + DESIGN_CAPTURE_TESTS, '-P', INSTRUMENTATION_CLASS[2:] + '=*']),
+            ('gradle', [task, '-P', INSTRUMENTATION_CLASS[2:] + '=' + DESIGN_CAPTURE_TESTS, INSTRUMENTATION_CLASS + '=*']),
+            ('gradle', [task, INSTRUMENTATION_CLASS + '=' + DESIGN_CAPTURE_TESTS, '--project-prop', INSTRUMENTATION_CLASS[2:] + '=*']),
+            ('gradle', [task, INSTRUMENTATION_CLASS + '=' + DESIGN_CAPTURE_TESTS, '--project-prop=' + INSTRUMENTATION_CLASS[2:] + '=*']),
             ('gradle', [task, INSTRUMENTATION_CLASS + '=' + DESIGN_CAPTURE_TESTS, ':app:check']),
             ('gradle', [task, INSTRUMENTATION_CLASS + '=' + DESIGN_CAPTURE_TESTS, ':app:testDebugUnitTest']),
             ('gradle', [task, INSTRUMENTATION_CLASS + '=' + DESIGN_CAPTURE_TESTS, ':app:allDevicesDebugAndroidTest']),
@@ -82,7 +86,8 @@ class SelectionTests(unittest.TestCase):
                     self.assertEqual(context.call_count, len(commands))
                     context.assert_called_with(record['socket'])
                     for kind, args in [('android', ['ui']), ('gradle', [nested[0]]),
-                                       ('gradle', [*nested, ':app:check'])]:
+                                       ('gradle', [*nested, ':app:check']),
+                                       ('gradle', [*nested, '-P', INSTRUMENTATION_CLASS[2:] + '=*'])]:
                         with self.subTest(kind=kind, args=args), self.assertRaises(policy.PolicyError):
                             policy.check(root, kind, args)
                 for response in [{'return_value': {**reply, 'runId': 'foreign-run'}},
@@ -91,6 +96,25 @@ class SelectionTests(unittest.TestCase):
                         for kind, args in commands:
                             with self.subTest(kind=kind, response=response), self.assertRaises(policy.PolicyError):
                                 policy.check(root, kind, args)
+
+    def test_instrumentation_property_spellings_share_validation_and_duplicate_detection(self):
+        def spellings(value):
+            property_value = INSTRUMENTATION_CLASS[2:] + '=' + value
+            return [['-P' + property_value], ['-P', property_value],
+                    ['--project-prop', property_value], ['--project-prop=' + property_value]]
+
+        for task in ['pixel8Api35DebugAndroidTest', 'pixel2Api33AtdDebugAndroidTest',
+                     'connectedDebugAndroidTest', 'connectedAndroidTest']:
+            for flags in spellings(DESIGN_CAPTURE_TESTS):
+                with self.subTest(task=task, flags=flags):
+                    policy.selection('gradle', [':app:' + task, *flags])
+                for override in spellings('*') + spellings(DESIGN_CAPTURE_TESTS):
+                    with self.subTest(task=task, flags=flags, override=override), self.assertRaises(policy.PolicyError):
+                        policy.selection('gradle', [':app:' + task, *flags, *override])
+            for value in ['', '*', DESIGN_CAPTURE_TESTS + ',de.pyryco.mobile.OtherTest#other']:
+                for flags in spellings(value):
+                    with self.subTest(task=task, flags=flags), self.assertRaises(policy.PolicyError):
+                        policy.selection('gradle', [':app:' + task, *flags])
 
     def test_desktop_unit_selection_is_exact_and_bounded(self):
         for args in [

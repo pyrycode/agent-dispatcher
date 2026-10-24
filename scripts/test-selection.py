@@ -178,13 +178,16 @@ def jvm_selection(args):
 
 def gradle_selection(args):
     tests = options(args, ['--tests'])
-    instrumentation = option(args, ['-Pandroid.testInstrumentationRunnerArguments.class'])
+    # Gradle also accepts split -P and long --project-prop arguments. Include
+    # them in duplicate detection so a later spelling cannot replace the class.
+    properties = ['-P' + value for value in options(args, ['-P', '--project-prop'])]
+    instrumentation = option([*args, *properties], ['-Pandroid.testInstrumentationRunnerArguments.class'])
     tasks = []
     skip = False
     value_flags = {'--tests','--console','--max-workers','--warning-mode','--project-dir','-p',
                    '--gradle-user-home','-g','--init-script','-I','--include-build',
                    '--configuration-cache-problems','--priority','--dependency-verification',
-                   '--write-verification-metadata','-P','-D'}
+                   '--write-verification-metadata','-P','--project-prop','-D'}
     for token in args:
         if skip:
             skip = False
