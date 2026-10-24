@@ -366,3 +366,66 @@ test("split transfer refuses unrelated edges, broad edits, and active foreign wo
   assert.equal(store.start(wrongRole).ok, true);
   assert.equal((await gh(await bridge("pyrybox", wrongRole.id), "POST", "/graphql", dependency())).status, 409);
 });
+
+test("Desktop #2191: a refused optional foreign label leaves the worker authorised to finish its own ticket", async t => {
+  const { store, dir } = fixture(t);
+  store.workflow.import(config, [item(2191, 'In Development'), item(2205, 'In Development')]);
+  const own = start('pyrybox', 2191, 'builder');
+  const foreign = start('hp', 2205, 'builder');
+  assert.equal(store.start(own).ok, true);
+  assert.equal(store.start(foreign).ok, true);
+  const { bridge } = await stack(t, store, fakeGitHub(0).fetcher, dir);
+  const socket = await bridge('pyrybox', own.id);
+  const before = structuredClone(store.workflow.get(foreign.ticket));
+  const claims = store.snapshot().claims;
+  const refused = await gh(socket, 'POST', `/repos/${project}/issues/2205/labels`, { labels: ['bug'] });
+  assert.equal(refused.status, 409);
+  assert.match(refused.body.message, /another machine/);
+  assert.deepEqual(store.workflow.get(foreign.ticket), before);
+  assert.deepEqual(store.snapshot().claims, claims);
+  const accepted = await gh(socket, 'POST', `/repos/${project}/issues/2191/labels`, { labels: ['bug'] });
+  assert.equal(accepted.status, 200);
+  assert.ok(store.workflow.get(own.ticket).labels.includes('bug'));
+
+  // Both runners see an ordinary tool error, not an approval rejection.
+  const { CodexStreamAdapter, CODEX_ROLE_GUIDANCE } = await import('./agent-runner.js');
+  const { advancePermissionDenialState, initPermissionDenialState } = await import('./agent-runtime.js');
+  let claude = initPermissionDenialState();
+  for (const result of [refused, accepted]) {
+    const advanced = advancePermissionDenialState(claude, { type: 'user', message: { content: [
+      { type: 'tool_result', is_error: result.status !== 200, content: JSON.stringify(result.body) },
+    ] } });
+    assert.equal(advanced.action, 'none');
+    claude = advanced.state;
+  }
+  assert.equal(claude.hadPermissionDenial, false);
+  const codex = new CodexStreamAdapter();
+  codex.accept({ type: 'item.completed', item: { type: 'command_execution', status: 'failed', exit_code: 1, aggregated_output: JSON.stringify(refused.body) } });
+  codex.accept({ type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify({ status: 'completed', summary: 'Skipped foreign label; own work completed.' }) } });
+  codex.accept({ type: 'turn.completed' });
+  assert.equal(codex.finish(0, false, 1).isError, false);
+  assert.match(CODEX_ROLE_GUIDANCE, /optional workflow action/);
+
+  // A real safety denial remains sticky even after a later success claim.
+  const denial = advancePermissionDenialState(claude, { type: 'user', message: { content: [
+    { type: 'tool_result', is_error: true, content: 'Permission to use Bash has been denied.' },
+  ] } });
+  assert.equal(denial.state.hadPermissionDenial, true);
+  codex.accept({ type: 'item.completed', item: { type: 'command_execution', status: 'declined', aggregated_output: 'This action was rejected due to unacceptable risk.' } });
+  assert.equal(codex.finish(0, false, 1).hadPermissionDenial, true);
+  assert.equal(codex.finish(0, false, 1).isError, true);
+
+  // Operator recovery invalidating the own claim makes the old worker's next write fail.
+  const ownClaim = store.snapshot().claims.find(c => c.ticket === own.ticket)!;
+  store.free(own.ticket, ownClaim.generation, true);
+  const stopped = structuredClone(store.workflow.get(own.ticket));
+  const late = await gh(socket, 'POST', `/repos/${project}/issues/2191/labels`, { labels: ['late'] });
+  assert.equal(late.status, 409);
+  assert.match(late.body.message, /finished or lost ownership|not owned|ownership/i);
+  const lost = new CodexStreamAdapter();
+  lost.accept({ type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify({ status: 'blocked', summary: 'Lost authority over assigned ticket.' }) } });
+  lost.accept({ type: 'turn.completed' });
+  assert.equal(lost.finish(0, false, 1).isError, true);
+  assert.deepEqual(store.workflow.get(own.ticket), stopped);
+  assert.deepEqual(store.workflow.get(foreign.ticket), before);
+});
